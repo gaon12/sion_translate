@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kjx"
+version = "0.1.0"
+description = "From-scratch Korean-Japanese experimental machine translation training stack"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = [
+  "numpy>=2.0",
+  "PyYAML>=6.0",
+  "sacrebleu>=2.5",
+  "sentencepiece>=0.2",
+  "tensorboard>=2.18",
+  "torch>=2.8",
+  "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3", "ruff>=0.8"]
+baselines = ["transformers>=4.48,<6"]
+
+[project.urls]
+Repository = "https://github.com/gaon12/sion_translate"
+Model = "https://huggingface.co/gaon12/sion_translate"
+
+[project.scripts]
+kjx-audit-data = "kjx.cli.audit_data:main"
+kjx-train-tokenizer = "kjx.cli.train_tokenizer:main"
+kjx-prepare-data = "kjx.cli.prepare_data:main"
+kjx-train = "kjx.cli.train:main"
+kjx-translate = "kjx.cli.translate:main"
+kjx-augment = "kjx.cli.augment:main"
+kjx-evaluate = "kjx.cli.evaluate:main"
+kjx-prepare-benchmark = "kjx.cli.prepare_benchmark:main"
+kjx-compare = "kjx.cli.compare:main"
+kjx-translate-cases = "kjx.cli.translate_cases:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "B", "PLE"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-q"

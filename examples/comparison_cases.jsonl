@@ -1,0 +1,16 @@
+{"id":"ko-ja-honorific-01","source_language":"ko","target_language":"ja","category":"honorific","source":"회의가 끝나면 수정된 자료를 검토해 주시겠어요?","reference":"会議が終わったら、修正した資料を確認していただけますか。"}
+{"id":"ko-ja-ambiguity-01","source_language":"ko","target_language":"ja","category":"ambiguity","source":"배가 고파서 배를 하나 깎아 먹었다.","reference":"お腹が空いたので、梨を一つむいて食べた。"}
+{"id":"ko-ja-numbers-01","source_language":"ko","target_language":"ja","category":"numbers","source":"결제 금액은 128,500원이며 환불 기한은 8월 3일입니다.","reference":"決済金額は128,500ウォンで、返金期限は8月3日です。"}
+{"id":"ko-ja-technical-01","source_language":"ko","target_language":"ja","category":"technical","source":"API가 HTTP 429를 반환하면 2초 뒤에 다시 시도하세요.","reference":"APIがHTTP 429を返した場合は、2秒後に再試行してください。"}
+{"id":"ko-ja-colloquial-01","source_language":"ko","target_language":"ja","category":"colloquial","source":"아, 그건 좀 아닌 것 같은데? 다른 방법을 찾아보자.","reference":"あ、それはちょっと違うと思うけど？別の方法を探してみよう。"}
+{"id":"ko-ja-long-01","source_language":"ko","target_language":"ja","category":"long_context","source":"비가 오는 줄 알았더라면 우산을 챙겼을 텐데, 아침에는 하늘이 너무 맑았다.","reference":"雨が降ると分かっていたら傘を持ってきたのに、朝は空がとても晴れていた。"}
+{"id":"ko-ja-proper-01","source_language":"ko","target_language":"ja","category":"proper_noun","source":"해솔역에서 내려 별빛도서관까지 걸어가 주세요.","reference":"ヘソル駅で降りて、星明かり図書館まで歩いてください。"}
+{"id":"ko-ja-idiom-01","source_language":"ko","target_language":"ja","category":"idiom","source":"일이 꼬였지만 지금 포기하면 다 된 밥에 재를 뿌리는 셈이다.","reference":"事態はこじれたが、今諦めたら、せっかくの努力を台無しにすることになる。"}
+{"id":"ja-ko-honorific-01","source_language":"ja","target_language":"ko","category":"honorific","source":"恐れ入りますが、こちらにお名前をご記入いただけますか。","reference":"죄송하지만, 여기에 성함을 적어 주시겠습니까?"}
+{"id":"ja-ko-ambiguity-01","source_language":"ja","target_language":"ko","category":"ambiguity","source":"今日はちょっと……また今度誘ってください。","reference":"오늘은 좀 곤란해요……다음에 또 불러 주세요."}
+{"id":"ja-ko-numbers-01","source_language":"ja","target_language":"ko","category":"numbers","source":"受付は17時30分までで、手数料は1,200円です。","reference":"접수는 17시 30분까지이며 수수료는 1,200엔입니다."}
+{"id":"ja-ko-technical-01","source_language":"ja","target_language":"ko","category":"technical","source":"config.yamlを保存してから、サーバーを再起動してください。","reference":"config.yaml을 저장한 뒤 서버를 다시 시작해 주세요."}
+{"id":"ja-ko-colloquial-01","source_language":"ja","target_language":"ko","category":"colloquial","source":"それ、めっちゃ助かる！あとでコーヒーおごるよ。","reference":"그거 진짜 도움 된다! 나중에 커피 살게."}
+{"id":"ja-ko-long-01","source_language":"ja","target_language":"ko","category":"long_context","source":"電車が遅れていなければ間に合ったはずだが、駅に着いた時には受付が終わっていた。","reference":"전철이 늦지 않았다면 제시간에 도착했을 텐데, 역에 도착했을 때는 접수가 끝나 있었다."}
+{"id":"ja-ko-proper-01","source_language":"ja","target_language":"ko","category":"proper_noun","source":"朝凪町の月影公園で、白波さんと待ち合わせています。","reference":"아사나기 마을의 츠키카게 공원에서 시라나미 씨와 만나기로 했습니다."}
+{"id":"ja-ko-idiom-01","source_language":"ja","target_language":"ko","category":"idiom","source":"急がば回れと言うし、まず原因を一つずつ確認しよう。","reference":"급할수록 돌아가라고 하니, 우선 원인을 하나씩 확인하자."}

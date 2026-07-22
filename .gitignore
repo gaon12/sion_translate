@@ -1,0 +1,52 @@
+# Python / editors
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+.idea/
+.vscode/
+
+# Local Codex state
+.agents/
+.codex/
+
+# Training data and locally prepared corpora
+data/**
+!data/.gitkeep
+data_mono/
+dataset.stale-*/
+benchmarks/
+
+# Model weights, tokenizers, checkpoints, and packaged artifacts
+artifacts/
+artifacts*/
+checkpoints/
+runs/
+exports/
+models/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.model
+*.vocab
+*.npz
+*.bin
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.sha256
+
+# Local evaluation material and service outputs
+reports/
+comparison_outputs/
+glossary_input.json
+*.log
+
+# Data acquisition helpers are intentionally kept local. The public project
+# starts from user-supplied JSONL and does not redistribute acquisition code.
+tools/

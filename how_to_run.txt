@@ -1,0 +1,115 @@
+Vast.ai 터미널에서 학습 실행하기
+
+프로젝트와 data/*.jsonl 파일을 Vast.ai 인스턴스에 올린 상태를 기준으로 합니다.
+아래 명령은 모두 프로젝트 루트에서 실행하세요.
+
+권장 한 줄 실행 (H100, 자동 RAM 디스크/CPU/GPU 설정):
+
+python3 easy_run.py
+
+이 명령은 가능한 경우 /dev/shm RAM 디스크에서 전처리와 dataset 읽기를 수행하고,
+완성된 artifacts를 일반 디스크에도 보존한 뒤 모든 GPU로 학습합니다.
+tmux가 없으면 자동 설치하고 kjx 세션 안에서 실행하므로 터미널 연결이 끊겨도
+학습은 계속됩니다. 재접속 명령은 tmux attach -t kjx 입니다.
+아래 단계별 명령은 문제 해결이나 수동 실행이 필요할 때 사용하세요.
+
+
+1. 프로젝트와 GPU 확인
+
+# 경로가 다르면 이 줄만 실제 경로로 바꾸세요.
+cd /workspace/sion_translate
+
+python3 -c "import sys; assert sys.version_info >= (3, 11), 'Python 3.11 이상이 필요합니다'; print(sys.version)"
+nvidia-smi
+find data -maxdepth 1 -name '*.jsonl' -type f | wc -l
+
+JSONL 파일은 Git에 포함되지 않으므로 0이 나오면 사용 권한을 확인한 병렬 말뭉치를
+data/ 폴더에 먼저 업로드해야 합니다.
+
+
+2. 설치 (인스턴스마다 최초 1회)
+
+Vast.ai에서는 Python 3.11 이상과 CUDA용 PyTorch 2.8 이상이 들어 있는
+PyTorch 이미지를 사용하는 것이 가장 간단합니다.
+
+python3 -m pip install --upgrade pip
+python3 -m pip install -e ".[dev]"
+
+python3 -c "import torch; assert torch.cuda.is_available(), 'CUDA를 찾지 못했습니다'; print('PyTorch:', torch.__version__, '| CUDA:', torch.version.cuda, '| GPU 수:', torch.cuda.device_count())"
+
+마지막 명령이 오류 없이 GPU 수를 출력하면 설치가 끝난 것입니다.
+CUDA를 찾지 못했다면 학습을 시작하지 말고 CUDA용 PyTorch가 포함된 Vast.ai 이미지로
+인스턴스를 다시 만드는 편이 가장 쉽습니다. nvidia-smi에 나온 숫자만 보고 특정 CUDA
+wheel을 덮어 설치하지 마세요.
+
+선택 확인:
+
+python3 -m pytest -q
+
+
+3. tmux 시작
+
+학습 중 브라우저 터미널이 끊겨도 계속 실행되게 tmux 안에서 진행합니다.
+
+tmux new -s kjx
+
+tmux가 없다면 먼저 아래 명령으로 설치한 뒤 다시 실행하세요.
+
+apt-get update && apt-get install -y tmux
+
+
+4. 토크나이저와 데이터셋 준비 (처음 한 번만)
+
+kjx-train-tokenizer --input "data/*.jsonl" --output-dir artifacts/tokenizer --vocab-size 48000
+
+kjx-prepare-data --input "data/*.jsonl" --tokenizer artifacts/tokenizer/kjx.model --output-dir artifacts/dataset
+
+처리 시간은 JSONL 크기에 따라 달라집니다. 두 명령이 모두 끝나면
+artifacts/tokenizer와 artifacts/dataset이 생깁니다. 입력이 바뀌지 않았다면 이후에는
+이 단계를 다시 하지 않아도 됩니다.
+
+
+5. 보이는 GPU를 모두 사용해 학습
+
+GPU_COUNT=$(python3 -c "import torch; print(torch.cuda.device_count())")
+echo "사용할 GPU 수: $GPU_COUNT"
+torchrun --standalone --nproc-per-node="$GPU_COUNT" -m kjx.cli.train
+
+별도 인자 없이 실행하면 kjx.yaml을 읽고 모델 크기, 배치 크기, 정밀도와 학습 step을
+자동으로 정합니다.
+
+
+6. 터미널 재접속과 학습 재개
+
+tmux 화면에서 빠져나오기: Ctrl+B를 누른 뒤 D
+tmux로 돌아가기:
+
+tmux attach -t kjx
+
+학습이 중단됐다면 프로젝트 폴더에서 5번 명령을 다시 실행하세요.
+runs/auto/pretrain/checkpoints/latest와 runs/auto/posttrain/checkpoints/latest를
+단계별로 확인해 자동으로 이어서 학습합니다.
+tmux는 터미널 연결 끊김만 막아 줍니다. Vast.ai 인스턴스를 종료하거나 삭제하기 전에는
+반드시 결과를 내려받으세요.
+
+
+7. 상태와 결과
+
+다른 터미널에서 GPU 상태 보기:
+
+watch -n 2 nvidia-smi
+
+주요 결과 위치:
+
+- 사전학습 모델: runs/auto/pretrain/exports/best
+- 사후학습 모델(추론 우선): runs/auto/posttrain/exports/best
+- 최근 재개 체크포인트: 각 단계의 checkpoints/latest
+- 토크나이저: artifacts/tokenizer
+
+다운로드하기 쉽게 결과 묶기:
+
+tar -czf kjx-result.tar.gz runs/auto/pretrain/exports/best runs/auto/posttrain/exports/best artifacts/tokenizer
+
+
+한 줄 요약:
+프로젝트 이동 → 설치 → tmux → 토크나이저/데이터 준비 1회 → torchrun으로 학습

@@ -1,0 +1,70 @@
+model:
+  d_model: 128
+  encoder_layers: 2
+  decoder_layers: 2
+  num_heads: 4
+  num_kv_heads: 2
+  d_ff: 384
+  max_seq_len: 128
+  dropout: 0.1
+  gradient_checkpointing: false
+  experimental:
+    bats_enabled: true
+    bats_dim: 32
+    bats_loss_weight: 0.0
+    bats_coverage_weight: 0.0
+    bats_stride: 1
+    bats_max_positions: 128
+    core_enabled: true
+    register_classes: 4
+    register_loss_weight: 0.05
+    tetm_enabled: true
+    tetm_types: 10
+    tetm_modes: 5
+    morphoscript_enabled: true
+    morphoscript_interval: 1
+    script_classes: 9
+
+data:
+  tokenizer_model: artifacts/tokenizer/kjx.model
+  tokenizer_features: artifacts/tokenizer/token_features.npz
+  dataset_dir: artifacts/dataset
+  max_source_length: 96
+  max_target_length: 96
+  denoise_probability: 0.20
+  validation_denoise_probability: 0.0
+  num_workers: 0
+  bucket_size: 128
+
+training:
+  output_dir: runs/debug
+  max_steps: 4
+  batch_size_per_gpu: 2
+  gradient_accumulation_steps: 1
+  learning_rate: 0.0003
+  warmup_steps: 1
+  precision: fp32
+  compile: false
+  fsdp2: false
+  log_every: 1
+  eval_every: 2
+  eval_batches: 2
+  save_every: 2
+  early_stopping_patience: 3
+  early_stopping_min_delta: 0.001
+  tensorboard: true
+
+posttraining:
+  enabled: true
+  max_steps: 1
+  batch_size_per_gpu: 1
+  gradient_accumulation_steps: 1
+  learning_rate: 0.0001
+  warmup_steps: 0
+  samples_per_source: 2
+  top_k: 8
+  max_new_tokens: 8
+  preference_weight: 0.10
+  validation_num_beams: 1
+  eval_every: 1
+  save_every: 1

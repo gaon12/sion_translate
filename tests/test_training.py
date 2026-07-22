@@ -1,0 +1,296 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+import torch
+
+from kjx.config import (
+    AppConfig,
+    DataConfig,
+    ExperimentalConfig,
+    ModelConfig,
+    PostTrainingConfig,
+    TrainingConfig,
+)
+from kjx.inference import find_exported_model
+from kjx.model import KJXForConditionalGeneration
+from kjx.training.distributed import DistributedContext
+from kjx.training.objectives import MinimumRiskObjective
+from kjx.training.trainer import build_optimizer_param_groups, cosine_scheduler, train
+
+
+def tiny_model_config() -> ModelConfig:
+    return ModelConfig(
+        vocab_size=64,
+        d_model=32,
+        encoder_layers=1,
+        decoder_layers=1,
+        num_heads=4,
+        num_kv_heads=2,
+        d_ff=64,
+        max_seq_len=16,
+        dropout=0.0,
+        gradient_checkpointing=False,
+        experimental=ExperimentalConfig(
+            bats_enabled=False,
+            core_enabled=False,
+            tetm_enabled=False,
+            morphoscript_enabled=False,
+        ),
+    )
+
+
+def tiny_batch() -> dict[str, torch.Tensor]:
+    return {
+        "input_ids": torch.tensor([[4, 10, 3], [4, 11, 3]]),
+        "attention_mask": torch.ones(2, 3, dtype=torch.bool),
+        "decoder_input_ids": torch.tensor([[2, 20, 21], [2, 22, 23]]),
+        "labels": torch.tensor([[20, 21, 3], [22, 23, 3]]),
+        "register_labels": torch.zeros(2, dtype=torch.long),
+        "memory_token_ids": torch.zeros(2, 1, 1, dtype=torch.long),
+        "memory_mask": torch.zeros(2, 1, dtype=torch.bool),
+        "memory_type_ids": torch.zeros(2, 1, dtype=torch.long),
+        "memory_mode_ids": torch.zeros(2, 1, dtype=torch.long),
+    }
+
+
+class FakeTokenizer:
+    pad_id = 0
+    bos_id = 2
+    eos_id = 3
+    mask_id = 6
+    language_tags = {"ja": 4, "ko": 5}
+    denoise_tags = {"ja": 7, "ko": 8}
+    slot_ids: list[int] = []
+
+    @staticmethod
+    def decode(ids) -> str:
+        return "".join(chr(0x3041 + int(token_id) % 80) for token_id in ids)
+
+
+def tiny_app_config(tmp_path: Path, **training_overrides) -> AppConfig:
+    training_values = {
+        "output_dir": str(tmp_path / "run"),
+        "max_steps": 1,
+        "batch_size_per_gpu": 2,
+        "learning_rate": 1e-3,
+        "warmup_steps": 0,
+        "precision": "fp32",
+        "fsdp2": False,
+        "log_every": 1,
+        "eval_every": 1,
+        "eval_batches": 1,
+        "save_every": 1,
+        "tensorboard": False,
+    }
+    training_values.update(training_overrides)
+    return AppConfig(
+        model=tiny_model_config(),
+        data=DataConfig(max_source_length=16, max_target_length=16, num_workers=0),
+        training=TrainingConfig(**training_values),
+    )
+
+
+def test_single_step_training_loop(tmp_path: Path) -> None:
+    config = tiny_app_config(tmp_path)
+    model = KJXForConditionalGeneration(config.model)
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+    result = train(model, [tiny_batch()], [tiny_batch()], config, context)
+    assert result["step"] == 1
+    assert (tmp_path / "run" / "checkpoints" / "best" / "checkpoint.pt").exists()
+    assert (tmp_path / "run" / "checkpoints" / "latest" / "checkpoint.pt").exists()
+    assert (tmp_path / "run" / "checkpoints" / "final" / "checkpoint.pt").exists()
+    # best/latest 각각 일반(FP32)·EMA·INT8 양자화 추론용 모델이 함께 저장되어야 한다.
+    for name in ("best", "latest"):
+        assert (tmp_path / "run" / "exports" / name / "model.pt").exists()
+        assert (tmp_path / "run" / "exports" / name / "model_ema.pt").exists()
+        assert (tmp_path / "run" / "exports" / name / "model_int8.pt").exists()
+
+
+def test_exported_models_reload_and_run(tmp_path: Path) -> None:
+    from kjx.config import ExperimentalConfig as ExpConfig
+    from kjx.config import ModelConfig as MConfig
+
+    config = tiny_app_config(tmp_path)
+    model = KJXForConditionalGeneration(config.model)
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+    train(model, [tiny_batch()], [tiny_batch()], config, context)
+
+    # 일반(FP32) 내보내기: 설정과 가중치로 모델을 재조립할 수 있어야 한다.
+    payload = torch.load(
+        tmp_path / "run" / "exports" / "latest" / "model.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    raw_config = dict(payload["model_config"])
+    rebuilt_config = MConfig(
+        **{key: value for key, value in raw_config.items() if key != "experimental"},
+        experimental=ExpConfig(**raw_config["experimental"]),
+    )
+    rebuilt = KJXForConditionalGeneration(rebuilt_config, pad_id=payload["pad_id"])
+    rebuilt.load_state_dict(payload["model"])
+    torch.testing.assert_close(
+        rebuilt.token_embedding.weight, model.token_embedding.weight
+    )
+
+    # INT8 양자화 내보내기: 모듈 전체가 저장되어 있어 바로 추론이 가능해야 한다.
+    quantized_payload = torch.load(
+        tmp_path / "run" / "exports" / "latest" / "model_int8.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    quantized = quantized_payload["model"]
+    batch = tiny_batch()
+    output = quantized(
+        input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
+        decoder_input_ids=batch["decoder_input_ids"],
+    )
+    assert output.logits.shape == (2, 3, config.model.vocab_size)
+
+
+def test_early_stopping_saves_best_checkpoint(tmp_path: Path) -> None:
+    config = tiny_app_config(
+        tmp_path,
+        max_steps=5,
+        save_every=5,
+        early_stopping_patience=1,
+        early_stopping_min_delta=1_000_000.0,
+    )
+    model = KJXForConditionalGeneration(config.model)
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+    result = train(model, [tiny_batch()], [tiny_batch()], config, context)
+    assert result["stopped_early"] is True
+    assert result["step"] == 2
+    assert result["early_stopping_bad_evals"] == 1
+    assert (tmp_path / "run" / "checkpoints" / "best" / "checkpoint.pt").exists()
+
+
+def test_tensorboard_writes_main_rank_scalars(tmp_path: Path) -> None:
+    config = tiny_app_config(tmp_path, tensorboard=True)
+    model = KJXForConditionalGeneration(config.model)
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+    train(model, [tiny_batch()], [tiny_batch()], config, context)
+    event_files = list((tmp_path / "run" / "tensorboard").glob("events.out.tfevents.*"))
+    assert event_files
+    assert all(path.stat().st_size > 0 for path in event_files)
+
+
+def test_empty_training_loader_fails_fast(tmp_path: Path) -> None:
+    config = tiny_app_config(tmp_path)
+    model = KJXForConditionalGeneration(config.model)
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+    with pytest.raises(ValueError, match="training loader is empty"):
+        train(model, [], [tiny_batch()], config, context)
+
+
+def test_adamw_groups_exclude_norms_biases_and_one_dimensional_parameters() -> None:
+    model = KJXForConditionalGeneration(tiny_model_config())
+    groups = build_optimizer_param_groups(model, weight_decay=0.1)
+    decayed = {id(parameter) for parameter in groups[0]["params"]}
+    not_decayed = {id(parameter) for parameter in groups[1]["params"]}
+    assert id(model.token_embedding.weight) in decayed
+    assert id(model.encoder_norm.weight) in not_decayed
+    for name, parameter in model.named_parameters():
+        if parameter.ndim == 1 or name.endswith(".bias") or "norm" in name.lower():
+            assert id(parameter) in not_decayed
+
+
+def test_cosine_scheduler_warms_up_then_decays() -> None:
+    parameter = torch.nn.Parameter(torch.ones(()))
+    optimizer = torch.optim.AdamW([parameter], lr=1.0)
+    scheduler = cosine_scheduler(optimizer, warmup_steps=2, max_steps=6, min_ratio=0.1)
+    learning_rates = [optimizer.param_groups[0]["lr"]]
+    for _ in range(6):
+        optimizer.step()
+        scheduler.step()
+        learning_rates.append(optimizer.param_groups[0]["lr"])
+    assert learning_rates[0] == pytest.approx(0.5)
+    assert learning_rates[1] == pytest.approx(1.0)
+    assert learning_rates[-1] == pytest.approx(0.1)
+
+
+def test_gradient_accumulation_matches_combined_token_normalization(
+    tmp_path: Path,
+) -> None:
+    # 초기 가중치에 따라 두 학습 경로의 부동소수점 차이가 허용 오차 근처까지
+    # 커질 수 있으므로, 테스트가 항상 같은 가중치에서 출발하도록 시드를 고정한다.
+    torch.manual_seed(20260711)
+    combined = tiny_batch()
+    micros = [
+        {name: value[index : index + 1].clone() for name, value in combined.items()}
+        for index in range(2)
+    ]
+    first = KJXForConditionalGeneration(tiny_model_config())
+    second = KJXForConditionalGeneration(tiny_model_config())
+    second.load_state_dict(first.state_dict())
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+
+    accumulated_config = tiny_app_config(
+        tmp_path / "accumulated",
+        gradient_accumulation_steps=2,
+    )
+    combined_config = tiny_app_config(tmp_path / "combined")
+    train(first, micros, [combined], accumulated_config, context)
+    train(second, [combined], [combined], combined_config, context)
+
+    for accumulated_parameter, combined_parameter in zip(
+        first.parameters(), second.parameters(), strict=True
+    ):
+        torch.testing.assert_close(
+            accumulated_parameter,
+            combined_parameter,
+            rtol=5e-4,
+            atol=3e-6,
+        )
+
+
+def test_mrt_posttraining_objective_and_stage_save(tmp_path: Path) -> None:
+    torch.manual_seed(11)
+    config = tiny_app_config(tmp_path)
+    config.training.output_dir = str(tmp_path / "run" / "posttrain")
+    config.posttraining = PostTrainingConfig(
+        max_steps=1,
+        batch_size_per_gpu=2,
+        gradient_accumulation_steps=1,
+        learning_rate=1e-4,
+        warmup_steps=0,
+        samples_per_source=2,
+        top_k=8,
+        max_new_tokens=4,
+        validation_num_beams=1,
+        eval_every=1,
+        save_every=1,
+    )
+    model = KJXForConditionalGeneration(config.model)
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+    objective = MinimumRiskObjective(FakeTokenizer(), config.posttraining)
+    result = train(
+        model,
+        [tiny_batch()],
+        [tiny_batch()],
+        config,
+        context,
+        objective=objective,
+        stage_name="posttrain/MRT",
+    )
+    assert result["step"] == 1
+    assert 0.0 <= result["best_validation_reward"] <= 1.0
+    assert (
+        tmp_path / "run" / "posttrain" / "checkpoints" / "final" / "checkpoint.pt"
+    ).exists()
+    assert (
+        tmp_path / "run" / "posttrain" / "exports" / "latest" / "model.pt"
+    ).exists()
+
+
+def test_inference_prefers_posttrain_then_pretrain(tmp_path: Path) -> None:
+    pretrain = tmp_path / "run" / "pretrain" / "exports" / "best" / "model.pt"
+    posttrain = tmp_path / "run" / "posttrain" / "exports" / "best" / "model.pt"
+    pretrain.parent.mkdir(parents=True)
+    pretrain.touch()
+    assert find_exported_model(tmp_path / "run") == pretrain
+    posttrain.parent.mkdir(parents=True)
+    posttrain.touch()
+    assert find_exported_model(tmp_path / "run") == posttrain
