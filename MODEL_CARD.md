@@ -38,12 +38,6 @@ The model uses custom code from
 [`gaon12/sion_translate`](https://github.com/gaon12/sion_translate) and is not a Transformers
 `AutoModel` checkpoint.
 
-## Live demo
-
-Try the interactive Korean↔Japanese translator in the
-[KJ-X Translator Space](https://huggingface.co/spaces/gaon12/sion_translate_demo). The Space
-uses the CPU INT8 export and exposes the same interface as a Gradio API.
-
 ## Usage
 
 ```bash
