@@ -8,6 +8,8 @@ joint SentencePiece, GQA, RoPE, pre-RMSNorm, QK-norm, SwiGLU, EMA, 양방향 번
 포함하지 않습니다. 사용자는 이용·가공·재배포 권한을 직접 확인한 JSONL만 준비해야
 합니다. 공개 모델 가중치는 별도
 [Hugging Face 저장소](https://huggingface.co/gaon12/sion_translate)에서 제공합니다.
+브라우저에서 바로 시험하려면
+[KJ-X Translator Space](https://huggingface.co/spaces/gaon12/sion_translate_demo)를 사용하세요.
 
 ## 빠른 시작
 

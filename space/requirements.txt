@@ -1,0 +1,2 @@
+git+https://github.com/gaon12/sion_translate.git@a525bc3f4dae4adac92498a4fbd180a169fd6dae
+huggingface_hub>=1.1,<2

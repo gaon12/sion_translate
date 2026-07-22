@@ -11,6 +11,15 @@ tags:
 - japanese
 - seq2seq
 - custom-code
+widget:
+- text: "회의가 끝나면 수정된 자료를 검토해 주시겠어요?"
+  example_title: "한국어 → 일본어"
+  output:
+    text: "会議が終われば、修正された資料を検討していただけますか。"
+- text: "恐れ入りますが、こちらにお名前をご記入いただけますか。"
+  example_title: "日本語 → 한국어"
+  output:
+    text: "죄송하지만 여기 성함을 기입해 주시겠어요?"
 ---
 
 # KJ-X Korean–Japanese Translation
@@ -28,6 +37,12 @@ training datasets and training checkpoints are not distributed.
 The model uses custom code from
 [`gaon12/sion_translate`](https://github.com/gaon12/sion_translate) and is not a Transformers
 `AutoModel` checkpoint.
+
+## Live demo
+
+Try the interactive Korean↔Japanese translator in the
+[KJ-X Translator Space](https://huggingface.co/spaces/gaon12/sion_translate_demo). The Space
+uses the CPU INT8 export and exposes the same interface as a Gradio API.
 
 ## Usage
 
