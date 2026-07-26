@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from typing import Sequence
 
+from kjx.console import configure_stdio
 from kjx.data.audit import audit_dataset
 
 
@@ -27,6 +28,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> None:
+    configure_stdio()
     args = build_parser().parse_args(argv)
     report = audit_dataset(
         args.input,

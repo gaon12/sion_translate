@@ -7,6 +7,7 @@ from collections import defaultdict
 
 from kjx.baselines import HF_BASELINES, translate_with_hf_baseline
 from kjx.comparison import ComparisonCase, load_comparison_cases, write_system_translations
+from kjx.console import configure_stdio
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -57,6 +58,7 @@ def _translate_with_kjx(
 
 
 def main() -> None:
+    configure_stdio()
     args = build_parser().parse_args()
     try:
         cases = load_comparison_cases(args.cases)

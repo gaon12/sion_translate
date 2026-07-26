@@ -4,6 +4,7 @@ import argparse
 from dataclasses import asdict
 import json
 
+from kjx.console import configure_stdio
 from kjx.data.prepare import prepare_dataset
 from kjx.data.quality import QualityPolicy
 
@@ -48,6 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    configure_stdio()
     args = build_parser().parse_args()
     stats = prepare_dataset(
         args.input,

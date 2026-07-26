@@ -26,6 +26,7 @@ import json
 from pathlib import Path
 
 from kjx.config import config_from_raw, load_raw_config
+from kjx.console import configure_stdio
 from kjx.data.quality import assess_pair, canonical_text
 from kjx.inference import Translator, find_exported_model
 
@@ -79,6 +80,7 @@ def log(message: str) -> None:
 
 
 def main() -> None:
+    configure_stdio()
     args = build_parser().parse_args()
 
     # ── 설정과 언어쌍 ───────────────────────────────────────────────────

@@ -47,6 +47,7 @@ if str(SRC) not in sys.path:
 import torch  # noqa: E402
 
 from kjx.config import config_from_raw, load_raw_config  # noqa: E402
+from kjx.console import configure_stdio  # noqa: E402
 from kjx.glossary import Glossary, load_glossary  # noqa: E402
 from kjx.inference import Translator, find_exported_model  # noqa: E402
 
@@ -777,6 +778,7 @@ def print_timing_report(
 
 def main() -> None:
     """CLI의 전체 추론 절차를 실행한다."""
+    configure_stdio()
     total_started = time.perf_counter()
 
     args = build_parser().parse_args()

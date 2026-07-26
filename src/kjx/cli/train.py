@@ -40,6 +40,7 @@ from kjx.auto import (
     write_fingerprint,
 )
 from kjx.config import AppConfig, config_from_raw, load_raw_config
+from kjx.console import configure_stdio
 from kjx.data import DistributedBucketBatchSampler, IndexedParallelDataset, KJBatchCollator
 from kjx.model import KJXForConditionalGeneration
 from kjx.tokenizer import KJTokenizer
@@ -228,6 +229,7 @@ def find_auto_resume(config: AppConfig) -> str | None:
 
 
 def main() -> None:
+    configure_stdio()
     args = build_parser().parse_args()
     context = initialize_distributed()
     try:

@@ -27,6 +27,7 @@ from kjx.benchmark import (
     write_jsonl,
 )
 from kjx.config import config_from_raw, load_raw_config
+from kjx.console import configure_stdio
 
 DEFAULT_CONFIG_FILE = "kjx.yaml"
 
@@ -59,6 +60,7 @@ def log(message: str) -> None:
 
 
 def main() -> None:
+    configure_stdio()
     args = build_parser().parse_args()
 
     config_path = args.config or (

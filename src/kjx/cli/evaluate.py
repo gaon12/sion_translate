@@ -24,6 +24,7 @@ import time
 from pathlib import Path
 
 from kjx.config import config_from_raw, load_raw_config
+from kjx.console import configure_stdio
 from kjx.glossary import load_glossary
 from kjx.evaluation import (
     DirectionResult,
@@ -88,6 +89,7 @@ def log(message: str) -> None:
 
 
 def main() -> None:
+    configure_stdio()
     args = build_parser().parse_args()
 
     config_path = args.config or (

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 
+from kjx.console import configure_stdio
 from kjx.tokenizer import train_tokenizer
 
 
@@ -38,6 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    configure_stdio()
     args = build_parser().parse_args()
     model_path = train_tokenizer(
         args.input,

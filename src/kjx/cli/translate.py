@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 
 from kjx.config import config_from_raw, load_raw_config
+from kjx.console import configure_stdio
 from kjx.glossary import load_glossary
 from kjx.inference import Translator, find_exported_model
 
@@ -45,6 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    configure_stdio()
     args = build_parser().parse_args()
 
     # 설정에서 토크나이저 위치와 출력 디렉터리를 알아냅니다.

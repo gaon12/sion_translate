@@ -11,6 +11,7 @@ from kjx.comparison import (
     save_comparison,
     score_systems,
 )
+from kjx.console import configure_stdio
 from kjx.evaluation import results_as_markdown
 
 
@@ -29,6 +30,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    configure_stdio()
     args = build_parser().parse_args()
     try:
         cases = load_comparison_cases(args.cases)
