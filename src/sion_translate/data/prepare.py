@@ -365,6 +365,12 @@ class _SqliteDigestSet:
             self.connection = None  # type: ignore[assignment]
 
 
+# 합성 데이터가 든 입력 파일의 접두어. 이런 파일은 train split 에만 넣습니다 —
+# 역번역이나 이어붙이기로 만든 예제가 holdout 에 들어가면 점수가 실제 번역 품질이
+# 아니라 합성 규칙을 재게 됩니다.
+DEFAULT_TRAIN_ONLY_PREFIXES: tuple[str, ...] = ("bt_", "concat_")
+
+
 def prepare_dataset(
     input_patterns: Sequence[str],
     tokenizer_model: str | Path,
@@ -379,7 +385,7 @@ def prepare_dataset(
     prevent_target_leakage: bool = True,
     dedup_backend: str = "sqlite",
     language_pair: Sequence[str] = ("ko", "ja"),
-    train_only_prefixes: Sequence[str] = ("bt_",),
+    train_only_prefixes: Sequence[str] = DEFAULT_TRAIN_ONLY_PREFIXES,
     num_workers: int | None = None,
 ) -> PrepareStats:
     paths = expand_inputs(input_patterns)

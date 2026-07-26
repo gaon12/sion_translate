@@ -5,7 +5,7 @@ from dataclasses import asdict
 import json
 
 from sion_translate.console import configure_stdio
-from sion_translate.data.prepare import prepare_dataset
+from sion_translate.data.prepare import DEFAULT_TRAIN_ONLY_PREFIXES, prepare_dataset
 from sion_translate.data.quality import QualityPolicy
 
 
@@ -45,6 +45,17 @@ def build_parser() -> argparse.ArgumentParser:
         metavar=("LANG_A", "LANG_B"),
         help="JSONL 키 이름 (기본: ko ja)",
     )
+    parser.add_argument(
+        "--train-only-prefix",
+        nargs="+",
+        default=list(DEFAULT_TRAIN_ONLY_PREFIXES),
+        metavar="PREFIX",
+        help=(
+            "이 접두어로 시작하는 입력 파일은 train split 에만 넣습니다 "
+            f"(기본: {' '.join(DEFAULT_TRAIN_ONLY_PREFIXES)}). 합성 데이터로 "
+            "holdout 점수가 올라가는 것을 막습니다"
+        ),
+    )
     return parser
 
 
@@ -68,6 +79,7 @@ def main() -> None:
         prevent_target_leakage=not args.allow_target_leakage,
         dedup_backend=args.dedup_backend,
         language_pair=args.language_pair,
+        train_only_prefixes=args.train_only_prefix,
         num_workers=args.workers,
     )
     print(json.dumps(asdict(stats), ensure_ascii=False, indent=2))

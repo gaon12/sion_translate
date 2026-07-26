@@ -187,6 +187,28 @@ sion-train --config configs/sion_data_fit.yaml
 토크나이저를 다시 만들면 vocab이 달라지므로 `artifacts/dataset`과 기존 체크포인트는
 재사용할 수 없습니다. 위 세 단계를 순서대로 다시 실행해야 합니다.
 
+### 다문장 입력 학습 (문장 이어붙이기)
+
+원문 코퍼스가 전부 한 문장짜리면 모델은 여러 문장을 한 번에 받았을 때 뒤쪽을
+빠뜨리거나 중간에서 멈춥니다. 서로 **무관한** 쌍을 이어붙이면 추가 수집 없이
+긴 입력·긴 출력·문장 경계·누락 방지를 지도할 수 있습니다.
+
+```bash
+sion-concat --input "data/*.jsonl" --output data/concat_multi.jsonl \
+  --count 300000 --min-sentences 2 --max-sentences 4 \
+  --tokenizer artifacts/tokenizer/sion.model --max-tokens 510
+```
+
+무관한 문장을 쓰는 것이 핵심입니다. 문맥이 이어지는 문단을 쓰면 모델이 앞 문장으로
+뒤 문장을 추측할 수 있어, "빠뜨리지 않고 다 옮기는" 능력 대신 문맥 예측을 배웁니다.
+
+`--separator seg`를 주면 `<seg>` 제어 토큰으로 경계를 명시적으로 지도합니다. 기본값인
+공백은 사용자가 여러 문장을 그냥 붙여 넣는 실제 사용 형태에 가깝습니다.
+
+산출 파일이 `concat_`으로 시작하면 `sion-prepare-data`의 `--train-only-prefix`
+기본값(`bt_ concat_`)에 걸려 train split에만 들어갑니다. 합성 예제가 holdout에
+들어가면 점수가 번역 품질이 아니라 합성 규칙을 재게 되므로 이 접두어를 유지하십시오.
+
 다중 GPU에서는 다음처럼 실행합니다.
 
 ```bash
