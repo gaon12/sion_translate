@@ -39,6 +39,7 @@ sion-evaluate = "sion_translate.cli.evaluate:main"
 sion-prepare-benchmark = "sion_translate.cli.prepare_benchmark:main"
 sion-compare = "sion_translate.cli.compare:main"
 sion-concat = "sion_translate.cli.concat:main"
+sion-revise-data = "sion_translate.cli.revise_data:main"
 sion-translate-cases = "sion_translate.cli.translate_cases:main"
 
 [tool.setuptools.packages.find]

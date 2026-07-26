@@ -33,11 +33,24 @@ SHARED_CONTROL_SYMBOLS = [
 ]
 SLOT_SYMBOLS = [f"<slot_{index}>" for index in range(64)]
 
+# 나중에 추가된 제어 토큰. 새로 학습하는 토크나이저에는 예약하지만, 이 토큰이 없는
+# 기존 토크나이저도 계속 불러올 수 있어야 하므로 **필수 목록에 넣지 않습니다**.
+# 없으면 관련 기능(초안 수정)만 사용할 수 없고 번역은 그대로 동작합니다.
+#
+# <draft> = "이 뒤는 같은 문장의 초벌 번역이다. 원문과 대조해 고쳐라."
+OPTIONAL_CONTROL_SYMBOLS = [
+    "<draft>",
+]
+
 
 def control_symbols(language_pair: Sequence[str] = DEFAULT_LANGUAGE_PAIR) -> list[str]:
     """언어쌍에 맞는 전체 제어 토큰 목록 (토크나이저 학습 시 vocab 에 예약)."""
     a, b = language_pair
-    return [f"<2{a}>", f"<2{b}>", f"<denoise_{a}>", f"<denoise_{b}>"] + SHARED_CONTROL_SYMBOLS
+    return (
+        [f"<2{a}>", f"<2{b}>", f"<denoise_{a}>", f"<denoise_{b}>"]
+        + SHARED_CONTROL_SYMBOLS
+        + OPTIONAL_CONTROL_SYMBOLS
+    )
 
 
 # 하위 호환용 별칭 (기존 ko-ja 토크나이저 검증 경로에서 사용)
@@ -248,6 +261,14 @@ class SionTokenizer:
 
         self.mask_id = symbol_ids["<mask>"]
         self.slot_ids = [symbol_ids[symbol] for symbol in SLOT_SYMBOLS]
+
+        # 선택적 제어 토큰: 없으면 None. 기존 토크나이저를 거부하지 않습니다.
+        self.optional_ids: dict[str, int] = {}
+        for symbol in OPTIONAL_CONTROL_SYMBOLS:
+            token_id = int(self.processor.piece_to_id(symbol))
+            if token_id >= 0 and self.processor.id_to_piece(token_id) == symbol:
+                self.optional_ids[symbol] = token_id
+        self.draft_id: int | None = self.optional_ids.get("<draft>")
         # 하위 호환 별칭 (ko-ja 토크나이저일 때만 존재)
         if {"ko", "ja"} == set(self.language_tags):
             self.ko_to_ja_id = self.language_tags["ja"]

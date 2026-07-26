@@ -13,6 +13,8 @@ from typing import Sequence
 import torch
 
 from sion_translate.glossary import Glossary, apply_source_placeholders, restore_targets
+from sion_translate.rerank import select as rerank_select
+from sion_translate.revision import DRAFT_SEPARATOR, serialize_revision_input
 from sion_translate.tokenizer import SLOT_SYMBOLS, SionTokenizer
 from sion_translate.training.export import load_exported_model
 
@@ -102,6 +104,11 @@ class Translator:
         batch_size: int = 16,
         glossary: Glossary | None = None,
         append_missing_glossary: bool = True,
+        num_candidates: int = 0,
+        rerank: str = "mbr+qe",
+        temperature: float = 0.7,
+        top_k: int = 0,
+        return_rerank_details: bool = False,
     ) -> list[str]:
         """문장 목록을 ``target_language`` 로 번역합니다.
 
@@ -113,7 +120,19 @@ class Translator:
         (원문에서 slot 토큰으로 치환 → 번역 → 대응어로 복원.)
         모델이 slot 을 보존하지 못해 누락된 용어는 ``append_missing_glossary``
         가 참이면 문장 끝에 괄호로 덧붙여 최소한의 강제를 보장합니다.
+
+        ``num_candidates`` 를 1 이상으로 두면 beam 결과에 더해 그 수만큼 확률적
+        후보를 뽑고 ``rerank`` 방식으로 하나를 고릅니다 (``sion_translate.rerank``
+        참고). 재학습 없이 추론 계산량만 늘리는 경로이며, 후보 목록의 첫 번째는
+        항상 beam 결과이므로 동점이면 기존 동작이 유지됩니다.
+
+        ``return_rerank_details`` 가 참이면 문자열 대신 ``RerankResult`` 목록을
+        돌려줍니다 — 어느 후보가 왜 뽑혔는지 확인할 때 씁니다.
         """
+        if num_candidates < 0:
+            raise ValueError("num_candidates 는 0 이상이어야 합니다")
+        if return_rerank_details and num_candidates < 1:
+            raise ValueError("return_rerank_details 는 num_candidates 가 1 이상일 때만 씁니다")
         tag_id = self.tokenizer.language_tags.get(target_language)
         if tag_id is None:
             raise ValueError(
@@ -130,8 +149,22 @@ class Translator:
             *self.tokenizer.language_tags.values(),
             *self.tokenizer.denoise_tags.values(),
         }
+        def restore(row: Sequence[int], slot_map: dict[str, str] | None) -> str:
+            """생성 토큰을 문자열로 되돌리고 글로서리 slot 을 복원합니다."""
+            tokens = [token for token in row if token not in special_ids]
+            text = self.tokenizer.decode(tokens)
+            if slot_map:
+                text, missing = restore_targets(text, slot_map)
+                if missing and append_missing_glossary:
+                    # 모델이 slot 을 흘린 경우: 최소한의 용어 보존을 위해
+                    # 강제 용어를 괄호로 덧붙입니다.
+                    text = f"{text} ({', '.join(missing)})"
+            return text
+
         for start in range(0, len(texts), batch_size):
             chunk = list(texts[start : start + batch_size])
+            # QE 는 원문과 대조하므로 slot 치환 전의 문장을 따로 보관합니다.
+            sources = list(chunk)
             # 글로서리 적용: 원문의 용어를 slot 으로 치환하고 문장별 매핑을 보관.
             slot_maps: list[dict[str, str]] = []
             if glossary is not None and source_language:
@@ -160,24 +193,91 @@ class Translator:
             for row, ids in enumerate(encoded):
                 input_ids[row, : len(ids)] = torch.tensor(ids, dtype=torch.long)
                 attention_mask[row, : len(ids)] = True
+            device_inputs = input_ids.to(self.device)
+            device_mask = attention_mask.to(self.device)
             generated = self.model.generate(
-                input_ids.to(self.device),
-                attention_mask.to(self.device),
+                device_inputs,
+                device_mask,
                 bos_id=self.tokenizer.bos_id,
                 eos_id=eos,
                 max_new_tokens=max_new_tokens,
                 num_beams=num_beams,
                 length_penalty=length_penalty,
             )
-            for row_index, row in enumerate(generated.tolist()):
-                # BOS/EOS/패딩 등 특수 토큰을 걷어내고 문자열로 복원
-                tokens = [token for token in row if token not in special_ids]
-                text = self.tokenizer.decode(tokens)
-                if slot_maps and slot_maps[row_index]:
-                    text, missing = restore_targets(text, slot_maps[row_index])
-                    if missing and append_missing_glossary:
-                        # 모델이 slot 을 흘린 경우: 최소한의 용어 보존을 위해
-                        # 강제 용어를 괄호로 덧붙입니다.
-                        text = f"{text} ({', '.join(missing)})"
-                results.append(text)
+            beam_texts = [
+                restore(row, slot_maps[index] if slot_maps else None)
+                for index, row in enumerate(generated.tolist())
+            ]
+
+            if num_candidates < 1:
+                results.extend(beam_texts)
+                continue
+
+            # beam 결과를 첫 후보로 두고 확률적 후보를 덧붙입니다. 동점이면
+            # 첫 후보가 유지되므로 재순위가 기존 동작보다 나빠질 일이 없습니다.
+            sampled = self.model.sample(
+                device_inputs,
+                device_mask,
+                bos_id=self.tokenizer.bos_id,
+                eos_id=eos,
+                num_samples=num_candidates,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_k=top_k,
+            )
+            for row_index, source_text in enumerate(sources):
+                slot_map = slot_maps[row_index] if slot_maps else None
+                candidates = [beam_texts[row_index]]
+                for sample_row in sampled[row_index].tolist():
+                    candidate = restore(sample_row, slot_map)
+                    # 같은 문장을 여러 번 채점할 이유가 없습니다.
+                    if candidate not in candidates:
+                        candidates.append(candidate)
+                outcome = rerank_select(
+                    source_text,
+                    candidates,
+                    strategy=rerank,
+                    target_language=target_language,
+                )
+                results.append(outcome if return_rerank_details else outcome.text)
         return results
+
+    @torch.no_grad()
+    def revise(
+        self,
+        texts: Sequence[str],
+        drafts: Sequence[str],
+        *,
+        target_language: str,
+        num_beams: int = 4,
+        length_penalty: float = 1.0,
+        max_new_tokens: int = 256,
+        batch_size: int = 16,
+    ) -> list[str]:
+        """``원문 + 초안`` 을 받아 고친 번역을 돌려줍니다.
+
+        ``sion-revise-data`` 로 만든 ``원문 <draft> 초안 → 번역`` 예제로 학습한
+        모델에서만 의미가 있습니다. 그렇게 학습하지 않은 모델에 쓰면 ``<draft>``
+        뒤를 그냥 원문의 일부로 읽으므로 결과가 나빠집니다.
+
+        토크나이저에 ``<draft>`` 가 없으면 (2026-07 이전 토크나이저) 오류를 냅니다 —
+        구분자가 여러 토큰으로 쪼개져 학습 때와 다른 입력이 되기 때문입니다.
+        """
+        if self.tokenizer.draft_id is None:
+            raise ValueError(
+                f"이 토크나이저에는 {DRAFT_SEPARATOR} 제어 토큰이 없어 초안 수정을 "
+                "쓸 수 없습니다. sion-train-tokenizer 로 다시 학습하십시오."
+            )
+        if len(texts) != len(drafts):
+            raise ValueError(f"원문 {len(texts)}개와 초안 {len(drafts)}개의 수가 다릅니다")
+        return self.translate(
+            [
+                serialize_revision_input(source, draft)
+                for source, draft in zip(texts, drafts, strict=True)
+            ],
+            target_language=target_language,
+            num_beams=num_beams,
+            length_penalty=length_penalty,
+            max_new_tokens=max_new_tokens,
+            batch_size=batch_size,
+        )
