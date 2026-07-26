@@ -4,7 +4,7 @@ import sys
 
 import pytest
 
-from kjx.console import configure_stdio
+from sion_translate.console import configure_stdio
 
 
 class FakeStream:

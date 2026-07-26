@@ -1,4 +1,4 @@
-"""Gradio Space for interactive KJ-X Korean↔Japanese translation."""
+"""Gradio Space for interactive sion_translate Korean↔Japanese translation."""
 
 from __future__ import annotations
 
@@ -22,10 +22,10 @@ BEAMS = {
 @lru_cache(maxsize=1)
 def load_translator():
     """Download the public INT8 export once and keep it loaded on CPU."""
-    from kjx.inference import Translator
+    from sion_translate.inference import Translator
 
     model_path = hf_hub_download(MODEL_REPO, "model_int8.pt")
-    tokenizer_path = hf_hub_download(MODEL_REPO, "kjx.model")
+    tokenizer_path = hf_hub_download(MODEL_REPO, "sion.model")
     return Translator(model_path, tokenizer_path, device="cpu")
 
 
@@ -48,12 +48,12 @@ def translate(text: str, direction: str, quality: str) -> str:
     return result[0]
 
 
-with gr.Blocks(title="KJ-X Translator") as demo:
+with gr.Blocks(title="sion_translate Translator") as demo:
     gr.Markdown(
         """
-        # KJ-X 한국어 ↔ 日本語
+        # sion_translate 한국어 ↔ 日本語
 
-        KJ-X INT8 모델을 CPU에서 실행합니다. 첫 번역은 모델 로딩 때문에 오래 걸릴 수
+        sion_translate INT8 모델을 CPU에서 실행합니다. 첫 번역은 모델 로딩 때문에 오래 걸릴 수
         있습니다. 중요한 번역은 반드시 사람이 검토하세요.
         """
     )

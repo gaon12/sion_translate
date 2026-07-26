@@ -25,7 +25,7 @@ def test_generated_config_points_only_data_artifacts_to_runtime(
 ) -> None:
     root = tmp_path / "project"
     root.mkdir()
-    (root / "kjx.yaml").write_text("training:\n  output_dir: runs/auto\n", encoding="utf-8")
+    (root / "sion_translate.yaml").write_text("training:\n  output_dir: runs/auto\n", encoding="utf-8")
     monkeypatch.setattr(easy_run, "ROOT", root)
 
     config_path = easy_run._generated_config(tmp_path / "ram-data", tmp_path / "ram-artifacts")
@@ -44,7 +44,7 @@ def test_generated_config_preserves_explicit_source_sampling_alpha(
 ) -> None:
     root = tmp_path / "project"
     root.mkdir()
-    (root / "kjx.yaml").write_text(
+    (root / "sion_translate.yaml").write_text(
         "data:\n  source_sampling_alpha: 0.75\n", encoding="utf-8"
     )
     monkeypatch.setattr(easy_run, "ROOT", root)

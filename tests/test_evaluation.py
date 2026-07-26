@@ -1,4 +1,4 @@
-"""평가(kjx-evaluate) 로직 검증."""
+"""평가(sion-evaluate) 로직 검증."""
 
 from __future__ import annotations
 
@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from kjx.data.prepare import prepare_dataset
-from kjx.evaluation import (
+from sion_translate.data.prepare import prepare_dataset
+from sion_translate.evaluation import (
     DirectionResult,
     load_benchmark_pairs,
     load_split_pairs,
@@ -18,7 +18,7 @@ from kjx.evaluation import (
     save_results,
     score_translations,
 )
-from kjx.tokenizer import KJTokenizer, train_tokenizer
+from sion_translate.tokenizer import SionTokenizer, train_tokenizer
 
 from tests.test_language_pair import write_en_de_jsonl
 
@@ -65,7 +65,7 @@ def test_load_split_pairs_round_trips_text(tmp_path: Path) -> None:
         seed_sentencepiece_size=1000,
         language_pair=("en", "de"),
     )
-    tokenizer = KJTokenizer(model_path)
+    tokenizer = SionTokenizer(model_path)
     dataset_dir = tmp_path / "dataset"
     stats = prepare_dataset(
         [str(source)],
@@ -147,11 +147,11 @@ def test_number_preservation_rejects_length_mismatch() -> None:
 
 def test_results_saved_as_json_and_markdown(tmp_path: Path) -> None:
     results = [
-        DirectionResult("kjx", "ko-ja", 100, 55.5, 22.2, "char", 91.0, 88),
+        DirectionResult("sion", "ko-ja", 100, 55.5, 22.2, "char", 91.0, 88),
         DirectionResult("deepl", "ko-ja", 100, 66.6, 33.3, "char", 99.5, 99),
     ]
     table = results_as_markdown(results)
-    assert "| kjx | ko-ja | 100 | 55.50 | 22.20 | 91.00 | 88/100 |" in table
+    assert "| sion | ko-ja | 100 | 55.50 | 22.20 | 91.00 | 88/100 |" in table
     save_results(results, tmp_path / "eval", metadata={"model": "test"})
     payload = json.loads((tmp_path / "eval.json").read_text(encoding="utf-8"))
     assert payload["metadata"]["model"] == "test"

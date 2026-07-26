@@ -6,11 +6,11 @@ import json
 import random
 from pathlib import Path
 
-from kjx.cli.augment import synthetic_budget
-from kjx.data import IndexedParallelDataset, KJBatchCollator
-from kjx.data.prepare import prepare_dataset
-from kjx.data.quality import assess_pair
-from kjx.tokenizer import KJTokenizer, train_tokenizer
+from sion_translate.cli.augment import synthetic_budget
+from sion_translate.data import IndexedParallelDataset, SionBatchCollator
+from sion_translate.data.prepare import prepare_dataset
+from sion_translate.data.quality import assess_pair
+from sion_translate.tokenizer import SionTokenizer, train_tokenizer
 
 
 def test_generic_language_pair_passes_quality() -> None:
@@ -55,7 +55,7 @@ def test_en_de_pipeline_end_to_end(tmp_path: Path) -> None:
         seed_sentencepiece_size=1000,
         language_pair=("en", "de"),
     )
-    tokenizer = KJTokenizer(model_path)
+    tokenizer = SionTokenizer(model_path)
     # 언어쌍이 vocab 의 <2xx> 태그에서 자동 인식되어야 한다.
     assert set(tokenizer.languages) == {"en", "de"}
     assert set(tokenizer.language_tags) == {"en", "de"}
@@ -79,7 +79,7 @@ def test_en_de_pipeline_end_to_end(tmp_path: Path) -> None:
     assert forward["src_language"] == "en" and forward["target_language"] == "de"
     assert reverse["src_language"] == "de" and reverse["target_language"] == "en"
 
-    collator = KJBatchCollator(tokenizer, max_source_length=64, max_target_length=64)
+    collator = SionBatchCollator(tokenizer, max_source_length=64, max_target_length=64)
     batch = collator([forward, reverse])
     # 방향 태그: en→de 예시는 <2de>, de→en 예시는 <2en> 으로 시작해야 한다.
     assert batch["input_ids"][0, 0].item() == tokenizer.language_tags["de"]
@@ -149,7 +149,7 @@ def test_source_token_dropout_keeps_slots_and_length(tmp_path: Path) -> None:
         seed_sentencepiece_size=1000,
         language_pair=("en", "de"),
     )
-    tokenizer = KJTokenizer(model_path)
+    tokenizer = SionTokenizer(model_path)
     # 보호 슬롯(<slot_n>) ID 영역(16~79)을 피해서 일반 토큰을 고른다.
     assert max(tokenizer.slot_ids) < 100
     item = {
@@ -161,11 +161,11 @@ def test_source_token_dropout_keeps_slots_and_length(tmp_path: Path) -> None:
         "target_register": 0,
     }
     random.seed(3)
-    clean = KJBatchCollator(
+    clean = SionBatchCollator(
         tokenizer, max_source_length=64, max_target_length=64, source_token_dropout=0.0
     )([dict(item)])
     random.seed(3)
-    dropped = KJBatchCollator(
+    dropped = SionBatchCollator(
         tokenizer, max_source_length=64, max_target_length=64, source_token_dropout=0.4
     )([dict(item)])
     clean_len = int(clean["attention_mask"][0].sum())

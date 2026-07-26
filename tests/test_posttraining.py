@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import torch
 
-from kjx.config import PostTrainingConfig
-from kjx.training.objectives import CompositeTranslationReward, MinimumRiskObjective
+from sion_translate.config import PostTrainingConfig
+from sion_translate.training.objectives import CompositeTranslationReward, MinimumRiskObjective
 
 
 class TextTokenizer:

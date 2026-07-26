@@ -1,6 +1,6 @@
-# KJ-X
+# sion_translate
 
-KJ-X는 한국어↔일본어 번역 모델을 처음부터 학습하고 평가하는 PyTorch 프로젝트입니다.
+sion_translate는 한국어↔일본어 번역 모델을 처음부터 학습하고 평가하는 PyTorch 프로젝트입니다.
 joint SentencePiece, GQA, RoPE, pre-RMSNorm, QK-norm, SwiGLU, EMA, 양방향 번역,
 용어집 강제, SFT 뒤 최소위험 사후학습을 포함합니다.
 
@@ -47,9 +47,9 @@ python easy_run.py
 학습이 끝나면 EMA export를 우선 사용합니다.
 
 ```bash
-kjx-translate --to ja "회의는 세 시에 시작합니다."
-kjx-translate --to ko "会議は三時に始まります。"
-kjx-translate --to ja --int8 "CPU에서 번역합니다."
+sion-translate --to ja "회의는 세 시에 시작합니다."
+sion-translate --to ko "会議は三時に始まります。"
+sion-translate --to ja --int8 "CPU에서 번역합니다."
 ```
 
 `--int8`은 모델 파일과 메모리 사용량을 줄이는 옵션입니다. 같은 CPU에서 측정하면
@@ -62,12 +62,12 @@ kjx-translate --to ja --int8 "CPU에서 번역합니다."
 모델이 값을 누락하는 대신 **그럴듯한 다른 값으로 바꿔 쓸** 수 있습니다. 실제로
 관측된 예: `250mg` → `1200mg`, `0.5mL` → `120ml`, `38,720円` → `38,000엔`.
 해당 토크나이저를 불러오면 `Translator`가 경고를 한 번 출력합니다. 재학습할 때는
-`kjx-train-tokenizer`의 기본값(숫자 분리 켜짐)을 그대로 쓰십시오.
+`sion-train-tokenizer`의 기본값(숫자 분리 켜짐)을 그대로 쓰십시오.
 
 직접 모델 파일을 지정할 수도 있습니다.
 
 ```bash
-kjx-translate --model runs/auto/posttrain/exports/best/model_ema.pt --to ja "안녕하세요."
+sion-translate --model runs/auto/posttrain/exports/best/model_ema.pt --to ja "안녕하세요."
 ```
 
 ## 여러 번역 시스템 비교
@@ -85,7 +85,7 @@ kjx-translate --model runs/auto/posttrain/exports/best/model_ema.pt --to ja "안
 둘 다 한국어→일본어와 일본어→한국어를 같은 수로 담고 있고 스키마가 같으므로
 `--cases`만 바꿔 끼우면 됩니다.
 
-비교 대상은 KJ-X, LibreTranslate, Papago, Google Cloud Translation, DeepL,
+비교 대상은 sion_translate, LibreTranslate, Papago, Google Cloud Translation, DeepL,
 M2M100 418M, NLLB-200 distilled 600M입니다. 실제 서비스 출력이나 점수는 저장소에
 미리 넣지 않습니다. 모델 버전, API 시점과 옵션이 달라지면 결과도 달라지므로 같은
 문장으로 직접 생성한 결과만 비교합니다.
@@ -101,24 +101,24 @@ M2M100 418M, NLLB-200 distilled 600M입니다. 실제 서비스 출력이나 점
 
 ### 2. 모델 출력 JSONL 생성
 
-KJ-X와 공개 baseline은 명령으로 바로 생성할 수 있습니다. 공개 baseline 가중치는
+sion_translate와 공개 baseline은 명령으로 바로 생성할 수 있습니다. 공개 baseline 가중치는
 Hugging Face 캐시에만 내려받고 프로젝트에는 복사하지 않습니다.
 
 ```bash
 mkdir -p comparison_outputs
 
-kjx-translate-cases \
-  --backend kjx \
+sion-translate-cases \
+  --backend sion \
   --cases examples/comparison_cases.jsonl \
   --model runs/auto/posttrain/exports/best/model_ema.pt \
-  --tokenizer artifacts/tokenizer/kjx.model \
-  --output comparison_outputs/kjx.jsonl
+  --tokenizer artifacts/tokenizer/sion.model \
+  --output comparison_outputs/sion.jsonl
 
 python -m pip install -e ".[baselines]"
-kjx-translate-cases --backend m2m100-418m \
+sion-translate-cases --backend m2m100-418m \
   --cases examples/comparison_cases.jsonl \
   --output comparison_outputs/m2m100-418m.jsonl
-kjx-translate-cases --backend nllb-200-distilled-600m \
+sion-translate-cases --backend nllb-200-distilled-600m \
   --cases examples/comparison_cases.jsonl \
   --output comparison_outputs/nllb-200.jsonl
 ```
@@ -135,9 +135,9 @@ LibreTranslate, Papago, Google, DeepL의 결과는
 ### 3. 같은 지표로 채점
 
 ```bash
-kjx-compare \
+sion-compare \
   --cases examples/comparison_cases.jsonl \
-  --system kjx=comparison_outputs/kjx.jsonl \
+  --system sion=comparison_outputs/sion.jsonl \
   --system libretranslate=comparison_outputs/libretranslate.jsonl \
   --system papago=comparison_outputs/papago.jsonl \
   --system google=comparison_outputs/google.jsonl \
@@ -158,14 +158,14 @@ kjx-compare \
 
 ### 자체 holdout 점수를 인용할 때
 
-`kjx-evaluate`가 `--dataset-dir`의 test split으로 내는 점수는 학습 데이터와 같은
+`sion-evaluate`가 `--dataset-dir`의 test split으로 내는 점수는 학습 데이터와 같은
 출처에서 잘라낸 in-domain holdout입니다. 누수는 막혀 있지만 도메인은 겹치므로,
 학습에 쓰지 않은 도메인의 문장에서는 점수가 크게 낮아집니다. 이 저장소의 데이터
 구성으로 측정했을 때 in-domain chrF와 도메인 밖 chrF의 차이는 20점을 넘었습니다.
 대외적으로 숫자를 제시할 때는 어느 쪽인지 함께 밝히고, 도메인별 고정 benchmark를
-따로 두십시오 (`kjx-prepare-benchmark`).
+따로 두십시오 (`sion-prepare-benchmark`).
 
-FLORES-200을 학습에 포함했다면 `kjx-prepare-benchmark`로 만든 FLORES 점수는 자기
+FLORES-200을 학습에 포함했다면 `sion-prepare-benchmark`로 만든 FLORES 점수는 자기
 채점이므로 인용할 수 없습니다. 학습에 넣을지, 평가에 쓸지 중 하나만 선택하십시오.
 
 서비스별 비교 관점과 라이선스 주의사항은
@@ -173,15 +173,15 @@ FLORES-200을 학습에 포함했다면 `kjx-prepare-benchmark`로 만든 FLORES
 
 ## 설정과 수동 실행
 
-기본 설정은 [`kjx.yaml`](kjx.yaml) 하나로 관리합니다. `data.language_pair`의 두 값이
+기본 설정은 [`sion_translate.yaml`](sion_translate.yaml) 하나로 관리합니다. `data.language_pair`의 두 값이
 JSONL 키, 방향 태그와 품질 검사에 사용됩니다.
 
 ```bash
-kjx-train-tokenizer --input "data/*.jsonl" --output-dir artifacts/tokenizer
-kjx-prepare-data --input "data/*.jsonl" \
-  --tokenizer artifacts/tokenizer/kjx.model \
+sion-train-tokenizer --input "data/*.jsonl" --output-dir artifacts/tokenizer
+sion-prepare-data --input "data/*.jsonl" \
+  --tokenizer artifacts/tokenizer/sion.model \
   --output-dir artifacts/dataset
-kjx-train --config configs/kjx_data_fit.yaml
+sion-train --config configs/sion_data_fit.yaml
 ```
 
 토크나이저를 다시 만들면 vocab이 달라지므로 `artifacts/dataset`과 기존 체크포인트는
@@ -190,7 +190,7 @@ kjx-train --config configs/kjx_data_fit.yaml
 다중 GPU에서는 다음처럼 실행합니다.
 
 ```bash
-torchrun --standalone --nproc-per-node=8 -m kjx.cli.train
+torchrun --standalone --nproc-per-node=8 -m sion_translate.cli.train
 ```
 
 ## 저장소에 포함하지 않는 파일

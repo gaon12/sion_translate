@@ -9,7 +9,7 @@
 
 | 시스템 | 확인할 강점 | 주의할 점 |
 |---|---|---|
-| KJ-X | 한↔일 전용, 완전 로컬 실행, 코드·생성 옵션 통제, slot 기반 용어 강제 | 작은 전용 모델의 일반화 한계, custom PyTorch loader 필요, 공개 점수만으로 프로덕션 품질을 보장할 수 없음 |
+| sion_translate | 한↔일 전용, 완전 로컬 실행, 코드·생성 옵션 통제, slot 기반 용어 강제 | 작은 전용 모델의 일반화 한계, custom PyTorch loader 필요, 공개 점수만으로 프로덕션 품질을 보장할 수 없음 |
 | [LibreTranslate](https://docs.libretranslate.com/) | 오픈 소스 API, self-host 가능, 외부 전송 없이 운영 가능 | 설치된 언어 모델에 따라 지원 범위가 달라지고 직접 언어쌍이 없으면 보통 영어를 경유하므로 `/languages` 결과를 기록해야 함 |
 | [Papago](https://api.ncloud-docs.com/docs/en/ai-naver-papagowebsitetranslation-translation) | 공식 API가 한국어↔일본어 방향을 명시적으로 지원 | 폐쇄형 클라우드 서비스이므로 모델 버전 고정이 어렵고 인증·요금·이용약관 확인 필요 |
 | [Google Cloud Translation](https://cloud.google.com/translate/docs) | 폭넓은 언어 지원, glossary와 adaptive translation 같은 옵션 | 클라우드 인증·비용이 필요하고 Basic/Advanced 및 적응형 설정을 섞으면 공정 비교가 아님 |
@@ -34,11 +34,11 @@
 두 파일 모두 스키마가 같으므로 `--cases` 를 바꿔 끼우면 됩니다.
 
 ```bash
-kjx-translate-cases --backend kjx \
+sion-translate-cases --backend sion \
   --cases examples/diagnostic_cases.jsonl \
   --model runs/auto/posttrain/exports/best/model_ema.pt \
-  --tokenizer artifacts/tokenizer/kjx.model \
-  --output comparison_outputs/kjx-diagnostic.jsonl
+  --tokenizer artifacts/tokenizer/sion.model \
+  --output comparison_outputs/sion-diagnostic.jsonl
 ```
 
 40문장도 순위를 정하기에는 작습니다. 카테고리별로 2~4문장이므로 시스템 간 총점 차이

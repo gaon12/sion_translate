@@ -4,11 +4,11 @@ from pathlib import Path
 
 import torch
 
-from kjx.config import ExperimentalConfig, ModelConfig
-from kjx.model import KJXForConditionalGeneration
-from kjx.training.checkpoint import load_checkpoint, save_checkpoint
-from kjx.training.distributed import DistributedContext
-from kjx.training.trainer import cosine_scheduler
+from sion_translate.config import ExperimentalConfig, ModelConfig
+from sion_translate.model import SionForConditionalGeneration
+from sion_translate.training.checkpoint import load_checkpoint, save_checkpoint
+from sion_translate.training.distributed import DistributedContext
+from sion_translate.training.trainer import cosine_scheduler
 
 
 class FakeScaler:
@@ -40,7 +40,7 @@ def test_local_checkpoint_round_trip(tmp_path: Path) -> None:
             morphoscript_enabled=False,
         ),
     )
-    model = KJXForConditionalGeneration(config)
+    model = SionForConditionalGeneration(config)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     scheduler = cosine_scheduler(optimizer, warmup_steps=1, max_steps=10, min_ratio=0.1)
     context = DistributedContext(0, 0, 1, torch.device("cpu"), False)

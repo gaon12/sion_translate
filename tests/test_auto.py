@@ -1,4 +1,4 @@
-"""자동 설정(kjx.auto)과 EMA 의 동작 검증."""
+"""자동 설정(sion_translate.auto)과 EMA 의 동작 검증."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from pathlib import Path
 
 import torch
 
-from kjx.auto import (
+from sion_translate.auto import (
     EnvironmentInfo,
     apply_auto_settings,
     pick_model_preset,
@@ -15,8 +15,8 @@ from kjx.auto import (
     stored_fingerprint,
     write_fingerprint,
 )
-from kjx.config import AppConfig
-from kjx.training.ema import EMAWeights
+from sion_translate.config import AppConfig
+from sion_translate.training.ema import EMAWeights
 
 
 def cpu_environment() -> EnvironmentInfo:
@@ -137,7 +137,7 @@ def test_auto_downweights_synthetic_sources() -> None:
 
 
 def test_epoch_budget_shrinks_with_data() -> None:
-    from kjx.auto import target_epochs
+    from sion_translate.auto import target_epochs
 
     assert target_epochs(100_000) > target_epochs(10_000_000) > target_epochs(200_000_000)
     assert target_epochs(200_000_000) >= 1.0

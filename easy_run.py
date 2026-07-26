@@ -1,4 +1,4 @@
-"""인자 없이 실행하는 KJ-X 고성능 학습 진입점.
+"""인자 없이 실행하는 sion_translate 고성능 학습 진입점.
 
 Linux에서 충분한 /dev/shm 공간이 있으면 원천 데이터와 전처리 산출물을 RAM
 디스크에 배치합니다. tokenizer/dataset은 학습 전에 일반 디스크 artifacts/에도
@@ -23,7 +23,7 @@ import yaml
 ROOT = Path(__file__).resolve().parent
 PERSISTENT_ARTIFACTS = ROOT / "artifacts"
 MIN_RAM_HEADROOM = 8 * 2**30
-TMUX_SESSION = "kjx"
+TMUX_SESSION = "sion"
 
 
 def _install_tmux() -> None:
@@ -53,7 +53,7 @@ def _install_tmux() -> None:
 def _enter_tmux() -> None:
     """Re-exec easy_run inside a durable tmux session when launched interactively."""
 
-    if os.name == "nt" or os.environ.get("TMUX") or os.environ.get("KJX_TMUX_ACTIVE") == "1":
+    if os.name == "nt" or os.environ.get("TMUX") or os.environ.get("SION_TMUX_ACTIVE") == "1":
         return
     _install_tmux()
     tmux = shutil.which("tmux")
@@ -80,7 +80,7 @@ def _enter_tmux() -> None:
         flush=True,
     )
     environment = os.environ.copy()
-    environment["KJX_TMUX_ACTIVE"] = "1"
+    environment["SION_TMUX_ACTIVE"] = "1"
     os.execve(
         tmux,
         [
@@ -136,26 +136,26 @@ def _ram_workspace(required_bytes: int) -> Path | None:
         )
         return None
     identity = hashlib.sha256(str(ROOT).encode("utf-8")).hexdigest()[:8]
-    workspace = shm / f"kjx-{ROOT.name}-{identity}"
+    workspace = shm / f"sion-{ROOT.name}-{identity}"
     workspace.mkdir(parents=True, exist_ok=True)
     return workspace
 
 
 def _generated_config(raw_dir: Path, artifacts_dir: Path) -> Path:
-    config_path = ROOT / "kjx.yaml"
+    config_path = ROOT / "sion_translate.yaml"
     raw = {}
     if config_path.exists():
         raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     data = raw.setdefault("data", {})
     data["raw_dir"] = str(raw_dir)
-    # Source 규모 차이를 완화하되 사용자가 kjx.yaml에서 지정한 값은 보존합니다.
+    # Source 규모 차이를 완화하되 사용자가 sion_translate.yaml에서 지정한 값은 보존합니다.
     data.setdefault("source_sampling_alpha", 0.9)
-    data["tokenizer_model"] = str(artifacts_dir / "tokenizer" / "kjx.model")
+    data["tokenizer_model"] = str(artifacts_dir / "tokenizer" / "sion.model")
     data["tokenizer_features"] = str(artifacts_dir / "tokenizer" / "token_features.npz")
     data["dataset_dir"] = str(artifacts_dir / "dataset")
 
     handle = tempfile.NamedTemporaryFile(
-        mode="w", encoding="utf-8", suffix=".yaml", prefix="kjx-easy-", delete=False
+        mode="w", encoding="utf-8", suffix=".yaml", prefix="sion-easy-", delete=False
     )
     with handle:
         yaml.safe_dump(raw, handle, allow_unicode=True, sort_keys=False)
@@ -210,7 +210,7 @@ def main() -> None:
             [
                 sys.executable,
                 "-m",
-                "kjx.cli.train",
+                "sion_translate.cli.train",
                 "--config",
                 str(generated_config),
                 "--prepare-only",
@@ -231,7 +231,7 @@ def main() -> None:
             "--standalone",
             f"--nproc-per-node={gpu_count}",
             "-m",
-            "kjx.cli.train",
+            "sion_translate.cli.train",
             "--config",
             str(generated_config),
         ]

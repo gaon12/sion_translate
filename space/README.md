@@ -1,5 +1,5 @@
 ---
-title: KJ-X Translator
+title: sion_translate Translator
 emoji: 🇰🇷
 colorFrom: blue
 colorTo: red
@@ -11,9 +11,9 @@ models:
 - gaon12/sion_translate
 ---
 
-# KJ-X Translator
+# sion_translate Translator
 
-Interactive Korean↔Japanese translation with the KJ-X INT8 CPU export.
+Interactive Korean↔Japanese translation with the sion_translate INT8 CPU export.
 
 The first request can take longer while the model is downloaded and loaded. Machine translation
 can be wrong; review important output before use.

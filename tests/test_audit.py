@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from kjx.cli.audit_data import main as audit_main
-from kjx.data.audit import audit_dataset
+from sion_translate.cli.audit_data import main as audit_main
+from sion_translate.data.audit import audit_dataset
 
 
 def _write_rows(path: Path, rows: list[object | str]) -> None:
@@ -62,7 +62,7 @@ def test_streaming_audit_reports_deterministic_quality_counters(tmp_path: Path) 
     repeated = audit_dataset([str(second), str(first)], **options)
 
     assert report == repeated
-    assert report["schema"] == "kjx-raw-dataset-audit-v1"
+    assert report["schema"] == "sion-raw-dataset-audit-v1"
     assert report["global"]["file_count"] == 2
     assert report["global"]["bytes"] == first.stat().st_size + second.stat().st_size
     assert report["global"]["rows"] == 14

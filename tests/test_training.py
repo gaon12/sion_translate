@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from kjx.config import (
+from sion_translate.config import (
     AppConfig,
     DataConfig,
     ExperimentalConfig,
@@ -13,11 +13,11 @@ from kjx.config import (
     PostTrainingConfig,
     TrainingConfig,
 )
-from kjx.inference import find_exported_model
-from kjx.model import KJXForConditionalGeneration
-from kjx.training.distributed import DistributedContext
-from kjx.training.objectives import MinimumRiskObjective
-from kjx.training.trainer import build_optimizer_param_groups, cosine_scheduler, train
+from sion_translate.inference import find_exported_model
+from sion_translate.model import SionForConditionalGeneration
+from sion_translate.training.distributed import DistributedContext
+from sion_translate.training.objectives import MinimumRiskObjective
+from sion_translate.training.trainer import build_optimizer_param_groups, cosine_scheduler, train
 
 
 def tiny_model_config() -> ModelConfig:
@@ -94,7 +94,7 @@ def tiny_app_config(tmp_path: Path, **training_overrides) -> AppConfig:
 
 def test_single_step_training_loop(tmp_path: Path) -> None:
     config = tiny_app_config(tmp_path)
-    model = KJXForConditionalGeneration(config.model)
+    model = SionForConditionalGeneration(config.model)
     context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
     result = train(model, [tiny_batch()], [tiny_batch()], config, context)
     assert result["step"] == 1
@@ -109,11 +109,11 @@ def test_single_step_training_loop(tmp_path: Path) -> None:
 
 
 def test_exported_models_reload_and_run(tmp_path: Path) -> None:
-    from kjx.config import ExperimentalConfig as ExpConfig
-    from kjx.config import ModelConfig as MConfig
+    from sion_translate.config import ExperimentalConfig as ExpConfig
+    from sion_translate.config import ModelConfig as MConfig
 
     config = tiny_app_config(tmp_path)
-    model = KJXForConditionalGeneration(config.model)
+    model = SionForConditionalGeneration(config.model)
     context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
     train(model, [tiny_batch()], [tiny_batch()], config, context)
 
@@ -128,7 +128,7 @@ def test_exported_models_reload_and_run(tmp_path: Path) -> None:
         **{key: value for key, value in raw_config.items() if key != "experimental"},
         experimental=ExpConfig(**raw_config["experimental"]),
     )
-    rebuilt = KJXForConditionalGeneration(rebuilt_config, pad_id=payload["pad_id"])
+    rebuilt = SionForConditionalGeneration(rebuilt_config, pad_id=payload["pad_id"])
     rebuilt.load_state_dict(payload["model"])
     torch.testing.assert_close(
         rebuilt.token_embedding.weight, model.token_embedding.weight
@@ -158,7 +158,7 @@ def test_early_stopping_saves_best_checkpoint(tmp_path: Path) -> None:
         early_stopping_patience=1,
         early_stopping_min_delta=1_000_000.0,
     )
-    model = KJXForConditionalGeneration(config.model)
+    model = SionForConditionalGeneration(config.model)
     context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
     result = train(model, [tiny_batch()], [tiny_batch()], config, context)
     assert result["stopped_early"] is True
@@ -169,7 +169,7 @@ def test_early_stopping_saves_best_checkpoint(tmp_path: Path) -> None:
 
 def test_tensorboard_writes_main_rank_scalars(tmp_path: Path) -> None:
     config = tiny_app_config(tmp_path, tensorboard=True)
-    model = KJXForConditionalGeneration(config.model)
+    model = SionForConditionalGeneration(config.model)
     context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
     train(model, [tiny_batch()], [tiny_batch()], config, context)
     event_files = list((tmp_path / "run" / "tensorboard").glob("events.out.tfevents.*"))
@@ -179,14 +179,14 @@ def test_tensorboard_writes_main_rank_scalars(tmp_path: Path) -> None:
 
 def test_empty_training_loader_fails_fast(tmp_path: Path) -> None:
     config = tiny_app_config(tmp_path)
-    model = KJXForConditionalGeneration(config.model)
+    model = SionForConditionalGeneration(config.model)
     context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
     with pytest.raises(ValueError, match="training loader is empty"):
         train(model, [], [tiny_batch()], config, context)
 
 
 def test_adamw_groups_exclude_norms_biases_and_one_dimensional_parameters() -> None:
-    model = KJXForConditionalGeneration(tiny_model_config())
+    model = SionForConditionalGeneration(tiny_model_config())
     groups = build_optimizer_param_groups(model, weight_decay=0.1)
     decayed = {id(parameter) for parameter in groups[0]["params"]}
     not_decayed = {id(parameter) for parameter in groups[1]["params"]}
@@ -222,8 +222,8 @@ def test_gradient_accumulation_matches_combined_token_normalization(
         {name: value[index : index + 1].clone() for name, value in combined.items()}
         for index in range(2)
     ]
-    first = KJXForConditionalGeneration(tiny_model_config())
-    second = KJXForConditionalGeneration(tiny_model_config())
+    first = SionForConditionalGeneration(tiny_model_config())
+    second = SionForConditionalGeneration(tiny_model_config())
     second.load_state_dict(first.state_dict())
     context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
 
@@ -263,7 +263,7 @@ def test_mrt_posttraining_objective_and_stage_save(tmp_path: Path) -> None:
         eval_every=1,
         save_every=1,
     )
-    model = KJXForConditionalGeneration(config.model)
+    model = SionForConditionalGeneration(config.model)
     context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
     objective = MinimumRiskObjective(FakeTokenizer(), config.posttraining)
     result = train(

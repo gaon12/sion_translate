@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=kjx-data-fit
+#SBATCH --job-name=sion-data-fit
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=8
@@ -15,7 +15,7 @@ export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 export NCCL_ASYNC_ERROR_HANDLING=1
 export TORCH_NCCL_AVOID_RECORD_STREAMS=1
 export OMP_NUM_THREADS=8
-export KJX_CONFIG="${KJX_CONFIG:-configs/kjx_data_fit.yaml}"
+export SION_CONFIG="${SION_CONFIG:-configs/sion_data_fit.yaml}"
 
 srun --label bash -c '
 torchrun \
@@ -24,5 +24,5 @@ torchrun \
   --node-rank="$SLURM_NODEID" \
   --master-addr="$MASTER_ADDR" \
   --master-port="$MASTER_PORT" \
-  -m kjx.cli.train --config "$KJX_CONFIG"
+  -m sion_translate.cli.train --config "$SION_CONFIG"
 '

@@ -6,7 +6,7 @@ import warnings
 
 import pytest
 
-from kjx.config import ExperimentalConfig
+from sion_translate.config import ExperimentalConfig
 
 
 def _warnings_from(config: ExperimentalConfig) -> list[str]:

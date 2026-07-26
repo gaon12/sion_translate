@@ -8,15 +8,15 @@ import numpy as np
 import pytest
 import torch
 
-from kjx.data import (
+from sion_translate.data import (
     DistributedBucketBatchSampler,
     IndexedParallelDataset,
-    KJBatchCollator,
+    SionBatchCollator,
     prepare_dataset,
 )
-from kjx.data.quality import QualityPolicy, assess_pair
-from kjx.data.prepare import protect_shared_spans
-from kjx.tokenizer import KJTokenizer, train_tokenizer
+from sion_translate.data.quality import QualityPolicy, assess_pair
+from sion_translate.data.prepare import protect_shared_spans
+from sion_translate.tokenizer import SionTokenizer, train_tokenizer
 
 
 def write_tiny_jsonl(path: Path) -> None:
@@ -57,7 +57,7 @@ def test_tokenizer_prepare_dataset_and_collate(tmp_path: Path) -> None:
         input_sentence_size=1000,
         seed_sentencepiece_size=1000,
     )
-    tokenizer = KJTokenizer(model_path)
+    tokenizer = SionTokenizer(model_path)
     assert len(tokenizer) >= 300
     assert tokenizer.decode(tokenizer.encode("한일翻訳テスト"))
 
@@ -93,7 +93,7 @@ def test_tokenizer_prepare_dataset_and_collate(tmp_path: Path) -> None:
     assert restored.pair_source_ids is None
     assert restored[0]["src_language"] == "ko"
 
-    collator = KJBatchCollator(
+    collator = SionBatchCollator(
         tokenizer,
         max_source_length=64,
         max_target_length=64,

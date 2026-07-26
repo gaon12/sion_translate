@@ -1,4 +1,4 @@
-"""학습한 KJ-X 모델을 위한 독립 실행형 추론 CLI.
+"""학습한 sion_translate 모델을 위한 독립 실행형 추론 CLI.
 
 사용 예시:
     python inferences.py --to ja "오늘 날씨가 좋습니다."
@@ -49,10 +49,10 @@ if str(SRC) not in sys.path:
 
 import torch  # noqa: E402
 
-from kjx.config import config_from_raw, load_raw_config  # noqa: E402
-from kjx.console import configure_stdio  # noqa: E402
-from kjx.glossary import Glossary, load_glossary  # noqa: E402
-from kjx.inference import Translator, find_exported_model  # noqa: E402
+from sion_translate.config import config_from_raw, load_raw_config  # noqa: E402
+from sion_translate.console import configure_stdio  # noqa: E402
+from sion_translate.glossary import Glossary, load_glossary  # noqa: E402
+from sion_translate.inference import Translator, find_exported_model  # noqa: E402
 
 
 # 품질 프리셋이다.
@@ -99,7 +99,7 @@ THINKING_BEAMS = {
 def build_parser() -> argparse.ArgumentParser:
     """명령행 인자 파서를 생성한다."""
     parser = argparse.ArgumentParser(
-        description="KJ-X 학습 모델로 한↔일 번역을 수행합니다.",
+        description="sion_translate 학습 모델로 한↔일 번역을 수행합니다.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -136,8 +136,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--config",
         type=Path,
-        default=ROOT / "kjx.yaml",
-        help="KJ-X 설정 파일입니다.",
+        default=ROOT / "sion_translate.yaml",
+        help="sion_translate 설정 파일입니다.",
     )
 
     parser.add_argument(
@@ -371,7 +371,7 @@ def choose_device(value: str, int8: bool) -> torch.device:
     if int8:
         if value not in ("auto", "cpu"):
             print(
-                "[KJ-X] INT8 export는 CPU 전용이므로 "
+                "[sion] INT8 export는 CPU 전용이므로 "
                 "device=cpu를 사용합니다.",
                 file=sys.stderr,
             )
@@ -481,13 +481,13 @@ def apply_runtime_options(
     if args.compile:
         if device.type != "cuda":
             print(
-                "[KJ-X] --compile은 CUDA에서만 적용합니다.",
+                "[sion] --compile은 CUDA에서만 적용합니다.",
                 file=sys.stderr,
             )
 
         elif not hasattr(torch, "compile"):
             print(
-                "[KJ-X] 현재 PyTorch에는 torch.compile이 없어 "
+                "[sion] 현재 PyTorch에는 torch.compile이 없어 "
                 "컴파일을 건너뜁니다.",
                 file=sys.stderr,
             )
@@ -738,7 +738,7 @@ def print_timing_report(
 
     print(
         (
-            f"[KJ-X] 추론 완료: "
+            f"[sion] 추론 완료: "
             f"{sentence_count}문장 / "
             f"추론 {inference_elapsed:.3f}초 / "
             f"전체 {total_elapsed:.3f}초 / "
@@ -751,32 +751,32 @@ def print_timing_report(
 
     if detailed:
         print(
-            "[KJ-X] 상세 시간:",
+            "[sion] 상세 시간:",
             file=sys.stderr,
         )
 
         print(
-            f"[KJ-X]   설정 및 입력 준비: {config_elapsed:.3f}초",
+            f"[sion]   설정 및 입력 준비: {config_elapsed:.3f}초",
             file=sys.stderr,
         )
 
         print(
-            f"[KJ-X]   모델 로딩 및 준비: {model_elapsed:.3f}초",
+            f"[sion]   모델 로딩 및 준비: {model_elapsed:.3f}초",
             file=sys.stderr,
         )
 
         print(
-            f"[KJ-X]   실제 번역 추론: {inference_elapsed:.3f}초",
+            f"[sion]   실제 번역 추론: {inference_elapsed:.3f}초",
             file=sys.stderr,
         )
 
         print(
-            f"[KJ-X]   결과 변환 및 출력: {output_elapsed:.3f}초",
+            f"[sion]   결과 변환 및 출력: {output_elapsed:.3f}초",
             file=sys.stderr,
         )
 
         print(
-            f"[KJ-X]   전체 실행: {total_elapsed:.3f}초",
+            f"[sion]   전체 실행: {total_elapsed:.3f}초",
             file=sys.stderr,
             flush=True,
         )
@@ -794,7 +794,7 @@ def main() -> None:
 
     sources = read_lines(args)
 
-    default_config_path = ROOT / "kjx.yaml"
+    default_config_path = ROOT / "sion_translate.yaml"
     config_path = (
         args.config
         if args.config.exists()
@@ -887,7 +887,7 @@ def main() -> None:
 
     print(
         (
-            f"[KJ-X] model={model_path} "
+            f"[sion] model={model_path} "
             f"device={device} "
             f"quality={args.quality} "
             f"beams={beams} "
@@ -972,7 +972,7 @@ def main() -> None:
         if "not a string" in error_message:
             raise SystemExit(
                 "SentencePiece에 문자열이 아닌 값이 전달되었습니다. "
-                "src/kjx/tokenizer.py의 encode()에서 입력값과 "
+                "src/sion_translate/tokenizer.py의 encode()에서 입력값과 "
                 "normalize_text() 반환값을 Python 기본 str로 변환해야 합니다."
             ) from error
 
@@ -997,7 +997,7 @@ def main() -> None:
         )
         if rescued_count or remaining_count:
             print(
-                f"[KJ-X] 반복 붕괴 재시도: 복구 {rescued_count}문장 / "
+                f"[sion] 반복 붕괴 재시도: 복구 {rescued_count}문장 / "
                 f"잔여 {remaining_count}문장",
                 file=sys.stderr,
                 flush=True,

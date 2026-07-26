@@ -1,4 +1,4 @@
-"""FLORES 벤치마크 변환(kjx.benchmark) 검증."""
+"""FLORES 벤치마크 변환(sion_translate.benchmark) 검증."""
 
 from __future__ import annotations
 
@@ -6,13 +6,13 @@ from pathlib import Path
 
 import pytest
 
-from kjx.benchmark import (
+from sion_translate.benchmark import (
     flores_code,
     find_flores_file,
     pairs_from_local_flores,
     write_jsonl,
 )
-from kjx.evaluation import load_benchmark_pairs
+from sion_translate.evaluation import load_benchmark_pairs
 
 
 def test_flores_code_lookup_and_override() -> None:
@@ -49,7 +49,7 @@ def test_pairs_from_local_flores_end_to_end(tmp_path: Path) -> None:
     assert len(pairs) == 5
     assert pairs[0] == {"ko": "한국어 문장 0", "ja": "日本語の文 0"}
 
-    # 변환한 JSONL 이 kjx-evaluate 로더로 그대로 읽혀야 한다.
+    # 변환한 JSONL 이 sion-evaluate 로더로 그대로 읽혀야 한다.
     output = tmp_path / "flores.jsonl"
     count = write_jsonl(pairs, output)
     assert count == 5

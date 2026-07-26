@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from kjx.comparison import (
+from sion_translate.comparison import (
     comparison_as_markdown,
     load_comparison_cases,
     load_system_translations,
@@ -124,5 +124,5 @@ def test_score_and_report_multiple_systems(tmp_path: Path) -> None:
     assert "| forward | general | ko-ja | perfect |" in markdown
     save_comparison(tmp_path / "comparison", cases, systems, results)
     payload = json.loads((tmp_path / "comparison.json").read_text(encoding="utf-8"))
-    assert payload["schema"] == "kjx-translation-comparison-v1"
+    assert payload["schema"] == "sion-translation-comparison-v1"
     assert (tmp_path / "comparison.md").exists()

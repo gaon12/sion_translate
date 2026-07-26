@@ -9,8 +9,8 @@ python3 easy_run.py
 
 이 명령은 가능한 경우 /dev/shm RAM 디스크에서 전처리와 dataset 읽기를 수행하고,
 완성된 artifacts를 일반 디스크에도 보존한 뒤 모든 GPU로 학습합니다.
-tmux가 없으면 자동 설치하고 kjx 세션 안에서 실행하므로 터미널 연결이 끊겨도
-학습은 계속됩니다. 재접속 명령은 tmux attach -t kjx 입니다.
+tmux가 없으면 자동 설치하고 sion 세션 안에서 실행하므로 터미널 연결이 끊겨도
+학습은 계속됩니다. 재접속 명령은 tmux attach -t sion 입니다.
 아래 단계별 명령은 문제 해결이나 수동 실행이 필요할 때 사용하세요.
 
 
@@ -51,7 +51,7 @@ python3 -m pytest -q
 
 학습 중 브라우저 터미널이 끊겨도 계속 실행되게 tmux 안에서 진행합니다.
 
-tmux new -s kjx
+tmux new -s sion
 
 tmux가 없다면 먼저 아래 명령으로 설치한 뒤 다시 실행하세요.
 
@@ -60,15 +60,15 @@ apt-get update && apt-get install -y tmux
 
 4. 토크나이저와 데이터셋 준비 (처음 한 번만)
 
-kjx-train-tokenizer --input "data/*.jsonl" --output-dir artifacts/tokenizer --vocab-size 48000
+sion-train-tokenizer --input "data/*.jsonl" --output-dir artifacts/tokenizer --vocab-size 48000
 
-kjx-prepare-data --input "data/*.jsonl" --tokenizer artifacts/tokenizer/kjx.model --output-dir artifacts/dataset
+sion-prepare-data --input "data/*.jsonl" --tokenizer artifacts/tokenizer/sion.model --output-dir artifacts/dataset
 
 처리 시간은 JSONL 크기에 따라 달라집니다. 두 명령이 모두 끝나면
 artifacts/tokenizer와 artifacts/dataset이 생깁니다. 입력이 바뀌지 않았다면 이후에는
 이 단계를 다시 하지 않아도 됩니다.
 
-kjx-train-tokenizer는 숫자를 한 자리씩 분리해 학습합니다(기본값). 이 옵션 없이 만든
+sion-train-tokenizer는 숫자를 한 자리씩 분리해 학습합니다(기본값). 이 옵션 없이 만든
 토크나이저는 금액·용량·날짜를 다른 값으로 바꿔 쓰는 오역을 일으키므로,
 --no-split-digits는 기존 산출물을 재현할 때만 쓰십시오.
 
@@ -81,9 +81,9 @@ kjx-train-tokenizer는 숫자를 한 자리씩 분리해 학습합니다(기본�
 
 GPU_COUNT=$(python3 -c "import torch; print(torch.cuda.device_count())")
 echo "사용할 GPU 수: $GPU_COUNT"
-torchrun --standalone --nproc-per-node="$GPU_COUNT" -m kjx.cli.train
+torchrun --standalone --nproc-per-node="$GPU_COUNT" -m sion_translate.cli.train
 
-별도 인자 없이 실행하면 kjx.yaml을 읽고 모델 크기, 배치 크기, 정밀도와 학습 step을
+별도 인자 없이 실행하면 sion_translate.yaml을 읽고 모델 크기, 배치 크기, 정밀도와 학습 step을
 자동으로 정합니다.
 
 
@@ -92,7 +92,7 @@ torchrun --standalone --nproc-per-node="$GPU_COUNT" -m kjx.cli.train
 tmux 화면에서 빠져나오기: Ctrl+B를 누른 뒤 D
 tmux로 돌아가기:
 
-tmux attach -t kjx
+tmux attach -t sion
 
 학습이 중단됐다면 프로젝트 폴더에서 5번 명령을 다시 실행하세요.
 runs/auto/pretrain/checkpoints/latest와 runs/auto/posttrain/checkpoints/latest를
@@ -116,7 +116,7 @@ watch -n 2 nvidia-smi
 
 다운로드하기 쉽게 결과 묶기:
 
-tar -czf kjx-result.tar.gz runs/auto/pretrain/exports/best runs/auto/posttrain/exports/best artifacts/tokenizer
+tar -czf sion-result.tar.gz runs/auto/pretrain/exports/best runs/auto/posttrain/exports/best artifacts/tokenizer
 
 
 한 줄 요약:

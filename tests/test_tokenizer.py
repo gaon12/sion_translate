@@ -6,8 +6,8 @@ from pathlib import Path
 import pytest
 import sentencepiece as spm
 
-from kjx.splitting import choose_split_for_text
-from kjx.tokenizer import KJTokenizer, iter_parallel_text, train_tokenizer
+from sion_translate.splitting import choose_split_for_text
+from sion_translate.tokenizer import SionTokenizer, iter_parallel_text, train_tokenizer
 
 
 def _pair_for_split(split: str) -> tuple[str, str]:
@@ -82,7 +82,7 @@ def test_kj_tokenizer_rejects_models_without_required_symbols(
 
     # 언어 태그(<2xx>)가 없는 일반 SentencePiece 모델은 거부해야 한다.
     with pytest.raises(ValueError, match="<2xx>"):
-        KJTokenizer(model_prefix.with_suffix(".model"))
+        SionTokenizer(model_prefix.with_suffix(".model"))
 
 
 def _numeric_corpus(tmp_path: Path) -> Path:
@@ -116,7 +116,7 @@ def test_train_tokenizer_splits_digits_by_default(tmp_path: Path) -> None:
         num_threads=1,
     )
 
-    tokenizer = KJTokenizer(model_path)
+    tokenizer = SionTokenizer(model_path)
     assert tokenizer.splits_digits
     # 금액이 한 자리씩 분리되어야 모델이 자릿수를 그대로 옮길 수 있다.
     pieces = tokenizer.processor.encode("38720원", out_type=str)
@@ -137,7 +137,7 @@ def test_train_tokenizer_can_disable_digit_splitting(tmp_path: Path) -> None:
         split_digits=False,
     )
 
-    tokenizer = KJTokenizer(model_path)
+    tokenizer = SionTokenizer(model_path)
     # 반복되는 "250" 같은 숫자열이 하나의 토큰으로 병합되므로 감지에 걸린다.
     assert not tokenizer.splits_digits
 

@@ -22,9 +22,9 @@ widget:
     text: "죄송하지만 여기 성함을 기입해 주시겠어요?"
 ---
 
-# KJ-X Korean–Japanese Translation
+# sion_translate Korean–Japanese Translation
 
-KJ-X is a custom PyTorch encoder-decoder model for bidirectional Korean↔Japanese
+sion_translate is a custom PyTorch encoder-decoder model for bidirectional Korean↔Japanese
 translation. The uploaded release contains inference exports and its SentencePiece tokenizer;
 training datasets and training checkpoints are not distributed.
 
@@ -32,7 +32,7 @@ training datasets and training checkpoints are not distributed.
 
 - `model_ema.pt`: recommended FP32 EMA inference export
 - `model_int8.pt`: smaller CPU-only dynamic INT8 export
-- `kjx.model`, `kjx.vocab`, `token_features.npz`: tokenizer files
+- `sion.model`, `sion.vocab`, `token_features.npz`: tokenizer files
 
 The model uses custom code from
 [`gaon12/sion_translate`](https://github.com/gaon12/sion_translate) and is not a Transformers
@@ -48,11 +48,11 @@ hf download gaon12/sion_translate --local-dir models/sion_translate
 ```
 
 ```python
-from kjx.inference import Translator
+from sion_translate.inference import Translator
 
 translator = Translator(
     "models/sion_translate/model_ema.pt",
-    "models/sion_translate/kjx.model",
+    "models/sion_translate/sion.model",
 )
 print(translator.translate(["안녕하세요."], target_language="ja", num_beams=4)[0])
 print(translator.translate(["こんにちは。"], target_language="ko", num_beams=4)[0])
@@ -65,7 +65,7 @@ load PyTorch pickle-based artifacts from repositories you trust.
 ## Evaluation
 
 The GitHub repository includes a small, independently authored diagnostic JSONL covering both
-directions and provides a common scorer for KJ-X, LibreTranslate, Papago, Google Translation,
+directions and provides a common scorer for sion_translate, LibreTranslate, Papago, Google Translation,
 DeepL, M2M100 418M, and NLLB-200. No universal quality claim is made from that small set.
 
 Scores from the repository's own test split are in-domain: the split is drawn from the same
@@ -93,6 +93,6 @@ it is.
 
 ## License
 
-The original KJ-X code and uploaded model release are provided under the MIT License. This does
+The original sion_translate code and uploaded model release are provided under the MIT License. This does
 not grant rights to user-provided inputs, generated service outputs, third-party software, or
 third-party models used only as comparison baselines.

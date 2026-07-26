@@ -3,7 +3,7 @@ requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "kjx"
+name = "sion-translate"
 version = "0.1.0"
 description = "From-scratch Korean-Japanese experimental machine translation training stack"
 readme = "README.md"
@@ -29,16 +29,16 @@ Repository = "https://github.com/gaon12/sion_translate"
 Model = "https://huggingface.co/gaon12/sion_translate"
 
 [project.scripts]
-kjx-audit-data = "kjx.cli.audit_data:main"
-kjx-train-tokenizer = "kjx.cli.train_tokenizer:main"
-kjx-prepare-data = "kjx.cli.prepare_data:main"
-kjx-train = "kjx.cli.train:main"
-kjx-translate = "kjx.cli.translate:main"
-kjx-augment = "kjx.cli.augment:main"
-kjx-evaluate = "kjx.cli.evaluate:main"
-kjx-prepare-benchmark = "kjx.cli.prepare_benchmark:main"
-kjx-compare = "kjx.cli.compare:main"
-kjx-translate-cases = "kjx.cli.translate_cases:main"
+sion-audit-data = "sion_translate.cli.audit_data:main"
+sion-train-tokenizer = "sion_translate.cli.train_tokenizer:main"
+sion-prepare-data = "sion_translate.cli.prepare_data:main"
+sion-train = "sion_translate.cli.train:main"
+sion-translate = "sion_translate.cli.translate:main"
+sion-augment = "sion_translate.cli.augment:main"
+sion-evaluate = "sion_translate.cli.evaluate:main"
+sion-prepare-benchmark = "sion_translate.cli.prepare_benchmark:main"
+sion-compare = "sion_translate.cli.compare:main"
+sion-translate-cases = "sion_translate.cli.translate_cases:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

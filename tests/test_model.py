@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import torch
 
-from kjx.config import ExperimentalConfig, ModelConfig
-from kjx.model import KJXForConditionalGeneration
+from sion_translate.config import ExperimentalConfig, ModelConfig
+from sion_translate.model import SionForConditionalGeneration
 
 
 def tiny_config() -> ModelConfig:
@@ -62,7 +62,7 @@ def make_batch() -> dict[str, torch.Tensor]:
 
 
 def test_forward_backward_all_experimental_modules() -> None:
-    model = KJXForConditionalGeneration(tiny_config())
+    model = SionForConditionalGeneration(tiny_config())
     output = model(**make_batch())
     assert output.logits.shape == (2, 4, 128)
     assert output.token_count.item() == 7
@@ -74,7 +74,7 @@ def test_forward_backward_all_experimental_modules() -> None:
 
 
 def test_greedy_generation() -> None:
-    model = KJXForConditionalGeneration(tiny_config())
+    model = SionForConditionalGeneration(tiny_config())
     batch = make_batch()
     generated = model.generate(
         batch["input_ids"],
@@ -93,7 +93,7 @@ def test_greedy_generation() -> None:
 
 def test_stochastic_sampling_returns_multiple_candidates() -> None:
     torch.manual_seed(7)
-    model = KJXForConditionalGeneration(tiny_config())
+    model = SionForConditionalGeneration(tiny_config())
     batch = make_batch()
     sampled = model.sample(
         batch["input_ids"],
@@ -112,7 +112,7 @@ def test_stochastic_sampling_returns_multiple_candidates() -> None:
 
 
 def test_tied_embedding_output() -> None:
-    model = KJXForConditionalGeneration(tiny_config())
+    model = SionForConditionalGeneration(tiny_config())
     assert model.lm_head is None
     assert model.parameter_count() > 0
 
@@ -121,7 +121,7 @@ def test_kv_cache_greedy_matches_full_redecode() -> None:
     """KV cache 디코딩이 '매번 prefix 전체를 다시 계산'하는 방식과
     토큰 단위로 완전히 같은 결과를 내야 한다."""
     torch.manual_seed(7)
-    model = KJXForConditionalGeneration(tiny_config())
+    model = SionForConditionalGeneration(tiny_config())
     model.eval()
     batch = make_batch()
     features = {
@@ -160,7 +160,7 @@ def test_kv_cache_greedy_matches_full_redecode() -> None:
 
 def test_beam_search_generation() -> None:
     torch.manual_seed(7)
-    model = KJXForConditionalGeneration(tiny_config())
+    model = SionForConditionalGeneration(tiny_config())
     batch = make_batch()
     features = {
         key: batch[key]
@@ -182,7 +182,7 @@ def test_beam_search_generation() -> None:
 
 
 def test_morph_gates_only_when_morphoscript_enabled() -> None:
-    from kjx.config import ExperimentalConfig, ModelConfig
+    from sion_translate.config import ExperimentalConfig, ModelConfig
 
     disabled = ModelConfig(
         vocab_size=64,
@@ -196,8 +196,8 @@ def test_morph_gates_only_when_morphoscript_enabled() -> None:
         gradient_checkpointing=False,
         experimental=ExperimentalConfig(morphoscript_enabled=False),
     )
-    model = KJXForConditionalGeneration(disabled)
+    model = SionForConditionalGeneration(disabled)
     assert model.morph_gates is None
     assert all("morph_gates" not in name for name, _ in model.named_parameters())
-    enabled_model = KJXForConditionalGeneration(tiny_config())
+    enabled_model = SionForConditionalGeneration(tiny_config())
     assert enabled_model.morph_gates is not None

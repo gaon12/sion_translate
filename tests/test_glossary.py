@@ -7,13 +7,13 @@ from pathlib import Path
 
 import pytest
 
-from kjx.glossary import (
+from sion_translate.glossary import (
     Glossary,
     apply_source_placeholders,
     load_glossary,
     restore_targets,
 )
-from kjx.tokenizer import SLOT_SYMBOLS
+from sion_translate.tokenizer import SLOT_SYMBOLS
 
 
 def make_glossary() -> Glossary:
