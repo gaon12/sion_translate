@@ -9,11 +9,19 @@
   띄어쓰기 규칙이 다른 언어에서도 공정합니다. 주 지표로 사용합니다.
 - **BLEU**: 관례상 함께 보고합니다. 한/일/중은 단어 분리가 모호하므로
   문자 단위(tokenize="char")로, 그 외 언어는 표준 13a 토큰화로 계산합니다.
+- **숫자 보존**: chrF/BLEU 는 문자 n-gram 이 대부분 겹치면 높은 점수를 주므로
+  ``250mg`` → ``1200mg`` 처럼 값 하나만 바뀐 오역을 거의 벌하지 않습니다.
+  금액·용량·날짜는 한 글자만 틀려도 문장 전체가 쓸 수 없게 되므로 따로
+  집계합니다. 재현율(누락)과 정밀도(환각)를 함께 보기 위해 F1 을 쓰고,
+  "숫자가 하나라도 틀린 문장이 몇 %인지"를 exact 비율로 함께 보고합니다.
 """
 
 from __future__ import annotations
 
 import json
+import re
+import unicodedata
+from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Sequence
@@ -23,6 +31,72 @@ from kjx.tokenizer import KJTokenizer
 
 # 문자 단위 BLEU 를 쓰는 언어 (공백 기반 토큰화가 무의미한 언어)
 CHARACTER_LEVEL_LANGUAGES = {"ko", "ja", "zh"}
+
+# 금액/용량/날짜/버전 등 "값" 으로 취급할 숫자열. 사후학습 보상과 같은 정의를
+# 써야 학습이 최적화하는 대상과 평가가 재는 대상이 어긋나지 않습니다.
+#
+# 경계 조건은 ASCII 영숫자/밑줄로만 판정합니다. 파이썬 ``\w`` 는 한글과 가나까지
+# 포함하므로 ``(?![\w])`` 로 막으면 ``4월``, ``1회``, ``5개`` 처럼 조사·단위가 붙은
+# 한 자리 숫자가 전부 값에서 빠집니다 — 날짜와 복용 횟수가 바로 그 형태입니다.
+# 반대로 ``utf8``, ``config2``, ``HTTP429`` 의 숫자는 값이 아니라 식별자의 일부라서
+# 앞뒤 ASCII 문자로 걸러냅니다. ``250mg`` 은 첫 분기가 ``250`` 을 잡아냅니다.
+NUMBER_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_])[-+]?\d[\d,.:/%+\-]*\d|(?<![A-Za-z0-9_])[-+]?\d(?![0-9])"
+)
+
+
+def normalized_matches(pattern: re.Pattern[str], text: str) -> list[str]:
+    """NFKC 정규화 후 패턴에 걸린 표면형 목록. 전각 숫자도 반각과 같게 봅니다."""
+    normalized = unicodedata.normalize("NFKC", text)
+    return [match.group(0).casefold().rstrip(".,;:!?") for match in pattern.finditer(normalized)]
+
+
+def multiset_f1(expected: Sequence[object], actual: Sequence[object]) -> float:
+    """중복을 보존하는 F1. 둘 다 비었으면 위반이 없으므로 1입니다."""
+    expected_counts = Counter(expected)
+    actual_counts = Counter(actual)
+    if not expected_counts and not actual_counts:
+        return 1.0
+    if not expected_counts or not actual_counts:
+        return 0.0
+    overlap = sum((expected_counts & actual_counts).values())
+    precision = overlap / sum(actual_counts.values())
+    recall = overlap / sum(expected_counts.values())
+    return 2.0 * precision * recall / max(precision + recall, 1e-12)
+
+
+def numeric_tokens(text: str) -> list[str]:
+    """문장에서 값으로 볼 숫자열을 뽑아냅니다. 콤마는 자리 구분자로 무시합니다.
+
+    ``38,720`` 과 ``38720`` 은 같은 값이고, 한쪽 표기만 다른 것을 오역으로
+    세면 지표가 표기 관습을 벌하게 됩니다.
+    """
+    return [token.replace(",", "") for token in normalized_matches(NUMBER_PATTERN, text)]
+
+
+def number_preservation(
+    hypotheses: Sequence[str],
+    references: Sequence[str],
+) -> tuple[float, int]:
+    """(숫자 F1 평균 ×100, 숫자가 모두 일치한 문장 수) 를 돌려줍니다.
+
+    숫자가 없는 문장쌍은 위반이 있을 수 없으므로 F1 1.0, 일치로 셉니다.
+    """
+    if len(hypotheses) != len(references):
+        raise ValueError(
+            f"번역문 {len(hypotheses)}개와 정답 {len(references)}개의 수가 다릅니다"
+        )
+    if not references:
+        return 0.0, 0
+    scores: list[float] = []
+    exact = 0
+    for hypothesis, reference in zip(hypotheses, references, strict=True):
+        expected = numeric_tokens(reference)
+        actual = numeric_tokens(hypothesis)
+        scores.append(multiset_f1(expected, actual))
+        if Counter(expected) == Counter(actual):
+            exact += 1
+    return 100.0 * sum(scores) / len(scores), exact
 
 
 @dataclass
@@ -35,6 +109,8 @@ class DirectionResult:
     chrf: float          # 주 지표 (0~100, 높을수록 좋음)
     bleu: float
     bleu_tokenize: str   # BLEU 토큰화 방식 (재현성 기록용)
+    number_f1: float = 0.0      # 숫자 보존 F1 평균 (0~100)
+    number_exact: int = 0       # 숫자가 모두 일치한 문장 수
 
 
 def score_translations(
@@ -122,13 +198,15 @@ def load_benchmark_pairs(
 def results_as_markdown(results: Sequence[DirectionResult]) -> str:
     """비교 표를 사람이 읽기 좋은 markdown 으로 만듭니다."""
     lines = [
-        "| system | direction | samples | chrF | BLEU |",
-        "|---|---|---:|---:|---:|",
+        "| system | direction | samples | chrF | BLEU | 숫자 F1 | 숫자 일치 |",
+        "|---|---|---:|---:|---:|---:|---:|",
     ]
     for result in results:
+        exact = f"{result.number_exact}/{result.samples}" if result.samples else "-"
         lines.append(
             f"| {result.system} | {result.direction} | {result.samples} "
-            f"| {result.chrf:.2f} | {result.bleu:.2f} |"
+            f"| {result.chrf:.2f} | {result.bleu:.2f} "
+            f"| {result.number_f1:.2f} | {exact} |"
         )
     return "\n".join(lines)
 

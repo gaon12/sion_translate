@@ -11,7 +11,12 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
 
-from kjx.evaluation import DirectionResult, results_as_markdown, score_translations
+from kjx.evaluation import (
+    DirectionResult,
+    number_preservation,
+    results_as_markdown,
+    score_translations,
+)
 
 
 @dataclass(frozen=True)
@@ -143,6 +148,7 @@ def score_systems(
                 references,
                 target_language=target_language,
             )
+            number_f1, number_exact = number_preservation(hypotheses, references)
             results.append(
                 DirectionResult(
                     system=system_name,
@@ -151,6 +157,8 @@ def score_systems(
                     chrf=chrf,
                     bleu=bleu,
                     bleu_tokenize=tokenize,
+                    number_f1=number_f1,
+                    number_exact=number_exact,
                 )
             )
     return results

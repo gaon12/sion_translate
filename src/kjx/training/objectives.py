@@ -4,7 +4,6 @@ from collections import Counter
 from dataclasses import dataclass
 import math
 import re
-import unicodedata
 
 import torch
 import torch.nn.functional as F
@@ -13,12 +12,12 @@ from torch import nn
 
 from kjx.config import PostTrainingConfig
 from kjx.data.quality import canonical_text, language_fraction
+from kjx.evaluation import multiset_f1, normalized_matches, numeric_tokens
 from kjx.tokenizer import KJTokenizer
 
 from .export import unwrap_model
 
 
-_NUMBER = re.compile(r"(?<![\w])[-+]?\d[\d,.:/%+\-]*\d|(?<![\w])[-+]?\d(?![\w])")
 _STRUCTURED = re.compile(
     r"https?://[^\s]+|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|"
     r"(?<![A-Za-z0-9])(?:[A-Z]{2,}[A-Z0-9_-]*|[A-Za-z]+[-_][A-Za-z0-9_-]+)"
@@ -43,25 +42,6 @@ class RewardOutput:
 
     reward: torch.Tensor
     components: dict[str, torch.Tensor]
-
-
-def _multiset_f1(expected: list[object], actual: list[object]) -> float:
-    """중복을 보존하는 F1. 둘 다 비었으면 위반이 없으므로 1입니다."""
-    expected_counts = Counter(expected)
-    actual_counts = Counter(actual)
-    if not expected_counts and not actual_counts:
-        return 1.0
-    if not expected_counts or not actual_counts:
-        return 0.0
-    overlap = sum((expected_counts & actual_counts).values())
-    precision = overlap / sum(actual_counts.values())
-    recall = overlap / sum(expected_counts.values())
-    return 2.0 * precision * recall / max(precision + recall, 1e-12)
-
-
-def _normalized_matches(pattern: re.Pattern[str], text: str) -> list[str]:
-    normalized = unicodedata.normalize("NFKC", text)
-    return [match.group(0).casefold().rstrip(".,;:!?") for match in pattern.finditer(normalized)]
 
 
 def _has_excessive_repetition(text: str) -> bool:
@@ -142,18 +122,17 @@ class CompositeTranslationReward:
         candidate_content = self._content_ids(candidate_ids)
         reference_content = self._content_ids(reference_ids)
         chrf = self.chrf.sentence_score(hypothesis, [reference_text]).score / 100.0
-        token_f1 = _multiset_f1(reference_content, candidate_content)
-        number = _multiset_f1(
-            _normalized_matches(_NUMBER, reference_text),
-            _normalized_matches(_NUMBER, hypothesis),
-        )
-        structured = _multiset_f1(
-            _normalized_matches(_STRUCTURED, reference_text),
-            _normalized_matches(_STRUCTURED, hypothesis),
+        token_f1 = multiset_f1(reference_content, candidate_content)
+        # 평가(kjx-evaluate / kjx-compare)와 같은 정의를 씁니다. 보상과 지표가
+        # 다른 것을 재면 사후학습이 개선했다는 항목이 리포트에 나타나지 않습니다.
+        number = multiset_f1(numeric_tokens(reference_text), numeric_tokens(hypothesis))
+        structured = multiset_f1(
+            normalized_matches(_STRUCTURED, reference_text),
+            normalized_matches(_STRUCTURED, hypothesis),
         )
         source_slots = [token_id for token_id in source_ids if token_id in self.slot_ids]
         candidate_slots = [token_id for token_id in candidate_ids if token_id in self.slot_ids]
-        slot = _multiset_f1(source_slots, candidate_slots)
+        slot = multiset_f1(source_slots, candidate_slots)
         letter_count = sum(char.isalpha() for char in hypothesis)
         language = (
             language_fraction(hypothesis, target_language)

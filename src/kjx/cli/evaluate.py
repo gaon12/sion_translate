@@ -30,6 +30,7 @@ from kjx.evaluation import (
     DirectionResult,
     load_benchmark_pairs,
     load_split_pairs,
+    number_preservation,
     results_as_markdown,
     save_results,
     score_translations,
@@ -170,6 +171,7 @@ def main() -> None:
         chrf, bleu, tokenize = score_translations(
             hypotheses, references, target_language=target_language
         )
+        number_f1, number_exact = number_preservation(hypotheses, references)
         results.append(
             DirectionResult(
                 system="kjx",
@@ -178,9 +180,14 @@ def main() -> None:
                 chrf=chrf,
                 bleu=bleu,
                 bleu_tokenize=tokenize,
+                number_f1=number_f1,
+                number_exact=number_exact,
             )
         )
-        log(f"{direction_name}: chrF {chrf:.2f} / BLEU {bleu:.2f} ({elapsed:.0f}초)")
+        log(
+            f"{direction_name}: chrF {chrf:.2f} / BLEU {bleu:.2f} / "
+            f"숫자 F1 {number_f1:.2f} (일치 {number_exact}/{len(samples)}) ({elapsed:.0f}초)"
+        )
 
         # 외부 시스템 출력 채점 (같은 정답, 같은 지표)
         for spec in args.compare:
@@ -196,9 +203,11 @@ def main() -> None:
                     f"{file_path}: 번역 {len(lines)}줄 < 평가쌍 {len(references)}개 — "
                     "줄 수가 평가셋과 일치해야 합니다"
                 )
+            hypotheses = lines[: len(references)]
             chrf, bleu, tokenize = score_translations(
-                lines[: len(references)], references, target_language=target_language
+                hypotheses, references, target_language=target_language
             )
+            number_f1, number_exact = number_preservation(hypotheses, references)
             results.append(
                 DirectionResult(
                     system=name,
@@ -207,6 +216,8 @@ def main() -> None:
                     chrf=chrf,
                     bleu=bleu,
                     bleu_tokenize=tokenize,
+                    number_f1=number_f1,
+                    number_exact=number_exact,
                 )
             )
 
