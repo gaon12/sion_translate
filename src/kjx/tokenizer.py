@@ -258,6 +258,18 @@ class KJTokenizer:
     def __len__(self) -> int:
         return self.processor.vocab_size()
 
+    @property
+    def splits_digits(self) -> bool:
+        """숫자가 한 자리씩 분리되는 토크나이저인지 확인한다.
+
+        SentencePiece 모델 파일에는 학습 플래그가 그대로 남지 않으므로,
+        여러 자리 숫자를 실제로 인코딩해 조각을 확인합니다. 거짓이면 금액·
+        용량 같은 값이 그럴듯한 다른 값으로 바뀌는 오역 위험이 있습니다
+        (자세한 배경은 ``train_tokenizer`` 의 ``split_digits`` 설명 참고).
+        """
+        pieces = self.processor.encode("38720", out_type=str)
+        return all(len(piece.replace("▁", "")) <= 1 for piece in pieces)
+
     def piece_id(self, piece: str) -> int:
         return int(self.processor.piece_to_id(piece))
 
@@ -297,7 +309,17 @@ def train_tokenizer(
     language_pair: Sequence[str] = DEFAULT_LANGUAGE_PAIR,
     num_workers: int | None = None,
     num_threads: int | None = None,
+    split_digits: bool = True,
 ) -> Path:
+    """병렬 코퍼스로 joint SentencePiece 토크나이저를 학습한다.
+
+    ``split_digits`` 는 기본으로 켭니다. 끄면 SentencePiece 가 자주 등장하는
+    숫자열을 하나의 토큰으로 병합하므로 (예: ``62.5kg`` → ``▁6`` + ``2.5`` + ``kg``,
+    ``1,286,400`` → ``▁1,2`` + ``86`` + ``,`` + ``400``) 모델이 숫자를 자릿수로
+    다루지 못하고 통째로 암기한 덩어리로만 볼 수 있습니다. 그 결과 금액·용량·
+    날짜가 그럴듯한 다른 값으로 바뀌는 오역이 생기며, 사후학습의 숫자 보존
+    보상(``reward_number_weight``)도 최적화할 신호를 얻지 못합니다.
+    """
     paths = expand_inputs(input_patterns)
     if not paths:
         raise FileNotFoundError(f"No JSONL files matched: {input_patterns}")
@@ -323,6 +345,7 @@ def train_tokenizer(
         model_type="unigram",
         character_coverage=1.0,
         byte_fallback=True,
+        split_digits=split_digits,
         normalization_rule_name="identity",
         pad_id=0,
         unk_id=1,

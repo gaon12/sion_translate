@@ -25,6 +25,15 @@ def build_parser() -> argparse.ArgumentParser:
         metavar=("LANG_A", "LANG_B"),
         help="JSONL 키 이름 (기본: ko ja)",
     )
+    parser.add_argument(
+        "--no-split-digits",
+        dest="split_digits",
+        action="store_false",
+        help=(
+            "숫자를 한 자리씩 분리하지 않음 (권장하지 않음). "
+            "끄면 금액·용량·날짜가 다른 값으로 바뀌는 오역이 늘어납니다."
+        ),
+    )
     return parser
 
 
@@ -41,6 +50,7 @@ def main() -> None:
         language_pair=args.language_pair,
         num_workers=args.workers,
         num_threads=args.threads,
+        split_digits=args.split_digits,
     )
     print(model_path)
 

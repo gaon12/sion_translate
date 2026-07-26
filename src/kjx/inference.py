@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 from typing import Sequence
 
@@ -55,6 +56,17 @@ class Translator:
         device: str | torch.device | None = None,
     ):
         self.tokenizer = KJTokenizer(tokenizer_path)
+        if not self.tokenizer.splits_digits:
+            # split_digits 없이 학습된 토크나이저는 숫자를 덩어리로 암기하므로
+            # 금액·용량·날짜가 조용히 다른 값으로 바뀔 수 있습니다. 출력만 보고는
+            # 알아채기 어려우므로 로드 시점에 한 번 알립니다.
+            warnings.warn(
+                f"{tokenizer_path} 는 숫자를 자릿수로 분리하지 않습니다. "
+                "금액·용량·날짜가 다른 값으로 바뀔 수 있으니 숫자가 중요한 문장은 "
+                "사람이 검토하세요. 재학습 시에는 split_digits 를 켜십시오.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         self.model, self.model_config, self.pad_id = load_exported_model(model_path)
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
