@@ -44,6 +44,13 @@ NUMBER_PATTERN = re.compile(
     r"(?<![A-Za-z0-9_])[-+]?\d[\d,.:/%+\-]*\d|(?<![A-Za-z0-9_])[-+]?\d(?![0-9])"
 )
 
+# URL, 이메일, 코드 식별자처럼 번역하지 않고 그대로 옮겨야 하는 문자열.
+STRUCTURED_PATTERN = re.compile(
+    r"https?://[^\s]+|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|"
+    r"(?<![A-Za-z0-9])(?:[A-Z]{2,}[A-Z0-9_-]*|[A-Za-z]+[-_][A-Za-z0-9_-]+)"
+    r"(?![A-Za-z0-9])"
+)
+
 
 def normalized_matches(pattern: re.Pattern[str], text: str) -> list[str]:
     """NFKC 정규화 후 패턴에 걸린 표면형 목록. 전각 숫자도 반각과 같게 봅니다."""
@@ -63,6 +70,21 @@ def multiset_f1(expected: Sequence[object], actual: Sequence[object]) -> float:
     precision = overlap / sum(actual_counts.values())
     recall = overlap / sum(expected_counts.values())
     return 2.0 * precision * recall / max(precision + recall, 1e-12)
+
+
+def structured_tokens(text: str) -> list[str]:
+    """URL·이메일·식별자처럼 그대로 옮겨야 하는 문자열 목록."""
+    return normalized_matches(STRUCTURED_PATTERN, text)
+
+
+def has_excessive_repetition(text: str) -> bool:
+    """한 문자나 짧은 구절이 병적으로 반복되는 생성 붕괴를 판정합니다."""
+    surface = [char for char in text if not char.isspace()]
+    if len(surface) < 12:
+        return False
+    if Counter(surface).most_common(1)[0][1] / len(surface) >= 0.70:
+        return True
+    return re.search(r"(.{1,8})\1{4,}", "".join(surface)) is not None
 
 
 def numeric_tokens(text: str) -> list[str]:

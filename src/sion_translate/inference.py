@@ -106,7 +106,7 @@ class Translator:
         append_missing_glossary: bool = True,
         num_candidates: int = 0,
         rerank: str = "mbr+qe",
-        temperature: float = 0.7,
+        temperature: float = 0.3,
         top_k: int = 0,
         return_rerank_details: bool = False,
     ) -> list[str]:

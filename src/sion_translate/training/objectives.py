@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-from collections import Counter
 from dataclasses import dataclass
 import math
-import re
 
 import torch
 import torch.nn.functional as F
@@ -12,17 +10,15 @@ from torch import nn
 
 from sion_translate.config import PostTrainingConfig
 from sion_translate.data.quality import canonical_text, language_fraction
-from sion_translate.evaluation import multiset_f1, normalized_matches, numeric_tokens
+from sion_translate.evaluation import (
+    has_excessive_repetition,
+    multiset_f1,
+    numeric_tokens,
+    structured_tokens,
+)
 from sion_translate.tokenizer import SionTokenizer
 
 from .export import unwrap_model
-
-
-_STRUCTURED = re.compile(
-    r"https?://[^\s]+|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|"
-    r"(?<![A-Za-z0-9])(?:[A-Z]{2,}[A-Z0-9_-]*|[A-Za-z]+[-_][A-Za-z0-9_-]+)"
-    r"(?![A-Za-z0-9])"
-)
 
 
 @dataclass
@@ -42,15 +38,6 @@ class RewardOutput:
 
     reward: torch.Tensor
     components: dict[str, torch.Tensor]
-
-
-def _has_excessive_repetition(text: str) -> bool:
-    surface = [char for char in text if not char.isspace()]
-    if len(surface) < 12:
-        return False
-    if Counter(surface).most_common(1)[0][1] / len(surface) >= 0.70:
-        return True
-    return re.search(r"(.{1,8})\1{4,}", "".join(surface)) is not None
 
 
 class CompositeTranslationReward:
@@ -127,8 +114,7 @@ class CompositeTranslationReward:
         # 다른 것을 재면 사후학습이 개선했다는 항목이 리포트에 나타나지 않습니다.
         number = multiset_f1(numeric_tokens(reference_text), numeric_tokens(hypothesis))
         structured = multiset_f1(
-            normalized_matches(_STRUCTURED, reference_text),
-            normalized_matches(_STRUCTURED, hypothesis),
+            structured_tokens(reference_text), structured_tokens(hypothesis)
         )
         source_slots = [token_id for token_id in source_ids if token_id in self.slot_ids]
         candidate_slots = [token_id for token_id in candidate_ids if token_id in self.slot_ids]
@@ -155,7 +141,7 @@ class CompositeTranslationReward:
         }
         reward = sum(self.weights[name] * value for name, value in components.items())
         reward /= self.weight_sum
-        if _has_excessive_repetition(hypothesis):
+        if has_excessive_repetition(hypothesis):
             reward -= self.config.reward_repetition_penalty
         if canonical_text(source_text).casefold() == canonical_text(hypothesis).casefold():
             reward -= self.config.reward_copy_penalty

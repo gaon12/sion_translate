@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -19,6 +20,8 @@ from sion_translate.config import config_from_raw, load_raw_config
 from sion_translate.console import configure_stdio
 from sion_translate.glossary import load_glossary
 from sion_translate.inference import Translator, find_exported_model
+from sion_translate.iterative import refine_batch, summarize
+from sion_translate.rerank import STRATEGIES as RERANK_STRATEGIES
 
 DEFAULT_CONFIG_FILE = "sion_translate.yaml"
 
@@ -34,6 +37,52 @@ def build_parser() -> argparse.ArgumentParser:
         help="INT8 양자화 모델 사용 (CPU 전용, 용량·메모리 절감. 속도는 빨라지지 않음)",
     )
     parser.add_argument("--num-beams", type=int, default=4, help="beam 수 (1=greedy, 기본 4)")
+    parser.add_argument(
+        "--candidates",
+        type=int,
+        default=0,
+        help=(
+            "beam 결과에 더해 뽑을 확률적 후보 수 (0=재순위 없음). "
+            "재학습 없이 추론 계산량만 늘려 품질을 올리는 경로입니다."
+        ),
+    )
+    parser.add_argument(
+        "--rerank",
+        default="mbr+qe",
+        choices=RERANK_STRATEGIES,
+        help="후보 선택 방식 (기본 mbr+qe). --candidates 가 1 이상일 때만 적용",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.3,
+        help="후보 샘플링 온도 (기본 0.3 — 홀드아웃에서 0.7 보다 나았음)",
+    )
+    parser.add_argument(
+        "--top-k", type=int, default=0, help="후보 샘플링 top-k (0=제한 없음)"
+    )
+    parser.add_argument(
+        "--revise-rounds",
+        type=int,
+        default=0,
+        help=(
+            "초안 수정 최대 반복 횟수 (0=끔). 쉬운 문장은 한 번만 번역하고 "
+            "기준 미달 문장만 다시 고칩니다. sion-revise-data 로 만든 데이터로 "
+            "학습한 모델에서만 의미가 있습니다"
+        ),
+    )
+    parser.add_argument(
+        "--accept-score",
+        type=float,
+        default=0.95,
+        help="QE 점수가 이 값 이상이면 수정하지 않음 (기본 0.95)",
+    )
+    parser.add_argument(
+        "--min-gain",
+        type=float,
+        default=0.01,
+        help="한 라운드의 QE 개선이 이 값 미만이면 중단 (기본 0.01)",
+    )
     parser.add_argument("--length-penalty", type=float, default=1.0)
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument(
@@ -88,14 +137,61 @@ def main() -> None:
         raise SystemExit("번역할 문장이 없습니다.")
 
     print(f"[sion] 모델: {model_path} → {target} 로 번역", file=sys.stderr, flush=True)
-    for translated in translator.translate(
+    if args.candidates > 0:
+        print(
+            f"[sion] 후보 {args.candidates + 1}개(beam 1 + 샘플 {args.candidates})를 "
+            f"{args.rerank} 로 재순위",
+            file=sys.stderr,
+            flush=True,
+        )
+    translations = translator.translate(
         lines,
         target_language=target,
         num_beams=args.num_beams,
         length_penalty=args.length_penalty,
         max_new_tokens=args.max_new_tokens,
         glossary=glossary,
-    ):
+        num_candidates=args.candidates,
+        rerank=args.rerank,
+        temperature=args.temperature,
+        top_k=args.top_k,
+    )
+
+    if args.revise_rounds > 0:
+        if translator.tokenizer.draft_id is None:
+            raise SystemExit(
+                "이 토크나이저에는 <draft> 제어 토큰이 없어 --revise-rounds 를 쓸 수 "
+                "없습니다. sion-train-tokenizer 로 토크나이저를 다시 학습하고, "
+                "sion-revise-data 로 만든 데이터를 학습에 포함하십시오."
+            )
+
+        def revise_batch(sources: list[str], drafts: list[str]) -> list[str]:
+            return translator.revise(
+                sources,
+                drafts,
+                target_language=target,
+                num_beams=args.num_beams,
+                length_penalty=args.length_penalty,
+                max_new_tokens=args.max_new_tokens,
+            )
+
+        results = refine_batch(
+            lines,
+            translations,
+            revise_batch,
+            target_language=target,
+            accept_score=args.accept_score,
+            min_gain=args.min_gain,
+            max_rounds=args.revise_rounds,
+        )
+        translations = [result.text for result in results]
+        print(
+            f"[sion] 반복 수정: {json.dumps(summarize(results), ensure_ascii=False)}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    for translated in translations:
         print(translated, flush=True)
 
 
