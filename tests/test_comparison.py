@@ -17,11 +17,37 @@ from kjx.comparison import (
 )
 
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+SHIPPED_CASE_FILES = [
+    REPOSITORY_ROOT / "examples" / "comparison_cases.jsonl",
+    REPOSITORY_ROOT / "examples" / "diagnostic_cases.jsonl",
+]
+
+
 def _write_jsonl(path: Path, rows: list[dict[str, str]]) -> None:
     path.write_text(
         "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
         encoding="utf-8",
     )
+
+
+@pytest.mark.parametrize("path", SHIPPED_CASE_FILES, ids=lambda path: path.name)
+def test_shipped_case_files_load_and_stay_balanced(path: Path) -> None:
+    """저장소가 제공하는 진단셋이 스키마를 지키고 방향이 균형인지 확인한다."""
+    cases = load_comparison_cases(path)
+    assert len(cases) >= 16
+
+    directions: dict[str, int] = {}
+    for case in cases:
+        directions[f"{case.source_language}-{case.target_language}"] = (
+            directions.get(f"{case.source_language}-{case.target_language}", 0) + 1
+        )
+    # 한 방향으로 치우치면 방향별 점수를 비교할 수 없다.
+    assert set(directions) == {"ko-ja", "ja-ko"}
+    assert directions["ko-ja"] == directions["ja-ko"]
+
+    # 모든 케이스에 카테고리가 있어야 카테고리별 진단이 가능하다.
+    assert all(case.category != "general" for case in cases)
 
 
 def _cases(path: Path):

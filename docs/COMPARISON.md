@@ -20,6 +20,30 @@
 표의 강점은 품질 우승을 뜻하지 않습니다. 각 시스템이 제공하는 배포·제어 특성을
 뜻하며, 실제 품질은 동일한 JSONL 결과로 확인해야 합니다.
 
+## 두 개의 진단셋
+
+| 파일 | 문장 | 목적 |
+|---|---:|---|
+| `examples/comparison_cases.jsonl` | 16 | 언어 현상 중심. 존댓말, 동음이의어, 숫자, 기술 문자열, 구어체, 장문 의존성, 고유명사, 관용 표현 |
+| `examples/diagnostic_cases.jsonl` | 40 | 도메인 중심. 위 항목에 의료, 법률, 행정, 관광, 학술, 부정 표현을 추가하고 고유명사·숫자 케이스를 늘림 |
+
+둘 다 이 프로젝트용으로 새로 작성한 합성 문장이며 어떤 학습 코퍼스에도 포함되지
+않습니다. 40문장 쪽은 학습 데이터에 없는 도메인에서 품질이 어떻게 떨어지는지 보려고
+만들었으므로, in-domain holdout 점수와 함께 보면 일반화 격차를 가늠할 수 있습니다.
+
+두 파일 모두 스키마가 같으므로 `--cases` 를 바꿔 끼우면 됩니다.
+
+```bash
+kjx-translate-cases --backend kjx \
+  --cases examples/diagnostic_cases.jsonl \
+  --model runs/auto/posttrain/exports/best/model_ema.pt \
+  --tokenizer artifacts/tokenizer/kjx.model \
+  --output comparison_outputs/kjx-diagnostic.jsonl
+```
+
+40문장도 순위를 정하기에는 작습니다. 카테고리별로 2~4문장이므로 시스템 간 총점 차이
+보다 **어느 카테고리에서 무엇이 틀렸는지**를 보는 데 쓰십시오.
+
 ## 공정한 실행 규칙
 
 1. `examples/comparison_cases.jsonl`을 수정했다면 모든 시스템을 다시 실행합니다.

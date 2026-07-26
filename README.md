@@ -72,9 +72,18 @@ kjx-translate --model runs/auto/posttrain/exports/best/model_ema.pt --to ja "안
 
 ## 여러 번역 시스템 비교
 
-저장소가 제공하는 16개 문장은 모두 이 프로젝트용으로 새로 작성한 합성 예시입니다.
-존댓말, 동음이의어, 숫자, 기술 문자열, 구어체, 장문 의존성, 고유명사와 관용 표현을
-한국어→일본어와 일본어→한국어 양쪽에서 확인합니다.
+저장소는 두 개의 진단셋을 제공합니다. 모두 이 프로젝트용으로 새로 작성한 합성
+문장이며 어떤 학습 코퍼스에도 포함되지 않습니다.
+
+- [`examples/comparison_cases.jsonl`](examples/comparison_cases.jsonl) — 16문장.
+  존댓말, 동음이의어, 숫자, 기술 문자열, 구어체, 장문 의존성, 고유명사, 관용 표현.
+- [`examples/diagnostic_cases.jsonl`](examples/diagnostic_cases.jsonl) — 40문장.
+  위 항목에 의료, 법률, 행정, 관광, 학술, 부정 표현을 더하고 고유명사·숫자 케이스를
+  늘렸습니다. 학습 데이터에 없는 도메인에서 품질이 얼마나 떨어지는지 보기 위한
+  셋이므로, 자체 holdout 점수와 함께 보면 일반화 격차를 가늠할 수 있습니다.
+
+둘 다 한국어→일본어와 일본어→한국어를 같은 수로 담고 있고 스키마가 같으므로
+`--cases`만 바꿔 끼우면 됩니다.
 
 비교 대상은 KJ-X, LibreTranslate, Papago, Google Cloud Translation, DeepL,
 M2M100 418M, NLLB-200 distilled 600M입니다. 실제 서비스 출력이나 점수는 저장소에
