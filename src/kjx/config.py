@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -45,6 +46,25 @@ class ExperimentalConfig:
         ):
             if value < 0:
                 raise ValueError(f"experimental.{name} must be non-negative")
+
+        # 모듈을 켜 두고 그 보조 손실 가중치를 모두 0으로 두면 파라미터와 순전파
+        # 비용만 늘고 학습 신호는 없습니다. 조용히 낭비되므로 알려 줍니다.
+        if self.bats_enabled and not (self.bats_loss_weight or self.bats_coverage_weight):
+            warnings.warn(
+                "experimental.bats_enabled 가 켜져 있지만 bats_loss_weight 와 "
+                "bats_coverage_weight 가 모두 0 입니다. 연산과 파라미터만 늘고 "
+                "학습되는 것은 없습니다 — 가중치를 주거나 bats_enabled 를 끄십시오.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        if self.core_enabled and not self.register_loss_weight:
+            warnings.warn(
+                "experimental.core_enabled 가 켜져 있지만 register_loss_weight 가 "
+                "0 입니다. register 분류기가 학습되지 않습니다 — 가중치를 주거나 "
+                "core_enabled 를 끄십시오.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
 
 @dataclass
