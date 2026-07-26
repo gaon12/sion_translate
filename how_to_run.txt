@@ -68,6 +68,14 @@ kjx-prepare-data --input "data/*.jsonl" --tokenizer artifacts/tokenizer/kjx.mode
 artifacts/tokenizer와 artifacts/dataset이 생깁니다. 입력이 바뀌지 않았다면 이후에는
 이 단계를 다시 하지 않아도 됩니다.
 
+kjx-train-tokenizer는 숫자를 한 자리씩 분리해 학습합니다(기본값). 이 옵션 없이 만든
+토크나이저는 금액·용량·날짜를 다른 값으로 바꿔 쓰는 오역을 일으키므로,
+--no-split-digits는 기존 산출물을 재현할 때만 쓰십시오.
+
+토크나이저를 다시 만들면 vocab이 바뀝니다. 그러면 artifacts/dataset의 기존 shard와
+이전 체크포인트는 그대로 쓸 수 없으므로, 4단계를 처음부터 다시 실행하고 학습도
+새로 시작해야 합니다.
+
 
 5. 보이는 GPU를 모두 사용해 학습
 

@@ -8,7 +8,9 @@ joint SentencePiece, GQA, RoPE, pre-RMSNorm, QK-norm, SwiGLU, EMA, 양방향 번
 포함하지 않습니다. 사용자는 이용·가공·재배포 권한을 직접 확인한 JSONL만 준비해야
 합니다. 공개 모델 가중치는 별도
 [Hugging Face 저장소](https://huggingface.co/gaon12/sion_translate)에서 제공합니다.
-모델 페이지에는 양방향 입력과 실제 출력 예시를 보여 주는 inference widget이 있습니다.
+모델 페이지의 widget에는 양방향 입력 예시와 그에 대해 미리 생성해 둔 출력이 적혀
+있습니다. 이 모델은 Transformers `AutoModel` 체크포인트가 아니므로 hosted inference로
+그 자리에서 실행되지는 않습니다. 직접 돌려 보려면 아래 설치 절차를 따르십시오.
 
 ## 빠른 시작
 
@@ -49,6 +51,18 @@ kjx-translate --to ja "회의는 세 시에 시작합니다."
 kjx-translate --to ko "会議は三時に始まります。"
 kjx-translate --to ja --int8 "CPU에서 번역합니다."
 ```
+
+`--int8`은 모델 파일과 메모리 사용량을 줄이는 옵션입니다. 같은 CPU에서 측정하면
+생성 속도는 FP32와 사실상 같으므로, 속도가 목표라면 `--num-beams`를 낮추십시오.
+
+### 숫자가 있는 문장 주의
+
+금액·용량·날짜가 들어간 문장은 번역 결과를 반드시 대조하십시오. 토크나이저가 숫자를
+자릿수로 분리하지 않고 학습된 경우 (2026-07 이전에 만든 토크나이저가 모두 해당)
+모델이 값을 누락하는 대신 **그럴듯한 다른 값으로 바꿔 쓸** 수 있습니다. 실제로
+관측된 예: `250mg` → `1200mg`, `0.5mL` → `120ml`, `38,720円` → `38,000엔`.
+해당 토크나이저를 불러오면 `Translator`가 경고를 한 번 출력합니다. 재학습할 때는
+`kjx-train-tokenizer`의 기본값(숫자 분리 켜짐)을 그대로 쓰십시오.
 
 직접 모델 파일을 지정할 수도 있습니다.
 
@@ -125,8 +139,25 @@ kjx-compare \
 
 결과는 `reports/comparison-*.json`과 문장별 나란히 보기가 포함된 Markdown으로
 저장됩니다. chrF와 문자 단위 BLEU는 보조 지표이며, 16문장 결과를 보편적인 서비스
-순위로 해석하면 안 됩니다. 의미 보존, 높임말, 용어 일관성과 숫자 보존을 사람이 함께
-검토해야 합니다.
+순위로 해석하면 안 됩니다. 의미 보존, 높임말, 용어 일관성을 사람이 함께 검토해야
+합니다.
+
+표에는 `숫자 F1`과 `숫자 일치` 열도 함께 나옵니다. chrF는 문자 n-gram이 대부분
+겹치면 높은 점수를 주므로 값 하나만 바뀐 오역을 거의 벌하지 않기 때문에, 금액·용량·
+날짜 보존은 따로 집계합니다. chrF가 가장 높은 시스템이 숫자에서는 가장 나쁠 수
+있으므로 두 열을 함께 보십시오.
+
+### 자체 holdout 점수를 인용할 때
+
+`kjx-evaluate`가 `--dataset-dir`의 test split으로 내는 점수는 학습 데이터와 같은
+출처에서 잘라낸 in-domain holdout입니다. 누수는 막혀 있지만 도메인은 겹치므로,
+학습에 쓰지 않은 도메인의 문장에서는 점수가 크게 낮아집니다. 이 저장소의 데이터
+구성으로 측정했을 때 in-domain chrF와 도메인 밖 chrF의 차이는 20점을 넘었습니다.
+대외적으로 숫자를 제시할 때는 어느 쪽인지 함께 밝히고, 도메인별 고정 benchmark를
+따로 두십시오 (`kjx-prepare-benchmark`).
+
+FLORES-200을 학습에 포함했다면 `kjx-prepare-benchmark`로 만든 FLORES 점수는 자기
+채점이므로 인용할 수 없습니다. 학습에 넣을지, 평가에 쓸지 중 하나만 선택하십시오.
 
 서비스별 비교 관점과 라이선스 주의사항은
 [`docs/COMPARISON.md`](docs/COMPARISON.md)에 정리했습니다.
@@ -143,6 +174,9 @@ kjx-prepare-data --input "data/*.jsonl" \
   --output-dir artifacts/dataset
 kjx-train --config configs/kjx_data_fit.yaml
 ```
+
+토크나이저를 다시 만들면 vocab이 달라지므로 `artifacts/dataset`과 기존 체크포인트는
+재사용할 수 없습니다. 위 세 단계를 순서대로 다시 실행해야 합니다.
 
 다중 GPU에서는 다음처럼 실행합니다.
 

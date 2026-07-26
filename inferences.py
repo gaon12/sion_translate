@@ -4,8 +4,11 @@
     python inferences.py --to ja "오늘 날씨가 좋습니다."
     python inferences.py --quality accurate --thinking high --to ko < input.txt
     python inferences.py --quality best --to ja --input input.txt
-    python inferences.py --int8 --quality fast --to ja --input input.txt
+    python inferences.py --int8 --to ja --input input.txt
     python inferences.py --quality best --batch-size 1 --profile --to ja --input input.txt
+
+``--int8``은 용량과 메모리를 줄이는 옵션이며 속도 옵션이 아닙니다.
+품질/속도는 ``--quality``로만 조절하십시오.
 
 ``thinking``은 번역 모델의 숨은 사고 과정을 출력하는 기능이 아닙니다.
 이 모델은 번역 전용 seq2seq 모델이므로, 여기서는 더 넓은 beam 탐색에
@@ -140,7 +143,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--int8",
         action="store_true",
-        help="CPU용 INT8 export 모델을 사용합니다.",
+        help=(
+            "CPU용 INT8 export 모델을 사용합니다. 파일과 메모리가 작아지지만 "
+            "번역 속도는 빨라지지 않습니다 (--quality fast 와는 무관)."
+        ),
     )
 
     parser.add_argument(

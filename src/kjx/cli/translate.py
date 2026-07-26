@@ -28,7 +28,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("text", nargs="*", help="번역할 문장 (없으면 표준 입력에서 줄 단위로 읽음)")
     parser.add_argument("--to", dest="target", help="목표 언어 (기본: 언어쌍의 두 번째, ko-ja 면 ja)")
     parser.add_argument("--model", help="내보낸 모델 경로 (기본: exports 에서 자동 탐색)")
-    parser.add_argument("--int8", action="store_true", help="INT8 양자화 모델 사용 (CPU 추론)")
+    parser.add_argument(
+        "--int8",
+        action="store_true",
+        help="INT8 양자화 모델 사용 (CPU 전용, 용량·메모리 절감. 속도는 빨라지지 않음)",
+    )
     parser.add_argument("--num-beams", type=int, default=4, help="beam 수 (1=greedy, 기본 4)")
     parser.add_argument("--length-penalty", type=float, default=1.0)
     parser.add_argument("--max-new-tokens", type=int, default=256)
