@@ -25,8 +25,27 @@ class ExperimentalConfig:
     morphoscript_enabled: bool = False
     morphoscript_interval: int = 4
     script_classes: int = 9
+    # 공유 블록 반복(latent reasoning): 인코더 마지막 N개 층을 같은 가중치로
+    # 여러 번 통과시켜, 파라미터를 늘리지 않고 깊이만 늘립니다. 명시적 사고
+    # 토큰 없이 hidden state 안에서 추가 계산을 하게 하는 구조입니다.
+    # 0 이면 꺼짐 — 기본이 꺼져 있어야 기존 체크포인트가 그대로 동작합니다.
+    recurrent_block_layers: int = 0
+    recurrent_steps: int = 1
 
     def validate(self) -> None:
+        if self.recurrent_block_layers < 0:
+            raise ValueError("experimental.recurrent_block_layers must be non-negative")
+        if self.recurrent_steps < 1:
+            raise ValueError("experimental.recurrent_steps must be at least 1")
+        if self.recurrent_block_layers and self.recurrent_steps == 1:
+            warnings.warn(
+                "experimental.recurrent_block_layers 가 설정됐지만 recurrent_steps 가 "
+                "1 입니다. 한 번만 통과하면 일반 층과 같으므로 반복 계산이 없습니다 — "
+                "recurrent_steps 를 2 이상으로 두거나 recurrent_block_layers 를 0 으로 "
+                "두십시오.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         for name, value in (
             ("bats_dim", self.bats_dim),
             ("bats_stride", self.bats_stride),

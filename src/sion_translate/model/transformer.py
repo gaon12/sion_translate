@@ -81,6 +81,12 @@ class SionForConditionalGeneration(nn.Module):
         self.decoder_layers = nn.ModuleList(
             [DecoderLayer(**layer_args, rope=self.decoder_rope) for _ in range(config.decoder_layers)]
         )
+        # 공유 블록 반복 설정. 가중치를 새로 만들지 않으므로 state_dict 가 바뀌지
+        # 않습니다 — 기존 체크포인트를 그대로 불러올 수 있습니다.
+        self.recurrent_block_layers = min(
+            config.experimental.recurrent_block_layers, config.encoder_layers
+        )
+        self.recurrent_steps = max(1, config.experimental.recurrent_steps)
         self.encoder_norm = RMSNorm(config.d_model, config.rms_norm_eps)
         self.decoder_norm = RMSNorm(config.d_model, config.rms_norm_eps)
         self.lm_head = None if config.tie_embeddings else nn.Linear(
@@ -183,8 +189,15 @@ class SionForConditionalGeneration(nn.Module):
                 src_coda_ids if src_coda_ids is not None else zero,
             )
         interval = max(1, self.config.experimental.morphoscript_interval)
+        # 공유 블록 반복: 마지막 recurrent_block_layers 개 층을 recurrent_steps 번
+        # 통과시킵니다. 같은 가중치를 재사용하므로 파라미터는 늘지 않고 유효 깊이만
+        # 늘어납니다. 0 이면 아래 루프가 원래대로 각 층을 한 번씩만 돕니다.
+        block_size = min(self.recurrent_block_layers, len(self.encoder_layers))
+        boundary = len(self.encoder_layers) - block_size
         for index, layer in enumerate(self.encoder_layers):
-            hidden = self._checkpoint(layer, hidden, attention_mask)
+            repeats = self.recurrent_steps if index >= boundary and block_size else 1
+            for _ in range(repeats):
+                hidden = self._checkpoint(layer, hidden, attention_mask)
             if side_states is not None and (index + 1) % interval == 0:
                 hidden = hidden + torch.tanh(self.morph_gates[index]) * side_states
         return self.encoder_norm(hidden)
