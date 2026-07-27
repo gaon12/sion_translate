@@ -48,9 +48,14 @@ from sion_translate.data import (
     IndexedParallelDataset,
     SionBatchCollator,
 )
-from sion_translate.fingerprint import DatasetFingerprint
+from sion_translate.fingerprint import DatasetFingerprint, file_sha256
 from sion_translate.model import SionForConditionalGeneration
-from sion_translate.tokenizer import SionTokenizer
+from sion_translate.tokenizer import (
+    SionTokenizer,
+    load_tokenizer_metadata,
+    tokenizer_split_digits_policy,
+    write_tokenizer_metadata,
+)
 from sion_translate.training.distributed import (
     DistributedContext,
     barrier,
@@ -146,6 +151,66 @@ def release_stage_resources(
     }
 
 
+def find_existing_checkpoint(config: AppConfig) -> Path | None:
+    """Find any checkpoint that constrains the tokenizer vocabulary identity."""
+
+    if config.training.resume_from:
+        explicit = Path(config.training.resume_from)
+        if explicit.exists():
+            return explicit
+    run_root = Path(config.training.output_dir)
+    for stage_root in (run_root, run_root / "pretrain", run_root / "posttrain"):
+        checkpoint_root = stage_root / "checkpoints"
+        if not checkpoint_root.is_dir():
+            continue
+        for candidate in sorted(checkpoint_root.iterdir()):
+            if (candidate / "checkpoint.pt").is_file() or (candidate / ".metadata").exists():
+                return candidate
+    return None
+
+
+def tokenizer_policy_problem(
+    tokenizer_path: str | Path,
+    language_pairs: tuple[tuple[str, str], ...],
+) -> str | None:
+    """Return a concrete compatibility problem for a tokenizer, if any."""
+
+    tokenizer_path = Path(tokenizer_path)
+    try:
+        tokenizer = SionTokenizer(tokenizer_path)
+        metadata = load_tokenizer_metadata(tokenizer_path)
+        recorded_policy = tokenizer_split_digits_policy(tokenizer_path)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        return f"토크나이저 정책/메타데이터를 읽을 수 없습니다: {exc}"
+
+    if not tokenizer.splits_digits:
+        return "토크나이저가 여러 자리 숫자를 한 자리씩 분리하지 않습니다 (split_digits=False 동작)"
+    if recorded_policy is False:
+        return "tokenizer_metadata.json에 split_digits=false가 기록되어 있습니다"
+    if recorded_policy is None or metadata is None:
+        return "버전 2 이상의 tokenizer_metadata.json이 없습니다"
+
+    recorded_hash = metadata.get("model_sha256")
+    if recorded_hash != file_sha256(tokenizer_path):
+        return "tokenizer_metadata.json의 model_sha256이 실제 모델과 다릅니다"
+    vocab_path = tokenizer_path.with_suffix(".vocab")
+    if not vocab_path.is_file() or metadata.get("vocab_sha256") != file_sha256(vocab_path):
+        return "tokenizer_metadata.json의 vocab_sha256이 실제 vocabulary와 다릅니다"
+    raw_pairs = metadata.get("language_pairs")
+    recorded_pairs = (
+        tuple((str(pair[0]), str(pair[1])) for pair in raw_pairs)
+        if isinstance(raw_pairs, list)
+        and all(isinstance(pair, list) and len(pair) == 2 for pair in raw_pairs)
+        else ()
+    )
+    if recorded_pairs != language_pairs:
+        return (
+            "tokenizer_metadata.json의 language_pairs가 현재 설정과 다릅니다 "
+            f"(metadata={recorded_pairs}, config={language_pairs})"
+        )
+    return None
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Train sion_translate. 인자 없이 실행하면 환경/데이터를 자동 인식합니다."
@@ -228,10 +293,16 @@ def ensure_artifacts(config: AppConfig, context: DistributedContext) -> None:
         dataset_dir = Path(config.data.dataset_dir)
         files = scan_configured_raw_data(config, data_dir, tokenizer_path)
         dataset_ready = (dataset_dir / "manifest.json").exists()
+        existing_checkpoint = find_existing_checkpoint(config)
 
         if not files and not dataset_ready:
             raise FileNotFoundError(
                 f"원천 데이터({data_dir}/*.jsonl)도 준비된 데이터셋({dataset_dir})도 없습니다."
+            )
+        if not tokenizer_path.is_file() and dataset_ready and not files:
+            raise FileNotFoundError(
+                f"준비된 데이터셋은 있지만 대응하는 토크나이저가 없습니다: {tokenizer_path}. "
+                "원천 데이터와 새 출력 경로를 지정해 새 run을 시작하세요."
             )
 
         if files:
@@ -250,6 +321,13 @@ def ensure_artifacts(config: AppConfig, context: DistributedContext) -> None:
             )
             # ── 토크나이저 ────────────────────────────────────────────
             if not tokenizer_path.exists():
+                if existing_checkpoint is not None:
+                    raise RuntimeError(
+                        "기존 체크포인트가 있지만 대응하는 토크나이저가 없습니다. "
+                        f"checkpoint={existing_checkpoint}. 기존 vocabulary를 추측해 "
+                        "새 토크나이저로 덮어쓸 수 없습니다. tokenizer_model, dataset_dir, "
+                        "training.output_dir을 새 경로로 지정해 새 run을 시작하세요."
+                    )
                 from sion_translate.tokenizer import train_tokenizer
 
                 pair_estimate = estimate_pair_count(files, data_dir)
@@ -272,6 +350,39 @@ def ensure_artifacts(config: AppConfig, context: DistributedContext) -> None:
                 files = scan_configured_raw_data(config, data_dir, tokenizer_path)
 
             # ── 데이터셋 (지문 기반 변경 감지) ─────────────────────────
+            policy_problem = tokenizer_policy_problem(
+                tokenizer_path,
+                config.data.configured_language_pairs(),
+            )
+            if policy_problem is not None:
+                existing_tokenizer = SionTokenizer(tokenizer_path)
+                if (
+                    existing_checkpoint is None
+                    and existing_tokenizer.splits_digits
+                    and load_tokenizer_metadata(tokenizer_path) is None
+                ):
+                    write_tokenizer_metadata(
+                        tokenizer_path,
+                        split_digits=True,
+                        language_pairs=config.data.configured_language_pairs(),
+                    )
+                    files = scan_configured_raw_data(config, data_dir, tokenizer_path)
+                    policy_problem = tokenizer_policy_problem(
+                        tokenizer_path,
+                        config.data.configured_language_pairs(),
+                    )
+                if policy_problem is not None:
+                    checkpoint_detail = (
+                        f" 기존 checkpoint={existing_checkpoint}와 vocabulary 호환성을 "
+                        "깨뜨리는 자동 재학습은 수행하지 않습니다."
+                        if existing_checkpoint is not None
+                        else ""
+                    )
+                    raise RuntimeError(
+                        f"{policy_problem}.{checkpoint_detail} tokenizer_model, dataset_dir, "
+                        "training.output_dir을 새 경로로 지정하고 split_digits=True로 "
+                        "토크나이저부터 재학습하는 새 run을 시작하세요."
+                    )
             existing_tokenizer = SionTokenizer(tokenizer_path)
             if set(existing_tokenizer.languages) != set(config.data.languages):
                 raise RuntimeError(

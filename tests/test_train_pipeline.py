@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import torch
 
 from sion_translate.cli.train import (
     dataloader_runtime_kwargs,
+    find_existing_checkpoint,
     release_stage_resources,
     shutdown_dataloader,
+    tokenizer_policy_problem,
 )
-from sion_translate.config import config_from_raw
+from sion_translate.config import AppConfig, config_from_raw
+from sion_translate.fingerprint import file_sha256
 from sion_translate.training.distributed import DistributedContext
 from sion_translate.training.distributed import (
     fsdp_reduce_dtype,
@@ -116,3 +121,55 @@ def test_parallel_strategy_config_rejects_ambiguous_legacy_override() -> None:
         assert "cannot both be set" in str(exc)
     else:
         raise AssertionError("ambiguous parallel settings must be rejected")
+
+
+def test_existing_checkpoint_search_covers_stage_directories(tmp_path: Path) -> None:
+    config = AppConfig()
+    config.training.output_dir = str(tmp_path / "run")
+    assert find_existing_checkpoint(config) is None
+
+    checkpoint = tmp_path / "run" / "pretrain" / "checkpoints" / "latest"
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "checkpoint.pt").write_bytes(b"weights")
+    assert find_existing_checkpoint(config) == checkpoint
+
+
+def test_tokenizer_policy_requires_digit_splitting_and_matching_identity(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    model_path = tmp_path / "sion.model"
+    model_path.write_bytes(b"tokenizer")
+    vocab_path = tmp_path / "sion.vocab"
+    vocab_path.write_bytes(b"vocabulary")
+    pairs = (("ko", "ja"),)
+
+    class DigitTokenizer:
+        splits_digits = True
+
+    metadata = {
+        "version": 2,
+        "split_digits": True,
+        "model_sha256": file_sha256(model_path),
+        "vocab_sha256": file_sha256(vocab_path),
+        "language_pairs": [["ko", "ja"]],
+    }
+    monkeypatch.setattr("sion_translate.cli.train.SionTokenizer", lambda _: DigitTokenizer())
+    monkeypatch.setattr(
+        "sion_translate.cli.train.load_tokenizer_metadata",
+        lambda _: metadata,
+    )
+    monkeypatch.setattr(
+        "sion_translate.cli.train.tokenizer_split_digits_policy",
+        lambda _: True,
+    )
+    assert tokenizer_policy_problem(model_path, pairs) is None
+
+    class MergedDigitTokenizer:
+        splits_digits = False
+
+    monkeypatch.setattr(
+        "sion_translate.cli.train.SionTokenizer",
+        lambda _: MergedDigitTokenizer(),
+    )
+    assert "split_digits=False" in str(tokenizer_policy_problem(model_path, pairs))
