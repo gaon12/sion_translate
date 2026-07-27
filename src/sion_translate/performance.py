@@ -61,7 +61,10 @@ def build_cpu_plan(*, world_size: int = 1, input_files: int | None = None) -> Cp
     per_rank = max(1, available // ranks)
     # Each rank owns its own DataLoader pool. Leave one execution slot per rank
     # for the training process and cap workers at the rank's CPU allocation.
-    dataloader_workers = max(0, per_rank - 1)
+    # Hundreds of workers per rank increase process scheduling and leave several
+    # persistent pools alive during validation/stage transitions. A bounded pool
+    # with deeper prefetching feeds H100-class GPUs more reliably.
+    dataloader_workers = min(16, max(0, per_rank - 1))
     return CpuPlan(
         available=available,
         preprocess_workers=preprocess_workers,

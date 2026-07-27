@@ -21,8 +21,10 @@ from __future__ import annotations
 
 import argparse
 import copy
+import gc
 import random
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -54,12 +56,75 @@ from sion_translate.training.distributed import (
     cleanup_distributed,
     initialize_distributed,
     parallelize_model,
+    resolve_parallel_strategy,
 )
 from sion_translate.training.objectives import MinimumRiskObjective
 from sion_translate.training.trainer import announce, train
 from sion_translate.performance import build_cpu_plan
 
 DEFAULT_CONFIG_FILE = "sion_translate.yaml"
+
+
+def dataloader_runtime_kwargs(
+    num_workers: int,
+    device: torch.device,
+    *,
+    training: bool,
+) -> dict[str, Any]:
+    """Build stage-specific loader settings without retaining idle worker pools."""
+
+    workers = max(0, num_workers)
+    options: dict[str, Any] = {
+        "num_workers": workers,
+        "pin_memory": device.type == "cuda",
+    }
+    if workers > 0:
+        options.update(
+            {
+                "persistent_workers": training,
+                "prefetch_factor": 4 if training else 2,
+            }
+        )
+    return options
+
+
+def shutdown_dataloader(loader: DataLoader | None) -> None:
+    """Stop a persistent DataLoader pool before constructing the next stage."""
+
+    if loader is None:
+        return
+    iterator = getattr(loader, "_iterator", None)
+    shutdown = getattr(iterator, "_shutdown_workers", None)
+    if callable(shutdown):
+        shutdown()
+    if iterator is not None:
+        loader._iterator = None
+
+
+def release_stage_resources(
+    context: DistributedContext,
+    *loaders: DataLoader | None,
+) -> dict[str, float]:
+    """Release CPU workers and CUDA cache at a pretrain/posttrain boundary."""
+
+    for loader in loaders:
+        shutdown_dataloader(loader)
+    gc.collect()
+    if context.device.type != "cuda":
+        return {}
+    torch.cuda.synchronize(context.device)
+    before_allocated = torch.cuda.memory_allocated(context.device) / 2**30
+    before_reserved = torch.cuda.memory_reserved(context.device) / 2**30
+    torch.cuda.empty_cache()
+    after_allocated = torch.cuda.memory_allocated(context.device) / 2**30
+    after_reserved = torch.cuda.memory_reserved(context.device) / 2**30
+    torch.cuda.reset_peak_memory_stats(context.device)
+    return {
+        "before_allocated_gib": before_allocated,
+        "before_reserved_gib": before_reserved,
+        "after_allocated_gib": after_allocated,
+        "after_reserved_gib": after_reserved,
+    }
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -184,7 +249,6 @@ def ensure_artifacts(config: AppConfig, context: DistributedContext) -> None:
                     num_threads=cpu_plan.sentencepiece_threads,
                 )
                 announce("토크나이저 학습 완료.", context)
-
             # ── 데이터셋 (지문 기반 변경 감지) ─────────────────────────
             existing_tokenizer = SionTokenizer(tokenizer_path)
             if set(existing_tokenizer.languages) != set(config.data.languages):
@@ -199,7 +263,8 @@ def ensure_artifacts(config: AppConfig, context: DistributedContext) -> None:
             if dataset_ready and stored is None:
                 # 수동으로 준비한 데이터셋: 현재 파일 목록을 지문으로 채택합니다.
                 announce(
-                    "기존 데이터셋에 지문이 없어 현재 원천 데이터 기준으로 기록합니다.", context
+                    "기존 데이터셋에 지문이 없어 현재 원천 데이터 기준으로 기록합니다.",
+                    context,
                 )
                 write_fingerprint(dataset_dir, files)
             elif not dataset_ready or stored != files:
@@ -350,29 +415,42 @@ def main() -> None:
             bucket_size=config.data.bucket_size,
             seed=config.training.seed + 1,
         )
-        loader_args = dict(
-            num_workers=config.data.num_workers,
-            pin_memory=context.device.type == "cuda",
-            persistent_workers=config.data.num_workers > 0,
+        train_loader_args = dataloader_runtime_kwargs(
+            config.data.num_workers,
+            context.device,
+            training=True,
+        )
+        validation_workers = (
+            0 if config.data.num_workers == 0 else min(4, max(1, config.data.num_workers // 4))
+        )
+        validation_loader_args = dataloader_runtime_kwargs(
+            validation_workers,
+            context.device,
+            training=False,
         )
         train_loader = DataLoader(
             train_dataset,
             batch_sampler=train_sampler,
             collate_fn=train_collator,
-            **loader_args,
+            **train_loader_args,
         )
         validation_loader = DataLoader(
             validation_dataset,
             batch_sampler=validation_sampler,
             collate_fn=validation_collator,
-            **loader_args,
+            **validation_loader_args,
         )
 
         # ── 모델 생성과 분산 배치 ────────────────────────────────────────
         announce("모델을 생성하고 장치에 배치합니다.", context)
         # FSDP2 에서는 meta device 로 '빈 모델'을 먼저 만들고, shard 이후에
         # 실제 메모리를 할당해 대형 모델도 rank 당 메모리 한도 안에서 생성합니다.
-        materialize_meta = context.distributed and config.training.fsdp2
+        parallel_strategy = resolve_parallel_strategy(
+            config.training.parallel_strategy,
+            context,
+            legacy_fsdp2=config.training.fsdp2,
+        )
+        materialize_meta = parallel_strategy == "fsdp2"
         construction_device = "meta" if materialize_meta else context.device
         with torch.device(construction_device):
             model = SionForConditionalGeneration(config.model, pad_id=tokenizer.pad_id)
@@ -391,8 +469,10 @@ def main() -> None:
         model = parallelize_model(
             model,
             context,
+            strategy=config.training.parallel_strategy,
             use_fsdp2=config.training.fsdp2,
             precision=config.training.precision,
+            reduce_dtype=config.training.fsdp_reduce_dtype,
             reshard_after_forward=config.training.reshard_after_forward,
             materialize_meta=materialize_meta,
             find_unused_parameters=has_conditional_parameters,
@@ -401,7 +481,10 @@ def main() -> None:
             model = torch.compile(model)
         # 여기서부터의 난수(dropout, denoising 등)는 rank 별로 달라야 합니다.
         seed_everything(config.training.seed, context.rank)
-        announce(f"모델 파라미터 수: {parameter_count:,}", context)
+        announce(
+            f"모델 파라미터 수: {parameter_count:,}; 병렬 전략: {parallel_strategy}",
+            context,
+        )
 
         # ── 단계 ⑥: SFT 사전학습 ───────────────────────────────────────
         announce("1단계 SFT 사전학습을 시작합니다.", context)
@@ -413,6 +496,20 @@ def main() -> None:
             context,
             stage_name="pretrain/SFT",
         )
+        barrier(context)
+        memory = release_stage_resources(context, train_loader, validation_loader)
+        del train_loader, validation_loader
+        del train_sampler, validation_sampler
+        del train_collator, validation_collator
+        if memory:
+            announce(
+                "사전학습 메모리 정리: "
+                f"allocated {memory['before_allocated_gib']:.2f}→"
+                f"{memory['after_allocated_gib']:.2f} GiB, "
+                f"reserved {memory['before_reserved_gib']:.2f}→"
+                f"{memory['after_reserved_gib']:.2f} GiB",
+                context,
+            )
 
         # ── 단계 ⑦: MRT 사후학습 ───────────────────────────────────────
         if config.posttraining.enabled:
@@ -451,11 +548,25 @@ def main() -> None:
                 source_sampling_weights=config.data.source_sampling_weights,
                 max_source_upsampling=config.data.max_source_upsampling,
             )
+            post_validation_sampler = DistributedBucketBatchSampler(
+                validation_dataset,
+                post.eval_batch_size_per_gpu,
+                rank=context.rank,
+                world_size=context.world_size,
+                bucket_size=config.data.bucket_size,
+                seed=config.training.seed + 3,
+            )
             post_loader = DataLoader(
                 train_dataset,
                 batch_sampler=post_sampler,
                 collate_fn=post_collator,
-                **loader_args,
+                **train_loader_args,
+            )
+            post_validation_loader = DataLoader(
+                validation_dataset,
+                batch_sampler=post_validation_sampler,
+                collate_fn=post_collator,
+                **validation_loader_args,
             )
             objective = MinimumRiskObjective(tokenizer, post)
             announce(
@@ -468,12 +579,27 @@ def main() -> None:
             train(
                 model,
                 post_loader,
-                validation_loader,
+                post_validation_loader,
                 post_config,
                 context,
                 objective=objective,
                 stage_name="posttrain/composite-MRT+preference",
             )
+            barrier(context)
+            memory = release_stage_resources(
+                context,
+                post_loader,
+                post_validation_loader,
+            )
+            if memory:
+                announce(
+                    "사후학습 메모리 정리: "
+                    f"allocated {memory['before_allocated_gib']:.2f}→"
+                    f"{memory['after_allocated_gib']:.2f} GiB, "
+                    f"reserved {memory['before_reserved_gib']:.2f}→"
+                    f"{memory['after_reserved_gib']:.2f} GiB",
+                    context,
+                )
         else:
             announce("posttraining.enabled=false — 사후학습을 건너뜁니다.", context)
     finally:

@@ -35,6 +35,7 @@ from .distributed import (
     DistributedContext,
     broadcast_bool,
     maybe_no_sync,
+    reduce_max,
     reduce_sum,
 )
 from .ema import EMAWeights
@@ -77,9 +78,7 @@ def cosine_scheduler(
     return torch.optim.lr_scheduler.LambdaLR(optimizer, schedule)
 
 
-def build_optimizer_param_groups(
-    model: nn.Module, weight_decay: float
-) -> list[dict[str, Any]]:
+def build_optimizer_param_groups(model: nn.Module, weight_decay: float) -> list[dict[str, Any]]:
     """AdamW weight decay 를 '행렬 형태의 가중치'에만 적용하도록 파라미터를 두 그룹으로 나눕니다.
 
     norm 가중치, bias, 1차원 게이트 같은 파라미터에 decay 를 걸면
@@ -119,7 +118,10 @@ def _make_grad_scaler(training: TrainingConfig, context: DistributedContext):
     bf16/fp32 에서는 비활성 상태의 scaler 가 반환되어 아무 일도 하지 않습니다.
     """
     enabled = context.device.type == "cuda" and training.precision.lower() == "fp16"
-    if enabled and context.distributed and training.fsdp2:
+    fsdp_enabled = training.parallel_strategy.lower() == "fsdp2" or (
+        training.parallel_strategy.lower() == "auto" and training.fsdp2 is True
+    )
+    if enabled and context.distributed and fsdp_enabled:
         from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
 
         return ShardedGradScaler(device="cuda", enabled=True)
@@ -144,7 +146,9 @@ def _make_summary_writer(
         ) from exc
     if not context.is_main:
         return None
-    log_dir = Path(training.tensorboard_dir) if training.tensorboard_dir else output_dir / "tensorboard"
+    log_dir = (
+        Path(training.tensorboard_dir) if training.tensorboard_dir else output_dir / "tensorboard"
+    )
     return SummaryWriter(
         log_dir=str(log_dir),
         purge_step=start_step if start_step > 0 else None,
@@ -334,13 +338,15 @@ def train(
     last_train_loss: float | None = None
     micro_step = 0
     # SFT는 token 수, MRT는 source 문장 수를 gradient 정규화 분모로 씁니다.
-    accumulated_local_normalizer = torch.zeros(
-        (), device=context.device, dtype=torch.float64
-    )
+    accumulated_local_normalizer = torch.zeros((), device=context.device, dtype=torch.float64)
     # [loss 합, 정규화 분모, 보조 loss 합, 보조 분모, 실제 처리 token 수]
     window = torch.zeros(5, device=context.device, dtype=torch.float64)
     objective_window: dict[str, torch.Tensor] = {}
     log_start = time.perf_counter()
+    data_wait_seconds = 0.0
+    steps_since_log = 0
+    if context.device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(context.device)
 
     def current_training_state() -> dict[str, Any]:
         return {
@@ -378,7 +384,9 @@ def train(
             step,
             ema=ema,
         )
-        saved = "model.pt + model_int8.pt" if ema is None else "model.pt + model_ema.pt + model_int8.pt"
+        saved = (
+            "model.pt + model_int8.pt" if ema is None else "model.pt + model_ema.pt + model_int8.pt"
+        )
         announce(f"추론용 모델 저장 완료: exports/{name}/{saved}", context)
 
     def validate_and_update_early_stopping() -> bool:
@@ -415,9 +423,7 @@ def train(
                     metrics[f"validation_ema_{name.removeprefix('validation_')}"] = value
         if last_train_loss is not None and objective is None:
             # 검증 loss - 학습 loss. 값이 커질수록 과적합 신호입니다.
-            metrics["generalization_gap"] = (
-                float(metrics["validation_loss"]) - last_train_loss
-            )
+            metrics["generalization_gap"] = float(metrics["validation_loss"]) - last_train_loss
         last_eval_step = step
         if context.is_main:
             summary = "검증 결과: loss={:.4f}, perplexity={:.2f}".format(
@@ -428,9 +434,7 @@ def train(
             if "validation_reward" in metrics:
                 summary += ", reward={:.4f}".format(metrics["validation_reward"])
             if "validation_ema_reward" in metrics:
-                summary += ", EMA reward={:.4f}".format(
-                    metrics["validation_ema_reward"]
-                )
+                summary += ", EMA reward={:.4f}".format(metrics["validation_ema_reward"])
             announce(summary, context)
             tqdm.write(json.dumps({"step": step, **metrics}))
             if writer is not None:
@@ -448,9 +452,7 @@ def train(
             candidate = -selection_value
             selection_name = "생성 복합 reward"
         else:
-            candidate = float(
-                metrics.get("validation_ema_loss", metrics["validation_loss"])
-            )
+            candidate = float(metrics.get("validation_ema_loss", metrics["validation_loss"]))
             selection_value = candidate
             selection_name = "검증 loss"
         improved_here = candidate < best_validation_loss - training.early_stopping_min_delta
@@ -471,8 +473,7 @@ def train(
                 context,
             )
         should_stop_here = (
-            training.early_stopping_patience > 0
-            and bad_evals >= training.early_stopping_patience
+            training.early_stopping_patience > 0 and bad_evals >= training.early_stopping_patience
         )
         should_stop = broadcast_bool(should_stop_here if context.is_main else False, context)
         if context.is_main and writer is not None:
@@ -504,10 +505,14 @@ def train(
     try:
         while step < training.max_steps and not stopped_early:
             # epoch 마다 sampler 의 셔플 순서를 바꿔 같은 배치 순서가 반복되지 않게 합니다.
-            if hasattr(train_loader, "batch_sampler") and hasattr(train_loader.batch_sampler, "set_epoch"):
+            if hasattr(train_loader, "batch_sampler") and hasattr(
+                train_loader.batch_sampler, "set_epoch"
+            ):
                 train_loader.batch_sampler.set_epoch(epoch)
             batches_this_epoch = 0
+            data_wait_started = time.perf_counter()
             for batch in train_loader:
+                data_wait_seconds += time.perf_counter() - data_wait_started
                 batches_this_epoch += 1
                 batch = move_to_device(batch, context.device)
                 # accumulation 창의 마지막 micro-batch 에서만 gradient 를 동기화합니다.
@@ -552,6 +557,7 @@ def train(
                     objective_window[name][0] += value.detach().double() * normalizer.double()
                     objective_window[name][1] += normalizer.double()
                 if not is_last_micro:
+                    data_wait_started = time.perf_counter()
                     continue  # accumulation 창이 아직 안 찼으면 다음 micro-batch 로
 
                 # ── optimizer step: gradient 정규화 → clip → 파라미터 갱신 ──
@@ -560,7 +566,7 @@ def train(
                 # 창 전체(모든 rank)의 정규화 분모를 여기서 한 번만 모읍니다.
                 global_normalizer = accumulated_local_normalizer.clone()
                 reduce_sum(global_normalizer, context)
-                gradient_denominator = max(float(global_normalizer.item()), 1.0)
+                gradient_denominator = global_normalizer.clamp_min(1.0)
                 for parameter in model.parameters():
                     if parameter.grad is not None:
                         parameter.grad.div_(gradient_denominator)
@@ -577,6 +583,7 @@ def train(
                 optimizer.zero_grad(set_to_none=True)
                 accumulated_local_normalizer.zero_()
                 if not optimizer_updated:
+                    data_wait_started = time.perf_counter()
                     continue  # overflow 로 건너뛴 step 은 세지 않습니다
 
                 if ema is not None:
@@ -584,21 +591,12 @@ def train(
                     ema.update(model)
                 scheduler.step()
                 step += 1
+                steps_since_log += 1
 
-                # 매 step: progress bar 에 현재 학습 수치를 표시합니다.
-                # (이 rank 의 로그 구간 통계이므로 표시용 근사값이며,
-                #  정확한 전 rank 평균은 log_every 마다 JSON 으로 남습니다.)
+                # 진행률 자체는 동기화 없이 매 step 갱신합니다. loss/grad_norm을
+                # 매번 Python scalar로 바꾸면 CUDA가 강제 동기화되므로, postfix는
+                # 아래 log_every 구간에서만 갱신합니다.
                 if context.is_main:
-                    local_tokens = max(float(window[1].item()), 1.0)
-                    progress.set_postfix(
-                        {
-                            "loss": f"{float(window[0].item()) / local_tokens:.4f}",
-                            "lr": f"{scheduler.get_last_lr()[0]:.2e}",
-                            "grad_norm": f"{float(grad_norm):.2f}",
-                            "epoch": epoch,
-                        },
-                        refresh=False,
-                    )
                     progress.update(1)
 
                 # log_every step 마다: 전 rank 합산 통계를 JSON + TensorBoard 로 기록
@@ -606,37 +604,75 @@ def train(
                     elapsed = max(time.perf_counter() - log_start, 1e-6)
                     reduced_window = window.clone()
                     reduce_sum(reduced_window, context)
+                    timing = torch.tensor(
+                        [data_wait_seconds, elapsed],
+                        device=context.device,
+                        dtype=torch.float64,
+                    )
+                    reduce_sum(timing, context)
+                    mean_data_wait = timing[0] / context.world_size
+                    mean_elapsed = timing[1] / context.world_size
                     records = {
                         "step": step,
                         "epoch": epoch,
                         "loss": (reduced_window[0] / reduced_window[1].clamp_min(1)).item(),
-                        "auxiliary_loss": (reduced_window[2] / reduced_window[3].clamp_min(1)).item(),
+                        "auxiliary_loss": (
+                            reduced_window[2] / reduced_window[3].clamp_min(1)
+                        ).item(),
                         "learning_rate": scheduler.get_last_lr()[0],
                         "grad_norm": float(grad_norm),
                         "global_tokens_per_second": reduced_window[4].item() / elapsed,
+                        "seconds_per_step": (mean_elapsed / max(steps_since_log, 1)).item(),
+                        "data_wait_fraction": (
+                            mean_data_wait / mean_elapsed.clamp_min(1e-6)
+                        ).item(),
                     }
+                    if context.device.type == "cuda":
+                        memory = torch.tensor(
+                            [
+                                torch.cuda.memory_allocated(context.device),
+                                torch.cuda.memory_reserved(context.device),
+                                torch.cuda.max_memory_allocated(context.device),
+                                torch.cuda.max_memory_reserved(context.device),
+                            ],
+                            device=context.device,
+                            dtype=torch.float64,
+                        )
+                        reduce_max(memory, context)
+                        (
+                            records["cuda_allocated_gib"],
+                            records["cuda_reserved_gib"],
+                            records["cuda_peak_allocated_gib"],
+                            records["cuda_peak_reserved_gib"],
+                        ) = (value.item() / 2**30 for value in memory)
                     for name, values in objective_window.items():
                         reduced_values = values.clone()
                         reduce_sum(reduced_values, context)
                         records[name] = (reduced_values[0] / reduced_values[1].clamp_min(1)).item()
                     last_train_loss = float(records["loss"])
                     if context.is_main:
+                        progress.set_postfix(
+                            {
+                                "loss": f"{records['loss']:.4f}",
+                                "lr": f"{records['learning_rate']:.2e}",
+                                "grad_norm": f"{records['grad_norm']:.2f}",
+                                "epoch": epoch,
+                            },
+                            refresh=False,
+                        )
                         tqdm.write(json.dumps(records))
                         if writer is not None:
-                            for name in (
-                                "loss",
-                                "auxiliary_loss",
-                                "learning_rate",
-                                "grad_norm",
-                                "global_tokens_per_second",
-                            ):
-                                writer.add_scalar(f"train/{name}", records[name], step)
-                            for name in objective_window:
-                                writer.add_scalar(f"train/{name}", records[name], step)
+                            for name, value in records.items():
+                                if name not in {"step", "epoch"}:
+                                    writer.add_scalar(f"train/{name}", value, step)
                     window.zero_()
                     for values in objective_window.values():
                         values.zero_()
                     log_start = time.perf_counter()
+                    data_wait_seconds = 0.0
+                    steps_since_log = 0
+                    if context.device.type == "cuda":
+                        torch.cuda.reset_peak_memory_stats(context.device)
 
                 # eval_every step 마다: 검증 + best 저장 + early stopping 판단
                 if step % training.eval_every == 0:
@@ -655,6 +691,7 @@ def train(
                     export_models("latest")
                 if step >= training.max_steps:
                     break
+                data_wait_started = time.perf_counter()
             if batches_this_epoch == 0:
                 raise ValueError("training loader produced no batches")
             if not stopped_early:

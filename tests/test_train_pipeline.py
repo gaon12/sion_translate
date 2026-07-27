@@ -1,0 +1,118 @@
+from __future__ import annotations
+
+import torch
+
+from sion_translate.cli.train import (
+    dataloader_runtime_kwargs,
+    release_stage_resources,
+    shutdown_dataloader,
+)
+from sion_translate.config import config_from_raw
+from sion_translate.training.distributed import DistributedContext
+from sion_translate.training.distributed import (
+    fsdp_reduce_dtype,
+    resolve_parallel_strategy,
+)
+
+
+class WorkerIterator:
+    def __init__(self) -> None:
+        self.stopped = False
+
+    def _shutdown_workers(self) -> None:
+        self.stopped = True
+
+
+class LoaderStub:
+    def __init__(self) -> None:
+        self._iterator = WorkerIterator()
+
+
+def test_dataloader_runtime_settings_separate_training_and_validation() -> None:
+    device = torch.device("cuda")
+    training = dataloader_runtime_kwargs(12, device, training=True)
+    validation = dataloader_runtime_kwargs(3, device, training=False)
+    single_process = dataloader_runtime_kwargs(0, torch.device("cpu"), training=True)
+
+    assert training == {
+        "num_workers": 12,
+        "pin_memory": True,
+        "persistent_workers": True,
+        "prefetch_factor": 4,
+    }
+    assert validation == {
+        "num_workers": 3,
+        "pin_memory": True,
+        "persistent_workers": False,
+        "prefetch_factor": 2,
+    }
+    assert single_process == {"num_workers": 0, "pin_memory": False}
+
+
+def test_stage_release_stops_persistent_workers_on_cpu() -> None:
+    loader = LoaderStub()
+    iterator = loader._iterator
+    shutdown_dataloader(loader)  # type: ignore[arg-type]
+    assert iterator.stopped
+    assert loader._iterator is None
+
+    second = LoaderStub()
+    context = DistributedContext(
+        rank=0,
+        local_rank=0,
+        world_size=1,
+        device=torch.device("cpu"),
+        distributed=False,
+    )
+    assert release_stage_resources(context, second) == {}  # type: ignore[arg-type]
+    assert second._iterator is None
+
+
+def test_parallel_strategy_prefers_ddp_and_supports_legacy_fsdp() -> None:
+    distributed = DistributedContext(
+        rank=0,
+        local_rank=0,
+        world_size=4,
+        device=torch.device("cuda"),
+        distributed=True,
+        backend="nccl",
+    )
+    single = DistributedContext(
+        rank=0,
+        local_rank=0,
+        world_size=1,
+        device=torch.device("cpu"),
+        distributed=False,
+    )
+    assert resolve_parallel_strategy("auto", distributed) == "ddp"
+    assert resolve_parallel_strategy("auto", distributed, legacy_fsdp2=True) == "fsdp2"
+    assert resolve_parallel_strategy("fsdp2", single) == "single"
+    assert fsdp_reduce_dtype("auto", torch.bfloat16) == torch.bfloat16
+    assert fsdp_reduce_dtype("auto", torch.float32) == torch.float32
+
+
+def test_parallel_strategy_config_rejects_ambiguous_legacy_override() -> None:
+    config = config_from_raw(
+        {
+            "training": {
+                "parallel_strategy": "fsdp2",
+                "fsdp_reduce_dtype": "bf16",
+            }
+        }
+    )
+    config.validate()
+    assert config.training.parallel_strategy == "fsdp2"
+
+    try:
+        config_from_raw(
+            {
+                "training": {
+                    "parallel_strategy": "ddp",
+                    "fsdp2": True,
+                }
+            }
+        )
+    except ValueError as exc:
+        assert "cannot both be set" in str(exc)
+    else:
+        raise AssertionError("ambiguous parallel settings must be rejected")

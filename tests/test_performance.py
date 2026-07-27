@@ -18,6 +18,12 @@ def test_cpu_plan_uses_allocated_capacity_without_oversubscription(monkeypatch) 
     assert plan.dataloader_workers_per_rank == 7
 
 
+def test_cpu_plan_caps_single_rank_dataloader_workers(monkeypatch) -> None:
+    monkeypatch.setattr("sion_translate.performance.available_cpu_count", lambda: 256)
+    plan = build_cpu_plan(world_size=1)
+    assert plan.dataloader_workers_per_rank == 16
+
+
 def test_bounded_ordered_map_preserves_order_and_laziness() -> None:
     consumed = 0
 
