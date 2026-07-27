@@ -10,6 +10,7 @@ from sion_translate.auto import (
     EnvironmentInfo,
     apply_auto_settings,
     pick_model_preset,
+    pick_parallel_strategy,
     pick_vocab_size,
     scan_raw_data,
     stored_fingerprint,
@@ -105,6 +106,27 @@ def test_h100_defaults_leave_memory_headroom_without_checkpointing() -> None:
     assert config.model.gradient_checkpointing is False
     assert config.training.batch_size_per_gpu == 32
     assert config.training.gradient_accumulation_steps == 8
+
+
+def test_multi_h100_prefers_ddp_and_bf16_collectives() -> None:
+    env = gpu_environment(vram=80.0, world_size=4)
+    assert pick_parallel_strategy(env, d_model=768) == "ddp"
+    config = AppConfig()
+    apply_auto_settings(
+        config,
+        raw={},
+        env=env,
+        train_examples=22_000_000,
+        validation_examples=110_000,
+    )
+    assert config.training.parallel_strategy == "ddp"
+    assert config.training.fsdp_reduce_dtype == "bf16"
+    assert config.data.num_workers <= 16
+
+
+def test_memory_constrained_large_model_selects_fsdp2() -> None:
+    env = gpu_environment(vram=24.0, world_size=4)
+    assert pick_parallel_strategy(env, d_model=1024) == "fsdp2"
 
 
 def test_auto_downweights_synthetic_sources() -> None:

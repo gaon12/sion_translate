@@ -43,7 +43,8 @@ training:
   warmup_steps: 2000
   precision: bf16
   compile: false
-  fsdp2: true
+  parallel_strategy: fsdp2
+  fsdp_reduce_dtype: bf16
   log_every: 10
   eval_every: 1000
   eval_batches: 50

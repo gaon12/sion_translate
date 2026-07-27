@@ -38,11 +38,7 @@ def initialize_distributed() -> DistributedContext:
     else:
         device = torch.device("cpu")
     if distributed:
-        backend = (
-            "nccl"
-            if device.type == "cuda" and dist.is_nccl_available()
-            else "gloo"
-        )
+        backend = "nccl" if device.type == "cuda" and dist.is_nccl_available() else "gloo"
         dist.init_process_group(backend=backend, timeout=timedelta(minutes=30))
     else:
         backend = None
@@ -67,6 +63,12 @@ def reduce_sum(tensor: torch.Tensor, context: DistributedContext) -> torch.Tenso
     return tensor
 
 
+def reduce_max(tensor: torch.Tensor, context: DistributedContext) -> torch.Tensor:
+    if context.distributed:
+        dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
+    return tensor
+
+
 def broadcast_bool(value: bool, context: DistributedContext, *, source: int = 0) -> bool:
     """Broadcast a control-flow decision so every rank exits at the same point."""
 
@@ -87,7 +89,9 @@ def precision_dtype(name: str, device: torch.device) -> torch.dtype:
     normalized = name.lower()
     if normalized == "bf16":
         if not torch.cuda.is_bf16_supported():
-            raise RuntimeError("bf16 precision was requested, but this CUDA device does not support it")
+            raise RuntimeError(
+                "bf16 precision was requested, but this CUDA device does not support it"
+            )
         return torch.bfloat16
     if normalized == "fp16":
         return torch.float16
@@ -96,23 +100,64 @@ def precision_dtype(name: str, device: torch.device) -> torch.dtype:
     raise ValueError(f"Unsupported precision: {name}")
 
 
+def resolve_parallel_strategy(
+    strategy: str,
+    context: DistributedContext,
+    *,
+    legacy_fsdp2: bool | None = None,
+) -> str:
+    """Resolve single-process, DDP, or FSDP2 without forcing sharding by default."""
+
+    normalized = strategy.lower()
+    if normalized not in {"auto", "ddp", "fsdp2"}:
+        raise ValueError("parallel strategy must be one of: auto, ddp, fsdp2")
+    if not context.distributed:
+        return "single"
+    if normalized == "auto":
+        if legacy_fsdp2 is not None:
+            return "fsdp2" if legacy_fsdp2 else "ddp"
+        # DDP avoids FSDP all-gathers and is generally faster when each H100 can
+        # hold this model and its optimizer. Auto-configuration selects FSDP2
+        # explicitly when the model-to-VRAM estimate says sharding is required.
+        return "ddp"
+    return normalized
+
+
+def fsdp_reduce_dtype(name: str, compute_dtype: torch.dtype) -> torch.dtype:
+    normalized = name.lower()
+    if normalized == "auto":
+        return compute_dtype if compute_dtype in {torch.bfloat16, torch.float16} else torch.float32
+    if normalized == "bf16":
+        return torch.bfloat16
+    if normalized == "fp32":
+        return torch.float32
+    raise ValueError("FSDP reduce dtype must be one of: auto, bf16, fp32")
+
+
 def parallelize_model(
     model: nn.Module,
     context: DistributedContext,
     *,
-    use_fsdp2: bool,
+    strategy: str = "auto",
+    use_fsdp2: bool | None = None,
     precision: str,
+    reduce_dtype: str = "auto",
     reshard_after_forward: bool,
     materialize_meta: bool,
     find_unused_parameters: bool = False,
 ) -> nn.Module:
     dtype = precision_dtype(precision, context.device)
-    if context.distributed and use_fsdp2:
+    resolved_strategy = resolve_parallel_strategy(
+        strategy,
+        context,
+        legacy_fsdp2=use_fsdp2,
+    )
+    if resolved_strategy == "fsdp2":
         from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 
         policy = MixedPrecisionPolicy(
             param_dtype=dtype,
-            reduce_dtype=torch.float32,
+            reduce_dtype=fsdp_reduce_dtype(reduce_dtype, dtype),
             output_dtype=dtype,
             cast_forward_inputs=True,
         )
@@ -150,6 +195,9 @@ def parallelize_model(
             model,
             device_ids=[context.local_rank] if context.device.type == "cuda" else None,
             find_unused_parameters=find_unused_parameters,
+            gradient_as_bucket_view=True,
+            static_graph=not find_unused_parameters,
+            broadcast_buffers=False,
         )
     return model
 

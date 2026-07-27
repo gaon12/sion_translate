@@ -282,6 +282,18 @@ def pick_batch_size(env: EnvironmentInfo, d_model: int) -> int:
     return base
 
 
+def pick_parallel_strategy(env: EnvironmentInfo, d_model: int) -> str:
+    """Prefer lower-overhead DDP whenever one GPU has enough training memory."""
+
+    if env.world_size <= 1:
+        return "auto"
+    if env.min_vram_gib >= 70 and d_model <= 1024:
+        return "ddp"
+    if env.min_vram_gib >= 40 and d_model <= 768:
+        return "ddp"
+    return "fsdp2"
+
+
 def _clamp(value: int, low: int, high: int) -> int:
     return max(low, min(high, value))
 
@@ -375,8 +387,19 @@ def apply_auto_settings(
         decisions.append(f"eval_batches: {config.training.eval_batches}")
 
     # ── 실행 방식 ───────────────────────────────────────────────────────
-    if auto(raw_training, "fsdp2"):
-        config.training.fsdp2 = env.world_size > 1
+    if auto(raw_training, "parallel_strategy") and auto(raw_training, "fsdp2"):
+        config.training.parallel_strategy = pick_parallel_strategy(
+            env,
+            config.model.d_model,
+        )
+        if env.world_size > 1:
+            decisions.append(f"다중 GPU 병렬화: {config.training.parallel_strategy.upper()}")
+    if auto(raw_training, "fsdp_reduce_dtype"):
+        config.training.fsdp_reduce_dtype = "bf16" if env.bf16 else "fp32"
+    if auto(raw_training, "reshard_after_forward"):
+        config.training.reshard_after_forward = not (
+            config.training.parallel_strategy == "fsdp2" and env.min_vram_gib >= 70
+        )
     if auto(raw_training, "compile"):
         # torch.compile 은 Linux CUDA 에서 안정적으로 이득이 있습니다.
         config.training.compile = env.cuda and env.os_name == "Linux"
@@ -384,7 +407,7 @@ def apply_auto_settings(
             decisions.append("torch.compile: 활성 (Linux CUDA)")
     if auto(raw_data, "num_workers"):
         per_rank = max(1, env.cpu_count // max(1, env.world_size))
-        config.data.num_workers = max(0, per_rank - 1)
+        config.data.num_workers = min(16, max(0, per_rank - 1))
         decisions.append(f"DataLoader workers: {config.data.num_workers}")
 
     # ── 합성(역번역) 데이터 자동 다운웨이트 ────────────────────────────

@@ -57,7 +57,8 @@ training:
   grad_clip: 1.0
   precision: bf16
   compile: false
-  fsdp2: true
+  parallel_strategy: fsdp2
+  fsdp_reduce_dtype: bf16
   reshard_after_forward: true
   log_every: 10
   eval_every: 1000

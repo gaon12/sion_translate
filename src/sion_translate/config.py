@@ -211,7 +211,12 @@ class TrainingConfig:
     grad_clip: float = 1.0
     precision: str = "bf16"
     compile: bool = False
-    fsdp2: bool = True
+    # auto는 모델이 GPU 한 장에 충분히 들어가면 통신이 적은 DDP를,
+    # 메모리가 부족할 때만 FSDP2를 선택합니다.
+    parallel_strategy: str = "auto"
+    # 이전 설정 파일 호환용. 새 설정에서는 parallel_strategy를 사용합니다.
+    fsdp2: bool | None = None
+    fsdp_reduce_dtype: str = "auto"
     reshard_after_forward: bool = True
     log_every: int = 10
     eval_every: int = 250
@@ -359,6 +364,12 @@ class AppConfig:
             raise ValueError("grad_clip must be positive")
         if self.training.precision.lower() not in {"fp32", "bf16", "fp16"}:
             raise ValueError("precision must be one of: fp32, bf16, fp16")
+        if self.training.parallel_strategy.lower() not in {"auto", "ddp", "fsdp2"}:
+            raise ValueError("parallel_strategy must be one of: auto, ddp, fsdp2")
+        if self.training.fsdp_reduce_dtype.lower() not in {"auto", "fp32", "bf16"}:
+            raise ValueError("fsdp_reduce_dtype must be one of: auto, fp32, bf16")
+        if self.training.fsdp2 is not None and self.training.parallel_strategy.lower() != "auto":
+            raise ValueError("training.fsdp2 and training.parallel_strategy cannot both be set")
         for name, value in (
             ("log_every", self.training.log_every),
             ("eval_every", self.training.eval_every),
@@ -452,12 +463,15 @@ def config_from_raw(raw: dict[str, Any]) -> AppConfig:
     data_values = dict(raw.get("data") or {})
     if "language_pair" in data_values and "language_pairs" in data_values:
         raise ValueError("data.language_pair and data.language_pairs cannot both be set")
+    training_values = dict(raw.get("training") or {})
+    if "fsdp2" in training_values and "parallel_strategy" in training_values:
+        raise ValueError("training.fsdp2 and training.parallel_strategy cannot both be set")
     experimental = _construct_dataclass(ExperimentalConfig, model_values.pop("experimental", {}))
     model = ModelConfig(experimental=experimental, **model_values)
     return AppConfig(
         model=model,
         data=_construct_dataclass(DataConfig, data_values),
-        training=_construct_dataclass(TrainingConfig, raw.get("training")),
+        training=_construct_dataclass(TrainingConfig, training_values),
         posttraining=_construct_dataclass(PostTrainingConfig, raw.get("posttraining")),
     )
 

@@ -45,7 +45,7 @@ training:
   warmup_steps: 1
   precision: fp32
   compile: false
-  fsdp2: false
+  parallel_strategy: ddp
   log_every: 1
   eval_every: 2
   eval_batches: 2

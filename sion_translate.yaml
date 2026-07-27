@@ -11,7 +11,7 @@
 #   - GPU당 배치 크기 (VRAM 기준), gradient accumulation (effective 256 목표)
 #   - max_steps (corpus 약 4회 통과 예산, early stopping 으로 조기 종료)
 #   - warmup / eval_every / save_every / eval_batches (step 예산에 비례)
-#   - DataLoader worker 수, FSDP2 (다중 GPU 시), torch.compile (Linux CUDA 시)
+#   - DataLoader worker 수, DDP/FSDP2 (다중 GPU 시), torch.compile (Linux CUDA 시)
 #
 # 데이터 자동 인식:
 #   - data/ 폴더의 *.jsonl 을 스캔합니다. 파일을 추가하거나 내용이 바뀌면
@@ -63,6 +63,9 @@ training:
 #   ema_decay: 0.999         # 가중치 지수이동평균 (0 이면 끔; 기본 0.999 권장)
 #   early_stopping_patience: 5
 #   precision: bf16          # fp32 / bf16 / fp16
+#   parallel_strategy: auto  # auto / ddp / fsdp2. H100에 모델이 들어가면 DDP 우선
+#   fsdp_reduce_dtype: bf16   # FSDP2 통신 dtype: auto / bf16 / fp32
+#   reshard_after_forward: false  # FSDP2에서 VRAM 여유 시 false가 더 빠름
 
 # SFT 뒤 복합 보상 MRT + 다중 후보 선호학습을 자동 실행합니다.
 # 두 단계 모델은 runs/auto/pretrain 과 runs/auto/posttrain 에 각각 저장됩니다.
