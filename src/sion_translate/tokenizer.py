@@ -18,11 +18,14 @@ from sion_translate.data.records import (
     normalize_language_pairs,
 )
 from sion_translate.data.quality import QualityPolicy, assess_pair, canonical_text
+from sion_translate.fingerprint import file_sha256
 from sion_translate.performance import bounded_ordered_map, build_cpu_plan
 from sion_translate.splitting import TargetSplitGuard, choose_split_for_key, normalized_split_key
 
 
 DEFAULT_LANGUAGE_PAIR = ("ko", "ja")
+TOKENIZER_METADATA_FILENAME = "tokenizer_metadata.json"
+TOKENIZER_METADATA_VERSION = 2
 
 # 언어쌍에 따라 달라지는 제어 토큰: <2xx> = "xx 언어로 번역하라",
 # <denoise_xx> = "xx 언어 원문을 복원하라(denoising)".
@@ -76,6 +79,81 @@ SCRIPT_OTHER = 8
 
 def normalize_text(text: str) -> str:
     return unicodedata.normalize("NFC", text).strip()
+
+
+def tokenizer_metadata_path(model_or_directory: str | Path) -> Path:
+    """Resolve the sidecar metadata path from a model, directory, or sidecar path."""
+
+    path = Path(model_or_directory)
+    if path.name == TOKENIZER_METADATA_FILENAME:
+        return path
+    if path.suffix == ".model":
+        return path.parent / TOKENIZER_METADATA_FILENAME
+    return path / TOKENIZER_METADATA_FILENAME
+
+
+def load_tokenizer_metadata(model_or_directory: str | Path) -> dict[str, object] | None:
+    """Load tokenizer metadata when present, leaving legacy artifacts supported."""
+
+    path = tokenizer_metadata_path(model_or_directory)
+    if not path.is_file():
+        return None
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError(f"Tokenizer metadata must be a JSON object: {path}")
+    return value
+
+
+def tokenizer_split_digits_policy(model_or_directory: str | Path) -> bool | None:
+    """Return the explicitly recorded digit policy, or ``None`` for legacy metadata."""
+
+    metadata = load_tokenizer_metadata(model_or_directory)
+    if metadata is None:
+        return None
+    version = metadata.get("version")
+    if (
+        not isinstance(version, int)
+        or isinstance(version, bool)
+        or version < TOKENIZER_METADATA_VERSION
+    ):
+        return None
+    split_digits = metadata.get("split_digits")
+    if not isinstance(split_digits, bool):
+        raise ValueError("Tokenizer metadata split_digits must be a boolean")
+    return split_digits
+
+
+def write_tokenizer_metadata(
+    model_path: str | Path,
+    *,
+    split_digits: bool,
+    language_pairs: Sequence[Sequence[str]],
+) -> Path:
+    """Write the reproducibility and identity contract for a trained tokenizer."""
+
+    model_path = Path(model_path)
+    vocab_path = model_path.with_suffix(".vocab")
+    normalized_pairs = normalize_language_pairs(language_pairs=language_pairs)
+    processor = spm.SentencePieceProcessor(model_file=str(model_path))
+    metadata = {
+        "version": TOKENIZER_METADATA_VERSION,
+        "split_digits": bool(split_digits),
+        "language_pair": list(normalized_pairs[0]),
+        "language_pairs": [list(pair) for pair in normalized_pairs],
+        "vocab_size": int(processor.vocab_size()),
+        "model_file": model_path.name,
+        "model_sha256": file_sha256(model_path),
+        "vocab_file": vocab_path.name,
+        "vocab_sha256": file_sha256(vocab_path),
+    }
+    output_path = tokenizer_metadata_path(model_path)
+    temporary_path = output_path.with_suffix(f"{output_path.suffix}.tmp")
+    temporary_path.write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary_path.replace(output_path)
+    return output_path
 
 
 def _to_python_string(value: object, *, value_name: str) -> str:
@@ -391,6 +469,11 @@ def train_tokenizer(
     )
     model_path = model_prefix.with_suffix(".model")
     write_token_features(model_path, output_dir / "token_features.npz")
+    write_tokenizer_metadata(
+        model_path,
+        split_digits=split_digits,
+        language_pairs=normalized_pairs,
+    )
     return model_path
 
 

@@ -6,8 +6,16 @@ from pathlib import Path
 import pytest
 import sentencepiece as spm
 
+from sion_translate.fingerprint import file_sha256
 from sion_translate.splitting import choose_split_for_text
-from sion_translate.tokenizer import SionTokenizer, iter_parallel_text, train_tokenizer
+from sion_translate.tokenizer import (
+    TOKENIZER_METADATA_VERSION,
+    SionTokenizer,
+    iter_parallel_text,
+    load_tokenizer_metadata,
+    tokenizer_split_digits_policy,
+    train_tokenizer,
+)
 
 
 def _pair_for_split(split: str) -> tuple[str, str]:
@@ -57,11 +65,11 @@ def test_iter_parallel_text_excludes_holdouts_and_invalid_rows(tmp_path: Path) -
     )
 
     assert list(iter_parallel_text([source])) == list(train_pair)
-    assert list(
-        iter_parallel_text(
-            [source], validation_fraction=0.0, test_fraction=0.0
-        )
-    ) == [*train_pair, *validation_pair, *test_pair]
+    assert list(iter_parallel_text([source], validation_fraction=0.0, test_fraction=0.0)) == [
+        *train_pair,
+        *validation_pair,
+        *test_pair,
+    ]
 
 
 def test_kj_tokenizer_rejects_models_without_required_symbols(
@@ -122,6 +130,19 @@ def test_train_tokenizer_splits_digits_by_default(tmp_path: Path) -> None:
     pieces = tokenizer.processor.encode("38720원", out_type=str)
     digit_pieces = [piece.replace("▁", "") for piece in pieces if piece.strip("▁").isdigit()]
     assert digit_pieces == ["3", "8", "7", "2", "0"]
+    metadata = load_tokenizer_metadata(model_path)
+    assert metadata is not None
+    assert metadata["version"] >= TOKENIZER_METADATA_VERSION
+    assert metadata["split_digits"] is True
+    assert metadata["language_pair"] == ["ko", "ja"]
+    assert metadata["language_pairs"] == [["ko", "ja"]]
+    assert metadata["vocab_size"] == len(tokenizer)
+    assert metadata["model_file"] == model_path.name
+    assert metadata["model_sha256"] == file_sha256(model_path)
+    vocab_path = model_path.with_suffix(".vocab")
+    assert metadata["vocab_file"] == vocab_path.name
+    assert metadata["vocab_sha256"] == file_sha256(vocab_path)
+    assert tokenizer_split_digits_policy(model_path) is True
 
 
 def test_train_tokenizer_can_disable_digit_splitting(tmp_path: Path) -> None:
@@ -140,6 +161,27 @@ def test_train_tokenizer_can_disable_digit_splitting(tmp_path: Path) -> None:
     tokenizer = SionTokenizer(model_path)
     # 반복되는 "250" 같은 숫자열이 하나의 토큰으로 병합되므로 감지에 걸린다.
     assert not tokenizer.splits_digits
+    metadata = load_tokenizer_metadata(model_path)
+    assert metadata is not None
+    assert metadata["split_digits"] is False
+    assert tokenizer_split_digits_policy(model_path) is False
+
+
+def test_split_digits_policy_requires_v2_metadata(tmp_path: Path) -> None:
+    legacy = tmp_path / "legacy"
+    legacy.mkdir()
+    (legacy / "tokenizer_metadata.json").write_text(
+        json.dumps({"version": 1, "split_digits": True}),
+        encoding="utf-8",
+    )
+    assert tokenizer_split_digits_policy(legacy) is None
+
+    (legacy / "tokenizer_metadata.json").write_text(
+        json.dumps({"version": TOKENIZER_METADATA_VERSION, "split_digits": "true"}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="split_digits"):
+        tokenizer_split_digits_policy(legacy)
 
 
 def test_tokenizer_guard_excludes_target_owned_by_holdout(tmp_path: Path) -> None:
