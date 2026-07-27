@@ -57,28 +57,43 @@ class EMAWeights:
             if shadow is not None:
                 shadow.lerp_(parameter.detach(), one_minus_decay)
 
+    @staticmethod
+    @torch.no_grad()
+    def _exchange(parameter: torch.Tensor, shadow: torch.Tensor) -> None:
+        """Exchange one parameter with its shadow using one-tensor scratch space."""
+
+        current = parameter.detach().clone()
+        parameter.copy_(shadow)
+        shadow.copy_(current)
+
     @contextmanager
     def swap(self, model: nn.Module) -> Iterator[None]:
         """블록 안에서만 모델 가중치를 EMA 값으로 바꿉니다 (나가면 원상복구).
 
-        평가나 내보내기 도중 예외가 나도 원본 가중치가 반드시 복원되도록
-        try/finally 로 감쌉니다.
+        전체 모델 크기의 backup dict를 만들지 않고 파라미터와 shadow를
+        하나씩 교환합니다. 따라서 추가 peak 메모리는 가장 큰 파라미터
+        하나뿐이며, 평가나 내보내기 도중 예외가 나도 원래 상태로 복원됩니다.
         """
-        backup: dict[str, torch.Tensor] = {}
-        with torch.no_grad():
+        swapped: list[tuple[torch.Tensor, torch.Tensor]] = []
+        try:
             for name, parameter in model.named_parameters():
                 shadow = self.shadow.get(name)
                 if shadow is not None:
-                    backup[name] = parameter.detach().clone()
-                    parameter.copy_(shadow)
-        try:
+                    self._exchange(parameter, shadow)
+                    swapped.append((parameter, shadow))
             yield
         finally:
-            with torch.no_grad():
-                for name, parameter in model.named_parameters():
-                    saved = backup.get(name)
-                    if saved is not None:
-                        parameter.copy_(saved)
+            for parameter, shadow in reversed(swapped):
+                self._exchange(parameter, shadow)
+
+    @torch.no_grad()
+    def copy_to(self, model: nn.Module) -> None:
+        """Permanently copy EMA weights into a model without allocating a backup."""
+
+        for name, parameter in model.named_parameters():
+            shadow = self.shadow.get(name)
+            if shadow is not None:
+                parameter.copy_(shadow)
 
     def state_dict(self) -> dict[str, torch.Tensor]:
         """체크포인트에 함께 저장해 재개 시 EMA 이력이 끊기지 않게 합니다."""

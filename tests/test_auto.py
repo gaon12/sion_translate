@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 import torch
 
 from sion_translate.auto import (
@@ -271,3 +272,31 @@ def test_ema_tracks_and_swaps() -> None:
     with ema.swap(model):
         assert torch.allclose(model.weight, torch.full_like(model.weight, 0.5))
     assert torch.allclose(model.weight, torch.full_like(model.weight, 1.0))
+
+
+def test_ema_swap_restores_model_and_shadow_after_an_exception() -> None:
+    model = torch.nn.Linear(3, 2, bias=False)
+    with torch.no_grad():
+        model.weight.fill_(1.0)
+    ema = EMAWeights(model, decay=0.5)
+    with torch.no_grad():
+        model.weight.fill_(3.0)
+    ema.update(model)
+    original_shadow = ema.shadow["weight"].clone()
+
+    with pytest.raises(RuntimeError, match="evaluation failed"):
+        with ema.swap(model):
+            torch.testing.assert_close(
+                model.weight,
+                torch.full_like(model.weight, 2.0),
+            )
+            torch.testing.assert_close(
+                ema.shadow["weight"],
+                torch.full_like(model.weight, 3.0),
+            )
+            raise RuntimeError("evaluation failed")
+
+    torch.testing.assert_close(model.weight, torch.full_like(model.weight, 3.0))
+    torch.testing.assert_close(ema.shadow["weight"], original_shadow)
+    ema.copy_to(model)
+    torch.testing.assert_close(model.weight, original_shadow)
