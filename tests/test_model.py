@@ -117,6 +117,63 @@ def test_tied_embedding_output() -> None:
     assert model.parameter_count() > 0
 
 
+def test_bf16_autocast_keeps_encoder_decoder_residuals_in_bf16() -> None:
+    config = tiny_config()
+    model = SionForConditionalGeneration(config)
+    batch = make_batch()
+    observed: dict[str, tuple[torch.dtype, torch.dtype]] = {}
+
+    def capture(name: str):
+        def hook(_module, inputs, output) -> None:
+            observed[name] = (inputs[0].dtype, output.dtype)
+
+        return hook
+
+    encoder_hook = model.encoder_layers[0].register_forward_hook(capture("encoder"))
+    decoder_hook = model.decoder_layers[0].register_forward_hook(capture("decoder"))
+    try:
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            output = model(**batch)
+    finally:
+        encoder_hook.remove()
+        decoder_hook.remove()
+
+    assert observed == {
+        "encoder": (torch.bfloat16, torch.bfloat16),
+        "decoder": (torch.bfloat16, torch.bfloat16),
+    }
+    assert output.logits.dtype == torch.bfloat16
+
+
+def test_meta_materialization_rebuilds_rope_buffers() -> None:
+    config = tiny_config()
+    config.experimental = ExperimentalConfig()
+    reference = SionForConditionalGeneration(config)
+
+    with torch.device("meta"):
+        materialized = SionForConditionalGeneration(config)
+    assert materialized.encoder_rope.cos.is_meta
+    assert materialized.decoder_rope.sin.is_meta
+
+    materialized.to_empty(device="cpu")
+    materialized.init_weights()
+
+    assert not materialized.encoder_rope.cos.is_meta
+    assert not materialized.decoder_rope.sin.is_meta
+    torch.testing.assert_close(materialized.encoder_rope.cos, reference.encoder_rope.cos)
+    torch.testing.assert_close(materialized.encoder_rope.sin, reference.encoder_rope.sin)
+    torch.testing.assert_close(materialized.decoder_rope.cos, reference.decoder_rope.cos)
+    torch.testing.assert_close(materialized.decoder_rope.sin, reference.decoder_rope.sin)
+
+    batch = make_batch()
+    output = materialized(
+        input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
+        decoder_input_ids=batch["decoder_input_ids"],
+    )
+    assert torch.isfinite(output.logits).all()
+
+
 def test_kv_cache_greedy_matches_full_redecode() -> None:
     """KV cache 디코딩이 '매번 prefix 전체를 다시 계산'하는 방식과
     토큰 단위로 완전히 같은 결과를 내야 한다."""
@@ -147,7 +204,10 @@ def test_kv_cache_greedy_matches_full_redecode() -> None:
         finished = torch.zeros(2, dtype=torch.bool)
         for _ in range(6):
             hidden = model.decode(
-                generated, encoder_states, batch["attention_mask"], register_context=register_context
+                generated,
+                encoder_states,
+                batch["attention_mask"],
+                register_context=register_context,
             )
             next_token = model._logits(hidden[:, -1:]).argmax(-1)
             next_token = torch.where(finished[:, None], 3, next_token)

@@ -21,7 +21,10 @@ class RMSNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         normalized = x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps)
-        return normalized.to(dtype=x.dtype) * self.weight
+        # AMP keeps master parameters in FP32. Multiplying the normalized BF16
+        # activation by the FP32 weight without this cast promotes the whole
+        # residual stream back to FP32, defeating most of BF16's memory benefit.
+        return normalized.to(dtype=x.dtype) * self.weight.to(dtype=x.dtype)
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -41,14 +44,48 @@ class RotaryEmbedding(nn.Module):
         super().__init__()
         if head_dim % 2:
             raise ValueError("RoPE head dimension must be even")
+        self.head_dim = head_dim
+        self.max_seq_len = max_seq_len
+        self.base = base
+        cos, sin = self._build_cache()
+        self.register_buffer("cos", cos, persistent=False)
+        self.register_buffer("sin", sin, persistent=False)
+
+    def _build_cache(
+        self, device: torch.device | str | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         inv_freq = 1.0 / (
-            base ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
+            self.base
+            ** (
+                torch.arange(
+                    0,
+                    self.head_dim,
+                    2,
+                    dtype=torch.float32,
+                    device=device,
+                )
+                / self.head_dim
+            )
         )
-        positions = torch.arange(max_seq_len, dtype=torch.float32)
+        positions = torch.arange(
+            self.max_seq_len,
+            dtype=torch.float32,
+            device=device,
+        )
         frequencies = torch.outer(positions, inv_freq)
         embedding = torch.cat((frequencies, frequencies), dim=-1)
-        self.register_buffer("cos", embedding.cos(), persistent=False)
-        self.register_buffer("sin", embedding.sin(), persistent=False)
+        return embedding.cos(), embedding.sin()
+
+    def reset_parameters(self) -> None:
+        """Rebuild derived RoPE buffers after meta-device materialization.
+
+        ``to_empty`` allocates storage for non-persistent buffers but cannot
+        reconstruct their values. FSDP's meta initialization therefore calls
+        the model initializer, which in turn calls this method.
+        """
+
+        device = self.cos.device
+        self.cos, self.sin = self._build_cache(device)
 
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, offset: int = 0
@@ -177,8 +214,10 @@ class GQAAttention(nn.Module):
             is_causal=is_causal,
             enable_gqa=enable_gqa,
         )
-        output = output.transpose(1, 2).contiguous().view(
-            hidden_states.shape[0], hidden_states.shape[1], self.d_model
+        output = (
+            output.transpose(1, 2)
+            .contiguous()
+            .view(hidden_states.shape[0], hidden_states.shape[1], self.d_model)
         )
         output = self.out_proj(output)
         if use_cache:
@@ -237,9 +276,7 @@ class EncoderLayer(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        x = x + self.dropout(
-            self.self_attn(self.attn_norm(x), key_padding_mask=attention_mask)
-        )
+        x = x + self.dropout(self.self_attn(self.attn_norm(x), key_padding_mask=attention_mask))
         x = x + self.dropout(self.ffn(self.ffn_norm(x)))
         return x * attention_mask.unsqueeze(-1).to(x.dtype)
 

@@ -76,10 +76,16 @@ class SionForConditionalGeneration(nn.Module):
             norm_eps=config.rms_norm_eps,
         )
         self.encoder_layers = nn.ModuleList(
-            [EncoderLayer(**layer_args, rope=self.encoder_rope) for _ in range(config.encoder_layers)]
+            [
+                EncoderLayer(**layer_args, rope=self.encoder_rope)
+                for _ in range(config.encoder_layers)
+            ]
         )
         self.decoder_layers = nn.ModuleList(
-            [DecoderLayer(**layer_args, rope=self.decoder_rope) for _ in range(config.decoder_layers)]
+            [
+                DecoderLayer(**layer_args, rope=self.decoder_rope)
+                for _ in range(config.decoder_layers)
+            ]
         )
         # 공유 블록 반복 설정. 가중치를 새로 만들지 않으므로 state_dict 가 바뀌지
         # 않습니다 — 기존 체크포인트를 그대로 불러올 수 있습니다.
@@ -89,8 +95,10 @@ class SionForConditionalGeneration(nn.Module):
         self.recurrent_steps = max(1, config.experimental.recurrent_steps)
         self.encoder_norm = RMSNorm(config.d_model, config.rms_norm_eps)
         self.decoder_norm = RMSNorm(config.d_model, config.rms_norm_eps)
-        self.lm_head = None if config.tie_embeddings else nn.Linear(
-            config.d_model, config.vocab_size, bias=False
+        self.lm_head = (
+            None
+            if config.tie_embeddings
+            else nn.Linear(config.d_model, config.vocab_size, bias=False)
         )
 
         exp = config.experimental
@@ -103,14 +111,10 @@ class SionForConditionalGeneration(nn.Module):
         # 파라미터로 등록해 두면 DDP 가 find_unused_parameters=True 를
         # 요구하게 되어 매 step 불필요한 통신 비용이 생깁니다.
         self.morph_gates = (
-            nn.Parameter(torch.zeros(config.encoder_layers))
-            if exp.morphoscript_enabled
-            else None
+            nn.Parameter(torch.zeros(config.encoder_layers)) if exp.morphoscript_enabled else None
         )
         self.register_state = (
-            ContentRegisterState(config.d_model, exp.register_classes)
-            if exp.core_enabled
-            else None
+            ContentRegisterState(config.d_model, exp.register_classes) if exp.core_enabled else None
         )
         self.typed_memory = (
             TypedEntityMemory(
@@ -127,9 +131,7 @@ class SionForConditionalGeneration(nn.Module):
             else None
         )
         self.alignment_head = (
-            BilingualAlignmentTransport(config.d_model, exp.bats_dim)
-            if exp.bats_enabled
-            else None
+            BilingualAlignmentTransport(config.d_model, exp.bats_dim) if exp.bats_enabled else None
         )
         self.init_weights()
 
@@ -153,15 +155,30 @@ class SionForConditionalGeneration(nn.Module):
                 nn.init.ones_(module.weight)
 
         self.apply(initialize)
-        residual_std = std / (2 * max(self.config.encoder_layers, self.config.decoder_layers)) ** 0.5
+        residual_std = (
+            std / (2 * max(self.config.encoder_layers, self.config.decoder_layers)) ** 0.5
+        )
         for module in self.modules():
             if isinstance(module, GQAAttention):
                 nn.init.normal_(module.out_proj.weight, mean=0.0, std=residual_std)
             elif isinstance(module, SwiGLU):
                 nn.init.normal_(module.down_proj.weight, mean=0.0, std=residual_std)
+            elif isinstance(module, RotaryEmbedding):
+                # Meta-device construction followed by ``to_empty`` leaves
+                # derived, non-persistent RoPE buffers uninitialized.
+                module.reset_parameters()
         if self.morph_gates is not None:
             with torch.no_grad():
                 self.morph_gates.zero_()
+
+    def _embed(self, token_ids: torch.Tensor) -> torch.Tensor:
+        hidden = self.token_embedding(token_ids)
+        device_type = hidden.device.type
+        if torch.is_autocast_enabled(device_type):
+            # Embedding is not an autocast op, so its FP32 output would promote
+            # every residual addition back to FP32 unless converted explicitly.
+            hidden = hidden.to(dtype=torch.get_autocast_dtype(device_type))
+        return self.embedding_dropout(hidden)
 
     def _checkpoint(self, layer: nn.Module, *args: torch.Tensor) -> torch.Tensor:
         if self.config.gradient_checkpointing and self.training:
@@ -178,7 +195,7 @@ class SionForConditionalGeneration(nn.Module):
         src_vowel_ids: torch.Tensor | None = None,
         src_coda_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        hidden = self.embedding_dropout(self.token_embedding(input_ids))
+        hidden = self._embed(input_ids)
         side_states = None
         if self.morphoscript is not None and src_script_ids is not None:
             zero = torch.zeros_like(src_script_ids)
@@ -210,9 +227,9 @@ class SionForConditionalGeneration(nn.Module):
         *,
         register_context: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        hidden = self.embedding_dropout(self.token_embedding(decoder_input_ids))
+        hidden = self._embed(decoder_input_ids)
         if register_context is not None:
-            hidden = hidden + register_context[:, None, :]
+            hidden = hidden + register_context[:, None, :].to(dtype=hidden.dtype)
         for layer in self.decoder_layers:
             hidden = self._checkpoint(layer, hidden, encoder_states, source_mask)
         return self.decoder_norm(hidden)
@@ -296,12 +313,16 @@ class SionForConditionalGeneration(nn.Module):
         if self.config.z_loss_weight > 0:
             valid_logits = logits.float().logsumexp(-1)[labels.ne(-100)]
             if valid_logits.numel() > 0:
-                auxiliary_loss = auxiliary_loss + self.config.z_loss_weight * valid_logits.square().mean()
+                auxiliary_loss = (
+                    auxiliary_loss + self.config.z_loss_weight * valid_logits.square().mean()
+                )
         register_loss = logits.new_zeros(())
         if register_logits is not None and register_labels is not None:
             known = register_labels > 0
             if known.any():
-                register_loss = F.cross_entropy(register_logits[known].float(), register_labels[known])
+                register_loss = F.cross_entropy(
+                    register_logits[known].float(), register_labels[known]
+                )
                 auxiliary_loss = auxiliary_loss + (
                     self.config.experimental.register_loss_weight * register_loss
                 )
@@ -353,9 +374,9 @@ class SionForConditionalGeneration(nn.Module):
         ``caches`` 는 layer 별 {"self": (k, v), "cross": (k, v)} 목록이며
         이 함수가 제자리에서(in-place) 갱신합니다.
         """
-        hidden = self.embedding_dropout(self.token_embedding(tokens))
+        hidden = self._embed(tokens)
         if register_context is not None:
-            hidden = hidden + register_context[:, None, :]
+            hidden = hidden + register_context[:, None, :].to(dtype=hidden.dtype)
         for layer, cache in zip(self.decoder_layers, caches, strict=True):
             hidden, cache["self"], cache["cross"] = layer.forward_step(
                 hidden,
@@ -566,9 +587,7 @@ class SionForConditionalGeneration(nn.Module):
             log_probs = F.log_softmax(self._logits(hidden[:, -1]).float(), dim=-1)
             vocab = log_probs.shape[-1]
             # 누적 점수 = 지금까지의 beam 점수 + 새 토큰 log 확률
-            candidate_scores = (beam_scores.view(-1, 1) + log_probs).view(
-                batch, num_beams * vocab
-            )
+            candidate_scores = (beam_scores.view(-1, 1) + log_probs).view(batch, num_beams * vocab)
             # EOS 로 빠지는 후보가 있어도 살아있는 beam 을 채울 수 있도록 2배수 선택
             top_scores, top_indices = candidate_scores.topk(2 * num_beams, dim=-1)
             source_beams = top_indices // vocab  # 어느 beam 에서 나온 후보인지
@@ -576,9 +595,7 @@ class SionForConditionalGeneration(nn.Module):
 
             next_scores = torch.full_like(beam_scores, float("-inf"))
             gather_flat = torch.zeros(batch, num_beams, dtype=torch.long, device=device)
-            step_tokens = torch.full(
-                (batch, num_beams), eos_id, dtype=torch.long, device=device
-            )
+            step_tokens = torch.full((batch, num_beams), eos_id, dtype=torch.long, device=device)
             for b in range(batch):
                 slot = 0
                 for cand in range(2 * num_beams):
@@ -638,13 +655,9 @@ class SionForConditionalGeneration(nn.Module):
             else:
                 best = int(beam_scores[b].argmax())
                 seq = sequences[b * num_beams + best]
-                outputs.append(
-                    torch.cat((seq, torch.tensor([eos_id], device=device)))
-                )
+                outputs.append(torch.cat((seq, torch.tensor([eos_id], device=device))))
         longest = max(len(seq) for seq in outputs)
-        padded = torch.full(
-            (batch, longest), eos_id, dtype=torch.long, device=device
-        )
+        padded = torch.full((batch, longest), eos_id, dtype=torch.long, device=device)
         for b, seq in enumerate(outputs):
             padded[b, : len(seq)] = seq
         return padded
