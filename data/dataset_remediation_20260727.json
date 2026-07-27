@@ -1,0 +1,306 @@
+{
+  "schema": "sion-verified-parallel-rebuild-v1",
+  "date": "2026-07-27",
+  "selected": [
+    "nict",
+    "bible",
+    "massive",
+    "ui"
+  ],
+  "existing_root_scan": true,
+  "existing_root_hits": {
+    "data16.jsonl": 12,
+    "data39.jsonl": 327,
+    "data37.jsonl": 22
+  },
+  "outputs": [
+    {
+      "source": "NICT QE/APE Japanese source + Korean human reference",
+      "target": "data16.jsonl",
+      "raw_rows": 10465,
+      "candidate_rows": 10451,
+      "rejected": {
+        "existing_root_exact_duplicate": 12,
+        "internal_exact_duplicate": 2
+      },
+      "details": {
+        "url": "https://paraphrasing.org/~fujita/resources/NICT-QEAPE-0.201710.zip",
+        "archive_sha256": "f1a8669ec9aaf183b435547294c7fb509e2d245afb0f98f55316ae3f0990d3a9",
+        "join": "source/reference ID",
+        "excluded_fields": [
+          "MT hypothesis",
+          "post-edit",
+          "quality labels"
+        ]
+      },
+      "written_rows": 10451,
+      "output_sha256": "a0cfd80b20b5b74e0292ab67f54db018bf4d0a8f9488b7da806b056269a02ef2",
+      "output_bytes": 4108657
+    },
+    {
+      "source": "Bible.com RNKSV 142 + 新共同訳 1819",
+      "target": "data18.jsonl",
+      "raw_rows": 31142,
+      "candidate_rows": 24939,
+      "rejected": {
+        "internal_exact_duplicate": 195,
+        "ja_only_verse_id": 258,
+        "ko_only_verse_id": 197,
+        "missing_expected_script_or_too_short": 1
+      },
+      "details": {
+        "join": "exact data-usfm verse ID only inside chapters whose Korean and Japanese verse-ID sets are identical",
+        "ko_chapters": 1189,
+        "ja_chapters": 1189,
+        "ko_verse_ids": 31081,
+        "ja_verse_ids": 31142,
+        "common_verse_ids": 25135,
+        "mismatched_chapters_excluded": 182,
+        "mismatched_chapter_sample": [
+          "1CH.12",
+          "1CH.4",
+          "1CH.5",
+          "1CH.6",
+          "1CH.8",
+          "1CO.11",
+          "1KI.22",
+          "1KI.4",
+          "1KI.5",
+          "1SA.21",
+          "1SA.23",
+          "1SA.24",
+          "2CH.1",
+          "2CH.13",
+          "2CH.14",
+          "2CH.2",
+          "2CO.1",
+          "2KI.11",
+          "2KI.12",
+          "2SA.18",
+          "2SA.19",
+          "ACT.1",
+          "ACT.15",
+          "ACT.19",
+          "ACT.2",
+          "ACT.24",
+          "ACT.25",
+          "ACT.28",
+          "ACT.8",
+          "DAN.3",
+          "DAN.4",
+          "DAN.5",
+          "DAN.6",
+          "DEU.12",
+          "DEU.13",
+          "DEU.19",
+          "DEU.22",
+          "DEU.23",
+          "DEU.28",
+          "DEU.29",
+          "ECC.4",
+          "ECC.5",
+          "EXO.21",
+          "EXO.22",
+          "EXO.25",
+          "EXO.7",
+          "EXO.8",
+          "EZK.15",
+          "EZK.20",
+          "EZK.21"
+        ],
+        "systemic_versification_books_excluded": [
+          "JOL",
+          "MAL",
+          "PSA"
+        ],
+        "all_excluded_chapters": 272,
+        "ko_only_sample": [
+          "GEN.31.55",
+          "EXO.8.29",
+          "EXO.8.30",
+          "EXO.8.31",
+          "EXO.8.32",
+          "EXO.22.31",
+          "EXO.25.13",
+          "EXO.25.14",
+          "LEV.6.24",
+          "LEV.6.25",
+          "LEV.6.26",
+          "LEV.6.27",
+          "LEV.6.28",
+          "LEV.6.29",
+          "LEV.6.30",
+          "NUM.16.36",
+          "NUM.16.37",
+          "NUM.16.38",
+          "NUM.16.39",
+          "NUM.16.40"
+        ],
+        "ja_only_sample": [
+          "1CH.12.41",
+          "1CH.4.17+1CH.4.18",
+          "1CH.5.27",
+          "1CH.5.28",
+          "1CH.5.29",
+          "1CH.5.30",
+          "1CH.5.31",
+          "1CH.5.32",
+          "1CH.5.33",
+          "1CH.5.34",
+          "1CH.5.35",
+          "1CH.5.36",
+          "1CH.5.37",
+          "1CH.5.38",
+          "1CH.5.39",
+          "1CH.5.40",
+          "1CH.5.41",
+          "1CH.8.6+1CH.8.7",
+          "1CO.11.14+1CO.11.15",
+          "1KI.22.54"
+        ],
+        "ko_start_url": "https://www.bible.com/bible/142/GEN.1",
+        "ja_start_url": "https://www.bible.com/bible/1819/GEN.1"
+      },
+      "written_rows": 24939,
+      "output_sha256": "747e29d1576ffb82cc248143191f0aa8598af80e064af930fc4ea55926732856",
+      "output_bytes": 14881264
+    },
+    {
+      "source": "Amazon MASSIVE 1.1 train",
+      "target": "data37.jsonl",
+      "raw_rows": 11514,
+      "candidate_rows": 7261,
+      "rejected": {
+        "existing_root_exact_duplicate": 22,
+        "internal_exact_duplicate": 75,
+        "judgment_quality": 641,
+        "locale_specific_slot_localization": 2996,
+        "slot_method_mismatch": 519
+      },
+      "details": {
+        "url": "https://amazon-massive-nlu-dataset.s3.amazonaws.com/amazon-massive-dataset-1.1.tar.gz",
+        "archive_sha256": "4cba5faa11c71437928e17cb1b9b3d8b8e727e7ea363a3a9a8045e19c0491577",
+        "join": "train partition + exact utterance ID",
+        "quality_policy": "same scenario/intent and slot labels; no slot_method=localization; both locales pass majority intent/language and median grammar/spelling checks"
+      },
+      "written_rows": 7261,
+      "output_sha256": "e66acabcc0456414be6ca81583ec551a53af1530347b399079d287cc6a7f14fc",
+      "output_bytes": 3345491
+    },
+    {
+      "source": "Pinned Firefox and VS Code Korean/Japanese localization",
+      "target": "data39.jsonl",
+      "raw_rows": 44960,
+      "candidate_rows": 31515,
+      "rejected": {
+        "Microsoft VS Code l10n:access_key": 3,
+        "Microsoft VS Code l10n:internal_exact_duplicate": 4592,
+        "Microsoft VS Code l10n:missing_expected_script": 1168,
+        "Microsoft VS Code l10n:number_mismatch": 295,
+        "Microsoft VS Code l10n:placeholder_mismatch": 28,
+        "Microsoft VS Code l10n:too_long": 2,
+        "Microsoft VS Code l10n:too_short": 74,
+        "Mozilla Firefox l10n:internal_exact_duplicate": 3455,
+        "Mozilla Firefox l10n:length_ratio": 4,
+        "Mozilla Firefox l10n:missing_expected_script": 3180,
+        "Mozilla Firefox l10n:number_mismatch": 109,
+        "Mozilla Firefox l10n:placeholder_mismatch": 22,
+        "Mozilla Firefox l10n:too_short": 177,
+        "cross_new_source_exact_duplicate": 9,
+        "existing_root_exact_duplicate": 327
+      },
+      "details": {
+        "join": "same repository-relative path and resource key",
+        "firefox": {
+          "repository": "https://github.com/mozilla-l10n/firefox-l10n.git",
+          "commit": "4ba6d99269dfe826c3441160c374bf7c1397e14a"
+        },
+        "vscode": {
+          "repository": "https://github.com/microsoft/vscode-loc.git",
+          "commit": "da6509eed60b550e0e785d0d78ac05be46d5e982"
+        },
+        "written_by_source_before_root_dedup": {
+          "Mozilla Firefox l10n": 12162,
+          "Microsoft VS Code l10n": 19689
+        },
+        "filters": [
+          "expected Korean/Japanese scripts",
+          "matching placeholders",
+          "matching ASCII numeric tokens",
+          "0.2 <= character-length ratio <= 5.0",
+          "no literal-identical or access-key-only rows",
+          "Fluent selectors excluded"
+        ]
+      },
+      "written_rows": 31515,
+      "output_sha256": "3e8261d07dd0a4beda3ef59b5e99245871b02c96d3f488c1b65eb1258c7126f8",
+      "output_bytes": 20366067
+    }
+  ],
+  "total_written": 74166,
+  "final_state": {
+    "schema": "sion-dataset-final-state-v1",
+    "date": "2026-07-27",
+    "note": "The outputs array records the deterministic rebuild stage. This section records subsequent semantic filtering, targeted correction, and full-source exclusions.",
+    "training_root": {
+      "data6.jsonl": {
+        "included": false,
+        "reason": "quality-assessment candidates contain corrupted facts but no retained quality labels"
+      },
+      "data16.jsonl": {
+        "included": true,
+        "rows": 10451,
+        "sha256": "301bfb9e3e2a660d2c65e18351235f99d8a9d4b1be15e7f1b5653921d8b720fd",
+        "corrections": [
+          "vp.d:349 Korean amount corrected from 26.5 cents to 26 dollars 5 cents"
+        ]
+      },
+      "data18.jsonl": {
+        "included": true,
+        "rows": 24939,
+        "sha256": "fb7b12e29ccfc5a40eff073d9162838907878ff73c2f654bb6adc05803ba8566",
+        "corrections": [
+          "AMO.7.10 inline Japanese note marker removed and sentence punctuation restored"
+        ]
+      },
+      "data23.jsonl": {
+        "included": false,
+        "reason": "systematic proper-name substitutions and malformed mixed-script localization"
+      },
+      "data25.jsonl": {
+        "included": false,
+        "reason": "Japanese scene metadata is aligned to Korean dialogue in a substantial portion"
+      },
+      "data27.jsonl": {
+        "included": true,
+        "rows": 5587,
+        "sha256": "4f4a4396aeb1d26792838cfb8e096153f30bb0b13fcf4ef3912780263c543986",
+        "targeted_removed_rows": 6,
+        "audit": "data/data27.remediation.json"
+      },
+      "data37.jsonl": {
+        "included": false,
+        "reason": "equal MASSIVE intent IDs use non-equivalent locale-specific entities and slots"
+      },
+      "synthetic_numeric_data38.jsonl": {
+        "included": true,
+        "rows": 240000,
+        "sha256": "28bdd8ade7787289c2a9b705e1c29389d3428e09b4e2278984eaa4f6a9d8f9a6",
+        "policy": "train-only and downweight required"
+      },
+      "data39.jsonl": {
+        "included": true,
+        "rows": 31101,
+        "sha256": "d103390e57411e67ec695d7286fee1ea08de6ff3db2bf4eafd12348b74f0c6ba",
+        "corrections": [
+          "removed unmatched Fluent explicit-space placeable",
+          "corrected Korean colon terminology",
+          "corrected Korean Sunda language name"
+        ]
+      }
+    },
+    "training_root_rows": 8654581,
+    "real_rows": 8414581,
+    "synthetic_rows": 240000
+  }
+}

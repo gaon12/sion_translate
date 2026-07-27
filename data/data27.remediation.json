@@ -1,0 +1,49 @@
+{
+  "schema": "sion-targeted-pair-remediation-v1",
+  "date": "2026-07-27",
+  "input": "data/data27.jsonl",
+  "input_rows": 5593,
+  "input_sha256": "1f7937d98290c9666cd6eddf6d7814580fe0a12889ae4d50c6ace1843a554f4c",
+  "policy": "Remove only manually confirmed translation-equivalence failures; do not apply a broader score-only cutoff.",
+  "removed": [
+    {
+      "resource_id": "line:825",
+      "reason": "speaker_action_mismatch",
+      "ko": "....저만 믿으세요.",
+      "ja": "「……しゃーないな。そこまで言うなら、手伝ってやるよ」"
+    },
+    {
+      "resource_id": "line:2038",
+      "reason": "target_contains_untranslated_additional_request_and_measurements",
+      "ko": "말 잘 들어! 지갑이랑 핸드폰 다 내놔!",
+      "ja": "「よ～く聞け！ 金とスマホ出せ！ ついでに、女Eカップ以上、男18センチ以上！ 番号も置いてけな！」"
+    },
+    {
+      "resource_id": "line:4130",
+      "reason": "train_identifiers_conflict",
+      "ko": "2A 승강장 | 일반 열차 2156 | 도착 21:33 | 목적지: 수카 시8G 승강장 | 특급 열차 2156 | 도착 19:42 | 목적지: 모카 시",
+      "ja": "2A番線 普通 320M 21:33 スーカ市行き/n 8G番線 特急 モカ3091号 19:42 モカ市行き"
+    },
+    {
+      "resource_id": "line:4428",
+      "reason": "device_model_entity_conflict",
+      "ko": "자세히 보니 클라라 주머니에 든 저 휴대폰 모델…… 저거 설마 전설의 「Mokia 3310」 ?!",
+      "ja": "クララがポケットにしまってた機種……なんと、あの伝説の『G'z●ne』だった。"
+    },
+    {
+      "resource_id": "line:5291",
+      "reason": "percentage_and_service_claim_missing_from_target",
+      "ko": "100% 본인 명의 서비스라는 소리잖아!",
+      "ja": "「あの子なりに……なんというか……“個人的”なんじゃない？」"
+    },
+    {
+      "resource_id": "line:5511",
+      "reason": "object_and_action_mismatch",
+      "ko": "응…… 몸 닦아줄까?",
+      "ja": "「はいはい……はい、服だよ」"
+    }
+  ],
+  "removed_rows": 6,
+  "output_rows": 5587,
+  "output_sha256": "4f4a4396aeb1d26792838cfb8e096153f30bb0b13fcf4ef3912780263c543986"
+}

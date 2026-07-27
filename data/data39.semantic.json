@@ -1,0 +1,1435 @@
+{
+  "schema": "sion-semantic-pair-filter-v1",
+  "input": "C:\\Users\\solso\\OneDrive\\Desktop\\sion_translate\\data\\data39.jsonl",
+  "input_rows": 31515,
+  "input_sha256": "3e8261d07dd0a4beda3ef59b5e99245871b02c96d3f488c1b65eb1258c7126f8",
+  "output": "C:\\Users\\solso\\OneDrive\\Desktop\\sion_translate\\data\\data39.jsonl",
+  "written_rows": 31110,
+  "output_sha256": "b72ca6ffd5922efbb788c1802d62b356ac606241464dfab490b4ae5b5ece0100",
+  "threshold": 0.8,
+  "removed_rows": 405,
+  "model": "intfloat/multilingual-e5-small",
+  "model_revision": "614241f622f53c4eeff9890bdc4f31cfecc418b3",
+  "default_domain": "software_ui",
+  "source_name": "Firefox l10n + VS Code localization",
+  "source_revision": "firefox:4ba6d99269dfe826c3441160c374bf7c1397e14a+vscode:da6509eed60b550e0e785d0d78ac05be46d5e982",
+  "max_length": 64,
+  "score_summary": {
+    "minimum": 0.7221215963363647,
+    "p01": 0.7952537536621094,
+    "p05": 0.8315853476524353,
+    "p10": 0.8493648767471313,
+    "p25": 0.8746269941329956,
+    "median": 0.8992742300033569,
+    "p75": 0.9217115044593811,
+    "p90": 0.9398983716964722,
+    "p95": 0.9506645798683167,
+    "p99": 0.9675174355506897,
+    "maximum": 0.9999998211860657,
+    "mean": 0.8963698805484926
+  },
+  "lowest_rejected_or_scored": [
+    {
+      "score": 0.7221215963363647,
+      "resource_id": "dom/chrome/dom/dom.properties::StopScriptButton",
+      "source": "Mozilla Firefox l10n",
+      "ko": "중지",
+      "ja": "スクリプトを停止"
+    },
+    {
+      "score": 0.728906512260437,
+      "resource_id": "browser/browser/setDesktopBackground.ftl::set-background-fill.label",
+      "source": "Mozilla Firefox l10n",
+      "ko": "채우기",
+      "ja": "ページ幅に合わせる"
+    },
+    {
+      "score": 0.7379294037818909,
+      "resource_id": "browser/browser/newtab/newtab.ftl::newtab-wallpaper-light-purple",
+      "source": "Mozilla Firefox l10n",
+      "ko": "연보라색",
+      "ja": "紅藤"
+    },
+    {
+      "score": 0.7397222518920898,
+      "resource_id": "toolkit/toolkit/pictureinpicture/pictureinpicture.ftl::pictureinpicture-seekbackward-btn.aria-label",
+      "source": "Mozilla Firefox l10n",
+      "ko": "뒤로",
+      "ja": "巻き戻し"
+    },
+    {
+      "score": 0.7402823567390442,
+      "resource_id": "toolkit/toolkit/intl/languageNames.ftl::language-name-dz",
+      "source": "Mozilla Firefox l10n",
+      "ko": "종카어",
+      "ja": "ゾンカ語"
+    },
+    {
+      "score": 0.7406712770462036,
+      "resource_id": "mobile/android/mobile/android/aboutConfig.ftl::config-new-pref-value-boolean",
+      "source": "Mozilla Firefox l10n",
+      "ko": "불린",
+      "ja": "真偽値"
+    },
+    {
+      "score": 0.7410874366760254,
+      "resource_id": "dom/chrome/layout/xmlparser.properties::12",
+      "source": "Mozilla Firefox l10n",
+      "ko": "반복적인 엔터티 참조",
+      "ja": "実体参照の定義が循環しています。"
+    },
+    {
+      "score": 0.7424373030662537,
+      "resource_id": "browser/browser/preferences/containers.ftl::containers-color-turquoise.label",
+      "source": "Mozilla Firefox l10n",
+      "ko": "청록색",
+      "ja": "ターコイズ"
+    },
+    {
+      "score": 0.7462940216064453,
+      "resource_id": "main.i18n.json::vs/workbench/browser/parts/editor/editorCommands/editorGroupLayout.vertical",
+      "source": "Microsoft VS Code l10n",
+      "ko": "세로",
+      "ja": "垂直"
+    },
+    {
+      "score": 0.7466689944267273,
+      "resource_id": "toolkit/toolkit/intl/languageNames.ftl::language-name-ht",
+      "source": "Mozilla Firefox l10n",
+      "ko": "아이티어",
+      "ja": "ハイチ語"
+    },
+    {
+      "score": 0.7488434314727783,
+      "resource_id": "browser/browser/newtab/newtab.ftl::newtab-sports-widget-team-name-label-civ.label",
+      "source": "Mozilla Firefox l10n",
+      "ko": "코트디브아르",
+      "ja": "アイボリーコースト"
+    },
+    {
+      "score": 0.7489709854125977,
+      "resource_id": "main.i18n.json::vs/workbench/contrib/issue/browser/screenshotAnnotation/eraser",
+      "source": "Microsoft VS Code l10n",
+      "ko": "지우개",
+      "ja": "消しゴム"
+    },
+    {
+      "score": 0.7491093873977661,
+      "resource_id": "devtools/client/memory.properties::tree-map.node-count",
+      "source": "Mozilla Firefox l10n",
+      "ko": "카운트",
+      "ja": "ノード数"
+    },
+    {
+      "score": 0.7508053779602051,
+      "resource_id": "main.i18n.json::vs/workbench/electron-browser/actions/developerActions/stopTracing",
+      "source": "Microsoft VS Code l10n",
+      "ko": "추적 중지",
+      "ja": "トレースの停止"
+    },
+    {
+      "score": 0.75185626745224,
+      "resource_id": "extensions/vscode.references-view.i18n.json::package/cmd.references-view.removeCallItem",
+      "source": "Microsoft VS Code l10n",
+      "ko": "해제",
+      "ja": "もどる"
+    },
+    {
+      "score": 0.7521626353263855,
+      "resource_id": "main.i18n.json::vs/workbench/contrib/chat/common/chatPermissionWarnings/permissions.autoApprove.warning.title",
+      "source": "Microsoft VS Code l10n",
+      "ko": "승인 우회를 활성화하시겠습니까?",
+      "ja": "承認のバイパスを有効にしますか?"
+    },
+    {
+      "score": 0.7523123621940613,
+      "resource_id": "main.i18n.json::vs/workbench/contrib/chat/browser/widget/chatWidget/chat.pendingRequests.steeringQueued",
+      "source": "Microsoft VS Code l10n",
+      "ko": "조종",
+      "ja": "ステアリング"
+    },
+    {
+      "score": 0.7534412145614624,
+      "resource_id": "toolkit/toolkit/intl/regionNames.ftl::region-name-gp",
+      "source": "Mozilla Firefox l10n",
+      "ko": "과들루프 제도",
+      "ja": "グアドループ"
+    },
+    {
+      "score": 0.7552546858787537,
+      "resource_id": "main.i18n.json::vs/editor/common/languages/suggestWidget.kind.snippet",
+      "source": "Microsoft VS Code l10n",
+      "ko": "코드 조각",
+      "ja": "スニペット"
+    },
+    {
+      "score": 0.755556583404541,
+      "resource_id": "main.i18n.json::vs/workbench/contrib/issue/browser/screenshotAnnotation/ellipse",
+      "source": "Microsoft VS Code l10n",
+      "ko": "타원",
+      "ja": "楕円"
+    },
+    {
+      "score": 0.7556803226470947,
+      "resource_id": "toolkit/toolkit/intl/languageNames.ftl::language-name-ho",
+      "source": "Mozilla Firefox l10n",
+      "ko": "히리모투어",
+      "ja": "ピジン語"
+    },
+    {
+      "score": 0.7563033103942871,
+      "resource_id": "toolkit/toolkit/intl/languageNames.ftl::language-name-pa",
+      "source": "Mozilla Firefox l10n",
+      "ko": "펀잡어",
+      "ja": "パンジャブ語"
+    },
+    {
+      "score": 0.7564042210578918,
+      "resource_id": "browser/browser/newtab/newtab.ftl::newtab-wallpaper-colors",
+      "source": "Mozilla Firefox l10n",
+      "ko": "색상",
+      "ja": "無地"
+    },
+    {
+      "score": 0.7564892768859863,
+      "resource_id": "dom/chrome/accessibility/mac/accessible.properties::alertDialog",
+      "source": "Mozilla Firefox l10n",
+      "ko": "경고창",
+      "ja": "警告ダイアログ"
+    },
+    {
+      "score": 0.7568449378013611,
+      "resource_id": "toolkit/toolkit/intl/languageNames.ftl::language-name-ts",
+      "source": "Mozilla Firefox l10n",
+      "ko": "통가어",
+      "ja": "ツォンガ語"
+    },
+    {
+      "score": 0.7571960687637329,
+      "resource_id": "browser/browser/profiles.ftl::profiles-cyan-theme",
+      "source": "Mozilla Firefox l10n",
+      "ko": "청록색",
+      "ja": "シアン"
+    },
+    {
+      "score": 0.7574784755706787,
+      "resource_id": "toolkit/toolkit/intl/languageNames.ftl::language-name-bi",
+      "source": "Mozilla Firefox l10n",
+      "ko": "바누아투어",
+      "ja": "ビスラマ語"
+    },
+    {
+      "score": 0.7576150894165039,
+      "resource_id": "browser/browser/preferences/preferences.ftl::appearance-window-density-group.label",
+      "source": "Mozilla Firefox l10n",
+      "ko": "창 밀도",
+      "ja": "ウィンドウの密度"
+    },
+    {
+      "score": 0.7577587366104126,
+      "resource_id": "main.i18n.json::vs/base/common/policy/telemetryConfigurationTitle",
+      "source": "Microsoft VS Code l10n",
+      "ko": "원격 분석",
+      "ja": "テレメトリ"
+    },
+    {
+      "score": 0.7579025626182556,
+      "resource_id": "toolkit/toolkit/about/aboutWebrtc.ftl::about-webrtc-remote-candidate",
+      "source": "Mozilla Firefox l10n",
+      "ko": "원격 후보자",
+      "ja": "リモート通信情報"
+    },
+    {
+      "score": 0.7590997219085693,
+      "resource_id": "toolkit/toolkit/global/commonDialog.ftl::common-dialog-title-unknown",
+      "source": "Mozilla Firefox l10n",
+      "ko": "알 수 없음",
+      "ja": "アンノーン"
+    },
+    {
+      "score": 0.7591138482093811,
+      "resource_id": "extensions/vscode.git.i18n.json::package/config.branchRandomNameDictionary.adjectives",
+      "source": "Microsoft VS Code l10n",
+      "ko": "무작위 형용사",
+      "ja": "ランダムな形容詞"
+    },
+    {
+      "score": 0.7592401504516602,
+      "resource_id": "dom/chrome/accessibility/AccessFu.properties::mathmlsquareroot",
+      "source": "Mozilla Firefox l10n",
+      "ko": "루트",
+      "ja": "平方根"
+    },
+    {
+      "score": 0.7593050599098206,
+      "resource_id": "devtools/client/inspector.properties::markupView.overflowBadge.label",
+      "source": "Mozilla Firefox l10n",
+      "ko": "넘침",
+      "ja": "オーバーフロー"
+    },
+    {
+      "score": 0.7594021558761597,
+      "resource_id": "main.i18n.json::vs/workbench/contrib/userDataSync/browser/userDataSync/turn off sync confirmation",
+      "source": "Microsoft VS Code l10n",
+      "ko": "동기화를 끄시겠습니까?",
+      "ja": "同期をオフにしますか?"
+    },
+    {
+      "score": 0.7599331140518188,
+      "resource_id": "toolkit/toolkit/about/aboutReader.ftl::about-reader-font-weight-light",
+      "source": "Mozilla Firefox l10n",
+      "ko": "가늘게",
+      "ja": "細字"
+    },
+    {
+      "score": 0.7611309289932251,
+      "resource_id": "toolkit/toolkit/about/aboutGlean.ftl::about-glean-metrics-table-settings-timelines-circle-radius",
+      "source": "Mozilla Firefox l10n",
+      "ko": "원 반지름",
+      "ja": "円の半径"
+    },
+    {
+      "score": 0.7611560821533203,
+      "resource_id": "browser/browser/profiles.ftl::profiles-violet-theme",
+      "source": "Mozilla Firefox l10n",
+      "ko": "남보라색",
+      "ja": "バイオレット"
+    },
+    {
+      "score": 0.7614793181419373,
+      "resource_id": "main.i18n.json::vs/workbench/contrib/snippets/browser/snippets.contribution/snippetSchema.json.default",
+      "source": "Microsoft VS Code l10n",
+      "ko": "빈 코드 조각",
+      "ja": "空のスニペット"
+    },
+    {
+      "score": 0.7615619897842407,
+      "resource_id": "toolkit/toolkit/pdfviewer/viewer.ftl::pdfjs-editor-comment-button.aria-label",
+      "source": "Mozilla Firefox l10n",
+      "ko": "주석",
+      "ja": "コメントを編集します"
+    },
+    {
+      "score": 0.7617903351783752,
+      "resource_id": "extensions/vscode.git.i18n.json::bundle/Are you sure you want to create an empty commit?",
+      "source": "Microsoft VS Code l10n",
+      "ko": "빈 커밋을 만드시겠습니까?",
+      "ja": "空のコミットを生成しますか?"
+    },
+    {
+      "score": 0.7619212865829468,
+      "resource_id": "toolkit/toolkit/about/abuseReports.ftl::abuse-report-deceptive-reason-v2",
+      "source": "Mozilla Firefox l10n",
+      "ko": "위장합니다",
+      "ja": "説明とは違うものだった"
+    },
+    {
+      "score": 0.7631946206092834,
+      "resource_id": "devtools/client/aboutdebugging.ftl::about-debugging-worker-status-stopped",
+      "source": "Mozilla Firefox l10n",
+      "ko": "중지됨",
+      "ja": "停止"
+    },
+    {
+      "score": 0.7633568048477173,
+      "resource_id": "security/manager/security/pippki/pippki.ftl::client-auth-cert-remember-always.label",
+      "source": "Mozilla Firefox l10n",
+      "ko": "영구히",
+      "ja": "次回からは確認しない"
+    },
+    {
+      "score": 0.7643078565597534,
+      "resource_id": "main.i18n.json::vs/workbench/contrib/issue/browser/issueReporterOverlay/stopRecording",
+      "source": "Microsoft VS Code l10n",
+      "ko": "기록 중지",
+      "ja": "ビデオ録画の停止"
+    },
+    {
+      "score": 0.7646293044090271,
+      "resource_id": "mobile/android/mobile/android/aboutConfig.ftl::config-new-pref-value-integer",
+      "source": "Mozilla Firefox l10n",
+      "ko": "정수",
+      "ja": "整数値"
+    },
+    {
+      "score": 0.7647092342376709,
+      "resource_id": "browser/browser/newtab/newtab.ftl::home-prefs-shortcuts-header-srd.label",
+      "source": "Mozilla Firefox l10n",
+      "ko": "바로 가기",
+      "ja": "ショートカット"
+    },
+    {
+      "score": 0.7648533582687378,
+      "resource_id": "toolkit/toolkit/intl/regionNames.ftl::region-name-xw",
+      "source": "Mozilla Firefox l10n",
+      "ko": "요르단 강 서안 지구",
+      "ja": "ヨルダン川西岸地区"
+    },
+    {
+      "score": 0.7656974792480469,
+      "resource_id": "browser/browser/preferences/colors.ftl::colors-text-and-background",
+      "source": "Mozilla Firefox l10n",
+      "ko": "글자와 배경",
+      "ja": "テキストと背景の色"
+    },
+    {
+      "score": 0.765754222869873,
+      "resource_id": "main.i18n.json::vs/sessions/contrib/aquarium/browser/aquarium.contribution/aquarium.simulateStreak.clear",
+      "source": "Microsoft VS Code l10n",
+      "ko": "연속 기록 지우기",
+      "ja": "連勝"
+    },
+    {
+      "score": 0.7658257484436035,
+      "resource_id": "browser/browser/newtab/newtab.ftl::newtab-wallpaper-sand-dunes",
+      "source": "Mozilla Firefox l10n",
+      "ko": "하얀 모래언덕",
+      "ja": "白砂の砂丘"
+    },
+    {
+      "score": 0.7660353183746338,
+      "resource_id": "browser/browser/profiles.ftl::profiles-marigold-theme-2",
+      "source": "Mozilla Firefox l10n",
+      "ko": "노란색 금잔화",
+      "ja": "マリーゴールドイエロー"
+    },
+    {
+      "score": 0.7660528421401978,
+      "resource_id": "browser/browser/profiles.ftl::heart-rate-avatar",
+      "source": "Mozilla Firefox l10n",
+      "ko": "심박수",
+      "ja": "心拍数"
+    },
+    {
+      "score": 0.7662621140480042,
+      "resource_id": "browser/browser/preferences/preferences.ftl::collection-header2.searchkeywords",
+      "source": "Mozilla Firefox l10n",
+      "ko": "원격 분석",
+      "ja": "テレメトリー"
+    },
+    {
+      "score": 0.7664806246757507,
+      "resource_id": "toolkit/toolkit/about/certviewer.ftl::certificate-viewer-qualifier",
+      "source": "Mozilla Firefox l10n",
+      "ko": "한정자",
+      "ja": "運用規程"
+    },
+    {
+      "score": 0.7665854096412659,
+      "resource_id": "browser/browser/newtab/newtab.ftl::newtab-wallpaper-category-title-colors",
+      "source": "Mozilla Firefox l10n",
+      "ko": "단색",
+      "ja": "無地"
+    },
+    {
+      "score": 0.7667300701141357,
+      "resource_id": "toolkit/toolkit/intl/languageNames.ftl::language-name-ka",
+      "source": "Mozilla Firefox l10n",
+      "ko": "그루지야어",
+      "ja": "ジョージア語"
+    },
+    {
+      "score": 0.766822338104248,
+      "resource_id": "devtools/client/netmonitor.properties::certmgr.fingerprints.label",
+      "source": "Mozilla Firefox l10n",
+      "ko": "지문",
+      "ja": "フィンガープリント"
+    },
+    {
+      "score": 0.766853928565979,
+      "resource_id": "toolkit/toolkit/pdfviewer/viewer.ftl::pdfjs-comment-floating-button.aria-label",
+      "source": "Mozilla Firefox l10n",
+      "ko": "주석",
+      "ja": "コメントを追加します"
+    },
+    {
+      "score": 0.7670712471008301,
+      "resource_id": "toolkit/toolkit/intl/languageNames.ftl::language-name-to",
+      "source": "Mozilla Firefox l10n",
+      "ko": "통가어",
+      "ja": "トンガ語"
+    },
+    {
+      "score": 0.7672132849693298,
+      "resource_id": "browser/browser/preferences/containers.ftl::containers-icon-chill.label",
+      "source": "Mozilla Firefox l10n",
+      "ko": "추운",
+      "ja": "クール"
+    },
+    {
+      "score": 0.7673643827438354,
+      "resource_id": "browser/browser/profiles.ftl::profiles-moss-theme-2",
+      "source": "Mozilla Firefox l10n",
+      "ko": "이끼 녹색",
+      "ja": "モスグリーン"
+    },
+    {
+      "score": 0.7673764228820801,
+      "resource_id": "toolkit/toolkit/intl/regionNames.ftl::region-name-fj",
+      "source": "Mozilla Firefox l10n",
+      "ko": "피지",
+      "ja": "フィジー"
+    },
+    {
+      "score": 0.7677209973335266,
+      "resource_id": "browser/browser/preferences/containers.ftl::containers-color-orange.label",
+      "source": "Mozilla Firefox l10n",
+      "ko": "주황색",
+      "ja": "オレンジ"
+    },
+    {
+      "score": 0.7679672241210938,
+      "resource_id": "browser/browser/customizeMode.ftl::customize-mode-uidensity.label",
+      "source": "Mozilla Firefox l10n",
+      "ko": "밀도",
+      "ja": "UI 密度"
+    },
+    {
+      "score": 0.768086314201355,
+      "resource_id": "devtools/client/debugger.properties::tracer.header",
+      "source": "Mozilla Firefox l10n",
+      "ko": "추적기",
+      "ja": "トレーサー"
+    },
+    {
+      "score": 0.7683189511299133,
+      "resource_id": "devtools/client/font-inspector.properties::fontinspector.fontItalicLabel",
+      "source": "Mozilla Firefox l10n",
+      "ko": "기울임꼴",
+      "ja": "イタリック"
+    },
+    {
+      "score": 0.7684363126754761,
+      "resource_id": "main.i18n.json::vs/workbench/browser/parts/editor/editorCommands/editorGroupLayout.horizontal",
+      "source": "Microsoft VS Code l10n",
+      "ko": "가로",
+      "ja": "水平"
+    },
+    {
+      "score": 0.7684653997421265,
+      "resource_id": "devtools/client/netmonitor.properties::netmonitor.toolbar.override",
+      "source": "Mozilla Firefox l10n",
+      "ko": "재정의",
+      "ja": "オーバーライド"
+    },
+    {
+      "score": 0.7686612606048584,
+      "resource_id": "main.i18n.json::vs/workbench/contrib/mergeEditor/browser/mergeEditorInputModel/saveTempFile.message",
+      "source": "Microsoft VS Code l10n",
+      "ko": "병합 결과를 수락하시겠습니까?",
+      "ja": "マージ結果を受け入れますか?"
+    },
+    {
+      "score": 0.768959641456604,
+      "resource_id": "devtools/client/debugger.properties::watchpoints.getWatchpoint",
+      "source": "Mozilla Firefox l10n",
+      "ko": "속성 반환",
+      "ja": "プロパティの取得"
+    },
+    {
+      "score": 0.7702634930610657,
+      "resource_id": "devtools/client/debugger.properties::watchpoints.setWatchpoint",
+      "source": "Mozilla Firefox l10n",
+      "ko": "속성 할당",
+      "ja": "プロパティの設定"
+    },
+    {
+      "score": 0.7702677249908447,
+      "resource_id": "toolkit/toolkit/intl/languageNames.ftl::language-name-gv",
+      "source": "Mozilla Firefox l10n",
+      "ko": "맹크스어",
+      "ja": "マン島語"
+    },
+    {
+      "score": 0.7705014944076538,
+      "resource_id": "dom/chrome/accessibility/AccessFu.properties::overscript",
+      "source": "Mozilla Firefox l10n",
+      "ko": "위첨자",
+      "ja": "真上付き"
+    },
+    {
+      "score": 0.7705725431442261,
+      "resource_id": "main.i18n.json::vs/workbench/contrib/terminalContrib/sendSignal/browser/terminal.sendSignal.contribution/SIGHUP",
+      "source": "Microsoft VS Code l10n",
+      "ko": "전화 끊기",
+      "ja": "ハングアップ"
+    },
+    {
+      "score": 0.7706909775733948,
+      "resource_id": "browser/browser/preferences/fonts.ftl::fonts-langgroup-ethiopic.label",
+      "source": "Mozilla Firefox l10n",
+      "ko": "에티오피아어",
+      "ja": "アムハラ語"
+    },
+    {
+      "score": 0.7711845636367798,
+      "resource_id": "devtools/client/netmonitor.properties::netmonitor.toolbar.initiator",
+      "source": "Mozilla Firefox l10n",
+      "ko": "초기자",
+      "ja": "要求元"
+    },
+    {
+      "score": 0.7717288732528687,
+      "resource_id": "dom/chrome/accessibility/AccessFu.properties::footer",
+      "source": "Mozilla Firefox l10n",
+      "ko": "꼬리말",
+      "ja": "フッター"
+    },
+    {
+      "score": 0.7724246978759766,
+      "resource_id": "browser/browser/aboutUnloads.ftl::about-unloads-button-unload",
+      "source": "Mozilla Firefox l10n",
+      "ko": "언로드",
+      "ja": "解放"
+    },
+    {
+      "score": 0.7724893093109131,
+      "resource_id": "browser/browser/genai.ftl::genai-prompts-proofread.label",
+      "source": "Mozilla Firefox l10n",
+      "ko": "교정",
+      "ja": "校正"
+    },
+    {
+      "score": 0.7726832628250122,
+      "resource_id": "toolkit/toolkit/about/aboutGlean.ftl::about-glean-metrics-table-settings-histograms-box-padding",
+      "source": "Mozilla Firefox l10n",
+      "ko": "박스 패딩",
+      "ja": "柱の間隔"
+    },
+    {
+      "score": 0.7727936506271362,
+      "resource_id": "dom/chrome/accessibility/AccessFu.properties::presuperscript",
+      "source": "Mozilla Firefox l10n",
+      "ko": "위첨자전",
+      "ja": "前上付き"
+    },
+    {
+      "score": 0.7728280425071716,
+      "resource_id": "main.i18n.json::vs/workbench/api/browser/mainThreadChatSessions/interruptActiveResponse",
+      "source": "Microsoft VS Code l10n",
+      "ko": "활성 세션을 중단하시겠습니까?",
+      "ja": "アクティブなセッションを中断しますか?"
+    },
+    {
+      "score": 0.7728583812713623,
+      "resource_id": "toolkit/toolkit/intl/languageNames.ftl::language-name-wo",
+      "source": "Mozilla Firefox l10n",
+      "ko": "세네갈어",
+      "ja": "ウォロフ語"
+    },
+    {
+      "score": 0.7728842496871948,
+      "resource_id": "devtools/client/aboutdebugging.ftl::about-debugging-worker-scope.label",
+      "source": "Mozilla Firefox l10n",
+      "ko": "범위",
+      "ja": "スコープ"
+    },
+    {
+      "score": 0.7730364799499512,
+      "resource_id": "devtools/shared/styleinspector.properties::rule.status.MATCHED",
+      "source": "Mozilla Firefox l10n",
+      "ko": "일치",
+      "ja": "適用候補"
+    },
+    {
+      "score": 0.7731113433837891,
+      "resource_id": "browser/browser/aiWindow.ftl::aiwindow-firstrun-model-fast-label",
+      "source": "Mozilla Firefox l10n",
+      "ko": "빠름",
+      "ja": "高速"
+    },
+    {
+      "score": 0.7733637690544128,
+      "resource_id": "main.i18n.json::vs/workbench/contrib/chat/browser/agentSessions/agentSessionsActions/chat.sessionsOrientation.stacked",
+      "source": "Microsoft VS Code l10n",
+      "ko": "스택형",
+      "ja": "上下に並べて表示"
+    },
+    {
+      "score": 0.7734075784683228,
+      "resource_id": "browser/browser/preferences/preferences.ftl::sync-currently-syncing-addons",
+      "source": "Mozilla Firefox l10n",
+      "ko": "부가 기능",
+      "ja": "アドオン"
+    },
+    {
+      "score": 0.7735240459442139,
+      "resource_id": "toolkit/toolkit/intl/regionNames.ftl::region-name-xc",
+      "source": "Mozilla Firefox l10n",
+      "ko": "산호해 제도",
+      "ja": "コーラル シー諸島"
+    },
+    {
+      "score": 0.7736906409263611,
+      "resource_id": "toolkit/toolkit/about/aboutPerformance.ftl::type-tracker",
+      "source": "Mozilla Firefox l10n",
+      "ko": "추적기",
+      "ja": "トラッカー"
+    },
+    {
+      "score": 0.7737758159637451,
+      "resource_id": "toolkit/toolkit/intl/languageNames.ftl::language-name-hsb",
+      "source": "Mozilla Firefox l10n",
+      "ko": "고지 소르브어",
+      "ja": "高地ソルブ語"
+    },
+    {
+      "score": 0.7744747400283813,
+      "resource_id": "devtools/client/storage.ftl::storage-collapse-pane.title",
+      "source": "Mozilla Firefox l10n",
+      "ko": "창 접기",
+      "ja": "ペインを折りたたみます"
+    },
+    {
+      "score": 0.7745607495307922,
+      "resource_id": "toolkit/toolkit/pdfviewer/viewer.ftl::pdfjs-comment-floating-button-label",
+      "source": "Mozilla Firefox l10n",
+      "ko": "주석",
+      "ja": "コメント"
+    },
+    {
+      "score": 0.7745684385299683,
+      "resource_id": "devtools/client/memory.properties::dominatortree.field.label",
+      "source": "Mozilla Firefox l10n",
+      "ko": "라벨",
+      "ja": "ドミネーター"
+    },
+    {
+      "score": 0.7746032476425171,
+      "resource_id": "devtools/client/font-inspector.properties::fontinspector.letterSpacingLabel",
+      "source": "Mozilla Firefox l10n",
+      "ko": "간격",
+      "ja": "文字間隔"
+    },
+    {
+      "score": 0.7746740579605103,
+      "resource_id": "browser/browser/profiles.ftl::profiles-magnolia-theme-2",
+      "source": "Mozilla Firefox l10n",
+      "ko": "목련 분홍색",
+      "ja": "マグノリアピンク"
+    },
+    {
+      "score": 0.7749561071395874,
+      "resource_id": "toolkit/toolkit/intl/languageNames.ftl::language-name-zu",
+      "source": "Mozilla Firefox l10n",
+      "ko": "줄루어",
+      "ja": "ズールー語"
+    },
+    {
+      "score": 0.7750023007392883,
+      "resource_id": "browser/browser/tabContextMenu.ftl::duplicate-tab2.label",
+      "source": "Mozilla Firefox l10n",
+      "ko": "복제",
+      "ja": "複製"
+    },
+    {
+      "score": 0.77516770362854,
+      "resource_id": "devtools/client/aboutdebugging.ftl::about-debugging-worker-origin.label",
+      "source": "Mozilla Firefox l10n",
+      "ko": "출처",
+      "ja": "オリジン"
+    }
+  ],
+  "highest_rejected": [
+    {
+      "score": 0.7947023510932922,
+      "resource_id": "toolkit/toolkit/intl/regionNames.ftl::region-name-xq",
+      "source": "Mozilla Firefox l10n",
+      "ko": "자르비스 섬",
+      "ja": "ジャーヴィス島"
+    },
+    {
+      "score": 0.7947071194648743,
+      "resource_id": "toolkit/toolkit/intl/languageNames.ftl::language-name-ab",
+      "source": "Mozilla Firefox l10n",
+      "ko": "압하지안어",
+      "ja": "アブハジア語"
+    },
+    {
+      "score": 0.7947779297828674,
+      "resource_id": "toolkit/toolkit/pdfviewer/viewer.ftl::pdfjs-editor-add-signature-clear-button-label",
+      "source": "Mozilla Firefox l10n",
+      "ko": "서명 지우기",
+      "ja": "署名を消去"
+    },
+    {
+      "score": 0.7948601245880127,
+      "resource_id": "devtools/client/webconsole.properties::propertiesFilterPlaceholder",
+      "source": "Mozilla Firefox l10n",
+      "ko": "속성 필터",
+      "ja": "プロパティを絞り込み"
+    },
+    {
+      "score": 0.794863224029541,
+      "resource_id": "main.i18n.json::vs/workbench/browser/parts/notifications/notificationsStatus/status.doNotDisturb",
+      "source": "Microsoft VS Code l10n",
+      "ko": "방해 금지",
+      "ja": "応答不可"
+    },
+    {
+      "score": 0.7948949933052063,
+      "resource_id": "browser/browser/preferences/preferences.ftl::prefs-syncing-on-2.label",
+      "source": "Mozilla Firefox l10n",
+      "ko": "동기화 켜짐",
+      "ja": "同期はオンです"
+    },
+    {
+      "score": 0.7951481342315674,
+      "resource_id": "devtools/client/aboutdebugging.ftl::about-debugging-worker-action-unregister",
+      "source": "Mozilla Firefox l10n",
+      "ko": "등록해제",
+      "ja": "解除"
+    },
+    {
+      "score": 0.7951621413230896,
+      "resource_id": "browser/browser/pageInfo.ftl::perm-tab.label",
+      "source": "Mozilla Firefox l10n",
+      "ko": "권한",
+      "ja": "サイト別設定"
+    },
+    {
+      "score": 0.7951656579971313,
+      "resource_id": "extensions/vscode.git.i18n.json::package/command.rebase2",
+      "source": "Microsoft VS Code l10n",
+      "ko": "기준 주소 다시 지정",
+      "ja": "リベース"
+    },
+    {
+      "score": 0.7952021360397339,
+      "resource_id": "main.i18n.json::vs/workbench/contrib/testing/common/constants/testGroup.coverage",
+      "source": "Microsoft VS Code l10n",
+      "ko": "적용 범위",
+      "ja": "カバレッジ"
+    },
+    {
+      "score": 0.7952537536621094,
+      "resource_id": "main.i18n.json::vs/workbench/contrib/terminalContrib/suggest/browser/terminal.suggest.contribution/workbench.action.terminal.suggestToggleDetails",
+      "source": "Microsoft VS Code l10n",
+      "ko": "제안 토글 세부 정보",
+      "ja": "提案の切り替えの詳細"
+    },
+    {
+      "score": 0.7953037023544312,
+      "resource_id": "browser/pdfviewer/viewer.properties::editor_ink_thickness",
+      "source": "Mozilla Firefox l10n",
+      "ko": "두께",
+      "ja": "太さ"
+    },
+    {
+      "score": 0.7953243255615234,
+      "resource_id": "toolkit/toolkit/about/aboutSupport.ftl::graphics-workarounds-title",
+      "source": "Mozilla Firefox l10n",
+      "ko": "임시방편",
+      "ja": "回避策"
+    },
+    {
+      "score": 0.7953457236289978,
+      "resource_id": "main.i18n.json::vs/workbench/contrib/chat/browser/chatDebug/chatDebugCacheExplorerView/chatDebug.cache.chunkBreakdown",
+      "source": "Microsoft VS Code l10n",
+      "ko": "청크 분석",
+      "ja": "チャンクの内訳"
+    },
+    {
+      "score": 0.7953503727912903,
+      "resource_id": "extensions/vscode.git.i18n.json::package/submenu.commit.signoff",
+      "source": "Microsoft VS Code l10n",
+      "ko": "승인",
+      "ja": "サインオフ"
+    },
+    {
+      "score": 0.795416533946991,
+      "resource_id": "dom/chrome/accessibility/AccessFu.properties::mathmlscripted",
+      "source": "Mozilla Firefox l10n",
+      "ko": "스크립트",
+      "ja": "添字"
+    },
+    {
+      "score": 0.7954397797584534,
+      "resource_id": "toolkit/toolkit/about/aboutAddons.ftl::list-empty-button.label",
+      "source": "Mozilla Firefox l10n",
+      "ko": "부가 기능 더 알아보기",
+      "ja": "アドオンについて知る"
+    },
+    {
+      "score": 0.7956088781356812,
+      "resource_id": "toolkit/toolkit/about/aboutProcesses.ftl::about-processes-web-isolated-property-with-coop-coep",
+      "source": "Mozilla Firefox l10n",
+      "ko": "교차 출처 격리됨",
+      "ja": "クロスオリジン隔離"
+    },
+    {
+      "score": 0.7956148386001587,
+      "resource_id": "main.i18n.json::vs/editor/contrib/inlineCompletions/browser/controller/commands/acceptLine",
+      "source": "Microsoft VS Code l10n",
+      "ko": "줄 수락",
+      "ja": "行を承諾する"
+    },
+    {
+      "score": 0.795721173286438,
+      "resource_id": "toolkit/toolkit/about/aboutProcesses.ftl::about-processes-cpu-fully-idle",
+      "source": "Mozilla Firefox l10n",
+      "ko": "유휴",
+      "ja": "待機"
+    },
+    {
+      "score": 0.7957326769828796,
+      "resource_id": "devtools/client/netmonitor.properties::netmonitor.toolbar.path",
+      "source": "Mozilla Firefox l10n",
+      "ko": "경로",
+      "ja": "パス"
+    },
+    {
+      "score": 0.7958556413650513,
+      "resource_id": "browser/browser/browser.ftl::trustpanel-clear-cookies-subview-button-clear",
+      "source": "Mozilla Firefox l10n",
+      "ko": "지우기",
+      "ja": "消去"
+    },
+    {
+      "score": 0.7958701848983765,
+      "resource_id": "main.i18n.json::vs/workbench/contrib/testing/browser/testExplorerActions/testing.clearCoverage",
+      "source": "Microsoft VS Code l10n",
+      "ko": "적용 범위 지우기",
+      "ja": "カバレッジのクリア"
+    },
+    {
+      "score": 0.7958924770355225,
+      "resource_id": "browser/browser/profiles.ftl::makeup-avatar",
+      "source": "Mozilla Firefox l10n",
+      "ko": "화장",
+      "ja": "化粧"
+    },
+    {
+      "score": 0.7959455251693726,
+      "resource_id": "browser/browser/preferences/preferences.ftl::content-blocking-warning-learn-how",
+      "source": "Mozilla Firefox l10n",
+      "ko": "방법 알아보기",
+      "ja": "詳細情報"
+    },
+    {
+      "score": 0.7960130572319031,
+      "resource_id": "toolkit/toolkit/pictureinpicture/pictureinpicture.ftl::pictureinpicture-seekforward-btn.aria-label",
+      "source": "Mozilla Firefox l10n",
+      "ko": "앞으로",
+      "ja": "早送り"
+    },
+    {
+      "score": 0.7960647940635681,
+      "resource_id": "main.i18n.json::vs/workbench/contrib/interactiveSession/browser/actions/interactiveSessionTitleActions/interactive.voteUp.label",
+      "source": "Microsoft VS Code l10n",
+      "ko": "투표하기",
+      "ja": "可決"
+    },
+    {
+      "score": 0.7961291074752808,
+      "resource_id": "main.i18n.json::vs/workbench/services/actions/common/menusExtensionPoint/menus.artifactContext",
+      "source": "Microsoft VS Code l10n",
+      "ko": "소스 제어 아티팩트 바로 가기 메뉴",
+      "ja": "ソース管理成果物のコンテキスト メニュー"
+    },
+    {
+      "score": 0.7961762547492981,
+      "resource_id": "devtools/client/debugger.properties::generated",
+      "source": "Mozilla Firefox l10n",
+      "ko": "성성됨",
+      "ja": "生成場所"
+    },
+    {
+      "score": 0.7962329387664795,
+      "resource_id": "browser/browser/newtab/newtab.ftl::newtab-weather-low.aria-label",
+      "source": "Mozilla Firefox l10n",
+      "ko": "낮음",
+      "ja": "最低気温"
+    },
+    {
+      "score": 0.7963456511497498,
+      "resource_id": "toolkit/toolkit/intl/regionNames.ftl::region-name-xu",
+      "source": "Mozilla Firefox l10n",
+      "ko": "존스턴 환초",
+      "ja": "ジョンストン環礁"
+    },
+    {
+      "score": 0.796461284160614,
+      "resource_id": "main.i18n.json::vs/editor/contrib/gotoSymbol/browser/goToCommands/actions.previewDecl.label",
+      "source": "Microsoft VS Code l10n",
+      "ko": "정의 피킹",
+      "ja": "定義をここに表示"
+    },
+    {
+      "score": 0.7964692115783691,
+      "resource_id": "main.i18n.json::vs/editor/contrib/codeAction/browser/codeActionMenu/codeAction.widget.id.surround",
+      "source": "Microsoft VS Code l10n",
+      "ko": "코드 감싸기",
+      "ja": "ブロックの挿入"
+    },
+    {
+      "score": 0.7965010404586792,
+      "resource_id": "toolkit/toolkit/intl/regionNames.ftl::region-name-vc",
+      "source": "Mozilla Firefox l10n",
+      "ko": "세인트 빈센트 그레나다",
+      "ja": "セントビンセントおよびグレナディーン諸島"
+    },
+    {
+      "score": 0.7965289354324341,
+      "resource_id": "browser/browser/appmenu.ftl::appmenuitem-vpn-description3",
+      "source": "Mozilla Firefox l10n",
+      "ko": "탐색 활동 추적 방지",
+      "ja": "ウェブブラウジングが追跡できないようにします"
+    },
+    {
+      "score": 0.7967221140861511,
+      "resource_id": "main.i18n.json::vs/workbench/contrib/snippets/browser/commands/configureSnippets/openSnippet.label",
+      "source": "Microsoft VS Code l10n",
+      "ko": "코드 조각 구성",
+      "ja": "スニペットの構成"
+    },
+    {
+      "score": 0.7967386245727539,
+      "resource_id": "devtools/client/debugger.properties::shortcuts.stepOut",
+      "source": "Mozilla Firefox l10n",
+      "ko": "나오기",
+      "ja": "ステップアウト"
+    },
+    {
+      "score": 0.7967455387115479,
+      "resource_id": "main.i18n.json::vs/workbench/contrib/terminal/browser/xterm/decorationAddon/gutter",
+      "source": "Microsoft VS Code l10n",
+      "ko": "여백 명령 장식",
+      "ja": "コマンド左側のアイコン"
+    },
+    {
+      "score": 0.7967658042907715,
+      "resource_id": "security/manager/security/certificates/certManager.ftl::certmgr-expires-label.label",
+      "source": "Mozilla Firefox l10n",
+      "ko": "만료일",
+      "ja": "有効期限"
+    },
+    {
+      "score": 0.7967860102653503,
+      "resource_id": "browser/browser/preferences/preferences.ftl::preferences-ai-controls-state-blocked.label",
+      "source": "Mozilla Firefox l10n",
+      "ko": "차단됨",
+      "ja": "ブロック"
+    },
+    {
+      "score": 0.796819269657135,
+      "resource_id": "dom/chrome/accessibility/AccessFu.properties::caption",
+      "source": "Mozilla Firefox l10n",
+      "ko": "캡션",
+      "ja": "表題"
+    },
+    {
+      "score": 0.7968488931655884,
+      "resource_id": "browser/browser/menubar.ftl::menu-view-full-zoom-actual-size.label",
+      "source": "Mozilla Firefox l10n",
+      "ko": "실제 크기",
+      "ja": "等倍"
+    },
+    {
+      "score": 0.7969359159469604,
+      "resource_id": "main.i18n.json::vs/workbench/contrib/extensions/browser/extensions.contribution/workbench.extensions.action.configureKeybindings",
+      "source": "Microsoft VS Code l10n",
+      "ko": "바로 가기 키",
+      "ja": "キーボード ショートカット"
+    },
+    {
+      "score": 0.7969636917114258,
+      "resource_id": "main.i18n.json::vs/workbench/contrib/extensions/browser/extensionsActions/togglePreRleaseLabel",
+      "source": "Microsoft VS Code l10n",
+      "ko": "시험판",
+      "ja": "プレリリース"
+    },
+    {
+      "score": 0.796992838382721,
+      "resource_id": "dom/chrome/accessibility/mac/accessible.properties::heading",
+      "source": "Mozilla Firefox l10n",
+      "ko": "머릿말",
+      "ja": "見出し"
+    },
+    {
+      "score": 0.7971234917640686,
+      "resource_id": "browser/pdfviewer/viewer.properties::editor_ink_opacity",
+      "source": "Mozilla Firefox l10n",
+      "ko": "불투명도",
+      "ja": "不透明度"
+    },
+    {
+      "score": 0.7971389889717102,
+      "resource_id": "main.i18n.json::vs/workbench/contrib/notebook/browser/controller/sectionActions/foldSection",
+      "source": "Microsoft VS Code l10n",
+      "ko": "구역 접기",
+      "ja": "セクションの折りたたみ"
+    },
+    {
+      "score": 0.7971463799476624,
+      "resource_id": "devtools/client/webconsole.properties::webconsole.input.selector.top",
+      "source": "Mozilla Firefox l10n",
+      "ko": "위쪽",
+      "ja": "トップ"
+    },
+    {
+      "score": 0.7971494197845459,
+      "resource_id": "toolkit/toolkit/intl/regionNames.ftl::region-name-va",
+      "source": "Mozilla Firefox l10n",
+      "ko": "바티칸 시국",
+      "ja": "バチカン"
+    },
+    {
+      "score": 0.7971586585044861,
+      "resource_id": "browser/browser/siteProtections.ftl::protections-not-blocking-fingerprinters.title",
+      "source": "Mozilla Firefox l10n",
+      "ko": "디지털 지문 차단하지 않음",
+      "ja": "未ブロックのフィンガープリント採取"
+    },
+    {
+      "score": 0.7971926331520081,
+      "resource_id": "toolkit/toolkit/about/aboutNetworking.ftl::about-networking-family",
+      "source": "Mozilla Firefox l10n",
+      "ko": "계통",
+      "ja": "系統"
+    },
+    {
+      "score": 0.797234058380127,
+      "resource_id": "browser/browser/appmenu.ftl::profiler-popup-presets-debug-label.label",
+      "source": "Mozilla Firefox l10n",
+      "ko": "디버그",
+      "ja": "デバッグ"
+    },
+    {
+      "score": 0.7973346710205078,
+      "resource_id": "main.i18n.json::vs/workbench/contrib/debug/browser/debug.contribution/disassembly",
+      "source": "Microsoft VS Code l10n",
+      "ko": "디스어셈블리",
+      "ja": "逆アセンブリ"
+    },
+    {
+      "score": 0.7973414659500122,
+      "resource_id": "browser/browser/newtab/newtab.ftl::newtab-wallpaper-celestial-starry-sky",
+      "source": "Mozilla Firefox l10n",
+      "ko": "별이 빛나는 하늘",
+      "ja": "星空"
+    },
+    {
+      "score": 0.7975173592567444,
+      "resource_id": "security/manager/chrome/pipnss/pipnss.properties::CertExceptionPermanent",
+      "source": "Mozilla Firefox l10n",
+      "ko": "영구",
+      "ja": "恒久的"
+    },
+    {
+      "score": 0.7975875735282898,
+      "resource_id": "toolkit/toolkit/intl/regionNames.ftl::region-name-ge",
+      "source": "Mozilla Firefox l10n",
+      "ko": "조지아",
+      "ja": "ジョージア"
+    },
+    {
+      "score": 0.7978275418281555,
+      "resource_id": "browser/browser/newtab/newtab.ftl::newtab-widget-timer-celebration-message-break",
+      "source": "Mozilla Firefox l10n",
+      "ko": "집중할 준비가 되었나요?",
+      "ja": "再開しますか?"
+    },
+    {
+      "score": 0.7978725433349609,
+      "resource_id": "main.i18n.json::vs/editor/contrib/contextmenu/browser/contextmenu/context.minimap.size.proportional",
+      "source": "Microsoft VS Code l10n",
+      "ko": "비례",
+      "ja": "均等"
+    },
+    {
+      "score": 0.797878623008728,
+      "resource_id": "browser/browser/pageInfo.ftl::media-cursor",
+      "source": "Mozilla Firefox l10n",
+      "ko": "커서",
+      "ja": "カーソル"
+    },
+    {
+      "score": 0.7978857159614563,
+      "resource_id": "browser/browser/newtab/newtab.ftl::newtab-section-follow-button",
+      "source": "Mozilla Firefox l10n",
+      "ko": "팔로우",
+      "ja": "フォローする"
+    },
+    {
+      "score": 0.7979570031166077,
+      "resource_id": "browser/browser/preferences/preferences.ftl::settings-spellcheck-header.label",
+      "source": "Mozilla Firefox l10n",
+      "ko": "맞춤법 검사",
+      "ja": "スペルチェック"
+    },
+    {
+      "score": 0.7979679703712463,
+      "resource_id": "main.i18n.json::vs/workbench/contrib/debug/browser/breakpointWidget/triggeredBy",
+      "source": "Microsoft VS Code l10n",
+      "ko": "중단점 대기",
+      "ja": "ブレークポイントの待機"
+    },
+    {
+      "score": 0.7980177998542786,
+      "resource_id": "browser/browser/appmenu.ftl::appmenuitem-fxa-sync-off-title",
+      "source": "Mozilla Firefox l10n",
+      "ko": "동기화 꺼짐",
+      "ja": "同期はオフです"
+    },
+    {
+      "score": 0.7981231808662415,
+      "resource_id": "extensions/vscode.css-language-features.i18n.json::bundle/Selector Specificity",
+      "source": "Microsoft VS Code l10n",
+      "ko": "선택기 특이성",
+      "ja": "セレクターの固有性"
+    },
+    {
+      "score": 0.7981398701667786,
+      "resource_id": "toolkit/toolkit/about/aboutNetworking.ftl::about-networking-bytes-sent",
+      "source": "Mozilla Firefox l10n",
+      "ko": "보낸 바이트 수",
+      "ja": "送信バイト数"
+    },
+    {
+      "score": 0.7982307076454163,
+      "resource_id": "browser/browser/newtab/newtab.ftl::newtab-wallpaper-dark-fox-anniversary",
+      "source": "Mozilla Firefox l10n",
+      "ko": "숲 근처 포장도로에 있는 여우",
+      "ja": "森林の道路に座るキツネ"
+    },
+    {
+      "score": 0.79823899269104,
+      "resource_id": "main.i18n.json::vs/workbench/contrib/scm/browser/scmHistoryViewPane/scm history",
+      "source": "Microsoft VS Code l10n",
+      "ko": "소스 제어 기록",
+      "ja": "ソース管理履歴"
+    },
+    {
+      "score": 0.7982494831085205,
+      "resource_id": "toolkit/toolkit/about/certviewer.ftl::certificate-viewer-method",
+      "source": "Mozilla Firefox l10n",
+      "ko": "메소드",
+      "ja": "方式"
+    },
+    {
+      "score": 0.7982621788978577,
+      "resource_id": "browser/browser/newtab/asrouter.ftl::device-migration-fxa-spotlight-sync-header",
+      "source": "Mozilla Firefox l10n",
+      "ko": "빠짐없이 탐색하기",
+      "ja": "シームレスにブラウジング"
+    },
+    {
+      "score": 0.7984341382980347,
+      "resource_id": "toolkit/toolkit/intl/languageNames.ftl::language-name-ee",
+      "source": "Mozilla Firefox l10n",
+      "ko": "이유어",
+      "ja": "エウェ語"
+    },
+    {
+      "score": 0.7984990477561951,
+      "resource_id": "devtools/client/debugger.properties::serviceWorkerInfo.redundant",
+      "source": "Mozilla Firefox l10n",
+      "ko": "중복",
+      "ja": "冗長"
+    },
+    {
+      "score": 0.7986682653427124,
+      "resource_id": "browser/browser/browser.ftl::urlbar-result-menu-button-feedback",
+      "source": "Mozilla Firefox l10n",
+      "ko": "의견 보내기",
+      "ja": "フィードバック"
+    },
+    {
+      "score": 0.7986910939216614,
+      "resource_id": "extensions/vscode.merge-conflict.i18n.json::package/command.accept.incoming",
+      "source": "Microsoft VS Code l10n",
+      "ko": "수신 수락",
+      "ja": "入力側を取り込む"
+    },
+    {
+      "score": 0.7988070249557495,
+      "resource_id": "main.i18n.json::vs/workbench/contrib/notebook/browser/contrib/saveParticipants/saveParticipants/trimNotebookWhitespace",
+      "source": "Microsoft VS Code l10n",
+      "ko": "전자 필기장 자르기 후행 공백",
+      "ja": "ノートブックの末尾の空白文字のトリミング"
+    },
+    {
+      "score": 0.7988085150718689,
+      "resource_id": "devtools/client/netmonitor.properties::netmonitor.cache.device",
+      "source": "Mozilla Firefox l10n",
+      "ko": "기기",
+      "ja": "取得元デバイス"
+    },
+    {
+      "score": 0.7988144755363464,
+      "resource_id": "toolkit/toolkit/intl/regionNames.ftl::region-name-mf",
+      "source": "Mozilla Firefox l10n",
+      "ko": "산타 마틴",
+      "ja": "サンマルタン"
+    },
+    {
+      "score": 0.7988150715827942,
+      "resource_id": "dom/chrome/accessibility/AccessFu.properties::treetable",
+      "source": "Mozilla Firefox l10n",
+      "ko": "트리 테이블",
+      "ja": "折り畳みリスト"
+    },
+    {
+      "score": 0.7988442182540894,
+      "resource_id": "browser/browser/reportBrokenSite.ftl::report-broken-site-panel-reason-label",
+      "source": "Mozilla Firefox l10n",
+      "ko": "어떤 문제인가요?",
+      "ja": "何が動作しませんか?"
+    },
+    {
+      "score": 0.7988601922988892,
+      "resource_id": "browser/browser/featureCallout.ftl::bookmarks-toolbar-callout-2b-title",
+      "source": "Mozilla Firefox l10n",
+      "ko": "북마크 도구 모음을 그대로 두시겠습니까?",
+      "ja": "ブックマークツールバーを表示したままにしますか?"
+    },
+    {
+      "score": 0.7988866567611694,
+      "resource_id": "main.i18n.json::vs/workbench/contrib/debug/browser/debugActionViewItems/debugLaunchConfigurations",
+      "source": "Microsoft VS Code l10n",
+      "ko": "디버그 시작 구성",
+      "ja": "起動構成のデバッグ"
+    },
+    {
+      "score": 0.7988963723182678,
+      "resource_id": "toolkit/toolkit/pdfviewer/viewer.ftl::pdfjs-editor-add-signature-draw-thickness-range-label",
+      "source": "Mozilla Firefox l10n",
+      "ko": "두께",
+      "ja": "線の太さ"
+    },
+    {
+      "score": 0.7989044785499573,
+      "resource_id": "devtools/shared/styleinspector.properties::rule.twistyCollapse.label",
+      "source": "Mozilla Firefox l10n",
+      "ko": "접기",
+      "ja": "折りたたみます"
+    },
+    {
+      "score": 0.7989346981048584,
+      "resource_id": "main.i18n.json::vs/sessions/contrib/chat/browser/newChatInput/sessionsChatInput.placeholder.describeYourMission",
+      "source": "Microsoft VS Code l10n",
+      "ko": "임무 설명",
+      "ja": "ミッションを説明してください"
+    },
+    {
+      "score": 0.7989547848701477,
+      "resource_id": "dom/chrome/accessibility/AccessFu.properties::complementary",
+      "source": "Mozilla Firefox l10n",
+      "ko": "보충 영역",
+      "ja": "補足的セクション"
+    },
+    {
+      "score": 0.798963725566864,
+      "resource_id": "toolkit/toolkit/global/extensionPermissions.ftl::webext-perms-description-data-short-browsingActivity",
+      "source": "Mozilla Firefox l10n",
+      "ko": "탐색 활동",
+      "ja": "ブラウジングアクティビティ"
+    },
+    {
+      "score": 0.7990054488182068,
+      "resource_id": "toolkit/toolkit/intl/languageNames.ftl::language-name-si",
+      "source": "Mozilla Firefox l10n",
+      "ko": "신할라어",
+      "ja": "シンハラ語"
+    },
+    {
+      "score": 0.7990170121192932,
+      "resource_id": "devtools/client/netmonitor.properties::networkMenu.sortedAsc",
+      "source": "Mozilla Firefox l10n",
+      "ko": "오름차순 정렬",
+      "ja": "昇順"
+    },
+    {
+      "score": 0.7990349531173706,
+      "resource_id": "dom/chrome/accessibility/AccessFu.properties::paragraph",
+      "source": "Mozilla Firefox l10n",
+      "ko": "단락",
+      "ja": "段落"
+    },
+    {
+      "score": 0.7990456819534302,
+      "resource_id": "main.i18n.json::vs/editor/common/languages/Enum",
+      "source": "Microsoft VS Code l10n",
+      "ko": "열거형",
+      "ja": "列挙型"
+    },
+    {
+      "score": 0.7991833090782166,
+      "resource_id": "browser/browser/translations.ftl::select-translations-panel-from-label",
+      "source": "Mozilla Firefox l10n",
+      "ko": "원본",
+      "ja": "翻訳元"
+    },
+    {
+      "score": 0.7992659211158752,
+      "resource_id": "main.i18n.json::vs/workbench/contrib/issue/browser/issueReporterOverlay/describeHeading",
+      "source": "Microsoft VS Code l10n",
+      "ko": "피드백 설명",
+      "ja": "フィードバックの内容を説明してください"
+    },
+    {
+      "score": 0.79936683177948,
+      "resource_id": "extensions/vscode.git.i18n.json::package/command.cloneRecursive",
+      "source": "Microsoft VS Code l10n",
+      "ko": "복제(재귀)",
+      "ja": "複製 (再帰)"
+    },
+    {
+      "score": 0.799370527267456,
+      "resource_id": "main.i18n.json::vs/workbench/contrib/welcomeGettingStarted/common/gettingStartedContent/gettingStarted.shortcuts.title",
+      "source": "Microsoft VS Code l10n",
+      "ko": "바로 가기 사용자 지정",
+      "ja": "ショートカットのカスタマイズ"
+    },
+    {
+      "score": 0.7995465397834778,
+      "resource_id": "dom/chrome/accessibility/AccessFu.properties::separator",
+      "source": "Mozilla Firefox l10n",
+      "ko": "구분선",
+      "ja": "区切り"
+    },
+    {
+      "score": 0.7995940446853638,
+      "resource_id": "toolkit/toolkit/neterror/certError.ftl::fp-certerror-advanced-button",
+      "source": "Mozilla Firefox l10n",
+      "ko": "고급",
+      "ja": "上級者向けの情報"
+    },
+    {
+      "score": 0.7996092438697815,
+      "resource_id": "security/manager/chrome/pipnss/pipnss.properties::CertExceptionTemporary",
+      "source": "Mozilla Firefox l10n",
+      "ko": "임시",
+      "ja": "一時的"
+    },
+    {
+      "score": 0.7996470332145691,
+      "resource_id": "browser/browser/preferences/preferences.ftl::preferences-etp-level-strict.label",
+      "source": "Mozilla Firefox l10n",
+      "ko": "엄격",
+      "ja": "厳格モード"
+    },
+    {
+      "score": 0.7996665239334106,
+      "resource_id": "devtools/shared/styleinspector.properties::rule.sourceConstructed",
+      "source": "Mozilla Firefox l10n",
+      "ko": "생성됨",
+      "ja": "構築スタイルシート"
+    },
+    {
+      "score": 0.7997548580169678,
+      "resource_id": "main.i18n.json::vs/sessions/contrib/welcome/browser/sessionsWalkthrough/walkthrough.aria",
+      "source": "Microsoft VS Code l10n",
+      "ko": "에이전트 시작 안내",
+      "ja": "エージェントのオンボードに関するチュートリアル"
+    },
+    {
+      "score": 0.7998418807983398,
+      "resource_id": "browser/pdfviewer/viewer.properties::page_rotate_cw_label",
+      "source": "Mozilla Firefox l10n",
+      "ko": "시계방향으로 회전",
+      "ja": "右回転"
+    }
+  ]
+}
