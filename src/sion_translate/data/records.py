@@ -131,11 +131,7 @@ def expand_parallel_record(
         if texts_a is None or texts_b is None:
             issue("non_string")
             return
-        if len(texts_a) == 1 and len(texts_b) > 1:
-            texts_a *= len(texts_b)
-        elif len(texts_b) == 1 and len(texts_a) > 1:
-            texts_b *= len(texts_a)
-        elif len(texts_a) != len(texts_b):
+        if len(texts_a) != len(texts_b):
             issue("unaligned_lists")
             return
         for text_a, text_b in zip(texts_a, texts_b, strict=True):

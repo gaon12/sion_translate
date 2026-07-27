@@ -19,16 +19,23 @@ from sion_translate.structured import protect_shared_structured_spans
 from sion_translate.tokenizer import SLOT_SYMBOLS, SionTokenizer, expand_inputs
 
 from .quality import QualityPolicy, assess_pair, canonical_text, dedup_key
+from .records import (
+    expand_parallel_record,
+    languages_from_pairs,
+    normalize_language_pairs,
+)
 
 
 INDEX_DTYPE = np.dtype(
     [
-        ("ko_offset", "<u8"),
-        ("ko_length", "<u4"),
-        ("ja_offset", "<u8"),
-        ("ja_length", "<u4"),
-        ("ko_register", "u1"),
-        ("ja_register", "u1"),
+        ("src_offset", "<u8"),
+        ("src_length", "<u4"),
+        ("tgt_offset", "<u8"),
+        ("tgt_length", "<u4"),
+        ("src_register", "u1"),
+        ("tgt_register", "u1"),
+        ("src_language_id", "<u2"),
+        ("tgt_language_id", "<u2"),
         ("source_id", "<u2"),
         ("quality_score", "u1"),
     ]
@@ -44,6 +51,8 @@ class PrepareStats:
     invalid_record: int = 0
     missing_text: int = 0
     non_string: int = 0
+    invalid_language: int = 0
+    unaligned_lists: int = 0
     duplicates: int = 0
     quality_filtered: int = 0
     too_short: int = 0
@@ -109,61 +118,64 @@ class ShardWriter:
         root: Path,
         split: str,
         shard_size: int,
-        side_names: Sequence[str] = ("ko", "ja"),
+        language_to_id: dict[str, int],
     ):
         self.root = root / split
         self.root.mkdir(parents=True, exist_ok=True)
         self.split = split
         self.shard_size = shard_size
-        # 토큰 bin 파일 이름에 쓰이는 언어 이름 (예: 00000.en.bin)
-        self.side_names = tuple(side_names)
+        self.language_to_id = language_to_id
         self.shard_index = 0
-        self.records: list[tuple[int, int, int, int, int, int, int, int]] = []
-        self.ko_offset = 0
-        self.ja_offset = 0
+        self.records: list[tuple[int, ...]] = []
+        self.src_offset = 0
+        self.tgt_offset = 0
         self.total_records = 0
-        self._ko_handle = None
-        self._ja_handle = None
+        self._src_handle = None
+        self._tgt_handle = None
         self._open_shard()
 
     def _prefix(self) -> str:
         return f"{self.shard_index:05d}"
 
     def _open_shard(self) -> None:
-        self._ko_handle = (self.root / f"{self._prefix()}.{self.side_names[0]}.bin").open("wb")
-        self._ja_handle = (self.root / f"{self._prefix()}.{self.side_names[1]}.bin").open("wb")
+        self._src_handle = (self.root / f"{self._prefix()}.src.bin").open("wb")
+        self._tgt_handle = (self.root / f"{self._prefix()}.tgt.bin").open("wb")
         self.records = []
-        self.ko_offset = 0
-        self.ja_offset = 0
+        self.src_offset = 0
+        self.tgt_offset = 0
 
     def add(
         self,
-        ko_ids: Sequence[int],
-        ja_ids: Sequence[int],
-        ko_register: int,
-        ja_register: int,
+        src_ids: Sequence[int],
+        tgt_ids: Sequence[int],
+        src_register: int,
+        tgt_register: int,
+        src_language: str,
+        tgt_language: str,
         source_id: int,
         quality_score: int,
     ) -> None:
-        assert self._ko_handle is not None and self._ja_handle is not None
-        ko_array = np.asarray(ko_ids, dtype=np.uint32)
-        ja_array = np.asarray(ja_ids, dtype=np.uint32)
-        ko_array.tofile(self._ko_handle)
-        ja_array.tofile(self._ja_handle)
+        assert self._src_handle is not None and self._tgt_handle is not None
+        src_array = np.asarray(src_ids, dtype=np.uint32)
+        tgt_array = np.asarray(tgt_ids, dtype=np.uint32)
+        src_array.tofile(self._src_handle)
+        tgt_array.tofile(self._tgt_handle)
         self.records.append(
             (
-                self.ko_offset,
-                len(ko_array),
-                self.ja_offset,
-                len(ja_array),
-                ko_register,
-                ja_register,
+                self.src_offset,
+                len(src_array),
+                self.tgt_offset,
+                len(tgt_array),
+                src_register,
+                tgt_register,
+                self.language_to_id[src_language],
+                self.language_to_id[tgt_language],
                 source_id,
                 quality_score,
             )
         )
-        self.ko_offset += len(ko_array)
-        self.ja_offset += len(ja_array)
+        self.src_offset += len(src_array)
+        self.tgt_offset += len(tgt_array)
         self.total_records += 1
         if len(self.records) >= self.shard_size:
             self._finish_shard()
@@ -171,9 +183,9 @@ class ShardWriter:
             self._open_shard()
 
     def _finish_shard(self) -> None:
-        assert self._ko_handle is not None and self._ja_handle is not None
-        self._ko_handle.close()
-        self._ja_handle.close()
+        assert self._src_handle is not None and self._tgt_handle is not None
+        self._src_handle.close()
+        self._tgt_handle.close()
         if self.records:
             np.save(
                 self.root / f"{self._prefix()}.idx.npy",
@@ -181,13 +193,13 @@ class ShardWriter:
                 allow_pickle=False,
             )
         else:
-            for side in self.side_names:
+            for side in ("src", "tgt"):
                 (self.root / f"{self._prefix()}.{side}.bin").unlink(missing_ok=True)
-        self._ko_handle = None
-        self._ja_handle = None
+        self._src_handle = None
+        self._tgt_handle = None
 
     def close(self) -> None:
-        if self._ko_handle is not None:
+        if self._src_handle is not None:
             self._finish_shard()
 
 
@@ -213,13 +225,14 @@ def _initialize_prepare_worker(tokenizer_model: str) -> None:
 def _process_prepare_batch(args):
     """CPU-heavy, order-preserving row work executed in worker processes."""
 
-    source_id, rows, quality_policy, filter_quality, language_pair = args
+    source_id, rows, quality_policy, filter_quality, language_pairs = args
     tokenizer = _PREPARE_WORKER_TOKENIZER
     if tokenizer is None:
         raise RuntimeError("prepare worker tokenizer was not initialized")
-    key_a, key_b = language_pair
     output = []
     for raw_line in rows:
+        output.append(("physical_line", (source_id,)))
+        record_group_key = hashlib.sha256(raw_line.strip()).hexdigest()
         try:
             line = raw_line.decode("utf-8-sig")
         except UnicodeDecodeError:
@@ -230,45 +243,52 @@ def _process_prepare_batch(args):
         except json.JSONDecodeError:
             output.append(("invalid_json", (source_id,)))
             continue
-        if not isinstance(row, dict):
-            output.append(("invalid_record", (source_id,)))
-            continue
-        raw_a, raw_b = row.get(key_a), row.get(key_b)
-        if not isinstance(raw_a, str) or not isinstance(raw_b, str):
-            output.append(("non_string", (source_id,)))
-            continue
-        text_a, text_b = canonical_text(raw_a), canonical_text(raw_b)
-        if not text_a or not text_b:
-            output.append(("missing_text", (source_id,)))
-            continue
-        assessment = assess_pair(text_a, text_b, quality_policy, languages=language_pair)
-        unsafe = "control_characters" in assessment.rejection_reasons
-        if not assessment.accepted and (filter_quality or unsafe):
+        expansion = expand_parallel_record(row, language_pairs)
+        for issue in expansion.issues:
+            output.append((issue, (source_id,)))
+        for pair in expansion.pairs:
+            language_pair = (pair.language_a, pair.language_b)
+            text_a, text_b = canonical_text(pair.text_a), canonical_text(pair.text_b)
+            assessment = assess_pair(
+                text_a,
+                text_b,
+                quality_policy,
+                languages=language_pair,
+            )
+            unsafe = "control_characters" in assessment.rejection_reasons
+            if not assessment.accepted and (filter_quality or unsafe):
+                output.append(
+                    (
+                        "quality_filtered",
+                        (
+                            source_id,
+                            assessment.rejection_reasons,
+                            assessment.warning_reasons,
+                        ),
+                    )
+                )
+                continue
+            encoded_a, encoded_b = protect_shared_spans(text_a, text_b)
             output.append(
                 (
-                    "quality_filtered",
-                    (source_id, assessment.rejection_reasons, assessment.warning_reasons),
+                    "candidate",
+                    (
+                        source_id,
+                        record_group_key,
+                        pair.language_a,
+                        pair.language_b,
+                        text_a,
+                        text_b,
+                        tokenizer.encode(encoded_a),
+                        tokenizer.encode(encoded_b),
+                        infer_register(text_a, pair.language_a),
+                        infer_register(text_b, pair.language_b),
+                        assessment.score,
+                        assessment.rejection_reasons,
+                        assessment.warning_reasons,
+                    ),
                 )
             )
-            continue
-        encoded_a, encoded_b = protect_shared_spans(text_a, text_b)
-        output.append(
-            (
-                "candidate",
-                (
-                    source_id,
-                    text_a,
-                    text_b,
-                    tokenizer.encode(encoded_a),
-                    tokenizer.encode(encoded_b),
-                    infer_register(text_a, key_a),
-                    infer_register(text_b, key_b),
-                    assessment.score,
-                    assessment.rejection_reasons,
-                    assessment.warning_reasons,
-                ),
-            )
-        )
     return output
 
 
@@ -276,7 +296,7 @@ def _prepare_input_batches(
     paths: Sequence[Path],
     quality_policy: QualityPolicy,
     filter_quality: bool,
-    language_pair: tuple[str, str],
+    language_pairs: tuple[tuple[str, str], ...],
     batch_size: int = 512,
 ):
     for source_id, path in enumerate(paths):
@@ -285,10 +305,10 @@ def _prepare_input_batches(
             for raw_line in handle:
                 rows.append(raw_line)
                 if len(rows) >= batch_size:
-                    yield source_id, rows, quality_policy, filter_quality, language_pair
+                    yield source_id, rows, quality_policy, filter_quality, language_pairs
                     rows = []
             if rows:
-                yield source_id, rows, quality_policy, filter_quality, language_pair
+                yield source_id, rows, quality_policy, filter_quality, language_pairs
 
 
 def _increment(stats: PrepareStats, field: str, amount: int = 1) -> None:
@@ -365,6 +385,7 @@ def prepare_dataset(
     prevent_target_leakage: bool = True,
     dedup_backend: str = "sqlite",
     language_pair: Sequence[str] = ("ko", "ja"),
+    language_pairs: Sequence[Sequence[str]] | None = None,
     train_only_prefixes: Sequence[str] = DEFAULT_TRAIN_ONLY_PREFIXES,
     num_workers: int | None = None,
 ) -> PrepareStats:
@@ -386,6 +407,9 @@ def prepare_dataset(
 
     quality_policy = quality_policy or QualityPolicy()
     quality_policy.validate()
+    normalized_pairs = normalize_language_pairs(language_pair, language_pairs)
+    languages = languages_from_pairs(normalized_pairs)
+    language_to_id = {language: index for index, language in enumerate(languages)}
 
     # Validate the model in the parent before starting a large worker pool.
     SionTokenizer(tokenizer_model)
@@ -402,7 +426,7 @@ def prepare_dataset(
     staging_dir.mkdir()
     try:
         writers = {
-            split: ShardWriter(staging_dir, split, shard_size, side_names=language_pair)
+            split: ShardWriter(staging_dir, split, shard_size, language_to_id)
             for split in ("train", "validation", "test")
         }
         digest_store = (
@@ -423,7 +447,12 @@ def prepare_dataset(
     )
 
     workers = num_workers or build_cpu_plan(input_files=len(paths)).dataset_workers
-    inputs = _prepare_input_batches(paths, quality_policy, filter_quality, tuple(language_pair))
+    inputs = _prepare_input_batches(
+        paths,
+        quality_policy,
+        filter_quality,
+        normalized_pairs,
+    )
     if workers <= 1:
         _initialize_prepare_worker(str(tokenizer_model))
         processed_batches = map(_process_prepare_batch, inputs)
@@ -438,15 +467,16 @@ def prepare_dataset(
             executor, _process_prepare_batch, inputs, max_pending=workers * 2
         )
 
-    key_a, key_b = language_pair
     try:
         for batch in processed_batches:
             for status, payload in batch:
                 source_id = payload[0]
                 source_stats = per_source_stats[source_id]
                 targets = (stats, source_stats)
-                for target in targets:
-                    _increment(target, "physical_lines")
+                if status == "physical_line":
+                    for target in targets:
+                        _increment(target, "physical_lines")
+                    continue
 
                 if status in {
                     "invalid_utf8",
@@ -454,6 +484,8 @@ def prepare_dataset(
                     "invalid_record",
                     "non_string",
                     "missing_text",
+                    "invalid_language",
+                    "unaligned_lists",
                 }:
                     for target in targets:
                         _increment(target, status)
@@ -474,12 +506,15 @@ def prepare_dataset(
 
                 (
                     _,
-                    ko,
-                    ja,
-                    ko_ids,
-                    ja_ids,
-                    ko_register,
-                    ja_register,
+                    record_group_key,
+                    language_a,
+                    language_b,
+                    text_a,
+                    text_b,
+                    ids_a,
+                    ids_b,
+                    register_a,
+                    register_b,
                     quality_score,
                     rejection_reasons,
                     warning_reasons,
@@ -492,14 +527,16 @@ def prepare_dataset(
                     for target in targets:
                         _increment(target, "ja_no_kana_warnings")
 
-                pair_key = f"{dedup_key(ko)}\0{dedup_key(ja)}".encode("utf-8")
+                pair_key = (
+                    f"{language_a}\0{dedup_key(text_a)}\0{language_b}\0{dedup_key(text_b)}"
+                ).encode("utf-8")
                 pair_digest = hashlib.sha256(pair_key).digest()[:16]
                 if not digest_store.add_if_new(pair_digest):
                     for target in targets:
                         _increment(target, "duplicates")
                     continue
 
-                if len(ko_ids) > max_tokens_per_side or len(ja_ids) > max_tokens_per_side:
+                if len(ids_a) > max_tokens_per_side or len(ids_b) > max_tokens_per_side:
                     for target in targets:
                         _increment(target, "too_long")
                     continue
@@ -509,21 +546,38 @@ def prepare_dataset(
                 if force_train_split:
                     split = "train"
                 else:
-                    split = choose_split_for_key(dedup_key(ko), validation_fraction, test_fraction)
+                    source_key = dedup_key(text_a)
+                    if len(normalized_pairs) > 1:
+                        source_key = f"record\0{record_group_key}"
+                    split = choose_split_for_key(
+                        source_key,
+                        validation_fraction,
+                        test_fraction,
+                    )
                 if target_split_guard is not None:
-                    target_digest = hashlib.sha256(dedup_key(ja).encode("utf-8")).digest()
+                    target_key = dedup_key(text_b)
+                    if len(normalized_pairs) > 1:
+                        target_key = f"{language_b}\0{target_key}"
+                    target_digest = hashlib.sha256(target_key.encode("utf-8")).digest()
                     if not target_split_guard.accept(split, target_digest):
                         for target in targets:
                             _increment(target, "split_conflicts")
                         continue
                 writers[split].add(
-                    ko_ids, ja_ids, ko_register, ja_register, source_id, quality_score
+                    ids_a,
+                    ids_b,
+                    register_a,
+                    register_b,
+                    language_a,
+                    language_b,
+                    source_id,
+                    quality_score,
                 )
                 for target in targets:
                     _increment(target, split)
                     _increment(target, "valid_pairs")
-                    _increment(target, "ko_tokens", len(ko_ids))
-                    _increment(target, "ja_tokens", len(ja_ids))
+                    _increment(target, "ko_tokens", len(ids_a))
+                    _increment(target, "ja_tokens", len(ids_b))
                     _increment(target, "quality_score_sum", quality_score)
     except BaseException:
         if executor is not None:
@@ -562,8 +616,12 @@ def prepare_dataset(
         raise
 
     manifest = {
-        "format": "sion-indexed-parallel-v2",
-        "language_pair": list(language_pair),
+        "format": "sion-indexed-parallel-v3",
+        "language_pair": list(normalized_pairs[0]),
+        "language_pairs": [list(pair) for pair in normalized_pairs],
+        "languages": list(languages),
+        "language_to_id": language_to_id,
+        "storage_sides": ["src", "tgt"],
         "train_only_prefixes": list(train_only_prefixes),
         "tokenizer_model": str(Path(tokenizer_model).resolve()),
         "inputs": [str(path) for path in paths],

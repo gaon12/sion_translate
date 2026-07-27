@@ -19,6 +19,11 @@ class IndexedParallelDataset(Dataset):
         if not self.index_paths:
             raise FileNotFoundError(f"No index shards found under {self.root}")
         self.indices = self._open_indices()
+        self.is_v3 = bool(
+            self.indices
+            and self.indices[0].dtype.names
+            and "src_offset" in self.indices[0].dtype.names
+        )
         self.cumulative: list[int] = []
         total = 0
         lengths: list[np.ndarray] = []
@@ -27,7 +32,11 @@ class IndexedParallelDataset(Dataset):
         for index in self.indices:
             total += len(index)
             self.cumulative.append(total)
-            lengths.append(index["ko_length"].astype(np.uint32) + index["ja_length"].astype(np.uint32))
+            src_length = "src_length" if self.is_v3 else "ko_length"
+            tgt_length = "tgt_length" if self.is_v3 else "ja_length"
+            lengths.append(
+                index[src_length].astype(np.uint32) + index[tgt_length].astype(np.uint32)
+            )
             if index.dtype.names is not None and "source_id" in index.dtype.names:
                 source_ids.append(index["source_id"].astype(np.uint16))
             else:
@@ -37,16 +46,12 @@ class IndexedParallelDataset(Dataset):
         self.pair_lengths = np.concatenate(lengths)
         self.pair_source_ids = np.concatenate(source_ids)
         self.source_names = self._load_source_names()
-        # 언어쌍 이름 (예: ("ko","ja") / ("en","de")) — 토큰 bin 파일 이름과
-        # 방향 태그가 이 이름을 따릅니다. manifest 에 없으면 ko/ja 로 간주.
-        self.language_pair = self._load_language_pair()
+        self.language_pairs, self.languages = self._load_language_metadata()
+        self.language_pair = self.language_pairs[0]
         self._token_cache: dict[tuple[int, str], np.memmap] = {}
 
     def _open_indices(self) -> list[np.ndarray]:
-        return [
-            np.load(path, mmap_mode="r", allow_pickle=False)
-            for path in self.index_paths
-        ]
+        return [np.load(path, mmap_mode="r", allow_pickle=False) for path in self.index_paths]
 
     def __getstate__(self) -> dict:
         """Keep Windows spawn workers from serializing hundreds of MB of memmaps."""
@@ -63,15 +68,33 @@ class IndexedParallelDataset(Dataset):
         self.indices = self._open_indices()
         self._token_cache = {}
 
-    def _load_language_pair(self) -> tuple[str, str]:
+    def _load_language_metadata(
+        self,
+    ) -> tuple[tuple[tuple[str, str], ...], tuple[str, ...]]:
         manifest_path = self.dataset_root / "manifest.json"
         if manifest_path.exists():
             with manifest_path.open("r", encoding="utf-8") as handle:
                 manifest = json.load(handle)
+            raw_pairs = manifest.get("language_pairs")
+            if isinstance(raw_pairs, list) and raw_pairs:
+                pairs = tuple(
+                    (str(pair[0]), str(pair[1]))
+                    for pair in raw_pairs
+                    if isinstance(pair, list) and len(pair) == 2
+                )
+                raw_languages = manifest.get("languages")
+                languages = (
+                    tuple(map(str, raw_languages))
+                    if isinstance(raw_languages, list)
+                    else tuple(dict.fromkeys(language for pair in pairs for language in pair))
+                )
+                if pairs and languages:
+                    return pairs, languages
             pair = manifest.get("language_pair")
             if isinstance(pair, list) and len(pair) == 2:
-                return str(pair[0]), str(pair[1])
-        return ("ko", "ja")
+                normalized = (str(pair[0]), str(pair[1]))
+                return (normalized,), normalized
+        return (("ko", "ja"),), ("ko", "ja")
 
     def _load_source_names(self) -> list[str]:
         manifest_path = self.dataset_root / "manifest.json"
@@ -112,6 +135,8 @@ class IndexedParallelDataset(Dataset):
             return int(self.pair_lengths[pair_index]) + 4
         shard, local = self._resolve(pair_index)
         row = self.indices[shard][local]
+        if self.is_v3:
+            return int(row["src_length"] + row["tgt_length"]) + 4
         return int(row["ko_length"] + row["ja_length"]) + 4
 
     def lengths_for_indices(self, indices: np.ndarray) -> np.ndarray:
@@ -142,24 +167,48 @@ class IndexedParallelDataset(Dataset):
         shard, local = self._resolve(pair_index)
         row = self.indices[shard][local]
 
-        # 인덱스 필드 이름의 ko_/ja_ 는 '첫 번째/두 번째 언어'라는 내부 명칭이며,
-        # 실제 언어 이름은 self.language_pair 를 따릅니다.
-        language_a, language_b = self.language_pair
-        ko_store = self._tokens(shard, language_a)
-        ja_store = self._tokens(shard, language_b)
-        ko_start, ko_length = int(row["ko_offset"]), int(row["ko_length"])
-        ja_start, ja_length = int(row["ja_offset"]), int(row["ja_length"])
-        ko = np.asarray(ko_store[ko_start : ko_start + ko_length], dtype=np.int64)
-        ja = np.asarray(ja_store[ja_start : ja_start + ja_length], dtype=np.int64)
+        if self.is_v3:
+            language_a = self.languages[int(row["src_language_id"])]
+            language_b = self.languages[int(row["tgt_language_id"])]
+            src_store = self._tokens(shard, "src")
+            tgt_store = self._tokens(shard, "tgt")
+            src_start, src_length = int(row["src_offset"]), int(row["src_length"])
+            tgt_start, tgt_length = int(row["tgt_offset"]), int(row["tgt_length"])
+            side_a = np.asarray(
+                src_store[src_start : src_start + src_length],
+                dtype=np.int64,
+            )
+            side_b = np.asarray(
+                tgt_store[tgt_start : tgt_start + tgt_length],
+                dtype=np.int64,
+            )
+            register_a = int(row["src_register"])
+            register_b = int(row["tgt_register"])
+        else:
+            language_a, language_b = self.language_pair
+            src_store = self._tokens(shard, language_a)
+            tgt_store = self._tokens(shard, language_b)
+            src_start, src_length = int(row["ko_offset"]), int(row["ko_length"])
+            tgt_start, tgt_length = int(row["ja_offset"]), int(row["ja_length"])
+            side_a = np.asarray(
+                src_store[src_start : src_start + src_length],
+                dtype=np.int64,
+            )
+            side_b = np.asarray(
+                tgt_store[tgt_start : tgt_start + tgt_length],
+                dtype=np.int64,
+            )
+            register_a = int(row["ko_register"])
+            register_b = int(row["ja_register"])
 
         if direction == 0:
-            src, tgt = ko, ja
+            src, tgt = side_a, side_b
             src_language, target_language = language_a, language_b
-            src_register, target_register = int(row["ko_register"]), int(row["ja_register"])
+            src_register, target_register = register_a, register_b
         else:
-            src, tgt = ja, ko
+            src, tgt = side_b, side_a
             src_language, target_language = language_b, language_a
-            src_register, target_register = int(row["ja_register"]), int(row["ko_register"])
+            src_register, target_register = register_b, register_a
         return {
             "src": src,
             "tgt": tgt,
@@ -214,23 +263,17 @@ class DistributedBucketBatchSampler(Sampler[list[int]]):
         known_sources = set(dataset.source_names)
         unknown_sources = set(self.source_sampling_weights) - known_sources
         if unknown_sources:
-            raise ValueError(
-                f"Unknown source_sampling_weights keys: {sorted(unknown_sources)}"
-            )
+            raise ValueError(f"Unknown source_sampling_weights keys: {sorted(unknown_sources)}")
         if any(weight < 0 for weight in self.source_sampling_weights.values()):
             raise ValueError("source sampling weights must be non-negative")
-        self._balance_sources = (
-            not math.isclose(source_sampling_alpha, 1.0)
-            or any(
-                not math.isclose(weight, 1.0)
-                for weight in self.source_sampling_weights.values()
-            )
+        self._balance_sources = not math.isclose(source_sampling_alpha, 1.0) or any(
+            not math.isclose(weight, 1.0) for weight in self.source_sampling_weights.values()
         )
         if self._balance_sources and not getattr(dataset, "has_source_metadata", True):
             raise ValueError(
                 "Source-balanced sampling requires v2 shards with source_id metadata; "
                 "re-run sion-prepare-data"
-        )
+            )
         self._source_pair_indices: dict[int, np.ndarray] | None = None
         self._source_ids: np.ndarray | None = None
         self._source_probabilities: np.ndarray | None = None
@@ -272,9 +315,7 @@ class DistributedBucketBatchSampler(Sampler[list[int]]):
             raise ValueError("Source sampling weights exclude every available source")
         return result / total
 
-    def _balanced_indices(
-        self, rng: np.random.Generator, sample_count: int
-    ) -> np.ndarray:
+    def _balanced_indices(self, rng: np.random.Generator, sample_count: int) -> np.ndarray:
         if self.dataset.pair_source_ids is None:
             raise RuntimeError("Source metadata is unavailable for balanced sampling")
         if self._source_ids is None or self._source_probabilities is None:
@@ -295,9 +336,9 @@ class DistributedBucketBatchSampler(Sampler[list[int]]):
                 raw, natural, self.max_source_upsampling
             )
             self._source_pair_indices = {
-                int(source_id): np.flatnonzero(
-                    self.dataset.pair_source_ids == source_id
-                ).astype(np.uint32, copy=False)
+                int(source_id): np.flatnonzero(self.dataset.pair_source_ids == source_id).astype(
+                    np.uint32, copy=False
+                )
                 for source_id in source_ids
             }
         source_ids = self._source_ids
@@ -313,9 +354,7 @@ class DistributedBucketBatchSampler(Sampler[list[int]]):
         for source_id in source_ids:
             positions = np.flatnonzero(sampled_sources == source_id)
             candidates = self._source_pair_indices[int(source_id)]
-            sampled_pairs[positions] = rng.choice(
-                candidates, size=len(positions), replace=True
-            )
+            sampled_pairs[positions] = rng.choice(candidates, size=len(positions), replace=True)
         if not self.dataset.bidirectional:
             return sampled_pairs
         directions = rng.integers(0, 2, size=sample_count, dtype=np.uint32)
@@ -328,9 +367,7 @@ class DistributedBucketBatchSampler(Sampler[list[int]]):
                 return
             # Balanced sampling is with replacement, so each rank can generate
             # its local stream directly instead of materializing a global epoch.
-            rng = np.random.default_rng(
-                self.seed + self.epoch + self.rank * 0x9E3779B1
-            )
+            rng = np.random.default_rng(self.seed + self.epoch + self.rank * 0x9E3779B1)
             indices = self._balanced_indices(rng, sample_count)
         else:
             rng = np.random.default_rng(self.seed + self.epoch)

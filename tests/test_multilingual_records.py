@@ -8,6 +8,8 @@ from sion_translate.data.records import (
     languages_from_pairs,
     normalize_language_pairs,
 )
+from sion_translate.data import IndexedParallelDataset
+from sion_translate.data.prepare import prepare_dataset
 from sion_translate.tokenizer import SionTokenizer, train_tokenizer
 
 
@@ -70,6 +72,13 @@ def test_record_expansion_reports_unaligned_lists_without_dropping_other_pairs()
     assert len(expansion.pairs) == 1
     assert expansion.pairs[0].language_a == "en"
 
+    scalar_list = expand_parallel_record(
+        {"ko": "한 문장", "ja": ["一文", "二文"]},
+        PAIRS,
+    )
+    assert not scalar_list.pairs
+    assert scalar_list.issues == ("unaligned_lists",)
+
 
 def test_language_pair_normalization_removes_reverse_duplicates() -> None:
     pairs = normalize_language_pairs(language_pairs=(("ko", "ja"), ("ja", "ko"), ("en", "ru")))
@@ -113,3 +122,34 @@ def test_multilingual_tokenizer_reads_heterogeneous_rows(tmp_path: Path) -> None
     assert tokenizer.languages == ("en", "ja", "ko", "ru")
     assert set(tokenizer.language_tags) == {"ko", "ja", "en", "ru"}
     assert set(tokenizer.denoise_tags) == {"ko", "ja", "en", "ru"}
+
+    dataset_dir = tmp_path / "dataset"
+    stats = prepare_dataset(
+        [str(source)],
+        model_path,
+        dataset_dir,
+        validation_fraction=0.1,
+        test_fraction=0.1,
+        dedup_backend="memory",
+        language_pairs=PAIRS,
+        num_workers=1,
+    )
+    assert stats.valid_pairs == 80
+    with (dataset_dir / "manifest.json").open("r", encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    assert manifest["format"] == "sion-indexed-parallel-v3"
+    assert manifest["language_pairs"] == [["ko", "ja"], ["en", "ru"]]
+    assert manifest["languages"] == ["ko", "ja", "en", "ru"]
+
+    dataset = IndexedParallelDataset(dataset_dir, "train", bidirectional=True)
+    assert dataset.language_pairs == PAIRS
+    observed_directions = {
+        (dataset[index]["src_language"], dataset[index]["target_language"])
+        for index in range(len(dataset))
+    }
+    assert observed_directions == {
+        ("ko", "ja"),
+        ("ja", "ko"),
+        ("en", "ru"),
+        ("ru", "en"),
+    }
