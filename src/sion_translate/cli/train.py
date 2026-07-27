@@ -510,6 +510,7 @@ def main() -> None:
             tokenizer=tokenizer,
             max_source_length=config.data.max_source_length,
             max_target_length=config.data.max_target_length,
+            pad_to_multiple_of=config.data.pad_to_multiple_of,
             denoise_noise_density=config.data.denoise_noise_density,
             denoise_mean_span=config.data.denoise_mean_span,
             augmentation_seed=config.training.seed,

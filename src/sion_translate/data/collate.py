@@ -54,6 +54,7 @@ class SionBatchCollator:
         *,
         max_source_length: int,
         max_target_length: int,
+        pad_to_multiple_of: int = 1,
         denoise_probability: float = 0.0,
         denoise_noise_density: float = 0.15,
         denoise_mean_span: float = 3.0,
@@ -65,6 +66,9 @@ class SionBatchCollator:
         self.tokenizer = tokenizer
         self.max_source_length = max_source_length
         self.max_target_length = max_target_length
+        if pad_to_multiple_of < 1:
+            raise ValueError("pad_to_multiple_of must be at least 1")
+        self.pad_to_multiple_of = int(pad_to_multiple_of)
         self.denoise_probability = denoise_probability
         self.denoise_noise_density = denoise_noise_density
         self.denoise_mean_span = denoise_mean_span
@@ -165,6 +169,23 @@ class SionBatchCollator:
         batch_size = len(examples)
         src_len = max(len(example["input_ids"]) for example in examples)
         tgt_len = max(len(example["decoder_input_ids"]) for example in examples)
+        if self.pad_to_multiple_of > 1:
+            src_len = min(
+                self.max_source_length,
+                max(
+                    src_len,
+                    ((src_len + self.pad_to_multiple_of - 1) // self.pad_to_multiple_of)
+                    * self.pad_to_multiple_of,
+                ),
+            )
+            tgt_len = min(
+                self.max_target_length,
+                max(
+                    tgt_len,
+                    ((tgt_len + self.pad_to_multiple_of - 1) // self.pad_to_multiple_of)
+                    * self.pad_to_multiple_of,
+                ),
+            )
         memory_len = max(1, max(len(example["memory_tokens"]) for example in examples))
 
         input_ids = torch.full((batch_size, src_len), self.tokenizer.pad_id, dtype=torch.long)

@@ -104,11 +104,14 @@ def test_tokenizer_prepare_dataset_and_collate(tmp_path: Path) -> None:
         tokenizer,
         max_source_length=64,
         max_target_length=64,
+        pad_to_multiple_of=8,
         denoise_probability=0.0,
         token_features=tokenizer_dir / "token_features.npz",
     )
     batch = collator([forward, reverse])
     assert batch["input_ids"].shape[0] == 2
+    assert batch["input_ids"].shape[1] % 8 == 0
+    assert batch["decoder_input_ids"].shape[1] % 8 == 0
     assert batch["labels"].shape == batch["decoder_input_ids"].shape
     assert batch["attention_mask"].dtype == torch.bool
     assert "src_script_ids" in batch

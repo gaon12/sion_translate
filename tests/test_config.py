@@ -87,3 +87,10 @@ def test_posttraining_memory_batch_sizes_must_be_positive(field: str) -> None:
     setattr(config.posttraining, field, 0)
     with pytest.raises(ValueError, match=field):
         config.validate()
+
+
+def test_padding_multiple_must_be_positive() -> None:
+    config = AppConfig()
+    config.data.pad_to_multiple_of = 0
+    with pytest.raises(ValueError, match="pad_to_multiple_of"):
+        config.validate()

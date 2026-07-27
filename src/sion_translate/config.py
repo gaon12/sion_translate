@@ -178,6 +178,9 @@ class DataConfig:
     bidirectional: bool = True
     max_source_length: int = 512
     max_target_length: int = 512
+    # Tensor Core 친화적인 sequence shape을 위해 동적 padding 길이를
+    # 이 배수로 올립니다. 1이면 배수 padding을 끕니다.
+    pad_to_multiple_of: int = 8
     denoise_probability: float = 0.10
     validation_denoise_probability: float = 0.0
     denoise_noise_density: float = 0.15
@@ -344,6 +347,8 @@ class AppConfig:
             raise ValueError("max_source_length cannot exceed model.max_seq_len")
         if self.data.max_target_length > self.model.max_seq_len:
             raise ValueError("max_target_length cannot exceed model.max_seq_len")
+        if self.data.pad_to_multiple_of < 1:
+            raise ValueError("pad_to_multiple_of must be at least 1")
         if self.data.num_workers < 0:
             raise ValueError("num_workers must be non-negative")
         if self.data.bucket_size <= 0:
