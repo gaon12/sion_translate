@@ -1,0 +1,27 @@
+{
+  "schema": "sion-numeric-structured-synthetic-v1",
+  "generator": "sion-numeric-structured-v1",
+  "seed": 20260727,
+  "rows": 240000,
+  "output": "C:\\Users\\solso\\OneDrive\\Desktop\\sion_translate\\data\\synthetic_numeric_data38.jsonl",
+  "output_bytes": 120297476,
+  "output_sha256": "28bdd8ade7787289c2a9b705e1c29389d3428e09b4e2278984eaa4f6a9d8f9a6",
+  "category_counts": {
+    "cardinal": 30000,
+    "percentage": 20000,
+    "currency": 30000,
+    "date": 30000,
+    "time_duration": 25000,
+    "measurement": 35000,
+    "range_interval": 20000,
+    "identifier": 25000,
+    "technical": 25000
+  },
+  "policies": {
+    "train_only": true,
+    "downweight_required": true,
+    "existing_sentences_copied": false,
+    "exact_pair_duplicates": 0,
+    "shared_structure_tokens_checked": true
+  }
+}

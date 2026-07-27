@@ -15,6 +15,12 @@ __pycache__/
 # Training data and locally prepared corpora
 data/**
 !data/.gitkeep
+!data/data.txt
+!data/*.manifest.json
+!data/*.remediation.json
+!data/*.semantic.json
+!data/*.structural.json
+!data/dataset_remediation_*.json
 data_mono/
 dataset.stale-*/
 benchmarks/
