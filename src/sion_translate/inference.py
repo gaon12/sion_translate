@@ -15,6 +15,7 @@ import torch
 from sion_translate.glossary import Glossary, apply_source_placeholders, restore_targets
 from sion_translate.rerank import select as rerank_select
 from sion_translate.revision import DRAFT_SEPARATOR, serialize_revision_input
+from sion_translate.structured import mask_structured_spans
 from sion_translate.tokenizer import SLOT_SYMBOLS, SionTokenizer
 from sion_translate.training.export import load_exported_model
 
@@ -104,6 +105,7 @@ class Translator:
         batch_size: int = 16,
         glossary: Glossary | None = None,
         append_missing_glossary: bool = True,
+        append_missing_structured: bool = True,
         num_candidates: int = 0,
         rerank: str = "mbr+qe",
         temperature: float = 0.3,
@@ -120,6 +122,10 @@ class Translator:
         (원문에서 slot 토큰으로 치환 → 번역 → 대응어로 복원.)
         모델이 slot 을 보존하지 못해 누락된 용어는 ``append_missing_glossary``
         가 참이면 문장 끝에 괄호로 덧붙여 최소한의 강제를 보장합니다.
+
+        숫자·단위·URL·현지화 플레이스홀더도 같은 slot 경로로 자동 보호하고
+        원문의 정확한 표면형으로 복원합니다. 모델이 slot 을 누락했을 때에도
+        ``append_missing_structured`` 가 참이면 값 자체가 사라지지 않게 덧붙입니다.
 
         ``num_candidates`` 를 1 이상으로 두면 beam 결과에 더해 그 수만큼 확률적
         후보를 뽑고 ``rerank`` 방식으로 하나를 고릅니다 (``sion_translate.rerank``
@@ -149,12 +155,21 @@ class Translator:
             *self.tokenizer.language_tags.values(),
             *self.tokenizer.denoise_tags.values(),
         }
-        def restore(row: Sequence[int], slot_map: dict[str, str] | None) -> str:
-            """생성 토큰을 문자열로 되돌리고 글로서리 slot 을 복원합니다."""
+
+        def restore(
+            row: Sequence[int],
+            structured_map: dict[str, str] | None,
+            glossary_map: dict[str, str] | None,
+        ) -> str:
+            """생성 토큰을 문자열로 되돌리고 보호 slot 을 복원합니다."""
             tokens = [token for token in row if token not in special_ids]
             text = self.tokenizer.decode(tokens)
-            if slot_map:
-                text, missing = restore_targets(text, slot_map)
+            if structured_map:
+                text, missing = restore_targets(text, structured_map)
+                if missing and append_missing_structured:
+                    text = f"{text} ({', '.join(missing)})"
+            if glossary_map:
+                text, missing = restore_targets(text, glossary_map)
                 if missing and append_missing_glossary:
                     # 모델이 slot 을 흘린 경우: 최소한의 용어 보존을 위해
                     # 강제 용어를 괄호로 덧붙입니다.
@@ -166,30 +181,33 @@ class Translator:
             # QE 는 원문과 대조하므로 slot 치환 전의 문장을 따로 보관합니다.
             sources = list(chunk)
             # 글로서리 적용: 원문의 용어를 slot 으로 치환하고 문장별 매핑을 보관.
-            slot_maps: list[dict[str, str]] = []
-            if glossary is not None and source_language:
-                prepared: list[str] = []
-                for text in chunk:
+            structured_maps: list[dict[str, str]] = []
+            glossary_maps: list[dict[str, str]] = []
+            prepared: list[str] = []
+            for text in chunk:
+                masked, structured_map = mask_structured_spans(
+                    text,
+                    slot_symbols=SLOT_SYMBOLS,
+                )
+                structured_maps.append(structured_map)
+                glossary_map: dict[str, str] = {}
+                if glossary is not None and source_language:
+                    remaining_slots = SLOT_SYMBOLS[len(structured_map) :]
                     masked, slot_map = apply_source_placeholders(
-                        text,
+                        masked,
                         glossary,
                         source_language=source_language,
                         target_language=target_language,
-                        slot_symbols=SLOT_SYMBOLS,
+                        slot_symbols=remaining_slots,
                     )
-                    prepared.append(masked)
-                    slot_maps.append(slot_map)
-                chunk = prepared
-            encoded = [
-                [tag_id, *self.tokenizer.encode(text), eos] for text in chunk
-            ]
+                    glossary_map = slot_map
+                glossary_maps.append(glossary_map)
+                prepared.append(masked)
+            chunk = prepared
+            encoded = [[tag_id, *self.tokenizer.encode(text), eos] for text in chunk]
             longest = max(len(ids) for ids in encoded)
-            input_ids = torch.full(
-                (len(encoded), longest), self.pad_id, dtype=torch.long
-            )
-            attention_mask = torch.zeros(
-                (len(encoded), longest), dtype=torch.bool
-            )
+            input_ids = torch.full((len(encoded), longest), self.pad_id, dtype=torch.long)
+            attention_mask = torch.zeros((len(encoded), longest), dtype=torch.bool)
             for row, ids in enumerate(encoded):
                 input_ids[row, : len(ids)] = torch.tensor(ids, dtype=torch.long)
                 attention_mask[row, : len(ids)] = True
@@ -205,7 +223,7 @@ class Translator:
                 length_penalty=length_penalty,
             )
             beam_texts = [
-                restore(row, slot_maps[index] if slot_maps else None)
+                restore(row, structured_maps[index], glossary_maps[index])
                 for index, row in enumerate(generated.tolist())
             ]
 
@@ -226,10 +244,13 @@ class Translator:
                 top_k=top_k,
             )
             for row_index, source_text in enumerate(sources):
-                slot_map = slot_maps[row_index] if slot_maps else None
                 candidates = [beam_texts[row_index]]
                 for sample_row in sampled[row_index].tolist():
-                    candidate = restore(sample_row, slot_map)
+                    candidate = restore(
+                        sample_row,
+                        structured_maps[row_index],
+                        glossary_maps[row_index],
+                    )
                     # 같은 문장을 여러 번 채점할 이유가 없습니다.
                     if candidate not in candidates:
                         candidates.append(candidate)

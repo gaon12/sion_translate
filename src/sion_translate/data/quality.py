@@ -6,14 +6,10 @@ import re
 import unicodedata
 
 from sion_translate.splitting import normalized_split_key
+from sion_translate.structured import structured_similarity
 
 
 _WHITESPACE = re.compile(r"\s+")
-_STRUCTURED_SPAN = re.compile(
-    r"https?://[^\s]+|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|"
-    r"(?<![A-Za-z0-9])\d[\d,.:/%+\-]*\d(?![A-Za-z0-9])|"
-    r"(?<![A-Za-z0-9])\d(?![A-Za-z0-9])"
-)
 
 
 @dataclass(frozen=True)
@@ -148,10 +144,6 @@ def _has_excessive_repetition(text: str) -> bool:
     return re.search(r"(.{1,8})\1{4,}", compact) is not None
 
 
-def _structured_spans(text: str) -> set[str]:
-    return {match.group(0).casefold() for match in _STRUCTURED_SPAN.finditer(text)}
-
-
 def assess_pair(
     ko: str,
     ja: str,
@@ -206,29 +198,19 @@ def assess_pair(
     if language_b == "ja":
         ja_kana = sum(_is_kana(char) for char in ja)
         ja_han = sum(_is_han(char) for char in ja)
-        if (
-            ja_letters >= policy.long_ja_kana_warning_chars
-            and ja_kana == 0
-            and ja_han >= 4
-        ):
+        if ja_letters >= policy.long_ja_kana_warning_chars and ja_kana == 0 and ja_han >= 4:
             warnings.append("ja_no_kana")
 
-    if policy.reject_controls and (
-        _has_control_characters(ko) or _has_control_characters(ja)
-    ):
+    if policy.reject_controls and (_has_control_characters(ko) or _has_control_characters(ja)):
         rejections.append("control_characters")
     if policy.reject_repetition and (
         _has_excessive_repetition(ko) or _has_excessive_repetition(ja)
     ):
         rejections.append("excessive_repetition")
 
-    ko_spans = _structured_spans(ko)
-    ja_spans = _structured_spans(ja)
-    if ko_spans or ja_spans:
-        shared = len(ko_spans & ja_spans)
-        total = len(ko_spans | ja_spans)
-        if total and shared / total < 0.5:
-            warnings.append("structured_span_mismatch")
+    structured_score, critical_mismatch = structured_similarity(ko, ja)
+    if critical_mismatch or structured_score < 0.5:
+        warnings.append("structured_span_mismatch")
 
     penalties = {
         "too_short": 45,

@@ -16,7 +16,13 @@ from sion_translate.data import (
 )
 from sion_translate.data.quality import QualityPolicy, assess_pair
 from sion_translate.data.prepare import protect_shared_spans
-from sion_translate.tokenizer import SionTokenizer, train_tokenizer
+from sion_translate.glossary import restore_targets
+from sion_translate.structured import (
+    extract_structured_spans,
+    mask_structured_spans,
+    structured_similarity,
+)
+from sion_translate.tokenizer import SLOT_SYMBOLS, SionTokenizer, train_tokenizer
 
 
 def write_tiny_jsonl(path: Path) -> None:
@@ -243,3 +249,72 @@ def test_protected_span_replacement_is_single_pass_and_boundary_safe() -> None:
     assert "<slot_<slot_" not in ja
     assert ko.count("<slot_") == 3
     assert ja.count("<slot_") == 3
+
+
+def test_structured_parser_handles_localization_placeholders_as_whole_spans() -> None:
+    text = (
+        '{ DATETIME($date, month: "long", year: "numeric") } '
+        '{ -brand(case: "accusative") } %CasterName %2$Spx &#39; &#x27;'
+    )
+    spans = extract_structured_spans(text)
+    surfaces = {(span.kind, span.surface) for span in spans}
+    assert (
+        "placeable",
+        '{ DATETIME($date, month: "long", year: "numeric") }',
+    ) in surfaces
+    assert ("placeable", '{ -brand(case: "accusative") }') in surfaces
+    assert ("percent_placeholder", "%CasterName") in surfaces
+    assert ("printf", "%2$S") in surfaces
+    assert ("entity", "&#39;") in surfaces
+    assert ("entity", "&#x27;") in surfaces
+    assert ("percent_placeholder", "%C") not in surfaces
+
+
+def test_structured_parser_preserves_case_sensitive_placeholder_identity() -> None:
+    score, mismatch = structured_similarity(
+        "{ $VERSION } ${BUILD_ID} &Aacute;",
+        "{ $version } ${build_id} &aacute;",
+    )
+    assert score == 0.0
+    assert mismatch
+
+
+def test_structured_similarity_counts_duplicates_and_nested_html_placeholders() -> None:
+    score, mismatch = structured_similarity(
+        '<a title="{ $name }">{ $name }</a>',
+        '<a title="{ $other }">{ $name }</a>',
+    )
+    assert score < 1.0
+    assert mismatch
+
+
+def test_structured_mask_covers_units_and_trims_url_particles() -> None:
+    source = "용량은 50MB, 약은 250mg이며 https://example.com/issues/102181에서 확인한다."
+    masked, mapping = mask_structured_spans(
+        source,
+        slot_symbols=SLOT_SYMBOLS,
+    )
+    assert "50MB" not in masked
+    assert "250mg" not in masked
+    assert "https://" not in masked
+    assert "에서 확인한다" in masked
+    assert set(mapping.values()) == {
+        "50MB",
+        "250mg",
+        "https://example.com/issues/102181",
+    }
+    restored, missing = restore_targets(masked, mapping)
+    assert restored == source
+    assert not missing
+
+
+def test_shared_complex_placeable_is_replaced_once() -> None:
+    placeable = '{ DATETIME($date, month: "long", year: "numeric") }'
+    left, right = protect_shared_spans(
+        f"날짜: {placeable}",
+        f"日付: {placeable}",
+    )
+    assert left.count("<slot_0>") == 1
+    assert right.count("<slot_0>") == 1
+    assert "numeric" not in left
+    assert "numeric" not in right

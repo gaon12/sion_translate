@@ -13,9 +13,10 @@ from typing import Sequence
 
 import numpy as np
 
-from sion_translate.tokenizer import SionTokenizer, expand_inputs
-from sion_translate.splitting import TargetSplitGuard, choose_split_for_key
 from sion_translate.performance import bounded_ordered_map, build_cpu_plan
+from sion_translate.splitting import TargetSplitGuard, choose_split_for_key
+from sion_translate.structured import protect_shared_structured_spans
+from sion_translate.tokenizer import SLOT_SYMBOLS, SionTokenizer, expand_inputs
 
 from .quality import QualityPolicy, assess_pair, canonical_text, dedup_key
 
@@ -31,15 +32,6 @@ INDEX_DTYPE = np.dtype(
         ("source_id", "<u2"),
         ("quality_score", "u1"),
     ]
-)
-
-PROTECTED_PATTERN = re.compile(
-    r"https?://[^\s]+|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|"
-    r"\{[A-Za-z_][A-Za-z0-9_.-]*\}|%[A-Za-z]|"
-    r"(?<![A-Za-z0-9_.-])[A-Za-z][A-Za-z0-9_.-]*\d[A-Za-z0-9_.-]*"
-    r"(?![A-Za-z0-9_.-])|"
-    r"(?<![A-Za-z0-9])\d[\d,.:/%+\-]*\d(?![A-Za-z0-9])|"
-    r"(?<![A-Za-z0-9])\d(?![A-Za-z0-9])"
 )
 
 
@@ -102,25 +94,13 @@ def protect_shared_spans(ko: str, ja: str, maximum: int = 64) -> tuple[str, str]
     need the stable symbols, which teach TETM to preserve rather than hallucinate.
     """
 
-    ko_spans = {match.group(0) for match in PROTECTED_PATTERN.finditer(ko)}
-    ja_spans = {match.group(0) for match in PROTECTED_PATTERN.finditer(ja)}
-    shared = sorted(ko_spans & ja_spans, key=lambda value: (-len(value), value))[:maximum]
-    replacements = {value: f"<slot_{index}>" for index, value in enumerate(shared)}
-
-    def replace_matches(text: str) -> str:
-        pieces: list[str] = []
-        cursor = 0
-        for match in PROTECTED_PATTERN.finditer(text):
-            replacement = replacements.get(match.group(0))
-            if replacement is None:
-                continue
-            pieces.append(text[cursor : match.start()])
-            pieces.append(replacement)
-            cursor = match.end()
-        pieces.append(text[cursor:])
-        return "".join(pieces)
-
-    return replace_matches(ko), replace_matches(ja)
+    if maximum < 0:
+        raise ValueError("maximum must be non-negative")
+    return protect_shared_structured_spans(
+        ko,
+        ja,
+        slot_symbols=SLOT_SYMBOLS[:maximum],
+    )
 
 
 class ShardWriter:
