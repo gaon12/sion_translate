@@ -13,9 +13,17 @@ from typing import Sequence
 
 import numpy as np
 
+from sion_translate.fingerprint import PREPROCESSING_SCHEMA, build_dataset_fingerprint
 from sion_translate.performance import bounded_ordered_map, build_cpu_plan
 from sion_translate.splitting import TargetSplitGuard, choose_split_for_key
 from sion_translate.structured import protect_shared_structured_spans
+from sion_translate.synthetic import (
+    DEFAULT_SYNTHETIC_PREFIXES,
+    DEFAULT_SYNTHETIC_SAMPLING_WEIGHT,
+    normalize_synthetic_prefixes,
+    synthetic_path,
+    synthetic_record,
+)
 from sion_translate.tokenizer import SLOT_SYMBOLS, SionTokenizer, expand_inputs
 
 from .quality import QualityPolicy, assess_pair, canonical_text, dedup_key
@@ -25,6 +33,7 @@ from .records import (
     normalize_language_pairs,
 )
 
+INDEX_FORMAT = "sion-indexed-parallel-v4"
 
 INDEX_DTYPE = np.dtype(
     [
@@ -38,6 +47,7 @@ INDEX_DTYPE = np.dtype(
         ("tgt_language_id", "<u2"),
         ("source_id", "<u2"),
         ("quality_score", "u1"),
+        ("synthetic", "u1"),
     ]
 )
 
@@ -71,6 +81,7 @@ class PrepareStats:
     ko_tokens: int = 0
     ja_tokens: int = 0
     quality_score_sum: int = 0
+    synthetic_pairs: int = 0
 
 
 def infer_register(text: str, language: str) -> int:
@@ -154,6 +165,7 @@ class ShardWriter:
         tgt_language: str,
         source_id: int,
         quality_score: int,
+        synthetic: bool,
     ) -> None:
         assert self._src_handle is not None and self._tgt_handle is not None
         src_array = np.asarray(src_ids, dtype=np.uint32)
@@ -172,6 +184,7 @@ class ShardWriter:
                 self.language_to_id[tgt_language],
                 source_id,
                 quality_score,
+                int(synthetic),
             )
         )
         self.src_offset += len(src_array)
@@ -243,6 +256,7 @@ def _process_prepare_batch(args):
         except json.JSONDecodeError:
             output.append(("invalid_json", (source_id,)))
             continue
+        record_is_synthetic = synthetic_record(row)
         expansion = expand_parallel_record(row, language_pairs)
         for issue in expansion.issues:
             output.append((issue, (source_id,)))
@@ -275,6 +289,7 @@ def _process_prepare_batch(args):
                     (
                         source_id,
                         record_group_key,
+                        record_is_synthetic,
                         pair.language_a,
                         pair.language_b,
                         text_a,
@@ -368,7 +383,7 @@ class _SqliteDigestSet:
 # 합성 데이터가 든 입력 파일의 접두어. 이런 파일은 train split 에만 넣습니다 —
 # 역번역이나 이어붙이기로 만든 예제가 holdout 에 들어가면 점수가 실제 번역 품질이
 # 아니라 합성 규칙을 재게 됩니다.
-DEFAULT_TRAIN_ONLY_PREFIXES: tuple[str, ...] = ("bt_", "concat_", "revise_")
+DEFAULT_TRAIN_ONLY_PREFIXES: tuple[str, ...] = DEFAULT_SYNTHETIC_PREFIXES
 
 
 def prepare_dataset(
@@ -387,6 +402,7 @@ def prepare_dataset(
     language_pair: Sequence[str] = ("ko", "ja"),
     language_pairs: Sequence[Sequence[str]] | None = None,
     train_only_prefixes: Sequence[str] = DEFAULT_TRAIN_ONLY_PREFIXES,
+    synthetic_sampling_weight: float = DEFAULT_SYNTHETIC_SAMPLING_WEIGHT,
     num_workers: int | None = None,
 ) -> PrepareStats:
     paths = expand_inputs(input_patterns)
@@ -404,10 +420,13 @@ def prepare_dataset(
         raise ValueError("Too many input files for the uint16 source_id field")
     if dedup_backend not in {"sqlite", "memory"}:
         raise ValueError("dedup_backend must be either 'sqlite' or 'memory'")
+    if not 0.0 <= synthetic_sampling_weight <= 1.0:
+        raise ValueError("synthetic_sampling_weight must be in [0, 1]")
 
     quality_policy = quality_policy or QualityPolicy()
     quality_policy.validate()
     normalized_pairs = normalize_language_pairs(language_pair, language_pairs)
+    train_only_prefixes = normalize_synthetic_prefixes(train_only_prefixes)
     languages = languages_from_pairs(normalized_pairs)
     language_to_id = {language: index for index, language in enumerate(languages)}
 
@@ -419,6 +438,25 @@ def prepare_dataset(
             "Tokenizer is missing configured language tags: "
             f"{missing_languages}; retrain it with language_pairs={normalized_pairs!r}"
         )
+    dataset_fingerprint = build_dataset_fingerprint(
+        paths,
+        language_pairs=normalized_pairs,
+        tokenizer_model=tokenizer_model,
+        preprocessing_schema=PREPROCESSING_SCHEMA,
+        preprocessing_options={
+            "dedup_backend": dedup_backend,
+            "filter_quality": filter_quality,
+            "index_dtype": INDEX_DTYPE.descr,
+            "max_tokens_per_side": max_tokens_per_side,
+            "prevent_target_leakage": prevent_target_leakage,
+            "quality_policy": quality_policy.to_dict(),
+            "shard_size": shard_size,
+            "synthetic_sampling_weight": synthetic_sampling_weight,
+            "test_fraction": test_fraction,
+            "train_only_prefixes": list(train_only_prefixes),
+            "validation_fraction": validation_fraction,
+        },
+    )
     output_dir = Path(output_dir)
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     if output_dir.exists():
@@ -513,6 +551,7 @@ def prepare_dataset(
                 (
                     _,
                     record_group_key,
+                    record_is_synthetic,
                     language_a,
                     language_b,
                     text_a,
@@ -548,8 +587,10 @@ def prepare_dataset(
                     continue
 
                 # Group all translations sharing a source text in one split.
-                force_train_split = paths[source_id].name.startswith(tuple(train_only_prefixes))
-                if force_train_split:
+                is_synthetic = record_is_synthetic or synthetic_path(
+                    paths[source_id], train_only_prefixes
+                )
+                if is_synthetic:
                     split = "train"
                 else:
                     source_key = dedup_key(text_a)
@@ -578,6 +619,7 @@ def prepare_dataset(
                     language_b,
                     source_id,
                     quality_score,
+                    is_synthetic,
                 )
                 for target in targets:
                     _increment(target, split)
@@ -585,6 +627,8 @@ def prepare_dataset(
                     _increment(target, "ko_tokens", len(ids_a))
                     _increment(target, "ja_tokens", len(ids_b))
                     _increment(target, "quality_score_sum", quality_score)
+                    if is_synthetic:
+                        _increment(target, "synthetic_pairs")
     except BaseException:
         if executor is not None:
             executor.shutdown(wait=False, cancel_futures=True)
@@ -622,20 +666,28 @@ def prepare_dataset(
         raise
 
     manifest = {
-        "format": "sion-indexed-parallel-v3",
+        "format": INDEX_FORMAT,
         "language_pair": list(normalized_pairs[0]),
         "language_pairs": [list(pair) for pair in normalized_pairs],
         "languages": list(languages),
         "language_to_id": language_to_id,
         "storage_sides": ["src", "tgt"],
         "train_only_prefixes": list(train_only_prefixes),
+        "synthetic_policy": {
+            "record_field": "synthetic",
+            "train_only": True,
+            "sampling_weight": synthetic_sampling_weight,
+            "prefixes": list(train_only_prefixes),
+        },
         "tokenizer_model": str(Path(tokenizer_model).resolve()),
+        "fingerprint": dataset_fingerprint.to_dict(),
         "inputs": [str(path) for path in paths],
         "sources": [
             {
                 "id": source_id,
                 "name": path.name,
                 "path": str(path),
+                "synthetic_file": synthetic_path(path, train_only_prefixes),
                 "stats": asdict(per_source_stats[source_id]),
                 "mean_quality_score": (
                     per_source_stats[source_id].quality_score_sum

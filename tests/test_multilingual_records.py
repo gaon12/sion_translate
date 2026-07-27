@@ -154,7 +154,7 @@ def test_multilingual_tokenizer_reads_heterogeneous_rows(tmp_path: Path) -> None
     assert stats.valid_pairs == 80
     with (dataset_dir / "manifest.json").open("r", encoding="utf-8") as handle:
         manifest = json.load(handle)
-    assert manifest["format"] == "sion-indexed-parallel-v3"
+    assert manifest["format"] == "sion-indexed-parallel-v4"
     assert manifest["language_pairs"] == [["ko", "ja"], ["en", "ru"]]
     assert manifest["languages"] == ["ko", "ja", "en", "ru"]
 

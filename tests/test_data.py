@@ -97,6 +97,7 @@ def test_tokenizer_prepare_dataset_and_collate(tmp_path: Path) -> None:
     restored = pickle.loads(pickle.dumps(dataset))
     assert restored.pair_lengths is None
     assert restored.pair_source_ids is None
+    assert restored.pair_synthetic_flags is None
     assert restored[0]["src_language"] == "ko"
 
     collator = SionBatchCollator(
@@ -209,6 +210,35 @@ def test_source_temperature_sampling_is_deterministic_and_balanced() -> None:
     assert first_indices == second_indices
     sampled_small = sum(index >= 90 for index in first_indices)
     assert 10 < sampled_small <= 30
+
+
+def test_record_level_synthetic_samples_are_downweighted() -> None:
+    class DummyDataset:
+        bidirectional = False
+        pair_count = 10_000
+        pair_source_ids = np.zeros(pair_count, dtype=np.uint16)
+        pair_synthetic_flags = np.asarray(
+            [False] * (pair_count // 2) + [True] * (pair_count // 2),
+            dtype=np.bool_,
+        )
+        source_names = ["mixed.jsonl"]
+        synthetic_sampling_weight = 0.5
+
+        def __len__(self) -> int:
+            return self.pair_count
+
+        def lengths_for_indices(self, indices: np.ndarray) -> np.ndarray:
+            return np.ones_like(indices)
+
+    sampler = DistributedBucketBatchSampler(
+        DummyDataset(),
+        batch_size=100,
+        bucket_size=10_000,
+        seed=17,
+    )
+    sampled = [index for batch in sampler for index in batch]
+    synthetic_share = sum(index >= 5_000 for index in sampled) / len(sampled)
+    assert 0.31 < synthetic_share < 0.36
 
 
 def test_distributed_sampler_pads_equal_batches_when_not_dropping() -> None:

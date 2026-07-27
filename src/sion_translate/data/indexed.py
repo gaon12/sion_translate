@@ -9,6 +9,8 @@ from typing import Iterator
 import numpy as np
 from torch.utils.data import Dataset, Sampler
 
+from sion_translate.synthetic import DEFAULT_SYNTHETIC_SAMPLING_WEIGHT
+
 
 class IndexedParallelDataset(Dataset):
     def __init__(self, root: str | Path, split: str, *, bidirectional: bool = True):
@@ -28,7 +30,9 @@ class IndexedParallelDataset(Dataset):
         total = 0
         lengths: list[np.ndarray] = []
         source_ids: list[np.ndarray] = []
+        synthetic_flags: list[np.ndarray] = []
         self.has_source_metadata = True
+        self.has_synthetic_metadata = True
         for index in self.indices:
             total += len(index)
             self.cumulative.append(total)
@@ -42,10 +46,17 @@ class IndexedParallelDataset(Dataset):
             else:
                 self.has_source_metadata = False
                 source_ids.append(np.zeros(len(index), dtype=np.uint16))
+            if index.dtype.names is not None and "synthetic" in index.dtype.names:
+                synthetic_flags.append(index["synthetic"].astype(np.bool_))
+            else:
+                self.has_synthetic_metadata = False
+                synthetic_flags.append(np.zeros(len(index), dtype=np.bool_))
         self.pair_count = total
         self.pair_lengths = np.concatenate(lengths)
         self.pair_source_ids = np.concatenate(source_ids)
+        self.pair_synthetic_flags = np.concatenate(synthetic_flags)
         self.source_names = self._load_source_names()
+        self.synthetic_sampling_weight = self._load_synthetic_sampling_weight()
         self.language_pairs, self.languages = self._load_language_metadata()
         self.language_pair = self.language_pairs[0]
         self._token_cache: dict[tuple[int, str], np.memmap] = {}
@@ -60,6 +71,7 @@ class IndexedParallelDataset(Dataset):
         state["indices"] = None
         state["pair_lengths"] = None
         state["pair_source_ids"] = None
+        state["pair_synthetic_flags"] = None
         state["_token_cache"] = {}
         return state
 
@@ -113,6 +125,15 @@ class IndexedParallelDataset(Dataset):
             names[int(source["id"])] = str(source["name"])
         return names
 
+    def _load_synthetic_sampling_weight(self) -> float:
+        manifest_path = self.dataset_root / "manifest.json"
+        if not manifest_path.exists():
+            return DEFAULT_SYNTHETIC_SAMPLING_WEIGHT
+        with manifest_path.open("r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        policy = manifest.get("synthetic_policy") or {}
+        return float(policy.get("sampling_weight", DEFAULT_SYNTHETIC_SAMPLING_WEIGHT))
+
     def __len__(self) -> int:
         return self.pair_count * (2 if self.bidirectional else 1)
 
@@ -154,6 +175,18 @@ class IndexedParallelDataset(Dataset):
         if row.dtype.names is not None and "source_id" in row.dtype.names:
             return int(row["source_id"])
         return 0
+
+    def synthetic_at(self, index: int) -> bool:
+        pair_index = index // 2 if self.bidirectional else index
+        if self.pair_synthetic_flags is not None:
+            return bool(self.pair_synthetic_flags[pair_index])
+        shard, local = self._resolve(pair_index)
+        row = self.indices[shard][local]
+        return bool(
+            row["synthetic"]
+            if row.dtype.names is not None and "synthetic" in row.dtype.names
+            else False
+        )
 
     def __getitem__(self, index: int) -> dict:
         if index < 0:
@@ -217,6 +250,11 @@ class IndexedParallelDataset(Dataset):
             "src_register": src_register,
             "target_register": target_register,
             "pair_index": pair_index,
+            "synthetic": bool(
+                row["synthetic"]
+                if row.dtype.names is not None and "synthetic" in row.dtype.names
+                else False
+            ),
         }
 
 
@@ -239,6 +277,7 @@ class DistributedBucketBatchSampler(Sampler[list[int]]):
         source_sampling_alpha: float = 1.0,
         source_sampling_weights: dict[str, float] | None = None,
         max_source_upsampling: float = 3.0,
+        synthetic_sampling_weight: float | None = None,
     ):
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
@@ -260,23 +299,42 @@ class DistributedBucketBatchSampler(Sampler[list[int]]):
         self.source_sampling_alpha = source_sampling_alpha
         self.source_sampling_weights = dict(source_sampling_weights or {})
         self.max_source_upsampling = max_source_upsampling
+        self.synthetic_sampling_weight = (
+            float(synthetic_sampling_weight)
+            if synthetic_sampling_weight is not None
+            else float(
+                getattr(
+                    dataset,
+                    "synthetic_sampling_weight",
+                    DEFAULT_SYNTHETIC_SAMPLING_WEIGHT,
+                )
+            )
+        )
+        if not 0.0 <= self.synthetic_sampling_weight <= 1.0:
+            raise ValueError("synthetic_sampling_weight must be in [0, 1]")
         known_sources = set(dataset.source_names)
         unknown_sources = set(self.source_sampling_weights) - known_sources
         if unknown_sources:
             raise ValueError(f"Unknown source_sampling_weights keys: {sorted(unknown_sources)}")
         if any(weight < 0 for weight in self.source_sampling_weights.values()):
             raise ValueError("source sampling weights must be non-negative")
-        self._balance_sources = not math.isclose(source_sampling_alpha, 1.0) or any(
-            not math.isclose(weight, 1.0) for weight in self.source_sampling_weights.values()
+        synthetic_flags = getattr(dataset, "pair_synthetic_flags", None)
+        has_synthetic = synthetic_flags is not None and bool(np.asarray(synthetic_flags).any())
+        self._balance_sources = (
+            not math.isclose(source_sampling_alpha, 1.0)
+            or any(
+                not math.isclose(weight, 1.0) for weight in self.source_sampling_weights.values()
+            )
+            or (has_synthetic and not math.isclose(self.synthetic_sampling_weight, 1.0))
         )
         if self._balance_sources and not getattr(dataset, "has_source_metadata", True):
             raise ValueError(
                 "Source-balanced sampling requires v2 shards with source_id metadata; "
                 "re-run sion-prepare-data"
             )
-        self._source_pair_indices: dict[int, np.ndarray] | None = None
-        self._source_ids: np.ndarray | None = None
-        self._source_probabilities: np.ndarray | None = None
+        self._group_pair_indices: dict[int, np.ndarray] | None = None
+        self._group_codes: np.ndarray | None = None
+        self._group_probabilities: np.ndarray | None = None
         self.epoch = 0
 
     def set_epoch(self, epoch: int) -> None:
@@ -318,42 +376,62 @@ class DistributedBucketBatchSampler(Sampler[list[int]]):
     def _balanced_indices(self, rng: np.random.Generator, sample_count: int) -> np.ndarray:
         if self.dataset.pair_source_ids is None:
             raise RuntimeError("Source metadata is unavailable for balanced sampling")
-        if self._source_ids is None or self._source_probabilities is None:
-            counts_all = np.bincount(self.dataset.pair_source_ids)
-            source_ids = np.flatnonzero(counts_all).astype(np.uint16, copy=False)
-            counts = counts_all[source_ids].astype(np.float64)
+        if self._group_codes is None or self._group_probabilities is None:
+            source_ids_for_pairs = self.dataset.pair_source_ids.astype(np.uint32, copy=False)
+            pair_synthetic_flags = getattr(self.dataset, "pair_synthetic_flags", None)
+            if pair_synthetic_flags is None:
+                pair_synthetic_flags = np.zeros(len(source_ids_for_pairs), dtype=np.bool_)
+            synthetic_flags = np.asarray(pair_synthetic_flags, dtype=np.uint32)
+            pair_group_codes = source_ids_for_pairs * np.uint32(2) + synthetic_flags
+            source_counts = np.bincount(source_ids_for_pairs)
+            synthetic_counts_by_source = np.bincount(
+                source_ids_for_pairs,
+                weights=synthetic_flags,
+            )
+            counts_all = np.bincount(pair_group_codes)
+            group_codes = np.flatnonzero(counts_all).astype(np.uint32, copy=False)
+            counts = counts_all[group_codes].astype(np.float64)
             natural = counts / counts.sum()
             raw = np.power(counts, self.source_sampling_alpha)
-            for position, source_id in enumerate(source_ids):
+            for position, group_code in enumerate(group_codes):
+                source_id = int(group_code) // 2
+                group_is_synthetic = bool(int(group_code) % 2)
                 name = (
-                    self.dataset.source_names[int(source_id)]
-                    if int(source_id) < len(self.dataset.source_names)
-                    else f"source-{int(source_id)}"
+                    self.dataset.source_names[source_id]
+                    if source_id < len(self.dataset.source_names)
+                    else f"source-{source_id}"
                 )
                 raw[position] *= self.source_sampling_weights.get(name, 1.0)
-            self._source_ids = source_ids
-            self._source_probabilities = self._cap_source_probabilities(
+                if group_is_synthetic:
+                    source_is_all_synthetic = (
+                        synthetic_counts_by_source[source_id] == source_counts[source_id]
+                    )
+                    has_explicit_source_weight = name in self.source_sampling_weights
+                    if not (source_is_all_synthetic and has_explicit_source_weight):
+                        raw[position] *= self.synthetic_sampling_weight
+            self._group_codes = group_codes
+            self._group_probabilities = self._cap_source_probabilities(
                 raw, natural, self.max_source_upsampling
             )
-            self._source_pair_indices = {
-                int(source_id): np.flatnonzero(self.dataset.pair_source_ids == source_id).astype(
+            self._group_pair_indices = {
+                int(group_code): np.flatnonzero(pair_group_codes == group_code).astype(
                     np.uint32, copy=False
                 )
-                for source_id in source_ids
+                for group_code in group_codes
             }
-        source_ids = self._source_ids
-        probabilities = self._source_probabilities
-        assert self._source_pair_indices is not None
-        sampled_sources = rng.choice(
-            source_ids,
+        group_codes = self._group_codes
+        probabilities = self._group_probabilities
+        assert self._group_pair_indices is not None
+        sampled_groups = rng.choice(
+            group_codes,
             size=sample_count,
             replace=True,
             p=probabilities,
         )
         sampled_pairs = np.empty(sample_count, dtype=np.uint32)
-        for source_id in source_ids:
-            positions = np.flatnonzero(sampled_sources == source_id)
-            candidates = self._source_pair_indices[int(source_id)]
+        for group_code in group_codes:
+            positions = np.flatnonzero(sampled_groups == group_code)
+            candidates = self._group_pair_indices[int(group_code)]
             sampled_pairs[positions] = rng.choice(candidates, size=len(positions), replace=True)
         if not self.dataset.bidirectional:
             return sampled_pairs

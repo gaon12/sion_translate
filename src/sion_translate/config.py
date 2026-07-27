@@ -7,6 +7,12 @@ from typing import Any
 
 import yaml
 
+from sion_translate.synthetic import (
+    DEFAULT_SYNTHETIC_PREFIXES,
+    DEFAULT_SYNTHETIC_SAMPLING_WEIGHT,
+    normalize_synthetic_prefixes,
+)
+
 
 @dataclass
 class ExperimentalConfig:
@@ -157,7 +163,10 @@ class DataConfig:
     # 역번역(backtranslation) 등 합성 데이터 파일의 이름 접두사.
     # 이 접두사로 시작하는 파일은 ① 항상 train split 에만 들어가고
     # ② 샘플링 가중치가 자동으로 낮아집니다 (합성 데이터 과다 방지).
+    # 기존 단일 설정은 계속 지원하며 synthetic_prefixes와 합쳐집니다.
     synthetic_prefix: str = "bt_"
+    synthetic_prefixes: list[str] = field(default_factory=lambda: list(DEFAULT_SYNTHETIC_PREFIXES))
+    synthetic_sampling_weight: float = DEFAULT_SYNTHETIC_SAMPLING_WEIGHT
     # 글로서리(용어집) JSON 경로. 지정하면 sion-translate/evaluate 가 이 파일을
     # 기본으로 불러와 지정한 용어를 정해진 대응어로 강제합니다. 빈 문자열이면 끔.
     glossary: str = ""
@@ -182,6 +191,12 @@ class DataConfig:
     def configured_language_pairs(self) -> tuple[tuple[str, str], ...]:
         raw_pairs = self.language_pairs or [self.language_pair]
         return tuple((str(pair[0]), str(pair[1])) for pair in raw_pairs)
+
+    def configured_synthetic_prefixes(self) -> tuple[str, ...]:
+        return normalize_synthetic_prefixes(
+            self.synthetic_prefixes,
+            legacy_prefix=self.synthetic_prefix,
+        )
 
     @property
     def languages(self) -> tuple[str, ...]:
@@ -312,6 +327,9 @@ class AppConfig:
             raise ValueError("source_token_dropout must be in [0, 0.5)")
         if not self.data.synthetic_prefix:
             raise ValueError("synthetic_prefix must be non-empty")
+        self.data.configured_synthetic_prefixes()
+        if not 0.0 <= self.data.synthetic_sampling_weight <= 1.0:
+            raise ValueError("synthetic_sampling_weight must be in [0, 1]")
         if not 0.0 <= self.data.denoise_probability <= 1.0:
             raise ValueError("denoise_probability must be in [0, 1]")
         if not 0.0 <= self.data.validation_denoise_probability <= 1.0:

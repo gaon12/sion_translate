@@ -415,12 +415,14 @@ def apply_auto_settings(
     # 오류 패턴을 학습할 수 있으므로, 사용자가 직접 가중치를 정하지 않은 한
     # 합성 출처의 샘플링 비중을 절반으로 낮춥니다.
     if auto(raw_data, "source_sampling_weights") and source_names:
-        prefix = config.data.synthetic_prefix
-        synthetic = [name for name in source_names if name.startswith(prefix)]
+        prefixes = config.data.configured_synthetic_prefixes()
+        synthetic = [name for name in source_names if name.startswith(prefixes)]
         if synthetic:
-            config.data.source_sampling_weights = {name: 0.5 for name in synthetic}
+            weight = config.data.synthetic_sampling_weight
+            config.data.source_sampling_weights = {name: weight for name in synthetic}
             decisions.append(
-                f"합성 데이터 가중치: {len(synthetic)}개 출처({prefix}*) × 0.5 다운웨이트"
+                f"합성 데이터 가중치: {len(synthetic)}개 출처"
+                f"({', '.join(prefixes)}*) × {weight:g} 다운웨이트"
             )
 
     return decisions

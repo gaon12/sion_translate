@@ -16,15 +16,39 @@ from sion_translate.tokenizer import SionTokenizer, train_tokenizer
 def test_generic_language_pair_passes_quality() -> None:
     # 라틴 문자 언어쌍은 문자 기반 언어 판별이 불가능하므로 script 검사를
     # 건너뛰고, 나머지 손상 검사(동일문 등)만 적용되어야 한다.
-    ok = assess_pair("The weather is nice today.", "Das Wetter ist heute schön.", languages=("en", "de"))
+    ok = assess_pair(
+        "The weather is nice today.", "Das Wetter ist heute schön.", languages=("en", "de")
+    )
     assert ok.accepted
     identical = assess_pair("Same text.", "Same text.", languages=("en", "de"))
     assert not identical.accepted
 
 
 def write_en_de_jsonl(path: Path, count: int = 60) -> None:
-    en_words = ["today", "tomorrow", "weather", "good", "bad", "school", "office", "train", "book", "friend"]
-    de_words = ["heute", "morgen", "Wetter", "gut", "schlecht", "Schule", "Büro", "Zug", "Buch", "Freund"]
+    en_words = [
+        "today",
+        "tomorrow",
+        "weather",
+        "good",
+        "bad",
+        "school",
+        "office",
+        "train",
+        "book",
+        "friend",
+    ]
+    de_words = [
+        "heute",
+        "morgen",
+        "Wetter",
+        "gut",
+        "schlecht",
+        "Schule",
+        "Büro",
+        "Zug",
+        "Buch",
+        "Freund",
+    ]
     rng = random.Random(0)
     with path.open("w", encoding="utf-8") as handle:
         for index in range(count):
@@ -87,9 +111,9 @@ def test_en_de_pipeline_end_to_end(tmp_path: Path) -> None:
 
 
 def test_synthetic_files_are_train_only(tmp_path: Path) -> None:
-    """bt_* 합성 파일은 validation/test 에 절대 들어가면 안 된다."""
+    """합성 파일과 synthetic=true 레코드는 holdout에 들어가면 안 된다."""
     real = tmp_path / "real.jsonl"
-    synthetic = tmp_path / "bt_mono.jsonl"
+    synthetic = tmp_path / "synthetic_numeric_data38.jsonl"
     write_en_de_jsonl(real, count=60)
     write_en_de_jsonl(synthetic, count=40)
     # 실데이터와 중복되지 않도록 합성 파일 내용을 비틀어 준다.
@@ -99,6 +123,18 @@ def test_synthetic_files_are_train_only(tmp_path: Path) -> None:
             row = json.loads(line)
             handle.write(
                 json.dumps({k: "synthetic " + v for k, v in row.items()}, ensure_ascii=False) + "\n"
+            )
+    with real.open("a", encoding="utf-8") as handle:
+        for index in range(10):
+            handle.write(
+                json.dumps(
+                    {
+                        "en": f"Explicit synthetic record source number {index + 1000}.",
+                        "de": f"Expliziter synthetischer Zielsatz Nummer {index + 1000}.",
+                        "synthetic": True,
+                    }
+                )
+                + "\n"
             )
 
     model_path = train_tokenizer(
@@ -123,11 +159,23 @@ def test_synthetic_files_are_train_only(tmp_path: Path) -> None:
     with (dataset_dir / "manifest.json").open("r", encoding="utf-8") as handle:
         manifest = json.load(handle)
     by_name = {source["name"]: source["stats"] for source in manifest["sources"]}
-    assert by_name["bt_mono.jsonl"]["validation"] == 0
-    assert by_name["bt_mono.jsonl"]["test"] == 0
-    assert by_name["bt_mono.jsonl"]["train"] == by_name["bt_mono.jsonl"]["valid_pairs"] > 0
+    synthetic_stats = by_name["synthetic_numeric_data38.jsonl"]
+    assert synthetic_stats["validation"] == 0
+    assert synthetic_stats["test"] == 0
+    assert synthetic_stats["train"] == synthetic_stats["valid_pairs"] > 0
+    assert by_name["real.jsonl"]["synthetic_pairs"] == 10
+    assert set(manifest["train_only_prefixes"]) >= {
+        "bt_",
+        "concat_",
+        "revise_",
+        "synthetic_",
+    }
+    assert manifest["fingerprint"]["language_pairs"] == [["en", "de"]]
+    assert manifest["fingerprint"]["tokenizer_sha256"]
     # 실데이터는 정상적으로 세 split 에 나뉜다.
     assert by_name["real.jsonl"]["validation"] > 0
+    train_dataset = IndexedParallelDataset(dataset_dir, "train", bidirectional=False)
+    assert train_dataset.pair_synthetic_flags.sum() == manifest["stats"]["synthetic_pairs"]
 
 
 def test_synthetic_budget_caps_generation() -> None:

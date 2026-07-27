@@ -137,11 +137,19 @@ def test_auto_downweights_synthetic_sources() -> None:
         env=cpu_environment(),
         train_examples=2000,
         validation_examples=100,
-        source_names=["real.jsonl", "bt_news.jsonl", "bt_wiki.jsonl"],
+        source_names=[
+            "real.jsonl",
+            "bt_news.jsonl",
+            "concat_dialogue.jsonl",
+            "revise_legal.jsonl",
+            "synthetic_numeric_data38.jsonl",
+        ],
     )
     assert config.data.source_sampling_weights == {
         "bt_news.jsonl": 0.5,
-        "bt_wiki.jsonl": 0.5,
+        "concat_dialogue.jsonl": 0.5,
+        "revise_legal.jsonl": 0.5,
+        "synthetic_numeric_data38.jsonl": 0.5,
     }
     assert any("합성" in line for line in decisions)
     # 사용자가 직접 가중치를 정했으면 손대지 않는다.
