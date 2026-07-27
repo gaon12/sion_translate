@@ -714,6 +714,32 @@ def train(
         save(output_dir / "checkpoints" / "final")
         save(output_dir / "checkpoints" / "latest")
         export_models("latest")
+        best_checkpoint = output_dir / "checkpoints" / "best"
+        best_exists_here = (best_checkpoint / "checkpoint.pt").is_file() or (
+            best_checkpoint / ".metadata"
+        ).exists()
+        best_exists = broadcast_bool(
+            best_exists_here if context.is_main else False,
+            context,
+        )
+        if best_exists:
+            best_step = load_checkpoint(
+                best_checkpoint,
+                model,
+                optimizer,
+                scheduler,
+                context,
+                scaler=scaler if scaler.is_enabled() else None,
+                ema=ema,
+            )
+            selected_weights = "EMA" if ema is not None else "raw"
+            if ema is not None:
+                ema.copy_to(model)
+            announce(
+                f"다음 단계용으로 best checkpoint(step {best_step}, "
+                f"{selected_weights} weights)를 복원했습니다.",
+                context,
+            )
         announce(
             f"학습 종료: step {step}, best "
             + (
