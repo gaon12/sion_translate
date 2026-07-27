@@ -381,6 +381,7 @@ def main() -> None:
             max_target_length=config.data.max_target_length,
             denoise_noise_density=config.data.denoise_noise_density,
             denoise_mean_span=config.data.denoise_mean_span,
+            augmentation_seed=config.training.seed,
             token_features=config.data.tokenizer_features,
         )
         train_collator = SionBatchCollator(

@@ -509,6 +509,10 @@ def train(
                 train_loader.batch_sampler, "set_epoch"
             ):
                 train_loader.batch_sampler.set_epoch(epoch)
+            if hasattr(train_loader, "collate_fn") and hasattr(
+                train_loader.collate_fn, "set_epoch"
+            ):
+                train_loader.collate_fn.set_epoch(epoch)
             batches_this_epoch = 0
             data_wait_started = time.perf_counter()
             for batch in train_loader:

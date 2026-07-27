@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import random
 from pathlib import Path
 from typing import Sequence
@@ -16,17 +17,19 @@ def corrupt_spans(
     *,
     noise_density: float,
     mean_span: float,
+    rng: random.Random | None = None,
 ) -> list[int]:
     ids = list(map(int, token_ids))
     if len(ids) < 2 or noise_density <= 0:
         return ids
+    generator = rng if rng is not None else random.Random()
     target = max(1, min(len(ids) - 1, round(len(ids) * noise_density)))
     masked: set[int] = set()
     attempts = 0
     while len(masked) < target and attempts < target * 10:
         attempts += 1
-        start = random.randrange(len(ids))
-        span = max(1, int(random.expovariate(1.0 / max(mean_span, 1e-3))))
+        start = generator.randrange(len(ids))
+        span = max(1, int(generator.expovariate(1.0 / max(mean_span, 1e-3))))
         for position in range(start, min(len(ids), start + span)):
             masked.add(position)
             if len(masked) >= target:
@@ -55,6 +58,8 @@ class SionBatchCollator:
         denoise_noise_density: float = 0.15,
         denoise_mean_span: float = 3.0,
         source_token_dropout: float = 0.0,
+        augmentation_seed: int = 0,
+        augmentation_key: int = 0,
         token_features: str | Path | None = None,
     ):
         self.tokenizer = tokenizer
@@ -67,20 +72,53 @@ class SionBatchCollator:
         # 단어가 빠진 입력에도 견고해지게 합니다. 학습 collator 에만 적용하고
         # 검증 collator 에는 0 을 넣어야 합니다.
         self.source_token_dropout = source_token_dropout
+        self.augmentation_seed = int(augmentation_seed)
+        # shared-memory scalar라 persistent DataLoader worker에도 epoch 변경이
+        # 전달됩니다. 각 샘플은 이 값과 pair identity로 독립 RNG를 만듭니다.
+        self._augmentation_key = torch.tensor(
+            int(augmentation_key), dtype=torch.int64
+        ).share_memory_()
         self.slot_ids = set(tokenizer.slot_ids)
         self.features = None
         if token_features and Path(token_features).exists():
             loaded = np.load(token_features, allow_pickle=False)
-            self.features = {name: torch.from_numpy(loaded[name].astype(np.int64)) for name in loaded.files}
+            self.features = {
+                name: torch.from_numpy(loaded[name].astype(np.int64)) for name in loaded.files
+            }
+
+    @property
+    def augmentation_key(self) -> int:
+        return int(self._augmentation_key.item())
+
+    def set_augmentation_key(self, augmentation_key: int) -> None:
+        self._augmentation_key.fill_(int(augmentation_key))
+
+    def set_epoch(self, epoch: int) -> None:
+        """Use the epoch as the deterministic augmentation stream key."""
+
+        self.set_augmentation_key(epoch)
+
+    def _sample_rng(self, item: dict) -> random.Random:
+        pair_index = int(item.get("pair_index", 0))
+        augmentation_key = item.get("augmentation_key", self.augmentation_key)
+        identity = "|".join(
+            (
+                str(self.augmentation_seed),
+                str(pair_index),
+                str(item["src_language"]),
+                str(item["target_language"]),
+                str(augmentation_key),
+            )
+        )
+        digest = hashlib.blake2b(identity.encode("utf-8"), digest_size=16).digest()
+        return random.Random(int.from_bytes(digest, byteorder="big"))
 
     def _make_example(self, item: dict) -> dict:
         src = list(map(int, item["src"]))
         tgt = list(map(int, item["tgt"]))
         target_register = int(item["target_register"])
-        denoise = (
-            self.denoise_probability > 0
-            and random.random() < self.denoise_probability
-        )
+        rng = self._sample_rng(item)
+        denoise = self.denoise_probability > 0 and rng.random() < self.denoise_probability
         if denoise:
             original = src
             src = corrupt_spans(
@@ -88,6 +126,7 @@ class SionBatchCollator:
                 self.tokenizer.mask_id,
                 noise_density=self.denoise_noise_density,
                 mean_span=self.denoise_mean_span,
+                rng=rng,
             )
             tgt = original
             # <denoise_xx>: 원문 언어에 맞는 복원 과제 태그
@@ -102,8 +141,7 @@ class SionBatchCollator:
                 kept = [
                     token_id
                     for token_id in src
-                    if token_id in self.slot_ids
-                    or random.random() >= self.source_token_dropout
+                    if token_id in self.slot_ids or rng.random() >= self.source_token_dropout
                 ]
                 if kept:
                     src = kept
