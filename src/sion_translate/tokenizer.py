@@ -12,9 +12,14 @@ from typing import Iterable, Iterator, Sequence
 import numpy as np
 import sentencepiece as spm
 
+from sion_translate.data.records import (
+    expand_parallel_record,
+    languages_from_pairs,
+    normalize_language_pairs,
+)
 from sion_translate.data.quality import QualityPolicy, assess_pair, canonical_text
-from sion_translate.splitting import TargetSplitGuard, choose_split_for_text, normalized_split_key
 from sion_translate.performance import bounded_ordered_map, build_cpu_plan
+from sion_translate.splitting import TargetSplitGuard, choose_split_for_key, normalized_split_key
 
 
 DEFAULT_LANGUAGE_PAIR = ("ko", "ja")
@@ -43,11 +48,13 @@ OPTIONAL_CONTROL_SYMBOLS = [
 ]
 
 
-def control_symbols(language_pair: Sequence[str] = DEFAULT_LANGUAGE_PAIR) -> list[str]:
-    """언어쌍에 맞는 전체 제어 토큰 목록 (토크나이저 학습 시 vocab 에 예약)."""
-    a, b = language_pair
+def control_symbols(languages: Sequence[str] = DEFAULT_LANGUAGE_PAIR) -> list[str]:
+    """언어 목록에 맞는 전체 제어 토큰 목록 (토크나이저 학습 시 예약)."""
+
+    unique_languages = tuple(dict.fromkeys(languages))
     return (
-        [f"<2{a}>", f"<2{b}>", f"<denoise_{a}>", f"<denoise_{b}>"]
+        [f"<2{language}>" for language in unique_languages]
+        + [f"<denoise_{language}>" for language in unique_languages]
         + SHARED_CONTROL_SYMBOLS
         + OPTIONAL_CONTROL_SYMBOLS
     )
@@ -80,9 +87,7 @@ def _to_python_string(value: object, *, value_name: str) -> str:
         try:
             return value.decode("utf-8")
         except UnicodeDecodeError as error:
-            raise TypeError(
-                f"{value_name}이 UTF-8로 해석할 수 없는 bytes입니다."
-            ) from error
+            raise TypeError(f"{value_name}이 UTF-8로 해석할 수 없는 bytes입니다.") from error
 
     # numpy.str_, pandas 문자열 스칼라 등은 item()으로 기본 스칼라를 얻는다.
     item_method = getattr(value, "item", None)
@@ -104,8 +109,7 @@ def _to_python_string(value: object, *, value_name: str) -> str:
                 ) from error
 
     raise TypeError(
-        f"{value_name}은 문자열이어야 합니다. "
-        f"현재 타입={type(value).__name__}, 값={value!r}"
+        f"{value_name}은 문자열이어야 합니다. 현재 타입={type(value).__name__}, 값={value!r}"
     )
 
 
@@ -123,34 +127,34 @@ def expand_inputs(patterns: Sequence[str]) -> list[Path]:
 
 
 def _filter_text_batch(
-    batch: tuple[list[bytes], tuple[str, str], float, float],
+    batch: tuple[list[bytes], tuple[tuple[str, str], ...], float, float],
 ) -> list[tuple[str, str, str, bytes]]:
-    lines, language_pair, validation_fraction, test_fraction = batch
+    lines, language_pairs, validation_fraction, test_fraction = batch
     policy = QualityPolicy()
     accepted: list[tuple[str, str, str, bytes]] = []
-    key_a, key_b = language_pair
     for raw_line in lines:
         try:
             row = json.loads(raw_line.decode("utf-8-sig"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             continue
-        if not isinstance(row, dict):
-            continue
-        raw_a, raw_b = row.get(key_a), row.get(key_b)
-        if not isinstance(raw_a, str) or not isinstance(raw_b, str):
-            continue
-        text_a, text_b = canonical_text(raw_a), canonical_text(raw_b)
-        if not text_a or not text_b:
-            continue
-        if not assess_pair(text_a, text_b, policy, languages=language_pair).accepted:
-            continue
-        split = choose_split_for_text(
-            text_a,
-            validation_fraction=validation_fraction,
-            test_fraction=test_fraction,
-        )
-        target_digest = hashlib.sha256(normalized_split_key(text_b).encode("utf-8")).digest()
-        accepted.append((text_a, text_b, split, target_digest))
+        expansion = expand_parallel_record(row, language_pairs)
+        for pair in expansion.pairs:
+            text_a, text_b = canonical_text(pair.text_a), canonical_text(pair.text_b)
+            languages = (pair.language_a, pair.language_b)
+            if not assess_pair(text_a, text_b, policy, languages=languages).accepted:
+                continue
+            source_key = normalized_split_key(text_a)
+            target_key = normalized_split_key(text_b)
+            if len(language_pairs) > 1:
+                source_key = f"{pair.language_a}\0{source_key}"
+                target_key = f"{pair.language_b}\0{target_key}"
+            split = choose_split_for_key(
+                source_key,
+                validation_fraction,
+                test_fraction,
+            )
+            target_digest = hashlib.sha256(target_key.encode("utf-8")).digest()
+            accepted.append((text_a, text_b, split, target_digest))
     return accepted
 
 
@@ -173,6 +177,7 @@ def iter_parallel_text(
     validation_fraction: float = 0.005,
     test_fraction: float = 0.005,
     language_pair: Sequence[str] = DEFAULT_LANGUAGE_PAIR,
+    language_pairs: Sequence[Sequence[str]] | None = None,
     num_workers: int | None = None,
 ) -> Iterator[str]:
     """Yield train-partition text without first materializing a temporary corpus."""
@@ -182,8 +187,9 @@ def iter_parallel_text(
     estimated_pairs = max(1, sum(path.stat().st_size for path in paths) // 200)
     target_split_guard = TargetSplitGuard(estimated_pairs, validation_fraction, test_fraction)
     workers = num_workers or build_cpu_plan(input_files=len(paths)).preprocess_workers
+    normalized_pairs = normalize_language_pairs(language_pair, language_pairs)
     inputs = (
-        (batch, tuple(language_pair), validation_fraction, test_fraction)
+        (batch, normalized_pairs, validation_fraction, test_fraction)
         for batch in _raw_batches(paths)
     )
     if workers <= 1:
@@ -240,9 +246,9 @@ class SionTokenizer:
                 self.language_tags[match.group(1)] = token_id
             elif match := denoise_pattern.match(piece):
                 self.denoise_tags[match.group(1)] = token_id
-        if len(self.language_tags) != 2 or set(self.language_tags) != set(self.denoise_tags):
+        if len(self.language_tags) < 2 or set(self.language_tags) != set(self.denoise_tags):
             raise ValueError(
-                "Tokenizer must reserve exactly two <2xx> tags with matching "
+                "Tokenizer must reserve at least two <2xx> tags with matching "
                 f"<denoise_xx> tags; found {sorted(self.language_tags)} / {sorted(self.denoise_tags)}"
             )
         self.languages = tuple(sorted(self.language_tags))
@@ -328,6 +334,7 @@ def train_tokenizer(
     validation_fraction: float = 0.005,
     test_fraction: float = 0.005,
     language_pair: Sequence[str] = DEFAULT_LANGUAGE_PAIR,
+    language_pairs: Sequence[Sequence[str]] | None = None,
     num_workers: int | None = None,
     num_threads: int | None = None,
     split_digits: bool = True,
@@ -348,7 +355,9 @@ def train_tokenizer(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     model_prefix = output_dir / "sion"
-    symbols = control_symbols(language_pair) + SLOT_SYMBOLS
+    normalized_pairs = normalize_language_pairs(language_pair, language_pairs)
+    languages = languages_from_pairs(normalized_pairs)
+    symbols = control_symbols(languages) + SLOT_SYMBOLS
 
     plan = build_cpu_plan(input_files=len(paths))
     workers = num_workers or plan.preprocess_workers
@@ -358,7 +367,7 @@ def train_tokenizer(
             paths,
             validation_fraction=validation_fraction,
             test_fraction=test_fraction,
-            language_pair=language_pair,
+            language_pairs=normalized_pairs,
             num_workers=workers,
         ),
         model_prefix=str(model_prefix),
