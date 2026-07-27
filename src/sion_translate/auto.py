@@ -19,12 +19,19 @@ import os
 import platform as platform_module
 import shutil
 import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import torch
 
 from sion_translate.config import AppConfig
+from sion_translate.fingerprint import (
+    PREPROCESSING_SCHEMA,
+    DatasetFingerprint,
+    build_dataset_fingerprint,
+)
 from sion_translate.performance import available_cpu_count
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -90,30 +97,71 @@ def describe_environment(env: EnvironmentInfo) -> str:
 FINGERPRINT_FILENAME = "raw_fingerprint.json"
 
 
-def scan_raw_data(data_dir: str | Path) -> dict[str, int]:
-    """``data_dir`` 의 *.jsonl 파일 목록과 크기를 반환합니다.
+def scan_raw_data(
+    data_dir: str | Path,
+    *,
+    language_pairs: Sequence[Sequence[str]] = (),
+    tokenizer_model: str | Path | None = None,
+    preprocessing_schema: str = PREPROCESSING_SCHEMA,
+    preprocessing_options: Mapping[str, Any] | None = None,
+) -> DatasetFingerprint:
+    """Build a content-addressed fingerprint for every raw JSONL input.
 
-    {파일이름: 바이트 크기} 형태이며, 이 자체가 '데이터 지문(fingerprint)'
-    입니다. 파일이 추가·삭제되거나 크기가 바뀌면 지문이 달라져
-    데이터셋 재준비가 자동으로 트리거됩니다.
+    The return value still behaves as ``Mapping[str, int]`` for legacy callers:
+    iteration yields file names and values are byte sizes. Equality additionally
+    covers file SHA-256, language pairs, tokenizer SHA-256, preprocessing schema,
+    and normalized preprocessing options.
     """
     data_dir = Path(data_dir)
-    return {path.name: path.stat().st_size for path in sorted(data_dir.glob("*.jsonl"))}
+    return build_dataset_fingerprint(
+        sorted(data_dir.glob("*.jsonl")),
+        language_pairs=language_pairs,
+        tokenizer_model=tokenizer_model,
+        preprocessing_schema=preprocessing_schema,
+        preprocessing_options=preprocessing_options,
+    )
 
 
-def stored_fingerprint(dataset_dir: str | Path) -> dict[str, int] | None:
+def stored_fingerprint(
+    dataset_dir: str | Path,
+) -> DatasetFingerprint | dict[str, int] | None:
     """이전 준비 때 기록해 둔 데이터 지문을 읽습니다 (없으면 None)."""
     path = Path(dataset_dir) / FINGERPRINT_FILENAME
     if not path.exists():
         return None
     with path.open("r", encoding="utf-8") as handle:
-        return {str(k): int(v) for k, v in json.load(handle).items()}
+        value = json.load(handle)
+    if isinstance(value, dict) and value.get("schema"):
+        try:
+            return DatasetFingerprint.from_dict(value)
+        except (KeyError, TypeError, ValueError):
+            return None
+    if isinstance(value, dict):
+        # v1 fingerprints only tracked byte sizes. Returning the legacy mapping
+        # makes it compare unequal to a v2 DatasetFingerprint and forces one
+        # safe rebuild.
+        try:
+            return {str(key): int(size) for key, size in value.items()}
+        except (TypeError, ValueError):
+            return None
+    return None
 
 
-def write_fingerprint(dataset_dir: str | Path, fingerprint: dict[str, int]) -> None:
+def write_fingerprint(
+    dataset_dir: str | Path,
+    fingerprint: DatasetFingerprint | Mapping[str, int],
+) -> None:
     """준비가 끝난 데이터셋 디렉터리에 지문을 기록합니다."""
-    with (Path(dataset_dir) / FINGERPRINT_FILENAME).open("w", encoding="utf-8") as handle:
-        json.dump(fingerprint, handle, ensure_ascii=False, indent=2)
+    payload = (
+        fingerprint.to_dict() if isinstance(fingerprint, DatasetFingerprint) else dict(fingerprint)
+    )
+    path = Path(dataset_dir) / FINGERPRINT_FILENAME
+    temporary = path.with_suffix(f"{path.suffix}.tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+        handle.flush()
+        os.fsync(handle.fileno())
+    temporary.replace(path)
 
 
 def backup_stale_dataset(dataset_dir: str | Path) -> Path:
@@ -127,7 +175,7 @@ def backup_stale_dataset(dataset_dir: str | Path) -> Path:
     return backup
 
 
-def estimate_pair_count(files: dict[str, int], data_dir: str | Path) -> int:
+def estimate_pair_count(files: Mapping[str, int], data_dir: str | Path) -> int:
     """원천 JSONL 의 행 수(≒ 번역쌍 수)를 빠르게 셉니다.
 
     토크나이저 vocab 크기를 정할 때 한 번만 사용합니다. 줄바꿈 문자를

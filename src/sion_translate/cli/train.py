@@ -48,6 +48,7 @@ from sion_translate.data import (
     IndexedParallelDataset,
     SionBatchCollator,
 )
+from sion_translate.fingerprint import DatasetFingerprint
 from sion_translate.model import SionForConditionalGeneration
 from sion_translate.tokenizer import SionTokenizer
 from sion_translate.training.distributed import (
@@ -63,6 +64,24 @@ from sion_translate.training.trainer import announce, train
 from sion_translate.performance import build_cpu_plan
 
 DEFAULT_CONFIG_FILE = "sion_translate.yaml"
+
+
+def scan_configured_raw_data(
+    config: AppConfig,
+    data_dir: Path,
+    tokenizer_path: Path,
+) -> DatasetFingerprint:
+    """Fingerprint every input that can change the prepared dataset."""
+
+    return scan_raw_data(
+        data_dir,
+        language_pairs=config.data.configured_language_pairs(),
+        tokenizer_model=tokenizer_path,
+        preprocessing_options={
+            "synthetic_sampling_weight": config.data.synthetic_sampling_weight,
+            "train_only_prefixes": list(config.data.configured_synthetic_prefixes()),
+        },
+    )
 
 
 def dataloader_runtime_kwargs(
@@ -207,7 +226,7 @@ def ensure_artifacts(config: AppConfig, context: DistributedContext) -> None:
         data_dir = Path(config.data.raw_dir)
         tokenizer_path = Path(config.data.tokenizer_model)
         dataset_dir = Path(config.data.dataset_dir)
-        files = scan_raw_data(data_dir)
+        files = scan_configured_raw_data(config, data_dir, tokenizer_path)
         dataset_ready = (dataset_dir / "manifest.json").exists()
 
         if not files and not dataset_ready:
@@ -249,6 +268,9 @@ def ensure_artifacts(config: AppConfig, context: DistributedContext) -> None:
                     num_threads=cpu_plan.sentencepiece_threads,
                 )
                 announce("토크나이저 학습 완료.", context)
+                # 토크나이저 파일의 SHA-256도 데이터셋 지문에 포함됩니다.
+                files = scan_configured_raw_data(config, data_dir, tokenizer_path)
+
             # ── 데이터셋 (지문 기반 변경 감지) ─────────────────────────
             existing_tokenizer = SionTokenizer(tokenizer_path)
             if set(existing_tokenizer.languages) != set(config.data.languages):
@@ -260,20 +282,16 @@ def ensure_artifacts(config: AppConfig, context: DistributedContext) -> None:
                     f"config={sorted(config.data.languages)}"
                 )
             stored = stored_fingerprint(dataset_dir) if dataset_ready else None
-            if dataset_ready and stored is None:
-                # 수동으로 준비한 데이터셋: 현재 파일 목록을 지문으로 채택합니다.
-                announce(
-                    "기존 데이터셋에 지문이 없어 현재 원천 데이터 기준으로 기록합니다.",
-                    context,
-                )
-                write_fingerprint(dataset_dir, files)
-            elif not dataset_ready or stored != files:
+            if not dataset_ready or stored != files:
                 from sion_translate.data.prepare import prepare_dataset
 
                 if dataset_ready:
                     backup = backup_stale_dataset(dataset_dir)
+                    reason = (
+                        "호환 가능한 지문 없음" if stored is None else "원천/토크나이저/전처리 변경"
+                    )
                     announce(
-                        f"원천 데이터 변경 감지 → 기존 데이터셋을 {backup.name}/ 으로 보관합니다.",
+                        f"{reason} 감지 → 기존 데이터셋을 {backup.name}/ 으로 보관합니다.",
                         context,
                     )
                 announce(
@@ -285,9 +303,11 @@ def ensure_artifacts(config: AppConfig, context: DistributedContext) -> None:
                     tokenizer_path,
                     dataset_dir,
                     language_pairs=config.data.configured_language_pairs(),
-                    train_only_prefixes=(config.data.synthetic_prefix,),
+                    train_only_prefixes=config.data.configured_synthetic_prefixes(),
+                    synthetic_sampling_weight=config.data.synthetic_sampling_weight,
                     num_workers=cpu_plan.dataset_workers,
                 )
+                files = scan_configured_raw_data(config, data_dir, tokenizer_path)
                 write_fingerprint(dataset_dir, files)
                 announce("데이터셋 준비 완료.", context)
             else:

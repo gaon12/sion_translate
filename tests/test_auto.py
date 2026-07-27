@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import torch
@@ -180,13 +181,79 @@ def test_fingerprint_detects_data_changes(tmp_path: Path) -> None:
     dataset_dir = tmp_path / "dataset"
     dataset_dir.mkdir()
 
-    first = scan_raw_data(data_dir)
+    tokenizer = tmp_path / "sion.model"
+    tokenizer.write_bytes(b"tokenizer-a")
+    first = scan_raw_data(
+        data_dir,
+        language_pairs=(("ko", "ja"),),
+        tokenizer_model=tokenizer,
+        preprocessing_options={"max_tokens_per_side": 510},
+    )
     write_fingerprint(dataset_dir, first)
     assert stored_fingerprint(dataset_dir) == first
+    assert dict(first) == {"a.jsonl": (data_dir / "a.jsonl").stat().st_size}
+    assert not (dataset_dir / "raw_fingerprint.json.tmp").exists()
 
-    # 파일 추가 → 지문 불일치 → 재준비 대상
-    (data_dir / "b.jsonl").write_text("y\n", encoding="utf-8")
-    assert scan_raw_data(data_dir) != stored_fingerprint(dataset_dir)
+    # 같은 바이트 수로 내용을 바꿔도 SHA-256이 달라져 재준비 대상이다.
+    (data_dir / "a.jsonl").write_text("y\n", encoding="utf-8")
+    changed = scan_raw_data(
+        data_dir,
+        language_pairs=(("ko", "ja"),),
+        tokenizer_model=tokenizer,
+        preprocessing_options={"max_tokens_per_side": 510},
+    )
+    assert changed != stored_fingerprint(dataset_dir)
+
+
+def test_fingerprint_covers_tokenizer_languages_and_preprocessing_schema(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "a.jsonl").write_text("{}\n", encoding="utf-8")
+    tokenizer = tmp_path / "sion.model"
+    tokenizer.write_bytes(b"first")
+    base = scan_raw_data(
+        data_dir,
+        language_pairs=(("ko", "ja"),),
+        tokenizer_model=tokenizer,
+        preprocessing_schema="prepare-v1",
+    )
+    assert base != scan_raw_data(
+        data_dir,
+        language_pairs=(("en", "ru"),),
+        tokenizer_model=tokenizer,
+        preprocessing_schema="prepare-v1",
+    )
+    assert base != scan_raw_data(
+        data_dir,
+        language_pairs=(("ko", "ja"),),
+        tokenizer_model=tokenizer,
+        preprocessing_schema="prepare-v2",
+    )
+    tokenizer.write_bytes(b"other")
+    assert base != scan_raw_data(
+        data_dir,
+        language_pairs=(("ko", "ja"),),
+        tokenizer_model=tokenizer,
+        preprocessing_schema="prepare-v1",
+    )
+
+
+def test_legacy_size_only_fingerprint_forces_a_safe_rebuild(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    source = data_dir / "a.jsonl"
+    source.write_text("{}\n", encoding="utf-8")
+    dataset_dir = tmp_path / "dataset"
+    dataset_dir.mkdir()
+    (dataset_dir / "raw_fingerprint.json").write_text(
+        json.dumps({"a.jsonl": source.stat().st_size}),
+        encoding="utf-8",
+    )
+
+    current = scan_raw_data(data_dir)
+    assert stored_fingerprint(dataset_dir) != current
 
 
 def test_ema_tracks_and_swaps() -> None:
