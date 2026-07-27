@@ -76,3 +76,14 @@ def test_reversed_multilingual_pair_is_rejected() -> None:
     config = AppConfig(data=DataConfig(language_pairs=[["ko", "ja"], ["ja", "ko"]]))
     with pytest.raises(ValueError, match="duplicate or reversed"):
         config.validate()
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("candidate_micro_batch", "eval_batch_size_per_gpu"),
+)
+def test_posttraining_memory_batch_sizes_must_be_positive(field: str) -> None:
+    config = AppConfig()
+    setattr(config.posttraining, field, 0)
+    with pytest.raises(ValueError, match=field):
+        config.validate()

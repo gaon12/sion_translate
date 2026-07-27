@@ -241,6 +241,11 @@ class PostTrainingConfig:
     learning_rate: float = 3e-5
     warmup_steps: int = 200
     samples_per_source: int = 2
+    # 후보 전체의 vocabulary logits를 한 번에 만들지 않고, source마다
+    # 이 개수씩 나눠 점수를 계산합니다. 1이 VRAM 사용량이 가장 낮습니다.
+    candidate_micro_batch: int = 1
+    # 후보 scoring graph의 큰 activation은 저장하지 않고 backward 때 재계산합니다.
+    candidate_gradient_checkpointing: bool = True
     sampling_temperature: float = 1.0
     top_k: int = 64
     max_new_tokens: int = 256
@@ -262,6 +267,7 @@ class PostTrainingConfig:
     reward_copy_penalty: float = 0.10
     # best/early stopping은 이 beam 수로 생성한 번역의 복합 보상을 사용합니다.
     validation_num_beams: int = 4
+    eval_batch_size_per_gpu: int = 1
     eval_every: int = 250
     save_every: int = 1_000
     early_stopping_patience: int = 5
@@ -375,7 +381,9 @@ class AppConfig:
             ("batch_size_per_gpu", post.batch_size_per_gpu),
             ("gradient_accumulation_steps", post.gradient_accumulation_steps),
             ("samples_per_source", post.samples_per_source),
+            ("candidate_micro_batch", post.candidate_micro_batch),
             ("max_new_tokens", post.max_new_tokens),
+            ("eval_batch_size_per_gpu", post.eval_batch_size_per_gpu),
             ("eval_every", post.eval_every),
             ("save_every", post.save_every),
             ("validation_num_beams", post.validation_num_beams),

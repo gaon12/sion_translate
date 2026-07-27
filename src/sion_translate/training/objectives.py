@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 from sacrebleu.metrics import CHRF
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 from sion_translate.config import PostTrainingConfig
 from sion_translate.data.quality import canonical_text, language_fraction
@@ -113,9 +114,7 @@ class CompositeTranslationReward:
         # 평가(sion-evaluate / sion-compare)와 같은 정의를 씁니다. 보상과 지표가
         # 다른 것을 재면 사후학습이 개선했다는 항목이 리포트에 나타나지 않습니다.
         number = multiset_f1(numeric_tokens(reference_text), numeric_tokens(hypothesis))
-        structured = multiset_f1(
-            structured_tokens(reference_text), structured_tokens(hypothesis)
-        )
+        structured = multiset_f1(structured_tokens(reference_text), structured_tokens(hypothesis))
         source_slots = [token_id for token_id in source_ids if token_id in self.slot_ids]
         candidate_slots = [token_id for token_id in candidate_ids if token_id in self.slot_ids]
         slot = multiset_f1(source_slots, candidate_slots)
@@ -127,9 +126,7 @@ class CompositeTranslationReward:
         )
         reference_length = sum(not char.isspace() for char in reference_text)
         hypothesis_length = sum(not char.isspace() for char in hypothesis)
-        length = math.exp(
-            -abs(math.log((hypothesis_length + 1.0) / (reference_length + 1.0)))
-        )
+        length = math.exp(-abs(math.log((hypothesis_length + 1.0) / (reference_length + 1.0))))
         components = {
             "chrf": chrf,
             "token_f1": token_f1,
@@ -160,9 +157,7 @@ class CompositeTranslationReward:
         inputs_cpu = input_ids.detach().to("cpu")
         references_cpu = reference_labels.detach().to("cpu")
         reward_rows: list[list[float]] = []
-        component_rows: dict[str, list[list[float]]] = {
-            name: [] for name in self.weights
-        }
+        component_rows: dict[str, list[list[float]]] = {name: [] for name in self.weights}
         for source, candidate_row, reference in zip(
             inputs_cpu, candidates_cpu, references_cpu, strict=True
         ):
@@ -236,6 +231,96 @@ class MinimumRiskObjective:
             return generated_scores.sum() * 0.0, pair_weight
         return (losses * weights).sum() / pair_weight.clamp_min(1e-8), pair_weight
 
+    @staticmethod
+    def _repeated_model_inputs(
+        batch: dict[str, torch.Tensor], repeats: int
+    ) -> dict[str, torch.Tensor]:
+        excluded = {
+            "decoder_input_ids",
+            "labels",
+            "register_labels",
+            "alignment_targets",
+        }
+        return {
+            name: value.repeat_interleave(repeats, dim=0)
+            for name, value in batch.items()
+            if name not in excluded
+        }
+
+    def _sequence_log_probabilities(
+        self,
+        model: nn.Module,
+        batch: dict[str, torch.Tensor],
+        decoder_input_ids: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return mean token log-probability for a small candidate chunk.
+
+        ``decoder_input_ids`` and ``labels`` have shape
+        ``(batch, candidates, length)``. Cross entropy computes only the target
+        token NLL instead of materializing a second, explicit log-softmax tensor.
+        Candidate activation checkpointing additionally keeps the large model and
+        vocabulary activations out of the retained forward graph.
+        """
+
+        def score_chunk(
+            chunk_decoder_input_ids: torch.Tensor,
+            chunk_labels: torch.Tensor,
+        ) -> torch.Tensor:
+            batch_size, candidates, target_length = chunk_decoder_input_ids.shape
+            output = model(
+                **self._repeated_model_inputs(batch, candidates),
+                decoder_input_ids=chunk_decoder_input_ids.reshape(
+                    batch_size * candidates, target_length
+                ),
+                labels=None,
+            )
+            flat_labels = chunk_labels.reshape(batch_size * candidates, target_length)
+            token_nll = F.cross_entropy(
+                output.logits.float().transpose(1, 2),
+                flat_labels,
+                ignore_index=-100,
+                reduction="none",
+            )
+            valid = flat_labels.ne(-100)
+            sequence_log_probs = -token_nll.masked_fill(~valid, 0.0).sum(-1) / valid.sum(
+                -1
+            ).clamp_min(1)
+            return sequence_log_probs.view(batch_size, candidates)
+
+        if self.config.candidate_gradient_checkpointing and torch.is_grad_enabled():
+            return checkpoint(
+                score_chunk,
+                decoder_input_ids,
+                labels,
+                use_reentrant=False,
+            )
+        return score_chunk(decoder_input_ids, labels)
+
+    def _reference_cross_entropy(
+        self,
+        model: nn.Module,
+        batch: dict[str, torch.Tensor],
+        decoder_input_ids: torch.Tensor,
+        labels: torch.Tensor,
+        *,
+        label_smoothing: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        output = model(
+            **self._repeated_model_inputs(batch, 1),
+            decoder_input_ids=decoder_input_ids,
+            labels=None,
+        )
+        ce_sum = F.cross_entropy(
+            output.logits.float().reshape(-1, output.logits.shape[-1]),
+            labels.reshape(-1),
+            ignore_index=-100,
+            reduction="sum",
+            label_smoothing=label_smoothing,
+        )
+        reference_tokens = labels.ne(-100).sum()
+        return ce_sum / reference_tokens.clamp_min(1), reference_tokens
+
     @torch.no_grad()
     def validation_metrics(
         self, model: nn.Module, batch: dict[str, torch.Tensor]
@@ -260,9 +345,7 @@ class MinimumRiskObjective:
         )
         return metrics
 
-    def __call__(
-        self, model: nn.Module, batch: dict[str, torch.Tensor]
-    ) -> ObjectiveOutput:
+    def __call__(self, model: nn.Module, batch: dict[str, torch.Tensor]) -> ObjectiveOutput:
         base = unwrap_model(model)
         reference_labels = batch["labels"]
         batch_size = reference_labels.shape[0]
@@ -308,49 +391,27 @@ class MinimumRiskObjective:
         decoder_inputs[:, samples:, : reference_inputs.shape[-1]] = reference_inputs
         labels[:, samples:, : reference_targets.shape[-1]] = reference_targets
 
-        repeats = samples + 1
-        repeated: dict[str, torch.Tensor] = {}
-        for name, value in batch.items():
-            if name in {"decoder_input_ids", "labels", "register_labels", "alignment_targets"}:
-                continue
-            repeated[name] = value.repeat_interleave(repeats, dim=0)
-        output = model(
-            **repeated,
-            decoder_input_ids=decoder_inputs.reshape(batch_size * repeats, target_length),
-            labels=None,
-        )
-        logits = output.logits.float().view(
-            batch_size, repeats, target_length, output.logits.shape[-1]
-        )
-        log_probs = F.log_softmax(logits, dim=-1)
-        safe_labels = labels.clamp_min(0)
-        token_log_probs = log_probs.gather(-1, safe_labels.unsqueeze(-1)).squeeze(-1)
-        valid = labels.ne(-100)
-
-        generated_valid = valid[:, :samples]
-        generated_scores = (
-            token_log_probs[:, :samples].masked_fill(~generated_valid, 0.0).sum(-1)
-            / generated_valid.sum(-1).clamp_min(1)
-        )
-        candidate_distribution = torch.softmax(
-            self.config.mrt_alpha * generated_scores, dim=-1
-        )
-        risk = (candidate_distribution * (1.0 - rewards)).sum(-1).mean()
-        preference_loss, pair_weight = self._pairwise_preference_loss(
-            generated_scores, rewards
-        )
-
-        reference_logits = logits[:, samples]
-        reference_flat = labels[:, samples]
-        ce_sum = F.cross_entropy(
-            reference_logits.reshape(-1, reference_logits.shape[-1]),
-            reference_flat.reshape(-1),
-            ignore_index=-100,
-            reduction="sum",
+        score_chunks = [
+            self._sequence_log_probabilities(
+                model,
+                batch,
+                decoder_inputs[:, start : start + self.config.candidate_micro_batch],
+                labels[:, start : start + self.config.candidate_micro_batch],
+            )
+            for start in range(0, samples, self.config.candidate_micro_batch)
+        ]
+        generated_scores = torch.cat(score_chunks, dim=1)
+        ce_loss, reference_tokens = self._reference_cross_entropy(
+            model,
+            batch,
+            decoder_inputs[:, samples],
+            labels[:, samples],
             label_smoothing=base.config.label_smoothing,
         )
-        reference_tokens = reference_flat.ne(-100).sum()
-        ce_loss = ce_sum / reference_tokens.clamp_min(1)
+        candidate_distribution = torch.softmax(self.config.mrt_alpha * generated_scores, dim=-1)
+        risk = (candidate_distribution * (1.0 - rewards)).sum(-1).mean()
+        preference_loss, pair_weight = self._pairwise_preference_loss(generated_scores, rewards)
+
         total_loss = (
             ce_loss
             + self.config.risk_weight * risk
@@ -375,8 +436,7 @@ class MinimumRiskObjective:
             normalizer=normalizer,
             processed_tokens=reference_tokens.detach(),
             auxiliary_loss=(
-                self.config.risk_weight * risk
-                + self.config.preference_weight * preference_loss
+                self.config.risk_weight * risk + self.config.preference_weight * preference_loss
             ).detach(),
             metrics=metrics,
         )

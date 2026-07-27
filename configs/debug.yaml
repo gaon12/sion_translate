@@ -62,9 +62,12 @@ posttraining:
   learning_rate: 0.0001
   warmup_steps: 0
   samples_per_source: 2
+  candidate_micro_batch: 1
+  candidate_gradient_checkpointing: true
   top_k: 8
   max_new_tokens: 8
   preference_weight: 0.10
   validation_num_beams: 1
+  eval_batch_size_per_gpu: 1
   eval_every: 1
   save_every: 1
