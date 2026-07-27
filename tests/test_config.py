@@ -6,7 +6,7 @@ import warnings
 
 import pytest
 
-from sion_translate.config import ExperimentalConfig
+from sion_translate.config import AppConfig, DataConfig, ExperimentalConfig, config_from_raw
 
 
 def _warnings_from(config: ExperimentalConfig) -> list[str]:
@@ -39,9 +39,7 @@ def test_no_bats_warning_when_module_is_disabled() -> None:
 
 
 def test_warns_when_core_is_enabled_without_register_loss_weight() -> None:
-    messages = _warnings_from(
-        ExperimentalConfig(core_enabled=True, register_loss_weight=0.0)
-    )
+    messages = _warnings_from(ExperimentalConfig(core_enabled=True, register_loss_weight=0.0))
     assert len(messages) == 1
     assert "core_enabled" in messages[0]
 
@@ -53,3 +51,28 @@ def test_no_core_warning_with_default_register_loss_weight() -> None:
 def test_negative_loss_weight_is_still_an_error() -> None:
     with pytest.raises(ValueError, match="bats_loss_weight"):
         ExperimentalConfig(bats_loss_weight=-0.1).validate()
+
+
+def test_multilingual_pairs_are_validated_and_expose_language_union() -> None:
+    config = AppConfig(data=DataConfig(language_pairs=[["ko", "ja"], ["en", "ru"]]))
+    config.validate()
+    assert config.data.configured_language_pairs() == (("ko", "ja"), ("en", "ru"))
+    assert config.data.languages == ("ko", "ja", "en", "ru")
+
+
+def test_single_and_multi_pair_keys_cannot_be_configured_together() -> None:
+    with pytest.raises(ValueError, match="cannot both"):
+        config_from_raw(
+            {
+                "data": {
+                    "language_pair": ["ko", "ja"],
+                    "language_pairs": [["en", "ru"]],
+                }
+            }
+        )
+
+
+def test_reversed_multilingual_pair_is_rejected() -> None:
+    config = AppConfig(data=DataConfig(language_pairs=[["ko", "ja"], ["ja", "ko"]]))
+    with pytest.raises(ValueError, match="duplicate or reversed"):
+        config.validate()

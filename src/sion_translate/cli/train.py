@@ -41,7 +41,11 @@ from sion_translate.auto import (
 )
 from sion_translate.config import AppConfig, config_from_raw, load_raw_config
 from sion_translate.console import configure_stdio
-from sion_translate.data import DistributedBucketBatchSampler, IndexedParallelDataset, SionBatchCollator
+from sion_translate.data import (
+    DistributedBucketBatchSampler,
+    IndexedParallelDataset,
+    SionBatchCollator,
+)
 from sion_translate.model import SionForConditionalGeneration
 from sion_translate.tokenizer import SionTokenizer
 from sion_translate.training.distributed import (
@@ -67,9 +71,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-steps", type=int, help="최대 step 수동 지정 (자동값 무시)")
     parser.add_argument("--posttrain-steps", type=int, help="MRT 사후학습 step 수동 지정")
-    parser.add_argument(
-        "--skip-posttraining", action="store_true", help="SFT 사전학습까지만 실행"
-    )
+    parser.add_argument("--skip-posttraining", action="store_true", help="SFT 사전학습까지만 실행")
     parser.add_argument(
         "--resume-from", help="재개할 체크포인트 수동 지정 (기본: latest 자동 감지)"
     )
@@ -177,13 +179,22 @@ def ensure_artifacts(config: AppConfig, context: DistributedContext) -> None:
                     [str(data_dir / "*.jsonl")],
                     tokenizer_path.parent,
                     vocab_size=vocab_size,
-                    language_pair=config.data.language_pair,
+                    language_pairs=config.data.configured_language_pairs(),
                     num_workers=cpu_plan.preprocess_workers,
                     num_threads=cpu_plan.sentencepiece_threads,
                 )
                 announce("토크나이저 학습 완료.", context)
 
             # ── 데이터셋 (지문 기반 변경 감지) ─────────────────────────
+            existing_tokenizer = SionTokenizer(tokenizer_path)
+            if set(existing_tokenizer.languages) != set(config.data.languages):
+                raise RuntimeError(
+                    "기존 토크나이저의 언어 태그가 현재 data.language_pairs와 "
+                    "다릅니다. 기존 체크포인트와 vocab 호환성을 확인한 뒤 "
+                    "tokenizer_model과 dataset_dir을 새 경로로 지정해 재학습하세요. "
+                    f"tokenizer={sorted(existing_tokenizer.languages)}, "
+                    f"config={sorted(config.data.languages)}"
+                )
             stored = stored_fingerprint(dataset_dir) if dataset_ready else None
             if dataset_ready and stored is None:
                 # 수동으로 준비한 데이터셋: 현재 파일 목록을 지문으로 채택합니다.
@@ -208,7 +219,7 @@ def ensure_artifacts(config: AppConfig, context: DistributedContext) -> None:
                     [str(data_dir / "*.jsonl")],
                     tokenizer_path,
                     dataset_dir,
-                    language_pair=config.data.language_pair,
+                    language_pairs=config.data.configured_language_pairs(),
                     train_only_prefixes=(config.data.synthetic_prefix,),
                     num_workers=cpu_plan.dataset_workers,
                 )

@@ -97,18 +97,24 @@ def main() -> None:
         DEFAULT_CONFIG_FILE if Path(DEFAULT_CONFIG_FILE).exists() else None
     )
     config = config_from_raw(load_raw_config(config_path) if config_path else {})
-    pair = tuple(config.data.language_pair)
+    configured_pairs = config.data.configured_language_pairs()
+    configured_edges = {frozenset(pair) for pair in configured_pairs}
 
     # ── 평가 방향 결정 ──────────────────────────────────────────────────
     if args.direction == "both":
-        directions = [(pair[0], pair[1]), (pair[1], pair[0])]
+        directions = [
+            direction for pair in configured_pairs for direction in (pair, (pair[1], pair[0]))
+        ]
     else:
         source, _, target = args.direction.partition("-")
-        if {source, target} != set(pair):
-            raise SystemExit(f"--direction 은 both 또는 {pair[0]}-{pair[1]} / {pair[1]}-{pair[0]} 이어야 합니다")
+        if frozenset((source, target)) not in configured_edges:
+            valid = ", ".join(f"{left}-{right}/{right}-{left}" for left, right in configured_pairs)
+            raise SystemExit(f"--direction 은 both 또는 다음 중 하나여야 합니다: {valid}")
         directions = [(source, target)]
     if (args.compare or args.export_sources) and len(directions) != 1:
-        raise SystemExit("--compare / --export-sources 는 --direction 을 한 방향으로 지정해야 합니다")
+        raise SystemExit(
+            "--compare / --export-sources 는 --direction 을 한 방향으로 지정해야 합니다"
+        )
 
     # ── 글로서리 (선택) ─────────────────────────────────────────────────
     glossary = None
@@ -123,7 +129,9 @@ def main() -> None:
     if args.benchmark:
         log(f"벤치마크 로드: {', '.join(args.benchmark)}")
         pairs = load_benchmark_pairs(
-            args.benchmark, pair, max_samples_per_direction=args.max_samples
+            args.benchmark,
+            configured_pairs,
+            max_samples_per_direction=args.max_samples,
         )
         eval_set_name = ";".join(args.benchmark)
     else:
@@ -140,11 +148,11 @@ def main() -> None:
     if args.export_sources:
         direction = directions[0]
         sources = [source for source, _ in pairs.get(direction, [])]
-        Path(args.export_sources).write_text(
-            "\n".join(sources) + "\n", encoding="utf-8"
+        Path(args.export_sources).write_text("\n".join(sources) + "\n", encoding="utf-8")
+        log(
+            f"원문 {len(sources)}문장 저장: {args.export_sources} "
+            f"(외부 서비스 번역 후 --compare 로 넘기세요)"
         )
-        log(f"원문 {len(sources)}문장 저장: {args.export_sources} "
-            f"(외부 서비스 번역 후 --compare 로 넘기세요)")
 
     # ── 평가 실행 ───────────────────────────────────────────────────────
     results: list[DirectionResult] = []
@@ -161,6 +169,7 @@ def main() -> None:
         started = time.perf_counter()
         hypotheses = translator.translate(
             sources,
+            source_language=source_language,
             target_language=target_language,
             num_beams=args.num_beams,
             max_new_tokens=args.max_new_tokens,
@@ -236,7 +245,7 @@ def main() -> None:
             "eval_set": eval_set_name,
             "num_beams": args.num_beams,
             "max_samples": args.max_samples,
-            "language_pair": list(pair),
+            "language_pairs": [list(pair) for pair in configured_pairs],
         },
     )
     log(f"저장: {output}.json / {output}.md")

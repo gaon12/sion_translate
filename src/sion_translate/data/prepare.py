@@ -411,8 +411,14 @@ def prepare_dataset(
     languages = languages_from_pairs(normalized_pairs)
     language_to_id = {language: index for index, language in enumerate(languages)}
 
-    # Validate the model in the parent before starting a large worker pool.
-    SionTokenizer(tokenizer_model)
+    # Validate the model and all required language tags before a large worker pool.
+    tokenizer = SionTokenizer(tokenizer_model)
+    missing_languages = sorted(set(languages) - set(tokenizer.languages))
+    if missing_languages:
+        raise ValueError(
+            "Tokenizer is missing configured language tags: "
+            f"{missing_languages}; retrain it with language_pairs={normalized_pairs!r}"
+        )
     output_dir = Path(output_dir)
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     if output_dir.exists():

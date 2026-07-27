@@ -29,7 +29,14 @@ DEFAULT_CONFIG_FILE = "sion_translate.yaml"
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Translate with a trained sion_translate model")
     parser.add_argument("text", nargs="*", help="번역할 문장 (없으면 표준 입력에서 줄 단위로 읽음)")
-    parser.add_argument("--to", dest="target", help="목표 언어 (기본: 언어쌍의 두 번째, ko-ja 면 ja)")
+    parser.add_argument(
+        "--from",
+        dest="source",
+        help="원문 언어 (다국어 모델에서는 필수)",
+    )
+    parser.add_argument(
+        "--to", dest="target", help="목표 언어 (기본: 언어쌍의 두 번째, ko-ja 면 ja)"
+    )
     parser.add_argument("--model", help="내보낸 모델 경로 (기본: exports 에서 자동 탐색)")
     parser.add_argument(
         "--int8",
@@ -58,9 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.3,
         help="후보 샘플링 온도 (기본 0.3 — 홀드아웃에서 0.7 보다 나았음)",
     )
-    parser.add_argument(
-        "--top-k", type=int, default=0, help="후보 샘플링 top-k (0=제한 없음)"
-    )
+    parser.add_argument("--top-k", type=int, default=0, help="후보 샘플링 top-k (0=제한 없음)")
     parser.add_argument(
         "--revise-rounds",
         type=int,
@@ -108,13 +113,12 @@ def main() -> None:
     )
     config = config_from_raw(load_raw_config(config_path) if config_path else {})
 
-    model_path = args.model or find_exported_model(
-        config.training.output_dir, int8=args.int8
-    )
+    model_path = args.model or find_exported_model(config.training.output_dir, int8=args.int8)
     translator = Translator(model_path, config.data.tokenizer_model)
 
     # 목표 언어: 지정하지 않으면 언어쌍의 두 번째 언어 (ko-ja 면 ja).
-    target = args.target or config.data.language_pair[1]
+    default_pair = config.data.configured_language_pairs()[0]
+    target = args.target or default_pair[1]
     if target not in translator.languages:
         raise SystemExit(
             f"--to {target} 는 이 모델이 지원하지 않습니다 (지원: {sorted(translator.languages)})"
@@ -146,6 +150,7 @@ def main() -> None:
         )
     translations = translator.translate(
         lines,
+        source_language=args.source,
         target_language=target,
         num_beams=args.num_beams,
         length_penalty=args.length_penalty,
@@ -169,6 +174,7 @@ def main() -> None:
             return translator.revise(
                 sources,
                 drafts,
+                source_language=args.source,
                 target_language=target,
                 num_beams=args.num_beams,
                 length_penalty=args.length_penalty,

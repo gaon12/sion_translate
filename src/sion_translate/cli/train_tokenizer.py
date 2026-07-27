@@ -27,6 +27,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="JSONL 키 이름 (기본: ko ja)",
     )
     parser.add_argument(
+        "--language-pairs",
+        nargs=2,
+        action="append",
+        metavar=("LANG_A", "LANG_B"),
+        help="여러 언어쌍을 학습할 때 반복 지정",
+    )
+    parser.add_argument(
         "--no-split-digits",
         dest="split_digits",
         action="store_false",
@@ -50,6 +57,7 @@ def main() -> None:
         validation_fraction=args.validation_fraction,
         test_fraction=args.test_fraction,
         language_pair=args.language_pair,
+        language_pairs=args.language_pairs,
         num_workers=args.workers,
         num_threads=args.threads,
         split_digits=args.split_digits,

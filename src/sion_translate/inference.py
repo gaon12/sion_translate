@@ -93,11 +93,32 @@ class Translator:
         others = [lang for lang in self.languages if lang != target_language]
         return others[0] if len(others) == 1 else ""
 
+    def _resolve_source_language(
+        self,
+        source_language: str | None,
+        target_language: str,
+    ) -> str:
+        if source_language is None:
+            source_language = self._other_language(target_language)
+            if not source_language:
+                raise ValueError(
+                    "다국어 모델은 source_language를 명시해야 합니다 "
+                    f"(지원: {sorted(self.languages)})"
+                )
+        if source_language not in self.languages:
+            raise ValueError(
+                f"지원하지 않는 원문 언어: {source_language} (지원: {sorted(self.languages)})"
+            )
+        if source_language == target_language:
+            raise ValueError("source_language와 target_language는 달라야 합니다")
+        return source_language
+
     @torch.no_grad()
     def translate(
         self,
         texts: Sequence[str],
         *,
+        source_language: str | None = None,
         target_language: str,
         num_beams: int = 4,
         length_penalty: float = 1.0,
@@ -144,7 +165,10 @@ class Translator:
             raise ValueError(
                 f"지원하지 않는 언어: {target_language} (지원: {sorted(self.languages)})"
             )
-        source_language = self._other_language(target_language)
+        source_language = self._resolve_source_language(
+            source_language,
+            target_language,
+        )
         eos = self.tokenizer.eos_id
         results: list[str] = []
         special_ids = {
@@ -269,6 +293,7 @@ class Translator:
         texts: Sequence[str],
         drafts: Sequence[str],
         *,
+        source_language: str | None = None,
         target_language: str,
         num_beams: int = 4,
         length_penalty: float = 1.0,
@@ -296,6 +321,7 @@ class Translator:
                 serialize_revision_input(source, draft)
                 for source, draft in zip(texts, drafts, strict=True)
             ],
+            source_language=source_language,
             target_language=target_language,
             num_beams=num_beams,
             length_penalty=length_penalty,

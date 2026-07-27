@@ -50,7 +50,15 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="LANG=CODE",
         help="언어별 FLORES 코드 수동 지정 (예: ko=kor_Hang). 기본 코드가 있으면 생략 가능",
     )
-    parser.add_argument("--output", help="출력 JSONL 경로 (기본: benchmarks/flores_<a>_<b>.<split>.jsonl)")
+    parser.add_argument(
+        "--output", help="출력 JSONL 경로 (기본: benchmarks/flores_<a>_<b>.<split>.jsonl)"
+    )
+    parser.add_argument(
+        "--language-pair",
+        nargs=2,
+        metavar=("LANG_A", "LANG_B"),
+        help="다국어 설정에서 변환할 한 언어쌍",
+    )
     parser.add_argument("--config", help=f"설정 파일 (기본: {DEFAULT_CONFIG_FILE})")
     return parser
 
@@ -67,7 +75,20 @@ def main() -> None:
         DEFAULT_CONFIG_FILE if Path(DEFAULT_CONFIG_FILE).exists() else None
     )
     config = config_from_raw(load_raw_config(config_path) if config_path else {})
-    pair = tuple(config.data.language_pair)
+    configured_pairs = config.data.configured_language_pairs()
+    if args.language_pair:
+        pair = tuple(args.language_pair)
+        if frozenset(pair) not in {frozenset(item) for item in configured_pairs}:
+            raise SystemExit(
+                f"설정에 없는 --language-pair 입니다: {pair} (지원: {configured_pairs})"
+            )
+    elif len(configured_pairs) == 1:
+        pair = configured_pairs[0]
+    else:
+        raise SystemExit(
+            "다국어 설정에서는 --language-pair LANG_A LANG_B를 지정하세요 "
+            f"(지원: {configured_pairs})"
+        )
 
     # --flores-code ko=kor_Hang ... 파싱
     overrides: dict[str, str] = {}
@@ -88,7 +109,9 @@ def main() -> None:
                 "--flores-dir <폴더> 또는 --hf 를 지정하세요. "
                 "FLORES-200 배포판을 내려받아 압축을 푼 폴더를 --flores-dir 로 주면 됩니다."
             )
-        log(f"로컬 FLORES {args.split} 로드: {args.flores_dir} ({codes[pair[0]]}, {codes[pair[1]]})")
+        log(
+            f"로컬 FLORES {args.split} 로드: {args.flores_dir} ({codes[pair[0]]}, {codes[pair[1]]})"
+        )
         pairs = pairs_from_local_flores(
             args.flores_dir, pair, split=args.split, code_overrides=overrides
         )

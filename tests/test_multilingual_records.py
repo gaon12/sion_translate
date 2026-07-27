@@ -10,6 +10,7 @@ from sion_translate.data.records import (
 )
 from sion_translate.data import IndexedParallelDataset
 from sion_translate.data.prepare import prepare_dataset
+from sion_translate.inference import Translator
 from sion_translate.tokenizer import SionTokenizer, train_tokenizer
 
 
@@ -86,6 +87,22 @@ def test_language_pair_normalization_removes_reverse_duplicates() -> None:
     assert languages_from_pairs(pairs) == ("ko", "ja", "en", "ru")
 
 
+def test_multilingual_inference_requires_and_validates_source_language() -> None:
+    translator = Translator.__new__(Translator)
+    translator.tokenizer = type(
+        "TokenizerStub",
+        (),
+        {"languages": ("en", "ja", "ko", "ru")},
+    )()
+    assert translator._resolve_source_language("ko", "ja") == "ko"
+    try:
+        translator._resolve_source_language(None, "ja")
+    except ValueError as error:
+        assert "source_language" in str(error)
+    else:
+        raise AssertionError("multilingual source omission must fail")
+
+
 def test_multilingual_tokenizer_reads_heterogeneous_rows(tmp_path: Path) -> None:
     source = tmp_path / "mixed.jsonl"
     rows = []
@@ -153,3 +170,42 @@ def test_multilingual_tokenizer_reads_heterogeneous_rows(tmp_path: Path) -> None
         ("en", "ru"),
         ("ru", "en"),
     }
+
+
+def test_prepare_rejects_tokenizer_missing_configured_languages(tmp_path: Path) -> None:
+    source = tmp_path / "two-language.jsonl"
+    source.write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "ko": f"한국어 문장 {index}입니다.",
+                    "ja": f"日本語の文{index}です。",
+                },
+                ensure_ascii=False,
+            )
+            for index in range(30)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    model_path = train_tokenizer(
+        [str(source)],
+        tmp_path / "two-language-tokenizer",
+        vocab_size=512,
+        input_sentence_size=1000,
+        seed_sentencepiece_size=1000,
+        num_workers=1,
+        num_threads=1,
+    )
+    try:
+        prepare_dataset(
+            [str(source)],
+            model_path,
+            tmp_path / "invalid-dataset",
+            language_pairs=PAIRS,
+            num_workers=1,
+        )
+    except ValueError as error:
+        assert "missing configured language tags" in str(error)
+    else:
+        raise AssertionError("stale two-language tokenizer must be rejected")

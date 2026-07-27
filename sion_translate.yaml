@@ -41,6 +41,10 @@ data:
   raw_dir: data              # 원천 JSONL 폴더 (여기에 파일을 추가하면 자동 인식)
   language_pair: [ko, ja]    # JSONL 키 이름 = 언어쌍. [en, de] 처럼 바꾸면
                              # 토크나이저/전처리/방향 태그가 모두 따라갑니다.
+# 여러 언어쌍을 한 모델에 넣을 때는 위 language_pair 대신 아래 형식을 씁니다.
+#   language_pairs:
+#     - [ko, ja]
+#     - [en, ru]
 #   source_token_dropout: 0.05  # 온라인 증강(원문 토큰 탈락) 확률. 0 이면 끔
 #   synthetic_prefix: bt_    # 역번역 합성 파일 접두사 (train 전용 + 자동 다운웨이트)
 #   glossary: glossary.json  # 용어집 JSON. 지정 시 번역/평가에서 용어 강제

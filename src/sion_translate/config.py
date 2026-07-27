@@ -147,6 +147,9 @@ class DataConfig:
     # 토크나이저의 <2xx>/<denoise_xx> 제어 토큰, 전처리, 방향 태그가
     # 모두 이 값을 따라가므로 다른 언어쌍도 설정만 바꾸면 학습됩니다.
     language_pair: list[str] = field(default_factory=lambda: ["ko", "ja"])
+    # 여러 언어쌍을 한 모델에서 학습할 때 사용합니다. 비어 있으면 위의
+    # language_pair 한 쌍만 사용합니다. YAML에서는 둘 중 하나만 적습니다.
+    language_pairs: list[list[str]] = field(default_factory=list)
     # 원문(입력) 쪽 토큰을 낮은 확률로 무작위 탈락시키는 온라인 증강.
     # 소량(0.05 안팎)은 과적합을 줄여 주지만, 큰 값은 오히려 해롭습니다.
     # 검증에는 절대 적용되지 않습니다. 0 이면 끕니다.
@@ -175,6 +178,18 @@ class DataConfig:
     source_sampling_alpha: float = 1.0
     source_sampling_weights: dict[str, float] = field(default_factory=dict)
     max_source_upsampling: float = 3.0
+
+    def configured_language_pairs(self) -> tuple[tuple[str, str], ...]:
+        raw_pairs = self.language_pairs or [self.language_pair]
+        return tuple((str(pair[0]), str(pair[1])) for pair in raw_pairs)
+
+    @property
+    def languages(self) -> tuple[str, ...]:
+        return tuple(
+            dict.fromkeys(
+                language for pair in self.configured_language_pairs() for language in pair
+            )
+        )
 
 
 @dataclass
@@ -261,15 +276,27 @@ class AppConfig:
 
     def validate(self) -> None:
         self.model.validate()
-        pair = self.data.language_pair
-        if (
-            len(pair) != 2
-            or pair[0] == pair[1]
-            or any(not lang or not lang.isascii() or not lang.isalnum() for lang in pair)
-        ):
-            raise ValueError(
-                "language_pair must be two distinct ASCII language keys, e.g. ['ko', 'ja']"
-            )
+        pairs = self.data.language_pairs or [self.data.language_pair]
+        if not pairs:
+            raise ValueError("at least one language pair is required")
+        seen_edges: set[frozenset[str]] = set()
+        for pair in pairs:
+            if (
+                len(pair) != 2
+                or pair[0] == pair[1]
+                or any(
+                    not lang or not lang.isascii() or not lang.isalnum() or not lang[0].isalpha()
+                    for lang in pair
+                )
+            ):
+                raise ValueError(
+                    "each language pair must contain two distinct ASCII language "
+                    "keys, e.g. ['ko', 'ja']"
+                )
+            edge = frozenset(pair)
+            if edge in seen_edges:
+                raise ValueError(f"duplicate or reversed language pair: {pair!r}")
+            seen_edges.add(edge)
         if not 0.0 <= self.data.source_token_dropout < 0.5:
             raise ValueError("source_token_dropout must be in [0, 0.5)")
         if not self.data.synthetic_prefix:
@@ -358,7 +385,9 @@ class AppConfig:
         if post.samples_per_source < 2:
             raise ValueError("posttraining.samples_per_source must be at least 2")
         if post.learning_rate <= 0 or post.sampling_temperature <= 0 or post.mrt_alpha <= 0:
-            raise ValueError("posttraining learning rate, temperature, and mrt_alpha must be positive")
+            raise ValueError(
+                "posttraining learning rate, temperature, and mrt_alpha must be positive"
+            )
         if not 0.0 <= post.risk_weight <= 1.0:
             raise ValueError("posttraining.risk_weight must be in [0, 1]")
         if not 0.0 <= post.preference_weight <= 1.0:
@@ -412,11 +441,14 @@ def load_raw_config(path: str | Path) -> dict[str, Any]:
 def config_from_raw(raw: dict[str, Any]) -> AppConfig:
     """raw dict 에서 AppConfig 를 만듭니다. 빠진 키는 dataclass 기본값을 씁니다."""
     model_values = dict(raw.get("model") or {})
+    data_values = dict(raw.get("data") or {})
+    if "language_pair" in data_values and "language_pairs" in data_values:
+        raise ValueError("data.language_pair and data.language_pairs cannot both be set")
     experimental = _construct_dataclass(ExperimentalConfig, model_values.pop("experimental", {}))
     model = ModelConfig(experimental=experimental, **model_values)
     return AppConfig(
         model=model,
-        data=_construct_dataclass(DataConfig, raw.get("data")),
+        data=_construct_dataclass(DataConfig, data_values),
         training=_construct_dataclass(TrainingConfig, raw.get("training")),
         posttraining=_construct_dataclass(PostTrainingConfig, raw.get("posttraining")),
     )

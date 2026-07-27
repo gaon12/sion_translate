@@ -35,7 +35,9 @@ DEFAULT_CONFIG_FILE = "sion_translate.yaml"
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Backtranslation data augmentation")
-    parser.add_argument("--mono-dir", default="data_mono", help="단일어 텍스트 폴더 (기본: data_mono)")
+    parser.add_argument(
+        "--mono-dir", default="data_mono", help="단일어 텍스트 폴더 (기본: data_mono)"
+    )
     parser.add_argument(
         "--max-ratio",
         type=float,
@@ -46,6 +48,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-beams", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument(
+        "--language-pair",
+        nargs=2,
+        metavar=("LANG_A", "LANG_B"),
+        help="다국어 모델에서 증강할 언어쌍",
+    )
     parser.add_argument("--config", help=f"설정 파일 (기본: {DEFAULT_CONFIG_FILE})")
     return parser
 
@@ -88,20 +96,33 @@ def main() -> None:
         DEFAULT_CONFIG_FILE if Path(DEFAULT_CONFIG_FILE).exists() else None
     )
     config = config_from_raw(load_raw_config(config_path) if config_path else {})
-    pair = tuple(config.data.language_pair)
+    configured_pairs = config.data.configured_language_pairs()
+    if args.language_pair:
+        pair = tuple(args.language_pair)
+        if frozenset(pair) not in {frozenset(item) for item in configured_pairs}:
+            raise SystemExit(
+                f"설정에 없는 --language-pair 입니다: {pair} (지원: {configured_pairs})"
+            )
+    elif len(configured_pairs) == 1:
+        pair = configured_pairs[0]
+    else:
+        raise SystemExit(
+            "다국어 모델에서는 --language-pair LANG_A LANG_B를 지정하세요 "
+            f"(지원: {configured_pairs})"
+        )
     prefix = config.data.synthetic_prefix
 
     # ── 과증강 방지: 예산 계산 ──────────────────────────────────────────
-    real_pairs, existing_synthetic = count_dataset_pairs(
-        Path(config.data.dataset_dir), prefix
-    )
+    real_pairs, existing_synthetic = count_dataset_pairs(Path(config.data.dataset_dir), prefix)
     budget = synthetic_budget(real_pairs, existing_synthetic, args.max_ratio)
     log(
         f"실데이터 {real_pairs:,}쌍 / 기존 합성 {existing_synthetic:,}쌍 / "
         f"상한 비율 {args.max_ratio:g} → 이번에 최대 {budget:,}쌍 생성 가능"
     )
     if budget <= 0:
-        log("합성 데이터가 이미 상한에 도달했습니다. --max-ratio 를 올리지 않는 한 추가 생성하지 않습니다.")
+        log(
+            "합성 데이터가 이미 상한에 도달했습니다. --max-ratio 를 올리지 않는 한 추가 생성하지 않습니다."
+        )
         return
 
     # ── 단일어 파일 탐색: <이름>.<언어>.txt ─────────────────────────────
@@ -158,6 +179,7 @@ def main() -> None:
                 chunk = lines[start : start + args.batch_size]
                 translations = translator.translate(
                     chunk,
+                    source_language=mono_language,
                     target_language=other_language,
                     num_beams=args.num_beams,
                     max_new_tokens=args.max_new_tokens,
@@ -169,9 +191,7 @@ def main() -> None:
                         pair[1]: mono_text if mono_language == pair[1] else synthetic_text,
                     }
                     # 품질 필터: 실데이터와 같은 기준으로 손상된 합성쌍을 버립니다.
-                    assessment = assess_pair(
-                        row[pair[0]], row[pair[1]], languages=pair
-                    )
+                    assessment = assess_pair(row[pair[0]], row[pair[1]], languages=pair)
                     if not assessment.accepted:
                         filtered += 1
                         continue
@@ -181,7 +201,9 @@ def main() -> None:
             # 빈 파일을 남기면 다음 학습 때 불필요한 데이터셋 재준비를
             # 유발하므로 지웁니다.
             output_path.unlink(missing_ok=True)
-            log(f"{path.name}: 품질 필터를 통과한 합성쌍이 없어 저장하지 않음 (탈락 {filtered:,}쌍)")
+            log(
+                f"{path.name}: 품질 필터를 통과한 합성쌍이 없어 저장하지 않음 (탈락 {filtered:,}쌍)"
+            )
             continue
         total_written += written
         log(f"{output_path.name}: {written:,}쌍 저장 (품질 탈락 {filtered:,}쌍)")

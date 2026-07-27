@@ -53,6 +53,35 @@ def test_load_benchmark_pairs_builds_both_directions(tmp_path: Path) -> None:
     assert pairs[("ja", "ko")][0] == (pairs[("ko", "ja")][0][1], pairs[("ko", "ja")][0][0])
 
 
+def test_load_benchmark_pairs_expands_multiple_language_pairs(tmp_path: Path) -> None:
+    benchmark = tmp_path / "multilingual.jsonl"
+    benchmark.write_text(
+        json.dumps(
+            {
+                "ko": "한국어 문장입니다.",
+                "ja": "日本語の文です。",
+                "en": "An English sentence.",
+                "ru": "Русское предложение.",
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    pairs = load_benchmark_pairs(
+        [benchmark],
+        (("ko", "ja"), ("en", "ru")),
+        max_samples_per_direction=10,
+    )
+    assert set(pairs) == {
+        ("ko", "ja"),
+        ("ja", "ko"),
+        ("en", "ru"),
+        ("ru", "en"),
+    }
+    assert pairs[("en", "ru")] == [("An English sentence.", "Русское предложение.")]
+
+
 def test_load_split_pairs_round_trips_text(tmp_path: Path) -> None:
     """holdout split 의 토큰 id 가 다시 읽을 수 있는 텍스트로 복원되어야 한다."""
     source = tmp_path / "corpus.jsonl"

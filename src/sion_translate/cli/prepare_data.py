@@ -46,6 +46,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="JSONL 키 이름 (기본: ko ja)",
     )
     parser.add_argument(
+        "--language-pairs",
+        nargs=2,
+        action="append",
+        metavar=("LANG_A", "LANG_B"),
+        help="여러 언어쌍을 한 데이터셋에 넣을 때 반복 지정",
+    )
+    parser.add_argument(
         "--train-only-prefix",
         nargs="+",
         default=list(DEFAULT_TRAIN_ONLY_PREFIXES),
@@ -79,6 +86,7 @@ def main() -> None:
         prevent_target_leakage=not args.allow_target_leakage,
         dedup_backend=args.dedup_backend,
         language_pair=args.language_pair,
+        language_pairs=args.language_pairs,
         train_only_prefixes=args.train_only_prefix,
         num_workers=args.workers,
     )

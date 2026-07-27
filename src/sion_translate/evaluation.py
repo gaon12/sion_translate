@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Sequence
 
 from sion_translate.data import IndexedParallelDataset
+from sion_translate.data.records import expand_parallel_record, normalize_language_pairs
 from sion_translate.tokenizer import SionTokenizer
 
 # 문자 단위 BLEU 를 쓰는 언어 (공백 기반 토큰화가 무의미한 언어)
@@ -105,9 +106,7 @@ def number_preservation(
     숫자가 없는 문장쌍은 위반이 있을 수 없으므로 F1 1.0, 일치로 셉니다.
     """
     if len(hypotheses) != len(references):
-        raise ValueError(
-            f"번역문 {len(hypotheses)}개와 정답 {len(references)}개의 수가 다릅니다"
-        )
+        raise ValueError(f"번역문 {len(hypotheses)}개와 정답 {len(references)}개의 수가 다릅니다")
     if not references:
         return 0.0, 0
     scores: list[float] = []
@@ -125,14 +124,14 @@ def number_preservation(
 class DirectionResult:
     """한 방향(예: ko→ja)에 대한 한 시스템의 평가 결과."""
 
-    system: str          # "sion" 또는 --compare 로 넘긴 외부 시스템 이름
-    direction: str       # "ko-ja" 형식
+    system: str  # "sion" 또는 --compare 로 넘긴 외부 시스템 이름
+    direction: str  # "ko-ja" 형식
     samples: int
-    chrf: float          # 주 지표 (0~100, 높을수록 좋음)
+    chrf: float  # 주 지표 (0~100, 높을수록 좋음)
     bleu: float
-    bleu_tokenize: str   # BLEU 토큰화 방식 (재현성 기록용)
-    number_f1: float = 0.0      # 숫자 보존 F1 평균 (0~100)
-    number_exact: int = 0       # 숫자가 모두 일치한 문장 수
+    bleu_tokenize: str  # BLEU 토큰화 방식 (재현성 기록용)
+    number_f1: float = 0.0  # 숫자 보존 F1 평균 (0~100)
+    number_exact: int = 0  # 숫자가 모두 일치한 문장 수
 
 
 def score_translations(
@@ -143,9 +142,7 @@ def score_translations(
 ) -> tuple[float, float, str]:
     """(chrF, BLEU, BLEU 토큰화 방식) 을 반환합니다."""
     if len(hypotheses) != len(references):
-        raise ValueError(
-            f"번역문 {len(hypotheses)}개와 정답 {len(references)}개의 수가 다릅니다"
-        )
+        raise ValueError(f"번역문 {len(hypotheses)}개와 정답 {len(references)}개의 수가 다릅니다")
     from sacrebleu.metrics import BLEU, CHRF
 
     tokenize = "char" if target_language in CHARACTER_LEVEL_LANGUAGES else "13a"
@@ -167,6 +164,7 @@ def load_split_pairs(
     shard 에는 토큰 id 만 저장되어 있으므로 토크나이저로 디코딩합니다.
     """
     dataset = IndexedParallelDataset(dataset_dir, split, bidirectional=True)
+    expected_directions = len(dataset.language_pairs) * 2
     pairs: dict[tuple[str, str], list[tuple[str, str]]] = {}
     for index in range(len(dataset)):
         item = dataset[index]
@@ -174,10 +172,10 @@ def load_split_pairs(
         bucket = pairs.setdefault(direction, [])
         if len(bucket) >= max_samples_per_direction:
             # 두 방향 모두 상한에 도달하면 더 읽을 필요가 없습니다.
-            if all(
-                len(existing) >= max_samples_per_direction
-                for existing in pairs.values()
-            ) and len(pairs) == 2:
+            if (
+                all(len(existing) >= max_samples_per_direction for existing in pairs.values())
+                and len(pairs) == expected_directions
+            ):
                 break
             continue
         bucket.append(
@@ -188,7 +186,7 @@ def load_split_pairs(
 
 def load_benchmark_pairs(
     paths: Sequence[str | Path],
-    language_pair: Sequence[str],
+    language_pair: Sequence[str] | Sequence[Sequence[str]],
     *,
     max_samples_per_direction: int,
 ) -> dict[tuple[str, str], list[tuple[str, str]]]:
@@ -197,8 +195,15 @@ def load_benchmark_pairs(
     형식은 학습 데이터와 같습니다: 한 줄에 {"ko": ..., "ja": ...}.
     양방향 모두 평가셋으로 씁니다.
     """
-    key_a, key_b = language_pair
-    forward: list[tuple[str, str]] = []
+    if language_pair and isinstance(language_pair[0], str):
+        language_pairs = normalize_language_pairs(language_pair)  # type: ignore[arg-type]
+    else:
+        language_pairs = normalize_language_pairs(
+            language_pairs=language_pair  # type: ignore[arg-type]
+        )
+    output: dict[tuple[str, str], list[tuple[str, str]]] = {
+        direction: [] for pair in language_pairs for direction in (pair, (pair[1], pair[0]))
+    }
     for path in paths:
         with Path(path).open("r", encoding="utf-8") as handle:
             for line in handle:
@@ -206,15 +211,17 @@ def load_benchmark_pairs(
                 if not line:
                     continue
                 row = json.loads(line)
-                text_a, text_b = row.get(key_a), row.get(key_b)
-                if isinstance(text_a, str) and isinstance(text_b, str) and text_a and text_b:
-                    forward.append((text_a, text_b))
-                if len(forward) >= max_samples_per_direction:
+                expansion = expand_parallel_record(row, language_pairs)
+                for pair in expansion.pairs:
+                    forward = output[(pair.language_a, pair.language_b)]
+                    reverse = output[(pair.language_b, pair.language_a)]
+                    if len(forward) < max_samples_per_direction:
+                        forward.append((pair.text_a, pair.text_b))
+                    if len(reverse) < max_samples_per_direction:
+                        reverse.append((pair.text_b, pair.text_a))
+                if all(len(samples) >= max_samples_per_direction for samples in output.values()):
                     break
-    return {
-        (key_a, key_b): forward,
-        (key_b, key_a): [(b, a) for a, b in forward],
-    }
+    return output
 
 
 def results_as_markdown(results: Sequence[DirectionResult]) -> str:
@@ -246,6 +253,4 @@ def save_results(
     output_path.with_suffix(".json").write_text(
         json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    output_path.with_suffix(".md").write_text(
-        results_as_markdown(results) + "\n", encoding="utf-8"
-    )
+    output_path.with_suffix(".md").write_text(results_as_markdown(results) + "\n", encoding="utf-8")

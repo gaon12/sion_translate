@@ -6,7 +6,11 @@ import argparse
 from collections import defaultdict
 
 from sion_translate.baselines import HF_BASELINES, translate_with_hf_baseline
-from sion_translate.comparison import ComparisonCase, load_comparison_cases, write_system_translations
+from sion_translate.comparison import (
+    ComparisonCase,
+    load_comparison_cases,
+    write_system_translations,
+)
 from sion_translate.console import configure_stdio
 
 
@@ -16,7 +20,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", required=True, help="번역 출력 JSONL")
     parser.add_argument("--backend", required=True, choices=("sion", *HF_BASELINES))
     parser.add_argument("--model", help="sion_translate export(.pt); backend=sion에서 필수")
-    parser.add_argument("--tokenizer", help="sion_translate SentencePiece(.model); backend=sion에서 필수")
+    parser.add_argument(
+        "--tokenizer", help="sion_translate SentencePiece(.model); backend=sion에서 필수"
+    )
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, cuda:0 등")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-beams", type=int, default=4)
@@ -43,9 +49,10 @@ def _translate_with_sion(
         grouped[(case.source_language, case.target_language)].append(case)
 
     translations: dict[str, str] = {}
-    for (_, target_language), direction_cases in grouped.items():
+    for (source_language, target_language), direction_cases in grouped.items():
         decoded = translator.translate(
             [case.source for case in direction_cases],
+            source_language=source_language,
             target_language=target_language,
             batch_size=batch_size,
             num_beams=num_beams,
