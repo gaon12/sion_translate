@@ -56,3 +56,6 @@ glossary_input.json
 # Data acquisition helpers are intentionally kept local. The public project
 # starts from user-supplied JSONL and does not redistribute acquisition code.
 tools/
+
+# Locally generated translation queue shards are large, resumable work products.
+translation_queue/*.jsonl
