@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -345,6 +347,240 @@ def test_existing_manifest_can_adopt_a_frozen_teacher_review_policy(
     assert resumed["teacher_review"]["approved"]
     assert resumed["teacher_review"]["pilot_rows"] == 2
     assert resumed["stats"]["generated"] >= 2
+
+
+def test_queue_resume_ignores_mtime_but_records_content_artifacts(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "queue.jsonl"
+    results = tmp_path / "results"
+    accepted = tmp_path / "accepted"
+    _write_queue(source)
+    translator = FakeTranslator()
+    partial = translate_queue(
+        source,
+        results,
+        translator,
+        accepted_dir=accepted,
+        options=_options(),
+        max_rows=1,
+    )
+    original_signature = partial["run_signature"]
+    artifact = partial["parts"][0]
+    assert artifact["result"]["rows"] == 1
+    assert len(artifact["result"]["sha256"]) == 64
+    assert artifact["accepted"]["rows"] == 1
+    assert artifact["status_counts"]["accepted"] == 1
+    assert artifact["generated_rows"] == 1
+
+    stat = source.stat()
+    os.utime(
+        source,
+        ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000),
+    )
+    completed = translate_queue(
+        source,
+        results,
+        translator,
+        accepted_dir=accepted,
+        options=_options(),
+    )
+
+    assert completed["progress"]["complete"]
+    assert completed["run_signature"] == original_signature
+    assert completed["signature_version"] == 2
+    assert completed["configuration"]["source"]["mtime_ns"] == source.stat().st_mtime_ns
+
+
+def test_completed_queue_rehashes_source_even_if_size_and_mtime_match(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "queue.jsonl"
+    results = tmp_path / "results"
+    accepted = tmp_path / "accepted"
+    _write_queue(source)
+    translator = FakeTranslator()
+    translate_queue(
+        source,
+        results,
+        translator,
+        accepted_dir=accepted,
+        options=_options(),
+    )
+    stat = source.stat()
+    original = source.read_bytes()
+    tampered = original.replace(
+        "안녕하세요".encode(),
+        "반갑습니다".encode(),
+        1,
+    )
+    assert len(tampered) == len(original)
+    source.write_bytes(tampered)
+    os.utime(source, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+
+    with pytest.raises(ValueError, match="resume configuration changed"):
+        translate_queue(
+            source,
+            results,
+            translator,
+            accepted_dir=accepted,
+            options=_options(),
+        )
+
+
+def test_queue_resume_rejects_corrupted_committed_shard(tmp_path: Path) -> None:
+    source = tmp_path / "queue.jsonl"
+    results = tmp_path / "results"
+    accepted = tmp_path / "accepted"
+    _write_queue(source)
+    translator = FakeTranslator()
+    translate_queue(
+        source,
+        results,
+        translator,
+        accepted_dir=accepted,
+        options=_options(),
+        max_rows=1,
+    )
+    with (results / "part-000000.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write("{}\n")
+
+    with pytest.raises(ValueError, match="integrity mismatch"):
+        translate_queue(
+            source,
+            results,
+            translator,
+            accepted_dir=accepted,
+            options=_options(),
+        )
+
+
+def test_queue_resume_rejects_missing_committed_shard(tmp_path: Path) -> None:
+    source = tmp_path / "queue.jsonl"
+    results = tmp_path / "results"
+    accepted = tmp_path / "accepted"
+    _write_queue(source)
+    translator = FakeTranslator()
+    manifest = translate_queue(
+        source,
+        results,
+        translator,
+        accepted_dir=accepted,
+        options=_options(),
+        max_rows=1,
+    )
+    Path(manifest["parts"][0]["accepted"]["path"]).unlink()
+
+    with pytest.raises(FileNotFoundError, match="accepted part"):
+        translate_queue(
+            source,
+            results,
+            translator,
+            accepted_dir=accepted,
+            options=_options(),
+        )
+
+
+def test_legacy_manifest_signature_and_shards_migrate_on_resume(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "queue.jsonl"
+    results = tmp_path / "results"
+    accepted = tmp_path / "accepted"
+    _write_queue(source)
+    translator = FakeTranslator()
+    manifest = translate_queue(
+        source,
+        results,
+        translator,
+        accepted_dir=accepted,
+        options=_options(),
+        max_rows=1,
+    )
+    configuration_bytes = json.dumps(
+        manifest["configuration"],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    legacy_signature = hashlib.sha256(configuration_bytes).hexdigest()
+    old_accepted_path = Path(manifest["parts"][0]["accepted"]["path"])
+    legacy_run_id = legacy_signature[:16]
+    legacy_accepted_path = accepted / f"bt_{source.stem}_{legacy_run_id}_000000.jsonl"
+    result_path = results / "part-000000.jsonl"
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result["run_id"] = legacy_run_id
+    result_path.write_text(json.dumps(result, ensure_ascii=False) + "\n", encoding="utf-8")
+    accepted_row = json.loads(old_accepted_path.read_text(encoding="utf-8"))
+    accepted_row["provenance"]["run_id"] = legacy_run_id
+    old_accepted_path.write_text(
+        json.dumps(accepted_row, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    old_accepted_path.rename(legacy_accepted_path)
+    manifest["run_id"] = legacy_run_id
+    manifest["run_signature"] = legacy_signature
+    manifest.pop("signature_version")
+    manifest.pop("parts")
+    (results / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    stat = source.stat()
+    os.utime(source, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+
+    migrated = translate_queue(
+        source,
+        results,
+        translator,
+        accepted_dir=accepted,
+        options=_options(),
+    )
+
+    assert migrated["progress"]["complete"]
+    assert migrated["run_id"] == legacy_run_id
+    assert migrated["run_signature"] != legacy_signature
+    assert migrated["signature_version"] == 2
+    assert len(migrated["parts"]) == migrated["progress"]["next_part"]
+
+
+def test_legacy_shard_registration_rejects_broken_source_sequence(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "queue.jsonl"
+    results = tmp_path / "results"
+    accepted = tmp_path / "accepted"
+    _write_queue(source)
+    translator = FakeTranslator()
+    manifest = translate_queue(
+        source,
+        results,
+        translator,
+        accepted_dir=accepted,
+        options=_options(),
+        max_rows=1,
+    )
+    result_path = results / "part-000000.jsonl"
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result["source_index"] = 99
+    result_path.write_text(
+        json.dumps(result, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    manifest.pop("parts")
+    (results / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="non-contiguous source_index"):
+        translate_queue(
+            source,
+            results,
+            translator,
+            accepted_dir=accepted,
+            options=_options(),
+        )
 
 
 def test_queue_default_roundtrip_threshold_is_conservative() -> None:

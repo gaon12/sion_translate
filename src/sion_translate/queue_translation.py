@@ -34,6 +34,7 @@ from sion_translate.structured import structured_similarity
 MANIFEST_SCHEMA = "sion-translation-queue-v1"
 RESULT_SCHEMA = "sion-translation-result-v1"
 PIPELINE_VERSION = 1
+SIGNATURE_VERSION = 2
 _CHRF = CHRF(word_order=0)
 
 
@@ -118,6 +119,19 @@ def _stable_digest(value: Mapping[str, Any]) -> str:
     return hashlib.sha256(serialized).hexdigest()
 
 
+def _signature_configuration(configuration: Mapping[str, Any]) -> dict[str, Any]:
+    """Exclude volatile file metadata while retaining content identity."""
+
+    source = configuration.get("source")
+    if not isinstance(source, Mapping):
+        raise ValueError("queue configuration has no source identity")
+    stable_source = {key: source.get(key) for key in ("path", "size", "sha256")}
+    return {
+        **dict(configuration),
+        "source": stable_source,
+    }
+
+
 def _atomic_write_json(path: Path, value: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
@@ -145,6 +159,115 @@ def _atomic_write_jsonl(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(temporary, path)
+
+
+def _jsonl_artifact(path: Path) -> dict[str, Any]:
+    digest = hashlib.sha256()
+    rows = 0
+    final_byte = b""
+    with path.open("rb") as handle:
+        while block := handle.read(8 * 1024 * 1024):
+            digest.update(block)
+            rows += block.count(b"\n")
+            final_byte = block[-1:]
+    size = path.stat().st_size
+    if size and final_byte != b"\n":
+        rows += 1
+    return {
+        "path": str(path.resolve()),
+        "size": size,
+        "rows": rows,
+        "sha256": digest.hexdigest(),
+    }
+
+
+def _validate_artifact(
+    artifact: Mapping[str, Any],
+    *,
+    expected_path: Path,
+    label: str,
+) -> dict[str, Any]:
+    if not isinstance(artifact, Mapping):
+        raise ValueError(f"{label} has no valid artifact metadata")
+    recorded_path = Path(str(artifact.get("path", "")))
+    if recorded_path.resolve() != expected_path.resolve():
+        raise ValueError(f"{label} path does not match its queue manifest")
+    if not expected_path.is_file():
+        raise FileNotFoundError(f"{label} is missing: {expected_path}")
+    observed = _jsonl_artifact(expected_path)
+    for field in ("size", "rows", "sha256"):
+        if artifact.get(field) != observed[field]:
+            raise ValueError(
+                f"{label} integrity mismatch for {field}: "
+                f"expected {artifact.get(field)!r}, observed {observed[field]!r}"
+            )
+    return observed
+
+
+def _part_semantics(
+    result_path: Path,
+    accepted_path: Path,
+    *,
+    source_start_index: int,
+    run_id: str,
+) -> tuple[dict[str, int], int]:
+    """Validate row continuity and the exact accepted subset for legacy shards."""
+
+    status_counts: Counter[str] = Counter()
+    accepted_result_ids: list[str] = []
+    generated_rows = 0
+    with result_path.open("r", encoding="utf-8") as handle:
+        for offset, line in enumerate(handle):
+            try:
+                result = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"invalid JSON in {result_path}:{offset + 1}") from exc
+            if not isinstance(result, dict) or result.get("schema") != RESULT_SCHEMA:
+                raise ValueError(f"invalid result record in {result_path}:{offset + 1}")
+            if result.get("source_index") != source_start_index + offset:
+                raise ValueError(f"non-contiguous source_index in {result_path}:{offset + 1}")
+            if result.get("run_id") != run_id:
+                raise ValueError(f"run_id mismatch in {result_path}:{offset + 1}")
+            status = result.get("status")
+            if status not in {"accepted", "rejected", "error", "skipped_existing"}:
+                raise ValueError(f"invalid result status in {result_path}:{offset + 1}")
+            status_counts[status] += 1
+            if result.get("translation") is not None and status != "skipped_existing":
+                generated_rows += 1
+            if status == "accepted":
+                row_id = result.get("id")
+                if not isinstance(row_id, str) or not row_id:
+                    raise ValueError(f"accepted result has no id in {result_path}:{offset + 1}")
+                accepted_result_ids.append(row_id)
+
+    accepted_ids: list[str] = []
+    with accepted_path.open("r", encoding="utf-8") as handle:
+        for offset, line in enumerate(handle):
+            try:
+                accepted = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"invalid JSON in {accepted_path}:{offset + 1}") from exc
+            if not isinstance(accepted, dict) or accepted.get("synthetic") is not True:
+                raise ValueError(f"invalid accepted record in {accepted_path}:{offset + 1}")
+            row_id = accepted.get("id")
+            provenance = accepted.get("provenance")
+            if (
+                not isinstance(row_id, str)
+                or not isinstance(provenance, dict)
+                or provenance.get("queue_id") != row_id
+                or provenance.get("run_id") != run_id
+            ):
+                raise ValueError(f"accepted provenance mismatch in {accepted_path}:{offset + 1}")
+            accepted_ids.append(row_id)
+    if accepted_ids != accepted_result_ids:
+        raise ValueError("accepted shard is not the exact accepted subset of its result shard")
+    return (
+        {
+            status: status_counts[status]
+            for status in ("accepted", "rejected", "error", "skipped_existing")
+        },
+        generated_rows,
+    )
 
 
 def _translate_resilient(
@@ -336,11 +459,17 @@ def _forward_quality(
     return quality, reasons
 
 
-def _source_identity(path: Path, previous: Mapping[str, Any] | None) -> dict[str, Any]:
+def _source_identity(
+    path: Path,
+    previous: Mapping[str, Any] | None,
+    *,
+    force_hash: bool = False,
+) -> dict[str, Any]:
     stat = path.stat()
     resolved = str(path.resolve())
     if (
-        previous
+        not force_hash
+        and previous
         and previous.get("path") == resolved
         and previous.get("size") == stat.st_size
         and previous.get("mtime_ns") == stat.st_mtime_ns
@@ -372,9 +501,10 @@ def _new_manifest(
         "run_metadata": dict(run_metadata),
         "accepted_dir": str(accepted_dir.resolve()),
     }
-    signature = _stable_digest(configuration)
+    signature = _stable_digest(_signature_configuration(configuration))
     return {
         "schema": MANIFEST_SCHEMA,
+        "signature_version": SIGNATURE_VERSION,
         "run_id": signature[:16],
         "run_signature": signature,
         "created_at": datetime.now(UTC).isoformat(),
@@ -405,7 +535,134 @@ def _new_manifest(
             if teacher_pilot_rows is not None
             else None
         ),
+        "parts": [],
     }
+
+
+def _validate_or_register_parts(
+    manifest: dict[str, Any],
+    *,
+    output_dir: Path,
+    accepted_dir: Path,
+    input_stem: str,
+) -> bool:
+    """Verify committed shards, registering legacy v1 shards on first resume."""
+
+    progress = manifest["progress"]
+    next_part = int(progress["next_part"])
+    parts = manifest.get("parts")
+    changed = False
+    if parts is None:
+        parts = []
+        manifest["parts"] = parts
+        changed = True
+        source_start = 0
+        for part_index in range(next_part):
+            result_path = output_dir / f"part-{part_index:06d}.jsonl"
+            accepted_path = (
+                accepted_dir / f"bt_{input_stem}_{manifest['run_id']}_{part_index:06d}.jsonl"
+            )
+            if not result_path.is_file():
+                raise FileNotFoundError(f"legacy result shard is missing: {result_path}")
+            if not accepted_path.is_file():
+                raise FileNotFoundError(f"legacy accepted shard is missing: {accepted_path}")
+            result_artifact = _jsonl_artifact(result_path)
+            accepted_artifact = _jsonl_artifact(accepted_path)
+            status_counts, generated_rows = _part_semantics(
+                result_path,
+                accepted_path,
+                source_start_index=source_start,
+                run_id=str(manifest["run_id"]),
+            )
+            parts.append(
+                {
+                    "part": part_index,
+                    "source_start_index": source_start,
+                    "source_rows": result_artifact["rows"],
+                    "result": result_artifact,
+                    "accepted": accepted_artifact,
+                    "status_counts": status_counts,
+                    "generated_rows": generated_rows,
+                }
+            )
+            source_start += int(result_artifact["rows"])
+    if not isinstance(parts, list) or len(parts) != next_part:
+        raise ValueError("queue manifest part count does not match progress.next_part")
+
+    total_result_rows = 0
+    total_accepted_rows = 0
+    total_generated_rows = 0
+    total_status_counts: Counter[str] = Counter()
+    expected_source_start = 0
+    for part_index, part in enumerate(parts):
+        if not isinstance(part, dict) or int(part.get("part", -1)) != part_index:
+            raise ValueError("queue manifest contains an invalid or out-of-order part")
+        result_path = output_dir / f"part-{part_index:06d}.jsonl"
+        accepted_path = (
+            accepted_dir / f"bt_{input_stem}_{manifest['run_id']}_{part_index:06d}.jsonl"
+        )
+        result = _validate_artifact(
+            part.get("result", {}),
+            expected_path=result_path,
+            label=f"result part {part_index:06d}",
+        )
+        accepted = _validate_artifact(
+            part.get("accepted", {}),
+            expected_path=accepted_path,
+            label=f"accepted part {part_index:06d}",
+        )
+        if int(part.get("source_rows", -1)) != result["rows"]:
+            raise ValueError(f"result part {part_index:06d} source row count mismatch")
+        if int(part.get("source_start_index", -1)) != expected_source_start:
+            raise ValueError(f"result part {part_index:06d} source range is not contiguous")
+        status_counts = part.get("status_counts")
+        generated_rows = part.get("generated_rows")
+        if not isinstance(status_counts, Mapping) or generated_rows is None:
+            status_counts, generated_rows = _part_semantics(
+                result_path,
+                accepted_path,
+                source_start_index=expected_source_start,
+                run_id=str(manifest["run_id"]),
+            )
+            part["status_counts"] = status_counts
+            part["generated_rows"] = generated_rows
+            changed = True
+        normalized_counts = {
+            status: int(status_counts.get(status, 0))
+            for status in ("accepted", "rejected", "error", "skipped_existing")
+        }
+        if sum(normalized_counts.values()) != result["rows"]:
+            raise ValueError(f"result part {part_index:06d} status counts do not match rows")
+        if normalized_counts["accepted"] != accepted["rows"]:
+            raise ValueError(f"accepted part {part_index:06d} row count does not match statuses")
+        if not 0 <= int(generated_rows) <= int(result["rows"]):
+            raise ValueError(f"result part {part_index:06d} has invalid generated row count")
+        total_result_rows += int(result["rows"])
+        total_accepted_rows += int(accepted["rows"])
+        total_generated_rows += int(generated_rows)
+        total_status_counts.update(normalized_counts)
+        expected_source_start += int(result["rows"])
+
+    if total_result_rows != int(progress["completed_rows"]):
+        raise ValueError("committed result rows do not match progress.completed_rows")
+    stats = manifest["stats"]
+    if total_result_rows != int(stats["processed"]):
+        raise ValueError("committed result rows do not match stats.processed")
+    if total_accepted_rows != int(stats["accepted"]):
+        raise ValueError("committed accepted rows do not match stats.accepted")
+    for status, stat_name in (
+        ("rejected", "rejected"),
+        ("error", "errors"),
+        ("skipped_existing", "skipped_existing"),
+    ):
+        if total_status_counts[status] != int(stats[stat_name]):
+            raise ValueError(f"committed {status} rows do not match stats.{stat_name}")
+    if "generated" not in stats:
+        stats["generated"] = total_generated_rows
+        changed = True
+    elif total_generated_rows != int(stats["generated"]):
+        raise ValueError("committed generated rows do not match stats.generated")
+    return changed
 
 
 def _configure_teacher_review(
@@ -517,7 +774,14 @@ def translate_queue(
     previous_source = (
         existing.get("configuration", {}).get("source") if existing is not None else None
     )
-    source = _source_identity(input_path, previous_source)
+    force_source_hash = bool(
+        approve_teacher or (existing is not None and existing.get("progress", {}).get("complete"))
+    )
+    source = _source_identity(
+        input_path,
+        previous_source,
+        force_hash=force_source_hash,
+    )
     candidate = _new_manifest(
         source=source,
         options=options,
@@ -525,17 +789,43 @@ def translate_queue(
         accepted_dir=accepted_dir,
         teacher_pilot_rows=teacher_pilot_rows,
     )
+    resume_metadata_changed = False
     if existing is None:
         if output_dir.exists() and any(output_dir.iterdir()):
             raise FileExistsError(f"{output_dir} is not empty and has no compatible queue manifest")
         manifest = candidate
     else:
-        if existing.get("run_signature") != candidate["run_signature"]:
+        existing_configuration = existing.get("configuration")
+        if not isinstance(existing_configuration, Mapping):
+            raise ValueError("queue manifest has no valid configuration")
+        stable_existing_signature = _stable_digest(_signature_configuration(existing_configuration))
+        legacy_existing_signature = _stable_digest(existing_configuration)
+        recorded_signature = existing.get("run_signature")
+        if recorded_signature not in {
+            stable_existing_signature,
+            legacy_existing_signature,
+        }:
+            raise ValueError("queue manifest signature is invalid")
+        if stable_existing_signature != candidate["run_signature"]:
             raise ValueError(
                 "queue resume configuration changed; use a new output directory "
                 "for a different source, model, or quality policy"
             )
         manifest = existing
+        resume_metadata_changed = (
+            recorded_signature != stable_existing_signature
+            or manifest.get("signature_version") != SIGNATURE_VERSION
+            or manifest["configuration"].get("source") != source
+        )
+        manifest["run_signature"] = stable_existing_signature
+        manifest["signature_version"] = SIGNATURE_VERSION
+        manifest["configuration"]["source"] = source
+    parts_changed = _validate_or_register_parts(
+        manifest,
+        output_dir=output_dir,
+        accepted_dir=accepted_dir,
+        input_stem=input_path.stem,
+    )
     review_changed = _configure_teacher_review(
         manifest,
         teacher_pilot_rows=teacher_pilot_rows,
@@ -543,7 +833,7 @@ def translate_queue(
         approval_actor=approval_actor,
         existing_manifest=existing is not None,
     )
-    if existing is None or review_changed:
+    if existing is None or resume_metadata_changed or parts_changed or review_changed:
         manifest["updated_at"] = datetime.now(UTC).isoformat()
         _atomic_write_json(manifest_path, manifest)
     progress = manifest["progress"]
@@ -719,18 +1009,34 @@ def translate_queue(
                     }
                 )
 
+            counts = Counter(result["status"] for result in results)
+            status_counts = {
+                status: counts[status]
+                for status in ("accepted", "rejected", "error", "skipped_existing")
+            }
+            generated_rows = sum(
+                result.get("translation") is not None and result["status"] != "skipped_existing"
+                for result in results
+            )
             result_path = output_dir / f"part-{part:06d}.jsonl"
             accepted_path = accepted_dir / f"bt_{input_path.stem}_{run_id}_{part:06d}.jsonl"
             _atomic_write_jsonl(result_path, results)
             _atomic_write_jsonl(accepted_path, accepted_rows)
+            manifest["parts"].append(
+                {
+                    "part": part,
+                    "source_start_index": start_index,
+                    "source_rows": len(raw_rows),
+                    "result": _jsonl_artifact(result_path),
+                    "accepted": _jsonl_artifact(accepted_path),
+                    "status_counts": status_counts,
+                    "generated_rows": generated_rows,
+                }
+            )
 
-            counts = Counter(result["status"] for result in results)
             stats = manifest["stats"]
             stats["processed"] += len(results)
-            stats["generated"] += sum(
-                result.get("translation") is not None and result["status"] != "skipped_existing"
-                for result in results
-            )
+            stats["generated"] += generated_rows
             stats["accepted"] += counts["accepted"]
             stats["rejected"] += counts["rejected"]
             stats["errors"] += counts["error"]
@@ -742,6 +1048,18 @@ def translate_queue(
             position = source_handle.tell()
             progress["complete"] = source_handle.read(1) == b""
             source_handle.seek(position)
+            if progress["complete"]:
+                final_source = _source_identity(input_path, None, force_hash=True)
+                if (
+                    _signature_configuration({"source": final_source})["source"]
+                    != (
+                        _signature_configuration({"source": manifest["configuration"]["source"]})[
+                            "source"
+                        ]
+                    )
+                ):
+                    raise ValueError("input source content changed during queue translation")
+                manifest["configuration"]["source"] = final_source
             review = manifest.get("teacher_review")
             if (
                 isinstance(review, dict)
