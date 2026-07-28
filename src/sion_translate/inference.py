@@ -741,15 +741,24 @@ class Translator:
                 else None
             )
             chunk_max_new_tokens = max_new_tokens
+            row_max_new_tokens: torch.Tensor | None = None
             if max_output_length_ratio is not None:
-                longest_source_content = max(len(ids) - 2 for ids in encoded)
-                adaptive_limit = (
-                    math.ceil(longest_source_content * max_output_length_ratio)
-                    + max_output_length_margin
-                )
-                chunk_max_new_tokens = min(
-                    max_new_tokens,
-                    max(1, adaptive_limit),
+                row_limits = [
+                    min(
+                        max_new_tokens,
+                        max(
+                            min_new_tokens + 1,
+                            math.ceil((len(ids) - 2) * max_output_length_ratio)
+                            + max_output_length_margin,
+                        ),
+                    )
+                    for ids in encoded
+                ]
+                chunk_max_new_tokens = max(row_limits)
+                row_max_new_tokens = torch.tensor(
+                    row_limits,
+                    dtype=torch.long,
+                    device=self.device,
                 )
             chunk_min_new_tokens = min(
                 min_new_tokens,
@@ -767,6 +776,7 @@ class Translator:
                 forbidden_token_ids=forbidden_token_ids,
                 min_new_tokens=chunk_min_new_tokens,
                 no_repeat_ngram_size=no_repeat_ngram_size,
+                max_new_tokens_per_row=row_max_new_tokens,
                 **({} if generation_context is not None else generation_features),
             )
             beam_texts = [
@@ -794,6 +804,7 @@ class Translator:
                 no_repeat_ngram_size=no_repeat_ngram_size,
                 generator=generator,
                 generation_context=generation_context,
+                max_new_tokens_per_row=row_max_new_tokens,
             )
             for row_index, source_text in enumerate(sources):
                 candidates = [beam_texts[row_index]]

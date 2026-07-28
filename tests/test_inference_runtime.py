@@ -351,6 +351,10 @@ def test_translator_applies_safe_decode_limits_and_control_token_mask(
 
     # FakeTokenizer.encode()는 본문 토큰 2개를 내므로 2*2 + margin 1입니다.
     assert captured["max_new_tokens"] == 5
+    torch.testing.assert_close(
+        captured["max_new_tokens_per_row"],
+        torch.tensor([5]),
+    )
     assert captured["no_repeat_ngram_size"] == 4
     assert captured["min_new_tokens"] == 1
     forbidden = set(captured["forbidden_token_ids"])

@@ -40,6 +40,48 @@ def _all_ranks_max_new_tokens(local_max_new_tokens: int, device: torch.device) -
     return int(limit.item())
 
 
+def _validate_row_generation_limits(
+    limits: torch.Tensor | None,
+    *,
+    batch_size: int,
+    max_new_tokens: int,
+    min_new_tokens: int,
+    device: torch.device,
+) -> torch.Tensor | None:
+    if limits is None:
+        return None
+    if not isinstance(limits, torch.Tensor):
+        raise TypeError("max_new_tokens_per_row must be a tensor or None")
+    if limits.ndim != 1 or limits.shape[0] != batch_size:
+        raise ValueError(
+            f"max_new_tokens_per_row must have shape ({batch_size},), got {tuple(limits.shape)}"
+        )
+    limits = limits.to(device=device, dtype=torch.long)
+    if bool((limits <= min_new_tokens).any()) or bool((limits > max_new_tokens).any()):
+        raise ValueError(
+            "max_new_tokens_per_row values must be greater than min_new_tokens "
+            "and no larger than max_new_tokens"
+        )
+    return limits
+
+
+def _force_eos_at_row_limits(
+    logits: torch.Tensor,
+    limits: torch.Tensor | None,
+    *,
+    position: int,
+    eos_id: int,
+) -> torch.Tensor:
+    if limits is None:
+        return logits
+    force_eos = limits <= position + 1
+    if not bool(force_eos.any()):
+        return logits
+    logits = logits.masked_fill(force_eos[:, None], float("-inf"))
+    logits[force_eos, eos_id] = 0.0
+    return logits
+
+
 @dataclass
 class SionOutput:
     """forward 결과 묶음.
@@ -609,6 +651,7 @@ class SionForConditionalGeneration(nn.Module):
         forbidden_token_ids: tuple[int, ...] = (),
         min_new_tokens: int = 0,
         no_repeat_ngram_size: int = 0,
+        max_new_tokens_per_row: torch.Tensor | None = None,
         **encoder_features: torch.Tensor,
     ) -> torch.Tensor:
         """번역문 생성.
@@ -634,6 +677,13 @@ class SionForConditionalGeneration(nn.Module):
         synchronize_ranks = self._synchronize_generation_across_ranks
         if synchronize_ranks:
             max_new_tokens = _all_ranks_max_new_tokens(max_new_tokens, input_ids.device)
+        max_new_tokens_per_row = _validate_row_generation_limits(
+            max_new_tokens_per_row,
+            batch_size=input_ids.shape[0],
+            max_new_tokens=max_new_tokens,
+            min_new_tokens=min_new_tokens,
+            device=input_ids.device,
+        )
         was_training = self.training
         self.eval()
         try:
@@ -668,6 +718,7 @@ class SionForConditionalGeneration(nn.Module):
                     forbidden_token_ids=forbidden_token_ids,
                     min_new_tokens=min_new_tokens,
                     no_repeat_ngram_size=no_repeat_ngram_size,
+                    max_new_tokens_per_row=max_new_tokens_per_row,
                     memory_token_ids=generation_context.memory_token_ids,
                     memory_mask=generation_context.memory_mask,
                     memory_type_ids=generation_context.memory_type_ids,
@@ -686,6 +737,7 @@ class SionForConditionalGeneration(nn.Module):
                 forbidden_token_ids=forbidden_token_ids,
                 min_new_tokens=min_new_tokens,
                 no_repeat_ngram_size=no_repeat_ngram_size,
+                max_new_tokens_per_row=max_new_tokens_per_row,
                 memory_token_ids=generation_context.memory_token_ids,
                 memory_mask=generation_context.memory_mask,
                 memory_type_ids=generation_context.memory_type_ids,
@@ -715,6 +767,7 @@ class SionForConditionalGeneration(nn.Module):
         generation_context: GenerationContext | None = None,
         min_new_tokens: int = 0,
         no_repeat_ngram_size: int = 0,
+        max_new_tokens_per_row: torch.Tensor | None = None,
         **encoder_features: torch.Tensor,
     ) -> torch.Tensor:
         """MRT용 확률적 후보를 ``(batch, samples, length)``로 생성합니다."""
@@ -738,6 +791,13 @@ class SionForConditionalGeneration(nn.Module):
             raise ValueError("min_new_tokens must be in [0, max_new_tokens)")
         if no_repeat_ngram_size < 0:
             raise ValueError("no_repeat_ngram_size must be non-negative")
+        max_new_tokens_per_row = _validate_row_generation_limits(
+            max_new_tokens_per_row,
+            batch_size=input_ids.shape[0],
+            max_new_tokens=max_new_tokens,
+            min_new_tokens=min_new_tokens,
+            device=input_ids.device,
+        )
         was_training = self.training
         self.eval()
         try:
@@ -778,6 +838,11 @@ class SionForConditionalGeneration(nn.Module):
                 memory_mode_ids = memory_mode_ids.repeat_interleave(num_samples, dim=0)
 
             total = input_ids.shape[0] * num_samples
+            if max_new_tokens_per_row is not None:
+                max_new_tokens_per_row = max_new_tokens_per_row.repeat_interleave(
+                    num_samples,
+                    dim=0,
+                )
             caches = self._fresh_caches(
                 len(self.decoder_layers),
                 generation_context.cross_key_values,
@@ -808,6 +873,12 @@ class SionForConditionalGeneration(nn.Module):
                     min_new_tokens=min_new_tokens,
                     forbidden_token_ids=forbidden_token_ids,
                     no_repeat_ngram_size=no_repeat_ngram_size,
+                )
+                logits = _force_eos_at_row_limits(
+                    logits,
+                    max_new_tokens_per_row,
+                    position=position,
+                    eos_id=eos_id,
                 )
                 if 0 < top_k < logits.shape[-1]:
                     threshold = logits.topk(top_k, dim=-1).values[:, -1:]
@@ -845,6 +916,7 @@ class SionForConditionalGeneration(nn.Module):
         forbidden_token_ids: tuple[int, ...] = (),
         min_new_tokens: int = 0,
         no_repeat_ngram_size: int = 0,
+        max_new_tokens_per_row: torch.Tensor | None = None,
         memory_token_ids: torch.Tensor | None = None,
         memory_mask: torch.Tensor | None = None,
         memory_type_ids: torch.Tensor | None = None,
@@ -881,6 +953,12 @@ class SionForConditionalGeneration(nn.Module):
                 forbidden_token_ids=forbidden_token_ids,
                 no_repeat_ngram_size=no_repeat_ngram_size,
             )
+            logits = _force_eos_at_row_limits(
+                logits,
+                max_new_tokens_per_row,
+                position=position,
+                eos_id=eos_id,
+            )
             next_token = logits.argmax(-1, keepdim=True)
             # 이미 끝난 문장은 EOS 를 반복해 길이만 맞춥니다.
             next_token = torch.where(finished[:, None], eos_id, next_token)
@@ -911,6 +989,7 @@ class SionForConditionalGeneration(nn.Module):
         forbidden_token_ids: tuple[int, ...] = (),
         min_new_tokens: int = 0,
         no_repeat_ngram_size: int = 0,
+        max_new_tokens_per_row: torch.Tensor | None = None,
         memory_token_ids: torch.Tensor | None = None,
         memory_mask: torch.Tensor | None = None,
         memory_type_ids: torch.Tensor | None = None,
@@ -940,6 +1019,11 @@ class SionForConditionalGeneration(nn.Module):
             memory_type_ids = memory_type_ids.repeat_interleave(num_beams, dim=0)
         if memory_mode_ids is not None:
             memory_mode_ids = memory_mode_ids.repeat_interleave(num_beams, dim=0)
+        beam_row_limits = (
+            max_new_tokens_per_row.repeat_interleave(num_beams, dim=0)
+            if max_new_tokens_per_row is not None
+            else None
+        )
 
         caches = self._fresh_caches(
             len(self.decoder_layers),
@@ -979,6 +1063,12 @@ class SionForConditionalGeneration(nn.Module):
                 min_new_tokens=min_new_tokens,
                 forbidden_token_ids=forbidden_token_ids,
                 no_repeat_ngram_size=no_repeat_ngram_size,
+            )
+            logits = _force_eos_at_row_limits(
+                logits,
+                beam_row_limits,
+                position=position,
+                eos_id=eos_id,
             )
             log_probs = F.log_softmax(logits, dim=-1)
             vocab = log_probs.shape[-1]

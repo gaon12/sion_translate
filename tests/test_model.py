@@ -292,6 +292,65 @@ def test_decode_constraints_block_control_tokens_and_repeated_ngrams() -> None:
     assert torch.isfinite(constrained[1, 5])
 
 
+@pytest.mark.parametrize("num_beams", (1, 2))
+def test_per_row_generation_limits_stop_runaway_rows(num_beams: int) -> None:
+    model = SionForConditionalGeneration(tiny_config())
+    batch = make_batch()
+
+    def never_eos(self, hidden: torch.Tensor) -> torch.Tensor:
+        logits = torch.full(
+            (*hidden.shape[:-1], self.config.vocab_size),
+            -1_000.0,
+            device=hidden.device,
+        )
+        logits[..., 4] = 0.0
+        return logits
+
+    model._logits = types.MethodType(never_eos, model)
+    generated = model.generate(
+        batch["input_ids"],
+        batch["attention_mask"],
+        bos_id=2,
+        eos_id=3,
+        max_new_tokens=6,
+        num_beams=num_beams,
+        max_new_tokens_per_row=torch.tensor([2, 5]),
+    )
+
+    assert generated[0, 2].item() == 3
+    assert generated[1, 1:5].eq(4).all()
+    assert generated[1, 5].item() == 3
+
+
+def test_sampling_repeats_per_row_generation_limits_for_candidates() -> None:
+    model = SionForConditionalGeneration(tiny_config())
+    batch = make_batch()
+
+    def never_eos(self, hidden: torch.Tensor) -> torch.Tensor:
+        logits = torch.full(
+            (*hidden.shape[:-1], self.config.vocab_size),
+            -1_000.0,
+            device=hidden.device,
+        )
+        logits[..., 4] = 0.0
+        return logits
+
+    model._logits = types.MethodType(never_eos, model)
+    sampled = model.sample(
+        batch["input_ids"],
+        batch["attention_mask"],
+        bos_id=2,
+        eos_id=3,
+        num_samples=2,
+        max_new_tokens=6,
+        max_new_tokens_per_row=torch.tensor([2, 5]),
+    )
+
+    assert sampled[0, :, 2].eq(3).all()
+    assert sampled[1, :, 1:5].eq(4).all()
+    assert sampled[1, :, 5].eq(3).all()
+
+
 def test_sampling_waits_until_every_distributed_rank_is_finished(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
