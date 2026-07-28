@@ -22,8 +22,9 @@ def test_qe_penalises_broken_identifiers() -> None:
     faithful = "config.jsonのretry_limitを増やしてください。"
     broken = "config.jsonのretry_limyを増やしてください。"
 
-    assert qe_components(source, faithful)["structured"] > (
-        qe_components(source, broken)["structured"]
+    assert (
+        qe_components(source, faithful)["structured"]
+        > (qe_components(source, broken)["structured"])
     )
 
 
@@ -43,9 +44,7 @@ def test_qe_length_score_penalises_omission_and_runaway() -> None:
     complete = "電車が遅れていなければ間に合ったはずだが、駅に着いた時には受付が終わっていた。"
     truncated = "電車が遅れた。"
 
-    assert qe_components(source, complete)["length"] > (
-        qe_components(source, truncated)["length"]
-    )
+    assert qe_components(source, complete)["length"] > (qe_components(source, truncated)["length"])
 
 
 def test_mbr_prefers_the_consensus_candidate() -> None:

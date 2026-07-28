@@ -34,9 +34,7 @@ def _inputs(length: int = 6):
 
 def test_disabled_by_default_so_existing_checkpoints_load() -> None:
     plain = SionForConditionalGeneration(_config())
-    recurrent = SionForConditionalGeneration(
-        _config(recurrent_block_layers=2, recurrent_steps=3)
-    )
+    recurrent = SionForConditionalGeneration(_config(recurrent_block_layers=2, recurrent_steps=3))
     # 가중치를 새로 만들지 않으므로 state_dict 모양이 같아야 한다.
     assert plain.state_dict().keys() == recurrent.state_dict().keys()
     recurrent.load_state_dict(plain.state_dict())
@@ -80,9 +78,7 @@ def test_one_step_is_identical_to_no_recurrence() -> None:
 
 
 def test_block_larger_than_the_encoder_is_clamped() -> None:
-    model = SionForConditionalGeneration(
-        _config(recurrent_block_layers=99, recurrent_steps=2)
-    )
+    model = SionForConditionalGeneration(_config(recurrent_block_layers=99, recurrent_steps=2))
     assert model.recurrent_block_layers == 4  # encoder_layers
     input_ids, attention_mask = _inputs()
     with torch.no_grad():
@@ -91,9 +87,7 @@ def test_block_larger_than_the_encoder_is_clamped() -> None:
 
 def test_gradients_flow_through_every_repeat() -> None:
     torch.manual_seed(2)
-    model = SionForConditionalGeneration(
-        _config(recurrent_block_layers=2, recurrent_steps=3)
-    )
+    model = SionForConditionalGeneration(_config(recurrent_block_layers=2, recurrent_steps=3))
     input_ids, attention_mask = _inputs()
     model.encode(input_ids, attention_mask).sum().backward()
     # 반복된 블록의 가중치는 여러 경로에서 기울기를 받아야 한다.

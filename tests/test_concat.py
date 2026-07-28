@@ -17,9 +17,7 @@ from sion_translate.data.prepare import DEFAULT_TRAIN_ONLY_PREFIXES
 
 def _pairs(count: int = 40) -> list[tuple[str, str]]:
     """공백 없는 문장. 이어붙인 결과를 공백으로 다시 쪼개 검증할 수 있게 한다."""
-    return [
-        (f"한국어문장{index}번입니다.", f"日本語の文{index}番です。") for index in range(count)
-    ]
+    return [(f"한국어문장{index}번입니다.", f"日本語の文{index}番です。") for index in range(count)]
 
 
 def test_concatenation_keeps_both_sides_aligned_and_ordered() -> None:
@@ -49,9 +47,7 @@ def test_concatenation_never_reuses_a_pair_within_one_example() -> None:
 
 
 def test_sentence_count_histogram_respects_bounds() -> None:
-    _, stats = build_concatenations(
-        _pairs(), count=200, min_sentences=3, max_sentences=5, seed=3
-    )
+    _, stats = build_concatenations(_pairs(), count=200, min_sentences=3, max_sentences=5, seed=3)
     assert set(stats.sentences_per_example) <= {3, 4, 5}
     assert sum(stats.sentences_per_example.values()) == stats.written
 

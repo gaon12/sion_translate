@@ -153,10 +153,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--quality",
         choices=tuple(QUALITY_DEFAULTS),
         default="balanced",
-        help=(
-            "속도와 품질 프리셋입니다. "
-            "best는 holdout 평가에서 검증된 beam 4를 사용합니다."
-        ),
+        help=("속도와 품질 프리셋입니다. best는 holdout 평가에서 검증된 beam 4를 사용합니다."),
     )
 
     parser.add_argument(
@@ -251,10 +248,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--profile",
         action="store_true",
-        help=(
-            "설정 준비, 모델 준비, 추론, 출력 시간을 구분하여 "
-            "상세하게 stderr에 출력합니다."
-        ),
+        help=("설정 준비, 모델 준비, 추론, 출력 시간을 구분하여 상세하게 stderr에 출력합니다."),
     )
 
     parser.add_argument(
@@ -288,9 +282,7 @@ def to_python_string(value: object, *, value_name: str) -> str:
         try:
             return value.decode("utf-8")
         except UnicodeDecodeError as error:
-            raise SystemExit(
-                f"{value_name}이 UTF-8로 해석할 수 없는 bytes입니다."
-            ) from error
+            raise SystemExit(f"{value_name}이 UTF-8로 해석할 수 없는 bytes입니다.") from error
 
     # numpy 또는 pandas 스칼라 객체는 item()으로
     # 기본 Python 스칼라를 얻을 수 있다.
@@ -310,22 +302,18 @@ def to_python_string(value: object, *, value_name: str) -> str:
                 return scalar_value.decode("utf-8")
             except UnicodeDecodeError as error:
                 raise SystemExit(
-                    f"{value_name}의 스칼라 값이 "
-                    "UTF-8로 해석할 수 없는 bytes입니다."
+                    f"{value_name}의 스칼라 값이 UTF-8로 해석할 수 없는 bytes입니다."
                 ) from error
 
     raise SystemExit(
-        f"{value_name}은 문자열이어야 합니다. "
-        f"현재 타입={type(value).__name__}, 값={value!r}"
+        f"{value_name}은 문자열이어야 합니다. 현재 타입={type(value).__name__}, 값={value!r}"
     )
 
 
 def read_lines(args: argparse.Namespace) -> list[str]:
     """명령행, 입력 파일 또는 표준 입력에서 번역할 문장을 읽는다."""
     if args.text and args.input:
-        raise SystemExit(
-            "문장 위치 인자와 --input은 함께 사용할 수 없습니다."
-        )
+        raise SystemExit("문장 위치 인자와 --input은 함께 사용할 수 없습니다.")
 
     raw_lines: Sequence[object]
 
@@ -338,15 +326,10 @@ def read_lines(args: argparse.Namespace) -> list[str]:
                 encoding="utf-8",
             ).splitlines()
         except (OSError, UnicodeError) as error:
-            raise SystemExit(
-                f"입력 파일을 읽을 수 없습니다: {args.input}: {error}"
-            ) from error
+            raise SystemExit(f"입력 파일을 읽을 수 없습니다: {args.input}: {error}") from error
 
     else:
-        raw_lines = [
-            line.rstrip("\r\n")
-            for line in sys.stdin
-        ]
+        raw_lines = [line.rstrip("\r\n") for line in sys.stdin]
 
     lines: list[str] = []
 
@@ -371,31 +354,22 @@ def choose_device(value: str, int8: bool) -> torch.device:
     if int8:
         if value not in ("auto", "cpu"):
             print(
-                "[sion] INT8 export는 CPU 전용이므로 "
-                "device=cpu를 사용합니다.",
+                "[sion] INT8 export는 CPU 전용이므로 device=cpu를 사용합니다.",
                 file=sys.stderr,
             )
 
         return torch.device("cpu")
 
     if value == "auto":
-        return torch.device(
-            "cuda"
-            if torch.cuda.is_available()
-            else "cpu"
-        )
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     try:
         device = torch.device(value)
     except (RuntimeError, ValueError) as error:
-        raise SystemExit(
-            f"유효하지 않은 --device 값입니다: {value}"
-        ) from error
+        raise SystemExit(f"유효하지 않은 --device 값입니다: {value}") from error
 
     if device.type == "cuda" and not torch.cuda.is_available():
-        raise SystemExit(
-            "CUDA를 요청했지만 사용 가능한 CUDA GPU가 없습니다."
-        )
+        raise SystemExit("CUDA를 요청했지만 사용 가능한 CUDA GPU가 없습니다.")
 
     if device.type == "cuda" and device.index is not None:
         if device.index >= torch.cuda.device_count():
@@ -447,9 +421,7 @@ def apply_runtime_options(
     """
     if args.threads is not None:
         if args.threads < 1:
-            raise SystemExit(
-                "--threads는 1 이상이어야 합니다."
-            )
+            raise SystemExit("--threads는 1 이상이어야 합니다.")
 
         torch.set_num_threads(args.threads)
 
@@ -457,10 +429,7 @@ def apply_runtime_options(
         return
 
     if args.dtype == "fp16" and device.type != "cuda":
-        raise SystemExit(
-            "fp16은 CUDA에서만 지원합니다. "
-            "CPU에서는 fp32 또는 bf16을 사용하십시오."
-        )
+        raise SystemExit("fp16은 CUDA에서만 지원합니다. CPU에서는 fp32 또는 bf16을 사용하십시오.")
 
     dtype = {
         "fp32": torch.float32,
@@ -487,8 +456,7 @@ def apply_runtime_options(
 
         elif not hasattr(torch, "compile"):
             print(
-                "[sion] 현재 PyTorch에는 torch.compile이 없어 "
-                "컴파일을 건너뜁니다.",
+                "[sion] 현재 PyTorch에는 torch.compile이 없어 컴파일을 건너뜁니다.",
                 file=sys.stderr,
             )
 
@@ -526,24 +494,16 @@ def generation_options(
         length_penalty = float(preset["length_penalty"])
 
     if beams < 1:
-        raise SystemExit(
-            "--num-beams는 1 이상이어야 합니다."
-        )
+        raise SystemExit("--num-beams는 1 이상이어야 합니다.")
 
     if batch_size < 1:
-        raise SystemExit(
-            "--batch-size는 1 이상이어야 합니다."
-        )
+        raise SystemExit("--batch-size는 1 이상이어야 합니다.")
 
     if args.max_new_tokens < 1:
-        raise SystemExit(
-            "--max-new-tokens는 1 이상이어야 합니다."
-        )
+        raise SystemExit("--max-new-tokens는 1 이상이어야 합니다.")
 
     if length_penalty <= 0:
-        raise SystemExit(
-            "--length-penalty는 0보다 커야 합니다."
-        )
+        raise SystemExit("--length-penalty는 0보다 커야 합니다.")
 
     return beams, batch_size, length_penalty
 
@@ -654,9 +614,7 @@ def retry_degenerate_translations(
                 resolved[index] = candidate
 
         pending = [
-            index
-            for index in pending
-            if degeneration_reasons(sources[index], resolved[index])
+            index for index in pending if degeneration_reasons(sources[index], resolved[index])
         ]
 
     rescued_count = len(initial_problem_indices) - len(pending)
@@ -708,9 +666,7 @@ def write_output(
         )
 
     except OSError as error:
-        raise SystemExit(
-            f"출력 파일을 쓸 수 없습니다: {output_path}: {error}"
-        ) from error
+        raise SystemExit(f"출력 파일을 쓸 수 없습니다: {output_path}: {error}") from error
 
 
 def print_timing_report(
@@ -730,11 +686,7 @@ def print_timing_report(
     )
 
     throughput = sentence_count / safe_inference_elapsed
-    average_milliseconds = (
-        safe_inference_elapsed
-        / max(sentence_count, 1)
-        * 1000.0
-    )
+    average_milliseconds = safe_inference_elapsed / max(sentence_count, 1) * 1000.0
 
     print(
         (
@@ -795,24 +747,14 @@ def main() -> None:
     sources = read_lines(args)
 
     default_config_path = ROOT / "sion_translate.yaml"
-    config_path = (
-        args.config
-        if args.config.exists()
-        else None
-    )
+    config_path = args.config if args.config.exists() else None
 
     # 사용자가 기본 경로가 아닌 별도 설정 파일을 지정했는데
     # 해당 파일이 없으면 즉시 오류를 발생시킨다.
     if args.config != default_config_path and config_path is None:
-        raise SystemExit(
-            f"설정 파일을 찾을 수 없습니다: {args.config}"
-        )
+        raise SystemExit(f"설정 파일을 찾을 수 없습니다: {args.config}")
 
-    raw_config = (
-        load_raw_config(config_path)
-        if config_path is not None
-        else {}
-    )
+    raw_config = load_raw_config(config_path) if config_path is not None else {}
 
     config = config_from_raw(raw_config)
 
@@ -879,9 +821,7 @@ def main() -> None:
         try:
             glossary = load_glossary(glossary_path)
         except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
-            raise SystemExit(
-                f"용어집을 읽을 수 없습니다: {glossary_path}: {error}"
-            ) from error
+            raise SystemExit(f"용어집을 읽을 수 없습니다: {glossary_path}: {error}") from error
 
     config_elapsed = time.perf_counter() - config_started
 
@@ -926,14 +866,9 @@ def main() -> None:
     )
 
     if target not in translator.languages:
-        supported_languages = ", ".join(
-            sorted(translator.languages)
-        )
+        supported_languages = ", ".join(sorted(translator.languages))
 
-        raise SystemExit(
-            f"--to {target}는 지원하지 않습니다. "
-            f"지원 언어: {supported_languages}"
-        )
+        raise SystemExit(f"--to {target}는 지원하지 않습니다. 지원 언어: {supported_languages}")
 
     synchronize_device(device)
     model_elapsed = time.perf_counter() - model_started
@@ -997,8 +932,7 @@ def main() -> None:
         )
         if rescued_count or remaining_count:
             print(
-                f"[sion] 반복 붕괴 재시도: 복구 {rescued_count}문장 / "
-                f"잔여 {remaining_count}문장",
+                f"[sion] 반복 붕괴 재시도: 복구 {rescued_count}문장 / 잔여 {remaining_count}문장",
                 file=sys.stderr,
                 flush=True,
             )

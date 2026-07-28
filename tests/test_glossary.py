@@ -120,9 +120,7 @@ def test_word_boundary_for_latin_languages() -> None:
 
 def test_slot_budget_is_respected() -> None:
     # 용어가 slot 개수보다 많으면 초과분은 강제하지 않는다.
-    entries = tuple(
-        {"ko": f"용어{i}", "ja": f"用語{i}"} for i in range(len(SLOT_SYMBOLS) + 5)
-    )
+    entries = tuple({"ko": f"용어{i}", "ja": f"用語{i}"} for i in range(len(SLOT_SYMBOLS) + 5))
     text = " ".join(entry["ko"] for entry in entries)
     _, slot_map = apply_source_placeholders(
         text,

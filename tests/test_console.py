@@ -51,9 +51,7 @@ def test_reopens_non_utf8_streams_as_utf8(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 @pytest.mark.parametrize("encoding", ["utf-8", "UTF-8", "utf8"])
-def test_leaves_utf8_streams_untouched(
-    monkeypatch: pytest.MonkeyPatch, encoding: str
-) -> None:
+def test_leaves_utf8_streams_untouched(monkeypatch: pytest.MonkeyPatch, encoding: str) -> None:
     streams = [FakeStream(encoding) for _ in range(3)]
     _install(monkeypatch, *streams)
 

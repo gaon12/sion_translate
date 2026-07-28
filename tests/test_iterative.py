@@ -55,8 +55,13 @@ def test_stalled_improvement_stops_early() -> None:
         return draft  # 아무것도 바꾸지 않는다 → 이득 0
 
     result = refine(
-        SOURCE, BAD, revise, target_language="ja", accept_score=0.99,
-        min_gain=0.01, max_rounds=5,
+        SOURCE,
+        BAD,
+        revise,
+        target_language="ja",
+        accept_score=0.99,
+        min_gain=0.01,
+        max_rounds=5,
     )
     assert result.stop_reason == "min_gain"
     assert calls["count"] == 1, "정체가 확인되면 남은 라운드를 쓰지 않아야 한다"
@@ -78,8 +83,13 @@ def test_max_rounds_caps_the_work() -> None:
         return text
 
     result = refine(
-        SOURCE, "合", revise, target_language="ja", accept_score=1.0,
-        min_gain=0.0, max_rounds=2,
+        SOURCE,
+        "合",
+        revise,
+        target_language="ja",
+        accept_score=1.0,
+        min_gain=0.0,
+        max_rounds=2,
     )
     assert calls["count"] == 2
     assert result.stop_reason == "max_rounds"
@@ -115,9 +125,7 @@ def test_batch_only_revises_the_sentences_that_need_it() -> None:
         seen_batches.append(list(drafts))
         return [GOOD] * len(drafts)
 
-    results = refine_batch(
-        sources, initials, revise_batch, target_language="ja", accept_score=0.9
-    )
+    results = refine_batch(sources, initials, revise_batch, target_language="ja", accept_score=0.9)
     # 이미 좋은 두 번째 문장은 배치에 들어가지 않아야 한다.
     assert seen_batches == [[BAD, BAD]]
     assert results[1].revisions_used == 0
@@ -133,8 +141,12 @@ def test_batch_stops_when_nothing_is_pending() -> None:
         return [GOOD] * len(drafts)
 
     refine_batch(
-        [SOURCE], [BAD], revise_batch, target_language="ja",
-        accept_score=0.9, max_rounds=5,
+        [SOURCE],
+        [BAD],
+        revise_batch,
+        target_language="ja",
+        accept_score=0.9,
+        max_rounds=5,
     )
     assert calls["count"] == 1, "기준을 넘으면 남은 라운드를 돌지 않아야 한다"
 
@@ -162,9 +174,7 @@ def test_summary_reports_the_saved_work() -> None:
     def revise_batch(batch_sources: Sequence[str], drafts: Sequence[str]) -> list[str]:
         return [GOOD] * len(drafts)
 
-    results = refine_batch(
-        sources, initials, revise_batch, target_language="ja", accept_score=0.9
-    )
+    results = refine_batch(sources, initials, revise_batch, target_language="ja", accept_score=0.9)
     summary = summarize(results)
     assert summary["sentences"] == 2
     assert summary["unrevised_sentences"] == 1
