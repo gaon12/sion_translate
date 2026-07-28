@@ -544,13 +544,10 @@ class Translator:
             )
         if source_language == target_language:
             raise ValueError("source_language와 target_language는 달라야 합니다")
-        if (
-            self._translation_direction_edges
-            and (source_language, target_language) not in self._translation_direction_edges
-        ):
-            supported = ", ".join(
-                f"{source}→{target}" for source, target in self.translation_directions
-            )
+        direction_edges = getattr(self, "_translation_direction_edges", set())
+        if direction_edges and (source_language, target_language) not in direction_edges:
+            translation_directions = getattr(self, "translation_directions", ())
+            supported = ", ".join(f"{source}→{target}" for source, target in translation_directions)
             raise ValueError(
                 f"학습되지 않은 번역 방향: {source_language}→{target_language} "
                 f"(지원 방향: {supported})"
