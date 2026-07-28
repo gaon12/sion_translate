@@ -38,7 +38,13 @@ def initialize_distributed() -> DistributedContext:
     else:
         device = torch.device("cpu")
     if distributed:
-        backend = "nccl" if device.type == "cuda" and dist.is_nccl_available() else "gloo"
+        if device.type == "cuda" and not dist.is_nccl_available():
+            raise RuntimeError(
+                "Multi-GPU CUDA training requires the NCCL distributed backend, "
+                "but this PyTorch installation does not provide NCCL. Install a "
+                "CUDA/NCCL-enabled PyTorch build before launching torchrun."
+            )
+        backend = "nccl" if device.type == "cuda" else "gloo"
         dist.init_process_group(backend=backend, timeout=timedelta(minutes=30))
     else:
         backend = None
@@ -134,6 +140,32 @@ def fsdp_reduce_dtype(name: str, compute_dtype: torch.dtype) -> torch.dtype:
     raise ValueError("FSDP reduce dtype must be one of: auto, bf16, fp32")
 
 
+def _load_fsdp2_api():
+    """Load the public FSDP2 APIs required by Sion's custom generation methods."""
+
+    try:
+        from torch.distributed import fsdp as fsdp_api
+    except ImportError as error:
+        raise RuntimeError(
+            "FSDP2 training requires a PyTorch build with torch.distributed.fsdp"
+        ) from error
+
+    required = (
+        "MixedPrecisionPolicy",
+        "fully_shard",
+        "register_fsdp_forward_method",
+    )
+    missing = [name for name in required if not callable(getattr(fsdp_api, name, None))]
+    if missing:
+        raise RuntimeError(
+            "This PyTorch build does not expose the public FSDP2 APIs required "
+            "for sharded generate()/sample() calls: "
+            + ", ".join(f"torch.distributed.fsdp.{name}" for name in missing)
+            + ". Upgrade to a supported PyTorch release."
+        )
+    return tuple(getattr(fsdp_api, name) for name in required)
+
+
 def parallelize_model(
     model: nn.Module,
     context: DistributedContext,
@@ -153,7 +185,7 @@ def parallelize_model(
         legacy_fsdp2=use_fsdp2,
     )
     if resolved_strategy == "fsdp2":
-        from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+        MixedPrecisionPolicy, fully_shard, register_fsdp_forward_method = _load_fsdp2_api()
 
         policy = MixedPrecisionPolicy(
             param_dtype=dtype,
@@ -176,6 +208,12 @@ def parallelize_model(
         if materialize_meta:
             model.to_empty(device=context.device)
             model.init_weights()
+        # FSDP2 installs all-gather/reshard hooks on ``forward`` by default.
+        # Sion's post-training path invokes these custom root methods directly,
+        # so register them through the public API before any generation call.
+        for method_name in ("generate", "sample"):
+            if hasattr(model, method_name):
+                register_fsdp_forward_method(model, method_name)
         return model
 
     if materialize_meta:

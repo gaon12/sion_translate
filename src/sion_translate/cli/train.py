@@ -152,6 +152,21 @@ def release_stage_resources(
     }
 
 
+def requires_ddp_unused_parameter_detection(config: AppConfig) -> bool:
+    """Return whether one DDP wrapper spans changing parameter-use graphs."""
+
+    experimental = config.model.experimental
+    if not experimental.bats_enabled:
+        return False
+    unused_during_sft = (
+        experimental.bats_loss_weight == 0 and experimental.bats_coverage_weight == 0
+    )
+    # MRT scores candidates through label-free forwards, so BATS parameters
+    # used by supervised losses become unused after the SFT stage. The same
+    # DDP wrapper spans both stages and therefore cannot use a static graph.
+    return unused_during_sft or config.posttraining.enabled
+
+
 def export_final_model(
     model: torch.nn.Module,
     config: AppConfig,
@@ -634,15 +649,9 @@ def main() -> None:
         with torch.device(construction_device):
             model = SionForConditionalGeneration(config.model, pad_id=tokenizer.pad_id)
         parameter_count = model.parameter_count()
-        # BATS를 만들고도 두 손실을 모두 0으로 둔 레거시 설정만 실제 unused
-        # parameter가 생깁니다. 활성 모듈 전체를 이유로 매 step autograd graph를
-        # 재탐색하면 H100 DDP 처리량이 불필요하게 떨어집니다.
-        experimental = config.model.experimental
-        has_conditional_parameters = (
-            experimental.bats_enabled
-            and experimental.bats_loss_weight == 0
-            and experimental.bats_coverage_weight == 0
-        )
+        # SFT와 MRT가 같은 DDP wrapper를 공유하므로 단계 전환 뒤의 파라미터
+        # 사용 집합까지 고려해 static_graph 사용 여부를 정합니다.
+        detect_unused_parameters = requires_ddp_unused_parameter_detection(config)
         model = parallelize_model(
             model,
             context,
@@ -652,7 +661,7 @@ def main() -> None:
             reduce_dtype=config.training.fsdp_reduce_dtype,
             reshard_after_forward=config.training.reshard_after_forward,
             materialize_meta=materialize_meta,
-            find_unused_parameters=has_conditional_parameters,
+            find_unused_parameters=detect_unused_parameters,
         )
         if config.training.compile:
             model = torch.compile(model)

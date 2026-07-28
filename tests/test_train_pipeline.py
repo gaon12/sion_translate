@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import torch
 
 from sion_translate.cli.train import (
@@ -9,6 +10,7 @@ from sion_translate.cli.train import (
     export_final_model,
     find_existing_checkpoint,
     release_stage_resources,
+    requires_ddp_unused_parameter_detection,
     shutdown_dataloader,
     tokenizer_policy_problem,
 )
@@ -17,6 +19,8 @@ from sion_translate.fingerprint import file_sha256
 from sion_translate.training.distributed import DistributedContext
 from sion_translate.training.distributed import (
     fsdp_reduce_dtype,
+    initialize_distributed,
+    parallelize_model,
     resolve_parallel_strategy,
 )
 
@@ -163,6 +167,133 @@ def test_parallel_strategy_config_rejects_ambiguous_legacy_override() -> None:
         assert "cannot both be set" in str(exc)
     else:
         raise AssertionError("ambiguous parallel settings must be rejected")
+
+
+def test_cuda_multi_gpu_fails_before_process_group_without_nccl(monkeypatch) -> None:
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "set_device", lambda _device: None)
+    monkeypatch.setattr(torch.distributed, "is_nccl_available", lambda: False)
+    initialized = False
+
+    def record_initialization(**_kwargs: object) -> None:
+        nonlocal initialized
+        initialized = True
+
+    monkeypatch.setattr(
+        torch.distributed,
+        "init_process_group",
+        record_initialization,
+    )
+
+    with pytest.raises(RuntimeError, match="requires the NCCL"):
+        initialize_distributed()
+    assert initialized is False
+
+
+def test_fsdp2_registers_custom_generation_forward_methods(monkeypatch) -> None:
+    from torch.distributed import fsdp as fsdp_api
+
+    class GeneratingModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.projection = torch.nn.Linear(2, 2)
+
+        def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+            return self.projection(inputs)
+
+        def generate(self, inputs: torch.Tensor) -> torch.Tensor:
+            return self.forward(inputs)
+
+        def sample(self, inputs: torch.Tensor) -> torch.Tensor:
+            return self.forward(inputs)
+
+    class Policy:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+    model = GeneratingModel()
+    events: list[tuple[str, object]] = []
+
+    def fully_shard(module: torch.nn.Module, **_kwargs: object) -> None:
+        events.append(("shard", module))
+
+    def register(module: torch.nn.Module, method_name: str) -> None:
+        events.append((method_name, module))
+
+    monkeypatch.setattr(fsdp_api, "MixedPrecisionPolicy", Policy)
+    monkeypatch.setattr(fsdp_api, "fully_shard", fully_shard)
+    monkeypatch.setattr(fsdp_api, "register_fsdp_forward_method", register)
+    context = DistributedContext(
+        rank=0,
+        local_rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        distributed=True,
+        backend="gloo",
+    )
+
+    result = parallelize_model(
+        model,
+        context,
+        strategy="fsdp2",
+        precision="fp32",
+        reshard_after_forward=True,
+        materialize_meta=False,
+    )
+
+    assert result is model
+    assert events == [
+        ("shard", model),
+        ("generate", model),
+        ("sample", model),
+    ]
+
+
+def test_fsdp2_reports_missing_custom_forward_registration_api(
+    monkeypatch,
+) -> None:
+    from torch.distributed import fsdp as fsdp_api
+
+    monkeypatch.setattr(fsdp_api, "register_fsdp_forward_method", None)
+    context = DistributedContext(
+        rank=0,
+        local_rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        distributed=True,
+        backend="gloo",
+    )
+
+    with pytest.raises(RuntimeError, match="register_fsdp_forward_method"):
+        parallelize_model(
+            torch.nn.Linear(2, 2),
+            context,
+            strategy="fsdp2",
+            precision="fp32",
+            reshard_after_forward=True,
+            materialize_meta=False,
+        )
+
+
+def test_ddp_unused_parameter_detection_covers_bats_stage_transition() -> None:
+    config = AppConfig()
+    config.model.experimental.bats_enabled = True
+    config.model.experimental.bats_coverage_weight = 0.01
+    config.posttraining.enabled = True
+    assert requires_ddp_unused_parameter_detection(config) is True
+
+    config.posttraining.enabled = False
+    assert requires_ddp_unused_parameter_detection(config) is False
+
+    config.model.experimental.bats_coverage_weight = 0.0
+    assert requires_ddp_unused_parameter_detection(config) is True
+
+    config.model.experimental.bats_enabled = False
+    config.posttraining.enabled = True
+    assert requires_ddp_unused_parameter_detection(config) is False
 
 
 def test_existing_checkpoint_search_covers_stage_directories(tmp_path: Path) -> None:

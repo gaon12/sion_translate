@@ -131,6 +131,53 @@ def test_memory_constrained_large_model_selects_fsdp2() -> None:
     assert pick_parallel_strategy(env, d_model=1024) == "fsdp2"
 
 
+def test_explicit_auto_parallel_strategy_uses_environment_picker() -> None:
+    config = AppConfig()
+    config.model.d_model = 1024
+    apply_auto_settings(
+        config,
+        raw={
+            "model": {"d_model": 1024},
+            "training": {"parallel_strategy": "auto"},
+        },
+        env=gpu_environment(vram=24.0, world_size=4),
+        train_examples=22_000_000,
+        validation_examples=110_000,
+    )
+    assert config.training.parallel_strategy == "fsdp2"
+
+
+def test_multi_h100_fsdp2_keeps_resharding_unless_explicitly_disabled() -> None:
+    env = gpu_environment(vram=80.0, world_size=4)
+    config = AppConfig()
+    config.model.d_model = 1280
+    apply_auto_settings(
+        config,
+        raw={"model": {"d_model": 1280}},
+        env=env,
+        train_examples=400_000_000,
+        validation_examples=110_000,
+    )
+    assert config.training.parallel_strategy == "fsdp2"
+    assert config.training.reshard_after_forward is True
+
+    explicit = AppConfig()
+    explicit.model.d_model = 1280
+    explicit.training.reshard_after_forward = False
+    apply_auto_settings(
+        explicit,
+        raw={
+            "model": {"d_model": 1280},
+            "training": {"reshard_after_forward": False},
+        },
+        env=env,
+        train_examples=400_000_000,
+        validation_examples=110_000,
+    )
+    assert explicit.training.parallel_strategy == "fsdp2"
+    assert explicit.training.reshard_after_forward is False
+
+
 def test_auto_downweights_synthetic_sources() -> None:
     config = AppConfig()
     decisions = apply_auto_settings(

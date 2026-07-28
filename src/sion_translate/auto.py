@@ -435,7 +435,9 @@ def apply_auto_settings(
         decisions.append(f"eval_batches: {config.training.eval_batches}")
 
     # ── 실행 방식 ───────────────────────────────────────────────────────
-    if auto(raw_training, "parallel_strategy") and auto(raw_training, "fsdp2"):
+    # ``parallel_strategy: auto`` is an explicit request for the environment
+    # picker, not a request to leave the generic DDP fallback unresolved.
+    if config.training.parallel_strategy.lower() == "auto" and auto(raw_training, "fsdp2"):
         config.training.parallel_strategy = pick_parallel_strategy(
             env,
             config.model.d_model,
@@ -445,9 +447,10 @@ def apply_auto_settings(
     if auto(raw_training, "fsdp_reduce_dtype"):
         config.training.fsdp_reduce_dtype = "bf16" if env.bf16 else "fp32"
     if auto(raw_training, "reshard_after_forward"):
-        config.training.reshard_after_forward = not (
-            config.training.parallel_strategy == "fsdp2" and env.min_vram_gib >= 70
-        )
+        # Keep FSDP2's memory-bounded default. Disabling resharding retains
+        # full parameters after every forward and can erase sharding's VRAM
+        # benefit even on an 80 GiB H100; users may still opt out explicitly.
+        config.training.reshard_after_forward = True
     if auto(raw_training, "compile"):
         # torch.compile 은 Linux CUDA 에서 안정적으로 이득이 있습니다.
         config.training.compile = env.cuda and env.os_name == "Linux"
