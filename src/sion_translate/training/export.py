@@ -230,6 +230,56 @@ def _metadata_language_pairs(metadata: Mapping[str, Any]) -> list[list[str]]:
     return []
 
 
+def _normalize_translation_directions(
+    language_pairs: Sequence[Sequence[str]],
+    *,
+    translation_directions: Sequence[Sequence[str]] | None = None,
+    bidirectional: bool = True,
+) -> list[list[str]]:
+    pairs = _normalize_language_pairs(language_pairs=language_pairs)
+    if not isinstance(bidirectional, bool):
+        raise ValueError("bidirectional must be a boolean")
+    if translation_directions is None:
+        directions: list[list[str]] = []
+        for source, target in pairs:
+            directions.append([source, target])
+            if bidirectional:
+                directions.append([target, source])
+        return directions
+    directions = _normalize_language_pairs(language_pairs=translation_directions)
+    if pairs and not directions:
+        raise ValueError(
+            "translation_directions cannot be empty when language pairs are configured"
+        )
+    allowed_edges = {frozenset(pair) for pair in pairs}
+    disconnected = [
+        direction for direction in directions if frozenset(direction) not in allowed_edges
+    ]
+    if disconnected:
+        raise ValueError(
+            f"translation directions must belong to configured language pairs: {disconnected!r}"
+        )
+    return directions
+
+
+def _metadata_translation_directions(metadata: Mapping[str, Any]) -> list[list[str]]:
+    pairs = _metadata_language_pairs(metadata)
+    raw_directions = metadata.get("translation_directions")
+    if raw_directions is None:
+        # Manifests predating explicit direction metadata represented
+        # bidirectional checkpoints, so preserve their historical contract.
+        return _normalize_translation_directions(pairs, bidirectional=True)
+    if not isinstance(raw_directions, Sequence) or isinstance(
+        raw_directions,
+        (str, bytes),
+    ):
+        raise ValueError("metadata.translation_directions must be a sequence")
+    return _normalize_translation_directions(
+        pairs,
+        translation_directions=raw_directions,
+    )
+
+
 def _metadata_revision_capability(metadata: Mapping[str, Any]) -> bool | None:
     capabilities = metadata.get("capabilities")
     if capabilities is None:
@@ -265,12 +315,14 @@ def _metadata_compatibility_id(metadata: Mapping[str, Any]) -> str:
             "language_pair",
             "language_pairs",
             "languages",
+            "translation_directions",
         }
     }
     pairs = _metadata_language_pairs(metadata)
     if pairs:
         material["language_pairs"] = pairs
         material["languages"] = _languages_from_pairs(pairs)
+        material["translation_directions"] = _metadata_translation_directions(metadata)
     elif metadata.get("languages"):
         material["languages"] = [str(value) for value in metadata["languages"]]
     encoded = json.dumps(
@@ -289,6 +341,8 @@ def build_export_metadata(
     token_features_path: str | Path | None = None,
     language_pair: Sequence[str] | None = None,
     language_pairs: Sequence[Sequence[str]] | None = None,
+    translation_directions: Sequence[Sequence[str]] | None = None,
+    bidirectional: bool = True,
     revision_trained: bool | None = None,
     step: int | None = None,
     source: str | Path | None = None,
@@ -312,8 +366,15 @@ def build_export_metadata(
     if pairs:
         metadata["language_pairs"] = pairs
         metadata["languages"] = _languages_from_pairs(pairs)
+        metadata["translation_directions"] = _normalize_translation_directions(
+            pairs,
+            translation_directions=translation_directions,
+            bidirectional=bidirectional,
+        )
         if len(pairs) == 1:
             metadata["language_pair"] = pairs[0]
+    elif translation_directions is not None:
+        raise ValueError("translation_directions require at least one language pair")
     metadata["feature_flags"] = {
         "bats": bool(experimental.bats_enabled),
         "core": bool(experimental.core_enabled),
@@ -529,6 +590,7 @@ def _inspect_transformers_checkpoint(path: Path) -> dict[str, Any]:
         "runtime_model_class": runtime_model_class,
         "languages": list(config.languages),
         "language_pairs": [list(pair) for pair in config.language_pairs],
+        "translation_directions": [list(direction) for direction in config.translation_directions],
         "revision_trained": config.revision_trained,
     }
 
@@ -542,6 +604,7 @@ def _write_transformers_checkpoint(
     tokenizer_path: str | Path | None,
     token_features_path: str | Path | None,
     language_pairs: Sequence[Sequence[str]],
+    translation_directions: Sequence[Sequence[str]],
     revision_trained: bool | None,
 ) -> dict[str, Any]:
     from sion_translate.hf.conversion import save_transformers_checkpoint
@@ -557,6 +620,7 @@ def _write_transformers_checkpoint(
             token_features_path=token_features_path,
             languages=_languages_from_pairs(language_pairs) or None,
             language_pairs=language_pairs,
+            translation_directions=translation_directions,
             revision_trained=revision_trained,
         )
         inspection = _inspect_transformers_checkpoint(temporary)
@@ -1074,6 +1138,10 @@ def export_state_dict_formats(
             export_metadata.pop("language_pair", None)
             export_metadata.pop("language_pairs", None)
             export_metadata.pop("languages", None)
+            export_metadata.pop("translation_directions", None)
+    resolved_translation_directions = _metadata_translation_directions(export_metadata)
+    if resolved_translation_directions:
+        export_metadata["translation_directions"] = resolved_translation_directions
     metadata_compatibility_id = _metadata_compatibility_id(export_metadata)
     previous_metadata_compatibility_id = None
     if same_weights and previous_manifest is not None:
@@ -1186,6 +1254,7 @@ def export_state_dict_formats(
                     tokenizer_path=tokenizer_path,
                     token_features_path=token_features_path,
                     language_pairs=resolved_language_pairs,
+                    translation_directions=resolved_translation_directions,
                     revision_trained=_metadata_revision_capability(export_metadata),
                 )
                 details = {
@@ -1258,6 +1327,7 @@ def convert_export(
     token_features_path: str | Path | None = None,
     language_pair: Sequence[str] | None = None,
     language_pairs: Sequence[Sequence[str]] | None = None,
+    bidirectional: bool | None = None,
     revision_trained: bool | None = None,
     int4_backend: str = "auto",
     llama_quantize: str | Path | None = None,
@@ -1311,6 +1381,7 @@ def convert_export(
         token_features_path=token_features_path,
         language_pair=language_pair,
         language_pairs=language_pairs,
+        bidirectional=True if bidirectional is None else bidirectional,
         revision_trained=revision_trained,
         step=step,
         source=source,
@@ -1326,6 +1397,7 @@ def convert_export(
             metadata["languages"] = _languages_from_pairs(inherited_pairs)
             if len(inherited_pairs) == 1:
                 metadata["language_pair"] = inherited_pairs[0]
+            metadata["translation_directions"] = _metadata_translation_directions(inherited)
     if revision_trained is None and inherited.get("capabilities"):
         metadata["capabilities"] = inherited["capabilities"]
     return export_state_dict_formats(
@@ -1606,6 +1678,11 @@ def validate_export_directory(directory: str | Path) -> dict[str, Any]:
                 expected_pairs = _metadata_language_pairs(manifest_metadata)
                 if expected_pairs and inspection["language_pairs"] != expected_pairs:
                     raise RuntimeError("Transformers language pairs do not match the manifest")
+                expected_directions = _metadata_translation_directions(manifest_metadata)
+                if inspection["translation_directions"] != expected_directions:
+                    raise RuntimeError(
+                        "Transformers translation directions do not match the manifest"
+                    )
                 expected_revision = _metadata_revision_capability(manifest_metadata)
                 if inspection["revision_trained"] is not expected_revision:
                     raise RuntimeError(
@@ -1712,6 +1789,7 @@ def export_inference_models(
     token_features_path: str | Path | None = None,
     language_pair: Sequence[str] | None = None,
     language_pairs: Sequence[Sequence[str]] | None = None,
+    bidirectional: bool = True,
     revision_trained: bool | None = None,
     int4_backend: str = "auto",
     strict: bool = False,
@@ -1734,6 +1812,7 @@ def export_inference_models(
                 token_features_path=token_features_path,
                 language_pair=language_pair,
                 language_pairs=language_pairs,
+                bidirectional=bidirectional,
                 revision_trained=revision_trained,
                 step=step,
             )

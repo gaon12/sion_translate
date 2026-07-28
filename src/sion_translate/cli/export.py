@@ -40,6 +40,11 @@ def build_parser() -> argparse.ArgumentParser:
         metavar=("SOURCE", "TARGET"),
         help=("내보낼 언어 방향. 여러 번 지정 가능: --language-pair ko ja --language-pair en ru"),
     )
+    parser.add_argument(
+        "--unidirectional",
+        action="store_true",
+        help="각 --language-pair의 SOURCE→TARGET 방향만 학습된 것으로 기록",
+    )
     capability = parser.add_mutually_exclusive_group()
     capability.add_argument(
         "--revision-trained",
@@ -81,6 +86,7 @@ def main() -> None:
         tokenizer_path=args.tokenizer,
         token_features_path=args.token_features,
         language_pairs=args.language_pairs,
+        bidirectional=not args.unidirectional,
         revision_trained=revision_trained,
         int4_backend=args.int4_backend,
         llama_quantize=args.llama_quantize,

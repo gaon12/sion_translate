@@ -73,6 +73,7 @@ def make_translator(
     *,
     revision_trained: bool | None = False,
     language_pairs: tuple[tuple[str, str], ...] = (("ko", "ja"),),
+    translation_directions: tuple[tuple[str, str], ...] | None = None,
     tokenizer_class: type[FakeTokenizer] = FakeTokenizer,
     quantization: dict[str, object] | None = None,
     feature_sha256: str | None = None,
@@ -124,6 +125,10 @@ def make_translator(
         metadata["capabilities"] = {"revision_trained": revision_trained}
     if quantization is not None:
         metadata["quantization"] = quantization
+    if translation_directions is not None:
+        metadata["translation_directions"] = [
+            list(direction) for direction in translation_directions
+        ]
     monkeypatch.setattr(inference, "SionTokenizer", tokenizer_class)
     monkeypatch.setattr(
         inference,
@@ -338,6 +343,34 @@ def test_disconnected_multilingual_graph_rejects_untrained_direction(
             source_language="ko",
             target_language="ru",
             max_new_tokens=2,
+        )
+
+
+def test_unidirectional_export_rejects_untrained_reverse_direction(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    translator = make_translator(
+        monkeypatch,
+        tmp_path,
+        runtime_config(),
+        translation_directions=(("ko", "ja"),),
+    )
+    assert translator._resolve_source_language("ko", "ja") == "ko"
+    with pytest.raises(ValueError, match="학습되지 않은 번역 방향"):
+        translator._resolve_source_language("ja", "ko")
+
+
+def test_translation_direction_metadata_rejects_disconnected_edges(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="invalid translation direction metadata"):
+        make_translator(
+            monkeypatch,
+            tmp_path,
+            runtime_config(),
+            translation_directions=(("ko", "ru"),),
         )
 
 

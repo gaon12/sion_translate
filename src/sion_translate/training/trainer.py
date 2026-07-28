@@ -392,6 +392,7 @@ def train(
             tokenizer_path=config.data.tokenizer_model,
             token_features_path=token_features_path,
             language_pairs=config.data.configured_language_pairs(),
+            bidirectional=config.data.bidirectional,
             revision_trained=config.data.revision_examples,
         )
         if context.is_main and manifest is not None:

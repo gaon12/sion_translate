@@ -86,6 +86,7 @@ def test_final_export_wires_all_formats_and_model_sidecars(
     config.data.tokenizer_model = str(tmp_path / "sion.model")
     config.data.tokenizer_features = str(tmp_path / "token_features.npz")
     config.data.language_pairs = [["ko", "ja"], ["en", "ru"]]
+    config.data.bidirectional = False
     config.data.revision_examples = True
     config.model.experimental.morphoscript_enabled = True
     context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
@@ -115,6 +116,7 @@ def test_final_export_wires_all_formats_and_model_sidecars(
     assert kwargs["tokenizer_path"] == config.data.tokenizer_model
     assert kwargs["token_features_path"] == config.data.tokenizer_features
     assert kwargs["language_pairs"] == (("ko", "ja"), ("en", "ru"))
+    assert kwargs["bidirectional"] is False
     assert kwargs["revision_trained"] is True
     assert kwargs["strict"] is True
 

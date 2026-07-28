@@ -482,12 +482,44 @@ def test_transformers_tokenizer_rejects_disconnected_language_edge(tmp_path: Pat
         language_pairs=[("ko", "ja"), ("en", "ru")],
     )
     restored = AutoTokenizer.from_pretrained(output_dir, trust_remote_code=True)
-    with pytest.raises(ValueError, match="unsupported translation edge"):
+    with pytest.raises(ValueError, match="unsupported translation direction"):
         restored._build_translation_inputs(
             "연결되지 않은 방향",
             return_tensors="pt",
             src_lang="ko",
             tgt_lang="ru",
+        )
+
+
+def test_transformers_tokenizer_enforces_trained_direction(tmp_path: Path) -> None:
+    tokenizer_path = train_tiny_tokenizer(tmp_path)
+    tokenizer = NativeSionTokenizer(tokenizer_path)
+    config = tiny_model_config(len(tokenizer))
+    native = NativeSionForConditionalGeneration(config, pad_id=tokenizer.pad_id)
+    output_dir = tmp_path / "unidirectional-transformers"
+    save_transformers_checkpoint(
+        output_dir,
+        native.state_dict(),
+        config,
+        pad_id=tokenizer.pad_id,
+        tokenizer_path=tokenizer_path,
+        language_pairs=[("ko", "ja")],
+        translation_directions=[("ko", "ja")],
+    )
+    restored = AutoTokenizer.from_pretrained(output_dir, trust_remote_code=True)
+    encoded = restored._build_translation_inputs(
+        "정방향",
+        return_tensors="pt",
+        src_lang="ko",
+        tgt_lang="ja",
+    )
+    assert encoded.input_ids.shape[0] == 1
+    with pytest.raises(ValueError, match="unsupported translation direction"):
+        restored._build_translation_inputs(
+            "역방향",
+            return_tensors="pt",
+            src_lang="ja",
+            tgt_lang="ko",
         )
 
 

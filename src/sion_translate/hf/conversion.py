@@ -164,6 +164,38 @@ def _state_dict_float_dtype(state_dict: dict[str, torch.Tensor]) -> torch.dtype:
     return dtype
 
 
+def _translation_directions(
+    language_pairs: Sequence[Sequence[str]],
+    configured: Sequence[Sequence[str]] | None,
+) -> list[list[str]]:
+    pairs = [list(map(str, pair)) for pair in language_pairs]
+    allowed_edges = {frozenset(pair) for pair in pairs}
+    raw_directions = (
+        configured
+        if configured is not None
+        else [direction for pair in pairs for direction in (pair, list(reversed(pair)))]
+    )
+    directions: list[list[str]] = []
+    seen: set[tuple[str, str]] = set()
+    if pairs and not raw_directions:
+        raise ValueError(
+            "translation_directions cannot be empty when language pairs are configured"
+        )
+    for raw_direction in raw_directions:
+        direction = list(map(str, raw_direction))
+        key = tuple(direction)
+        if (
+            len(direction) != 2
+            or direction[0] == direction[1]
+            or frozenset(direction) not in allowed_edges
+        ):
+            raise ValueError(f"invalid translation direction: {raw_direction!r}")
+        if key not in seen:
+            seen.add(key)
+            directions.append(direction)
+    return directions
+
+
 def save_transformers_checkpoint(
     output_dir: str | Path,
     state_dict: dict[str, torch.Tensor],
@@ -174,6 +206,7 @@ def save_transformers_checkpoint(
     token_features_path: str | Path | None = None,
     languages: Sequence[str] | None = None,
     language_pairs: Sequence[Sequence[str]] | None = None,
+    translation_directions: Sequence[Sequence[str]] | None = None,
     revision_trained: bool | None = None,
     max_shard_size: str = "5GB",
 ) -> Path:
@@ -203,6 +236,7 @@ def save_transformers_checkpoint(
         slot_token_ids = list(tokenizer.slot_ids)
     else:
         pairs = [list(map(str, pair)) for pair in (language_pairs or [])]
+    directions = _translation_directions(pairs, translation_directions)
 
     if token_features_path is None and tokenizer_path is not None:
         sibling_features = tokenizer_path.parent / "token_features.npz"
@@ -235,6 +269,7 @@ def save_transformers_checkpoint(
         eos_token_id=eos_id,
         languages=list(languages or []),
         language_pairs=pairs,
+        translation_directions=directions,
         revision_trained=revision_trained,
         slot_token_ids=slot_token_ids,
         tokenizer_sha256=tokenizer_sha256,
@@ -278,6 +313,7 @@ def save_transformers_checkpoint(
             tokenizer_sha256=tokenizer_sha256,
             slot_token_ids=slot_token_ids,
             language_pairs=pairs,
+            translation_directions=directions,
             script_classes=model_config.experimental.script_classes,
             tetm_type_id=min(8, model_config.experimental.tetm_types - 1),
             tetm_mode_id=min(4, model_config.experimental.tetm_modes - 1),
@@ -344,6 +380,7 @@ def save_transformers_checkpoint(
         "dtype": str(export_dtype).removeprefix("torch."),
         "languages": list(languages or []),
         "language_pairs": pairs,
+        "translation_directions": directions,
         "capabilities": (
             {"revision_trained": revision_trained} if revision_trained is not None else {}
         ),

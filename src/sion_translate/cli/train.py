@@ -193,6 +193,7 @@ def export_final_model(
             else None
         ),
         language_pairs=config.data.configured_language_pairs(),
+        bidirectional=config.data.bidirectional,
         revision_trained=config.data.revision_examples,
         strict=True,
     )

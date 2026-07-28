@@ -56,6 +56,43 @@ def _language_pairs_from_metadata(
     return tuple(pairs)
 
 
+def _translation_directions_from_metadata(
+    metadata: Mapping[str, Any] | None,
+) -> tuple[tuple[str, str], ...]:
+    if not isinstance(metadata, Mapping):
+        return ()
+    pairs = _language_pairs_from_metadata(metadata)
+    raw_directions = metadata.get("translation_directions")
+    if raw_directions is None:
+        return tuple(direction for pair in pairs for direction in (pair, (pair[1], pair[0])))
+    if not isinstance(raw_directions, Sequence) or isinstance(
+        raw_directions,
+        (str, bytes),
+    ):
+        raise ValueError("translation_directions metadata must be a sequence")
+    if pairs and not raw_directions:
+        raise ValueError(
+            "translation_directions metadata cannot be empty when language pairs are configured"
+        )
+    allowed_edges = {frozenset(pair) for pair in pairs}
+    directions: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for raw_direction in raw_directions:
+        if (
+            not isinstance(raw_direction, Sequence)
+            or isinstance(raw_direction, (str, bytes))
+            or len(raw_direction) != 2
+        ):
+            raise ValueError(f"invalid translation direction metadata: {raw_direction!r}")
+        direction = (str(raw_direction[0]), str(raw_direction[1]))
+        if direction[0] == direction[1] or frozenset(direction) not in allowed_edges:
+            raise ValueError(f"invalid translation direction metadata: {raw_direction!r}")
+        if direction not in seen:
+            seen.add(direction)
+            directions.append(direction)
+    return tuple(directions)
+
+
 def _manifest_artifact(directory: Path, *, int8: bool) -> Path | None:
     manifest_path = directory / "export_manifest.json"
     try:
@@ -156,7 +193,18 @@ class Translator:
             self.language_pairs = _language_pairs_from_metadata(self.tokenizer_metadata)
         if not self.language_pairs and len(self.tokenizer.languages) == 2:
             self.language_pairs = ((self.tokenizer.languages[0], self.tokenizer.languages[1]),)
-        self._language_pair_edges = {frozenset(pair) for pair in self.language_pairs}
+        self.translation_directions = _translation_directions_from_metadata(self.export_metadata)
+        if not self.translation_directions:
+            self.translation_directions = _translation_directions_from_metadata(
+                self.tokenizer_metadata
+            )
+        if not self.translation_directions:
+            self.translation_directions = tuple(
+                direction
+                for pair in self.language_pairs
+                for direction in (pair, (pair[1], pair[0]))
+            )
+        self._translation_direction_edges = set(self.translation_directions)
         self._validate_compatibility(tokenizer_path)
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -497,13 +545,15 @@ class Translator:
         if source_language == target_language:
             raise ValueError("source_language와 target_language는 달라야 합니다")
         if (
-            self._language_pair_edges
-            and frozenset((source_language, target_language)) not in self._language_pair_edges
+            self._translation_direction_edges
+            and (source_language, target_language) not in self._translation_direction_edges
         ):
-            supported = ", ".join(f"{left}↔{right}" for left, right in self.language_pairs)
+            supported = ", ".join(
+                f"{source}→{target}" for source, target in self.translation_directions
+            )
             raise ValueError(
                 f"학습되지 않은 번역 방향: {source_language}→{target_language} "
-                f"(지원 언어쌍: {supported})"
+                f"(지원 방향: {supported})"
             )
         return source_language
 

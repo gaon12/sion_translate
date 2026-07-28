@@ -61,6 +61,7 @@ class SionTokenizer(PreTrainedTokenizer):
         tokenizer_sha256: str | None = None,
         slot_token_ids: list[int] | tuple[int, ...] | None = None,
         language_pairs: list[list[str]] | tuple[tuple[str, str], ...] | None = None,
+        translation_directions: list[list[str]] | tuple[tuple[str, str], ...] | None = None,
         script_classes: int = 9,
         tetm_type_id: int = 8,
         tetm_mode_id: int = 4,
@@ -118,6 +119,34 @@ class SionTokenizer(PreTrainedTokenizer):
                 seen_pairs.add(edge)
                 self.language_pairs.append(pair)
         self._language_pair_edges = seen_pairs
+        raw_directions = (
+            translation_directions
+            if translation_directions is not None
+            else [
+                direction
+                for pair in self.language_pairs
+                for direction in (pair, list(reversed(pair)))
+            ]
+        )
+        self.translation_directions: list[list[str]] = []
+        seen_directions: set[tuple[str, str]] = set()
+        if self.language_pairs and not raw_directions:
+            raise ValueError(
+                "translation_directions cannot be empty when language pairs are configured"
+            )
+        for raw_direction in raw_directions:
+            direction = [str(language) for language in raw_direction]
+            key = tuple(direction)
+            if (
+                len(direction) != 2
+                or direction[0] == direction[1]
+                or frozenset(direction) not in self._language_pair_edges
+            ):
+                raise ValueError(f"invalid tokenizer translation direction: {raw_direction!r}")
+            if key not in seen_directions:
+                seen_directions.add(key)
+                self.translation_directions.append(direction)
+        self._translation_direction_edges = seen_directions
         self.script_classes = int(script_classes)
         if self.script_classes < 1:
             raise ValueError("script_classes must be positive")
@@ -178,6 +207,7 @@ class SionTokenizer(PreTrainedTokenizer):
         kwargs.setdefault("tokenizer_sha256", actual_tokenizer_sha256)
         kwargs.setdefault("slot_token_ids", self.slot_token_ids)
         kwargs.setdefault("language_pairs", self.language_pairs)
+        kwargs.setdefault("translation_directions", self.translation_directions)
         kwargs.setdefault("script_classes", self.script_classes)
         kwargs.setdefault("tetm_type_id", self.tetm_type_id)
         kwargs.setdefault("tetm_mode_id", self.tetm_mode_id)
@@ -433,11 +463,12 @@ class SionTokenizer(PreTrainedTokenizer):
                 f"unsupported translation direction {src_lang}-{tgt_lang}; "
                 f"available={sorted(self.language_tags)}"
             )
-        if self._language_pair_edges and frozenset((src_lang, tgt_lang)) not in (
-            self._language_pair_edges
+        if self._translation_direction_edges and (src_lang, tgt_lang) not in (
+            self._translation_direction_edges
         ):
             raise ValueError(
-                f"unsupported translation edge {src_lang}-{tgt_lang}; trained={self.language_pairs}"
+                f"unsupported translation direction {src_lang}->{tgt_lang}; "
+                f"trained={self.translation_directions}"
             )
         self.src_lang = src_lang
         self.tgt_lang = tgt_lang

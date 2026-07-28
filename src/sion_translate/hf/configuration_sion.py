@@ -55,6 +55,7 @@ class SionConfig(PretrainedConfig):
         experimental: ExperimentalConfig | dict[str, Any] | None = None,
         languages: list[str] | tuple[str, ...] | None = None,
         language_pairs: list[list[str]] | tuple[tuple[str, str], ...] | None = None,
+        translation_directions: list[list[str]] | tuple[tuple[str, str], ...] | None = None,
         revision_trained: bool | None = None,
         slot_token_ids: list[int] | tuple[int, ...] | None = None,
         tokenizer_sha256: str | None = None,
@@ -100,8 +101,20 @@ class SionConfig(PretrainedConfig):
             self.experimental = experimental
         else:
             self.experimental = ExperimentalConfig(**dict(experimental or {}))
-        self.languages = list(languages or [])
         self.language_pairs = [list(pair) for pair in (language_pairs or [])]
+        self.languages = list(
+            languages
+            or dict.fromkeys(language for pair in self.language_pairs for language in pair)
+        )
+        self.translation_directions = (
+            [list(direction) for direction in translation_directions]
+            if translation_directions is not None
+            else [
+                list(direction)
+                for pair in self.language_pairs
+                for direction in (pair, list(reversed(pair)))
+            ]
+        )
         if revision_trained is not None and not isinstance(revision_trained, bool):
             raise ValueError("revision_trained must be a boolean or null")
         self.revision_trained = revision_trained
@@ -147,6 +160,31 @@ class SionConfig(PretrainedConfig):
                 raise ValueError(
                     f"token feature {name} shape must be [{self.vocab_size}], got {shape}"
                 )
+        allowed_edges: set[frozenset[str]] = set()
+        for pair in self.language_pairs:
+            if (
+                len(pair) != 2
+                or pair[0] == pair[1]
+                or any(language not in self.languages for language in pair)
+            ):
+                raise ValueError(f"invalid language pair: {pair!r}")
+            allowed_edges.add(frozenset(pair))
+        seen_directions: set[tuple[str, str]] = set()
+        if self.language_pairs and not self.translation_directions:
+            raise ValueError(
+                "translation_directions cannot be empty when language pairs are configured"
+            )
+        for direction in self.translation_directions:
+            key = tuple(direction)
+            if (
+                len(direction) != 2
+                or direction[0] == direction[1]
+                or frozenset(direction) not in allowed_edges
+            ):
+                raise ValueError(f"invalid translation direction: {direction!r}")
+            if key in seen_directions:
+                raise ValueError(f"duplicate translation direction: {direction!r}")
+            seen_directions.add(key)
 
     def to_model_config(self) -> ModelConfig:
         return ModelConfig(
@@ -180,6 +218,7 @@ class SionConfig(PretrainedConfig):
         eos_token_id: int = 3,
         languages: list[str] | tuple[str, ...] | None = None,
         language_pairs: list[list[str]] | tuple[tuple[str, str], ...] | None = None,
+        translation_directions: list[list[str]] | tuple[tuple[str, str], ...] | None = None,
         revision_trained: bool | None = None,
         slot_token_ids: list[int] | tuple[int, ...] | None = None,
         tokenizer_sha256: str | None = None,
@@ -195,6 +234,7 @@ class SionConfig(PretrainedConfig):
             eos_token_id=eos_token_id,
             languages=languages,
             language_pairs=language_pairs,
+            translation_directions=translation_directions,
             revision_trained=revision_trained,
             slot_token_ids=slot_token_ids,
             tokenizer_sha256=tokenizer_sha256,

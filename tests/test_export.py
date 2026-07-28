@@ -134,6 +134,16 @@ def test_export_metadata_records_tokenizer_hash(tmp_path: Path) -> None:
     assert metadata["capabilities"]["revision_trained"] is True
 
 
+def test_export_metadata_records_exact_trained_translation_directions() -> None:
+    metadata = build_export_metadata(
+        export_config(),
+        language_pairs=(("ko", "ja"), ("en", "ru")),
+        bidirectional=False,
+    )
+    assert metadata["language_pairs"] == [["ko", "ja"], ["en", "ru"]]
+    assert metadata["translation_directions"] == [["ko", "ja"], ["en", "ru"]]
+
+
 def test_cpu_export_model_reuses_stable_snapshot_storage() -> None:
     config = export_config()
     source = SionForConditionalGeneration(config).state_dict()
@@ -218,6 +228,12 @@ def test_transformers_directory_hash_is_deterministic_and_tamper_evident(
     checkpoint_dir = tmp_path / "first" / first_entry["file"]
     config_json = json.loads((checkpoint_dir / "config.json").read_text())
     assert config_json["language_pairs"] == [["ko", "ja"], ["en", "ru"]]
+    assert config_json["translation_directions"] == [
+        ["ko", "ja"],
+        ["ja", "ko"],
+        ["en", "ru"],
+        ["ru", "en"],
+    ]
     assert validate_export_directory(tmp_path / "first")["valid"]
 
     config_path = checkpoint_dir / "config.json"
@@ -356,6 +372,12 @@ def test_transformers_options_flow_through_conversion_and_training_export(
         assert call["tokenizer_path"] == tokenizer_marker
         assert call["languages"] == ["ko", "ja", "en", "ru"]
         assert call["language_pairs"] == [["ko", "ja"], ["en", "ru"]]
+        assert call["translation_directions"] == [
+            ["ko", "ja"],
+            ["ja", "ko"],
+            ["en", "ru"],
+            ["ru", "en"],
+        ]
 
 
 def test_export_cli_accepts_repeated_language_pairs_and_transformers_default() -> None:
@@ -372,9 +394,11 @@ def test_export_cli_accepts_repeated_language_pairs_and_transformers_default() -
             "--language-pair",
             "en",
             "ru",
+            "--unidirectional",
         ]
     )
     assert args.language_pairs == [["ko", "ja"], ["en", "ru"]]
+    assert args.unidirectional is True
     assert "transformers" in args.formats.split(",")
 
 
