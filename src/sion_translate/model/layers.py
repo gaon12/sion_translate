@@ -50,6 +50,10 @@ class RotaryEmbedding(nn.Module):
         cos, sin = self._build_cache()
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
+        # Python attributes survive ``meta -> to_empty(device)`` materialization.
+        # The tensor storage does not, so this marker lets the first real
+        # forward rebuild non-persistent caches instead of reading garbage.
+        self._cache_device = str(cos.device)
 
     def _build_cache(
         self, device: torch.device | str | None = None
@@ -86,10 +90,14 @@ class RotaryEmbedding(nn.Module):
 
         device = self.cos.device
         self.cos, self.sin = self._build_cache(device)
+        self._cache_device = str(device)
 
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, offset: int = 0
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._cache_device != str(q.device) or self.cos.device != q.device:
+            self.cos, self.sin = self._build_cache(q.device)
+            self._cache_device = str(q.device)
         seq_len = q.shape[-2]
         if offset + seq_len > self.cos.shape[0]:
             raise ValueError(

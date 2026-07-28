@@ -7,7 +7,17 @@ from typing import Any
 
 from transformers import PretrainedConfig
 
-from sion_translate.config import ExperimentalConfig, ModelConfig
+try:
+    from sion_translate.config import ExperimentalConfig, ModelConfig
+except ImportError:
+    # ``save_transformers_checkpoint`` writes this small runtime module next to
+    # the remote-code files.  Keeping the fallback in a relative import lets a
+    # Hub checkpoint load without installing the Sion source package.
+    from importlib import import_module
+
+    _native_config = import_module(f"{__package__}.sion_native_config")
+    ExperimentalConfig = _native_config.ExperimentalConfig
+    ModelConfig = _native_config.ModelConfig
 
 
 class SionConfig(PretrainedConfig):
@@ -45,6 +55,10 @@ class SionConfig(PretrainedConfig):
         experimental: ExperimentalConfig | dict[str, Any] | None = None,
         languages: list[str] | tuple[str, ...] | None = None,
         language_pairs: list[list[str]] | tuple[tuple[str, str], ...] | None = None,
+        slot_token_ids: list[int] | tuple[int, ...] | None = None,
+        tokenizer_sha256: str | None = None,
+        token_features_sha256: str | None = None,
+        token_features_shapes: dict[str, list[int] | tuple[int, ...]] | None = None,
         pad_token_id: int = 0,
         bos_token_id: int = 2,
         eos_token_id: int = 3,
@@ -87,6 +101,13 @@ class SionConfig(PretrainedConfig):
             self.experimental = ExperimentalConfig(**dict(experimental or {}))
         self.languages = list(languages or [])
         self.language_pairs = [list(pair) for pair in (language_pairs or [])]
+        self.slot_token_ids = [int(token_id) for token_id in (slot_token_ids or [])]
+        self.tokenizer_sha256 = tokenizer_sha256
+        self.token_features_sha256 = token_features_sha256
+        self.token_features_shapes = {
+            str(name): [int(dimension) for dimension in shape]
+            for name, shape in (token_features_shapes or {}).items()
+        }
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -106,6 +127,22 @@ class SionConfig(PretrainedConfig):
             value = getattr(self, name)
             if value is None or value < 0:
                 raise ValueError(f"{name} must be a non-negative integer")
+        if len(self.slot_token_ids) > 64:
+            raise ValueError("slot_token_ids may contain at most 64 protected slot IDs")
+        if len(set(self.slot_token_ids)) != len(self.slot_token_ids):
+            raise ValueError("slot_token_ids must not contain duplicates")
+        if any(token_id < 0 or token_id >= self.vocab_size for token_id in self.slot_token_ids):
+            raise ValueError("slot_token_ids must be valid vocabulary IDs")
+        required_features = {"script", "onset", "vowel", "coda"}
+        if self.token_features_shapes and set(self.token_features_shapes) != required_features:
+            raise ValueError(
+                "token_features_shapes must contain exactly script, onset, vowel, and coda"
+            )
+        for name, shape in self.token_features_shapes.items():
+            if shape != [self.vocab_size]:
+                raise ValueError(
+                    f"token feature {name} shape must be [{self.vocab_size}], got {shape}"
+                )
 
     def to_model_config(self) -> ModelConfig:
         return ModelConfig(
@@ -139,6 +176,10 @@ class SionConfig(PretrainedConfig):
         eos_token_id: int = 3,
         languages: list[str] | tuple[str, ...] | None = None,
         language_pairs: list[list[str]] | tuple[tuple[str, str], ...] | None = None,
+        slot_token_ids: list[int] | tuple[int, ...] | None = None,
+        tokenizer_sha256: str | None = None,
+        token_features_sha256: str | None = None,
+        token_features_shapes: dict[str, list[int] | tuple[int, ...]] | None = None,
         **kwargs: Any,
     ) -> SionConfig:
         values = asdict(config)
@@ -149,6 +190,10 @@ class SionConfig(PretrainedConfig):
             eos_token_id=eos_token_id,
             languages=languages,
             language_pairs=language_pairs,
+            slot_token_ids=slot_token_ids,
+            tokenizer_sha256=tokenizer_sha256,
+            token_features_sha256=token_features_sha256,
+            token_features_shapes=token_features_shapes,
             **kwargs,
         )
 
