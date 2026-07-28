@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 from torch.utils.checkpoint import checkpoint
@@ -17,6 +18,16 @@ from .experimental import (
     TypedEntityMemory,
 )
 from .layers import DecoderLayer, EncoderLayer, GQAAttention, RMSNorm, RotaryEmbedding, SwiGLU
+
+
+def _all_ranks_finished(local_finished: bool, device: torch.device) -> bool:
+    """Return true only when every distributed rank can leave its decode loop."""
+
+    if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() == 1:
+        return local_finished
+    flag = torch.tensor(1 if local_finished else 0, dtype=torch.int32, device=device)
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+    return bool(flag.item())
 
 
 @dataclass
@@ -587,7 +598,7 @@ class SionForConditionalGeneration(nn.Module):
                 next_token = torch.where(finished[:, None], eos_id, next_token)
                 pieces.append(next_token)
                 finished |= next_token.squeeze(1).eq(eos_id)
-                if finished.all():
+                if _all_ranks_finished(bool(finished.all()), input_ids.device):
                     break
                 current = next_token
             sequences = torch.cat(pieces, dim=1)
@@ -633,7 +644,7 @@ class SionForConditionalGeneration(nn.Module):
             next_token = torch.where(finished[:, None], eos_id, next_token)
             pieces.append(next_token)
             finished |= next_token.squeeze(1).eq(eos_id)
-            if finished.all():
+            if _all_ranks_finished(bool(finished.all()), device):
                 break
             current = next_token
         return torch.cat(pieces, dim=1)
@@ -764,7 +775,7 @@ class SionForConditionalGeneration(nn.Module):
                 if best_possible > worst_kept:
                     all_done = False
                     break
-            if all_done:
+            if _all_ranks_finished(all_done, device):
                 break
 
         # 길이 제한에 걸린 live beam도 이미 끝난 가설과 함께 비교합니다.

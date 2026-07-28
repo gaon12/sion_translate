@@ -5,6 +5,7 @@ import types
 import pytest
 import torch
 
+import sion_translate.model.transformer as transformer_module
 from sion_translate.config import ExperimentalConfig, ModelConfig
 from sion_translate.model import SionForConditionalGeneration
 
@@ -154,6 +155,57 @@ def test_stochastic_sampling_returns_multiple_candidates() -> None:
     assert sampled.shape[:2] == (2, 3)
     assert sampled.shape[-1] <= 6
     assert sampled[:, :, 0].eq(2).all()
+
+
+def test_sampling_waits_until_every_distributed_rank_is_finished(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = SionForConditionalGeneration(tiny_config())
+    batch = make_batch()
+
+    def eos_logits(self, hidden: torch.Tensor) -> torch.Tensor:
+        logits = torch.full(
+            (*hidden.shape[:-1], self.config.vocab_size),
+            -1_000.0,
+            device=hidden.device,
+        )
+        logits[..., 3] = 0.0
+        return logits
+
+    synchronized_results = iter((False, True))
+    model._logits = types.MethodType(eos_logits, model)
+    monkeypatch.setattr(
+        transformer_module,
+        "_all_ranks_finished",
+        lambda _local, _device: next(synchronized_results),
+    )
+    sampled = model.sample(
+        batch["input_ids"],
+        batch["attention_mask"],
+        bos_id=2,
+        eos_id=3,
+        num_samples=1,
+        max_new_tokens=3,
+    )
+    assert sampled.shape == (2, 1, 3)
+    assert sampled[:, :, 1:].eq(3).all()
+
+
+def test_distributed_finished_consensus_uses_all_rank_minimum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(transformer_module.dist, "is_available", lambda: True)
+    monkeypatch.setattr(transformer_module.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(transformer_module.dist, "get_world_size", lambda: 2)
+    reductions: list[object] = []
+
+    def one_remote_rank_is_running(flag: torch.Tensor, *, op: object) -> None:
+        reductions.append(op)
+        flag.zero_()
+
+    monkeypatch.setattr(transformer_module.dist, "all_reduce", one_remote_rank_is_running)
+    assert not transformer_module._all_ranks_finished(True, torch.device("cpu"))
+    assert reductions == [transformer_module.dist.ReduceOp.MIN]
 
 
 def test_beam_finalization_compares_live_and_completed_hypotheses() -> None:

@@ -183,7 +183,9 @@ all-gather 비용을 늘린다. 80GB에서 여유가 확인된 경우에만 `fal
 peak allocated가 안전 범위인지 확인한다.
 사후학습이 직접 호출하는 `generate()`와 `sample()`도 FSDP2의 공개
 `register_fsdp_forward_method`에 등록되므로 root parameter all-gather를
-우회하지 않는다.
+우회하지 않는다. 토큰별 종료 조건은 rank 전체에 `MIN` 합의되므로 한 rank만
+먼저 nested decoder collective를 빠져나가지 않는다. 먼저 끝난 rank는 EOS를
+반복하며 다른 rank와 같은 횟수로 디코더를 호출하다가 전 rank가 함께 종료한다.
 
 DDP는 `gradient_as_bucket_view`를 사용한다. BATS는 SFT의 label 기반 보조
 손실에서는 사용되지만 MRT candidate scoring의 label-free forward에서는
