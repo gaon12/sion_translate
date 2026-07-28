@@ -138,6 +138,7 @@ def test_queue_translation_is_resumable_audited_and_failure_isolated(
     assert not partial["progress"]["complete"]
     assert partial["stats"] == {
         "processed": 4,
+        "generated": 2,
         "accepted": 1,
         "rejected": 1,
         "errors": 1,
@@ -239,3 +240,111 @@ def test_queue_options_validate(field: str, value: object) -> None:
     options = _options(**{field: value})
     with pytest.raises(ValueError):
         options.validate()
+
+
+def test_teacher_pilot_requires_review_before_approval(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "queue.jsonl"
+    _write_queue(source)
+    translator = FakeTranslator()
+
+    with pytest.raises(ValueError, match="cannot be approved before"):
+        translate_queue(
+            source,
+            tmp_path / "fresh-results",
+            translator,
+            accepted_dir=tmp_path / "fresh-accepted",
+            options=_options(),
+            teacher_pilot_rows=2,
+            approve_teacher=True,
+            approval_actor="reviewer",
+        )
+
+    results = tmp_path / "results"
+    accepted = tmp_path / "accepted"
+    pilot = translate_queue(
+        source,
+        results,
+        translator,
+        accepted_dir=accepted,
+        options=_options(),
+        teacher_pilot_rows=2,
+    )
+    assert pilot["progress"]["completed_rows"] == 2
+    assert pilot["stats"]["generated"] == 2
+    assert pilot["teacher_review"] == {
+        "pilot_rows": 2,
+        "review_required": True,
+        "approved": False,
+        "approved_at": None,
+        "approved_by": None,
+    }
+
+    with pytest.raises(ValueError, match="pilot size is fixed"):
+        translate_queue(
+            source,
+            results,
+            translator,
+            accepted_dir=accepted,
+            options=_options(),
+            teacher_pilot_rows=3,
+        )
+
+    completed = translate_queue(
+        source,
+        results,
+        translator,
+        accepted_dir=accepted,
+        options=_options(),
+        teacher_pilot_rows=2,
+        approve_teacher=True,
+        approval_actor="reviewer",
+    )
+    assert completed["progress"]["complete"]
+    assert completed["teacher_review"]["approved"]
+    assert completed["teacher_review"]["approved_by"] == "reviewer"
+    assert completed["teacher_review"]["approved_at"]
+
+
+def test_existing_manifest_can_adopt_a_frozen_teacher_review_policy(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "queue.jsonl"
+    results = tmp_path / "results"
+    accepted = tmp_path / "accepted"
+    _write_queue(source)
+    translator = FakeTranslator()
+    legacy = translate_queue(
+        source,
+        results,
+        translator,
+        accepted_dir=accepted,
+        options=_options(),
+        max_rows=2,
+    )
+    legacy.pop("teacher_review")
+    legacy["stats"].pop("generated")
+    (results / "manifest.json").write_text(
+        json.dumps(legacy, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    resumed = translate_queue(
+        source,
+        results,
+        translator,
+        accepted_dir=accepted,
+        options=_options(),
+        teacher_pilot_rows=2,
+        approve_teacher=True,
+        approval_actor="migration-reviewer",
+    )
+
+    assert resumed["teacher_review"]["approved"]
+    assert resumed["teacher_review"]["pilot_rows"] == 2
+    assert resumed["stats"]["generated"] >= 2
+
+
+def test_queue_default_roundtrip_threshold_is_conservative() -> None:
+    assert QueueTranslationOptions().min_roundtrip_score == 0.65

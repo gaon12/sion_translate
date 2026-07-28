@@ -64,7 +64,7 @@ class QueueTranslationOptions:
     roundtrip_max_new_tokens: int = 128
     roundtrip_max_output_length_ratio: float = 2.0
     roundtrip_max_output_length_margin: int = 12
-    min_roundtrip_score: float = 0.55
+    min_roundtrip_score: float = 0.65
     min_pair_score: int = 80
     min_target_language_fraction: float = 0.50
     min_structured_similarity: float = 1.0
@@ -352,6 +352,7 @@ def _new_manifest(
     options: QueueTranslationOptions,
     run_metadata: Mapping[str, Any],
     accepted_dir: Path,
+    teacher_pilot_rows: int | None,
 ) -> dict[str, Any]:
     configuration = {
         "pipeline_version": PIPELINE_VERSION,
@@ -376,12 +377,97 @@ def _new_manifest(
         },
         "stats": {
             "processed": 0,
+            "generated": 0,
             "accepted": 0,
             "rejected": 0,
             "errors": 0,
             "skipped_existing": 0,
         },
+        "teacher_review": (
+            {
+                "pilot_rows": teacher_pilot_rows,
+                "review_required": False,
+                "approved": False,
+                "approved_at": None,
+                "approved_by": None,
+            }
+            if teacher_pilot_rows is not None
+            else None
+        ),
     }
+
+
+def _configure_teacher_review(
+    manifest: dict[str, Any],
+    *,
+    teacher_pilot_rows: int | None,
+    approve_teacher: bool,
+    approval_actor: str | None,
+    existing_manifest: bool,
+) -> bool:
+    """Restore/freeze the pilot policy and record explicit post-pilot approval."""
+
+    stats = manifest["stats"]
+    changed = False
+    if "generated" not in stats:
+        stats["generated"] = int(stats.get("accepted", 0)) + int(stats.get("rejected", 0))
+        changed = True
+    review = manifest.get("teacher_review")
+    if review is None and teacher_pilot_rows is not None:
+        review = {
+            "pilot_rows": teacher_pilot_rows,
+            "review_required": False,
+            "approved": False,
+            "approved_at": None,
+            "approved_by": None,
+        }
+        manifest["teacher_review"] = review
+        changed = True
+    elif isinstance(review, dict) and teacher_pilot_rows is not None:
+        if int(review["pilot_rows"]) != teacher_pilot_rows:
+            raise ValueError(
+                "teacher pilot size is fixed by the manifest; "
+                "use the original value or a new output directory"
+            )
+    elif review is not None and not isinstance(review, dict):
+        raise ValueError("invalid teacher_review in queue manifest")
+
+    if (
+        isinstance(review, dict)
+        and not review.get("approved")
+        and (
+            int(stats["generated"]) >= int(review["pilot_rows"])
+            or (manifest["progress"].get("complete") and int(stats["generated"]) > 0)
+        )
+        and not review.get("review_required")
+    ):
+        review["review_required"] = True
+        changed = True
+
+    if approve_teacher:
+        if not existing_manifest or not isinstance(review, dict):
+            raise ValueError("a teacher cannot be approved before a pilot run")
+        if not review.get("review_required"):
+            raise ValueError("the teacher pilot is not complete or has no reviewable output")
+        if not review.get("approved"):
+            actor = canonical_text(approval_actor or "")
+            if not actor:
+                raise ValueError("approval_actor is required to approve a teacher")
+            review["approved"] = True
+            review["approved_at"] = datetime.now(UTC).isoformat()
+            review["approved_by"] = actor
+            changed = True
+    return changed
+
+
+def _remaining_teacher_pilot_rows(manifest: Mapping[str, Any]) -> int | None:
+    review = manifest.get("teacher_review")
+    if not isinstance(review, Mapping) or review.get("approved"):
+        return None
+    return max(
+        0,
+        int(review["pilot_rows"]) - int(manifest["stats"].get("generated", 0)),
+    )
 
 
 def translate_queue(
@@ -393,6 +479,9 @@ def translate_queue(
     options: QueueTranslationOptions | None = None,
     run_metadata: Mapping[str, Any] | None = None,
     max_rows: int | None = None,
+    teacher_pilot_rows: int | None = None,
+    approve_teacher: bool = False,
+    approval_actor: str | None = None,
     log: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Translate pending queue rows into atomic result and training shards."""
@@ -401,6 +490,8 @@ def translate_queue(
     options.validate()
     if max_rows is not None and max_rows <= 0:
         raise ValueError("max_rows must be positive or None")
+    if teacher_pilot_rows is not None and teacher_pilot_rows <= 0:
+        raise ValueError("teacher_pilot_rows must be positive or None")
     input_path = Path(input_path)
     output_dir = Path(output_dir)
     accepted_dir = Path(accepted_dir)
@@ -421,12 +512,12 @@ def translate_queue(
         options=options,
         run_metadata=run_metadata or {},
         accepted_dir=accepted_dir,
+        teacher_pilot_rows=teacher_pilot_rows,
     )
     if existing is None:
         if output_dir.exists() and any(output_dir.iterdir()):
             raise FileExistsError(f"{output_dir} is not empty and has no compatible queue manifest")
         manifest = candidate
-        _atomic_write_json(manifest_path, manifest)
     else:
         if existing.get("run_signature") != candidate["run_signature"]:
             raise ValueError(
@@ -434,6 +525,16 @@ def translate_queue(
                 "for a different source, model, or quality policy"
             )
         manifest = existing
+    review_changed = _configure_teacher_review(
+        manifest,
+        teacher_pilot_rows=teacher_pilot_rows,
+        approve_teacher=approve_teacher,
+        approval_actor=approval_actor,
+        existing_manifest=existing is not None,
+    )
+    if existing is None or review_changed:
+        manifest["updated_at"] = datetime.now(UTC).isoformat()
+        _atomic_write_json(manifest_path, manifest)
     progress = manifest["progress"]
     if progress.get("complete"):
         return manifest
@@ -442,11 +543,21 @@ def translate_queue(
     with input_path.open("rb") as source_handle:
         source_handle.seek(int(progress["source_byte_offset"]))
         while max_rows is None or processed_this_call < max_rows:
+            pilot_remaining = _remaining_teacher_pilot_rows(manifest)
+            if pilot_remaining == 0:
+                review = manifest["teacher_review"]
+                if not review["review_required"]:
+                    review["review_required"] = True
+                    manifest["updated_at"] = datetime.now(UTC).isoformat()
+                    _atomic_write_json(manifest_path, manifest)
+                break
             remaining = (
                 options.shard_size
                 if max_rows is None
                 else min(options.shard_size, max_rows - processed_this_call)
             )
+            if pilot_remaining is not None:
+                remaining = min(remaining, pilot_remaining)
             start_index = int(progress["completed_rows"])
             raw_rows: list[bytes] = []
             for _ in range(remaining):
@@ -600,6 +711,10 @@ def translate_queue(
             counts = Counter(result["status"] for result in results)
             stats = manifest["stats"]
             stats["processed"] += len(results)
+            stats["generated"] += sum(
+                result.get("translation") is not None and result["status"] != "skipped_existing"
+                for result in results
+            )
             stats["accepted"] += counts["accepted"]
             stats["rejected"] += counts["rejected"]
             stats["errors"] += counts["error"]
@@ -611,6 +726,16 @@ def translate_queue(
             position = source_handle.tell()
             progress["complete"] = source_handle.read(1) == b""
             source_handle.seek(position)
+            review = manifest.get("teacher_review")
+            if (
+                isinstance(review, dict)
+                and not review["approved"]
+                and (
+                    stats["generated"] >= review["pilot_rows"]
+                    or (progress["complete"] and stats["generated"] > 0)
+                )
+            ):
+                review["review_required"] = True
             manifest["updated_at"] = datetime.now(UTC).isoformat()
             _atomic_write_json(manifest_path, manifest)
             if log is not None:

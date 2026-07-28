@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from sion_translate.queue_translation import (
 )
 
 DEFAULT_CONFIG_FILE = "sion_translate.yaml"
+DEFAULT_TEACHER_PILOT_ROWS = 1_000
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -39,6 +41,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--shard-size", type=int, default=1_000)
     parser.add_argument("--max-rows", type=int, help="additional rows to process this invocation")
+    parser.add_argument(
+        "--teacher-pilot-rows",
+        type=int,
+        default=DEFAULT_TEACHER_PILOT_ROWS,
+        help=(
+            "without --approve-teacher, stop after this many generated translations so the "
+            "teacher's semantic quality can be reviewed"
+        ),
+    )
+    parser.add_argument(
+        "--approve-teacher",
+        action="store_true",
+        help="continue beyond the pilot after manually reviewing its translations",
+    )
+    parser.add_argument(
+        "--approval-actor",
+        help="name recorded in the manifest when --approve-teacher is accepted",
+    )
     parser.add_argument("--num-beams", type=int, default=1)
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--max-output-length-ratio", type=float, default=2.0)
@@ -60,7 +80,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=12,
     )
-    parser.add_argument("--min-roundtrip-score", type=float, default=0.55)
+    parser.add_argument("--min-roundtrip-score", type=float, default=0.65)
     parser.add_argument("--min-pair-score", type=int, default=80)
     parser.add_argument("--min-target-language-fraction", type=float, default=0.50)
     parser.add_argument("--min-structured-similarity", type=float, default=1.0)
@@ -155,8 +175,17 @@ def main() -> None:
         options=options,
         run_metadata=metadata,
         max_rows=args.max_rows,
+        teacher_pilot_rows=args.teacher_pilot_rows,
+        approve_teacher=args.approve_teacher,
+        approval_actor=args.approval_actor or getpass.getuser(),
         log=log,
     )
+    teacher_review = manifest.get("teacher_review")
+    if isinstance(teacher_review, dict) and teacher_review.get("review_required"):
+        log(
+            f"teacher pilot is ready for semantic review in {output_dir.resolve()}; "
+            "continue with --approve-teacher only if its translations are acceptable"
+        )
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
 
 
