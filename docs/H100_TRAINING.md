@@ -188,6 +188,7 @@ peak allocated가 안전 범위인지 확인한다.
 우회하지 않는다. 토큰별 종료 조건은 rank 전체에 `MIN` 합의되므로 한 rank만
 먼저 nested decoder collective를 빠져나가지 않는다. 먼저 끝난 rank는 EOS를
 반복하며 다른 rank와 같은 횟수로 디코더를 호출하다가 전 rank가 함께 종료한다.
+rank별 batch padding 길이에서 계산된 생성 한도 역시 시작 시 `MAX`로 통일한다.
 
 DDP는 `gradient_as_bucket_view`를 사용한다. BATS는 SFT의 label 기반 보조
 손실에서는 사용되지만 MRT candidate scoring의 label-free forward에서는

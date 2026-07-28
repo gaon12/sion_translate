@@ -208,6 +208,23 @@ def test_distributed_finished_consensus_uses_all_rank_minimum(
     assert reductions == [transformer_module.dist.ReduceOp.MIN]
 
 
+def test_distributed_generation_uses_largest_rank_token_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(transformer_module.dist, "is_available", lambda: True)
+    monkeypatch.setattr(transformer_module.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(transformer_module.dist, "get_world_size", lambda: 2)
+    reductions: list[object] = []
+
+    def remote_rank_has_longer_batch(limit: torch.Tensor, *, op: object) -> None:
+        reductions.append(op)
+        limit.fill_(17)
+
+    monkeypatch.setattr(transformer_module.dist, "all_reduce", remote_rank_has_longer_batch)
+    assert transformer_module._all_ranks_max_new_tokens(9, torch.device("cpu")) == 17
+    assert reductions == [transformer_module.dist.ReduceOp.MAX]
+
+
 def test_beam_finalization_compares_live_and_completed_hypotheses() -> None:
     config = ModelConfig(
         vocab_size=8,

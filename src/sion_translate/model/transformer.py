@@ -30,6 +30,16 @@ def _all_ranks_finished(local_finished: bool, device: torch.device) -> bool:
     return bool(flag.item())
 
 
+def _all_ranks_max_new_tokens(local_max_new_tokens: int, device: torch.device) -> int:
+    """Use one decode-loop bound even when rank-local batches have different lengths."""
+
+    if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() == 1:
+        return local_max_new_tokens
+    limit = torch.tensor(local_max_new_tokens, dtype=torch.int32, device=device)
+    dist.all_reduce(limit, op=dist.ReduceOp.MAX)
+    return int(limit.item())
+
+
 @dataclass
 class SionOutput:
     """forward 결과 묶음.
@@ -471,6 +481,7 @@ class SionForConditionalGeneration(nn.Module):
                 "max_new_tokens must be between 1 and "
                 f"model max_seq_len ({self.config.max_seq_len})"
             )
+        max_new_tokens = _all_ranks_max_new_tokens(max_new_tokens, input_ids.device)
         was_training = self.training
         self.eval()
         try:
@@ -538,6 +549,7 @@ class SionForConditionalGeneration(nn.Module):
                 "max_new_tokens must be between 1 and "
                 f"model max_seq_len ({self.config.max_seq_len})"
             )
+        max_new_tokens = _all_ranks_max_new_tokens(max_new_tokens, input_ids.device)
         if num_samples < 1:
             raise ValueError("num_samples must be positive")
         if temperature <= 0:
