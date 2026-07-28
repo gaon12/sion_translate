@@ -174,6 +174,7 @@ def save_transformers_checkpoint(
     token_features_path: str | Path | None = None,
     languages: Sequence[str] | None = None,
     language_pairs: Sequence[Sequence[str]] | None = None,
+    revision_trained: bool | None = None,
     max_shard_size: str = "5GB",
 ) -> Path:
     """Save native Sion weights as a safe, AutoClass-compatible directory."""
@@ -234,14 +235,18 @@ def save_transformers_checkpoint(
         eos_token_id=eos_id,
         languages=list(languages or []),
         language_pairs=pairs,
+        revision_trained=revision_trained,
         slot_token_ids=slot_token_ids,
         tokenizer_sha256=tokenizer_sha256,
         token_features_sha256=token_features_sha256,
         token_features_shapes=token_features_shapes,
     )
-    model = SionForConditionalGeneration(config)
-    model.to(dtype=export_dtype)
-    model.model.load_state_dict(state_dict, strict=True)
+    # Build only metadata tensors, then bind the caller's stable CPU snapshot
+    # directly. A normal 32B wrapper would allocate another ~128 GiB of FP32
+    # parameters before loading the same state.
+    with torch.device("meta"):
+        model = SionForConditionalGeneration(config)
+    model.model.load_state_dict(state_dict, strict=True, assign=True)
     model.eval()
     model.save_pretrained(
         output_dir,
@@ -339,6 +344,9 @@ def save_transformers_checkpoint(
         "dtype": str(export_dtype).removeprefix("torch."),
         "languages": list(languages or []),
         "language_pairs": pairs,
+        "capabilities": (
+            {"revision_trained": revision_trained} if revision_trained is not None else {}
+        ),
         "native_state_dict_prefix": "model.",
         "self_contained_remote_code": True,
         "runtime_files": runtime_files,

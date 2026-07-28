@@ -148,6 +148,7 @@ def test_transformers_checkpoint_auto_classes_and_safe_weights(
         tokenizer_path=tokenizer_path,
         languages=["ko", "ja"],
         language_pairs=[["ko", "ja"]],
+        revision_trained=True,
         max_shard_size="1MB",
     )
 
@@ -186,6 +187,7 @@ def test_transformers_checkpoint_auto_classes_and_safe_weights(
     assert remote_model.__class__.__module__.startswith("transformers_modules.")
     assert remote_tokenizer.__class__.__module__.startswith("transformers_modules.")
     assert remote_model.model.__class__.__module__.startswith("transformers_modules.")
+    assert remote_model.config.revision_trained is True
     assert remote_model.config.slot_token_ids == tokenizer.slot_ids
     assert remote_model.config.token_features_shapes == {
         "script": [len(tokenizer)],
@@ -210,6 +212,9 @@ def test_transformers_checkpoint_auto_classes_and_safe_weights(
     )
     assert isinstance(local_config, SionConfig)
     assert isinstance(local_model, SionForConditionalGeneration)
+    assert local_config.revision_trained is True
+    export_metadata = json.loads((output_dir / "sion_export.json").read_text(encoding="utf-8"))
+    assert export_metadata["capabilities"]["revision_trained"] is True
     local_tokenizer.src_lang = "ko"
     local_tokenizer.tgt_lang = "ja"
     encoded = local_tokenizer(
@@ -402,6 +407,11 @@ def test_transformers_checkpoint_preserves_source_precision(tmp_path: Path) -> N
         assert saved_dtypes == {dtype}
         metadata = json.loads((output_dir / "sion_export.json").read_text())
         assert metadata["dtype"] == serialized_dtype
+
+
+def test_transformers_config_rejects_non_boolean_revision_capability() -> None:
+    with pytest.raises(ValueError, match="revision_trained must be a boolean"):
+        SionConfig(revision_trained="true")
 
 
 def test_transformers_export_rejects_incompatible_tokenizer_and_features(

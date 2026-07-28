@@ -230,6 +230,18 @@ def _metadata_language_pairs(metadata: Mapping[str, Any]) -> list[list[str]]:
     return []
 
 
+def _metadata_revision_capability(metadata: Mapping[str, Any]) -> bool | None:
+    capabilities = metadata.get("capabilities")
+    if capabilities is None:
+        return None
+    if not isinstance(capabilities, Mapping):
+        raise ValueError("metadata.capabilities must be an object")
+    value = capabilities.get("revision_trained")
+    if value is not None and not isinstance(value, bool):
+        raise ValueError("metadata.capabilities.revision_trained must be a boolean")
+    return value
+
+
 def _languages_from_pairs(language_pairs: Sequence[Sequence[str]]) -> list[str]:
     return list(
         dict.fromkeys(
@@ -517,6 +529,7 @@ def _inspect_transformers_checkpoint(path: Path) -> dict[str, Any]:
         "runtime_model_class": runtime_model_class,
         "languages": list(config.languages),
         "language_pairs": [list(pair) for pair in config.language_pairs],
+        "revision_trained": config.revision_trained,
     }
 
 
@@ -529,6 +542,7 @@ def _write_transformers_checkpoint(
     tokenizer_path: str | Path | None,
     token_features_path: str | Path | None,
     language_pairs: Sequence[Sequence[str]],
+    revision_trained: bool | None,
 ) -> dict[str, Any]:
     from sion_translate.hf.conversion import save_transformers_checkpoint
 
@@ -543,6 +557,7 @@ def _write_transformers_checkpoint(
             token_features_path=token_features_path,
             languages=_languages_from_pairs(language_pairs) or None,
             language_pairs=language_pairs,
+            revision_trained=revision_trained,
         )
         inspection = _inspect_transformers_checkpoint(temporary)
         _atomic_replace_directory(temporary, path)
@@ -572,10 +587,10 @@ def _cpu_model(
 ) -> SionForConditionalGeneration:
     config = copy.deepcopy(model_config)
     config.gradient_checkpointing = False
-    with torch.random.fork_rng(devices=[]):
+    with torch.device("meta"):
         model = SionForConditionalGeneration(config, pad_id=pad_id)
-    # Reuse the stable CPU snapshot instead of allocating a second full model
-    # copy before TorchAO replaces eligible weights.
+    # Bind the stable CPU snapshot without first allocating an equally large
+    # initialized model. TorchAO replaces eligible Parameters after this point.
     model.load_state_dict(dict(state_dict), assign=True)
     model.eval()
     return model
@@ -1171,6 +1186,7 @@ def export_state_dict_formats(
                     tokenizer_path=tokenizer_path,
                     token_features_path=token_features_path,
                     language_pairs=resolved_language_pairs,
+                    revision_trained=_metadata_revision_capability(export_metadata),
                 )
                 details = {
                     "dtype": (
@@ -1590,6 +1606,11 @@ def validate_export_directory(directory: str | Path) -> dict[str, Any]:
                 expected_pairs = _metadata_language_pairs(manifest_metadata)
                 if expected_pairs and inspection["language_pairs"] != expected_pairs:
                     raise RuntimeError("Transformers language pairs do not match the manifest")
+                expected_revision = _metadata_revision_capability(manifest_metadata)
+                if inspection["revision_trained"] is not expected_revision:
+                    raise RuntimeError(
+                        "Transformers revision capability does not match the manifest"
+                    )
                 validation["inspection"] = inspection
             validation["valid"] = True
         except Exception as error:
@@ -1758,6 +1779,11 @@ def export_inference_models(
                 _filename_overrides=filename_overrides,
             )
             if strict:
+                # Conversion is complete. Release the full deployment snapshot
+                # before strict validation reloads native artifacts one at a
+                # time, otherwise a 32B FP32 state overlaps every validator.
+                deployment_state.clear()
+                gc.collect()
                 failures = {
                     name: entry
                     for name in requested

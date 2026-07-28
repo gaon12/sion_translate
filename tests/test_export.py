@@ -14,6 +14,7 @@ from sion_translate.model import SionForConditionalGeneration
 from sion_translate.training.distributed import DistributedContext
 from sion_translate.training.export import (
     EXPORT_SCHEMA,
+    _cpu_model,
     _quantize_affine_k,
     build_export_metadata,
     convert_export,
@@ -81,6 +82,7 @@ def test_stable_precision_and_packed_int4_exports_reload(tmp_path: Path) -> None
         int4_backend="packed",
     )
     assert all(entry["status"] == "ok" for entry in manifest["formats"].values())
+    assert manifest["formats"]["transformers"]["revision_trained"] is False
     packed_payload = torch.load(tmp_path / "model_int4.pt", weights_only=False)
     assert packed_payload["schema"] == EXPORT_SCHEMA
     assert not isinstance(packed_payload["model"], torch.nn.Module)
@@ -130,6 +132,14 @@ def test_export_metadata_records_tokenizer_hash(tmp_path: Path) -> None:
     )
     assert metadata["tokenizer"]["sha256"] == hashlib.sha256(tokenizer.read_bytes()).hexdigest()
     assert metadata["capabilities"]["revision_trained"] is True
+
+
+def test_cpu_export_model_reuses_stable_snapshot_storage() -> None:
+    config = export_config()
+    source = SionForConditionalGeneration(config).state_dict()
+    restored = _cpu_model(config, source, 0)
+    for name, tensor in restored.state_dict().items():
+        assert tensor.data_ptr() == source[name].data_ptr()
 
 
 def test_conversion_inherits_source_tokenizer_hash_when_path_is_omitted(

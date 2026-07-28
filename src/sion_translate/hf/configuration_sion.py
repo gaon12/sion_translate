@@ -55,6 +55,7 @@ class SionConfig(PretrainedConfig):
         experimental: ExperimentalConfig | dict[str, Any] | None = None,
         languages: list[str] | tuple[str, ...] | None = None,
         language_pairs: list[list[str]] | tuple[tuple[str, str], ...] | None = None,
+        revision_trained: bool | None = None,
         slot_token_ids: list[int] | tuple[int, ...] | None = None,
         tokenizer_sha256: str | None = None,
         token_features_sha256: str | None = None,
@@ -101,6 +102,9 @@ class SionConfig(PretrainedConfig):
             self.experimental = ExperimentalConfig(**dict(experimental or {}))
         self.languages = list(languages or [])
         self.language_pairs = [list(pair) for pair in (language_pairs or [])]
+        if revision_trained is not None and not isinstance(revision_trained, bool):
+            raise ValueError("revision_trained must be a boolean or null")
+        self.revision_trained = revision_trained
         self.slot_token_ids = [int(token_id) for token_id in (slot_token_ids or [])]
         self.tokenizer_sha256 = tokenizer_sha256
         self.token_features_sha256 = token_features_sha256
@@ -176,6 +180,7 @@ class SionConfig(PretrainedConfig):
         eos_token_id: int = 3,
         languages: list[str] | tuple[str, ...] | None = None,
         language_pairs: list[list[str]] | tuple[tuple[str, str], ...] | None = None,
+        revision_trained: bool | None = None,
         slot_token_ids: list[int] | tuple[int, ...] | None = None,
         tokenizer_sha256: str | None = None,
         token_features_sha256: str | None = None,
@@ -190,6 +195,7 @@ class SionConfig(PretrainedConfig):
             eos_token_id=eos_token_id,
             languages=languages,
             language_pairs=language_pairs,
+            revision_trained=revision_trained,
             slot_token_ids=slot_token_ids,
             tokenizer_sha256=tokenizer_sha256,
             token_features_sha256=token_features_sha256,
