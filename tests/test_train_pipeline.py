@@ -6,6 +6,7 @@ import torch
 
 from sion_translate.cli.train import (
     dataloader_runtime_kwargs,
+    export_final_model,
     find_existing_checkpoint,
     release_stage_resources,
     shutdown_dataloader,
@@ -71,6 +72,47 @@ def test_stage_release_stops_persistent_workers_on_cpu() -> None:
     )
     assert release_stage_resources(context, second) == {}  # type: ignore[arg-type]
     assert second._iterator is None
+
+
+def test_final_export_wires_all_formats_and_model_sidecars(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = AppConfig()
+    config.data.tokenizer_model = str(tmp_path / "sion.model")
+    config.data.tokenizer_features = str(tmp_path / "token_features.npz")
+    config.data.language_pairs = [["ko", "ja"], ["en", "ru"]]
+    config.data.revision_examples = True
+    config.model.experimental.morphoscript_enabled = True
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def capture(*args: object, **kwargs: object) -> None:
+        calls.append((args, kwargs))
+
+    monkeypatch.setattr(
+        "sion_translate.cli.train.export_inference_models",
+        capture,
+    )
+    destination = export_final_model(
+        torch.nn.Linear(1, 1),
+        config,
+        context,
+        tmp_path / "run",
+        stage="posttrain",
+        step=17,
+    )
+
+    assert destination == tmp_path / "run" / "posttrain" / "exports" / "best"
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args[0] == destination
+    assert kwargs["formats"] == tuple(config.training.final_export_formats)
+    assert kwargs["tokenizer_path"] == config.data.tokenizer_model
+    assert kwargs["token_features_path"] == config.data.tokenizer_features
+    assert kwargs["language_pairs"] == (("ko", "ja"), ("en", "ru"))
+    assert kwargs["revision_trained"] is True
+    assert kwargs["strict"] is True
 
 
 def test_parallel_strategy_prefers_ddp_and_supports_legacy_fsdp() -> None:

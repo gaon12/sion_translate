@@ -142,6 +142,10 @@ def test_train_tokenizer_splits_digits_by_default(tmp_path: Path) -> None:
     vocab_path = model_path.with_suffix(".vocab")
     assert metadata["vocab_file"] == vocab_path.name
     assert metadata["vocab_sha256"] == file_sha256(vocab_path)
+    features_path = model_path.parent / "token_features.npz"
+    assert metadata["token_features_file"] == features_path.name
+    assert metadata["token_features_size"] == features_path.stat().st_size
+    assert metadata["token_features_sha256"] == file_sha256(features_path)
     assert tokenizer_split_digits_policy(model_path) is True
 
 

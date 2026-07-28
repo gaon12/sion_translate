@@ -133,6 +133,7 @@ def write_tokenizer_metadata(
 
     model_path = Path(model_path)
     vocab_path = model_path.with_suffix(".vocab")
+    features_path = model_path.parent / "token_features.npz"
     normalized_pairs = normalize_language_pairs(language_pairs=language_pairs)
     processor = spm.SentencePieceProcessor(model_file=str(model_path))
     metadata = {
@@ -146,6 +147,10 @@ def write_tokenizer_metadata(
         "vocab_file": vocab_path.name,
         "vocab_sha256": file_sha256(vocab_path),
     }
+    if features_path.is_file():
+        metadata["token_features_file"] = features_path.name
+        metadata["token_features_size"] = features_path.stat().st_size
+        metadata["token_features_sha256"] = file_sha256(features_path)
     output_path = tokenizer_metadata_path(model_path)
     temporary_path = output_path.with_suffix(f"{output_path.suffix}.tmp")
     temporary_path.write_text(

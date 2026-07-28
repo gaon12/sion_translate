@@ -94,3 +94,35 @@ def test_padding_multiple_must_be_positive() -> None:
     config.data.pad_to_multiple_of = 0
     with pytest.raises(ValueError, match="pad_to_multiple_of"):
         config.validate()
+
+
+def test_final_export_formats_cover_all_requested_deployment_precisions() -> None:
+    config = AppConfig()
+    assert config.training.final_export_formats == [
+        "fp32",
+        "fp16",
+        "bf16",
+        "int8",
+        "int4",
+        "gguf_q4_k_m",
+        "transformers",
+    ]
+    config.validate()
+
+
+@pytest.mark.parametrize(
+    "formats, message",
+    [
+        ([], "at least one"),
+        (["fp32", "fp32"], "duplicates"),
+        (["onnx"], "unsupported"),
+    ],
+)
+def test_final_export_formats_are_validated(
+    formats: list[str],
+    message: str,
+) -> None:
+    config = AppConfig()
+    config.training.final_export_formats = formats
+    with pytest.raises(ValueError, match=message):
+        config.validate()

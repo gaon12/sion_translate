@@ -167,6 +167,10 @@ class DataConfig:
     synthetic_prefix: str = "bt_"
     synthetic_prefixes: list[str] = field(default_factory=lambda: list(DEFAULT_SYNTHETIC_PREFIXES))
     synthetic_sampling_weight: float = DEFAULT_SYNTHETIC_SAMPLING_WEIGHT
+    # ``원문 <draft> 초안 -> 정답`` revision 예제가 실제 학습 데이터에
+    # 포함됐음을 산출물 metadata에 기록합니다. ``revise_`` 접두사의 원천은
+    # 학습 CLI가 자동 감지하며, 다른 파일명을 썼을 때만 직접 켭니다.
+    revision_examples: bool = False
     # 글로서리(용어집) JSON 경로. 지정하면 sion-translate/evaluate 가 이 파일을
     # 기본으로 불러와 지정한 용어를 정해진 대응어로 강제합니다. 빈 문자열이면 끔.
     glossary: str = ""
@@ -250,6 +254,19 @@ class TrainingConfig:
     tensorboard: bool = True
     tensorboard_dir: str | None = None
     resume_from: str | None = None
+    # 전체 학습이 끝난 뒤 선택된 best 가중치에서 한 번만 생성합니다.
+    # 중간 best/latest 저장은 학습을 오래 멈추지 않도록 FP32만 유지합니다.
+    final_export_formats: list[str] = field(
+        default_factory=lambda: [
+            "fp32",
+            "fp16",
+            "bf16",
+            "int8",
+            "int4",
+            "gguf_q4_k_m",
+            "transformers",
+        ]
+    )
 
 
 @dataclass
@@ -407,6 +424,27 @@ class AppConfig:
             raise ValueError("early_stopping_min_delta must be non-negative")
         if not 0.0 <= self.training.ema_decay < 1.0:
             raise ValueError("ema_decay must be in [0, 1)")
+        supported_export_formats = {
+            "fp32",
+            "fp16",
+            "bf16",
+            "int8",
+            "int4",
+            "gguf_q4_k_m",
+            "transformers",
+        }
+        if not self.training.final_export_formats:
+            raise ValueError("final_export_formats must contain at least one format")
+        if len(set(self.training.final_export_formats)) != len(self.training.final_export_formats):
+            raise ValueError("final_export_formats must not contain duplicates")
+        unknown_export_formats = sorted(
+            set(self.training.final_export_formats) - supported_export_formats
+        )
+        if unknown_export_formats:
+            raise ValueError(
+                "unsupported final_export_formats: "
+                f"{unknown_export_formats}; supported={sorted(supported_export_formats)}"
+            )
         post = self.posttraining
         if post.method != "mrt":
             raise ValueError("posttraining.method must be 'mrt'")

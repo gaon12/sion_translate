@@ -16,6 +16,7 @@ from sion_translate.config import (
 from sion_translate.inference import find_exported_model
 from sion_translate.model import SionForConditionalGeneration
 from sion_translate.training.distributed import DistributedContext
+from sion_translate.training.export import load_exported_model
 from sion_translate.training.objectives import MinimumRiskObjective
 from sion_translate.training.trainer import build_optimizer_param_groups, cosine_scheduler, train
 
@@ -70,6 +71,9 @@ class FakeTokenizer:
 
 
 def tiny_app_config(tmp_path: Path, **training_overrides) -> AppConfig:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    tokenizer_path = tmp_path / "tokenizer.model"
+    tokenizer_path.write_bytes(b"training export tokenizer fixture")
     training_values = {
         "output_dir": str(tmp_path / "run"),
         "max_steps": 1,
@@ -87,7 +91,12 @@ def tiny_app_config(tmp_path: Path, **training_overrides) -> AppConfig:
     training_values.update(training_overrides)
     return AppConfig(
         model=tiny_model_config(),
-        data=DataConfig(max_source_length=16, max_target_length=16, num_workers=0),
+        data=DataConfig(
+            tokenizer_model=str(tokenizer_path),
+            max_source_length=16,
+            max_target_length=16,
+            num_workers=0,
+        ),
         training=TrainingConfig(**training_values),
     )
 
@@ -101,53 +110,25 @@ def test_single_step_training_loop(tmp_path: Path) -> None:
     assert (tmp_path / "run" / "checkpoints" / "best" / "checkpoint.pt").exists()
     assert (tmp_path / "run" / "checkpoints" / "latest" / "checkpoint.pt").exists()
     assert (tmp_path / "run" / "checkpoints" / "final" / "checkpoint.pt").exists()
-    # best/latest 각각 일반(FP32)·EMA·INT8 양자화 추론용 모델이 함께 저장되어야 한다.
+    # raw 가중치는 checkpoint에 있으므로 중간 inference export는 EMA 하나뿐이다.
     for name in ("best", "latest"):
-        assert (tmp_path / "run" / "exports" / name / "model.pt").exists()
         assert (tmp_path / "run" / "exports" / name / "model_ema.pt").exists()
-        assert (tmp_path / "run" / "exports" / name / "model_int8.pt").exists()
+        assert not (tmp_path / "run" / "exports" / name / "model.pt").exists()
 
 
 def test_exported_models_reload_and_run(tmp_path: Path) -> None:
-    from sion_translate.config import ExperimentalConfig as ExpConfig
-    from sion_translate.config import ModelConfig as MConfig
-
     config = tiny_app_config(tmp_path)
     model = SionForConditionalGeneration(config.model)
     context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
     train(model, [tiny_batch()], [tiny_batch()], config, context)
 
-    # 일반(FP32) 내보내기: 설정과 가중치로 모델을 재조립할 수 있어야 한다.
-    payload = torch.load(
-        tmp_path / "run" / "exports" / "latest" / "model.pt",
-        map_location="cpu",
-        weights_only=False,
+    # 학습 종료 시 live model은 best EMA로 복원되므로 같은 export와 비교한다.
+    rebuilt, rebuilt_config, pad_id = load_exported_model(
+        tmp_path / "run" / "exports" / "best" / "model_ema.pt",
     )
-    raw_config = dict(payload["model_config"])
-    rebuilt_config = MConfig(
-        **{key: value for key, value in raw_config.items() if key != "experimental"},
-        experimental=ExpConfig(**raw_config["experimental"]),
-    )
-    rebuilt = SionForConditionalGeneration(rebuilt_config, pad_id=payload["pad_id"])
-    rebuilt.load_state_dict(payload["model"])
-    torch.testing.assert_close(
-        rebuilt.token_embedding.weight, model.token_embedding.weight
-    )
-
-    # INT8 양자화 내보내기: 모듈 전체가 저장되어 있어 바로 추론이 가능해야 한다.
-    quantized_payload = torch.load(
-        tmp_path / "run" / "exports" / "latest" / "model_int8.pt",
-        map_location="cpu",
-        weights_only=False,
-    )
-    quantized = quantized_payload["model"]
-    batch = tiny_batch()
-    output = quantized(
-        input_ids=batch["input_ids"],
-        attention_mask=batch["attention_mask"],
-        decoder_input_ids=batch["decoder_input_ids"],
-    )
-    assert output.logits.shape == (2, 3, config.model.vocab_size)
+    assert rebuilt_config == config.model
+    assert pad_id == 0
+    torch.testing.assert_close(rebuilt.token_embedding.weight, model.token_embedding.weight)
 
 
 def test_early_stopping_saves_best_checkpoint(tmp_path: Path) -> None:
@@ -277,12 +258,8 @@ def test_mrt_posttraining_objective_and_stage_save(tmp_path: Path) -> None:
     )
     assert result["step"] == 1
     assert 0.0 <= result["best_validation_reward"] <= 1.0
-    assert (
-        tmp_path / "run" / "posttrain" / "checkpoints" / "final" / "checkpoint.pt"
-    ).exists()
-    assert (
-        tmp_path / "run" / "posttrain" / "exports" / "latest" / "model.pt"
-    ).exists()
+    assert (tmp_path / "run" / "posttrain" / "checkpoints" / "final" / "checkpoint.pt").exists()
+    assert (tmp_path / "run" / "posttrain" / "exports" / "latest" / "model_ema.pt").exists()
 
 
 def test_inference_prefers_posttrain_then_pretrain(tmp_path: Path) -> None:

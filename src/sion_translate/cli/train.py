@@ -64,6 +64,7 @@ from sion_translate.training.distributed import (
     parallelize_model,
     resolve_parallel_strategy,
 )
+from sion_translate.training.export import export_inference_models
 from sion_translate.training.objectives import MinimumRiskObjective
 from sion_translate.training.trainer import announce, train
 from sion_translate.performance import build_cpu_plan
@@ -149,6 +150,38 @@ def release_stage_resources(
         "after_allocated_gib": after_allocated,
         "after_reserved_gib": after_reserved,
     }
+
+
+def export_final_model(
+    model: torch.nn.Module,
+    config: AppConfig,
+    context: DistributedContext,
+    run_root: Path,
+    *,
+    stage: str,
+    step: int,
+) -> Path:
+    """Create the required final format set from the restored best weights."""
+
+    export_dir = run_root / stage / "exports" / "best"
+    export_inference_models(
+        export_dir,
+        model,
+        config.model,
+        context,
+        step=step,
+        formats=tuple(config.training.final_export_formats),
+        tokenizer_path=config.data.tokenizer_model,
+        token_features_path=(
+            config.data.tokenizer_features
+            if config.model.experimental.morphoscript_enabled
+            else None
+        ),
+        language_pairs=config.data.configured_language_pairs(),
+        revision_trained=config.data.revision_examples,
+        strict=True,
+    )
+    return export_dir
 
 
 def find_existing_checkpoint(config: AppConfig) -> Path | None:
@@ -471,6 +504,19 @@ def main() -> None:
             config.data.validation_split,
             bidirectional=config.data.bidirectional,
         )
+        revision_sources = [
+            source
+            for source in train_dataset.source_names
+            if Path(source).name.startswith("revise_")
+        ]
+        if revision_sources and not config.data.revision_examples:
+            config.data.revision_examples = True
+            announce(
+                "revision 예제 원천을 자동 감지했습니다: "
+                + ", ".join(revision_sources[:3])
+                + (" …" if len(revision_sources) > 3 else ""),
+                context,
+            )
         announce(
             f"데이터 규모: 학습 {len(train_dataset):,}개 / 검증 {len(validation_dataset):,}개 "
             f"(양방향 포함)",
@@ -588,16 +634,14 @@ def main() -> None:
         with torch.device(construction_device):
             model = SionForConditionalGeneration(config.model, pad_id=tokenizer.pad_id)
         parameter_count = model.parameter_count()
-        # 실험 모듈이 켜져 있으면 일부 파라미터가 조건부로만 쓰이므로
-        # DDP 의 unused-parameter 탐색이 필요합니다 (꺼져 있으면 비활성 = 더 빠름).
+        # BATS를 만들고도 두 손실을 모두 0으로 둔 레거시 설정만 실제 unused
+        # parameter가 생깁니다. 활성 모듈 전체를 이유로 매 step autograd graph를
+        # 재탐색하면 H100 DDP 처리량이 불필요하게 떨어집니다.
         experimental = config.model.experimental
-        has_conditional_parameters = any(
-            (
-                experimental.bats_enabled,
-                experimental.core_enabled,
-                experimental.tetm_enabled,
-                experimental.morphoscript_enabled,
-            )
+        has_conditional_parameters = (
+            experimental.bats_enabled
+            and experimental.bats_loss_weight == 0
+            and experimental.bats_coverage_weight == 0
         )
         model = parallelize_model(
             model,
@@ -621,7 +665,7 @@ def main() -> None:
 
         # ── 단계 ⑥: SFT 사전학습 ───────────────────────────────────────
         announce("1단계 SFT 사전학습을 시작합니다.", context)
-        train(
+        pretrain_result = train(
             model,
             train_loader,
             validation_loader,
@@ -709,7 +753,7 @@ def main() -> None:
                 f"검증 beam {post.validation_num_beams}",
                 context,
             )
-            train(
+            posttrain_result = train(
                 model,
                 post_loader,
                 post_validation_loader,
@@ -733,8 +777,28 @@ def main() -> None:
                     f"{memory['after_reserved_gib']:.2f} GiB",
                     context,
                 )
+            final_step = int(posttrain_result["step"])
         else:
             announce("posttraining.enabled=false — 사후학습을 건너뜁니다.", context)
+            final_step = int(pretrain_result["step"])
+
+        # 중간 best/latest에서는 학습 재개와 빠른 확인에 필요한 경량 포맷만
+        # 저장합니다. 모든 학습 단계가 끝난 지금 선택된 best 가중치에서 7종을
+        # 한 번만 생성해, 매 평가 때 대형 CPU 양자화/I/O로 H100을 세우지 않습니다.
+        final_stage = "posttrain" if config.posttraining.enabled else "pretrain"
+        announce(
+            "선택된 best 가중치 최종 내보내기: " + ", ".join(config.training.final_export_formats),
+            context,
+        )
+        final_export_dir = export_final_model(
+            model,
+            config,
+            context,
+            run_root,
+            stage=final_stage,
+            step=final_step,
+        )
+        announce(f"최종 모델 내보내기 검증 완료: {final_export_dir}", context)
     finally:
         cleanup_distributed(context)
 

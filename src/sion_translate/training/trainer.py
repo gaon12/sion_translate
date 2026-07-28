@@ -372,22 +372,49 @@ def train(
     def export_models(name: str) -> None:
         """추론용 모델을 exports/<name>/ 에 저장합니다.
 
-        일반(FP32) model.pt, (EMA 활성 시) model_ema.pt, INT8 양자화
-        model_int8.pt 세 가지가 함께 저장됩니다. 분산 학습에서는 가중치
-        수집이 집단 통신이므로 모든 rank 가 함께 호출합니다.
+        학습 중에는 EMA가 켜졌으면 선택용 model_ema.pt 하나만, 아니면
+        model.pt 하나만 저장합니다. raw 학습 가중치는 재개 체크포인트에 이미
+        있으므로 중복 full-state export를 만들지 않습니다. 느린 양자화·HF 변환은
+        전체 학습 종료 뒤 선택된 best에서 한 번 수행합니다.
         """
-        export_inference_models(
+        token_features_path = (
+            config.data.tokenizer_features
+            if config.model.experimental.morphoscript_enabled
+            else None
+        )
+        manifest = export_inference_models(
             output_dir / "exports" / name,
             model,
             config.model,
             context,
             step,
             ema=ema,
+            tokenizer_path=config.data.tokenizer_model,
+            token_features_path=token_features_path,
+            language_pairs=config.data.configured_language_pairs(),
+            revision_trained=config.data.revision_examples,
         )
-        saved = (
-            "model.pt + model_int8.pt" if ema is None else "model.pt + model_ema.pt + model_int8.pt"
-        )
-        announce(f"추론용 모델 저장 완료: exports/{name}/{saved}", context)
+        if context.is_main and manifest is not None:
+            successful = [
+                format_name
+                for format_name, entry in manifest["formats"].items()
+                if entry.get("status") == "ok"
+            ]
+            failed = [
+                f"{format_name}({entry.get('error_type', 'error')}: "
+                f"{entry.get('message', 'unknown')})"
+                for format_name, entry in manifest["formats"].items()
+                if entry.get("status") != "ok"
+            ]
+            announce(
+                f"추론용 모델 저장 완료: exports/{name} [{', '.join(successful)}]",
+                context,
+            )
+            if failed:
+                announce(
+                    "일부 중간 포맷 저장 실패(체크포인트 학습은 계속됨): " + ", ".join(failed),
+                    context,
+                )
 
     def validate_and_update_early_stopping() -> bool:
         """검증을 수행하고 best 갱신 여부와 early stopping 여부를 결정합니다.
