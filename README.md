@@ -40,7 +40,11 @@ python easy_run.py
 `easy_run.py`는 입력 JSONL과 실행 환경을 감지해 토크나이저 준비, 품질 필터링,
 중복 제거, split 생성, 모델 크기·배치·정밀도 선택, SFT와 사후학습, 체크포인트 재개를
 순서대로 처리합니다. 세부 GPU 서버 실행법은 [`how_to_run.txt`](how_to_run.txt),
-사후학습 설계는 [`POSTTRAINING.md`](POSTTRAINING.md)를 참고하세요.
+사후학습 설계는 [`POSTTRAINING.md`](POSTTRAINING.md)를 참고하세요. H100
+단일·다중 GPU 용량 점검과 7종 내보내기는
+[`docs/H100_TRAINING.md`](docs/H100_TRAINING.md), 데이터 정비 현황과 1억 쌍
+분야별 확장량은 [`docs/DATA_EXPANSION_PLAN.md`](docs/DATA_EXPANSION_PLAN.md)에
+정리되어 있습니다.
 
 ## 번역
 
