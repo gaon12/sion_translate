@@ -234,6 +234,7 @@ def test_queue_resume_rejects_quality_or_model_changes(tmp_path: Path) -> None:
         ("min_roundtrip_score", 1.1),
         ("min_pair_score", 101),
         ("min_target_language_fraction", -0.1),
+        ("min_japanese_kana_chars", -1),
     ],
 )
 def test_queue_options_validate(field: str, value: object) -> None:
@@ -348,3 +349,39 @@ def test_existing_manifest_can_adopt_a_frozen_teacher_review_policy(
 
 def test_queue_default_roundtrip_threshold_is_conservative() -> None:
     assert QueueTranslationOptions().min_roundtrip_score == 0.65
+
+
+def test_han_only_candidate_cannot_pass_as_japanese(tmp_path: Path) -> None:
+    source = tmp_path / "queue.jsonl"
+    source.write_text(
+        json.dumps(
+            {
+                "id": "chinese-output",
+                "source_lang": "ko",
+                "target_lang": "ja",
+                "source": "안녕하세요",
+                "translation": None,
+                "status": "pending",
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    translator = FakeTranslator()
+    translator.mapping[("ko", "ja", "안녕하세요")] = "你好世界"
+    translator.mapping[("ja", "ko", "你好世界")] = "안녕하세요"
+
+    manifest = translate_queue(
+        source,
+        tmp_path / "results",
+        translator,
+        accepted_dir=tmp_path / "accepted",
+        options=_options(),
+    )
+
+    assert manifest["stats"]["accepted"] == 0
+    result = json.loads((tmp_path / "results" / "part-000000.jsonl").read_text(encoding="utf-8"))
+    assert result["quality"]["forward"]["target_language_fraction"] == 1.0
+    assert result["quality"]["forward"]["target_japanese_kana_chars"] == 0
+    assert result["rejection_reasons"] == ["target_japanese_kana"]

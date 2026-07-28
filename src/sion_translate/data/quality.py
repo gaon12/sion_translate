@@ -105,6 +105,12 @@ def _is_kana(char: str) -> bool:
     )
 
 
+def japanese_kana_count(text: str) -> int:
+    """Count hiragana, katakana, extensions, and half-width kana."""
+
+    return sum(_is_kana(char) for char in text)
+
+
 def language_fraction(text: str, language: str) -> float:
     """해당 언어 문자가 차지하는 비율. 문자 기반 판별이 가능한 언어(ko/ja)만
     실제로 검사하고, 그 외 언어는 1.0 을 돌려 검사를 통과시킵니다
@@ -196,7 +202,7 @@ def assess_pair(
         rejections.append("ja_script_mismatch")
     # 일본어 특화 경고: 긴 문장에 가나가 전혀 없으면 중국어 혼입 의심.
     if language_b == "ja":
-        ja_kana = sum(_is_kana(char) for char in ja)
+        ja_kana = japanese_kana_count(ja)
         ja_han = sum(_is_han(char) for char in ja)
         if ja_letters >= policy.long_ja_kana_warning_chars and ja_kana == 0 and ja_han >= 4:
             warnings.append("ja_no_kana")

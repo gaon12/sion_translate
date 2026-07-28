@@ -83,6 +83,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-roundtrip-score", type=float, default=0.65)
     parser.add_argument("--min-pair-score", type=int, default=80)
     parser.add_argument("--min-target-language-fraction", type=float, default=0.50)
+    parser.add_argument(
+        "--min-japanese-kana-chars",
+        type=int,
+        default=1,
+        help="reject Japanese candidates with fewer kana characters (0 disables)",
+    )
     parser.add_argument("--min-structured-similarity", type=float, default=1.0)
     parser.add_argument(
         "--threads",
@@ -146,6 +152,7 @@ def main() -> None:
         min_roundtrip_score=args.min_roundtrip_score,
         min_pair_score=args.min_pair_score,
         min_target_language_fraction=args.min_target_language_fraction,
+        min_japanese_kana_chars=args.min_japanese_kana_chars,
         min_structured_similarity=args.min_structured_similarity,
     )
     options.validate()

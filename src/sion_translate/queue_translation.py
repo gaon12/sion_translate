@@ -21,7 +21,12 @@ from typing import Any, Protocol
 
 from sacrebleu.metrics import CHRF
 
-from sion_translate.data.quality import assess_pair, canonical_text, language_fraction
+from sion_translate.data.quality import (
+    assess_pair,
+    canonical_text,
+    japanese_kana_count,
+    language_fraction,
+)
 from sion_translate.evaluation import multiset_f1, numeric_tokens
 from sion_translate.structured import structured_similarity
 
@@ -67,6 +72,7 @@ class QueueTranslationOptions:
     min_roundtrip_score: float = 0.65
     min_pair_score: int = 80
     min_target_language_fraction: float = 0.50
+    min_japanese_kana_chars: int = 1
     min_structured_similarity: float = 1.0
 
     def validate(self) -> None:
@@ -88,6 +94,8 @@ class QueueTranslationOptions:
             raise ValueError("min_pair_score must be in [0, 100]")
         if not 0.0 <= self.min_target_language_fraction <= 1.0:
             raise ValueError("min_target_language_fraction must be in [0, 1]")
+        if self.min_japanese_kana_chars < 0:
+            raise ValueError("min_japanese_kana_chars must be non-negative")
         if not 0.0 <= self.min_structured_similarity <= 1.0:
             raise ValueError("min_structured_similarity must be in [0, 1]")
 
@@ -320,6 +328,9 @@ def _forward_quality(
         "structured": structured_score,
         "critical_structured_mismatch": critical_mismatch,
         "target_language_fraction": target_fraction,
+        "target_japanese_kana_chars": (
+            japanese_kana_count(translation) if target_language == "ja" else None
+        ),
     }
     reasons = list(assessment.rejection_reasons)
     return quality, reasons
@@ -620,6 +631,11 @@ def translate_queue(
                         reasons.append("structured_mismatch")
                     if quality["target_language_fraction"] < options.min_target_language_fraction:
                         reasons.append("target_language")
+                    if (
+                        target_language == "ja"
+                        and quality["target_japanese_kana_chars"] < options.min_japanese_kana_chars
+                    ):
+                        reasons.append("target_japanese_kana")
                     if reasons:
                         job["status"] = "rejected"
                         job["rejection_reasons"] = list(dict.fromkeys(reasons))
