@@ -164,8 +164,6 @@ def write_concatenations(
     written = 0
     with output_path.open("w", encoding="utf-8", newline="\n") as handle:
         for text_a, text_b in examples:
-            handle.write(
-                json.dumps({key_a: text_a, key_b: text_b}, ensure_ascii=False) + "\n"
-            )
+            handle.write(json.dumps({key_a: text_a, key_b: text_b}, ensure_ascii=False) + "\n")
             written += 1
     return written

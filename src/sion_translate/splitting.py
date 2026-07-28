@@ -42,9 +42,7 @@ def choose_split_for_text(
     validation_fraction: float = 0.005,
     test_fraction: float = 0.005,
 ) -> str:
-    return choose_split_for_key(
-        normalized_split_key(text), validation_fraction, test_fraction
-    )
+    return choose_split_for_key(normalized_split_key(text), validation_fraction, test_fraction)
 
 
 class BloomFilter:
@@ -69,8 +67,7 @@ class BloomFilter:
 
     def contains(self, digest: bytes) -> bool:
         return all(
-            self.bits[position >> 3] & (1 << (position & 7))
-            for position in self._positions(digest)
+            self.bits[position >> 3] & (1 << (position & 7)) for position in self._positions(digest)
         )
 
 
@@ -94,9 +91,7 @@ class TargetSplitGuard:
         test_capacity = max(1, round(estimated_pairs * test_fraction))
         self.filters = {
             "train": BloomFilter(bit_count(train_capacity, 24, 1 << 16)),
-            "validation": BloomFilter(
-                bit_count(validation_capacity, 32, 1 << 14)
-            ),
+            "validation": BloomFilter(bit_count(validation_capacity, 32, 1 << 14)),
             "test": BloomFilter(bit_count(test_capacity, 32, 1 << 14)),
         }
 

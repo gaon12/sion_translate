@@ -218,8 +218,6 @@ def write_revision_examples(
     written = 0
     with output_path.open("w", encoding="utf-8", newline="\n") as handle:
         for serialized, target in examples:
-            handle.write(
-                json.dumps({key_a: serialized, key_b: target}, ensure_ascii=False) + "\n"
-            )
+            handle.write(json.dumps({key_a: serialized, key_b: target}, ensure_ascii=False) + "\n")
             written += 1
     return written

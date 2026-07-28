@@ -148,9 +148,7 @@ def refine_batch(
 
     # 아직 기준에 못 미친 문장의 인덱스만 들고 갑니다.
     pending = [
-        index
-        for index, result in enumerate(results)
-        if result.stop_reason != "accept_score"
+        index for index, result in enumerate(results) if result.stop_reason != "accept_score"
     ]
     for round_index in range(1, max_rounds + 1):
         if not pending:
@@ -160,9 +158,7 @@ def refine_batch(
             [results[index].text for index in pending],
         )
         if len(revised) != len(pending):
-            raise ValueError(
-                f"수정 결과 {len(revised)}개가 요청한 {len(pending)}개와 다릅니다"
-            )
+            raise ValueError(f"수정 결과 {len(revised)}개가 요청한 {len(pending)}개와 다릅니다")
         still_pending: list[int] = []
         for index, candidate in zip(pending, revised, strict=True):
             result = results[index]

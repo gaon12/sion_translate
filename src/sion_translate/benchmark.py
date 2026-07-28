@@ -134,8 +134,7 @@ def pairs_from_hf_datasets(
     field_b = f"sentence_{code_b}"
     if field_a not in dataset.column_names or field_b not in dataset.column_names:
         raise ValueError(
-            f"FLORES 데이터에 {field_a} 또는 {field_b} 필드가 없습니다. "
-            "언어 코드를 확인하세요."
+            f"FLORES 데이터에 {field_a} 또는 {field_b} 필드가 없습니다. 언어 코드를 확인하세요."
         )
     pairs: list[dict[str, str]] = []
     for row in dataset:

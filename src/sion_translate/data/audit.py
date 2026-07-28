@@ -55,11 +55,7 @@ class HyperLogLog:
         remaining_bits = 64 - self.precision
         register = value >> remaining_bits
         suffix = value & ((1 << remaining_bits) - 1)
-        rank = (
-            remaining_bits - suffix.bit_length() + 1
-            if suffix
-            else remaining_bits + 1
-        )
+        rank = remaining_bits - suffix.bit_length() + 1 if suffix else remaining_bits + 1
         if rank > self.registers[register]:
             self.registers[register] = rank
 
@@ -73,9 +69,7 @@ class HyperLogLog:
             alpha = 0.709
         else:
             alpha = 0.7213 / (1.0 + 1.079 / registers)
-        raw = alpha * registers * registers / sum(
-            2.0 ** (-value) for value in self.registers
-        )
+        raw = alpha * registers * registers / sum(2.0 ** (-value) for value in self.registers)
         empty = self.registers.count(0)
         if raw <= 2.5 * registers and empty:
             return registers * math.log(registers / empty)
@@ -250,9 +244,7 @@ class _AuditAccumulator:
     def report(self) -> dict[str, Any]:
         estimate = max(0, round(self.hll.estimate()))
         signal_names = sorted(set(_QUALITY_REJECTION_REASONS) | self.signals.keys())
-        warning_names = sorted(
-            set(_QUALITY_WARNING_REASONS) | self.warning_signals.keys()
-        )
+        warning_names = sorted(set(_QUALITY_WARNING_REASONS) | self.warning_signals.keys())
         return {
             "bytes": self.bytes,
             "rows": self.rows,
@@ -275,15 +267,11 @@ class _AuditAccumulator:
                     "count": estimate,
                     "precision": self.hll.precision,
                     "registers": self.hll.register_count,
-                    "relative_standard_error": round(
-                        1.04 / math.sqrt(self.hll.register_count), 6
-                    ),
+                    "relative_standard_error": round(1.04 / math.sqrt(self.hll.register_count), 6),
                 },
             },
             "signals": {name: self.signals[name] for name in signal_names},
-            "warning_signals": {
-                name: self.warning_signals[name] for name in warning_names
-            },
+            "warning_signals": {name: self.warning_signals[name] for name in warning_names},
             "quality_pass_count": self.quality_pass,
             "quality_pass_rate": _rate(self.quality_pass, self.valid),
             "quality_rate_denominator": "valid_rows",

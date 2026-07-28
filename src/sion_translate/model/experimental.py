@@ -115,7 +115,11 @@ class TypedEntityMemory(nn.Module):
         token_mask = memory_token_ids.ne(pad_id).unsqueeze(-1)
         token_states = token_embedding(memory_token_ids)
         slot_states = (token_states * token_mask).sum(-2) / token_mask.sum(-2).clamp_min(1)
-        slot_states = slot_states + self.type_embedding(memory_type_ids) + self.mode_embedding(memory_mode_ids)
+        slot_states = (
+            slot_states
+            + self.type_embedding(memory_type_ids)
+            + self.mode_embedding(memory_mode_ids)
+        )
         has_memory = memory_mask.any(-1)
         safe_mask = memory_mask.clone()
         safe_mask[~has_memory, 0] = True
@@ -155,8 +159,12 @@ class BilingualAlignmentTransport(nn.Module):
         max_positions: int,
         alignment_targets: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        src_pos = self._positions(source_states.shape[1], stride, max_positions, source_states.device)
-        tgt_pos = self._positions(target_states.shape[1], stride, max_positions, target_states.device)
+        src_pos = self._positions(
+            source_states.shape[1], stride, max_positions, source_states.device
+        )
+        tgt_pos = self._positions(
+            target_states.shape[1], stride, max_positions, target_states.device
+        )
         source = self.source_proj(source_states.index_select(1, src_pos))
         target = self.target_proj(target_states.index_select(1, tgt_pos))
         src_mask = source_mask.index_select(1, src_pos)
@@ -182,7 +190,9 @@ class BilingualAlignmentTransport(nn.Module):
         # A deliberately weak under-coverage signal; it is disabled by default.
         non_null = probabilities[:, :, :-1] * tgt_mask[:, :, None].to(probabilities.dtype)
         coverage = non_null.sum(1)
-        expected = tgt_mask.sum(1, keepdim=True) / src_mask[:, :-1].sum(1, keepdim=True).clamp_min(1)
+        expected = tgt_mask.sum(1, keepdim=True) / src_mask[:, :-1].sum(1, keepdim=True).clamp_min(
+            1
+        )
         coverage_loss = (
             F.relu(0.5 * expected - coverage) * src_mask[:, :-1].to(coverage.dtype)
         ).sum() / src_mask[:, :-1].sum().clamp_min(1)

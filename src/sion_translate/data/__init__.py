@@ -5,7 +5,10 @@ from typing import Any
 
 
 _EXPORTS = {
-    "DistributedBucketBatchSampler": ("sion_translate.data.indexed", "DistributedBucketBatchSampler"),
+    "DistributedBucketBatchSampler": (
+        "sion_translate.data.indexed",
+        "DistributedBucketBatchSampler",
+    ),
     "IndexedParallelDataset": ("sion_translate.data.indexed", "IndexedParallelDataset"),
     "SionBatchCollator": ("sion_translate.data.collate", "SionBatchCollator"),
     "QualityPolicy": ("sion_translate.data.quality", "QualityPolicy"),

@@ -82,9 +82,7 @@ def load_glossary(path: str | Path) -> Glossary:
     with path.open("r", encoding="utf-8") as handle:
         data = json.load(handle)
     if not isinstance(data, list):
-        raise ValueError(
-            "글로서리는 [{\"ko\": ..., \"ja\": ...}, ...] 형식의 리스트여야 합니다."
-        )
+        raise ValueError('글로서리는 [{"ko": ..., "ja": ...}, ...] 형식의 리스트여야 합니다.')
     entries: list[dict[str, str]] = []
     for row in data:
         if not isinstance(row, dict):

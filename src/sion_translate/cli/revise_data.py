@@ -39,13 +39,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--input", nargs="+", required=True, help="JSONL 파일 또는 glob 패턴")
     parser.add_argument("--output", required=True, help="산출 JSONL 경로")
-    parser.add_argument(
-        "--limit", type=int, default=None, help="사용할 최대 쌍 수 (기본: 전체)"
-    )
+    parser.add_argument("--limit", type=int, default=None, help="사용할 최대 쌍 수 (기본: 전체)")
     parser.add_argument(
         "--drafts",
         help=(
-            "모델이 만든 초안 JSONL ({\"draft\": ...} 한 줄에 하나, 입력과 같은 순서). "
+            '모델이 만든 초안 JSONL ({"draft": ...} 한 줄에 하나, 입력과 같은 순서). '
             "주면 합성 손상 대신 이 초안을 씁니다"
         ),
     )
