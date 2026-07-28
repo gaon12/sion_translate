@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import math
+import time
 
 import torch
 import torch.nn.functional as F
@@ -153,6 +155,31 @@ class CompositeTranslationReward:
         candidates_include_bos: bool = True,
     ) -> RewardOutput:
         """candidates ``(batch, samples, length)``의 복합 보상을 계산합니다."""
+
+        cpu_output = self.score_cpu(
+            candidates,
+            input_ids,
+            reference_labels,
+            candidates_include_bos=candidates_include_bos,
+        )
+        device = candidates.device
+        return RewardOutput(
+            reward=cpu_output.reward.to(device=device),
+            components={
+                name: values.to(device=device) for name, values in cpu_output.components.items()
+            },
+        )
+
+    def score_cpu(
+        self,
+        candidates: torch.Tensor,
+        input_ids: torch.Tensor,
+        reference_labels: torch.Tensor,
+        *,
+        candidates_include_bos: bool = True,
+    ) -> RewardOutput:
+        """Detach inputs and calculate the Python/string reward entirely on CPU."""
+
         candidates_cpu = candidates.detach().to("cpu")
         inputs_cpu = input_ids.detach().to("cpu")
         references_cpu = reference_labels.detach().to("cpu")
@@ -179,11 +206,10 @@ class CompositeTranslationReward:
             reward_rows.append(row_rewards)
             for name, values in row_components.items():
                 component_rows[name].append(values)
-        device = candidates.device
         return RewardOutput(
-            reward=torch.tensor(reward_rows, device=device, dtype=torch.float32),
+            reward=torch.tensor(reward_rows, dtype=torch.float32),
             components={
-                name: torch.tensor(rows, device=device, dtype=torch.float32)
+                name: torch.tensor(rows, dtype=torch.float32)
                 for name, rows in component_rows.items()
             },
         )
@@ -369,45 +395,80 @@ class MinimumRiskObjective:
             forbidden_token_ids=forbidden,
             **encoder_features,
         )
-        reward_output = self.reward_model(sampled, batch["input_ids"], reference_labels)
-        rewards = reward_output.reward
+        reward_transfer_started = time.perf_counter()
+        reward_candidates_cpu = sampled.detach().to("cpu")
+        reward_inputs_cpu = batch["input_ids"].detach().to("cpu")
+        reward_references_cpu = reference_labels.detach().to("cpu")
+        reward_input_transfer_seconds = time.perf_counter() - reward_transfer_started
+        reward_submitted = time.perf_counter()
 
-        samples = self.config.samples_per_source
-        candidate_inputs = sampled[..., :-1]
-        candidate_labels = self._candidate_labels(sampled, self.tokenizer.eos_id)
-        reference_inputs = batch["decoder_input_ids"][:, None, :]
-        reference_targets = reference_labels[:, None, :]
-        target_length = max(candidate_inputs.shape[-1], reference_inputs.shape[-1])
+        def calculate_reward() -> tuple[RewardOutput, float]:
+            started = time.perf_counter()
+            output = self.reward_model.score_cpu(
+                reward_candidates_cpu,
+                reward_inputs_cpu,
+                reward_references_cpu,
+            )
+            return output, time.perf_counter() - started
 
-        decoder_inputs = torch.full(
-            (batch_size, samples + 1, target_length),
-            self.tokenizer.pad_id,
-            dtype=torch.long,
-            device=sampled.device,
-        )
-        labels = torch.full_like(decoder_inputs, -100)
-        decoder_inputs[:, :samples, : candidate_inputs.shape[-1]] = candidate_inputs
-        labels[:, :samples, : candidate_labels.shape[-1]] = candidate_labels
-        decoder_inputs[:, samples:, : reference_inputs.shape[-1]] = reference_inputs
-        labels[:, samples:, : reference_targets.shape[-1]] = reference_targets
+        # String decoding and chrF/structure metrics are CPU/Python-heavy. Run
+        # them while the main thread submits candidate-scoring work to the GPU.
+        # A per-call executor has a small cost relative to generation, and its
+        # context guarantees that exceptions and cancellation never leak a
+        # worker beyond this optimizer micro-step.
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="sion-reward") as executor:
+            reward_future = executor.submit(calculate_reward)
 
-        score_chunks = [
-            self._sequence_log_probabilities(
+            samples = self.config.samples_per_source
+            candidate_inputs = sampled[..., :-1]
+            candidate_labels = self._candidate_labels(sampled, self.tokenizer.eos_id)
+            reference_inputs = batch["decoder_input_ids"][:, None, :]
+            reference_targets = reference_labels[:, None, :]
+            target_length = max(candidate_inputs.shape[-1], reference_inputs.shape[-1])
+
+            decoder_inputs = torch.full(
+                (batch_size, samples + 1, target_length),
+                self.tokenizer.pad_id,
+                dtype=torch.long,
+                device=sampled.device,
+            )
+            labels = torch.full_like(decoder_inputs, -100)
+            decoder_inputs[:, :samples, : candidate_inputs.shape[-1]] = candidate_inputs
+            labels[:, :samples, : candidate_labels.shape[-1]] = candidate_labels
+            decoder_inputs[:, samples:, : reference_inputs.shape[-1]] = reference_inputs
+            labels[:, samples:, : reference_targets.shape[-1]] = reference_targets
+
+            score_chunks = [
+                self._sequence_log_probabilities(
+                    model,
+                    batch,
+                    decoder_inputs[:, start : start + self.config.candidate_micro_batch],
+                    labels[:, start : start + self.config.candidate_micro_batch],
+                )
+                for start in range(0, samples, self.config.candidate_micro_batch)
+            ]
+            generated_scores = torch.cat(score_chunks, dim=1)
+            ce_loss, reference_tokens = self._reference_cross_entropy(
                 model,
                 batch,
-                decoder_inputs[:, start : start + self.config.candidate_micro_batch],
-                labels[:, start : start + self.config.candidate_micro_batch],
+                decoder_inputs[:, samples],
+                labels[:, samples],
+                label_smoothing=base.config.label_smoothing,
             )
-            for start in range(0, samples, self.config.candidate_micro_batch)
-        ]
-        generated_scores = torch.cat(score_chunks, dim=1)
-        ce_loss, reference_tokens = self._reference_cross_entropy(
-            model,
-            batch,
-            decoder_inputs[:, samples],
-            labels[:, samples],
-            label_smoothing=base.config.label_smoothing,
+            reward_wait_started = time.perf_counter()
+            reward_output_cpu, reward_cpu_seconds = reward_future.result()
+            reward_wait_seconds = time.perf_counter() - reward_wait_started
+
+        candidate_scoring_seconds = max(0.0, reward_wait_started - reward_submitted)
+        reward_overlap_seconds = min(reward_cpu_seconds, candidate_scoring_seconds)
+        reward_output = RewardOutput(
+            reward=reward_output_cpu.reward.to(device=sampled.device),
+            components={
+                name: values.to(device=sampled.device)
+                for name, values in reward_output_cpu.components.items()
+            },
         )
+        rewards = reward_output.reward
         candidate_distribution = torch.softmax(self.config.mrt_alpha * generated_scores, dim=-1)
         risk = (candidate_distribution * (1.0 - rewards)).sum(-1).mean()
         preference_loss, pair_weight = self._pairwise_preference_loss(generated_scores, rewards)
@@ -424,6 +485,36 @@ class MinimumRiskObjective:
             "preference_loss": preference_loss.detach(),
             "preference_pair_weight": pair_weight.detach(),
             "reward": rewards.mean().detach(),
+            "reward_cpu_seconds": torch.tensor(
+                reward_cpu_seconds,
+                device=sampled.device,
+                dtype=torch.float32,
+            ),
+            "reward_wait_seconds": torch.tensor(
+                reward_wait_seconds,
+                device=sampled.device,
+                dtype=torch.float32,
+            ),
+            "reward_overlap_seconds": torch.tensor(
+                reward_overlap_seconds,
+                device=sampled.device,
+                dtype=torch.float32,
+            ),
+            "reward_overlap_fraction": torch.tensor(
+                reward_overlap_seconds / max(reward_cpu_seconds, 1e-9),
+                device=sampled.device,
+                dtype=torch.float32,
+            ),
+            "candidate_scoring_seconds": torch.tensor(
+                candidate_scoring_seconds,
+                device=sampled.device,
+                dtype=torch.float32,
+            ),
+            "reward_input_transfer_seconds": torch.tensor(
+                reward_input_transfer_seconds,
+                device=sampled.device,
+                dtype=torch.float32,
+            ),
         }
         metrics.update(
             {

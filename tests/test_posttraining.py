@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import threading
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -108,6 +110,127 @@ class TinyCandidateScorer(nn.Module):
         source = source / source_mask.sum(1).clamp_min(1)
         hidden = torch.tanh(self.embedding(decoder_input_ids) + source[:, None])
         return SimpleNamespace(logits=self.projection(hidden))
+
+
+class ConcurrentCandidateScorer(TinyCandidateScorer):
+    def __init__(
+        self,
+        reward_started: threading.Event,
+        candidate_scoring_started: threading.Event,
+    ) -> None:
+        super().__init__()
+        self.config = SimpleNamespace(label_smoothing=0.1, max_seq_len=16, vocab_size=64)
+        self.reward_started = reward_started
+        self.candidate_scoring_started = candidate_scoring_started
+
+    def sample(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        *,
+        num_samples: int,
+        **kwargs,
+    ) -> torch.Tensor:
+        del attention_mask, kwargs
+        candidates = torch.tensor(
+            [[2, 20, 21, 3], [2, 20, 22, 3]],
+            device=input_ids.device,
+        )
+        return candidates[:num_samples].unsqueeze(0).expand(input_ids.shape[0], -1, -1)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        decoder_input_ids: torch.Tensor,
+        labels: torch.Tensor | None = None,
+    ):
+        self.candidate_scoring_started.set()
+        if not self.reward_started.wait(timeout=2):
+            raise AssertionError("reward worker did not start before candidate scoring")
+        return super().forward(
+            input_ids,
+            attention_mask,
+            decoder_input_ids,
+            labels,
+        )
+
+
+def posttraining_batch() -> dict[str, torch.Tensor]:
+    return {
+        "input_ids": torch.tensor([[4, 10, 11, 3]]),
+        "attention_mask": torch.ones(1, 4, dtype=torch.bool),
+        "decoder_input_ids": torch.tensor([[2, 20, 21]]),
+        "labels": torch.tensor([[20, 21, 3]]),
+    }
+
+
+def test_reward_cpu_work_overlaps_candidate_scoring_and_reports_wait_telemetry() -> None:
+    config = PostTrainingConfig(
+        samples_per_source=2,
+        candidate_micro_batch=1,
+        candidate_gradient_checkpointing=False,
+        max_new_tokens=4,
+    )
+    objective = MinimumRiskObjective(TextTokenizer(), config)
+    reward_started = threading.Event()
+    candidate_scoring_started = threading.Event()
+    model = ConcurrentCandidateScorer(reward_started, candidate_scoring_started)
+    real_score_cpu = objective.reward_model.score_cpu
+    worker_names: list[str] = []
+
+    def synchronized_score(*args, **kwargs):
+        worker_names.append(threading.current_thread().name)
+        reward_started.set()
+        if not candidate_scoring_started.wait(timeout=2):
+            raise AssertionError("candidate scoring did not overlap CPU reward")
+        return real_score_cpu(*args, **kwargs)
+
+    objective.reward_model.score_cpu = synchronized_score
+    output = objective(model, posttraining_batch())
+
+    assert reward_started.is_set()
+    assert candidate_scoring_started.is_set()
+    assert worker_names and worker_names[0].startswith("sion-reward")
+    for metric_name in (
+        "reward_cpu_seconds",
+        "reward_wait_seconds",
+        "reward_overlap_seconds",
+        "reward_overlap_fraction",
+        "reward_input_transfer_seconds",
+        "candidate_scoring_seconds",
+    ):
+        assert torch.isfinite(output.metrics[metric_name])
+        assert output.metrics[metric_name].item() >= 0.0
+    assert output.metrics["reward_overlap_fraction"].item() <= 1.0
+    output.loss_sum.backward()
+    assert model.embedding.weight.grad is not None
+
+
+def test_reward_worker_exception_propagates_without_leaking_executor_thread() -> None:
+    config = PostTrainingConfig(
+        samples_per_source=2,
+        candidate_micro_batch=1,
+        candidate_gradient_checkpointing=False,
+        max_new_tokens=4,
+    )
+    objective = MinimumRiskObjective(TextTokenizer(), config)
+    reward_started = threading.Event()
+    candidate_scoring_started = threading.Event()
+    model = ConcurrentCandidateScorer(reward_started, candidate_scoring_started)
+
+    def fail_reward(*args, **kwargs):
+        del args, kwargs
+        reward_started.set()
+        raise RuntimeError("intentional reward failure")
+
+    objective.reward_model.score_cpu = fail_reward
+    with pytest.raises(RuntimeError, match="intentional reward failure"):
+        objective(model, posttraining_batch())
+    assert not any(
+        thread.name.startswith("sion-reward") and thread.is_alive()
+        for thread in threading.enumerate()
+    )
 
 
 def _legacy_full_candidate_loss(
