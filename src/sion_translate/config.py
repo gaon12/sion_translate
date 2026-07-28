@@ -37,12 +37,20 @@ class ExperimentalConfig:
     # 0 이면 꺼짐 — 기본이 꺼져 있어야 기존 체크포인트가 그대로 동작합니다.
     recurrent_block_layers: int = 0
     recurrent_steps: int = 1
+    # Kimi K3의 SiTU-GLU: SwiGLU의 gate/up pre-activation을 부드럽게
+    # 제한해 큰 activation과 저정밀도 overflow를 줄입니다. projection
+    # 파라미터 모양은 같아서 기능을 끈 기존 체크포인트와 호환됩니다.
+    situglu_enabled: bool = False
+    situglu_gate_beta: float = 4.0
+    situglu_up_beta: float = 25.0
 
     def validate(self) -> None:
         if self.recurrent_block_layers < 0:
             raise ValueError("experimental.recurrent_block_layers must be non-negative")
         if self.recurrent_steps < 1:
             raise ValueError("experimental.recurrent_steps must be at least 1")
+        if self.situglu_gate_beta <= 0 or self.situglu_up_beta <= 0:
+            raise ValueError("experimental SiTU-GLU beta values must be positive")
         if self.recurrent_block_layers and self.recurrent_steps == 1:
             warnings.warn(
                 "experimental.recurrent_block_layers 가 설정됐지만 recurrent_steps 가 "

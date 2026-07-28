@@ -8,6 +8,7 @@ import torch
 import sion_translate.model.transformer as transformer_module
 from sion_translate.config import ExperimentalConfig, ModelConfig
 from sion_translate.model import SionForConditionalGeneration
+from sion_translate.model.layers import SwiGLU
 
 
 def tiny_config() -> ModelConfig:
@@ -75,6 +76,39 @@ def test_forward_backward_all_experimental_modules() -> None:
     assert output.alignment_loss.item() >= 0
     output.loss.backward()
     assert model.token_embedding.weight.grad is not None
+
+
+def test_situglu_bounds_activations_and_keeps_swiglu_state_compatible() -> None:
+    torch.manual_seed(11)
+    swiglu = SwiGLU(8, 16, 0.0)
+    situglu = SwiGLU(8, 16, 0.0, gate_beta=4.0, up_beta=25.0)
+    situglu.load_state_dict(swiglu.state_dict(), strict=True)
+    assert swiglu.state_dict().keys() == situglu.state_dict().keys()
+
+    small_input = torch.randn(2, 3, 8) * 1e-4
+    torch.testing.assert_close(
+        situglu.gated_activations(small_input),
+        swiglu.gated_activations(small_input),
+        rtol=1e-5,
+        atol=1e-10,
+    )
+    huge_input = torch.full((2, 3, 8), 1e6)
+    bounded = situglu.gated_activations(huge_input)
+    assert torch.isfinite(bounded).all()
+    assert bounded.abs().max() <= 100.0
+
+
+def test_model_wires_situglu_into_encoder_and_decoder_without_extra_parameters() -> None:
+    baseline_config = tiny_config()
+    situ_config = tiny_config()
+    situ_config.experimental.situglu_enabled = True
+    baseline = SionForConditionalGeneration(baseline_config)
+    situ = SionForConditionalGeneration(situ_config)
+
+    assert baseline.parameter_count() == situ.parameter_count()
+    assert baseline.encoder_layers[0].ffn.gate_beta is None
+    assert situ.encoder_layers[0].ffn.gate_beta == 4.0
+    assert situ.decoder_layers[0].ffn.up_beta == 25.0
 
 
 def test_auxiliary_loss_masks_are_compile_safe_and_keep_empty_batches_finite() -> None:

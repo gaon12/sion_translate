@@ -13,6 +13,7 @@ model:
   gradient_checkpointing: true
   init_std: 0.0125
   experimental:
+    situglu_enabled: true
     bats_enabled: true
     bats_dim: 512
     bats_loss_weight: 0.0

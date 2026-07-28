@@ -21,8 +21,11 @@
 #   - 이전 학습이 있으면 checkpoints/latest 에서 자동으로 이어서 학습합니다.
 # ============================================================================
 
-# model:
-#   # 모델 크기를 직접 고정하고 싶을 때만 주석 해제 (기본: 데이터 규모로 자동)
+model:
+  experimental:
+    # Kimi K3 SiTU-GLU: FFN activation 폭주를 부드럽게 제한
+    situglu_enabled: true
+# 아래 모델 크기는 직접 고정하고 싶을 때만 주석 해제 (기본: 데이터 규모로 자동)
 #   d_model: 768
 #   encoder_layers: 16
 #   decoder_layers: 8

@@ -112,6 +112,14 @@ class SionForConditionalGeneration(nn.Module):
             dropout=config.dropout,
             qk_norm=config.qk_norm,
             norm_eps=config.rms_norm_eps,
+            ffn_gate_beta=(
+                config.experimental.situglu_gate_beta
+                if config.experimental.situglu_enabled
+                else None
+            ),
+            ffn_up_beta=(
+                config.experimental.situglu_up_beta if config.experimental.situglu_enabled else None
+            ),
         )
         self.encoder_layers = nn.ModuleList(
             [

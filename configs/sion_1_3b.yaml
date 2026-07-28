@@ -11,6 +11,7 @@ model:
   # H100 at this sequence/batch budget; recomputation only lowers utilization.
   gradient_checkpointing: false
   experimental:
+    situglu_enabled: true
     bats_enabled: true
     bats_dim: 256
     bats_loss_weight: 0.0

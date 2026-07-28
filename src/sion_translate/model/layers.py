@@ -245,15 +245,39 @@ class SwiGLU(nn.Module):
     """SwiGLU feed-forward. 일반 FFN(ReLU) 대신 gate × up 곱 구조를 써서
     같은 파라미터 수로 더 좋은 성능을 내는 현대 표준 구성입니다."""
 
-    def __init__(self, d_model: int, d_ff: int, dropout: float):
+    def __init__(
+        self,
+        d_model: int,
+        d_ff: int,
+        dropout: float,
+        *,
+        gate_beta: float | None = None,
+        up_beta: float | None = None,
+    ):
         super().__init__()
+        if (gate_beta is None) != (up_beta is None):
+            raise ValueError("gate_beta and up_beta must be configured together")
         self.gate_proj = nn.Linear(d_model, d_ff, bias=False)
         self.up_proj = nn.Linear(d_model, d_ff, bias=False)
         self.down_proj = nn.Linear(d_ff, d_model, bias=False)
         self.dropout = nn.Dropout(dropout)
+        self.gate_beta = gate_beta
+        self.up_beta = up_beta
+
+    def gated_activations(self, x: torch.Tensor) -> torch.Tensor:
+        gate = self.gate_proj(x)
+        up = self.up_proj(x)
+        if self.gate_beta is None or self.up_beta is None:
+            return F.silu(gate) * up
+        # SiTU(z) = sigmoid(z) * beta_1*tanh(z/beta_1), while the
+        # up branch is beta_2*tanh(z/beta_2). With 4/25 the product is
+        # smoothly bounded by 100 but matches SwiGLU to first order at zero.
+        capped_gate = torch.sigmoid(gate) * self.gate_beta * torch.tanh(gate / self.gate_beta)
+        capped_up = self.up_beta * torch.tanh(up / self.up_beta)
+        return capped_gate * capped_up
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(self.dropout(F.silu(self.gate_proj(x)) * self.up_proj(x)))
+        return self.down_proj(self.dropout(self.gated_activations(x)))
 
 
 class EncoderLayer(nn.Module):
@@ -275,6 +299,8 @@ class EncoderLayer(nn.Module):
         qk_norm: bool,
         norm_eps: float,
         rope: RotaryEmbedding,
+        ffn_gate_beta: float | None = None,
+        ffn_up_beta: float | None = None,
     ):
         super().__init__()
         self.attn_norm = RMSNorm(d_model, norm_eps)
@@ -288,7 +314,13 @@ class EncoderLayer(nn.Module):
             rope=rope,
         )
         self.ffn_norm = RMSNorm(d_model, norm_eps)
-        self.ffn = SwiGLU(d_model, d_ff, dropout)
+        self.ffn = SwiGLU(
+            d_model,
+            d_ff,
+            dropout,
+            gate_beta=ffn_gate_beta,
+            up_beta=ffn_up_beta,
+        )
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
@@ -316,6 +348,8 @@ class DecoderLayer(nn.Module):
         qk_norm: bool,
         norm_eps: float,
         rope: RotaryEmbedding,
+        ffn_gate_beta: float | None = None,
+        ffn_up_beta: float | None = None,
     ):
         super().__init__()
         self.self_norm = RMSNorm(d_model, norm_eps)
@@ -339,7 +373,13 @@ class DecoderLayer(nn.Module):
             rope=None,
         )
         self.ffn_norm = RMSNorm(d_model, norm_eps)
-        self.ffn = SwiGLU(d_model, d_ff, dropout)
+        self.ffn = SwiGLU(
+            d_model,
+            d_ff,
+            dropout,
+            gate_beta=ffn_gate_beta,
+            up_beta=ffn_up_beta,
+        )
         self.dropout = nn.Dropout(dropout)
 
     def forward(

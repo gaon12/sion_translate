@@ -9,6 +9,7 @@ model:
   dropout: 0.1
   gradient_checkpointing: false
   experimental:
+    situglu_enabled: true
     bats_enabled: true
     bats_dim: 32
     bats_loss_weight: 0.0

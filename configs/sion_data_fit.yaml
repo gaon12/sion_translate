@@ -17,6 +17,7 @@ model:
   gradient_checkpointing: false
   init_std: 0.02
   experimental:
+    situglu_enabled: true
     bats_enabled: false
     core_enabled: false
     tetm_enabled: false

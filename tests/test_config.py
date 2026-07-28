@@ -53,6 +53,14 @@ def test_negative_loss_weight_is_still_an_error() -> None:
         ExperimentalConfig(bats_loss_weight=-0.1).validate()
 
 
+@pytest.mark.parametrize("field", ("situglu_gate_beta", "situglu_up_beta"))
+def test_situglu_caps_must_be_positive(field: str) -> None:
+    config = ExperimentalConfig(situglu_enabled=True)
+    setattr(config, field, 0.0)
+    with pytest.raises(ValueError, match="SiTU-GLU"):
+        config.validate()
+
+
 @pytest.mark.parametrize(
     ("field", "value", "minimum"),
     [
