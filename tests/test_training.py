@@ -144,6 +144,8 @@ def test_early_stopping_saves_best_checkpoint(tmp_path: Path) -> None:
     result = train(model, [tiny_batch()], [tiny_batch()], config, context)
     assert result["stopped_early"] is True
     assert result["step"] == 2
+    assert result["best_step"] == 1
+    assert result["selected_step"] == 1
     assert result["early_stopping_bad_evals"] == 1
     assert (tmp_path / "run" / "checkpoints" / "best" / "checkpoint.pt").exists()
 

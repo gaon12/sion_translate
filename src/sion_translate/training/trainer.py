@@ -307,6 +307,7 @@ def train(
         announce(f"EMA 가중치 평균 활성화 (decay={training.ema_decay})", context)
     training_state: dict[str, Any] = {
         "best_validation_loss": float("inf"),
+        "best_step": -1,
         "early_stopping_bad_evals": 0,
         "epoch": 0,
     }
@@ -332,6 +333,7 @@ def train(
     step = start_step
     epoch = int(training_state.get("epoch", 0))
     best_validation_loss = float(training_state.get("best_validation_loss", float("inf")))
+    best_step = int(training_state.get("best_step", -1))
     bad_evals = int(training_state.get("early_stopping_bad_evals", 0))
     stopped_early = False
     last_eval_step = -1
@@ -351,6 +353,7 @@ def train(
     def current_training_state() -> dict[str, Any]:
         return {
             "best_validation_loss": best_validation_loss,
+            "best_step": best_step,
             "early_stopping_bad_evals": bad_evals,
             "epoch": epoch,
         }
@@ -422,7 +425,7 @@ def train(
 
         반환값이 True 면 '더 이상 개선이 없어 학습을 멈춰야 한다'는 뜻입니다.
         """
-        nonlocal best_validation_loss, bad_evals, last_eval_step
+        nonlocal best_validation_loss, best_step, bad_evals, last_eval_step
         announce(f"검증 시작 (step {step})", context)
         metrics = evaluate(
             model,
@@ -487,6 +490,7 @@ def train(
         improved = broadcast_bool(improved_here if context.is_main else False, context)
         if improved:
             best_validation_loss = candidate
+            best_step = step
             bad_evals = 0
             announce(
                 f"{selection_name} 최고 기록 갱신 ({selection_value:.4f}) → best 저장",
@@ -768,6 +772,10 @@ def train(
                 f"{selected_weights} weights)를 복원했습니다.",
                 context,
             )
+        else:
+            # A non-finite validation metric can prevent a best checkpoint.
+            # In that exceptional case the live final weights are selected.
+            best_step = step
         announce(
             f"학습 종료: step {step}, best "
             + (
@@ -785,6 +793,8 @@ def train(
 
     result: dict[str, float | int | bool] = {
         "step": step,
+        "best_step": best_step,
+        "selected_step": best_step,
         "epoch": epoch,
         "best_validation_loss": best_validation_loss,
         "early_stopping_bad_evals": bad_evals,

@@ -787,10 +787,10 @@ def main() -> None:
                     f"{memory['after_reserved_gib']:.2f} GiB",
                     context,
                 )
-            final_step = int(posttrain_result["step"])
+            final_step = int(posttrain_result["selected_step"])
         else:
             announce("posttraining.enabled=false — 사후학습을 건너뜁니다.", context)
-            final_step = int(pretrain_result["step"])
+            final_step = int(pretrain_result["selected_step"])
 
         # 중간 best/latest에서는 학습 재개와 빠른 확인에 필요한 경량 포맷만
         # 저장합니다. 모든 학습 단계가 끝난 지금 선택된 best 가중치에서 7종을
