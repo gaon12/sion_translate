@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import types
+
 import pytest
 import torch
 
@@ -74,6 +76,48 @@ def test_forward_backward_all_experimental_modules() -> None:
     assert model.token_embedding.weight.grad is not None
 
 
+def test_auxiliary_loss_masks_are_compile_safe_and_keep_empty_batches_finite() -> None:
+    config = ModelConfig(
+        vocab_size=64,
+        d_model=32,
+        encoder_layers=1,
+        decoder_layers=1,
+        num_heads=4,
+        num_kv_heads=2,
+        d_ff=64,
+        max_seq_len=16,
+        dropout=0.0,
+        gradient_checkpointing=False,
+        experimental=ExperimentalConfig(core_enabled=True),
+    )
+    model = SionForConditionalGeneration(config)
+    batch = {
+        "input_ids": torch.tensor([[4, 5, 3], [4, 6, 3]]),
+        "attention_mask": torch.ones(2, 3, dtype=torch.bool),
+        "decoder_input_ids": torch.tensor([[2, 8, 0], [2, 9, 10]]),
+        "labels": torch.tensor([[8, 3, -100], [9, 10, 3]]),
+        "register_labels": torch.tensor([2, 0]),
+    }
+
+    eager = model(**batch)
+    compiled = torch.compile(model, backend="eager", fullgraph=True)
+    compiled_output = compiled(**batch)
+    torch.testing.assert_close(compiled_output.loss, eager.loss)
+    torch.testing.assert_close(compiled_output.register_loss, eager.register_loss)
+
+    empty_batch = {
+        **batch,
+        "labels": torch.full_like(batch["labels"], -100),
+        "register_labels": torch.zeros_like(batch["register_labels"]),
+    }
+    empty_output = model(**empty_batch)
+    assert empty_output.register_loss.item() == 0.0
+    assert empty_output.auxiliary_loss.item() == 0.0
+    assert torch.isfinite(empty_output.loss)
+    empty_output.loss.backward()
+    assert model.token_embedding.weight.grad is not None
+
+
 def test_greedy_generation() -> None:
     model = SionForConditionalGeneration(tiny_config())
     batch = make_batch()
@@ -110,6 +154,61 @@ def test_stochastic_sampling_returns_multiple_candidates() -> None:
     assert sampled.shape[:2] == (2, 3)
     assert sampled.shape[-1] <= 6
     assert sampled[:, :, 0].eq(2).all()
+
+
+def test_beam_finalization_compares_live_and_completed_hypotheses() -> None:
+    config = ModelConfig(
+        vocab_size=8,
+        d_model=16,
+        encoder_layers=1,
+        decoder_layers=1,
+        num_heads=4,
+        num_kv_heads=2,
+        d_ff=32,
+        max_seq_len=8,
+        dropout=0.0,
+        gradient_checkpointing=False,
+    )
+    model = SionForConditionalGeneration(config)
+
+    def fixed_step(
+        self,
+        tokens,
+        encoder_states,
+        source_mask,
+        caches,
+        position,
+        register_context,
+        **kwargs,
+    ):
+        del encoder_states, source_mask, position, register_context, kwargs
+        total = tokens.shape[0]
+        for cache in caches:
+            zeros = torch.zeros(total, 1, 1, 1)
+            cache["self"] = (zeros, zeros)
+            cache["cross"] = (zeros, zeros)
+        return torch.zeros(total, 1, config.d_model)
+
+    def fixed_logits(self, hidden):
+        del self
+        result = torch.full((*hidden.shape[:-1], config.vocab_size), -20.0)
+        result[..., 4] = 5.0
+        result[..., 3] = 0.0
+        return result
+
+    model._decoder_step = types.MethodType(fixed_step, model)
+    model._logits = types.MethodType(fixed_logits, model)
+    output = model._beam_decode(
+        torch.zeros(1, 2, config.d_model),
+        torch.ones(1, 2, dtype=torch.bool),
+        None,
+        bos_id=2,
+        eos_id=3,
+        max_new_tokens=2,
+        num_beams=2,
+        length_penalty=1.0,
+    )
+    assert output.tolist() == [[2, 4, 4, 3]]
 
 
 @pytest.mark.parametrize("max_new_tokens", (0, -1, 33))

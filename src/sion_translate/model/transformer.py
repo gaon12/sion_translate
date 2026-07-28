@@ -329,21 +329,26 @@ class SionForConditionalGeneration(nn.Module):
         # z-loss: logsumexp(logits)² 에 작은 벌점을 줘 logit 크기가
         # 무한정 커지는 것을 막습니다 (혼합 정밀도 학습 안정화).
         if self.config.z_loss_weight > 0:
-            valid_logits = logits.float().logsumexp(-1)[labels.ne(-100)]
-            if valid_logits.numel() > 0:
-                auxiliary_loss = (
-                    auxiliary_loss + self.config.z_loss_weight * valid_logits.square().mean()
-                )
+            log_normalizer = logits.float().logsumexp(-1)
+            valid_targets = labels.ne(-100).to(dtype=log_normalizer.dtype)
+            z_loss = (log_normalizer.square() * valid_targets).sum()
+            z_loss = z_loss / valid_targets.sum().clamp_min(1.0)
+            auxiliary_loss = auxiliary_loss + self.config.z_loss_weight * z_loss
         register_loss = logits.new_zeros(())
         if register_logits is not None and register_labels is not None:
             known = register_labels > 0
-            if known.any():
-                register_loss = F.cross_entropy(
-                    register_logits[known].float(), register_labels[known]
-                )
-                auxiliary_loss = auxiliary_loss + (
-                    self.config.experimental.register_loss_weight * register_loss
-                )
+            safe_labels = torch.where(known, register_labels, torch.zeros_like(register_labels))
+            register_losses = F.cross_entropy(
+                register_logits.float(),
+                safe_labels,
+                reduction="none",
+            )
+            known_weights = known.to(dtype=register_losses.dtype)
+            register_loss = (register_losses * known_weights).sum()
+            register_loss = register_loss / known_weights.sum().clamp_min(1.0)
+            auxiliary_loss = auxiliary_loss + (
+                self.config.experimental.register_loss_weight * register_loss
+            )
 
         alignment_loss = logits.new_zeros(())
         coverage_loss = logits.new_zeros(())
@@ -762,16 +767,27 @@ class SionForConditionalGeneration(nn.Module):
             if all_done:
                 break
 
-        # batch 별 최고 가설을 고릅니다. 완성 가설이 없으면(길이 제한에 걸림)
-        # 살아있는 beam 중 최고 점수에 EOS 를 붙여 사용합니다.
+        # 길이 제한에 걸린 live beam도 이미 끝난 가설과 함께 비교합니다.
+        # 낮은 확률의 EOS가 일찍 한 번 나왔다는 이유만으로 더 높은 점수의
+        # 진행 중 번역을 버리면 max_new_tokens 경계에서 품질이 역전됩니다.
         outputs: list[torch.Tensor] = []
+        generated_length = max(1, sequences.shape[1] - 1)
         for b in range(batch):
-            if done[b]:
-                outputs.append(max(done[b], key=lambda item: item[0])[1])
-            else:
-                best = int(beam_scores[b].argmax())
-                seq = sequences[b * num_beams + best]
-                outputs.append(torch.cat((seq, torch.tensor([eos_id], device=device))))
+            hypotheses = list(done[b])
+            for beam_index in range(num_beams):
+                raw_score = float(beam_scores[b, beam_index])
+                if raw_score == float("-inf"):
+                    continue
+                sequence = sequences[b * num_beams + beam_index]
+                hypotheses.append(
+                    (
+                        penalized(raw_score, generated_length),
+                        torch.cat((sequence, torch.tensor([eos_id], device=device))),
+                    )
+                )
+            if not hypotheses:
+                raise RuntimeError("beam search did not produce a finite hypothesis")
+            outputs.append(max(hypotheses, key=lambda item: item[0])[1])
         longest = max(len(seq) for seq in outputs)
         padded = torch.full((batch, longest), eos_id, dtype=torch.long, device=device)
         for b, seq in enumerate(outputs):
