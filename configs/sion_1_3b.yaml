@@ -7,12 +7,14 @@ model:
   d_ff: 4096
   max_seq_len: 2048
   dropout: 0.1
-  gradient_checkpointing: true
+  # A 1.3B model with BF16 activations and FP32 Adam states fits on an 80GB
+  # H100 at this sequence/batch budget; recomputation only lowers utilization.
+  gradient_checkpointing: false
   experimental:
     bats_enabled: true
     bats_dim: 256
     bats_loss_weight: 0.0
-    bats_coverage_weight: 0.0
+    bats_coverage_weight: 0.01
     bats_stride: 2
     bats_max_positions: 1024
     core_enabled: true
@@ -37,13 +39,13 @@ data:
 training:
   output_dir: runs/sion-1.3b
   max_steps: 40000
-  batch_size_per_gpu: 8
-  gradient_accumulation_steps: 2
+  batch_size_per_gpu: 16
+  gradient_accumulation_steps: 1
   learning_rate: 0.0002
   warmup_steps: 800
   precision: bf16
-  compile: false
-  parallel_strategy: fsdp2
+  compile: true
+  parallel_strategy: ddp
   fsdp_reduce_dtype: bf16
   log_every: 10
   eval_every: 1000

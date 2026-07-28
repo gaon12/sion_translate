@@ -12,7 +12,7 @@ model:
     bats_enabled: true
     bats_dim: 32
     bats_loss_weight: 0.0
-    bats_coverage_weight: 0.0
+    bats_coverage_weight: 0.01
     bats_stride: 1
     bats_max_positions: 128
     core_enabled: true

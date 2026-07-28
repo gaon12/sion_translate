@@ -42,10 +42,11 @@ data:
 training:
   output_dir: runs/sion-data-fit
   seed: 20260711
-  # On 8 GPUs this is an effective batch of 256 sequences/update.
+  # H100 80GB: use the headroom observed with batch 16. On 8 GPUs this remains
+  # an effective batch of 256 sequences/update without an extra accumulation pass.
   max_steps: 120000
-  batch_size_per_gpu: 16
-  gradient_accumulation_steps: 2
+  batch_size_per_gpu: 32
+  gradient_accumulation_steps: 1
   learning_rate: 0.0003
   min_learning_rate_ratio: 0.10
   warmup_steps: 3000
@@ -55,7 +56,7 @@ training:
   adam_eps: 0.00000001
   grad_clip: 1.0
   precision: bf16
-  compile: false
+  compile: true
   parallel_strategy: ddp
   fsdp_reduce_dtype: bf16
   log_every: 20
