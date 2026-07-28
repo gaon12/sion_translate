@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from sion_translate.config import ExperimentalConfig, ModelConfig
@@ -109,6 +110,23 @@ def test_stochastic_sampling_returns_multiple_candidates() -> None:
     assert sampled.shape[:2] == (2, 3)
     assert sampled.shape[-1] <= 6
     assert sampled[:, :, 0].eq(2).all()
+
+
+@pytest.mark.parametrize("max_new_tokens", (0, -1, 33))
+def test_native_generation_rejects_invalid_lengths(max_new_tokens: int) -> None:
+    model = SionForConditionalGeneration(tiny_config())
+    batch = make_batch()
+    common = {
+        "input_ids": batch["input_ids"],
+        "attention_mask": batch["attention_mask"],
+        "bos_id": 2,
+        "eos_id": 3,
+        "max_new_tokens": max_new_tokens,
+    }
+    with pytest.raises(ValueError, match="max_new_tokens"):
+        model.generate(**common)
+    with pytest.raises(ValueError, match="max_new_tokens"):
+        model.sample(**common, num_samples=1)
 
 
 def test_tied_embedding_output() -> None:

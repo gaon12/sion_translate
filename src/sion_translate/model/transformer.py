@@ -241,6 +241,33 @@ class SionForConditionalGeneration(nn.Module):
             return self.lm_head(hidden)
         return F.linear(hidden, self.token_embedding.weight)
 
+    def _apply_typed_memory(
+        self,
+        decoder_states: torch.Tensor,
+        *,
+        memory_token_ids: torch.Tensor | None = None,
+        memory_mask: torch.Tensor | None = None,
+        memory_type_ids: torch.Tensor | None = None,
+        memory_mode_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if (
+            self.typed_memory is None
+            or memory_token_ids is None
+            or memory_mask is None
+            or memory_type_ids is None
+            or memory_mode_ids is None
+        ):
+            return decoder_states
+        return self.typed_memory(
+            decoder_states,
+            self.token_embedding,
+            memory_token_ids,
+            memory_type_ids,
+            memory_mode_ids,
+            memory_mask,
+            self.pad_id,
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -278,22 +305,13 @@ class SionForConditionalGeneration(nn.Module):
             attention_mask,
             register_context=register_context,
         )
-        if (
-            self.typed_memory is not None
-            and memory_token_ids is not None
-            and memory_mask is not None
-            and memory_type_ids is not None
-            and memory_mode_ids is not None
-        ):
-            decoder_states = self.typed_memory(
-                decoder_states,
-                self.token_embedding,
-                memory_token_ids,
-                memory_type_ids,
-                memory_mode_ids,
-                memory_mask,
-                self.pad_id,
-            )
+        decoder_states = self._apply_typed_memory(
+            decoder_states,
+            memory_token_ids=memory_token_ids,
+            memory_mask=memory_mask,
+            memory_type_ids=memory_type_ids,
+            memory_mode_ids=memory_mode_ids,
+        )
         logits = self._logits(decoder_states)
 
         if labels is None:
@@ -368,6 +386,11 @@ class SionForConditionalGeneration(nn.Module):
         caches: list[dict[str, tuple[torch.Tensor, torch.Tensor] | None]],
         position: int,
         register_context: torch.Tensor | None,
+        *,
+        memory_token_ids: torch.Tensor | None = None,
+        memory_mask: torch.Tensor | None = None,
+        memory_type_ids: torch.Tensor | None = None,
+        memory_mode_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """KV cache 를 사용해 새 토큰 1개를 디코딩합니다 (추론 전용).
 
@@ -386,7 +409,14 @@ class SionForConditionalGeneration(nn.Module):
                 cross_kv=cache["cross"],
                 position_offset=position,
             )
-        return self.decoder_norm(hidden)
+        hidden = self.decoder_norm(hidden)
+        return self._apply_typed_memory(
+            hidden,
+            memory_token_ids=memory_token_ids,
+            memory_mask=memory_mask,
+            memory_type_ids=memory_type_ids,
+            memory_mode_ids=memory_mode_ids,
+        )
 
     @staticmethod
     def _fresh_caches(layer_count: int) -> list[dict[str, Any]]:
@@ -403,6 +433,10 @@ class SionForConditionalGeneration(nn.Module):
         max_new_tokens: int = 256,
         num_beams: int = 1,
         length_penalty: float = 1.0,
+        memory_token_ids: torch.Tensor | None = None,
+        memory_mask: torch.Tensor | None = None,
+        memory_type_ids: torch.Tensor | None = None,
+        memory_mode_ids: torch.Tensor | None = None,
         **encoder_features: torch.Tensor,
     ) -> torch.Tensor:
         """번역문 생성.
@@ -414,6 +448,13 @@ class SionForConditionalGeneration(nn.Module):
         두 경로 모두 KV cache 를 사용해 토큰당 비용이 문장 길이에 선형입니다
         (이전 구현은 매 토큰마다 prefix 전체를 다시 계산했습니다).
         """
+        if not isinstance(max_new_tokens, int) or isinstance(max_new_tokens, bool):
+            raise TypeError("max_new_tokens must be an integer")
+        if not 1 <= max_new_tokens <= self.config.max_seq_len:
+            raise ValueError(
+                "max_new_tokens must be between 1 and "
+                f"model max_seq_len ({self.config.max_seq_len})"
+            )
         was_training = self.training
         self.eval()
         try:
@@ -431,6 +472,10 @@ class SionForConditionalGeneration(nn.Module):
                     bos_id=bos_id,
                     eos_id=eos_id,
                     max_new_tokens=max_new_tokens,
+                    memory_token_ids=memory_token_ids,
+                    memory_mask=memory_mask,
+                    memory_type_ids=memory_type_ids,
+                    memory_mode_ids=memory_mode_ids,
                 )
             return self._beam_decode(
                 encoder_states,
@@ -441,6 +486,10 @@ class SionForConditionalGeneration(nn.Module):
                 max_new_tokens=max_new_tokens,
                 num_beams=num_beams,
                 length_penalty=length_penalty,
+                memory_token_ids=memory_token_ids,
+                memory_mask=memory_mask,
+                memory_type_ids=memory_type_ids,
+                memory_mode_ids=memory_mode_ids,
             )
         finally:
             self.train(was_training)
@@ -458,9 +507,21 @@ class SionForConditionalGeneration(nn.Module):
         temperature: float = 1.0,
         top_k: int = 0,
         forbidden_token_ids: tuple[int, ...] = (),
+        generator: torch.Generator | None = None,
+        memory_token_ids: torch.Tensor | None = None,
+        memory_mask: torch.Tensor | None = None,
+        memory_type_ids: torch.Tensor | None = None,
+        memory_mode_ids: torch.Tensor | None = None,
         **encoder_features: torch.Tensor,
     ) -> torch.Tensor:
         """MRT용 확률적 후보를 ``(batch, samples, length)``로 생성합니다."""
+        if not isinstance(max_new_tokens, int) or isinstance(max_new_tokens, bool):
+            raise TypeError("max_new_tokens must be an integer")
+        if not 1 <= max_new_tokens <= self.config.max_seq_len:
+            raise ValueError(
+                "max_new_tokens must be between 1 and "
+                f"model max_seq_len ({self.config.max_seq_len})"
+            )
         if num_samples < 1:
             raise ValueError("num_samples must be positive")
         if temperature <= 0:
@@ -480,6 +541,14 @@ class SionForConditionalGeneration(nn.Module):
             source_mask = attention_mask.repeat_interleave(num_samples, dim=0)
             if register_context is not None:
                 register_context = register_context.repeat_interleave(num_samples, dim=0)
+            if memory_token_ids is not None:
+                memory_token_ids = memory_token_ids.repeat_interleave(num_samples, dim=0)
+            if memory_mask is not None:
+                memory_mask = memory_mask.repeat_interleave(num_samples, dim=0)
+            if memory_type_ids is not None:
+                memory_type_ids = memory_type_ids.repeat_interleave(num_samples, dim=0)
+            if memory_mode_ids is not None:
+                memory_mode_ids = memory_mode_ids.repeat_interleave(num_samples, dim=0)
 
             total = input_ids.shape[0] * num_samples
             caches = self._fresh_caches(len(self.decoder_layers))
@@ -488,7 +557,16 @@ class SionForConditionalGeneration(nn.Module):
             finished = torch.zeros(total, dtype=torch.bool, device=input_ids.device)
             for position in range(max_new_tokens):
                 hidden = self._decoder_step(
-                    current, encoder_states, source_mask, caches, position, register_context
+                    current,
+                    encoder_states,
+                    source_mask,
+                    caches,
+                    position,
+                    register_context,
+                    memory_token_ids=memory_token_ids,
+                    memory_mask=memory_mask,
+                    memory_type_ids=memory_type_ids,
+                    memory_mode_ids=memory_mode_ids,
                 )
                 logits = self._logits(hidden[:, -1]).float() / temperature
                 if forbidden_token_ids:
@@ -496,7 +574,11 @@ class SionForConditionalGeneration(nn.Module):
                 if 0 < top_k < logits.shape[-1]:
                     threshold = logits.topk(top_k, dim=-1).values[:, -1:]
                     logits = logits.masked_fill(logits < threshold, float("-inf"))
-                next_token = torch.multinomial(torch.softmax(logits, dim=-1), 1)
+                next_token = torch.multinomial(
+                    torch.softmax(logits, dim=-1),
+                    1,
+                    generator=generator,
+                )
                 next_token = torch.where(finished[:, None], eos_id, next_token)
                 pieces.append(next_token)
                 finished |= next_token.squeeze(1).eq(eos_id)
@@ -517,6 +599,10 @@ class SionForConditionalGeneration(nn.Module):
         bos_id: int,
         eos_id: int,
         max_new_tokens: int,
+        memory_token_ids: torch.Tensor | None = None,
+        memory_mask: torch.Tensor | None = None,
+        memory_type_ids: torch.Tensor | None = None,
+        memory_mode_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch = encoder_states.shape[0]
         device = encoder_states.device
@@ -526,7 +612,16 @@ class SionForConditionalGeneration(nn.Module):
         finished = torch.zeros(batch, dtype=torch.bool, device=device)
         for position in range(max_new_tokens):
             hidden = self._decoder_step(
-                current, encoder_states, source_mask, caches, position, register_context
+                current,
+                encoder_states,
+                source_mask,
+                caches,
+                position,
+                register_context,
+                memory_token_ids=memory_token_ids,
+                memory_mask=memory_mask,
+                memory_type_ids=memory_type_ids,
+                memory_mode_ids=memory_mode_ids,
             )
             next_token = self._logits(hidden[:, -1:]).argmax(-1)
             # 이미 끝난 문장은 EOS 를 반복해 길이만 맞춥니다.
@@ -549,6 +644,10 @@ class SionForConditionalGeneration(nn.Module):
         max_new_tokens: int,
         num_beams: int,
         length_penalty: float,
+        memory_token_ids: torch.Tensor | None = None,
+        memory_mask: torch.Tensor | None = None,
+        memory_type_ids: torch.Tensor | None = None,
+        memory_mode_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """배치 beam search.
 
@@ -566,6 +665,14 @@ class SionForConditionalGeneration(nn.Module):
         source_mask = source_mask.repeat_interleave(num_beams, dim=0)
         if register_context is not None:
             register_context = register_context.repeat_interleave(num_beams, dim=0)
+        if memory_token_ids is not None:
+            memory_token_ids = memory_token_ids.repeat_interleave(num_beams, dim=0)
+        if memory_mask is not None:
+            memory_mask = memory_mask.repeat_interleave(num_beams, dim=0)
+        if memory_type_ids is not None:
+            memory_type_ids = memory_type_ids.repeat_interleave(num_beams, dim=0)
+        if memory_mode_ids is not None:
+            memory_mode_ids = memory_mode_ids.repeat_interleave(num_beams, dim=0)
 
         caches = self._fresh_caches(len(self.decoder_layers))
         sequences = torch.full((total, 1), bos_id, dtype=torch.long, device=device)
@@ -582,7 +689,16 @@ class SionForConditionalGeneration(nn.Module):
 
         for position in range(max_new_tokens):
             hidden = self._decoder_step(
-                sequences[:, -1:], encoder_states, source_mask, caches, position, register_context
+                sequences[:, -1:],
+                encoder_states,
+                source_mask,
+                caches,
+                position,
+                register_context,
+                memory_token_ids=memory_token_ids,
+                memory_mask=memory_mask,
+                memory_type_ids=memory_type_ids,
+                memory_mode_ids=memory_mode_ids,
             )
             log_probs = F.log_softmax(self._logits(hidden[:, -1]).float(), dim=-1)
             vocab = log_probs.shape[-1]

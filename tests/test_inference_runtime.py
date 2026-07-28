@@ -1,0 +1,397 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+
+import numpy as np
+import pytest
+import torch
+
+import sion_translate.inference as inference
+from sion_translate.config import ExperimentalConfig, ModelConfig
+from sion_translate.model import SionForConditionalGeneration
+
+
+class FakeTokenizer:
+    pad_id = 0
+    unk_id = 1
+    bos_id = 2
+    eos_id = 3
+    mask_id = 6
+    language_tags = {"ja": 4, "ko": 5}
+    denoise_tags = {"ja": 7, "ko": 8}
+    slot_ids = [20]
+    draft_id = 9
+    splits_digits = True
+    languages = ("ja", "ko")
+
+    def __init__(self, _path):
+        pass
+
+    def __len__(self):
+        return 64
+
+    @staticmethod
+    def encode(_text):
+        return [20, 11]
+
+    @staticmethod
+    def decode(ids):
+        return " ".join(map(str, ids))
+
+
+class MultilingualFakeTokenizer(FakeTokenizer):
+    language_tags = {"ja": 4, "ko": 5, "en": 12, "ru": 13}
+    denoise_tags = {"ja": 7, "ko": 8, "en": 14, "ru": 15}
+    languages = ("ja", "ko", "en", "ru")
+
+
+def runtime_config(*, experimental: ExperimentalConfig | None = None) -> ModelConfig:
+    return ModelConfig(
+        vocab_size=64,
+        d_model=32,
+        encoder_layers=1,
+        decoder_layers=1,
+        num_heads=4,
+        num_kv_heads=2,
+        d_ff=64,
+        max_seq_len=16,
+        dropout=0.0,
+        gradient_checkpointing=False,
+        experimental=experimental or ExperimentalConfig(),
+    )
+
+
+def make_translator(
+    monkeypatch,
+    tmp_path: Path,
+    config: ModelConfig,
+    *,
+    revision_trained: bool | None = False,
+    language_pairs: tuple[tuple[str, str], ...] = (("ko", "ja"),),
+    tokenizer_class: type[FakeTokenizer] = FakeTokenizer,
+    quantization: dict[str, object] | None = None,
+    feature_sha256: str | None = None,
+    feature_filename: str = "token_features.npz",
+    explicit_features: bool = True,
+    device: str = "cpu",
+) -> inference.Translator:
+    tokenizer_path = tmp_path / "tokenizer.model"
+    tokenizer_path.write_bytes(b"fake tokenizer")
+    digest = hashlib.sha256(tokenizer_path.read_bytes()).hexdigest()
+    model = SionForConditionalGeneration(config)
+    features = tmp_path / feature_filename
+    zeros = np.zeros(64, dtype=np.uint8)
+    np.savez_compressed(
+        features,
+        script=zeros,
+        onset=zeros,
+        vowel=zeros,
+        coda=zeros,
+    )
+    metadata: dict[str, object] = {
+        "tokenizer": {"sha256": digest},
+        "token_features": {
+            "filename": features.name,
+            "size": features.stat().st_size,
+            "sha256": feature_sha256 or hashlib.sha256(features.read_bytes()).hexdigest(),
+        },
+        "language_pairs": [list(pair) for pair in language_pairs],
+        "feature_flags": {
+            "bats": config.experimental.bats_enabled,
+            "core": config.experimental.core_enabled,
+            "tetm": config.experimental.tetm_enabled,
+            "morphoscript": config.experimental.morphoscript_enabled,
+            "recurrent_block": False,
+        },
+        "capabilities": {"revision_trained": revision_trained},
+        "legacy": False,
+        "format": "fp32",
+    }
+    if quantization is not None:
+        metadata["quantization"] = quantization
+    monkeypatch.setattr(inference, "SionTokenizer", tokenizer_class)
+    monkeypatch.setattr(
+        inference,
+        "load_exported_model",
+        lambda *_args, **_kwargs: (model, config, 0, metadata),
+    )
+    return inference.Translator(
+        tmp_path / "model.pt",
+        tokenizer_path,
+        device=device,
+        token_features_path=features if explicit_features else None,
+    )
+
+
+def test_translator_connects_morphoscript_and_typed_memory(monkeypatch, tmp_path: Path) -> None:
+    config = runtime_config(
+        experimental=ExperimentalConfig(
+            tetm_enabled=True,
+            morphoscript_enabled=True,
+            morphoscript_interval=1,
+        )
+    )
+    translator = make_translator(monkeypatch, tmp_path, config)
+    morph_calls: list[int] = []
+    memory_calls: list[int] = []
+    morph_hook = translator.model.morphoscript.register_forward_hook(
+        lambda *_args: morph_calls.append(1)
+    )
+    memory_hook = translator.model.typed_memory.register_forward_hook(
+        lambda *_args: memory_calls.append(1)
+    )
+    try:
+        output = translator.translate(
+            ["용어"],
+            target_language="ja",
+            num_beams=1,
+            max_new_tokens=2,
+            batch_size=1,
+        )
+    finally:
+        morph_hook.remove()
+        memory_hook.remove()
+    assert len(output) == 1
+    assert morph_calls
+    assert memory_calls
+
+
+def test_translator_validates_generation_lengths(monkeypatch, tmp_path: Path) -> None:
+    translator = make_translator(monkeypatch, tmp_path, runtime_config())
+    monkeypatch.setattr(
+        translator.model,
+        "generate",
+        lambda input_ids, *_args, **_kwargs: torch.tensor([[2, 3]]).expand(input_ids.shape[0], -1),
+    )
+    assert translator.translate(
+        ["문장"],
+        target_language="ja",
+        max_new_tokens=translator.model_config.max_seq_len,
+    )
+    with pytest.raises(ValueError, match="batch_size"):
+        translator.translate(["문장"], target_language="ja", batch_size=0)
+    with pytest.raises(ValueError, match="max_new_tokens"):
+        translator.translate(
+            ["문장"],
+            target_language="ja",
+            max_new_tokens=translator.model_config.max_seq_len + 1,
+        )
+
+
+def test_revision_requires_exported_training_capability(monkeypatch, tmp_path: Path) -> None:
+    translator = make_translator(
+        monkeypatch,
+        tmp_path,
+        runtime_config(),
+        revision_trained=False,
+    )
+    with pytest.raises(ValueError, match="revision capability"):
+        translator.revise(
+            ["원문"],
+            ["초안"],
+            target_language="ja",
+            max_new_tokens=2,
+        )
+
+
+def test_translator_rejects_model_tokenizer_vocab_mismatch(monkeypatch, tmp_path: Path) -> None:
+    config = runtime_config()
+    config.vocab_size = 65
+    with pytest.raises(ValueError, match="tokenizer vocab"):
+        make_translator(monkeypatch, tmp_path, config)
+
+
+def test_find_exported_model_preserves_best_semantic_priority(tmp_path: Path) -> None:
+    exports = tmp_path / "run" / "posttrain" / "exports"
+
+    def write_export(stage: str, timestamp: float) -> Path:
+        directory = exports / stage
+        directory.mkdir(parents=True)
+        artifact = directory / "model.pt"
+        artifact.touch()
+        (directory / "export_manifest.json").write_text(
+            json.dumps(
+                {
+                    "created_unix": timestamp,
+                    "formats": {
+                        "fp32": {
+                            "status": "ok",
+                            "file": artifact.name,
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        return artifact
+
+    best = write_export("best", 10.0)
+    write_export("latest", 20.0)
+    assert inference.find_exported_model(tmp_path / "run") == best
+
+
+def test_translator_sampling_seed_builds_reproducible_generator(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    translator = make_translator(monkeypatch, tmp_path, runtime_config())
+    draws: list[torch.Tensor] = []
+
+    def sample(*_args, generator: torch.Generator, **_kwargs) -> torch.Tensor:
+        draws.append(torch.randint(0, 1_000_000, (8,), generator=generator))
+        return torch.tensor([[[2, 3]]])
+
+    monkeypatch.setattr(translator.model, "sample", sample)
+    kwargs = {
+        "target_language": "ja",
+        "num_beams": 1,
+        "max_new_tokens": 2,
+        "batch_size": 1,
+        "num_candidates": 1,
+    }
+    translator.translate(["문장"], seed=41, **kwargs)
+    translator.translate(["문장"], sampling_seed=41, **kwargs)
+    translator.translate(["문장"], seed=42, **kwargs)
+    torch.testing.assert_close(draws[0], draws[1])
+    assert not torch.equal(draws[0], draws[2])
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        translator.translate(
+            ["문장"],
+            seed=41,
+            generator=torch.Generator(),
+            **kwargs,
+        )
+
+
+def test_native_sampling_generator_is_reproducible() -> None:
+    model = SionForConditionalGeneration(runtime_config())
+    input_ids = torch.tensor([[4, 11, 3]])
+    attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+    kwargs = {
+        "bos_id": 2,
+        "eos_id": 3,
+        "num_samples": 2,
+        "max_new_tokens": 3,
+        "temperature": 0.8,
+        "top_k": 16,
+    }
+    first = model.sample(
+        input_ids,
+        attention_mask,
+        generator=torch.Generator().manual_seed(123),
+        **kwargs,
+    )
+    second = model.sample(
+        input_ids,
+        attention_mask,
+        generator=torch.Generator().manual_seed(123),
+        **kwargs,
+    )
+    torch.testing.assert_close(first, second)
+
+
+def test_disconnected_multilingual_graph_rejects_untrained_direction(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    translator = make_translator(
+        monkeypatch,
+        tmp_path,
+        runtime_config(),
+        language_pairs=(("ko", "ja"), ("en", "ru")),
+        tokenizer_class=MultilingualFakeTokenizer,
+    )
+    with pytest.raises(ValueError, match="학습되지 않은 번역 방향"):
+        translator.translate(
+            ["문장"],
+            source_language="ko",
+            target_language="ru",
+            max_new_tokens=2,
+        )
+
+
+def test_cpu_only_quantization_metadata_overrides_requested_cuda(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    with pytest.warns(RuntimeWarning, match="CPU 전용"):
+        translator = make_translator(
+            monkeypatch,
+            tmp_path,
+            runtime_config(),
+            quantization={"backend": "torchao", "runtime_device": "cpu"},
+            device="cuda",
+        )
+    assert translator.device == torch.device("cpu")
+    assert translator.quantized
+
+
+def test_typed_memory_matches_training_slot_cap(monkeypatch, tmp_path: Path) -> None:
+    translator = make_translator(
+        monkeypatch,
+        tmp_path,
+        runtime_config(experimental=ExperimentalConfig(tetm_enabled=True)),
+    )
+    features = translator._generation_features(torch.full((1, 100), 20, dtype=torch.long))
+    assert features["memory_token_ids"].shape == (1, 64, 1)
+    assert int(features["memory_mask"].sum()) == 64
+
+
+def test_token_feature_identity_mismatch_is_rejected(monkeypatch, tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="token feature SHA256"):
+        make_translator(
+            monkeypatch,
+            tmp_path,
+            runtime_config(
+                experimental=ExperimentalConfig(
+                    morphoscript_enabled=True,
+                    morphoscript_interval=1,
+                )
+            ),
+            feature_sha256="0" * 64,
+        )
+
+
+def test_token_features_follow_export_metadata_filename(monkeypatch, tmp_path: Path) -> None:
+    translator = make_translator(
+        monkeypatch,
+        tmp_path,
+        runtime_config(
+            experimental=ExperimentalConfig(
+                morphoscript_enabled=True,
+                morphoscript_interval=1,
+            )
+        ),
+        feature_filename="custom_morphoscript_features.npz",
+        explicit_features=False,
+    )
+    assert translator.token_features is not None
+    assert set(translator.token_features) == {"script", "onset", "vowel", "coda"}
+
+
+def test_unknown_legacy_revision_capability_warns_but_remains_usable(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    translator = make_translator(
+        monkeypatch,
+        tmp_path,
+        runtime_config(),
+        revision_trained=None,
+    )
+    monkeypatch.setattr(
+        translator,
+        "translate",
+        lambda texts, **_kwargs: list(texts),
+    )
+    with pytest.warns(RuntimeWarning, match="기록되어 있지 않습니다"):
+        revised = translator.revise(
+            ["원문"],
+            ["초안"],
+            target_language="ja",
+            max_new_tokens=2,
+        )
+    assert revised == ["원문 <draft> 초안"]
