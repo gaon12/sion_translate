@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 from pathlib import Path
@@ -11,7 +12,12 @@ import numpy as np
 import pytest
 import torch
 from safetensors import safe_open
-from transformers import AutoConfig, AutoModelForSeq2SeqLM, AutoTokenizer
+from transformers import (
+    AutoConfig,
+    AutoModelForSeq2SeqLM,
+    AutoTokenizer,
+    DataCollatorForSeq2Seq,
+)
 
 from sion_translate.config import ModelConfig
 from sion_translate.hf import (
@@ -45,12 +51,18 @@ def tiny_model_config(vocab_size: int = 128) -> ModelConfig:
     )
 
 
-def train_tiny_tokenizer(tmp_path: Path) -> Path:
+def train_tiny_tokenizer(
+    tmp_path: Path,
+    *,
+    language_pairs: list[tuple[str, str]] | None = None,
+) -> Path:
     source = tmp_path / "parallel.jsonl"
     rows = [
         {
             "ko": f"한국어 체크포인트 예문 {index}입니다.",
             "ja": f"日本語チェックポイント例文{index}です。",
+            "en": f"English checkpoint sentence {index}.",
+            "ru": f"Русское предложение контрольной точки {index}.",
         }
         for index in range(40)
     ]
@@ -66,6 +78,7 @@ def train_tiny_tokenizer(tmp_path: Path) -> Path:
         seed_sentencepiece_size=1000,
         validation_fraction=0.0,
         test_fraction=0.0,
+        language_pairs=language_pairs,
         num_workers=1,
         num_threads=1,
     )
@@ -172,6 +185,7 @@ def test_transformers_checkpoint_auto_classes_and_safe_weights(
     )
     assert remote_model.__class__.__module__.startswith("transformers_modules.")
     assert remote_tokenizer.__class__.__module__.startswith("transformers_modules.")
+    assert remote_model.model.__class__.__module__.startswith("transformers_modules.")
     assert remote_model.config.slot_token_ids == tokenizer.slot_ids
     assert remote_model.config.token_features_shapes == {
         "script": [len(tokenizer)],
@@ -234,6 +248,56 @@ def test_transformers_checkpoint_auto_classes_and_safe_weights(
         "memory_type_ids",
         "memory_mode_ids",
     } <= captured_generate.keys()
+    trainer_style = local_model.generate(
+        **encoded,
+        labels=torch.tensor([[11, 3]]),
+        max_new_tokens=2,
+        generation_config=local_model.generation_config,
+        synced_gpus=False,
+    )
+    assert trainer_style.shape == (1, 3)
+    inputs_alias = local_model.generate(
+        inputs=encoded.input_ids,
+        attention_mask=encoded.attention_mask,
+        max_new_tokens=2,
+    )
+    assert inputs_alias.shape == (1, 3)
+    with pytest.raises(ValueError, match="only one of inputs or input_ids"):
+        local_model.generate(
+            inputs=encoded.input_ids,
+            input_ids=encoded.input_ids,
+            max_new_tokens=2,
+        )
+    with pytest.raises(NotImplementedError, match="synced_gpus=True"):
+        local_model.generate(**encoded, max_new_tokens=2, synced_gpus=True)
+    attention_config = copy.deepcopy(local_model.generation_config)
+    attention_config.output_attentions = True
+    with pytest.raises(NotImplementedError, match="output_attentions"):
+        local_model.generate(
+            **encoded,
+            max_new_tokens=2,
+            generation_config=attention_config,
+        )
+
+    collator = DataCollatorForSeq2Seq(
+        tokenizer=local_tokenizer,
+        model=local_model,
+        return_tensors="pt",
+    )
+    collated = collator(
+        [
+            local_tokenizer("짧은 문장"),
+            local_tokenizer("길이가 서로 다른 문장을 표준 collator로 묶습니다."),
+        ]
+    )
+    assert collated["src_script_ids"].shape == collated["input_ids"].shape
+    assert collated["memory_token_ids"].shape[:2] == (2, 1)
+    assert not collated["memory_mask"].any()
+    tokenizer_copy = tmp_path / "tokenizer-copy"
+    local_tokenizer.save_pretrained(tokenizer_copy)
+    assert (tokenizer_copy / "token_features.npz").is_file()
+    reloaded_copy = AutoTokenizer.from_pretrained(tokenizer_copy, trust_remote_code=True)
+    assert reloaded_copy.token_features is not None
 
     captured_sample: dict[str, object] = {}
     native_sample = local_model.model.sample
@@ -387,6 +451,33 @@ def test_transformers_export_rejects_incompatible_tokenizer_and_features(
             config,
             tokenizer_path=tokenizer_path,
             token_features_path=wrong_features,
+        )
+
+
+def test_transformers_tokenizer_rejects_disconnected_language_edge(tmp_path: Path) -> None:
+    tokenizer_path = train_tiny_tokenizer(
+        tmp_path,
+        language_pairs=[("ko", "ja"), ("en", "ru")],
+    )
+    tokenizer = NativeSionTokenizer(tokenizer_path)
+    config = tiny_model_config(len(tokenizer))
+    native = NativeSionForConditionalGeneration(config, pad_id=tokenizer.pad_id)
+    output_dir = tmp_path / "multilingual-transformers"
+    save_transformers_checkpoint(
+        output_dir,
+        native.state_dict(),
+        config,
+        pad_id=tokenizer.pad_id,
+        tokenizer_path=tokenizer_path,
+        language_pairs=[("ko", "ja"), ("en", "ru")],
+    )
+    restored = AutoTokenizer.from_pretrained(output_dir, trust_remote_code=True)
+    with pytest.raises(ValueError, match="unsupported translation edge"):
+        restored._build_translation_inputs(
+            "연결되지 않은 방향",
+            return_tensors="pt",
+            src_lang="ko",
+            tgt_lang="ru",
         )
 
 

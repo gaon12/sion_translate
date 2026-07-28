@@ -217,6 +217,41 @@ def test_transformers_directory_hash_is_deterministic_and_tamper_evident(
     assert invalid["formats"]["transformers"]["error_type"] == "RuntimeError"
 
 
+def test_transformers_export_rejects_broken_bundled_remote_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sion_translate.hf import conversion as hf_conversion
+
+    config = export_config()
+    model = SionForConditionalGeneration(config)
+    original_save = hf_conversion.save_transformers_checkpoint
+
+    def corrupt_remote_code(output_dir, *args, **kwargs):
+        destination = original_save(output_dir, *args, **kwargs)
+        (Path(output_dir) / "modeling_sion.py").write_text(
+            "this is not valid Python !!!\n",
+            encoding="utf-8",
+        )
+        return destination
+
+    monkeypatch.setattr(
+        hf_conversion,
+        "save_transformers_checkpoint",
+        corrupt_remote_code,
+    )
+    manifest = export_state_dict_formats(
+        tmp_path,
+        model.state_dict(),
+        config,
+        0,
+        formats=("transformers",),
+    )
+    entry = manifest["formats"]["transformers"]
+    assert entry["status"] == "error"
+    assert entry["error_type"] in {"RuntimeError", "SyntaxError"}
+
+
 def test_validator_requires_v2_integrity_fields(tmp_path: Path) -> None:
     config = export_config()
     model = SionForConditionalGeneration(config)

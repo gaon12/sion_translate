@@ -16,7 +16,6 @@ from transformers import PreTrainedTokenizer
 
 _FEATURE_NAMES = ("script", "onset", "vowel", "coda")
 _FEATURE_MAXIMUM_IDS = {
-    "script": 9,
     "onset": 20,
     "vowel": 22,
     "coda": 29,
@@ -61,6 +60,8 @@ class SionTokenizer(PreTrainedTokenizer):
         token_features_sha256: str | None = None,
         tokenizer_sha256: str | None = None,
         slot_token_ids: list[int] | tuple[int, ...] | None = None,
+        language_pairs: list[list[str]] | tuple[tuple[str, str], ...] | None = None,
+        script_classes: int = 9,
         tetm_type_id: int = 8,
         tetm_mode_id: int = 4,
         **kwargs: Any,
@@ -102,6 +103,24 @@ class SionTokenizer(PreTrainedTokenizer):
                 )
         self.slot_token_ids = discovered_slot_ids
         self._slot_token_id_set = frozenset(discovered_slot_ids)
+        self.language_pairs: list[list[str]] = []
+        seen_pairs: set[frozenset[str]] = set()
+        for raw_pair in language_pairs or ():
+            pair = [str(language) for language in raw_pair]
+            edge = frozenset(pair)
+            if (
+                len(pair) != 2
+                or len(edge) != 2
+                or any(language not in self.language_tags for language in pair)
+            ):
+                raise ValueError(f"invalid tokenizer language pair: {raw_pair!r}")
+            if edge not in seen_pairs:
+                seen_pairs.add(edge)
+                self.language_pairs.append(pair)
+        self._language_pair_edges = seen_pairs
+        self.script_classes = int(script_classes)
+        if self.script_classes < 1:
+            raise ValueError("script_classes must be positive")
         self.tetm_type_id = int(tetm_type_id)
         self.tetm_mode_id = int(tetm_mode_id)
         if self.tetm_type_id < 0 or self.tetm_mode_id < 0:
@@ -158,6 +177,8 @@ class SionTokenizer(PreTrainedTokenizer):
         kwargs.setdefault("token_features_sha256", actual_features_sha256)
         kwargs.setdefault("tokenizer_sha256", actual_tokenizer_sha256)
         kwargs.setdefault("slot_token_ids", self.slot_token_ids)
+        kwargs.setdefault("language_pairs", self.language_pairs)
+        kwargs.setdefault("script_classes", self.script_classes)
         kwargs.setdefault("tetm_type_id", self.tetm_type_id)
         kwargs.setdefault("tetm_mode_id", self.tetm_mode_id)
         super().__init__(**kwargs)
@@ -180,13 +201,9 @@ class SionTokenizer(PreTrainedTokenizer):
                 if not np.issubdtype(values.dtype, np.integer):
                     raise ValueError(f"token feature {name} must use an integer dtype")
                 values = values.astype(np.int64, copy=True)
-                if values.size and (
-                    int(values.min()) < 0 or int(values.max()) >= _FEATURE_MAXIMUM_IDS[name]
-                ):
-                    raise ValueError(
-                        f"token feature {name} contains IDs outside "
-                        f"[0, {_FEATURE_MAXIMUM_IDS[name]})"
-                    )
+                maximum_id = self.script_classes if name == "script" else _FEATURE_MAXIMUM_IDS[name]
+                if values.size and (int(values.min()) < 0 or int(values.max()) >= maximum_id):
+                    raise ValueError(f"token feature {name} contains IDs outside [0, {maximum_id})")
                 values.setflags(write=False)
                 features[name] = values
         return features
@@ -298,6 +315,54 @@ class SionTokenizer(PreTrainedTokenizer):
         encoding = super().__call__(*args, **kwargs)
         return self._add_native_features(encoding, return_tensors=return_tensors)
 
+    def pad(
+        self,
+        encoded_inputs: Any,
+        padding: bool | str = True,
+        max_length: int | None = None,
+        pad_to_multiple_of: int | None = None,
+        padding_side: str | None = None,
+        return_attention_mask: bool | None = None,
+        return_tensors: Any = None,
+        verbose: bool = True,
+    ):
+        """Pad standard fields first, then rebuild Sion's derived tensors.
+
+        Individual tokenizer calls contain source features whose sequence
+        lengths and typed-memory slot counts differ.  The base collator cannot
+        infer two independent padding axes, so discard those deterministic
+        fields and derive them again from the padded ``input_ids`` batch.
+        """
+
+        native_names = set(_MODEL_FEATURE_NAMES.values()) | {
+            "memory_token_ids",
+            "memory_mask",
+            "memory_type_ids",
+            "memory_mode_ids",
+        }
+        if isinstance(encoded_inputs, (list, tuple)):
+            stripped: Any = [
+                {name: value for name, value in dict(item).items() if name not in native_names}
+                for item in encoded_inputs
+            ]
+        else:
+            stripped = {
+                name: value
+                for name, value in dict(encoded_inputs).items()
+                if name not in native_names
+            }
+        encoding = super().pad(
+            stripped,
+            padding=padding,
+            max_length=max_length,
+            pad_to_multiple_of=pad_to_multiple_of,
+            padding_side=padding_side,
+            return_attention_mask=return_attention_mask,
+            return_tensors=return_tensors,
+            verbose=verbose,
+        )
+        return self._add_native_features(encoding, return_tensors=return_tensors)
+
     @property
     def vocab_size(self) -> int:
         return int(self.sp_model.vocab_size())
@@ -368,6 +433,12 @@ class SionTokenizer(PreTrainedTokenizer):
                 f"unsupported translation direction {src_lang}-{tgt_lang}; "
                 f"available={sorted(self.language_tags)}"
             )
+        if self._language_pair_edges and frozenset((src_lang, tgt_lang)) not in (
+            self._language_pair_edges
+        ):
+            raise ValueError(
+                f"unsupported translation edge {src_lang}-{tgt_lang}; trained={self.language_pairs}"
+            )
         self.src_lang = src_lang
         self.tgt_lang = tgt_lang
         return self(raw_inputs, add_special_tokens=True, return_tensors=return_tensors, **kwargs)
@@ -383,4 +454,8 @@ class SionTokenizer(PreTrainedTokenizer):
         destination = directory / filename
         if Path(self.vocab_file).resolve() != destination.resolve():
             shutil.copyfile(self.vocab_file, destination)
+        if self._token_features_path is not None:
+            feature_destination = directory / self._token_features_path.name
+            if self._token_features_path.resolve() != feature_destination.resolve():
+                shutil.copyfile(self._token_features_path, feature_destination)
         return (str(destination),)

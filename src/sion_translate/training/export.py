@@ -413,32 +413,108 @@ def _inspect_transformers_checkpoint(path: Path) -> dict[str, Any]:
     except ImportError as error:
         raise RuntimeError("safetensors is required for Transformers validation") from error
 
-    from sion_translate.hf.configuration_sion import SionConfig
+    try:
+        from transformers.dynamic_module_utils import get_class_from_dynamic_module
+    except ImportError as error:
+        raise RuntimeError("transformers is required for checkpoint validation") from error
 
-    config = SionConfig.from_pretrained(path)
+    config_payload = json.loads((path / "config.json").read_text(encoding="utf-8"))
+    auto_map = config_payload.get("auto_map")
+    if not isinstance(auto_map, Mapping):
+        raise RuntimeError("Transformers checkpoint is missing its remote-code auto_map")
+
+    def load_remote_class(auto_class: str, mapping: Mapping[str, Any]) -> type:
+        reference = mapping.get(auto_class)
+        if isinstance(reference, Sequence) and not isinstance(reference, (str, bytes)):
+            reference = next((item for item in reference if isinstance(item, str)), None)
+        if not isinstance(reference, str):
+            raise RuntimeError(f"Transformers checkpoint is missing auto_map.{auto_class}")
+        return get_class_from_dynamic_module(
+            reference,
+            path,
+            local_files_only=True,
+        )
+
+    remote_config_class = load_remote_class("AutoConfig", auto_map)
+    config = remote_config_class.from_pretrained(path)
     weight_files = sorted(path.glob("model*.safetensors"))
     if not weight_files:
         raise RuntimeError("Transformers checkpoint has no model*.safetensors weights")
     tensor_count = 0
     tensor_names: set[str] = set()
     dtypes: set[str] = set()
+    tensor_shapes: dict[str, tuple[int, ...]] = {}
     for weight_file in weight_files:
         with safe_open(weight_file, framework="pt", device="cpu") as handle:
             names = list(handle.keys())
             tensor_count += len(names)
             tensor_names.update(names)
-            dtypes.update(str(handle.get_tensor(name).dtype) for name in names)
+            for name in names:
+                tensor_slice = handle.get_slice(name)
+                serialized_dtype = str(tensor_slice.get_dtype())
+                dtypes.add(
+                    {
+                        "F32": "torch.float32",
+                        "F16": "torch.float16",
+                        "BF16": "torch.bfloat16",
+                    }.get(serialized_dtype, serialized_dtype)
+                )
+                tensor_shapes[name] = tuple(tensor_slice.get_shape())
     if "model.token_embedding.weight" not in tensor_names:
         raise RuntimeError("Transformers checkpoint is missing model.token_embedding.weight")
     if (path / "tokenizer.model").is_file():
-        from sion_translate.hf.tokenization_sion import SionTokenizer
+        tokenizer_payload = json.loads((path / "tokenizer_config.json").read_text(encoding="utf-8"))
+        tokenizer_auto_map = tokenizer_payload.get("auto_map")
+        if not isinstance(tokenizer_auto_map, Mapping):
+            raise RuntimeError("Transformers tokenizer is missing its remote-code auto_map")
+        remote_tokenizer_class = load_remote_class("AutoTokenizer", tokenizer_auto_map)
+        remote_tokenizer = remote_tokenizer_class.from_pretrained(path)
+        if not remote_tokenizer.__class__.__module__.startswith("transformers_modules."):
+            raise RuntimeError(
+                "Transformers checkpoint imported an installed tokenizer instead of bundled code"
+            )
+        del remote_tokenizer
 
-        SionTokenizer.from_pretrained(path)
+    # Import the exact bundled remote code and materialize its architecture on
+    # the meta device. This catches syntax/import/API drift and verifies every
+    # safetensors key and shape without allocating a second 8B/32B CPU model.
+    remote_model_class = load_remote_class("AutoModelForSeq2SeqLM", auto_map)
+    with torch.device("meta"):
+        remote_model = remote_model_class(config)
+    expected_state = remote_model.state_dict()
+    expected_names = set(expected_state)
+    if tensor_names != expected_names:
+        missing = sorted(expected_names - tensor_names)
+        unexpected = sorted(tensor_names - expected_names)
+        raise RuntimeError(
+            "Transformers state dictionary does not match bundled model code: "
+            f"missing={missing[:8]}, unexpected={unexpected[:8]}"
+        )
+    mismatched_shapes = {
+        name: (tensor_shapes[name], tuple(expected_state[name].shape))
+        for name in tensor_names
+        if tensor_shapes[name] != tuple(expected_state[name].shape)
+    }
+    if mismatched_shapes:
+        raise RuntimeError(
+            "Transformers tensor shapes do not match bundled model code: "
+            f"{dict(list(sorted(mismatched_shapes.items()))[:8])}"
+        )
+    runtime_model_class = (
+        f"{remote_model.model.__class__.__module__}.{remote_model.model.__class__.__qualname__}"
+    )
+    if not remote_model.model.__class__.__module__.startswith("transformers_modules."):
+        raise RuntimeError(
+            "Transformers checkpoint imported an installed Sion runtime instead of bundled code"
+        )
+    del remote_model, expected_state
+    gc.collect()
     return {
         "tensor_count": tensor_count,
         "weight_files": len(weight_files),
         "dtypes": sorted(dtypes),
         "model_type": config.model_type,
+        "runtime_model_class": runtime_model_class,
         "languages": list(config.languages),
         "language_pairs": [list(pair) for pair in config.language_pairs],
     }

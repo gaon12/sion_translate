@@ -9,7 +9,7 @@ import torch
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 from transformers import PreTrainedModel
-from transformers.generation import GenerationMixin
+from transformers.generation import GenerationConfig, GenerationMixin
 from transformers.generation.utils import GenerateEncoderDecoderOutput
 from transformers.modeling_outputs import Seq2SeqLMOutput
 
@@ -101,6 +101,16 @@ class SionForConditionalGeneration(PreTrainedModel, GenerationMixin):
         attention_mask: torch.Tensor | None = None,
         decoder_input_ids: torch.Tensor | None = None,
         labels: torch.Tensor | None = None,
+        register_labels: torch.Tensor | None = None,
+        memory_token_ids: torch.Tensor | None = None,
+        memory_mask: torch.Tensor | None = None,
+        memory_type_ids: torch.Tensor | None = None,
+        memory_mode_ids: torch.Tensor | None = None,
+        src_script_ids: torch.Tensor | None = None,
+        src_onset_ids: torch.Tensor | None = None,
+        src_vowel_ids: torch.Tensor | None = None,
+        src_coda_ids: torch.Tensor | None = None,
+        alignment_targets: torch.Tensor | None = None,
         return_dict: bool | None = None,
         **kwargs: Any,
     ) -> Seq2SeqLMOutput | tuple[torch.Tensor, ...]:
@@ -110,21 +120,22 @@ class SionForConditionalGeneration(PreTrainedModel, GenerationMixin):
             if labels is None:
                 raise ValueError("decoder_input_ids or labels must be provided")
             decoder_input_ids = self.prepare_decoder_input_ids_from_labels(labels)
+        del kwargs
         supported = {
-            name: kwargs[name]
-            for name in (
-                "register_labels",
-                "memory_token_ids",
-                "memory_mask",
-                "memory_type_ids",
-                "memory_mode_ids",
-                "src_script_ids",
-                "src_onset_ids",
-                "src_vowel_ids",
-                "src_coda_ids",
-                "alignment_targets",
+            name: value
+            for name, value in (
+                ("register_labels", register_labels),
+                ("memory_token_ids", memory_token_ids),
+                ("memory_mask", memory_mask),
+                ("memory_type_ids", memory_type_ids),
+                ("memory_mode_ids", memory_mode_ids),
+                ("src_script_ids", src_script_ids),
+                ("src_onset_ids", src_onset_ids),
+                ("src_vowel_ids", src_vowel_ids),
+                ("src_coda_ids", src_coda_ids),
+                ("alignment_targets", alignment_targets),
             )
-            if name in kwargs
+            if value is not None
         }
         native = self.model(
             input_ids=input_ids,
@@ -337,25 +348,110 @@ class SionForConditionalGeneration(PreTrainedModel, GenerationMixin):
         *,
         max_new_tokens: int | None = None,
         max_length: int | None = None,
-        num_beams: int = 1,
-        length_penalty: float = 1.0,
-        do_sample: bool = False,
-        temperature: float = 1.0,
-        top_k: int = 0,
-        num_return_sequences: int = 1,
-        return_dict_in_generate: bool = False,
-        output_scores: bool = False,
+        num_beams: int | None = None,
+        length_penalty: float | None = None,
+        do_sample: bool | None = None,
+        temperature: float | None = None,
+        top_k: int | None = None,
+        num_return_sequences: int | None = None,
+        return_dict_in_generate: bool | None = None,
+        output_scores: bool | None = None,
         generator: torch.Generator | None = None,
+        generation_config: GenerationConfig | None = None,
+        synced_gpus: bool | None = None,
         **kwargs: Any,
     ) -> torch.Tensor | GenerateEncoderDecoderOutput:
+        inputs = kwargs.pop("inputs", None)
+        if inputs is not None:
+            if input_ids is not None:
+                raise ValueError("pass only one of inputs or input_ids")
+            input_ids = inputs
         if input_ids is None:
-            raise ValueError("input_ids must be provided")
+            raise ValueError("inputs or input_ids must be provided")
         if attention_mask is None:
             attention_mask = input_ids.ne(int(self.config.pad_token_id))
+        active_generation_config = generation_config or self.generation_config
+        explicit_temperature = temperature is not None
+        explicit_top_k = top_k is not None
+        unsupported_non_neutral = {
+            name: getattr(active_generation_config, name)
+            for name, neutral in (
+                ("top_p", 1.0),
+                ("typical_p", 1.0),
+                ("epsilon_cutoff", 0.0),
+                ("eta_cutoff", 0.0),
+                ("repetition_penalty", 1.0),
+                ("encoder_repetition_penalty", 1.0),
+                ("no_repeat_ngram_size", 0),
+                ("diversity_penalty", 0.0),
+                ("num_beam_groups", 1),
+                ("min_length", 0),
+                ("early_stopping", False),
+                ("remove_invalid_values", False),
+                ("renormalize_logits", False),
+                ("token_healing", False),
+                ("output_attentions", False),
+                ("output_hidden_states", False),
+                ("output_logits", False),
+                ("return_legacy_cache", False),
+            )
+            if hasattr(active_generation_config, name)
+            and getattr(active_generation_config, name) not in (None, neutral)
+        }
+        for name in (
+            "min_p",
+            "penalty_alpha",
+            "bad_words_ids",
+            "force_words_ids",
+            "constraints",
+            "min_new_tokens",
+            "forced_bos_token_id",
+            "forced_eos_token_id",
+            "exponential_decay_length_penalty",
+            "suppress_tokens",
+            "begin_suppress_tokens",
+            "sequence_bias",
+            "guidance_scale",
+            "watermarking_config",
+            "stop_strings",
+            "max_time",
+            "cache_implementation",
+            "cache_config",
+        ):
+            value = getattr(active_generation_config, name, None)
+            if value not in (None, 0, False, (), [], {}):
+                unsupported_non_neutral[name] = value
+        if unsupported_non_neutral:
+            raise NotImplementedError(
+                "unsupported Sion generation_config options: "
+                + ", ".join(sorted(unsupported_non_neutral))
+            )
+
+        def configured(value: Any, name: str, fallback: Any) -> Any:
+            if value is not None:
+                return value
+            configured_value = getattr(active_generation_config, name, None)
+            return fallback if configured_value is None else configured_value
+
+        num_beams = int(configured(num_beams, "num_beams", 1))
+        length_penalty = float(configured(length_penalty, "length_penalty", 1.0))
+        do_sample = bool(configured(do_sample, "do_sample", False))
+        temperature = float(configured(temperature, "temperature", 1.0))
+        top_k = int(configured(top_k, "top_k", 0))
+        num_return_sequences = int(configured(num_return_sequences, "num_return_sequences", 1))
+        return_dict_in_generate = bool(
+            configured(return_dict_in_generate, "return_dict_in_generate", False)
+        )
+        output_scores = bool(configured(output_scores, "output_scores", False))
         if output_scores:
             raise NotImplementedError(
                 "Sion native generation does not expose per-step scores; "
                 "output_scores=True is unsupported"
+            )
+        if synced_gpus:
+            raise NotImplementedError(
+                "synced_gpus=True is unsupported by Sion native generation; "
+                "run prediction with synchronized input counts instead"
             )
         unsupported = {
             name
@@ -392,29 +488,54 @@ class SionForConditionalGeneration(PreTrainedModel, GenerationMixin):
             ("eos_token_id", int(self.config.eos_token_id)),
             ("pad_token_id", int(self.config.pad_token_id)),
         ):
-            if name in kwargs:
-                value = kwargs.pop(name)
+            value = (
+                kwargs.pop(name)
+                if name in kwargs
+                else getattr(active_generation_config, name, None)
+            )
+            if value is not None:
                 if isinstance(value, (list, tuple)) or int(value) != expected:
                     raise ValueError(
                         f"{name}={value!r} does not match the checkpoint value {expected}"
                     )
-        if "use_cache" in kwargs and not bool(kwargs.pop("use_cache")):
+        use_cache = (
+            kwargs.pop("use_cache")
+            if "use_cache" in kwargs
+            else getattr(active_generation_config, "use_cache", True)
+        )
+        if use_cache is False:
             raise NotImplementedError("use_cache=False is unsupported by Sion native generation")
         for no_op_name in ("output_logits", "return_legacy_cache"):
             if no_op_name in kwargs and bool(kwargs.pop(no_op_name)):
                 raise NotImplementedError(f"{no_op_name}=True is unsupported")
+        for no_op_name in ("output_attentions", "output_hidden_states"):
+            if no_op_name in kwargs and bool(kwargs.pop(no_op_name)):
+                raise NotImplementedError(f"{no_op_name}=True is unsupported")
+        # Seq2SeqTrainer forwards labels to generate during prediction. They
+        # constrain neither encoder input nor free-running decoder generation.
+        kwargs.pop("labels", None)
 
         if max_new_tokens is not None and max_length is not None:
             raise ValueError("set only one of max_new_tokens or max_length")
+        if max_new_tokens is None and max_length is None:
+            configured_new_tokens = getattr(active_generation_config, "max_new_tokens", None)
+            if configured_new_tokens is not None:
+                max_new_tokens = int(configured_new_tokens)
+            else:
+                configured_max_length = getattr(active_generation_config, "max_length", None)
+                max_length = 20 if configured_max_length is None else int(configured_max_length)
         if max_length is not None:
             if max_length < 2:
                 raise ValueError("max_length must be at least 2 because output starts with BOS")
             max_new_tokens = max_length - 1
-        elif max_new_tokens is None:
-            configured_max_length = int(getattr(self.generation_config, "max_length", 20))
-            max_new_tokens = configured_max_length - 1
+        assert max_new_tokens is not None
         if max_new_tokens < 1:
             raise ValueError("max_new_tokens must be positive")
+        if max_new_tokens > self.model.config.max_seq_len:
+            raise ValueError(
+                "max_new_tokens exceeds model max_seq_len: "
+                f"{max_new_tokens} > {self.model.config.max_seq_len}"
+            )
         if num_beams < 1:
             raise ValueError("num_beams must be positive")
         if num_return_sequences < 1:
@@ -431,7 +552,9 @@ class SionForConditionalGeneration(PreTrainedModel, GenerationMixin):
             )
         if not do_sample and num_beams == 1 and num_return_sequences != 1:
             raise ValueError("greedy generation supports only num_return_sequences=1")
-        if not do_sample and (temperature != 1.0 or top_k != 0):
+        if not do_sample and (
+            (explicit_temperature and temperature != 1.0) or (explicit_top_k and top_k != 0)
+        ):
             raise ValueError("temperature and top_k only apply when do_sample=True")
         if do_sample and length_penalty != 1.0:
             raise ValueError("length_penalty only applies to deterministic beam search")

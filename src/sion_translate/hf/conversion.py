@@ -272,6 +272,8 @@ def save_transformers_checkpoint(
             token_features_sha256=token_features_sha256,
             tokenizer_sha256=tokenizer_sha256,
             slot_token_ids=slot_token_ids,
+            language_pairs=pairs,
+            script_classes=model_config.experimental.script_classes,
             tetm_type_id=min(8, model_config.experimental.tetm_types - 1),
             tetm_mode_id=min(4, model_config.experimental.tetm_modes - 1),
         )
@@ -290,28 +292,45 @@ def save_transformers_checkpoint(
     ):
         source = (module_dir / filename).read_text(encoding="utf-8")
         if filename == "configuration_sion.py":
-            dynamic_fallback = (
+            installed_fallback = (
+                "try:\n"
+                "    from sion_translate.config import ExperimentalConfig, ModelConfig\n"
+                "except ImportError:\n"
+                "    # ``save_transformers_checkpoint`` writes this small runtime module next to\n"
+                "    # the remote-code files.  Keeping the fallback in a relative import lets a\n"
+                "    # Hub checkpoint load without installing the Sion source package.\n"
                 "    from importlib import import_module\n\n"
                 '    _native_config = import_module(f"{__package__}.sion_native_config")\n'
                 "    ExperimentalConfig = _native_config.ExperimentalConfig\n"
-                "    ModelConfig = _native_config.ModelConfig"
+                "    ModelConfig = _native_config.ModelConfig\n"
             )
+            if installed_fallback not in source:
+                raise RuntimeError("could not rewrite configuration_sion.py for remote loading")
             source = source.replace(
-                dynamic_fallback,
-                "    from .sion_native_config import ExperimentalConfig, ModelConfig",
+                installed_fallback,
+                "from .sion_native_config import ExperimentalConfig, ModelConfig\n",
             )
         elif filename == "modeling_sion.py":
-            dynamic_fallback = (
+            installed_fallback = (
+                "try:\n"
+                "    from sion_translate.model import (\n"
+                "        SionForConditionalGeneration as NativeSionForConditionalGeneration,\n"
+                "    )\n"
+                "except ImportError:\n"
+                "    # Remote checkpoints contain the native runtime under relative module names,\n"
+                "    # so only torch/transformers are needed when sion-translate is not installed.\n"
                 "    from importlib import import_module\n\n"
                 "    NativeSionForConditionalGeneration = import_module(\n"
                 '        f"{__package__}.sion_native_transformer"\n'
-                "    ).SionForConditionalGeneration"
+                "    ).SionForConditionalGeneration\n"
             )
+            if installed_fallback not in source:
+                raise RuntimeError("could not rewrite modeling_sion.py for remote loading")
             source = source.replace(
-                dynamic_fallback,
-                "    from .sion_native_transformer import (\n"
-                "        SionForConditionalGeneration as NativeSionForConditionalGeneration,\n"
-                "    )",
+                installed_fallback,
+                "from .sion_native_transformer import (\n"
+                "    SionForConditionalGeneration as NativeSionForConditionalGeneration,\n"
+                ")\n",
             )
         (output_dir / filename).write_text(source, encoding="utf-8")
     runtime_files = _copy_self_contained_runtime(output_dir)
