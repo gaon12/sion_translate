@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+import sion_translate.cli.train as train_module
 from sion_translate.cli.train import (
+    construct_training_model,
     dataloader_runtime_kwargs,
     export_final_model,
     find_existing_checkpoint,
@@ -345,6 +348,44 @@ def test_h100_capacity_gate_requires_four_gpus_for_8b_and_sixteen_for_32b() -> N
     )
     assert thirty_two_billion is not None
     assert thirty_two_billion["minimum_world_size"] == 16
+
+
+def test_single_gpu_capacity_gate_runs_before_parameter_materialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    construction_devices: list[str] = []
+
+    class OversizedModel(torch.nn.Module):
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.empty(1))
+            construction_devices.append(self.weight.device.type)
+
+        @staticmethod
+        def parameter_count() -> int:
+            return 32_083_082_800
+
+    monkeypatch.setattr(train_module, "SionForConditionalGeneration", OversizedModel)
+    monkeypatch.setattr(
+        train_module.torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(total_memory=80 * 2**30),
+    )
+    context = DistributedContext(
+        rank=0,
+        local_rank=0,
+        world_size=1,
+        device=torch.device("cuda"),
+        distributed=False,
+    )
+    with pytest.raises(RuntimeError, match="Switch to FSDP2"):
+        construct_training_model(
+            AppConfig(),
+            context,
+            pad_id=0,
+            parallel_strategy="single",
+        )
+    assert construction_devices == ["meta"]
 
 
 def test_existing_checkpoint_search_covers_stage_directories(tmp_path: Path) -> None:

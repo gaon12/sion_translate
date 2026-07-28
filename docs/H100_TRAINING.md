@@ -170,12 +170,14 @@ NCCL, 저장 장치, 처리량을 검증한 뒤 전체 작업을 시작한다. �
 | 각 GPU에 전체 모델이 들어감 | `ddp` | `sion_data_fit`, `sion_1_3b` | parameter all-gather가 없어 보통 더 빠름 |
 | 전체 모델/optimizer가 한 GPU에 안 들어감 | `fsdp2` | `sion_8b`, `sion_32b` | layer 단위 parameter·gradient·optimizer state sharding |
 
-모델을 실제 할당하기 전에 FP32 master parameter, gradient, AdamW 1·2차 moment,
-선택적 FP32 EMA를 합산한다. BF16 layer all-gather, activation, 커널 임시공간,
-CUDA context를 위해 GPU VRAM의 51% 이상을 남기는 보수적 gate다. 이 계산에서
-8B는 2×80GB, 32B는 8×80GB를 명시적으로 거부하며 각각 최소 4장과 16장을
-안내한다. 32B를 더 적은 GPU로 실행하려면 EMA 비활성화만으로 충분하다고
-가정하지 말고 optimizer/offload 정책까지 별도 구현·검증해야 한다.
+모든 CUDA 전략은 먼저 meta device에 저장 공간 없는 모델을 만들고 FP32 master
+parameter, gradient, AdamW 1·2차 moment, 선택적 FP32 EMA를 합산한다. 따라서
+single/DDP의 과대 모델도 실제 GPU constructor OOM 전에 명확한 용량 오류로
+종료한다. BF16 layer all-gather, activation, 커널 임시공간, CUDA context를 위해
+GPU VRAM의 51% 이상을 남기는 보수적 gate다. 이 계산에서 8B는 2×80GB, 32B는
+8×80GB를 명시적으로 거부하며 각각 최소 4장과 16장을 안내한다. 32B를 더 적은
+GPU로 실행하려면 EMA 비활성화만으로 충분하다고 가정하지 말고 optimizer/offload
+정책까지 별도 구현·검증해야 한다.
 
 H100에서는 `precision: bf16`과 `fsdp_reduce_dtype: bf16`을 사용한다. FSDP2의
 `reshard_after_forward: true`는 메모리를 줄이는 대신 다음 backward/forward 전에

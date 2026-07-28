@@ -224,6 +224,34 @@ def validate_training_capacity(
     return report
 
 
+def construct_training_model(
+    config: AppConfig,
+    context: DistributedContext,
+    *,
+    pad_id: int,
+    parallel_strategy: str,
+) -> tuple[
+    SionForConditionalGeneration,
+    int,
+    dict[str, float | int] | None,
+    bool,
+]:
+    """Count and capacity-check CUDA models before allocating parameter storage."""
+
+    materialize_meta = context.device.type == "cuda"
+    construction_device: torch.device | str = "meta" if materialize_meta else context.device
+    with torch.device(construction_device):
+        model = SionForConditionalGeneration(config.model, pad_id=pad_id)
+    parameter_count = model.parameter_count()
+    capacity = validate_training_capacity(
+        parameter_count,
+        context,
+        parallel_strategy=parallel_strategy,
+        ema_enabled=config.training.ema_decay > 0,
+    )
+    return model, parameter_count, capacity, materialize_meta
+
+
 def export_final_model(
     model: torch.nn.Module,
     config: AppConfig,
@@ -695,23 +723,19 @@ def main() -> None:
 
         # ── 모델 생성과 분산 배치 ────────────────────────────────────────
         announce("모델을 생성하고 장치에 배치합니다.", context)
-        # FSDP2 에서는 meta device 로 '빈 모델'을 먼저 만들고, shard 이후에
-        # 실제 메모리를 할당해 대형 모델도 rank 당 메모리 한도 안에서 생성합니다.
+        # 모든 CUDA 전략은 meta device에서 파라미터 수와 영구 상태 용량을 먼저
+        # 검사합니다. 통과한 뒤에만 single/DDP는 전체 모델을, FSDP2는 shard를
+        # 실제 GPU에 할당하므로 과대 구성도 constructor OOM보다 명확히 실패합니다.
         parallel_strategy = resolve_parallel_strategy(
             config.training.parallel_strategy,
             context,
             legacy_fsdp2=config.training.fsdp2,
         )
-        materialize_meta = parallel_strategy == "fsdp2"
-        construction_device = "meta" if materialize_meta else context.device
-        with torch.device(construction_device):
-            model = SionForConditionalGeneration(config.model, pad_id=tokenizer.pad_id)
-        parameter_count = model.parameter_count()
-        capacity = validate_training_capacity(
-            parameter_count,
+        model, parameter_count, capacity, materialize_meta = construct_training_model(
+            config,
             context,
+            pad_id=tokenizer.pad_id,
             parallel_strategy=parallel_strategy,
-            ema_enabled=config.training.ema_decay > 0,
         )
         # SFT와 MRT가 같은 DDP wrapper를 공유하므로 단계 전환 뒤의 파라미터
         # 사용 집합까지 고려해 static_graph 사용 여부를 정합니다.
