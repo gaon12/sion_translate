@@ -25,6 +25,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8.3", "ruff>=0.8"]
 baselines = []
+export = ["gguf>=0.19", "torchao>=0.17"]
 
 [project.urls]
 Repository = "https://github.com/gaon12/sion_translate"
@@ -43,6 +44,7 @@ sion-compare = "sion_translate.cli.compare:main"
 sion-concat = "sion_translate.cli.concat:main"
 sion-revise-data = "sion_translate.cli.revise_data:main"
 sion-translate-cases = "sion_translate.cli.translate_cases:main"
+sion-export = "sion_translate.cli.export:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
