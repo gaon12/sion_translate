@@ -1,3 +1,4 @@
+# Capacity-gate baseline: at least 4×80GB H100 with FP32 AdamW state and EMA.
 model:
   d_model: 3072
   encoder_layers: 30

@@ -13,6 +13,7 @@ from sion_translate.cli.train import (
     requires_ddp_unused_parameter_detection,
     shutdown_dataloader,
     tokenizer_policy_problem,
+    validate_training_capacity,
 )
 from sion_translate.config import AppConfig, config_from_raw
 from sion_translate.fingerprint import file_sha256
@@ -296,6 +297,54 @@ def test_ddp_unused_parameter_detection_covers_bats_stage_transition() -> None:
     config.model.experimental.bats_enabled = False
     config.posttraining.enabled = True
     assert requires_ddp_unused_parameter_detection(config) is False
+
+
+def test_h100_capacity_gate_requires_four_gpus_for_8b_and_sixteen_for_32b() -> None:
+    def context(world_size: int) -> DistributedContext:
+        return DistributedContext(
+            rank=0,
+            local_rank=0,
+            world_size=world_size,
+            device=torch.device("cuda"),
+            distributed=True,
+            backend="nccl",
+        )
+
+    with pytest.raises(RuntimeError, match="at least 4 GPUs"):
+        validate_training_capacity(
+            8_000_000_000,
+            context(2),
+            parallel_strategy="fsdp2",
+            ema_enabled=True,
+            per_gpu_vram_gib=80.0,
+        )
+    eight_billion = validate_training_capacity(
+        8_000_000_000,
+        context(4),
+        parallel_strategy="fsdp2",
+        ema_enabled=True,
+        per_gpu_vram_gib=80.0,
+    )
+    assert eight_billion is not None
+    assert eight_billion["per_rank_state_gib"] < eight_billion["state_budget_gib"]
+
+    with pytest.raises(RuntimeError, match="at least 16 GPUs"):
+        validate_training_capacity(
+            32_083_082_800,
+            context(8),
+            parallel_strategy="fsdp2",
+            ema_enabled=True,
+            per_gpu_vram_gib=80.0,
+        )
+    thirty_two_billion = validate_training_capacity(
+        32_083_082_800,
+        context(16),
+        parallel_strategy="fsdp2",
+        ema_enabled=True,
+        per_gpu_vram_gib=80.0,
+    )
+    assert thirty_two_billion is not None
+    assert thirty_two_billion["minimum_world_size"] == 16
 
 
 def test_existing_checkpoint_search_covers_stage_directories(tmp_path: Path) -> None:

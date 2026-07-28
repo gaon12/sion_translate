@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import copy
 import gc
+import math
 import random
 from pathlib import Path
 from typing import Any
@@ -165,6 +166,62 @@ def requires_ddp_unused_parameter_detection(config: AppConfig) -> bool:
     # used by supervised losses become unused after the SFT stage. The same
     # DDP wrapper spans both stages and therefore cannot use a static graph.
     return unused_during_sft or config.posttraining.enabled
+
+
+def validate_training_capacity(
+    parameter_count: int,
+    context: DistributedContext,
+    *,
+    parallel_strategy: str,
+    ema_enabled: bool,
+    per_gpu_vram_gib: float | None = None,
+) -> dict[str, float | int] | None:
+    """Fail before allocation when persistent training state consumes H100 headroom."""
+
+    if parameter_count <= 0:
+        raise ValueError("parameter_count must be positive")
+    if per_gpu_vram_gib is None:
+        if context.device.type != "cuda":
+            return None
+        per_gpu_vram_gib = torch.cuda.get_device_properties(context.device).total_memory / 2**30
+    if per_gpu_vram_gib <= 0:
+        raise ValueError("per_gpu_vram_gib must be positive")
+
+    # FP32 master parameter + gradient + AdamW first/second moments = 16 B.
+    # EMA adds another FP32 shard. Reserve just over half of VRAM for BF16 layer
+    # all-gathers, activations, temporary kernels, and the CUDA context.
+    bytes_per_parameter = 16 + (4 if ema_enabled else 0)
+    sharding_factor = context.world_size if parallel_strategy == "fsdp2" else 1
+    total_state_gib = parameter_count * bytes_per_parameter / 2**30
+    per_rank_state_gib = total_state_gib / sharding_factor
+    state_budget_gib = per_gpu_vram_gib * 0.49
+    minimum_world_size = (
+        math.ceil(total_state_gib / state_budget_gib)
+        if parallel_strategy == "fsdp2"
+        else context.world_size
+    )
+    report: dict[str, float | int] = {
+        "bytes_per_parameter": bytes_per_parameter,
+        "total_state_gib": total_state_gib,
+        "per_rank_state_gib": per_rank_state_gib,
+        "state_budget_gib": state_budget_gib,
+        "minimum_world_size": minimum_world_size,
+    }
+    if per_rank_state_gib > state_budget_gib:
+        strategy_hint = (
+            f"Use at least {minimum_world_size} GPUs with FSDP2"
+            if parallel_strategy == "fsdp2"
+            else "Switch to FSDP2 or use a smaller model"
+        )
+        ema_hint = ", disable EMA (training.ema_decay=0)" if ema_enabled else ""
+        raise RuntimeError(
+            "Estimated persistent training state leaves insufficient accelerator "
+            f"headroom: {per_rank_state_gib:.1f} GiB/rank versus a "
+            f"{state_budget_gib:.1f} GiB safety budget on {per_gpu_vram_gib:.1f} GiB GPUs. "
+            f"{strategy_hint}{ema_hint}, or use an explicitly validated lower-memory "
+            "optimizer/offload policy."
+        )
+    return report
 
 
 def export_final_model(
@@ -650,6 +707,12 @@ def main() -> None:
         with torch.device(construction_device):
             model = SionForConditionalGeneration(config.model, pad_id=tokenizer.pad_id)
         parameter_count = model.parameter_count()
+        capacity = validate_training_capacity(
+            parameter_count,
+            context,
+            parallel_strategy=parallel_strategy,
+            ema_enabled=config.training.ema_decay > 0,
+        )
         # SFT와 MRT가 같은 DDP wrapper를 공유하므로 단계 전환 뒤의 파라미터
         # 사용 집합까지 고려해 static_graph 사용 여부를 정합니다.
         detect_unused_parameters = requires_ddp_unused_parameter_detection(config)
@@ -672,6 +735,13 @@ def main() -> None:
             f"모델 파라미터 수: {parameter_count:,}; 병렬 전략: {parallel_strategy}",
             context,
         )
+        if capacity is not None:
+            announce(
+                "영구 학습 상태 추정: "
+                f"rank당 {capacity['per_rank_state_gib']:.1f} GiB / "
+                f"안전 예산 {capacity['state_budget_gib']:.1f} GiB",
+                context,
+            )
 
         # ── 단계 ⑥: SFT 사전학습 ───────────────────────────────────────
         announce("1단계 SFT 사전학습을 시작합니다.", context)
