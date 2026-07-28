@@ -267,13 +267,15 @@ class SwiGLU(nn.Module):
     def gated_activations(self, x: torch.Tensor) -> torch.Tensor:
         gate = self.gate_proj(x)
         up = self.up_proj(x)
-        if self.gate_beta is None or self.up_beta is None:
+        gate_beta = getattr(self, "gate_beta", None)
+        up_beta = getattr(self, "up_beta", None)
+        if gate_beta is None or up_beta is None:
             return F.silu(gate) * up
         # SiTU(z) = sigmoid(z) * beta_1*tanh(z/beta_1), while the
         # up branch is beta_2*tanh(z/beta_2). With 4/25 the product is
         # smoothly bounded by 100 but matches SwiGLU to first order at zero.
-        capped_gate = torch.sigmoid(gate) * self.gate_beta * torch.tanh(gate / self.gate_beta)
-        capped_up = self.up_beta * torch.tanh(up / self.up_beta)
+        capped_gate = torch.sigmoid(gate) * gate_beta * torch.tanh(gate / gate_beta)
+        capped_up = up_beta * torch.tanh(up / up_beta)
         return capped_gate * capped_up
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

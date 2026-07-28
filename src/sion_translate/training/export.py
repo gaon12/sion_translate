@@ -13,13 +13,16 @@ storage/interchange artifact rather than a falsely advertised llama.cpp model.
 from __future__ import annotations
 
 import copy
+from contextlib import contextmanager
 import gc
 import hashlib
 import json
 import math
 import os
 import shutil
+import sys
 import time
+import types
 import uuid
 import zipfile
 from collections.abc import Mapping, Sequence
@@ -34,6 +37,7 @@ from torch import nn
 
 from sion_translate.config import ExperimentalConfig, ModelConfig
 from sion_translate.model import SionForConditionalGeneration
+from sion_translate.model.layers import RotaryEmbedding, SwiGLU
 
 from .distributed import DistributedContext
 
@@ -66,6 +70,73 @@ _PRECISION_DTYPES = {
     "bf16": torch.bfloat16,
 }
 _INT4_GROUP_SIZE = 128
+
+
+@contextmanager
+def _legacy_kjx_pickle_aliases():
+    """Temporarily map the project's pre-rename pickle module paths.
+
+    Early exports stored a quantized ``nn.Module`` under ``kjx.*`` rather
+    than a portable state dictionary. PyTorch pickle resolves those module
+    names before the payload schema can be inspected, so aliases must exist
+    around ``torch.load`` itself.
+    """
+    import sion_translate
+    import sion_translate.config as config_module
+    import sion_translate.model as model_module
+    import sion_translate.model.experimental as experimental_module
+    import sion_translate.model.layers as layers_module
+
+    legacy_model_module = types.ModuleType("kjx.model.kjx")
+    legacy_model_module.KJXForConditionalGeneration = SionForConditionalGeneration
+    aliases = {
+        "kjx": sion_translate,
+        "kjx.config": config_module,
+        "kjx.model": model_module,
+        "kjx.model.experimental": experimental_module,
+        "kjx.model.layers": layers_module,
+        "kjx.model.kjx": legacy_model_module,
+    }
+    added: list[str] = []
+    for name, module in aliases.items():
+        if name not in sys.modules:
+            sys.modules[name] = module
+            added.append(name)
+    try:
+        yield
+    finally:
+        for name in reversed(added):
+            sys.modules.pop(name, None)
+
+
+def _hydrate_legacy_module_attributes(model: nn.Module, config: ModelConfig) -> None:
+    """Restore non-parameter runtime attributes absent from early pickles."""
+
+    if isinstance(model, SionForConditionalGeneration):
+        model._synchronize_generation_across_ranks = getattr(
+            model,
+            "_synchronize_generation_across_ranks",
+            False,
+        )
+        model.recurrent_block_layers = getattr(
+            model,
+            "recurrent_block_layers",
+            min(config.experimental.recurrent_block_layers, config.encoder_layers),
+        )
+        model.recurrent_steps = getattr(
+            model,
+            "recurrent_steps",
+            max(1, config.experimental.recurrent_steps),
+        )
+    for module in model.modules():
+        if isinstance(module, SwiGLU):
+            module.gate_beta = getattr(module, "gate_beta", None)
+            module.up_beta = getattr(module, "up_beta", None)
+        elif isinstance(module, RotaryEmbedding):
+            module.head_dim = getattr(module, "head_dim", config.d_model // config.num_heads)
+            module.max_seq_len = getattr(module, "max_seq_len", config.max_seq_len)
+            module.base = getattr(module, "base", 10000.0)
+            module._cache_device = getattr(module, "_cache_device", str(module.cos.device))
 
 
 def _model_config_from_dict(raw: Mapping[str, Any]) -> ModelConfig:
@@ -1426,7 +1497,8 @@ def load_exported_model(
     """Load native precision, TorchAO INT8/INT4, packed INT4, or legacy exports."""
 
     path = Path(path)
-    payload = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
+    with _legacy_kjx_pickle_aliases():
+        payload = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
     if not isinstance(payload, dict):
         raise ValueError(f"{path} does not contain an export payload")
     schema = payload.get("schema")
@@ -1441,6 +1513,7 @@ def load_exported_model(
 
     if isinstance(stored, nn.Module):
         model: nn.Module = stored
+        _hydrate_legacy_module_attributes(model, config)
     else:
         if isinstance(quantization, Mapping) and quantization.get("backend") == "sion-packed":
             if not isinstance(stored, Mapping):

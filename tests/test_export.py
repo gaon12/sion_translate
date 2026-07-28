@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
+import types
+from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +15,7 @@ import sion_translate.training.export as export_module
 from sion_translate.config import ExperimentalConfig, ModelConfig
 from sion_translate.inference import find_exported_model
 from sion_translate.model import SionForConditionalGeneration
+from sion_translate.model.layers import RotaryEmbedding, SwiGLU
 from sion_translate.training.distributed import DistributedContext
 from sion_translate.training.export import (
     EXPORT_SCHEMA,
@@ -40,6 +44,83 @@ def export_config(*, d_model: int = 32) -> ModelConfig:
         gradient_checkpointing=False,
         experimental=ExperimentalConfig(),
     )
+
+
+def test_loader_resolves_pre_rename_kjx_module_pickles(tmp_path: Path) -> None:
+    legacy_root = types.ModuleType("kjx")
+    legacy_root.__path__ = []
+    legacy_model_package = types.ModuleType("kjx.model")
+    legacy_model_package.__path__ = []
+    legacy_module = types.ModuleType("kjx.model.kjx")
+    legacy_class = type(
+        "KJXForConditionalGeneration",
+        (SionForConditionalGeneration,),
+        {"__module__": "kjx.model.kjx"},
+    )
+    legacy_module.KJXForConditionalGeneration = legacy_class
+    temporary_modules = {
+        "kjx": legacy_root,
+        "kjx.model": legacy_model_package,
+        "kjx.model.kjx": legacy_module,
+    }
+    sys.modules.update(temporary_modules)
+    path = tmp_path / "legacy.pt"
+    config = export_config()
+    legacy_model = legacy_class(config)
+    del legacy_model._synchronize_generation_across_ranks
+    del legacy_model.recurrent_block_layers
+    del legacy_model.recurrent_steps
+    for module in legacy_model.modules():
+        if isinstance(module, SwiGLU):
+            del module.gate_beta
+            del module.up_beta
+        elif isinstance(module, RotaryEmbedding):
+            del module.head_dim
+            del module.max_seq_len
+            del module.base
+            del module._cache_device
+    try:
+        torch.save(
+            {
+                "model_config": asdict(config),
+                "pad_id": 0,
+                "model": legacy_model,
+            },
+            path,
+        )
+    finally:
+        for name in reversed(temporary_modules):
+            sys.modules.pop(name, None)
+
+    loaded, loaded_config, pad_id = load_exported_model(path)
+
+    assert type(loaded) is SionForConditionalGeneration
+    assert loaded_config == config
+    assert pad_id == 0
+    assert loaded._synchronize_generation_across_ranks is False
+    assert loaded.recurrent_block_layers == 0
+    assert loaded.recurrent_steps == 1
+    assert all(
+        hasattr(module, "gate_beta") and hasattr(module, "up_beta")
+        for module in loaded.modules()
+        if isinstance(module, SwiGLU)
+    )
+    assert all(
+        module.head_dim == config.d_model // config.num_heads
+        and module.max_seq_len == config.max_seq_len
+        and module.base == 10000.0
+        and module._cache_device == str(module.cos.device)
+        for module in loaded.modules()
+        if isinstance(module, RotaryEmbedding)
+    )
+    generated = loaded.generate(
+        torch.tensor([[4, 5, 3]]),
+        torch.ones(1, 3, dtype=torch.bool),
+        bos_id=2,
+        eos_id=3,
+        max_new_tokens=2,
+    )
+    assert generated.shape[0] == 1
 
 
 @pytest.mark.parametrize("bits", (4, 5))
