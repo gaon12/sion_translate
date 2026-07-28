@@ -73,6 +73,78 @@ def test_composite_reward_applies_repetition_and_source_copy_penalties() -> None
     assert penalized_score < base_score - 0.7
 
 
+def test_roundtrip_reward_requires_recovering_the_source() -> None:
+    config = PostTrainingConfig(
+        roundtrip_enabled=True,
+        roundtrip_reward_weight=0.4,
+        roundtrip_failure_penalty=0.3,
+        roundtrip_min_score=0.6,
+    )
+    reward = CompositeTranslationReward(TextTokenizer(), config)
+    source = torch.tensor([[4, 10, 11, 3]])
+    reference = torch.tensor([[20, 21, 3]])
+    # 정방향 후보는 같고, 역번역 결과만 하나는 원문을 복원하고 하나는 실패합니다.
+    candidates = torch.tensor([[[2, 20, 21, 3], [2, 20, 21, 3]]])
+    roundtrips = torch.tensor([[[2, 10, 11, 3], [2, 20, 22, 3]]])
+
+    result = reward(
+        candidates,
+        source,
+        reference,
+        roundtrip_candidates=roundtrips,
+    )
+
+    assert result.components["roundtrip"][0, 0] > result.components["roundtrip"][0, 1]
+    assert result.reward[0, 0] > result.reward[0, 1] + 0.2
+
+
+def test_backtranslation_batches_valid_candidates_and_skips_denoising_rows() -> None:
+    class RecordingGenerator:
+        config = SimpleNamespace(max_seq_len=16)
+
+        def __init__(self) -> None:
+            self.inputs: torch.Tensor | None = None
+
+        def generate(
+            self,
+            input_ids: torch.Tensor,
+            attention_mask: torch.Tensor,
+            **kwargs,
+        ) -> torch.Tensor:
+            del attention_mask, kwargs
+            self.inputs = input_ids
+            return torch.tensor(
+                [[2, 10, 11, 3]] * input_ids.shape[0],
+                device=input_ids.device,
+            )
+
+    objective = MinimumRiskObjective(
+        TextTokenizer(),
+        PostTrainingConfig(roundtrip_enabled=True),
+    )
+    model = RecordingGenerator()
+    batch = {
+        "attention_mask": torch.ones(2, 4, dtype=torch.bool),
+        "source_language_tag_ids": torch.tensor([5, -1]),
+    }
+    candidates = torch.tensor(
+        [
+            [[2, 20, 21, 3], [2, 20, 22, 3]],
+            [[2, 20, 21, 3], [2, 20, 22, 3]],
+        ]
+    )
+
+    roundtrips, mask = objective._backtranslate_candidates(model, batch, candidates)
+
+    assert model.inputs is not None
+    assert model.inputs.shape[0] == 2
+    assert model.inputs[:, 0].tolist() == [5, 5]
+    assert mask is not None
+    assert mask.tolist() == [[True, True], [False, False]]
+    assert roundtrips is not None
+    assert roundtrips[0, 0].tolist() == [2, 10, 11, 3]
+
+
 def test_multi_pair_preference_loss_uses_reward_ordering() -> None:
     objective = MinimumRiskObjective(TextTokenizer(), PostTrainingConfig())
     rewards = torch.tensor([[0.9, 0.6, 0.2]])

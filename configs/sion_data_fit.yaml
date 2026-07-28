@@ -95,6 +95,12 @@ posttraining:
   reward_length_weight: 0.05
   reward_repetition_penalty: 0.15
   reward_copy_penalty: 0.10
+  roundtrip_enabled: true
+  roundtrip_reward_weight: 0.20
+  roundtrip_failure_penalty: 0.15
+  roundtrip_min_score: 0.55
+  roundtrip_num_beams: 1
+  roundtrip_max_new_tokens: 256
   validation_num_beams: 4
   eval_batch_size_per_gpu: 1
   eval_every: 250

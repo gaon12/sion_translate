@@ -115,6 +115,31 @@ def test_posttraining_memory_batch_sizes_must_be_positive(field: str) -> None:
         config.validate()
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("roundtrip_reward_weight", -0.1),
+        ("roundtrip_failure_penalty", 1.1),
+        ("roundtrip_min_score", -0.1),
+        ("roundtrip_num_beams", 0),
+        ("roundtrip_max_new_tokens", 0),
+    ],
+)
+def test_roundtrip_posttraining_parameters_are_validated(field: str, value: float) -> None:
+    config = AppConfig()
+    setattr(config.posttraining, field, value)
+    with pytest.raises(ValueError, match=field):
+        config.validate()
+
+
+def test_enabled_roundtrip_requires_a_positive_reward_weight() -> None:
+    config = AppConfig()
+    config.posttraining.roundtrip_enabled = True
+    config.posttraining.roundtrip_reward_weight = 0.0
+    with pytest.raises(ValueError, match="roundtrip_reward_weight"):
+        config.validate()
+
+
 def test_padding_multiple_must_be_positive() -> None:
     config = AppConfig()
     config.data.pad_to_multiple_of = 0

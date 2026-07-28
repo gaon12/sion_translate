@@ -114,6 +114,10 @@ def test_tokenizer_prepare_dataset_and_collate(tmp_path: Path) -> None:
     assert batch["decoder_input_ids"].shape[1] % 8 == 0
     assert batch["labels"].shape == batch["decoder_input_ids"].shape
     assert batch["attention_mask"].dtype == torch.bool
+    assert batch["source_language_tag_ids"].tolist() == [
+        tokenizer.language_tags["ko"],
+        tokenizer.language_tags["ja"],
+    ]
     assert "src_script_ids" in batch
 
     with pytest.raises(FileExistsError, match="not empty"):

@@ -315,6 +315,14 @@ class PostTrainingConfig:
     reward_length_weight: float = 0.05
     reward_repetition_penalty: float = 0.15
     reward_copy_penalty: float = 0.10
+    # 후보를 원문 언어로 다시 번역해 원문 복원 여부를 확인합니다. 정답과
+    # 우연히 비슷한 후보가 보상을 독식하지 못하게 하는 순환 일관성 검증입니다.
+    roundtrip_enabled: bool = False
+    roundtrip_reward_weight: float = 0.20
+    roundtrip_failure_penalty: float = 0.15
+    roundtrip_min_score: float = 0.55
+    roundtrip_num_beams: int = 1
+    roundtrip_max_new_tokens: int = 256
     # best/early stopping은 이 beam 수로 생성한 번역의 복합 보상을 사용합니다.
     validation_num_beams: int = 4
     eval_batch_size_per_gpu: int = 1
@@ -469,6 +477,8 @@ class AppConfig:
             ("eval_every", post.eval_every),
             ("save_every", post.save_every),
             ("validation_num_beams", post.validation_num_beams),
+            ("roundtrip_num_beams", post.roundtrip_num_beams),
+            ("roundtrip_max_new_tokens", post.roundtrip_max_new_tokens),
         ):
             if value <= 0:
                 raise ValueError(f"posttraining.{name} must be positive")
@@ -506,6 +516,16 @@ class AppConfig:
             raise ValueError("posttraining.reward_repetition_penalty must be in [0, 1]")
         if not 0.0 <= post.reward_copy_penalty <= 1.0:
             raise ValueError("posttraining.reward_copy_penalty must be in [0, 1]")
+        if post.roundtrip_reward_weight < 0:
+            raise ValueError("posttraining.roundtrip_reward_weight must be non-negative")
+        if not 0.0 <= post.roundtrip_failure_penalty <= 1.0:
+            raise ValueError("posttraining.roundtrip_failure_penalty must be in [0, 1]")
+        if not 0.0 <= post.roundtrip_min_score <= 1.0:
+            raise ValueError("posttraining.roundtrip_min_score must be in [0, 1]")
+        if post.roundtrip_enabled and post.roundtrip_reward_weight == 0:
+            raise ValueError(
+                "posttraining.roundtrip_reward_weight must be positive when roundtrip is enabled"
+            )
         if post.top_k < 0:
             raise ValueError("posttraining.top_k must be non-negative")
         if post.warmup_steps < 0 or post.warmup_steps > post.max_steps:
