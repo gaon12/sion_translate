@@ -157,6 +157,17 @@ class GQAAttention(nn.Module):
         batch, seq_len, _ = x.shape
         return x.view(batch, seq_len, heads, self.head_dim).transpose(1, 2)
 
+    def project_key_value(
+        self,
+        key_value_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project reusable key/value states without computing a query."""
+        key = self._shape(self.k_proj(key_value_states), self.num_kv_heads)
+        value = self._shape(self.v_proj(key_value_states), self.num_kv_heads)
+        if self.qk_norm:
+            key = _head_rms_norm(key, self.norm_eps)
+        return key, value
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -187,10 +198,7 @@ class GQAAttention(nn.Module):
             k, v = past_key_value
         else:
             source = key_value_states if is_cross_attention else hidden_states
-            k = self._shape(self.k_proj(source), self.num_kv_heads)
-            v = self._shape(self.v_proj(source), self.num_kv_heads)
-            if self.qk_norm:
-                k = _head_rms_norm(k, self.norm_eps)
+            k, v = self.project_key_value(source)
             if self.rope is not None and not is_cross_attention:
                 q, k = self.rope(q, k, offset=position_offset)
             if not is_cross_attention and past_key_value is not None:

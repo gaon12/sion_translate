@@ -710,6 +710,15 @@ class Translator:
             device_inputs = input_ids.to(self.device)
             device_mask = attention_mask.to(self.device)
             generation_features = self._generation_features(input_ids)
+            generation_context = (
+                self.model.prepare_generation(
+                    device_inputs,
+                    device_mask,
+                    **generation_features,
+                )
+                if num_candidates > 0
+                else None
+            )
             generated = self.model.generate(
                 device_inputs,
                 device_mask,
@@ -718,7 +727,8 @@ class Translator:
                 max_new_tokens=max_new_tokens,
                 num_beams=num_beams,
                 length_penalty=length_penalty,
-                **generation_features,
+                generation_context=generation_context,
+                **({} if generation_context is not None else generation_features),
             )
             beam_texts = [
                 restore(row, structured_maps[index], glossary_maps[index])
@@ -741,7 +751,7 @@ class Translator:
                 temperature=temperature,
                 top_k=top_k,
                 generator=generator,
-                **generation_features,
+                generation_context=generation_context,
             )
             for row_index, source_text in enumerate(sources):
                 candidates = [beam_texts[row_index]]

@@ -62,6 +62,20 @@ class SionOutput:
     coverage_loss: torch.Tensor | None = None
 
 
+@dataclass(frozen=True)
+class GenerationContext:
+    """Encoder and cross-attention state reusable across decode strategies."""
+
+    encoder_states: torch.Tensor
+    source_mask: torch.Tensor
+    register_context: torch.Tensor | None
+    cross_key_values: tuple[tuple[torch.Tensor, torch.Tensor], ...]
+    memory_token_ids: torch.Tensor | None = None
+    memory_mask: torch.Tensor | None = None
+    memory_type_ids: torch.Tensor | None = None
+    memory_mode_ids: torch.Tensor | None = None
+
+
 class SionForConditionalGeneration(nn.Module):
     """sion_translate 번역 모델 본체 (encoder-decoder Transformer).
 
@@ -452,8 +466,80 @@ class SionForConditionalGeneration(nn.Module):
         )
 
     @staticmethod
-    def _fresh_caches(layer_count: int) -> list[dict[str, Any]]:
-        return [{"self": None, "cross": None} for _ in range(layer_count)]
+    def _fresh_caches(
+        layer_count: int,
+        cross_key_values: tuple[tuple[torch.Tensor, torch.Tensor], ...] | None = None,
+        *,
+        repeats: int = 1,
+    ) -> list[dict[str, Any]]:
+        if cross_key_values is None:
+            return [{"self": None, "cross": None} for _ in range(layer_count)]
+        if len(cross_key_values) != layer_count:
+            raise ValueError("cross_key_values must have one entry per decoder layer")
+        return [
+            {
+                "self": None,
+                "cross": (
+                    tuple(value.repeat_interleave(repeats, dim=0) for value in key_value)
+                    if repeats > 1
+                    else key_value
+                ),
+            }
+            for key_value in cross_key_values
+        ]
+
+    @torch.no_grad()
+    def prepare_generation(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        *,
+        memory_token_ids: torch.Tensor | None = None,
+        memory_mask: torch.Tensor | None = None,
+        memory_type_ids: torch.Tensor | None = None,
+        memory_mode_ids: torch.Tensor | None = None,
+        **encoder_features: torch.Tensor,
+    ) -> GenerationContext:
+        """Encode once and pre-project decoder cross-attention key/value states."""
+        was_training = self.training
+        self.eval()
+        try:
+            encoder_states = self.encode(input_ids, attention_mask, **encoder_features)
+            register_context = None
+            if self.register_state is not None:
+                _, register_context, _ = self.register_state(
+                    encoder_states,
+                    attention_mask,
+                    register_labels=None,
+                )
+            cross_key_values = tuple(
+                layer.cross_attn.project_key_value(encoder_states) for layer in self.decoder_layers
+            )
+            return GenerationContext(
+                encoder_states=encoder_states,
+                source_mask=attention_mask,
+                register_context=register_context,
+                cross_key_values=cross_key_values,
+                memory_token_ids=memory_token_ids,
+                memory_mask=memory_mask,
+                memory_type_ids=memory_type_ids,
+                memory_mode_ids=memory_mode_ids,
+            )
+        finally:
+            self.train(was_training)
+
+    @staticmethod
+    def _validate_generation_context(
+        context: GenerationContext,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> None:
+        if context.encoder_states.shape[0] != input_ids.shape[0]:
+            raise ValueError("generation_context batch size does not match input_ids")
+        if context.source_mask.shape != attention_mask.shape:
+            raise ValueError("generation_context source mask does not match attention_mask")
+        if context.encoder_states.device != input_ids.device:
+            raise ValueError("generation_context and input_ids must be on the same device")
 
     @torch.no_grad()
     def generate(
@@ -470,6 +556,7 @@ class SionForConditionalGeneration(nn.Module):
         memory_mask: torch.Tensor | None = None,
         memory_type_ids: torch.Tensor | None = None,
         memory_mode_ids: torch.Tensor | None = None,
+        generation_context: GenerationContext | None = None,
         **encoder_features: torch.Tensor,
     ) -> torch.Tensor:
         """번역문 생성.
@@ -494,38 +581,53 @@ class SionForConditionalGeneration(nn.Module):
         was_training = self.training
         self.eval()
         try:
-            encoder_states = self.encode(input_ids, attention_mask, **encoder_features)
-            register_context = None
-            if self.register_state is not None:
-                _, register_context, _ = self.register_state(
-                    encoder_states, attention_mask, register_labels=None
-                )
-            if num_beams <= 1:
-                return self._greedy_decode(
-                    encoder_states,
+            if generation_context is None:
+                generation_context = self.prepare_generation(
+                    input_ids,
                     attention_mask,
-                    register_context,
-                    bos_id=bos_id,
-                    eos_id=eos_id,
-                    max_new_tokens=max_new_tokens,
                     memory_token_ids=memory_token_ids,
                     memory_mask=memory_mask,
                     memory_type_ids=memory_type_ids,
                     memory_mode_ids=memory_mode_ids,
+                    **encoder_features,
+                )
+            else:
+                self._validate_generation_context(
+                    generation_context,
+                    input_ids,
+                    attention_mask,
+                )
+            encoder_states = generation_context.encoder_states
+            source_mask = generation_context.source_mask
+            register_context = generation_context.register_context
+            if num_beams <= 1:
+                return self._greedy_decode(
+                    encoder_states,
+                    source_mask,
+                    register_context,
+                    bos_id=bos_id,
+                    eos_id=eos_id,
+                    max_new_tokens=max_new_tokens,
+                    cross_key_values=generation_context.cross_key_values,
+                    memory_token_ids=generation_context.memory_token_ids,
+                    memory_mask=generation_context.memory_mask,
+                    memory_type_ids=generation_context.memory_type_ids,
+                    memory_mode_ids=generation_context.memory_mode_ids,
                 )
             return self._beam_decode(
                 encoder_states,
-                attention_mask,
+                source_mask,
                 register_context,
                 bos_id=bos_id,
                 eos_id=eos_id,
                 max_new_tokens=max_new_tokens,
                 num_beams=num_beams,
                 length_penalty=length_penalty,
-                memory_token_ids=memory_token_ids,
-                memory_mask=memory_mask,
-                memory_type_ids=memory_type_ids,
-                memory_mode_ids=memory_mode_ids,
+                cross_key_values=generation_context.cross_key_values,
+                memory_token_ids=generation_context.memory_token_ids,
+                memory_mask=generation_context.memory_mask,
+                memory_type_ids=generation_context.memory_type_ids,
+                memory_mode_ids=generation_context.memory_mode_ids,
             )
         finally:
             self.train(was_training)
@@ -548,6 +650,7 @@ class SionForConditionalGeneration(nn.Module):
         memory_mask: torch.Tensor | None = None,
         memory_type_ids: torch.Tensor | None = None,
         memory_mode_ids: torch.Tensor | None = None,
+        generation_context: GenerationContext | None = None,
         **encoder_features: torch.Tensor,
     ) -> torch.Tensor:
         """MRT용 확률적 후보를 ``(batch, samples, length)``로 생성합니다."""
@@ -570,14 +673,31 @@ class SionForConditionalGeneration(nn.Module):
         was_training = self.training
         self.eval()
         try:
-            encoder_states = self.encode(input_ids, attention_mask, **encoder_features)
-            register_context = None
-            if self.register_state is not None:
-                _, register_context, _ = self.register_state(
-                    encoder_states, attention_mask, register_labels=None
+            if generation_context is None:
+                generation_context = self.prepare_generation(
+                    input_ids,
+                    attention_mask,
+                    memory_token_ids=memory_token_ids,
+                    memory_mask=memory_mask,
+                    memory_type_ids=memory_type_ids,
+                    memory_mode_ids=memory_mode_ids,
+                    **encoder_features,
                 )
+            else:
+                self._validate_generation_context(
+                    generation_context,
+                    input_ids,
+                    attention_mask,
+                )
+            encoder_states = generation_context.encoder_states
+            source_mask = generation_context.source_mask
+            register_context = generation_context.register_context
+            memory_token_ids = generation_context.memory_token_ids
+            memory_mask = generation_context.memory_mask
+            memory_type_ids = generation_context.memory_type_ids
+            memory_mode_ids = generation_context.memory_mode_ids
             encoder_states = encoder_states.repeat_interleave(num_samples, dim=0)
-            source_mask = attention_mask.repeat_interleave(num_samples, dim=0)
+            source_mask = source_mask.repeat_interleave(num_samples, dim=0)
             if register_context is not None:
                 register_context = register_context.repeat_interleave(num_samples, dim=0)
             if memory_token_ids is not None:
@@ -590,7 +710,11 @@ class SionForConditionalGeneration(nn.Module):
                 memory_mode_ids = memory_mode_ids.repeat_interleave(num_samples, dim=0)
 
             total = input_ids.shape[0] * num_samples
-            caches = self._fresh_caches(len(self.decoder_layers))
+            caches = self._fresh_caches(
+                len(self.decoder_layers),
+                generation_context.cross_key_values,
+                repeats=num_samples,
+            )
             current = torch.full((total, 1), bos_id, dtype=torch.long, device=input_ids.device)
             pieces = [current]
             finished = torch.zeros(total, dtype=torch.bool, device=input_ids.device)
@@ -643,6 +767,7 @@ class SionForConditionalGeneration(nn.Module):
         bos_id: int,
         eos_id: int,
         max_new_tokens: int,
+        cross_key_values: tuple[tuple[torch.Tensor, torch.Tensor], ...] | None = None,
         memory_token_ids: torch.Tensor | None = None,
         memory_mask: torch.Tensor | None = None,
         memory_type_ids: torch.Tensor | None = None,
@@ -650,7 +775,10 @@ class SionForConditionalGeneration(nn.Module):
     ) -> torch.Tensor:
         batch = encoder_states.shape[0]
         device = encoder_states.device
-        caches = self._fresh_caches(len(self.decoder_layers))
+        caches = self._fresh_caches(
+            len(self.decoder_layers),
+            cross_key_values,
+        )
         current = torch.full((batch, 1), bos_id, dtype=torch.long, device=device)
         pieces = [current]
         finished = torch.zeros(batch, dtype=torch.bool, device=device)
@@ -693,6 +821,7 @@ class SionForConditionalGeneration(nn.Module):
         max_new_tokens: int,
         num_beams: int,
         length_penalty: float,
+        cross_key_values: tuple[tuple[torch.Tensor, torch.Tensor], ...] | None = None,
         memory_token_ids: torch.Tensor | None = None,
         memory_mask: torch.Tensor | None = None,
         memory_type_ids: torch.Tensor | None = None,
@@ -723,7 +852,11 @@ class SionForConditionalGeneration(nn.Module):
         if memory_mode_ids is not None:
             memory_mode_ids = memory_mode_ids.repeat_interleave(num_beams, dim=0)
 
-        caches = self._fresh_caches(len(self.decoder_layers))
+        caches = self._fresh_caches(
+            len(self.decoder_layers),
+            cross_key_values,
+            repeats=num_beams,
+        )
         sequences = torch.full((total, 1), bos_id, dtype=torch.long, device=device)
         # 첫 스텝에서 모든 beam 이 같은 BOS 에서 출발하므로, beam 0 만 점수 0 으로
         # 두고 나머지는 -inf 로 시작해 중복 후보를 걸러냅니다.

@@ -157,6 +157,78 @@ def test_stochastic_sampling_returns_multiple_candidates() -> None:
     assert sampled[:, :, 0].eq(2).all()
 
 
+def test_generation_context_reuses_encoder_and_cross_attention_state() -> None:
+    torch.manual_seed(19)
+    model = SionForConditionalGeneration(tiny_config())
+    model.eval()
+    batch = make_batch()
+    features = {
+        key: batch[key]
+        for key in ("src_script_ids", "src_onset_ids", "src_vowel_ids", "src_coda_ids")
+    }
+    baseline_beam = model.generate(
+        batch["input_ids"],
+        batch["attention_mask"],
+        bos_id=2,
+        eos_id=3,
+        max_new_tokens=4,
+        num_beams=2,
+        **features,
+    )
+    baseline_samples = model.sample(
+        batch["input_ids"],
+        batch["attention_mask"],
+        bos_id=2,
+        eos_id=3,
+        num_samples=2,
+        max_new_tokens=4,
+        temperature=0.8,
+        top_k=16,
+        generator=torch.Generator().manual_seed(41),
+        **features,
+    )
+
+    encode_calls = 0
+    real_encode = model.encode
+
+    def count_encode(*args, **kwargs):
+        nonlocal encode_calls
+        encode_calls += 1
+        return real_encode(*args, **kwargs)
+
+    model.encode = count_encode
+    context = model.prepare_generation(
+        batch["input_ids"],
+        batch["attention_mask"],
+        **features,
+    )
+    shared_beam = model.generate(
+        batch["input_ids"],
+        batch["attention_mask"],
+        bos_id=2,
+        eos_id=3,
+        max_new_tokens=4,
+        num_beams=2,
+        generation_context=context,
+    )
+    shared_samples = model.sample(
+        batch["input_ids"],
+        batch["attention_mask"],
+        bos_id=2,
+        eos_id=3,
+        num_samples=2,
+        max_new_tokens=4,
+        temperature=0.8,
+        top_k=16,
+        generator=torch.Generator().manual_seed(41),
+        generation_context=context,
+    )
+
+    assert encode_calls == 1
+    torch.testing.assert_close(shared_beam, baseline_beam)
+    torch.testing.assert_close(shared_samples, baseline_samples)
+
+
 def test_sampling_waits_until_every_distributed_rank_is_finished(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

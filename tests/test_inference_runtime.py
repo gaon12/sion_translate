@@ -299,6 +299,34 @@ def test_translator_sampling_seed_builds_reproducible_generator(
         )
 
 
+def test_candidate_reranking_encodes_each_source_batch_once(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    translator = make_translator(monkeypatch, tmp_path, runtime_config())
+    encode_calls = 0
+    real_encode = translator.model.encode
+
+    def count_encode(*args, **kwargs):
+        nonlocal encode_calls
+        encode_calls += 1
+        return real_encode(*args, **kwargs)
+
+    monkeypatch.setattr(translator.model, "encode", count_encode)
+    output = translator.translate(
+        ["문장"],
+        target_language="ja",
+        num_beams=2,
+        max_new_tokens=2,
+        batch_size=1,
+        num_candidates=2,
+        seed=17,
+    )
+
+    assert len(output) == 1
+    assert encode_calls == 1
+
+
 def test_native_sampling_generator_is_reproducible() -> None:
     model = SionForConditionalGeneration(runtime_config())
     input_ids = torch.tensor([[4, 11, 3]])
