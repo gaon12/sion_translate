@@ -95,7 +95,7 @@ def expand_parallel_record(
     """Expand one JSON value into configured parallel pairs.
 
     Supported layouts include flat language keys, list-valued language keys,
-    arrays of records, ``records/items/pairs/translations`` containers, explicit
+    arrays of records, ``records/items/pairs/translation(s)`` containers, explicit
     source/target language fields, and pair-named containers such as ``ko-ja``.
     """
 
@@ -207,6 +207,11 @@ def expand_parallel_record(
             if key in nested:
                 walk(value, nested[key])
             elif key in _CONTAINER_KEYS:
+                walk(value, context)
+            elif key == "translation" and not explicit and isinstance(value, (dict, list, tuple)):
+                # Hugging Face translation datasets conventionally wrap their
+                # language map in a singular ``translation`` field.  Keep the
+                # scalar field reserved for explicit source/target records.
                 walk(value, context)
 
     walk(record)

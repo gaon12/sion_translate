@@ -59,6 +59,42 @@ def test_record_expansion_supports_nested_and_explicit_items() -> None:
     assert expansion.pairs[1].text_b == "Вторая строка."
 
 
+def test_record_expansion_supports_hugging_face_translation_container() -> None:
+    expansion = expand_parallel_record(
+        {
+            "translation": {
+                "ko": "안녕하세요.",
+                "ja": "こんにちは。",
+                "en": "Hello.",
+                "ru": "Здравствуйте.",
+            }
+        },
+        PAIRS,
+    )
+    assert [
+        (pair.language_a, pair.text_a, pair.language_b, pair.text_b) for pair in expansion.pairs
+    ] == [
+        ("ko", "안녕하세요.", "ja", "こんにちは。"),
+        ("en", "Hello.", "ru", "Здравствуйте."),
+    ]
+    assert not expansion.issues
+
+
+def test_record_expansion_keeps_scalar_translation_as_explicit_target() -> None:
+    expansion = expand_parallel_record(
+        {
+            "source_language": "ko",
+            "target_language": "ja",
+            "source": "안녕하세요.",
+            "translation": "こんにちは。",
+        },
+        PAIRS,
+    )
+    assert len(expansion.pairs) == 1
+    assert expansion.pairs[0].text_b == "こんにちは。"
+    assert not expansion.issues
+
+
 def test_record_expansion_reports_unaligned_lists_without_dropping_other_pairs() -> None:
     expansion = expand_parallel_record(
         {
