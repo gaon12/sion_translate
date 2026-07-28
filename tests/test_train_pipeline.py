@@ -251,6 +251,7 @@ def test_fsdp2_registers_custom_generation_forward_methods(monkeypatch) -> None:
     )
 
     assert result is model
+    assert model._synchronize_generation_across_ranks is True
     assert events == [
         ("shard", model),
         ("generate", model),

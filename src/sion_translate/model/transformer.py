@@ -82,6 +82,9 @@ class SionForConditionalGeneration(nn.Module):
             raise ValueError("ModelConfig.vocab_size must be set before model construction")
         self.config = config
         self.pad_id = pad_id
+        # FSDP2 enables this after sharding. Replicated single/DDP inference
+        # keeps its low-latency local exit without a collective per token.
+        self._synchronize_generation_across_ranks = False
         self.token_embedding = nn.Embedding(config.vocab_size, config.d_model, padding_idx=pad_id)
         self.embedding_dropout = nn.Dropout(config.dropout)
         head_dim = config.d_model // config.num_heads
@@ -481,7 +484,9 @@ class SionForConditionalGeneration(nn.Module):
                 "max_new_tokens must be between 1 and "
                 f"model max_seq_len ({self.config.max_seq_len})"
             )
-        max_new_tokens = _all_ranks_max_new_tokens(max_new_tokens, input_ids.device)
+        synchronize_ranks = self._synchronize_generation_across_ranks
+        if synchronize_ranks:
+            max_new_tokens = _all_ranks_max_new_tokens(max_new_tokens, input_ids.device)
         was_training = self.training
         self.eval()
         try:
@@ -549,7 +554,9 @@ class SionForConditionalGeneration(nn.Module):
                 "max_new_tokens must be between 1 and "
                 f"model max_seq_len ({self.config.max_seq_len})"
             )
-        max_new_tokens = _all_ranks_max_new_tokens(max_new_tokens, input_ids.device)
+        synchronize_ranks = self._synchronize_generation_across_ranks
+        if synchronize_ranks:
+            max_new_tokens = _all_ranks_max_new_tokens(max_new_tokens, input_ids.device)
         if num_samples < 1:
             raise ValueError("num_samples must be positive")
         if temperature <= 0:
@@ -610,7 +617,12 @@ class SionForConditionalGeneration(nn.Module):
                 next_token = torch.where(finished[:, None], eos_id, next_token)
                 pieces.append(next_token)
                 finished |= next_token.squeeze(1).eq(eos_id)
-                if _all_ranks_finished(bool(finished.all()), input_ids.device):
+                local_finished = bool(finished.all())
+                if (
+                    _all_ranks_finished(local_finished, input_ids.device)
+                    if synchronize_ranks
+                    else local_finished
+                ):
                     break
                 current = next_token
             sequences = torch.cat(pieces, dim=1)
@@ -656,7 +668,12 @@ class SionForConditionalGeneration(nn.Module):
             next_token = torch.where(finished[:, None], eos_id, next_token)
             pieces.append(next_token)
             finished |= next_token.squeeze(1).eq(eos_id)
-            if _all_ranks_finished(bool(finished.all()), device):
+            local_finished = bool(finished.all())
+            if (
+                _all_ranks_finished(local_finished, device)
+                if self._synchronize_generation_across_ranks
+                else local_finished
+            ):
                 break
             current = next_token
         return torch.cat(pieces, dim=1)
@@ -787,7 +804,11 @@ class SionForConditionalGeneration(nn.Module):
                 if best_possible > worst_kept:
                     all_done = False
                     break
-            if _all_ranks_finished(all_done, device):
+            if (
+                _all_ranks_finished(all_done, device)
+                if self._synchronize_generation_across_ranks
+                else all_done
+            ):
                 break
 
         # 길이 제한에 걸린 live beam도 이미 끝난 가설과 함께 비교합니다.

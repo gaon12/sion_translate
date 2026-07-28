@@ -185,6 +185,7 @@ def parallelize_model(
         legacy_fsdp2=use_fsdp2,
     )
     if resolved_strategy == "fsdp2":
+        model._synchronize_generation_across_ranks = True
         MixedPrecisionPolicy, fully_shard, register_fsdp_forward_method = _load_fsdp2_api()
 
         policy = MixedPrecisionPolicy(

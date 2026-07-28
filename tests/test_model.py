@@ -174,6 +174,7 @@ def test_sampling_waits_until_every_distributed_rank_is_finished(
 
     synchronized_results = iter((False, True))
     model._logits = types.MethodType(eos_logits, model)
+    model._synchronize_generation_across_ranks = True
     monkeypatch.setattr(
         transformer_module,
         "_all_ranks_finished",
