@@ -203,6 +203,14 @@ def test_reward_cpu_work_overlaps_candidate_scoring_and_reports_wait_telemetry()
         assert torch.isfinite(output.metrics[metric_name])
         assert output.metrics[metric_name].item() >= 0.0
     assert output.metrics["reward_overlap_fraction"].item() <= 1.0
+    assert (
+        output.metrics["reward_overlap_seconds"].item()
+        <= output.metrics["candidate_scoring_seconds"].item()
+    )
+    assert (
+        output.metrics["reward_overlap_seconds"].item()
+        <= output.metrics["reward_cpu_seconds"].item()
+    )
     output.loss_sum.backward()
     assert model.embedding.weight.grad is not None
 

@@ -400,16 +400,15 @@ class MinimumRiskObjective:
         reward_inputs_cpu = batch["input_ids"].detach().to("cpu")
         reward_references_cpu = reference_labels.detach().to("cpu")
         reward_input_transfer_seconds = time.perf_counter() - reward_transfer_started
-        reward_submitted = time.perf_counter()
 
-        def calculate_reward() -> tuple[RewardOutput, float]:
+        def calculate_reward() -> tuple[RewardOutput, float, float]:
             started = time.perf_counter()
             output = self.reward_model.score_cpu(
                 reward_candidates_cpu,
                 reward_inputs_cpu,
                 reward_references_cpu,
             )
-            return output, time.perf_counter() - started
+            return output, started, time.perf_counter()
 
         # String decoding and chrF/structure metrics are CPU/Python-heavy. Run
         # them while the main thread submits candidate-scoring work to the GPU.
@@ -438,6 +437,14 @@ class MinimumRiskObjective:
             decoder_inputs[:, samples:, : reference_inputs.shape[-1]] = reference_inputs
             labels[:, samples:, : reference_targets.shape[-1]] = reference_targets
 
+            scoring_start_event = None
+            scoring_end_event = None
+            if sampled.device.type == "cuda":
+                scoring_start_event = torch.cuda.Event(enable_timing=True)
+                scoring_end_event = torch.cuda.Event(enable_timing=True)
+                scoring_start_event.record()
+                scoring_start_event.synchronize()
+            candidate_scoring_started = time.perf_counter()
             score_chunks = [
                 self._sequence_log_probabilities(
                     model,
@@ -455,12 +462,27 @@ class MinimumRiskObjective:
                 labels[:, samples],
                 label_smoothing=base.config.label_smoothing,
             )
+            if scoring_end_event is not None:
+                scoring_end_event.record()
+                scoring_end_event.synchronize()
+                assert scoring_start_event is not None
+                candidate_scoring_seconds = (
+                    scoring_start_event.elapsed_time(scoring_end_event) / 1_000.0
+                )
+                candidate_scoring_finished = candidate_scoring_started + candidate_scoring_seconds
+            else:
+                candidate_scoring_finished = time.perf_counter()
+                candidate_scoring_seconds = candidate_scoring_finished - candidate_scoring_started
             reward_wait_started = time.perf_counter()
-            reward_output_cpu, reward_cpu_seconds = reward_future.result()
+            reward_output_cpu, reward_cpu_started, reward_cpu_finished = reward_future.result()
             reward_wait_seconds = time.perf_counter() - reward_wait_started
 
-        candidate_scoring_seconds = max(0.0, reward_wait_started - reward_submitted)
-        reward_overlap_seconds = min(reward_cpu_seconds, candidate_scoring_seconds)
+        reward_cpu_seconds = max(0.0, reward_cpu_finished - reward_cpu_started)
+        reward_overlap_seconds = max(
+            0.0,
+            min(reward_cpu_finished, candidate_scoring_finished)
+            - max(reward_cpu_started, candidate_scoring_started),
+        )
         reward_output = RewardOutput(
             reward=reward_output_cpu.reward.to(device=sampled.device),
             components={

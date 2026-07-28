@@ -217,8 +217,8 @@ DDP는 `gradient_as_bucket_view`를 사용한다. BATS는 SFT의 label 기반 �
 | `grad_norm` | clipping 전후 학습 안정성 관찰값 | 급격한 폭증·비유한 값이면 설정을 되돌림 |
 | `reward_cpu_seconds` | 사후학습 문자열 decode·복합 reward CPU 시간 | 길어지면 tokenizer·chrF·구조 검사 CPU 병목 |
 | `reward_wait_seconds` | GPU candidate scoring 뒤 reward worker를 기다린 시간 | 0에 가까울수록 CPU 작업이 GPU 작업 뒤에 숨겨짐 |
-| `reward_overlap_seconds` / `reward_overlap_fraction` | CPU reward 중 GPU scoring과 겹친 시간·비율 | overlap은 높고 wait는 낮은 상태가 목표 |
-| `candidate_scoring_seconds` | 사후학습 GPU 후보 점수화 시간 | reward 시간과 함께 MRT 병목 분리 |
+| `reward_overlap_seconds` / `reward_overlap_fraction` | CPU reward worker와 candidate scoring의 실제 시작·종료 구간 교집합과 CPU 시간 대비 비율 | overlap은 높고 wait는 낮은 상태가 목표 |
+| `candidate_scoring_seconds` | 사후학습 후보 점수화 시간(CUDA는 event, CPU는 monotonic wall clock) | reward 시간과 함께 MRT 병목 분리 |
 | `reward_input_transfer_seconds` | reward 입력을 CPU로 옮긴 시간 | 비정상적으로 크면 동기화·전송 병목 확인 |
 
 CUDA peak 통계는 로그 구간마다 reset된다. 따라서 한 줄만 보지 말고 최소 수백
