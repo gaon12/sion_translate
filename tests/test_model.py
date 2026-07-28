@@ -229,6 +229,35 @@ def test_generation_context_reuses_encoder_and_cross_attention_state() -> None:
     torch.testing.assert_close(shared_samples, baseline_samples)
 
 
+def test_decode_constraints_block_control_tokens_and_repeated_ngrams() -> None:
+    logits = torch.zeros(2, 16)
+    logits[:, 3] = 9.0
+    logits[:, 5] = 10.0
+    sequences = torch.tensor(
+        [
+            [2, 5, 6, 7, 5, 6, 7],
+            [2, 8, 9, 10, 11, 12, 13],
+        ]
+    )
+
+    constrained = SionForConditionalGeneration._apply_decode_constraints(
+        logits,
+        sequences,
+        eos_id=3,
+        position=0,
+        min_new_tokens=1,
+        forbidden_token_ids=(0, 2),
+        no_repeat_ngram_size=4,
+    )
+
+    assert constrained[:, 0].isneginf().all()
+    assert constrained[:, 2].isneginf().all()
+    assert constrained[:, 3].isneginf().all()
+    # 첫 행의 마지막 5,6,7 뒤에는 과거에 5가 왔으므로 그 4-gram을 차단합니다.
+    assert constrained[0, 5].isneginf()
+    assert torch.isfinite(constrained[1, 5])
+
+
 def test_sampling_waits_until_every_distributed_rank_is_finished(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

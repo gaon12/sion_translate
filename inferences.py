@@ -185,6 +185,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=256,
         help="문장당 최대 생성 토큰 수입니다.",
     )
+    parser.add_argument(
+        "--no-repeat-ngram-size",
+        type=int,
+        default=4,
+        help="이 크기의 n-gram 재생성을 금지합니다. 0이면 끕니다.",
+    )
+    parser.add_argument(
+        "--max-output-length-ratio",
+        type=float,
+        default=3.0,
+        help="원문 토큰 수 대비 출력 상한 비율입니다. 여유 토큰 16개를 별도로 둡니다.",
+    )
 
     parser.add_argument(
         "--batch-size",
@@ -574,6 +586,8 @@ def retry_degenerate_translations(
     max_new_tokens: int,
     batch_size: int,
     glossary: Glossary | None,
+    no_repeat_ngram_size: int = 4,
+    max_output_length_ratio: float = 3.0,
 ) -> tuple[list[str], int, int]:
     """붕괴한 결과만 좁은 beam 후보로 교체한다.
 
@@ -604,6 +618,8 @@ def retry_degenerate_translations(
             max_new_tokens=max_new_tokens,
             batch_size=min(batch_size, len(retry_sources)),
             glossary=glossary,
+            no_repeat_ngram_size=no_repeat_ngram_size,
+            max_output_length_ratio=max_output_length_ratio,
         )
         retry_translations = validate_translations(retry_sources, retry_raw)
 
@@ -889,6 +905,8 @@ def main() -> None:
             max_new_tokens=args.max_new_tokens,
             batch_size=batch_size,
             glossary=glossary,
+            no_repeat_ngram_size=args.no_repeat_ngram_size,
+            max_output_length_ratio=args.max_output_length_ratio,
         )
 
     except torch.cuda.OutOfMemoryError as error:
@@ -929,6 +947,8 @@ def main() -> None:
             max_new_tokens=args.max_new_tokens,
             batch_size=batch_size,
             glossary=glossary,
+            no_repeat_ngram_size=args.no_repeat_ngram_size,
+            max_output_length_ratio=args.max_output_length_ratio,
         )
         if rescued_count or remaining_count:
             print(

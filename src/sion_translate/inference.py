@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import warnings
 from collections.abc import Mapping
 from pathlib import Path
@@ -576,6 +577,10 @@ class Translator:
         sampling_seed: int | None = None,
         generator: torch.Generator | None = None,
         return_rerank_details: bool = False,
+        min_new_tokens: int = 1,
+        no_repeat_ngram_size: int = 4,
+        max_output_length_ratio: float | None = 3.0,
+        max_output_length_margin: int = 16,
     ) -> list[str]:
         """문장 목록을 ``target_language`` 로 번역합니다.
 
@@ -599,6 +604,10 @@ class Translator:
 
         ``return_rerank_details`` 가 참이면 문자열 대신 ``RerankResult`` 목록을
         돌려줍니다 — 어느 후보가 왜 뽑혔는지 확인할 때 씁니다.
+
+        생성 중에는 학습 제어 토큰을 금지하고 ``no_repeat_ngram_size`` 크기의
+        반복을 차단합니다. ``max_output_length_ratio``는 원문 토큰 수에 비해
+        비정상적으로 긴 디코딩만 일찍 잘라 정상적인 EOS 종료에는 관여하지 않습니다.
         """
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
@@ -619,6 +628,14 @@ class Translator:
             raise ValueError("temperature must be positive")
         if top_k < 0:
             raise ValueError("top_k must be non-negative")
+        if min_new_tokens < 0:
+            raise ValueError("min_new_tokens must be non-negative")
+        if no_repeat_ngram_size < 0:
+            raise ValueError("no_repeat_ngram_size must be non-negative")
+        if max_output_length_ratio is not None and max_output_length_ratio <= 0:
+            raise ValueError("max_output_length_ratio must be positive or None")
+        if max_output_length_margin < 0:
+            raise ValueError("max_output_length_margin must be non-negative")
         if seed is not None and sampling_seed is not None:
             raise ValueError("seed and sampling_seed are aliases; provide only one")
         resolved_seed = seed if seed is not None else sampling_seed
@@ -646,6 +663,9 @@ class Translator:
             *self.tokenizer.language_tags.values(),
             *self.tokenizer.denoise_tags.values(),
         }
+        if self.tokenizer.draft_id is not None:
+            special_ids.add(self.tokenizer.draft_id)
+        forbidden_token_ids = tuple(sorted(special_ids - {eos}))
 
         def restore(
             row: Sequence[int],
@@ -719,15 +739,33 @@ class Translator:
                 if num_candidates > 0
                 else None
             )
+            chunk_max_new_tokens = max_new_tokens
+            if max_output_length_ratio is not None:
+                longest_source_content = max(len(ids) - 2 for ids in encoded)
+                adaptive_limit = (
+                    math.ceil(longest_source_content * max_output_length_ratio)
+                    + max_output_length_margin
+                )
+                chunk_max_new_tokens = min(
+                    max_new_tokens,
+                    max(1, adaptive_limit),
+                )
+            chunk_min_new_tokens = min(
+                min_new_tokens,
+                max(0, chunk_max_new_tokens - 1),
+            )
             generated = self.model.generate(
                 device_inputs,
                 device_mask,
                 bos_id=self.tokenizer.bos_id,
                 eos_id=eos,
-                max_new_tokens=max_new_tokens,
+                max_new_tokens=chunk_max_new_tokens,
                 num_beams=num_beams,
                 length_penalty=length_penalty,
                 generation_context=generation_context,
+                forbidden_token_ids=forbidden_token_ids,
+                min_new_tokens=chunk_min_new_tokens,
+                no_repeat_ngram_size=no_repeat_ngram_size,
                 **({} if generation_context is not None else generation_features),
             )
             beam_texts = [
@@ -747,9 +785,12 @@ class Translator:
                 bos_id=self.tokenizer.bos_id,
                 eos_id=eos,
                 num_samples=num_candidates,
-                max_new_tokens=max_new_tokens,
+                max_new_tokens=chunk_max_new_tokens,
                 temperature=temperature,
                 top_k=top_k,
+                forbidden_token_ids=forbidden_token_ids,
+                min_new_tokens=chunk_min_new_tokens,
+                no_repeat_ngram_size=no_repeat_ngram_size,
                 generator=generator,
                 generation_context=generation_context,
             )

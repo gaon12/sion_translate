@@ -327,6 +327,36 @@ def test_candidate_reranking_encodes_each_source_batch_once(
     assert encode_calls == 1
 
 
+def test_translator_applies_safe_decode_limits_and_control_token_mask(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    translator = make_translator(monkeypatch, tmp_path, runtime_config())
+    captured: dict[str, object] = {}
+
+    def capture_generate(input_ids, _attention_mask, **kwargs):
+        captured.update(kwargs)
+        return torch.tensor([[2, 3]]).expand(input_ids.shape[0], -1)
+
+    monkeypatch.setattr(translator.model, "generate", capture_generate)
+    translator.translate(
+        ["문장"],
+        target_language="ja",
+        max_new_tokens=15,
+        max_output_length_ratio=2.0,
+        max_output_length_margin=1,
+        no_repeat_ngram_size=4,
+    )
+
+    # FakeTokenizer.encode()는 본문 토큰 2개를 내므로 2*2 + margin 1입니다.
+    assert captured["max_new_tokens"] == 5
+    assert captured["no_repeat_ngram_size"] == 4
+    assert captured["min_new_tokens"] == 1
+    forbidden = set(captured["forbidden_token_ids"])
+    assert {0, 2, 4, 5, 6, 7, 8, 9} <= forbidden
+    assert 3 not in forbidden
+
+
 def test_native_sampling_generator_is_reproducible() -> None:
     model = SionForConditionalGeneration(runtime_config())
     input_ids = torch.tensor([[4, 11, 3]])

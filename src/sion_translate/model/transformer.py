@@ -541,6 +541,47 @@ class SionForConditionalGeneration(nn.Module):
         if context.encoder_states.device != input_ids.device:
             raise ValueError("generation_context and input_ids must be on the same device")
 
+    @staticmethod
+    def _apply_decode_constraints(
+        logits: torch.Tensor,
+        sequences: torch.Tensor,
+        *,
+        eos_id: int,
+        position: int,
+        min_new_tokens: int,
+        forbidden_token_ids: tuple[int, ...],
+        no_repeat_ngram_size: int,
+    ) -> torch.Tensor:
+        """Mask invalid next tokens without moving beam state to Python."""
+        if not forbidden_token_ids and min_new_tokens == 0 and no_repeat_ngram_size == 0:
+            return logits
+        if forbidden_token_ids:
+            valid_forbidden = [
+                token_id for token_id in forbidden_token_ids if 0 <= token_id < logits.shape[-1]
+            ]
+            if valid_forbidden:
+                logits[:, valid_forbidden] = float("-inf")
+        if position < min_new_tokens and 0 <= eos_id < logits.shape[-1]:
+            logits[:, eos_id] = float("-inf")
+
+        ngram_size = no_repeat_ngram_size
+        if ngram_size == 1 and sequences.shape[1] > 0:
+            logits.scatter_(1, sequences, float("-inf"))
+        elif ngram_size > 1 and sequences.shape[1] >= ngram_size:
+            prefix_size = ngram_size - 1
+            prefix = sequences[:, -prefix_size:]
+            previous_prefixes = sequences[:, :-1].unfold(1, prefix_size, 1)
+            matches = previous_prefixes.eq(prefix[:, None, :]).all(dim=-1)
+            previous_next_tokens = sequences[:, prefix_size:]
+            rows, columns = matches.nonzero(as_tuple=True)
+            logits[rows, previous_next_tokens[rows, columns]] = float("-inf")
+
+        # 극단적으로 작은 vocab이나 과도한 사용자 제약에서도 multinomial/
+        # argmax가 NaN으로 무너지지 않게 EOS를 최후의 탈출구로 둡니다.
+        no_valid_token = ~torch.isfinite(logits).any(dim=-1)
+        logits[no_valid_token, eos_id] = 0.0
+        return logits
+
     @torch.no_grad()
     def generate(
         self,
@@ -557,6 +598,9 @@ class SionForConditionalGeneration(nn.Module):
         memory_type_ids: torch.Tensor | None = None,
         memory_mode_ids: torch.Tensor | None = None,
         generation_context: GenerationContext | None = None,
+        forbidden_token_ids: tuple[int, ...] = (),
+        min_new_tokens: int = 0,
+        no_repeat_ngram_size: int = 0,
         **encoder_features: torch.Tensor,
     ) -> torch.Tensor:
         """번역문 생성.
@@ -575,6 +619,10 @@ class SionForConditionalGeneration(nn.Module):
                 "max_new_tokens must be between 1 and "
                 f"model max_seq_len ({self.config.max_seq_len})"
             )
+        if min_new_tokens < 0 or min_new_tokens >= max_new_tokens:
+            raise ValueError("min_new_tokens must be in [0, max_new_tokens)")
+        if no_repeat_ngram_size < 0:
+            raise ValueError("no_repeat_ngram_size must be non-negative")
         synchronize_ranks = self._synchronize_generation_across_ranks
         if synchronize_ranks:
             max_new_tokens = _all_ranks_max_new_tokens(max_new_tokens, input_ids.device)
@@ -609,6 +657,9 @@ class SionForConditionalGeneration(nn.Module):
                     eos_id=eos_id,
                     max_new_tokens=max_new_tokens,
                     cross_key_values=generation_context.cross_key_values,
+                    forbidden_token_ids=forbidden_token_ids,
+                    min_new_tokens=min_new_tokens,
+                    no_repeat_ngram_size=no_repeat_ngram_size,
                     memory_token_ids=generation_context.memory_token_ids,
                     memory_mask=generation_context.memory_mask,
                     memory_type_ids=generation_context.memory_type_ids,
@@ -624,6 +675,9 @@ class SionForConditionalGeneration(nn.Module):
                 num_beams=num_beams,
                 length_penalty=length_penalty,
                 cross_key_values=generation_context.cross_key_values,
+                forbidden_token_ids=forbidden_token_ids,
+                min_new_tokens=min_new_tokens,
+                no_repeat_ngram_size=no_repeat_ngram_size,
                 memory_token_ids=generation_context.memory_token_ids,
                 memory_mask=generation_context.memory_mask,
                 memory_type_ids=generation_context.memory_type_ids,
@@ -651,6 +705,8 @@ class SionForConditionalGeneration(nn.Module):
         memory_type_ids: torch.Tensor | None = None,
         memory_mode_ids: torch.Tensor | None = None,
         generation_context: GenerationContext | None = None,
+        min_new_tokens: int = 0,
+        no_repeat_ngram_size: int = 0,
         **encoder_features: torch.Tensor,
     ) -> torch.Tensor:
         """MRT용 확률적 후보를 ``(batch, samples, length)``로 생성합니다."""
@@ -670,6 +726,10 @@ class SionForConditionalGeneration(nn.Module):
             raise ValueError("temperature must be positive")
         if top_k < 0:
             raise ValueError("top_k must be non-negative")
+        if min_new_tokens < 0 or min_new_tokens >= max_new_tokens:
+            raise ValueError("min_new_tokens must be in [0, max_new_tokens)")
+        if no_repeat_ngram_size < 0:
+            raise ValueError("no_repeat_ngram_size must be non-negative")
         was_training = self.training
         self.eval()
         try:
@@ -716,7 +776,7 @@ class SionForConditionalGeneration(nn.Module):
                 repeats=num_samples,
             )
             current = torch.full((total, 1), bos_id, dtype=torch.long, device=input_ids.device)
-            pieces = [current]
+            sequences = current
             finished = torch.zeros(total, dtype=torch.bool, device=input_ids.device)
             for position in range(max_new_tokens):
                 hidden = self._decoder_step(
@@ -732,8 +792,15 @@ class SionForConditionalGeneration(nn.Module):
                     memory_mode_ids=memory_mode_ids,
                 )
                 logits = self._logits(hidden[:, -1]).float() / temperature
-                if forbidden_token_ids:
-                    logits[:, list(forbidden_token_ids)] = float("-inf")
+                logits = self._apply_decode_constraints(
+                    logits,
+                    sequences,
+                    eos_id=eos_id,
+                    position=position,
+                    min_new_tokens=min_new_tokens,
+                    forbidden_token_ids=forbidden_token_ids,
+                    no_repeat_ngram_size=no_repeat_ngram_size,
+                )
                 if 0 < top_k < logits.shape[-1]:
                     threshold = logits.topk(top_k, dim=-1).values[:, -1:]
                     logits = logits.masked_fill(logits < threshold, float("-inf"))
@@ -743,7 +810,7 @@ class SionForConditionalGeneration(nn.Module):
                     generator=generator,
                 )
                 next_token = torch.where(finished[:, None], eos_id, next_token)
-                pieces.append(next_token)
+                sequences = torch.cat((sequences, next_token), dim=1)
                 finished |= next_token.squeeze(1).eq(eos_id)
                 local_finished = bool(finished.all())
                 if (
@@ -753,7 +820,6 @@ class SionForConditionalGeneration(nn.Module):
                 ):
                     break
                 current = next_token
-            sequences = torch.cat(pieces, dim=1)
             return sequences.view(input_ids.shape[0], num_samples, -1)
         finally:
             self.train(was_training)
@@ -768,6 +834,9 @@ class SionForConditionalGeneration(nn.Module):
         eos_id: int,
         max_new_tokens: int,
         cross_key_values: tuple[tuple[torch.Tensor, torch.Tensor], ...] | None = None,
+        forbidden_token_ids: tuple[int, ...] = (),
+        min_new_tokens: int = 0,
+        no_repeat_ngram_size: int = 0,
         memory_token_ids: torch.Tensor | None = None,
         memory_mask: torch.Tensor | None = None,
         memory_type_ids: torch.Tensor | None = None,
@@ -780,7 +849,7 @@ class SionForConditionalGeneration(nn.Module):
             cross_key_values,
         )
         current = torch.full((batch, 1), bos_id, dtype=torch.long, device=device)
-        pieces = [current]
+        sequences = current
         finished = torch.zeros(batch, dtype=torch.bool, device=device)
         for position in range(max_new_tokens):
             hidden = self._decoder_step(
@@ -795,10 +864,19 @@ class SionForConditionalGeneration(nn.Module):
                 memory_type_ids=memory_type_ids,
                 memory_mode_ids=memory_mode_ids,
             )
-            next_token = self._logits(hidden[:, -1:]).argmax(-1)
+            logits = self._apply_decode_constraints(
+                self._logits(hidden[:, -1]).float(),
+                sequences,
+                eos_id=eos_id,
+                position=position,
+                min_new_tokens=min_new_tokens,
+                forbidden_token_ids=forbidden_token_ids,
+                no_repeat_ngram_size=no_repeat_ngram_size,
+            )
+            next_token = logits.argmax(-1, keepdim=True)
             # 이미 끝난 문장은 EOS 를 반복해 길이만 맞춥니다.
             next_token = torch.where(finished[:, None], eos_id, next_token)
-            pieces.append(next_token)
+            sequences = torch.cat((sequences, next_token), dim=1)
             finished |= next_token.squeeze(1).eq(eos_id)
             local_finished = bool(finished.all())
             if (
@@ -808,7 +886,7 @@ class SionForConditionalGeneration(nn.Module):
             ):
                 break
             current = next_token
-        return torch.cat(pieces, dim=1)
+        return sequences
 
     def _beam_decode(
         self,
@@ -822,6 +900,9 @@ class SionForConditionalGeneration(nn.Module):
         num_beams: int,
         length_penalty: float,
         cross_key_values: tuple[tuple[torch.Tensor, torch.Tensor], ...] | None = None,
+        forbidden_token_ids: tuple[int, ...] = (),
+        min_new_tokens: int = 0,
+        no_repeat_ngram_size: int = 0,
         memory_token_ids: torch.Tensor | None = None,
         memory_mask: torch.Tensor | None = None,
         memory_type_ids: torch.Tensor | None = None,
@@ -882,7 +963,16 @@ class SionForConditionalGeneration(nn.Module):
                 memory_type_ids=memory_type_ids,
                 memory_mode_ids=memory_mode_ids,
             )
-            log_probs = F.log_softmax(self._logits(hidden[:, -1]).float(), dim=-1)
+            logits = self._apply_decode_constraints(
+                self._logits(hidden[:, -1]).float(),
+                sequences,
+                eos_id=eos_id,
+                position=position,
+                min_new_tokens=min_new_tokens,
+                forbidden_token_ids=forbidden_token_ids,
+                no_repeat_ngram_size=no_repeat_ngram_size,
+            )
+            log_probs = F.log_softmax(logits, dim=-1)
             vocab = log_probs.shape[-1]
             # 누적 점수 = 지금까지의 beam 점수 + 새 토큰 log 확률
             candidate_scores = (beam_scores.view(-1, 1) + log_probs).view(batch, num_beams * vocab)

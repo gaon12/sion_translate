@@ -91,6 +91,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--length-penalty", type=float, default=1.0)
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument(
+        "--no-repeat-ngram-size",
+        type=int,
+        default=4,
+        help="이 크기의 n-gram 재생성을 금지 (0=끔, 기본 4)",
+    )
+    parser.add_argument(
+        "--max-output-length-ratio",
+        type=float,
+        default=3.0,
+        help="원문 토큰 수 대비 출력 상한 비율 (여유 토큰 16개 별도 추가)",
+    )
+    parser.add_argument(
         "--glossary",
         help="용어집 JSON 경로 (지정한 용어를 정해진 대응어로 강제; 기본: 설정의 data.glossary)",
     )
@@ -160,6 +172,8 @@ def main() -> None:
         rerank=args.rerank,
         temperature=args.temperature,
         top_k=args.top_k,
+        no_repeat_ngram_size=args.no_repeat_ngram_size,
+        max_output_length_ratio=args.max_output_length_ratio,
     )
 
     if args.revise_rounds > 0:
