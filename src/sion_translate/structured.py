@@ -48,6 +48,15 @@ _NUMBER = re.compile(
     r"(?![A-Za-z0-9_])",
     re.IGNORECASE,
 )
+# These suffixes carry ordinary language meaning and should be translated
+# (원→ウォン, 개→個, 명→人, ...).  Protecting the complete ``12,500원``
+# surface restores the Korean suffix after Japanese generation and can even
+# produce duplicated units such as ``12,500원ウォン``.  Machine-readable SI
+# units (mg, mL, GB, ...) remain part of the protected span.
+_TRANSLATABLE_NUMBER_SUFFIX = re.compile(
+    r"(?:퍼센트|달러|유로|개|명|원|엔)$",
+    re.IGNORECASE,
+)
 
 _URL_TRAILING_PUNCTUATION = ".,!?;:。！？、，；："
 _URL_KOREAN_PARTICLES = tuple(
@@ -255,7 +264,11 @@ def _regex_spans(text: str) -> Iterable[StructuredSpan]:
     for match in _PRINTF.finditer(text):
         yield _span(match.start(), match.end(), match.group(0), "printf")
     for match in _NUMBER.finditer(text):
-        yield _span(match.start(), match.end(), match.group(0), "number")
+        surface = match.group(0)
+        suffix = _TRANSLATABLE_NUMBER_SUFFIX.search(surface)
+        end = match.end() - (len(suffix.group(0)) if suffix is not None else 0)
+        if end > match.start():
+            yield _span(match.start(), end, text[match.start() : end], "number")
     for match in _IDENTIFIER.finditer(text):
         yield _span(match.start(), match.end(), match.group(0), "identifier")
 

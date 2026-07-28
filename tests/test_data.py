@@ -345,6 +345,29 @@ def test_structured_mask_covers_units_and_trims_url_particles() -> None:
     assert not missing
 
 
+def test_structured_mask_leaves_natural_language_units_translatable() -> None:
+    source = "배송비는 12,500원이고 수량은 3개이며 용량은 250mg이다."
+    masked, mapping = mask_structured_spans(
+        source,
+        slot_symbols=SLOT_SYMBOLS,
+    )
+
+    assert "원" in masked
+    assert "개" in masked
+    assert "mg" not in masked
+    assert set(mapping.values()) == {"12,500", "3", "250mg"}
+    restored, missing = restore_targets(masked, mapping)
+    assert restored == source
+    assert not missing
+
+    score, critical_mismatch = structured_similarity(
+        "배송비는 12,500원이다.",
+        "送料は12,500ウォンです。",
+    )
+    assert score == 1.0
+    assert not critical_mismatch
+
+
 def test_shared_complex_placeable_is_replaced_once() -> None:
     placeable = '{ DATETIME($date, month: "long", year: "numeric") }'
     left, right = protect_shared_spans(
