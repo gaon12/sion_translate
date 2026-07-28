@@ -53,6 +53,32 @@ def test_negative_loss_weight_is_still_an_error() -> None:
         ExperimentalConfig(bats_loss_weight=-0.1).validate()
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "minimum"),
+    [
+        ("tetm_types", 8, 9),
+        ("tetm_modes", 4, 5),
+    ],
+)
+def test_tetm_requires_protected_slot_type_and_mode_capacity(
+    field: str,
+    value: int,
+    minimum: int,
+) -> None:
+    config = ExperimentalConfig(tetm_enabled=True)
+    setattr(config, field, value)
+    with pytest.raises(ValueError, match=rf"{field} must be at least {minimum}"):
+        config.validate()
+
+
+def test_disabled_tetm_allows_smaller_positive_embedding_tables() -> None:
+    ExperimentalConfig(
+        tetm_enabled=False,
+        tetm_types=1,
+        tetm_modes=1,
+    ).validate()
+
+
 def test_multilingual_pairs_are_validated_and_expose_language_union() -> None:
     config = AppConfig(data=DataConfig(language_pairs=[["ko", "ja"], ["en", "ru"]]))
     config.validate()

@@ -290,6 +290,17 @@ class Translator:
                     f"model feature metadata does not match model config: {mismatches}"
                 )
 
+        capabilities = self.export_metadata.get("capabilities")
+        if capabilities is not None:
+            if not isinstance(capabilities, Mapping):
+                raise ValueError("model capabilities metadata must be an object")
+            if "revision_trained" in capabilities and not isinstance(
+                capabilities["revision_trained"], bool
+            ):
+                raise ValueError(
+                    "model capabilities.revision_trained must be a boolean when present"
+                )
+
         tokenizer_metadata = self.tokenizer_metadata
         if tokenizer_metadata is None:
             return
@@ -379,15 +390,21 @@ class Translator:
             "coda": 29,
         }
         with np.load(path, allow_pickle=False) as loaded:
+            required_names = {"script", "onset", "vowel", "coda"}
+            if set(loaded.files) != required_names:
+                raise ValueError(
+                    "token feature file must contain exactly "
+                    f"{', '.join(sorted(required_names))}; got {sorted(loaded.files)}"
+                )
             for name in ("script", "onset", "vowel", "coda"):
-                if name not in loaded:
-                    raise ValueError(f"token feature file is missing {name}: {path}")
                 values = np.asarray(loaded[name])
                 if values.ndim != 1 or len(values) != expected_length:
                     raise ValueError(
                         f"token feature {name} has shape {values.shape}; "
                         f"expected ({expected_length},)"
                     )
+                if not np.issubdtype(values.dtype, np.integer):
+                    raise ValueError(f"token feature {name} must use an integer dtype")
                 values = values.astype(np.int64, copy=True)
                 if values.size and (
                     int(values.min()) < 0 or int(values.max()) >= maximum_ids[name]

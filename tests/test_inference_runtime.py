@@ -13,6 +13,9 @@ from sion_translate.config import ExperimentalConfig, ModelConfig
 from sion_translate.model import SionForConditionalGeneration
 
 
+_UNSET = object()
+
+
 class FakeTokenizer:
     pad_id = 0
     unk_id = 1
@@ -76,6 +79,8 @@ def make_translator(
     feature_filename: str = "token_features.npz",
     explicit_features: bool = True,
     device: str = "cpu",
+    raw_revision_capability: object = _UNSET,
+    feature_arrays: dict[str, np.ndarray] | None = None,
 ) -> inference.Translator:
     tokenizer_path = tmp_path / "tokenizer.model"
     tokenizer_path.write_bytes(b"fake tokenizer")
@@ -85,10 +90,15 @@ def make_translator(
     zeros = np.zeros(64, dtype=np.uint8)
     np.savez_compressed(
         features,
-        script=zeros,
-        onset=zeros,
-        vowel=zeros,
-        coda=zeros,
+        **(
+            feature_arrays
+            or {
+                "script": zeros,
+                "onset": zeros,
+                "vowel": zeros,
+                "coda": zeros,
+            }
+        ),
     )
     metadata: dict[str, object] = {
         "tokenizer": {"sha256": digest},
@@ -105,10 +115,13 @@ def make_translator(
             "morphoscript": config.experimental.morphoscript_enabled,
             "recurrent_block": False,
         },
-        "capabilities": {"revision_trained": revision_trained},
         "legacy": False,
         "format": "fp32",
     }
+    if raw_revision_capability is not _UNSET:
+        metadata["capabilities"] = {"revision_trained": raw_revision_capability}
+    elif revision_trained is not None:
+        metadata["capabilities"] = {"revision_trained": revision_trained}
     if quantization is not None:
         metadata["quantization"] = quantization
     monkeypatch.setattr(inference, "SionTokenizer", tokenizer_class)
@@ -193,6 +206,21 @@ def test_revision_requires_exported_training_capability(monkeypatch, tmp_path: P
             ["초안"],
             target_language="ja",
             max_new_tokens=2,
+        )
+
+
+@pytest.mark.parametrize("invalid_value", [None, "false", 0, 1, [], {}])
+def test_revision_capability_rejects_non_boolean_manifest_values(
+    monkeypatch,
+    tmp_path: Path,
+    invalid_value: object,
+) -> None:
+    with pytest.raises(ValueError, match="revision_trained must be a boolean"):
+        make_translator(
+            monkeypatch,
+            tmp_path,
+            runtime_config(),
+            raw_revision_capability=invalid_value,
         )
 
 
@@ -352,6 +380,42 @@ def test_token_feature_identity_mismatch_is_rejected(monkeypatch, tmp_path: Path
                 )
             ),
             feature_sha256="0" * 64,
+        )
+
+
+def test_token_feature_archive_rejects_extra_arrays(monkeypatch, tmp_path: Path) -> None:
+    zeros = np.zeros(64, dtype=np.uint8)
+    with pytest.raises(ValueError, match="must contain exactly"):
+        make_translator(
+            monkeypatch,
+            tmp_path,
+            runtime_config(),
+            feature_arrays={
+                "script": zeros,
+                "onset": zeros,
+                "vowel": zeros,
+                "coda": zeros,
+                "unexpected": zeros,
+            },
+        )
+
+
+def test_token_feature_archive_rejects_non_integer_arrays(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    zeros = np.zeros(64, dtype=np.uint8)
+    with pytest.raises(ValueError, match="script must use an integer dtype"):
+        make_translator(
+            monkeypatch,
+            tmp_path,
+            runtime_config(),
+            feature_arrays={
+                "script": np.zeros(64, dtype=np.float32),
+                "onset": zeros,
+                "vowel": zeros,
+                "coda": zeros,
+            },
         )
 
 

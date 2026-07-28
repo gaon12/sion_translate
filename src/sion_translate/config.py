@@ -64,6 +64,16 @@ class ExperimentalConfig:
         ):
             if value <= 0:
                 raise ValueError(f"experimental.{name} must be positive")
+        if self.tetm_enabled and self.tetm_types < 9:
+            raise ValueError(
+                "experimental.tetm_types must be at least 9 when TETM is enabled "
+                "because protected slots use type ID 8"
+            )
+        if self.tetm_enabled and self.tetm_modes < 5:
+            raise ValueError(
+                "experimental.tetm_modes must be at least 5 when TETM is enabled "
+                "because protected slots use mode ID 4"
+            )
         for name, value in (
             ("bats_loss_weight", self.bats_loss_weight),
             ("bats_coverage_weight", self.bats_coverage_weight),
