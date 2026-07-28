@@ -1452,20 +1452,12 @@ def load_exported_model(
         runtime_config = copy.deepcopy(config)
         runtime_config.gradient_checkpointing = False
         with torch.random.fork_rng(devices=[]):
-            model = SionForConditionalGeneration(runtime_config, pad_id=pad_id)
-        if isinstance(quantization, Mapping) and quantization.get("backend") == "torchao":
-            model.load_state_dict(state, assign=True)
-        else:
-            first_float = next(
-                (tensor for tensor in state.values() if tensor.is_floating_point()),
-                None,
-            )
-            if first_float is not None and first_float.dtype in {
-                torch.float16,
-                torch.bfloat16,
-            }:
-                model.to(dtype=first_float.dtype)
-            model.load_state_dict(state)
+            with torch.device("meta"):
+                model = SionForConditionalGeneration(runtime_config, pad_id=pad_id)
+        # Bind mmap-backed tensors directly instead of allocating and initializing
+        # another full model before copying.  This keeps strict validation of a
+        # 32B FP32 artifact near one model's host-memory footprint rather than two.
+        model.load_state_dict(state, assign=True)
     model.eval()
     metadata = copy.deepcopy(payload.get("metadata") or {})
     if isinstance(quantization, Mapping):

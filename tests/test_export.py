@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import torch
 
+import sion_translate.training.export as export_module
 from sion_translate.config import ExperimentalConfig, ModelConfig
 from sion_translate.inference import find_exported_model
 from sion_translate.model import SionForConditionalGeneration
@@ -119,6 +120,34 @@ def test_stable_precision_and_packed_int4_exports_reload(tmp_path: Path) -> None
         "gguf_q4_k_m",
         "transformers",
     }
+
+
+def test_native_loader_constructs_on_meta_before_binding_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = export_config()
+    source = SionForConditionalGeneration(config)
+    export_state_dict_formats(
+        tmp_path,
+        source.state_dict(),
+        config,
+        0,
+        step=1,
+        formats=("fp32",),
+    )
+    original_constructor = export_module.SionForConditionalGeneration
+    constructor_devices: list[str] = []
+
+    def recording_constructor(*args: object, **kwargs: object) -> SionForConditionalGeneration:
+        model = original_constructor(*args, **kwargs)
+        constructor_devices.append(next(model.parameters()).device.type)
+        return model
+
+    monkeypatch.setattr(export_module, "SionForConditionalGeneration", recording_constructor)
+    restored, _, _ = load_exported_model(tmp_path / "model.pt")
+    assert constructor_devices == ["meta"]
+    assert next(restored.parameters()).device.type == "cpu"
 
 
 def test_export_metadata_records_tokenizer_hash(tmp_path: Path) -> None:
