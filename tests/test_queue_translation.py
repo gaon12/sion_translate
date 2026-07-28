@@ -1,0 +1,241 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from sion_translate.queue_translation import (
+    QueueTranslationOptions,
+    translate_queue,
+)
+
+
+class FakeTokenizer:
+    @staticmethod
+    def encode(text: str) -> list[str]:
+        return [character for character in text if not character.isspace()]
+
+
+class FakeTranslator:
+    tokenizer = FakeTokenizer()
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, tuple[str, ...]]] = []
+        self.mapping = {
+            ("ko", "ja", "안녕하세요."): "こんにちは。",
+            ("ja", "ko", "こんにちは。"): "안녕하세요.",
+            ("ko", "ja", "원래 문장입니다."): "元の文です。",
+            ("ja", "ko", "元の文です。"): "전혀 다른 내용입니다.",
+            ("ko", "ja", "정상 문장입니다."): "正常な文です。",
+            ("ja", "ko", "正常な文です。"): "정상 문장입니다.",
+        }
+
+    def translate(
+        self,
+        texts,
+        *,
+        source_language,
+        target_language,
+        num_beams,
+        max_new_tokens,
+        batch_size,
+        max_output_length_ratio,
+        max_output_length_margin,
+    ):
+        del (
+            num_beams,
+            max_new_tokens,
+            batch_size,
+            max_output_length_ratio,
+            max_output_length_margin,
+        )
+        self.calls.append((source_language, target_language, tuple(texts)))
+        if "고장 문장입니다." in texts:
+            raise RuntimeError("synthetic failure")
+        return [self.mapping[(source_language, target_language, text)] for text in texts]
+
+
+def _write_queue(path: Path) -> None:
+    rows = [
+        {
+            "id": "one",
+            "source_lang": "ko",
+            "target_lang": "ja",
+            "source": "안녕하세요.",
+            "translation": None,
+            "status": "pending",
+        },
+        {
+            "id": "bad-cycle",
+            "source_lang": "ko",
+            "target_lang": "ja",
+            "source": "원래 문장입니다.",
+            "translation": None,
+            "status": "pending",
+        },
+        {
+            "id": "failure",
+            "source_lang": "ko",
+            "target_lang": "ja",
+            "source": "고장 문장입니다.",
+            "translation": None,
+            "status": "pending",
+        },
+        {
+            "id": "already",
+            "source_lang": "ko",
+            "target_lang": "ja",
+            "source": "이미 처리한 문장입니다.",
+            "translation": "処理済みです。",
+            "status": "accepted",
+        },
+        {
+            "id": "two",
+            "source_lang": "ko",
+            "target_lang": "ja",
+            "source": "정상 문장입니다.",
+            "translation": None,
+            "status": "pending",
+        },
+    ]
+    with path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def _options(**updates) -> QueueTranslationOptions:
+    values = {
+        "batch_size": 4,
+        "shard_size": 2,
+        "min_roundtrip_score": 0.75,
+        "min_target_language_fraction": 0.20,
+    }
+    values.update(updates)
+    return QueueTranslationOptions(**values)
+
+
+def test_queue_translation_is_resumable_audited_and_failure_isolated(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "queue.jsonl"
+    results = tmp_path / "results"
+    accepted = tmp_path / "accepted"
+    _write_queue(source)
+    translator = FakeTranslator()
+
+    partial = translate_queue(
+        source,
+        results,
+        translator,
+        accepted_dir=accepted,
+        options=_options(),
+        run_metadata={"model": "fake-v1"},
+        max_rows=4,
+    )
+
+    assert partial["progress"]["completed_rows"] == 4
+    assert not partial["progress"]["complete"]
+    assert partial["stats"] == {
+        "processed": 4,
+        "accepted": 1,
+        "rejected": 1,
+        "errors": 1,
+        "skipped_existing": 1,
+    }
+    first_rows = [
+        json.loads(line)
+        for line in (results / "part-000000.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert first_rows[0]["status"] == "accepted"
+    assert first_rows[1]["status"] == "rejected"
+    assert first_rows[1]["rejection_reasons"] == ["roundtrip_score"]
+
+    completed = translate_queue(
+        source,
+        results,
+        translator,
+        accepted_dir=accepted,
+        options=_options(),
+        run_metadata={"model": "fake-v1"},
+    )
+
+    assert completed["progress"]["complete"]
+    assert completed["progress"]["completed_rows"] == 5
+    assert completed["stats"]["accepted"] == 2
+    accepted_rows = [
+        json.loads(line)
+        for path in sorted(accepted.glob("*.jsonl"))
+        for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [row["id"] for row in accepted_rows] == ["one", "two"]
+    assert all(row["synthetic"] is True for row in accepted_rows)
+    assert all(row["provenance"]["run_id"] == completed["run_id"] for row in accepted_rows)
+
+    call_count = len(translator.calls)
+    unchanged = translate_queue(
+        source,
+        results,
+        translator,
+        accepted_dir=accepted,
+        options=_options(),
+        run_metadata={"model": "fake-v1"},
+    )
+    assert unchanged["stats"] == completed["stats"]
+    assert len(translator.calls) == call_count
+
+
+def test_queue_resume_rejects_quality_or_model_changes(tmp_path: Path) -> None:
+    source = tmp_path / "queue.jsonl"
+    results = tmp_path / "results"
+    accepted = tmp_path / "accepted"
+    _write_queue(source)
+    translator = FakeTranslator()
+    translate_queue(
+        source,
+        results,
+        translator,
+        accepted_dir=accepted,
+        options=_options(),
+        run_metadata={"model": "fake-v1"},
+        max_rows=1,
+    )
+
+    with pytest.raises(ValueError, match="resume configuration changed"):
+        translate_queue(
+            source,
+            results,
+            translator,
+            accepted_dir=accepted,
+            options=_options(min_roundtrip_score=0.10),
+            run_metadata={"model": "fake-v1"},
+        )
+    with pytest.raises(ValueError, match="resume configuration changed"):
+        translate_queue(
+            source,
+            results,
+            translator,
+            accepted_dir=accepted,
+            options=_options(),
+            run_metadata={"model": "fake-v2"},
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("batch_size", 0),
+        ("shard_size", 0),
+        ("num_beams", 0),
+        ("max_new_tokens", 0),
+        ("max_output_length_ratio", 0),
+        ("max_output_length_margin", -1),
+        ("min_roundtrip_score", 1.1),
+        ("min_pair_score", 101),
+        ("min_target_language_fraction", -0.1),
+    ],
+)
+def test_queue_options_validate(field: str, value: object) -> None:
+    options = _options(**{field: value})
+    with pytest.raises(ValueError):
+        options.validate()

@@ -44,6 +44,7 @@ sion-compare = "sion_translate.cli.compare:main"
 sion-concat = "sion_translate.cli.concat:main"
 sion-revise-data = "sion_translate.cli.revise_data:main"
 sion-translate-cases = "sion_translate.cli.translate_cases:main"
+sion-translate-queue = "sion_translate.cli.translate_queue:main"
 sion-export = "sion_translate.cli.export:main"
 
 [tool.setuptools.packages.find]
