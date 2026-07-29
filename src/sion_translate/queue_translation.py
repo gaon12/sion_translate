@@ -4,12 +4,15 @@ Queue files are immutable inputs.  Each source row receives a result record,
 while only rows that pass forward and round-trip checks are copied into
 separate ``bt_*`` training shards.  Progress is committed after atomic shard
 writes so a stopped multi-day run can safely resume from its byte offset.
+Accepted shards are consumable only when their manifest part has
+``published: true``; a two-phase pending publish prevents partial training data.
 """
 
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 import hashlib
@@ -17,7 +20,7 @@ import json
 import math
 import os
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, BinaryIO, Protocol
 
 from sacrebleu.metrics import CHRF
 
@@ -33,8 +36,11 @@ from sion_translate.structured import structured_similarity
 
 MANIFEST_SCHEMA = "sion-translation-queue-v1"
 RESULT_SCHEMA = "sion-translation-result-v1"
+ACCEPTED_OWNER_SCHEMA = "sion-accepted-namespace-owner-v1"
 PIPELINE_VERSION = 1
 SIGNATURE_VERSION = 2
+RUN_LOCK_FILENAME = ".queue-translation.lock"
+ACCEPTED_LOCK_FILENAME = RUN_LOCK_FILENAME
 _CHRF = CHRF(word_order=0)
 
 
@@ -161,6 +167,146 @@ def _atomic_write_jsonl(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
     os.replace(temporary, path)
 
 
+def _acquire_file_lock(handle: BinaryIO) -> None:
+    handle.seek(0, os.SEEK_END)
+    if handle.tell() == 0:
+        handle.write(b"\0")
+        handle.flush()
+        os.fsync(handle.fileno())
+    handle.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _release_file_lock(handle: BinaryIO) -> None:
+    handle.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def _directory_run_lock(
+    directory: Path,
+    *,
+    lock_filename: str,
+    label: str,
+) -> Iterator[None]:
+    directory.mkdir(parents=True, exist_ok=True)
+    lock_path = directory / lock_filename
+    with lock_path.open("a+b") as handle:
+        try:
+            _acquire_file_lock(handle)
+        except OSError as exc:
+            raise RuntimeError(
+                f"{label} is already being translated: {directory.resolve()}"
+            ) from exc
+        try:
+            yield
+        finally:
+            _release_file_lock(handle)
+
+
+@contextmanager
+def _queue_run_lock(output_dir: Path) -> Iterator[None]:
+    """Hold an OS-released single-writer lock for one queue output directory."""
+
+    with _directory_run_lock(
+        output_dir,
+        lock_filename=RUN_LOCK_FILENAME,
+        label="queue output",
+    ):
+        yield
+
+
+@contextmanager
+def _accepted_run_lock(accepted_dir: Path) -> Iterator[None]:
+    """Serialize publishers sharing an accepted-shard namespace."""
+
+    with _directory_run_lock(
+        accepted_dir,
+        lock_filename=ACCEPTED_LOCK_FILENAME,
+        label="accepted queue namespace",
+    ):
+        yield
+
+
+def _pending_accepted_path(path: Path) -> Path:
+    return path.with_name(f".{path.name}.pending")
+
+
+def _publish_no_replace(pending_path: Path, accepted_path: Path) -> None:
+    """Atomically publish without overwriting a target created by another host."""
+
+    try:
+        os.link(pending_path, accepted_path)
+    except FileExistsError:
+        raise
+    except OSError as exc:
+        raise OSError(
+            f"filesystem does not support atomic no-clobber publication: {accepted_path}"
+        ) from exc
+    pending_path.unlink()
+
+
+def _claim_accepted_namespace(
+    manifest: Mapping[str, Any],
+    *,
+    output_dir: Path,
+    accepted_dir: Path,
+    input_stem: str,
+) -> None:
+    """Persistently bind one accepted run ID to its owning output manifest."""
+
+    accepted_dir.mkdir(parents=True, exist_ok=True)
+    owner_path = accepted_dir / f".{input_stem}_{manifest['run_id']}.owner.json"
+    owner = {
+        "schema": ACCEPTED_OWNER_SCHEMA,
+        "run_id": manifest["run_id"],
+        "output_dir": str(output_dir.resolve()),
+        "manifest": str((output_dir / "manifest.json").resolve()),
+    }
+    if owner_path.is_file():
+        try:
+            existing = json.loads(owner_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid accepted namespace owner: {owner_path}") from exc
+        if existing != owner:
+            raise FileExistsError(
+                f"accepted queue namespace is already owned by another output: {owner_path}"
+            )
+        return
+    temporary = owner_path.with_name(f".{owner_path.name}.{os.getpid()}.tmp")
+    with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+        json.dump(owner, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    try:
+        _publish_no_replace(temporary, owner_path)
+    except FileExistsError as exc:
+        temporary.unlink(missing_ok=True)
+        try:
+            existing = json.loads(owner_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError) as read_error:
+            raise ValueError(f"invalid accepted namespace owner: {owner_path}") from read_error
+        if existing != owner:
+            raise FileExistsError(
+                f"accepted queue namespace is already owned by another output: {owner_path}"
+            ) from exc
+
+
 def _jsonl_artifact(path: Path) -> dict[str, Any]:
     digest = hashlib.sha256()
     rows = 0
@@ -179,6 +325,71 @@ def _jsonl_artifact(path: Path) -> dict[str, Any]:
         "rows": rows,
         "sha256": digest.hexdigest(),
     }
+
+
+def _artifact_content_matches(path: Path, expected: Mapping[str, Any]) -> bool:
+    if not path.is_file():
+        return False
+    observed = _jsonl_artifact(path)
+    return all(observed[field] == expected.get(field) for field in ("size", "rows", "sha256"))
+
+
+def _recover_pending_accepted_parts(
+    manifest: dict[str, Any],
+    *,
+    accepted_dir: Path,
+    input_stem: str,
+) -> bool:
+    """Publish a committed accepted shard if a crash preceded its final rename."""
+
+    next_part = int(manifest["progress"]["next_part"])
+    parts = manifest.get("parts")
+    changed = False
+    for part_index in range(next_part):
+        accepted_path = (
+            accepted_dir / f"bt_{input_stem}_{manifest['run_id']}_{part_index:06d}.jsonl"
+        )
+        pending_path = _pending_accepted_path(accepted_path)
+        if isinstance(parts, list) and part_index < len(parts):
+            part = parts[part_index]
+            expected = part.get("accepted") if isinstance(part, Mapping) else None
+            if not isinstance(part, dict) or not isinstance(expected, Mapping):
+                raise ValueError(f"accepted part {part_index:06d} has no valid manifest metadata")
+            if part.get("published") is True and not pending_path.exists():
+                continue
+            final_matches = _artifact_content_matches(accepted_path, expected)
+            pending_matches = _artifact_content_matches(pending_path, expected)
+            if final_matches:
+                if pending_path.exists():
+                    pending_path.unlink()
+                if part.get("published") is not True:
+                    part["published"] = True
+                    changed = True
+                continue
+            if pending_matches:
+                try:
+                    _publish_no_replace(pending_path, accepted_path)
+                except FileExistsError as exc:
+                    if _artifact_content_matches(accepted_path, expected):
+                        pending_path.unlink()
+                    else:
+                        raise ValueError(
+                            f"accepted part {part_index:06d} collided during recovery"
+                        ) from exc
+                if part.get("published") is not True:
+                    part["published"] = True
+                    changed = True
+                continue
+            if not accepted_path.exists() and not pending_path.exists():
+                raise FileNotFoundError(
+                    f"accepted part {part_index:06d} and its pending recovery are missing"
+                )
+            raise ValueError(f"accepted part {part_index:06d} does not match its manifest")
+        if pending_path.is_file() and not accepted_path.exists():
+            _publish_no_replace(pending_path, accepted_path)
+        elif pending_path.exists():
+            raise ValueError(f"ambiguous legacy accepted part recovery for {part_index:06d}")
+    return changed
 
 
 def _validate_artifact(
@@ -583,6 +794,7 @@ def _validate_or_register_parts(
                     "accepted": accepted_artifact,
                     "status_counts": status_counts,
                     "generated_rows": generated_rows,
+                    "published": True,
                 }
             )
             source_start += int(result_artifact["rows"])
@@ -597,6 +809,8 @@ def _validate_or_register_parts(
     for part_index, part in enumerate(parts):
         if not isinstance(part, dict) or int(part.get("part", -1)) != part_index:
             raise ValueError("queue manifest contains an invalid or out-of-order part")
+        if part.get("published") is not True:
+            raise ValueError(f"accepted part {part_index:06d} is not published")
         result_path = output_dir / f"part-{part_index:06d}.jsonl"
         accepted_path = (
             accepted_dir / f"bt_{input_stem}_{manifest['run_id']}_{part_index:06d}.jsonl"
@@ -738,7 +952,7 @@ def _remaining_teacher_pilot_rows(manifest: Mapping[str, Any]) -> int | None:
     )
 
 
-def translate_queue(
+def _translate_queue_unlocked(
     input_path: str | Path,
     output_dir: str | Path,
     translator: TranslatorLike,
@@ -791,7 +1005,12 @@ def translate_queue(
     )
     resume_metadata_changed = False
     if existing is None:
-        if output_dir.exists() and any(output_dir.iterdir()):
+        non_lock_entries = [
+            entry
+            for entry in output_dir.iterdir()
+            if entry.name not in {RUN_LOCK_FILENAME, ACCEPTED_LOCK_FILENAME}
+        ]
+        if non_lock_entries:
             raise FileExistsError(f"{output_dir} is not empty and has no compatible queue manifest")
         manifest = candidate
     else:
@@ -820,12 +1039,27 @@ def translate_queue(
         manifest["run_signature"] = stable_existing_signature
         manifest["signature_version"] = SIGNATURE_VERSION
         manifest["configuration"]["source"] = source
-    parts_changed = _validate_or_register_parts(
+    _claim_accepted_namespace(
         manifest,
         output_dir=output_dir,
         accepted_dir=accepted_dir,
         input_stem=input_path.stem,
     )
+    if existing is not None:
+        recovery_changed = _recover_pending_accepted_parts(
+            manifest,
+            accepted_dir=accepted_dir,
+            input_stem=input_path.stem,
+        )
+    else:
+        recovery_changed = False
+    validation_changed = _validate_or_register_parts(
+        manifest,
+        output_dir=output_dir,
+        accepted_dir=accepted_dir,
+        input_stem=input_path.stem,
+    )
+    parts_changed = recovery_changed or validation_changed
     review_changed = _configure_teacher_review(
         manifest,
         teacher_pilot_rows=teacher_pilot_rows,
@@ -867,7 +1101,23 @@ def translate_queue(
                     break
                 raw_rows.append(raw)
             if not raw_rows:
+                final_source = _source_identity(input_path, None, force_hash=True)
+                if (
+                    _signature_configuration({"source": final_source})["source"]
+                    != _signature_configuration({"source": manifest["configuration"]["source"]})[
+                        "source"
+                    ]
+                ):
+                    raise ValueError("input source content changed during queue translation")
+                manifest["configuration"]["source"] = final_source
                 progress["complete"] = True
+                review = manifest.get("teacher_review")
+                if (
+                    isinstance(review, dict)
+                    and not review["approved"]
+                    and manifest["stats"]["generated"] > 0
+                ):
+                    review["review_required"] = True
                 manifest["updated_at"] = datetime.now(UTC).isoformat()
                 _atomic_write_json(manifest_path, manifest)
                 break
@@ -1020,17 +1270,26 @@ def translate_queue(
             )
             result_path = output_dir / f"part-{part:06d}.jsonl"
             accepted_path = accepted_dir / f"bt_{input_path.stem}_{run_id}_{part:06d}.jsonl"
+            pending_accepted_path = _pending_accepted_path(accepted_path)
+            if accepted_path.exists():
+                raise FileExistsError(
+                    "uncommitted accepted shard target already exists; "
+                    f"refusing to overwrite {accepted_path}"
+                )
             _atomic_write_jsonl(result_path, results)
-            _atomic_write_jsonl(accepted_path, accepted_rows)
+            _atomic_write_jsonl(pending_accepted_path, accepted_rows)
+            accepted_artifact = _jsonl_artifact(pending_accepted_path)
+            accepted_artifact["path"] = str(accepted_path.resolve())
             manifest["parts"].append(
                 {
                     "part": part,
                     "source_start_index": start_index,
                     "source_rows": len(raw_rows),
                     "result": _jsonl_artifact(result_path),
-                    "accepted": _jsonl_artifact(accepted_path),
+                    "accepted": accepted_artifact,
                     "status_counts": status_counts,
                     "generated_rows": generated_rows,
+                    "published": False,
                 }
             )
 
@@ -1046,9 +1305,10 @@ def translate_queue(
             progress["next_part"] += 1
             processed_this_call += len(raw_rows)
             position = source_handle.tell()
-            progress["complete"] = source_handle.read(1) == b""
+            source_exhausted = source_handle.read(1) == b""
             source_handle.seek(position)
-            if progress["complete"]:
+            progress["complete"] = False
+            if source_exhausted:
                 final_source = _source_identity(input_path, None, force_hash=True)
                 if (
                     _signature_configuration({"source": final_source})["source"]
@@ -1066,10 +1326,15 @@ def translate_queue(
                 and not review["approved"]
                 and (
                     stats["generated"] >= review["pilot_rows"]
-                    or (progress["complete"] and stats["generated"] > 0)
+                    or (source_exhausted and stats["generated"] > 0)
                 )
             ):
                 review["review_required"] = True
+            manifest["updated_at"] = datetime.now(UTC).isoformat()
+            _atomic_write_json(manifest_path, manifest)
+            _publish_no_replace(pending_accepted_path, accepted_path)
+            manifest["parts"][-1]["published"] = True
+            progress["complete"] = source_exhausted
             manifest["updated_at"] = datetime.now(UTC).isoformat()
             _atomic_write_json(manifest_path, manifest)
             if log is not None:
@@ -1081,3 +1346,40 @@ def translate_queue(
             if progress["complete"]:
                 break
     return manifest
+
+
+def translate_queue(
+    input_path: str | Path,
+    output_dir: str | Path,
+    translator: TranslatorLike,
+    *,
+    accepted_dir: str | Path,
+    options: QueueTranslationOptions | None = None,
+    run_metadata: Mapping[str, Any] | None = None,
+    max_rows: int | None = None,
+    teacher_pilot_rows: int | None = None,
+    approve_teacher: bool = False,
+    approval_actor: str | None = None,
+    log: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """Translate a queue under a single-writer lock."""
+
+    output_path = Path(output_dir)
+    accepted_path = Path(accepted_dir)
+    with ExitStack() as locks:
+        locks.enter_context(_queue_run_lock(output_path))
+        if output_path.resolve() != accepted_path.resolve():
+            locks.enter_context(_accepted_run_lock(accepted_path))
+        return _translate_queue_unlocked(
+            input_path,
+            output_dir,
+            translator,
+            accepted_dir=accepted_dir,
+            options=options,
+            run_metadata=run_metadata,
+            max_rows=max_rows,
+            teacher_pilot_rows=teacher_pilot_rows,
+            approve_teacher=approve_teacher,
+            approval_actor=approval_actor,
+            log=log,
+        )

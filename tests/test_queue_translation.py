@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import multiprocessing
 import os
 from pathlib import Path
 
 import pytest
 
+import sion_translate.queue_translation as queue_translation_module
 from sion_translate.queue_translation import (
     QueueTranslationOptions,
+    _accepted_run_lock,
+    _queue_run_lock,
     translate_queue,
 )
 
@@ -17,6 +21,12 @@ class FakeTokenizer:
     @staticmethod
     def encode(text: str) -> list[str]:
         return [character for character in text if not character.isspace()]
+
+
+def _hold_queue_lock(path: str, ready, release) -> None:
+    with _queue_run_lock(Path(path)):
+        ready.set()
+        release.wait(timeout=10)
 
 
 class FakeTranslator:
@@ -367,6 +377,7 @@ def test_queue_resume_ignores_mtime_but_records_content_artifacts(
     )
     original_signature = partial["run_signature"]
     artifact = partial["parts"][0]
+    assert artifact["published"] is True
     assert artifact["result"]["rows"] == 1
     assert len(artifact["result"]["sha256"]) == 64
     assert artifact["accepted"]["rows"] == 1
@@ -581,6 +592,341 @@ def test_legacy_shard_registration_rejects_broken_source_sequence(
             accepted_dir=accepted,
             options=_options(),
         )
+
+
+def test_queue_output_allows_only_one_writer(tmp_path: Path) -> None:
+    source = tmp_path / "queue.jsonl"
+    results = tmp_path / "results"
+    _write_queue(source)
+
+    with _queue_run_lock(results):
+        with pytest.raises(RuntimeError, match="already being translated"):
+            translate_queue(
+                source,
+                results,
+                FakeTranslator(),
+                accepted_dir=tmp_path / "accepted",
+                options=_options(),
+            )
+
+
+def test_queue_lock_excludes_a_second_process(tmp_path: Path) -> None:
+    results = tmp_path / "results"
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    release = context.Event()
+    process = context.Process(
+        target=_hold_queue_lock,
+        args=(str(results), ready, release),
+    )
+    process.start()
+    try:
+        assert ready.wait(timeout=10)
+        with pytest.raises(RuntimeError, match="already being translated"):
+            with _queue_run_lock(results):
+                pass
+    finally:
+        release.set()
+        process.join(timeout=10)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=10)
+    assert process.exitcode == 0
+
+
+def test_shared_accepted_namespace_allows_only_one_publisher(tmp_path: Path) -> None:
+    source = tmp_path / "queue.jsonl"
+    accepted = tmp_path / "accepted"
+    _write_queue(source)
+
+    with _accepted_run_lock(accepted):
+        with pytest.raises(RuntimeError, match="accepted queue namespace"):
+            translate_queue(
+                source,
+                tmp_path / "other-results",
+                FakeTranslator(),
+                accepted_dir=accepted,
+                options=_options(),
+            )
+
+
+def test_new_output_refuses_to_overwrite_existing_accepted_shard(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "queue.jsonl"
+    accepted = tmp_path / "accepted"
+    _write_queue(source)
+    translate_queue(
+        source,
+        tmp_path / "first-results",
+        FakeTranslator(),
+        accepted_dir=accepted,
+        options=_options(),
+        max_rows=1,
+    )
+
+    with pytest.raises(FileExistsError, match="already owned"):
+        translate_queue(
+            source,
+            tmp_path / "second-results",
+            FakeTranslator(),
+            accepted_dir=accepted,
+            options=_options(),
+            max_rows=1,
+        )
+
+
+def test_committed_pending_accepted_shard_is_recovered(tmp_path: Path) -> None:
+    source = tmp_path / "queue.jsonl"
+    results = tmp_path / "results"
+    accepted = tmp_path / "accepted"
+    _write_queue(source)
+    translator = FakeTranslator()
+    manifest = translate_queue(
+        source,
+        results,
+        translator,
+        accepted_dir=accepted,
+        options=_options(),
+        max_rows=1,
+    )
+    accepted_path = Path(manifest["parts"][0]["accepted"]["path"])
+    pending_path = accepted_path.with_name(f".{accepted_path.name}.pending")
+    accepted_path.replace(pending_path)
+
+    completed = translate_queue(
+        source,
+        results,
+        translator,
+        accepted_dir=accepted,
+        options=_options(),
+    )
+
+    assert completed["progress"]["complete"]
+    assert accepted_path.is_file()
+    assert not pending_path.exists()
+
+
+def test_published_final_wins_over_stale_pending(tmp_path: Path) -> None:
+    source = tmp_path / "queue.jsonl"
+    results = tmp_path / "results"
+    accepted = tmp_path / "accepted"
+    _write_queue(source)
+    translator = FakeTranslator()
+    manifest = translate_queue(
+        source,
+        results,
+        translator,
+        accepted_dir=accepted,
+        options=_options(),
+        max_rows=1,
+    )
+    accepted_path = Path(manifest["parts"][0]["accepted"]["path"])
+    pending_path = accepted_path.with_name(f".{accepted_path.name}.pending")
+    pending_path.write_text("{}\n", encoding="utf-8")
+
+    completed = translate_queue(
+        source,
+        results,
+        translator,
+        accepted_dir=accepted,
+        options=_options(),
+    )
+
+    assert completed["progress"]["complete"]
+    assert accepted_path.is_file()
+    assert not pending_path.exists()
+
+
+def test_accepted_shard_is_not_published_before_manifest_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "queue.jsonl"
+    results = tmp_path / "results"
+    accepted = tmp_path / "accepted"
+    _write_queue(source)
+    translator = FakeTranslator()
+    original_write = queue_translation_module._atomic_write_json
+    writes = 0
+
+    def fail_part_commit(path: Path, value) -> None:
+        nonlocal writes
+        writes += 1
+        if writes == 2:
+            raise OSError("simulated manifest failure")
+        original_write(path, value)
+
+    monkeypatch.setattr(
+        queue_translation_module,
+        "_atomic_write_json",
+        fail_part_commit,
+    )
+    with pytest.raises(OSError, match="simulated manifest failure"):
+        translate_queue(
+            source,
+            results,
+            translator,
+            accepted_dir=accepted,
+            options=_options(),
+            max_rows=1,
+        )
+
+    disk_manifest = json.loads((results / "manifest.json").read_text(encoding="utf-8"))
+    assert disk_manifest["progress"]["next_part"] == 0
+    assert list(accepted.glob("*.jsonl")) == []
+    assert len(list(accepted.glob("*.pending"))) == 1
+
+    monkeypatch.setattr(
+        queue_translation_module,
+        "_atomic_write_json",
+        original_write,
+    )
+    resumed = translate_queue(
+        source,
+        results,
+        translator,
+        accepted_dir=accepted,
+        options=_options(),
+        max_rows=1,
+    )
+    assert resumed["progress"]["next_part"] == 1
+    assert len(list(accepted.glob("*.jsonl"))) == 1
+    assert list(accepted.glob("*.pending")) == []
+
+
+def test_unpublished_manifest_part_recovers_after_final_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "queue.jsonl"
+    results = tmp_path / "results"
+    accepted = tmp_path / "accepted"
+    _write_queue(source)
+    first_row = source.read_text(encoding="utf-8").splitlines()[0]
+    source.write_text(first_row + "\n", encoding="utf-8")
+    translator = FakeTranslator()
+    original_write = queue_translation_module._atomic_write_json
+    writes = 0
+
+    def fail_published_commit(path: Path, value) -> None:
+        nonlocal writes
+        writes += 1
+        if writes == 3:
+            raise OSError("simulated published-manifest failure")
+        original_write(path, value)
+
+    monkeypatch.setattr(
+        queue_translation_module,
+        "_atomic_write_json",
+        fail_published_commit,
+    )
+    with pytest.raises(OSError, match="published-manifest failure"):
+        translate_queue(
+            source,
+            results,
+            translator,
+            accepted_dir=accepted,
+            options=_options(),
+            max_rows=1,
+        )
+
+    disk_manifest = json.loads((results / "manifest.json").read_text(encoding="utf-8"))
+    assert disk_manifest["progress"]["next_part"] == 1
+    assert disk_manifest["progress"]["complete"] is False
+    assert disk_manifest["parts"][0]["published"] is False
+    assert len(list(accepted.glob("*.jsonl"))) == 1
+
+    monkeypatch.setattr(
+        queue_translation_module,
+        "_atomic_write_json",
+        original_write,
+    )
+    recovered = translate_queue(
+        source,
+        results,
+        translator,
+        accepted_dir=accepted,
+        options=_options(),
+        max_rows=1,
+    )
+    assert recovered["parts"][0]["published"] is True
+    assert recovered["progress"]["complete"] is True
+    persisted = json.loads((results / "manifest.json").read_text(encoding="utf-8"))
+    assert persisted["parts"][0]["published"] is True
+    assert persisted["progress"]["complete"] is True
+
+
+def test_atomic_publish_never_overwrites_external_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "queue.jsonl"
+    results = tmp_path / "results"
+    accepted = tmp_path / "accepted"
+    _write_queue(source)
+    original_link = queue_translation_module.os.link
+
+    def create_foreign_target_then_link(source_path, target_path) -> None:
+        if str(target_path).endswith(".jsonl"):
+            Path(target_path).write_text("foreign\n", encoding="utf-8")
+        original_link(source_path, target_path)
+
+    monkeypatch.setattr(
+        queue_translation_module.os,
+        "link",
+        create_foreign_target_then_link,
+    )
+    with pytest.raises(FileExistsError):
+        translate_queue(
+            source,
+            results,
+            FakeTranslator(),
+            accepted_dir=accepted,
+            options=_options(),
+            max_rows=1,
+        )
+
+    disk_manifest = json.loads((results / "manifest.json").read_text(encoding="utf-8"))
+    accepted_path = Path(disk_manifest["parts"][0]["accepted"]["path"])
+    assert accepted_path.read_text(encoding="utf-8") == "foreign\n"
+    assert disk_manifest["parts"][0]["published"] is False
+    assert disk_manifest["progress"]["complete"] is False
+
+
+def test_owner_claim_never_overwrites_external_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "queue.jsonl"
+    results = tmp_path / "results"
+    accepted = tmp_path / "accepted"
+    _write_queue(source)
+    original_link = queue_translation_module.os.link
+
+    def create_foreign_owner_then_link(source_path, target_path) -> None:
+        if str(target_path).endswith(".owner.json"):
+            Path(target_path).write_text("{}\n", encoding="utf-8")
+        original_link(source_path, target_path)
+
+    monkeypatch.setattr(
+        queue_translation_module.os,
+        "link",
+        create_foreign_owner_then_link,
+    )
+    with pytest.raises(FileExistsError, match="already owned"):
+        translate_queue(
+            source,
+            results,
+            FakeTranslator(),
+            accepted_dir=accepted,
+            options=_options(),
+            max_rows=1,
+        )
+
+    owner_files = list(accepted.glob("*.owner.json"))
+    assert len(owner_files) == 1
+    assert owner_files[0].read_text(encoding="utf-8") == "{}\n"
 
 
 def test_queue_default_roundtrip_threshold_is_conservative() -> None:
