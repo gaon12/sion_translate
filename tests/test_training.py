@@ -116,6 +116,76 @@ def test_single_step_training_loop(tmp_path: Path) -> None:
         assert not (tmp_path / "run" / "exports" / name / "model.pt").exists()
 
 
+def test_mid_epoch_resume_uses_saved_batch_cursor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "sion_translate.training.trainer.export_inference_models",
+        lambda *args, **kwargs: None,
+    )
+    first_batch = tiny_batch()
+    second_batch = {name: value.clone() for name, value in first_batch.items()}
+    second_batch["input_ids"][:, 1] = torch.tensor([30, 31])
+    second_batch["labels"][:, 0] = torch.tensor([32, 33])
+    batches = [first_batch, second_batch, tiny_batch()]
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+
+    torch.manual_seed(20260730)
+    initial = SionForConditionalGeneration(tiny_model_config())
+    initial_state = {name: value.detach().clone() for name, value in initial.state_dict().items()}
+
+    baseline = SionForConditionalGeneration(tiny_model_config())
+    baseline.load_state_dict(initial_state)
+    baseline_config = tiny_app_config(
+        tmp_path / "baseline",
+        max_steps=2,
+        eval_every=100,
+        save_every=100,
+        ema_decay=0.0,
+        min_learning_rate_ratio=1.0,
+    )
+    train(baseline, batches, [tiny_batch()], baseline_config, context)
+
+    interrupted = SionForConditionalGeneration(tiny_model_config())
+    interrupted.load_state_dict(initial_state)
+    resumed_config = tiny_app_config(
+        tmp_path / "resumed",
+        max_steps=1,
+        eval_every=100,
+        save_every=100,
+        ema_decay=0.0,
+        min_learning_rate_ratio=1.0,
+    )
+    train(interrupted, batches, [tiny_batch()], resumed_config, context)
+    resume_path = tmp_path / "resumed" / "run" / "checkpoints" / "latest"
+    interrupted_payload = torch.load(
+        resume_path / "checkpoint.pt",
+        map_location="cpu",
+        weights_only=True,
+    )
+    assert interrupted_payload["training_state"]["batch_in_epoch"] == 1
+    assert interrupted_payload["training_state"]["epoch"] == 0
+
+    resumed_config.training.max_steps = 2
+    resumed_config.training.resume_from = str(resume_path)
+    resumed = SionForConditionalGeneration(tiny_model_config())
+    train(resumed, batches, [tiny_batch()], resumed_config, context)
+
+    baseline_payload = torch.load(
+        tmp_path / "baseline" / "run" / "checkpoints" / "final" / "checkpoint.pt",
+        map_location="cpu",
+        weights_only=True,
+    )
+    resumed_payload = torch.load(
+        tmp_path / "resumed" / "run" / "checkpoints" / "final" / "checkpoint.pt",
+        map_location="cpu",
+        weights_only=True,
+    )
+    for name, expected in baseline_payload["model"].items():
+        torch.testing.assert_close(resumed_payload["model"][name], expected)
+
+
 def test_exported_models_reload_and_run(tmp_path: Path) -> None:
     config = tiny_app_config(tmp_path)
     model = SionForConditionalGeneration(config.model)

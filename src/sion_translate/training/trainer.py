@@ -30,7 +30,7 @@ from tqdm.auto import tqdm
 
 from sion_translate.config import AppConfig, TrainingConfig
 
-from .checkpoint import load_checkpoint, save_checkpoint
+from .checkpoint import build_checkpoint_identity, load_checkpoint, save_checkpoint
 from .distributed import (
     DistributedContext,
     broadcast_bool,
@@ -277,6 +277,31 @@ def train(
 
     training = config.training
     output_dir = Path(training.output_dir)
+    batch_sampler = getattr(train_loader, "batch_sampler", None)
+    checkpoint_identity = build_checkpoint_identity(
+        model_config=config.model,
+        tokenizer_path=config.data.tokenizer_model,
+        token_features_path=config.data.tokenizer_features,
+        dataset_dir=config.data.dataset_dir,
+        data_config=config.data,
+        sampling_seed=getattr(
+            batch_sampler,
+            "seed",
+            config.training.seed,
+        ),
+        stage_name=stage_name,
+        loader_config={
+            "batch_size_per_rank": getattr(
+                batch_sampler,
+                "batch_size",
+                config.training.batch_size_per_gpu,
+            ),
+            "world_size": context.world_size,
+            "gradient_accumulation_steps": config.training.gradient_accumulation_steps,
+            "drop_last": getattr(batch_sampler, "drop_last", None),
+            "bucket_size": getattr(batch_sampler, "bucket_size", None),
+        },
+    )
     if context.is_main:
         output_dir.mkdir(parents=True, exist_ok=True)
         # 이 run 이 정확히 어떤 설정으로 돌았는지 나중에 확인할 수 있도록 저장합니다.
@@ -310,6 +335,7 @@ def train(
         "best_step": -1,
         "early_stopping_bad_evals": 0,
         "epoch": 0,
+        "batch_in_epoch": 0,
     }
 
     # ── 단계 2/4: (선택) 체크포인트에서 재개 ──────────────────────────────
@@ -324,6 +350,7 @@ def train(
             scaler=scaler if scaler.is_enabled() else None,
             training_state=training_state,
             ema=ema,
+            expected_identity=checkpoint_identity,
         )
         announce(f"재개 완료: step {start_step} 부터 다시 시작합니다.", context)
     else:
@@ -332,6 +359,9 @@ def train(
     writer = _make_summary_writer(training, output_dir, context, start_step)
     step = start_step
     epoch = int(training_state.get("epoch", 0))
+    batch_in_epoch = int(training_state.get("batch_in_epoch", 0))
+    if batch_in_epoch < 0:
+        raise ValueError("checkpoint batch_in_epoch must be non-negative")
     best_validation_loss = float(training_state.get("best_validation_loss", float("inf")))
     best_step = int(training_state.get("best_step", -1))
     bad_evals = int(training_state.get("early_stopping_bad_evals", 0))
@@ -356,6 +386,7 @@ def train(
             "best_step": best_step,
             "early_stopping_bad_evals": bad_evals,
             "epoch": epoch,
+            "batch_in_epoch": batch_in_epoch,
         }
 
     def save(path: Path) -> None:
@@ -370,6 +401,7 @@ def train(
             scaler=scaler if scaler.is_enabled() else None,
             training_state=current_training_state(),
             ema=ema,
+            identity=checkpoint_identity,
         )
 
     def export_models(name: str) -> None:
@@ -541,15 +573,43 @@ def train(
                 train_loader.batch_sampler, "set_epoch"
             ):
                 train_loader.batch_sampler.set_epoch(epoch)
+            sampler_has_cursor = hasattr(train_loader, "batch_sampler") and hasattr(
+                train_loader.batch_sampler,
+                "set_start_batch",
+            )
+            if sampler_has_cursor:
+                train_loader.batch_sampler.set_start_batch(batch_in_epoch)
             if hasattr(train_loader, "collate_fn") and hasattr(
                 train_loader.collate_fn, "set_epoch"
             ):
                 train_loader.collate_fn.set_epoch(epoch)
-            batches_this_epoch = 0
+            batches_this_epoch = batch_in_epoch
             data_wait_started = time.perf_counter()
-            for batch in train_loader:
+            # DataLoader iterator creation draws a worker seed from torch's global
+            # RNG. Preserve the model RNG so a mid-epoch restart does not inject
+            # one extra random draw into dropout or other stochastic layers.
+            torch_rng_before_iterator = torch.get_rng_state()
+            train_iterator = iter(train_loader)
+            torch.set_rng_state(torch_rng_before_iterator)
+            if batch_in_epoch and not sampler_has_cursor:
+                # Generic Iterable compatibility. The project's sampler uses the
+                # cursor above and therefore avoids fetching/collating skipped data.
+                for _ in range(batch_in_epoch):
+                    try:
+                        next(train_iterator)
+                    except StopIteration as error:
+                        raise ValueError(
+                            "checkpoint batch_in_epoch exceeds the training loader length"
+                        ) from error
+                # Skipping a generic iterator may use torch RNG in its collator.
+                # The skipped batches happened before the checkpoint, so discard
+                # those duplicate RNG draws.
+                torch.set_rng_state(torch_rng_before_iterator)
+            epoch_completed = True
+            for batch in train_iterator:
                 data_wait_seconds += time.perf_counter() - data_wait_started
                 batches_this_epoch += 1
+                batch_in_epoch += 1
                 batch = move_to_device(batch, context.device)
                 # accumulation 창의 마지막 micro-batch 에서만 gradient 를 동기화합니다.
                 is_last_micro = (micro_step + 1) % training.gradient_accumulation_steps == 0
@@ -718,6 +778,7 @@ def train(
                             f"Early stopping: {bad_evals}회 연속 개선이 없어 학습을 종료합니다.",
                             context,
                         )
+                        epoch_completed = False
                         break
 
                 # save_every step 마다: 최신(latest) 체크포인트 + 추론용 모델 저장
@@ -726,12 +787,14 @@ def train(
                     save(output_dir / "checkpoints" / "latest")
                     export_models("latest")
                 if step >= training.max_steps:
+                    epoch_completed = False
                     break
                 data_wait_started = time.perf_counter()
             if batches_this_epoch == 0:
                 raise ValueError("training loader produced no batches")
-            if not stopped_early:
+            if not stopped_early and epoch_completed:
                 epoch += 1
+                batch_in_epoch = 0
 
         # ── 단계 4/4: 마무리 저장 ─────────────────────────────────────────
         # 마지막 step 에서 검증을 아직 안 했다면 한 번 더 수행합니다.
@@ -763,6 +826,7 @@ def train(
                 context,
                 scaler=scaler if scaler.is_enabled() else None,
                 ema=ema,
+                expected_identity=checkpoint_identity,
             )
             selected_weights = "EMA" if ema is not None else "raw"
             if ema is not None:

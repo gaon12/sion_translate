@@ -278,6 +278,33 @@ def test_distributed_sampler_pads_equal_batches_when_not_dropping() -> None:
     assert batch_counts == [2, 2, 2]
 
 
+def test_distributed_sampler_resumes_from_batch_cursor_without_refetching() -> None:
+    class DummyDataset:
+        bidirectional = False
+        pair_count = 12
+        pair_source_ids = np.zeros(12, dtype=np.uint16)
+        source_names = ["only.jsonl"]
+
+        def __len__(self) -> int:
+            return self.pair_count
+
+        def lengths_for_indices(self, indices: np.ndarray) -> np.ndarray:
+            return np.ones_like(indices)
+
+    sampler = DistributedBucketBatchSampler(
+        DummyDataset(),
+        batch_size=2,
+        seed=19,
+    )
+    sampler.set_epoch(4)
+    full_epoch = list(sampler)
+    sampler.set_epoch(4)
+    sampler.set_start_batch(2)
+    assert list(sampler) == full_epoch[2:]
+    sampler.set_epoch(4)
+    assert list(sampler) == full_epoch
+
+
 def test_protected_span_replacement_is_single_pass_and_boundary_safe() -> None:
     ko, ja = protect_shared_spans(
         "코드 A-0, 값 0과 10을 확인한다.",

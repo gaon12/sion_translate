@@ -66,6 +66,7 @@ from sion_translate.training.distributed import (
     parallelize_model,
     resolve_parallel_strategy,
 )
+from sion_translate.training.checkpoint import checkpoint_path_exists
 from sion_translate.training.export import export_inference_models
 from sion_translate.training.objectives import MinimumRiskObjective
 from sion_translate.training.trainer import announce, train
@@ -338,7 +339,7 @@ def find_existing_checkpoint(config: AppConfig) -> Path | None:
         if not checkpoint_root.is_dir():
             continue
         for candidate in sorted(checkpoint_root.iterdir()):
-            if (candidate / "checkpoint.pt").is_file() or (candidate / ".metadata").exists():
+            if checkpoint_path_exists(candidate):
                 return candidate
     return None
 
@@ -606,7 +607,7 @@ def ensure_artifacts(config: AppConfig, context: DistributedContext) -> None:
 def find_auto_resume(config: AppConfig) -> str | None:
     """이전 학습의 latest 체크포인트가 있으면 그 경로를 돌려줍니다."""
     latest = Path(config.training.output_dir) / "checkpoints" / "latest"
-    if (latest / "checkpoint.pt").exists() or (latest / ".metadata").exists():
+    if checkpoint_path_exists(latest):
         return str(latest)
     return None
 

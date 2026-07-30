@@ -502,9 +502,18 @@ class DistributedBucketBatchSampler(Sampler[list[int]]):
         self._group_codes: np.ndarray | None = None
         self._group_probabilities: np.ndarray | None = None
         self.epoch = 0
+        self.start_batch = 0
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = epoch
+        self.start_batch = 0
+
+    def set_start_batch(self, start_batch: int) -> None:
+        """Skip already-consumed batches without fetching or collating them."""
+
+        if start_batch < 0 or start_batch > len(self):
+            raise ValueError(f"start_batch must be in [0, {len(self)}]")
+        self.start_batch = int(start_batch)
 
     def __len__(self) -> int:
         denominator = self.batch_size * self.world_size
@@ -636,7 +645,9 @@ class DistributedBucketBatchSampler(Sampler[list[int]]):
                 if usable > len(indices):
                     indices = np.resize(indices, usable)
             local = indices[self.rank : usable : self.world_size]
-        for start in range(0, len(local), self.batch_size):
+        for batch_index, start in enumerate(range(0, len(local), self.batch_size)):
+            if batch_index < self.start_batch:
+                continue
             batch = local[start : start + self.batch_size]
             if len(batch) < self.batch_size and self.drop_last:
                 break

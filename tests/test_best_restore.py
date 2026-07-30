@@ -100,12 +100,12 @@ def test_training_returns_best_ema_weights_for_the_next_stage(
     best = torch.load(
         tmp_path / "run" / "checkpoints" / "best" / "checkpoint.pt",
         map_location="cpu",
-        weights_only=False,
+        weights_only=True,
     )
     final = torch.load(
         tmp_path / "run" / "checkpoints" / "final" / "checkpoint.pt",
         map_location="cpu",
-        weights_only=False,
+        weights_only=True,
     )
     live = dict(model.named_parameters())
     for name, expected in best["ema"].items():
