@@ -97,27 +97,67 @@ def numeric_tokens(text: str) -> list[str]:
     return [token.replace(",", "") for token in normalized_matches(NUMBER_PATTERN, text)]
 
 
+@dataclass(frozen=True, slots=True)
+class NumberPreservationResult:
+    """숫자가 실제로 등장한 문장에 한정한 보존 지표."""
+
+    f1: float
+    exact: int
+    samples: int
+    inventions: int
+
+
+def number_preservation_details(
+    hypotheses: Sequence[str],
+    references: Sequence[str],
+) -> NumberPreservationResult:
+    """숫자 관련 문장만을 분모로 보존율과 환각 횟수를 계산합니다.
+
+    숫자가 없는 깨끗한 문장을 정답으로 대량 집계하면 실제 숫자 오역이
+    희석됩니다. 대신 reference 또는 hypothesis 어느 한쪽에라도 숫자가 있는
+    문장만 ``samples``에 포함하고, reference에 없던 숫자가 생성된 문장은
+    ``inventions``로 별도 집계합니다.
+    """
+
+    if len(hypotheses) != len(references):
+        raise ValueError(f"번역문 {len(hypotheses)}개와 정답 {len(references)}개의 수가 다릅니다")
+
+    scores: list[float] = []
+    exact = 0
+    inventions = 0
+    for hypothesis, reference in zip(hypotheses, references, strict=True):
+        expected = numeric_tokens(reference)
+        actual = numeric_tokens(hypothesis)
+        if not expected and not actual:
+            continue
+        scores.append(multiset_f1(expected, actual))
+        if Counter(expected) == Counter(actual):
+            exact += 1
+        if not expected and actual:
+            inventions += 1
+
+    if not scores:
+        return NumberPreservationResult(f1=100.0, exact=0, samples=0, inventions=0)
+    return NumberPreservationResult(
+        f1=100.0 * sum(scores) / len(scores),
+        exact=exact,
+        samples=len(scores),
+        inventions=inventions,
+    )
+
+
 def number_preservation(
     hypotheses: Sequence[str],
     references: Sequence[str],
 ) -> tuple[float, int]:
-    """(숫자 F1 평균 ×100, 숫자가 모두 일치한 문장 수) 를 돌려줍니다.
+    """하위 호환용 ``(숫자 F1, 숫자 일치 문장 수)`` 요약을 반환합니다.
 
-    숫자가 없는 문장쌍은 위반이 있을 수 없으므로 F1 1.0, 일치로 셉니다.
+    두 값 모두 숫자 관련 문장에 한정됩니다. 보고서에서 정확한 분모와 숫자
+    환각 횟수가 필요하면 :func:`number_preservation_details`를 사용하십시오.
     """
-    if len(hypotheses) != len(references):
-        raise ValueError(f"번역문 {len(hypotheses)}개와 정답 {len(references)}개의 수가 다릅니다")
-    if not references:
-        return 0.0, 0
-    scores: list[float] = []
-    exact = 0
-    for hypothesis, reference in zip(hypotheses, references, strict=True):
-        expected = numeric_tokens(reference)
-        actual = numeric_tokens(hypothesis)
-        scores.append(multiset_f1(expected, actual))
-        if Counter(expected) == Counter(actual):
-            exact += 1
-    return 100.0 * sum(scores) / len(scores), exact
+
+    result = number_preservation_details(hypotheses, references)
+    return result.f1, result.exact
 
 
 @dataclass
@@ -132,6 +172,8 @@ class DirectionResult:
     bleu_tokenize: str  # BLEU 토큰화 방식 (재현성 기록용)
     number_f1: float = 0.0  # 숫자 보존 F1 평균 (0~100)
     number_exact: int = 0  # 숫자가 모두 일치한 문장 수
+    number_samples: int = 0  # reference/hypothesis 중 숫자가 있는 문장 수
+    number_inventions: int = 0  # reference에 없던 숫자를 생성한 문장 수
 
 
 def score_translations(
@@ -230,15 +272,16 @@ def load_benchmark_pairs(
 def results_as_markdown(results: Sequence[DirectionResult]) -> str:
     """비교 표를 사람이 읽기 좋은 markdown 으로 만듭니다."""
     lines = [
-        "| system | direction | samples | chrF | BLEU | 숫자 F1 | 숫자 일치 |",
-        "|---|---|---:|---:|---:|---:|---:|",
+        "| system | direction | samples | chrF | BLEU | 숫자 F1 | 숫자 일치 | 숫자 환각 |",
+        "|---|---|---:|---:|---:|---:|---:|---:|",
     ]
     for result in results:
-        exact = f"{result.number_exact}/{result.samples}" if result.samples else "-"
+        number_f1 = f"{result.number_f1:.2f}" if result.number_samples else "-"
+        exact = f"{result.number_exact}/{result.number_samples}" if result.number_samples else "-"
         lines.append(
             f"| {result.system} | {result.direction} | {result.samples} "
             f"| {result.chrf:.2f} | {result.bleu:.2f} "
-            f"| {result.number_f1:.2f} | {exact} |"
+            f"| {number_f1} | {exact} | {result.number_inventions} |"
         )
     return "\n".join(lines)
 

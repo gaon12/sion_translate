@@ -30,7 +30,7 @@ from sion_translate.evaluation import (
     DirectionResult,
     load_benchmark_pairs,
     load_split_pairs,
-    number_preservation,
+    number_preservation_details,
     results_as_markdown,
     save_results,
     score_translations,
@@ -180,7 +180,7 @@ def main() -> None:
         chrf, bleu, tokenize = score_translations(
             hypotheses, references, target_language=target_language
         )
-        number_f1, number_exact = number_preservation(hypotheses, references)
+        number_result = number_preservation_details(hypotheses, references)
         results.append(
             DirectionResult(
                 system="sion",
@@ -189,13 +189,22 @@ def main() -> None:
                 chrf=chrf,
                 bleu=bleu,
                 bleu_tokenize=tokenize,
-                number_f1=number_f1,
-                number_exact=number_exact,
+                number_f1=number_result.f1,
+                number_exact=number_result.exact,
+                number_samples=number_result.samples,
+                number_inventions=number_result.inventions,
             )
+        )
+        number_summary = (
+            f"숫자 F1 {number_result.f1:.2f} "
+            f"(일치 {number_result.exact}/{number_result.samples}, "
+            f"환각 {number_result.inventions})"
+            if number_result.samples
+            else "숫자 문장 없음"
         )
         log(
             f"{direction_name}: chrF {chrf:.2f} / BLEU {bleu:.2f} / "
-            f"숫자 F1 {number_f1:.2f} (일치 {number_exact}/{len(samples)}) ({elapsed:.0f}초)"
+            f"{number_summary} ({elapsed:.0f}초)"
         )
 
         # 외부 시스템 출력 채점 (같은 정답, 같은 지표)
@@ -216,7 +225,7 @@ def main() -> None:
             chrf, bleu, tokenize = score_translations(
                 hypotheses, references, target_language=target_language
             )
-            number_f1, number_exact = number_preservation(hypotheses, references)
+            number_result = number_preservation_details(hypotheses, references)
             results.append(
                 DirectionResult(
                     system=name,
@@ -225,8 +234,10 @@ def main() -> None:
                     chrf=chrf,
                     bleu=bleu,
                     bleu_tokenize=tokenize,
-                    number_f1=number_f1,
-                    number_exact=number_exact,
+                    number_f1=number_result.f1,
+                    number_exact=number_result.exact,
+                    number_samples=number_result.samples,
+                    number_inventions=number_result.inventions,
                 )
             )
 

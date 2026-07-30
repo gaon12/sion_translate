@@ -13,6 +13,7 @@ from sion_translate.evaluation import (
     load_benchmark_pairs,
     load_split_pairs,
     number_preservation,
+    number_preservation_details,
     numeric_tokens,
     results_as_markdown,
     save_results,
@@ -166,7 +167,31 @@ def test_number_preservation_scores_missing_and_invented_numbers() -> None:
 def test_number_preservation_treats_numberless_pairs_as_clean() -> None:
     f1, exact = number_preservation(["번역문입니다."], ["정답 문장입니다."])
     assert f1 == pytest.approx(100.0)
-    assert exact == 1
+    assert exact == 0
+
+
+def test_number_preservation_does_not_dilute_numeric_failures() -> None:
+    hypotheses = ["숫자 없는 번역"] * 19 + ["용량은 1200mg입니다."]
+    references = ["숫자 없는 정답"] * 19 + ["용량은 250mg입니다."]
+
+    result = number_preservation_details(hypotheses, references)
+
+    assert result.f1 == pytest.approx(0.0)
+    assert result.exact == 0
+    assert result.samples == 1
+    assert result.inventions == 0
+
+
+def test_number_preservation_reports_invented_numbers_separately() -> None:
+    result = number_preservation_details(
+        ["금액은 38,720엔입니다."],
+        ["금액은 미정입니다."],
+    )
+
+    assert result.f1 == pytest.approx(0.0)
+    assert result.exact == 0
+    assert result.samples == 1
+    assert result.inventions == 1
 
 
 def test_number_preservation_rejects_length_mismatch() -> None:
@@ -176,11 +201,11 @@ def test_number_preservation_rejects_length_mismatch() -> None:
 
 def test_results_saved_as_json_and_markdown(tmp_path: Path) -> None:
     results = [
-        DirectionResult("sion", "ko-ja", 100, 55.5, 22.2, "char", 91.0, 88),
-        DirectionResult("deepl", "ko-ja", 100, 66.6, 33.3, "char", 99.5, 99),
+        DirectionResult("sion", "ko-ja", 100, 55.5, 22.2, "char", 91.0, 8, 10, 1),
+        DirectionResult("deepl", "ko-ja", 100, 66.6, 33.3, "char", 99.5, 9, 10, 0),
     ]
     table = results_as_markdown(results)
-    assert "| sion | ko-ja | 100 | 55.50 | 22.20 | 91.00 | 88/100 |" in table
+    assert "| sion | ko-ja | 100 | 55.50 | 22.20 | 91.00 | 8/10 | 1 |" in table
     save_results(results, tmp_path / "eval", metadata={"model": "test"})
     payload = json.loads((tmp_path / "eval.json").read_text(encoding="utf-8"))
     assert payload["metadata"]["model"] == "test"

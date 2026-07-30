@@ -13,7 +13,7 @@ from typing import Mapping, Sequence
 
 from sion_translate.evaluation import (
     DirectionResult,
-    number_preservation,
+    number_preservation_details,
     results_as_markdown,
     score_translations,
 )
@@ -148,7 +148,7 @@ def score_systems(
                 references,
                 target_language=target_language,
             )
-            number_f1, number_exact = number_preservation(hypotheses, references)
+            number_result = number_preservation_details(hypotheses, references)
             results.append(
                 DirectionResult(
                     system=system_name,
@@ -157,8 +157,10 @@ def score_systems(
                     chrf=chrf,
                     bleu=bleu,
                     bleu_tokenize=tokenize,
-                    number_f1=number_f1,
-                    number_exact=number_exact,
+                    number_f1=number_result.f1,
+                    number_exact=number_result.exact,
+                    number_samples=number_result.samples,
+                    number_inventions=number_result.inventions,
                 )
             )
     return results
