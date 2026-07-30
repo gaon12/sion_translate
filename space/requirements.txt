@@ -1,2 +1,2 @@
-git+https://github.com/gaon12/sion_translate.git@a525bc3f4dae4adac92498a4fbd180a169fd6dae
+git+https://github.com/gaon12/sion_translate.git@1369d127bfe773e763a67d7335bcee03f330940e
 huggingface_hub>=1.1,<2
