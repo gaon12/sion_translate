@@ -16,11 +16,6 @@ __pycache__/
 data/**
 !data/.gitkeep
 !data/data.txt
-!data/*.manifest.json
-!data/*.remediation.json
-!data/*.semantic.json
-!data/*.structural.json
-!data/dataset_remediation_*.json
 data_mono/
 dataset.stale-*/
 benchmarks/
@@ -57,5 +52,7 @@ glossary_input.json
 # starts from user-supplied JSONL and does not redistribute acquisition code.
 tools/
 
-# Locally generated translation queue shards are large, resumable work products.
-translation_queue/*.jsonl
+# Locally generated translation queues contain source and translated text.
+# Ignore the complete tree: results and accepted shards live below nested
+# directories and must not be staged by a broad `git add .`.
+translation_queue/**
