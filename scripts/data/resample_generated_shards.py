@@ -36,15 +36,17 @@ import json
 from pathlib import Path
 import re
 import sys
+from typing import Sequence
 
 from sion_translate.data.quality import canonical_text
+from sion_translate.scripts_registry import (
+    has_foreign_script,
+    resolve_scripts,
+)
 
 
 _QUOTED = re.compile(r"[\"“‘'][^\"”’']{1,120}[\"”’']")
 _DIGITS = re.compile(r"\d")
-_HANGUL = re.compile(r"[가-힣ㄱ-ㅣ]")
-_KANA = re.compile(r"[぀-ヿｦ-ﾟ]")
-_HAN = re.compile(r"[一-鿿]")
 
 
 @dataclass
@@ -68,20 +70,28 @@ class ShardResult:
     dropped_span_examples: list[tuple[str, int]] = field(default_factory=list)
 
 
+def script_list(value: str) -> tuple[str, ...]:
+    """Parse a comma-separated script/language list.
+
+    A comma-separated single value is used rather than nargs="+", which would
+    swallow the positional shard paths.
+    """
+
+    names = tuple(part.strip() for part in value.split(",") if part.strip())
+    resolve_scripts(names)
+    return names
+
+
 def skeleton(text: str) -> str:
     """Blank quoted spans and digits, matching audit_generated_shards.skeleton."""
 
     return _DIGITS.sub("#", _QUOTED.sub("<Q>", text))
 
 
-def target_is_foreign(text: str, target_language: str) -> bool:
-    if target_language == "ja":
-        return bool(_HANGUL.search(text))
-    if target_language == "ko":
-        return bool(_KANA.search(text) or _HAN.search(text))
-    if target_language == "none":
-        return False
-    raise ValueError(f"target_language must be ja, ko or none; got {target_language!r}")
+def target_is_foreign(text: str, target_scripts: Sequence[str]) -> bool:
+    """True when the target uses a script its language does not permit."""
+
+    return has_foreign_script(text, target_scripts)
 
 
 def _rank(source: str, target: str, seed: int) -> bytes:
@@ -99,7 +109,7 @@ def resample_shard(
     max_per_quoted_span: int | None = None,
     source_key: str = "ko",
     target_key: str = "ja",
-    target_language: str = "ja",
+    target_scripts: Sequence[str] = (),
     seed: int = 20260730,
 ) -> ShardResult:
     """Write ``output`` under a per-frame and an optional per-quoted-span cap.
@@ -115,7 +125,8 @@ def resample_shard(
         raise ValueError("max_per_quoted_span must be positive")
     if not path.is_file():
         raise FileNotFoundError(path)
-    target_is_foreign("", target_language)
+    # Resolve eagerly so an unknown script name fails before the file is read.
+    resolve_scripts(target_scripts)
 
     result = ShardResult(path=str(path), output=str(output))
     candidates: list[tuple[bytes, str, str, tuple[str, ...]]] = []
@@ -146,7 +157,7 @@ def resample_shard(
             if not source or not target:
                 result.unreadable += 1
                 continue
-            if target_is_foreign(target, target_language):
+            if target_is_foreign(target, target_scripts):
                 result.dropped_foreign_script += 1
                 continue
             digest = _rank(source, target, seed)
@@ -234,7 +245,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--source-key", default="ko")
     parser.add_argument("--target-key", default="ja")
-    parser.add_argument("--target-language", default="ja", choices=("ja", "ko", "none"))
+    parser.add_argument(
+        "--target-scripts",
+        type=script_list,
+        default=(),
+        metavar="LIST",
+        help=(
+            "writing systems the target may use: script names or language "
+            "shorthands, comma separated (ko / ja / kana,han). "
+            "omit to keep every row regardless of script"
+        ),
+    )
     parser.add_argument("--seed", type=int, default=20260730)
     parser.add_argument("--report", help="write the resampling report JSON here")
     return parser
@@ -274,7 +295,7 @@ def main(argv: list[str] | None = None) -> int:
                     max_per_quoted_span=args.max_per_quoted_span,
                     source_key=args.source_key,
                     target_key=args.target_key,
-                    target_language=args.target_language,
+                    target_scripts=args.target_scripts,
                     seed=args.seed,
                 )
             )

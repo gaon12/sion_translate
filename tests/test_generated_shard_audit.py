@@ -90,9 +90,10 @@ def test_hangul_in_japanese_target_is_rejected(tmp_path: Path) -> None:
         (source, f"{_word(index, _JA_SYLLABLES)}村の 문장 は違う。")
         for index, (source, _) in enumerate(distinct_rows(300))
     ]
-    report = AUDIT.audit_shard(write_shard(tmp_path / "leak.jsonl", rows))
+    report = AUDIT.audit_shard(write_shard(tmp_path / "leak.jsonl", rows), target_scripts=("ja",))
 
     assert report.foreign_script_target == pytest.approx(1.0)
+    assert report.foreign_target_scripts == ["hangul"]
     assert any(name.startswith("foreign_script_target") for name in report.violations)
 
 
@@ -111,9 +112,9 @@ def test_korean_target_is_not_reported_as_foreign(tmp_path: Path) -> None:
         for source, target in rows:
             handle.write(json.dumps({"kj": source, "ko": target}, ensure_ascii=False) + "\n")
 
-    japanese = AUDIT.audit_shard(path, source_key="kj", target_key="ko", target_language="ja")
-    korean = AUDIT.audit_shard(path, source_key="kj", target_key="ko", target_language="ko")
-    ignored = AUDIT.audit_shard(path, source_key="kj", target_key="ko", target_language="none")
+    japanese = AUDIT.audit_shard(path, source_key="kj", target_key="ko", target_scripts=("ja",))
+    korean = AUDIT.audit_shard(path, source_key="kj", target_key="ko", target_scripts=("ko",))
+    ignored = AUDIT.audit_shard(path, source_key="kj", target_key="ko")
 
     assert japanese.foreign_script_target == pytest.approx(1.0)
     assert korean.foreign_script_target == pytest.approx(0.0)
@@ -128,17 +129,36 @@ def test_kana_in_a_korean_target_is_gated(tmp_path: Path) -> None:
     ]
     path = write_shard(tmp_path / "kanaleak.jsonl", rows)
 
-    report = AUDIT.audit_shard(path, target_language="ko")
+    report = AUDIT.audit_shard(path, target_scripts=("ko",))
 
     assert report.foreign_script_target == pytest.approx(1.0)
+    assert report.foreign_target_scripts == ["kana"]
     assert any(name.startswith("foreign_script_target") for name in report.violations)
 
 
-def test_unknown_target_language_is_rejected(tmp_path: Path) -> None:
+def test_unknown_script_name_is_rejected(tmp_path: Path) -> None:
     path = write_shard(tmp_path / "x.jsonl", distinct_rows(10))
 
-    with pytest.raises(ValueError, match="target_language must be"):
-        AUDIT.audit_shard(path, target_language="en")
+    with pytest.raises(ValueError, match="unknown script or language"):
+        AUDIT.audit_shard(path, target_scripts=("klingon",))
+
+
+def test_script_list_parses_a_comma_separated_value() -> None:
+    assert AUDIT.script_list("ko") == ("ko",)
+    assert AUDIT.script_list("kana, han") == ("kana", "han")
+    assert AUDIT.script_list("") == ()
+    with pytest.raises(ValueError):
+        AUDIT.script_list("klingon")
+
+
+def test_scripts_present_are_reported_for_both_sides(tmp_path: Path) -> None:
+    path = write_shard(tmp_path / "scripts.jsonl", distinct_rows(300))
+
+    report = AUDIT.audit_shard(path)
+
+    assert report.source_scripts == ["hangul"]
+    assert report.target_scripts == ["han", "kana"]
+    assert report.foreign_target_scripts == []
 
 
 def test_kana_in_korean_source_is_measured_but_not_gated(tmp_path: Path) -> None:
@@ -149,10 +169,17 @@ def test_kana_in_korean_source_is_measured_but_not_gated(tmp_path: Path) -> None
         )
         for index in range(300)
     ]
-    report = AUDIT.audit_shard(write_shard(tmp_path / "mixed.jsonl", rows))
+    path = write_shard(tmp_path / "mixed.jsonl", rows)
 
-    assert report.foreign_script_source == pytest.approx(1.0)
-    assert report.passed, report.violations
+    # Declaring the source as Korean measures the kana but never gates on it.
+    measured = AUDIT.audit_shard(path, source_scripts=("ko",))
+    # Declaring it as 한본어 says the mixture is expected, so nothing is foreign.
+    expected = AUDIT.audit_shard(path, source_scripts=("kj",))
+
+    assert measured.foreign_script_source == pytest.approx(1.0)
+    assert measured.foreign_source_scripts == ["kana"]
+    assert measured.passed, measured.violations
+    assert expected.foreign_script_source == pytest.approx(0.0)
 
 
 def test_near_duplicate_leak_is_detected(tmp_path: Path) -> None:

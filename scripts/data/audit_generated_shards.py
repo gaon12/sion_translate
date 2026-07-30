@@ -33,9 +33,14 @@ import json
 from pathlib import Path
 import re
 import sys
-from typing import Iterator
+from typing import Iterator, Sequence
 
 from sion_translate.data.quality import canonical_text
+from sion_translate.scripts_registry import (
+    foreign_scripts,
+    resolve_scripts,
+    scripts_in,
+)
 from sion_translate.splitting import choose_split_for_key, normalized_split_key
 
 
@@ -43,9 +48,6 @@ from sion_translate.splitting import choose_split_for_key, normalized_split_key
 # fixed, so it has to be blanked out before frames can be compared.
 _QUOTED = re.compile(r"[\"“‘'][^\"”’']{1,120}[\"”’']")
 _DIGITS = re.compile(r"\d")
-_HANGUL = re.compile(r"[가-힣ㄱ-ㅣ]")
-_KANA = re.compile(r"[぀-ヿｦ-ﾟ]")
-_HAN = re.compile(r"[一-鿿]")
 
 
 @dataclass(frozen=True)
@@ -85,6 +87,10 @@ class ShardReport:
     foreign_script_source: float = 0.0
     held_out_rows: int = 0
     near_duplicate_leak: float = 0.0
+    source_scripts: list[str] = field(default_factory=list)
+    target_scripts: list[str] = field(default_factory=list)
+    foreign_source_scripts: list[str] = field(default_factory=list)
+    foreign_target_scripts: list[str] = field(default_factory=list)
     top_skeletons: list[tuple[str, int]] = field(default_factory=list)
     top_quoted: list[tuple[str, int]] = field(default_factory=list)
     violations: list[str] = field(default_factory=list)
@@ -92,6 +98,18 @@ class ShardReport:
     @property
     def passed(self) -> bool:
         return not self.violations
+
+
+def script_list(value: str) -> tuple[str, ...]:
+    """Parse a comma-separated script/language list.
+
+    A comma-separated single value is used rather than nargs="+", which would
+    swallow the positional shard paths.
+    """
+
+    names = tuple(part.strip() for part in value.split(",") if part.strip())
+    resolve_scripts(names)
+    return names
 
 
 def skeleton(text: str) -> str:
@@ -124,30 +142,14 @@ def iter_rows(path: Path, *, source_key: str, target_key: str) -> Iterator[tuple
             yield canonical_text(source), canonical_text(target)
 
 
-def _foreign_script_probe(target_language: str):
-    """Return the predicate for "this target contains the wrong script".
-
-    Hardcoding "Hangul is foreign" only works when the target is Japanese. It
-    reports every row as contaminated when auditing kj->ko, where the target is
-    supposed to be Korean.
-    """
-
-    if target_language == "ja":
-        return lambda text: bool(_HANGUL.search(text))
-    if target_language == "ko":
-        return lambda text: bool(_KANA.search(text) or _HAN.search(text))
-    if target_language == "none":
-        return lambda text: False
-    raise ValueError(f"target_language must be ja, ko or none; got {target_language!r}")
-
-
 def audit_shard(
     path: Path,
     thresholds: Thresholds | None = None,
     *,
     source_key: str = "ko",
     target_key: str = "ja",
-    target_language: str = "ja",
+    target_scripts: Sequence[str] = (),
+    source_scripts: Sequence[str] = (),
     validation_fraction: float = 0.005,
     test_fraction: float = 0.005,
     examples: int = 3,
@@ -158,7 +160,9 @@ def audit_shard(
     thresholds.validate()
     if examples < 0:
         raise ValueError("examples must be non-negative")
-    is_foreign = _foreign_script_probe(target_language)
+    # Resolve eagerly so an unknown script name fails before the file is read.
+    permitted_target = resolve_scripts(target_scripts)
+    permitted_source = resolve_scripts(source_scripts)
     if not path.is_file():
         raise FileNotFoundError(path)
 
@@ -171,6 +175,10 @@ def audit_shard(
     held_out_skeletons: list[str] = []
     foreign_target = 0
     foreign_source = 0
+    observed_source_scripts: set[str] = set()
+    observed_target_scripts: set[str] = set()
+    observed_source_foreign: set[str] = set()
+    observed_target_foreign: set[str] = set()
 
     for source, target in iter_rows(path, source_key=source_key, target_key=target_key):
         report.rows += 1
@@ -183,12 +191,19 @@ def audit_shard(
         skeletons[source_skeleton] += 1
         for span in _QUOTED.findall(source):
             quoted[span] += 1
-        # The target must be monolingual in its own language. A code-mixed
-        # source is legitimate for 한본어, so that side is reported only.
-        if is_foreign(target):
+        # The target must use only the scripts its language permits. A
+        # code-mixed source is legitimate (한본어), so the source side is
+        # measured but only gated when source_scripts is given.
+        target_foreign = foreign_scripts(target, permitted_target)
+        if target_foreign:
             foreign_target += 1
-        if _KANA.search(source) or _HAN.search(source):
+            observed_target_foreign.update(target_foreign)
+        source_foreign = foreign_scripts(source, permitted_source)
+        if source_foreign:
             foreign_source += 1
+            observed_source_foreign.update(source_foreign)
+        observed_source_scripts.update(scripts_in(source))
+        observed_target_scripts.update(scripts_in(target))
         split = choose_split_for_key(
             normalized_split_key(source),
             validation_fraction,
@@ -217,6 +232,10 @@ def audit_shard(
     report.max_targets_per_source = max(len(targets) for targets in targets_by_source.values())
     report.foreign_script_target = foreign_target / usable
     report.foreign_script_source = foreign_source / usable
+    report.source_scripts = sorted(observed_source_scripts)
+    report.target_scripts = sorted(observed_target_scripts)
+    report.foreign_source_scripts = sorted(observed_source_foreign)
+    report.foreign_target_scripts = sorted(observed_target_foreign)
     report.held_out_rows = len(held_out_skeletons)
     if held_out_skeletons:
         leaked = sum(1 for value in held_out_skeletons if value in train_skeletons)
@@ -262,10 +281,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-key", default="ko", help="JSON key holding the source text")
     parser.add_argument("--target-key", default="ja", help="JSON key holding the target text")
     parser.add_argument(
-        "--target-language",
-        default="ja",
-        choices=("ja", "ko", "none"),
-        help="language the target is expected to be monolingual in",
+        "--target-scripts",
+        type=script_list,
+        default=(),
+        metavar="LIST",
+        help="writing systems the target may use: script names or language shorthands, comma separated (ko / ja / kana,han). 'any' or omitting the flag disables the check",
+    )
+    parser.add_argument(
+        "--source-scripts",
+        type=script_list,
+        default=(),
+        metavar="LIST",
+        help="writing systems the source may use, comma separated; omit to measure without gating",
     )
     parser.add_argument("--examples", type=int, default=3, help="worst offenders to print")
     parser.add_argument("--min-skeleton-ttr", type=float, default=0.50)
@@ -305,7 +332,8 @@ def main(argv: list[str] | None = None) -> int:
                     thresholds,
                     source_key=args.source_key,
                     target_key=args.target_key,
-                    target_language=args.target_language,
+                    target_scripts=args.target_scripts,
+                    source_scripts=args.source_scripts,
                     examples=args.examples,
                 )
             )

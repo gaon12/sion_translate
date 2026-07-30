@@ -145,7 +145,7 @@ def test_foreign_script_targets_are_dropped(tmp_path: Path) -> None:
     source = write_shard(tmp_path / "in.jsonl", rows)
     output = tmp_path / "out.jsonl"
 
-    result = RESAMPLE.resample_shard(source, output, max_per_skeleton=8)
+    result = RESAMPLE.resample_shard(source, output, max_per_skeleton=8, target_scripts=("ja",))
 
     assert result.dropped_foreign_script == 1
     assert result.rows_out == 1
@@ -169,7 +169,7 @@ def test_korean_target_language_drops_kana_instead(tmp_path: Path) -> None:
         max_per_skeleton=8,
         source_key="kj",
         target_key="ko",
-        target_language="ko",
+        target_scripts=("ko",),
     )
 
     assert result.dropped_foreign_script == 1
@@ -210,9 +210,9 @@ def test_resample_rejects_bad_arguments(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="max_per_skeleton must be positive"):
         RESAMPLE.resample_shard(source, tmp_path / "o.jsonl", max_per_skeleton=0)
-    with pytest.raises(ValueError, match="target_language must be"):
+    with pytest.raises(ValueError, match="unknown script or language"):
         RESAMPLE.resample_shard(
-            source, tmp_path / "o.jsonl", max_per_skeleton=1, target_language="en"
+            source, tmp_path / "o.jsonl", max_per_skeleton=1, target_scripts=("klingon",)
         )
     with pytest.raises(FileNotFoundError):
         RESAMPLE.resample_shard(
