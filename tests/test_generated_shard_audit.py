@@ -96,6 +96,51 @@ def test_hangul_in_japanese_target_is_rejected(tmp_path: Path) -> None:
     assert any(name.startswith("foreign_script_target") for name in report.violations)
 
 
+def test_korean_target_is_not_reported_as_foreign(tmp_path: Path) -> None:
+    """Auditing kj->ko must not flag the Korean target as contaminated."""
+
+    rows = [
+        (
+            f"{_word(index, _JA_SYLLABLES)}ノ 마을은 조용데스네",
+            f"{_word(index, _KO_SYLLABLES)} 마을은 조용하네요",
+        )
+        for index in range(300)
+    ]
+    path = tmp_path / "kj.jsonl"
+    with path.open("w", encoding="utf-8", newline="\n") as handle:
+        for source, target in rows:
+            handle.write(json.dumps({"kj": source, "ko": target}, ensure_ascii=False) + "\n")
+
+    japanese = AUDIT.audit_shard(path, source_key="kj", target_key="ko", target_language="ja")
+    korean = AUDIT.audit_shard(path, source_key="kj", target_key="ko", target_language="ko")
+    ignored = AUDIT.audit_shard(path, source_key="kj", target_key="ko", target_language="none")
+
+    assert japanese.foreign_script_target == pytest.approx(1.0)
+    assert korean.foreign_script_target == pytest.approx(0.0)
+    assert ignored.foreign_script_target == pytest.approx(0.0)
+    assert korean.passed, korean.violations
+
+
+def test_kana_in_a_korean_target_is_gated(tmp_path: Path) -> None:
+    rows = [
+        (source, f"{_word(index, _KO_SYLLABLES)} 마을은 やっぱり 조용하다")
+        for index, (source, _) in enumerate(distinct_rows(300))
+    ]
+    path = write_shard(tmp_path / "kanaleak.jsonl", rows)
+
+    report = AUDIT.audit_shard(path, target_language="ko")
+
+    assert report.foreign_script_target == pytest.approx(1.0)
+    assert any(name.startswith("foreign_script_target") for name in report.violations)
+
+
+def test_unknown_target_language_is_rejected(tmp_path: Path) -> None:
+    path = write_shard(tmp_path / "x.jsonl", distinct_rows(10))
+
+    with pytest.raises(ValueError, match="target_language must be"):
+        AUDIT.audit_shard(path, target_language="en")
+
+
 def test_kana_in_korean_source_is_measured_but_not_gated(tmp_path: Path) -> None:
     rows = [
         (

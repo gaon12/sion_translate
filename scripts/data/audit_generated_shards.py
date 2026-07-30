@@ -43,8 +43,9 @@ from sion_translate.splitting import choose_split_for_key, normalized_split_key
 # fixed, so it has to be blanked out before frames can be compared.
 _QUOTED = re.compile(r"[\"“‘'][^\"”’']{1,120}[\"”’']")
 _DIGITS = re.compile(r"\d")
-_HANGUL = re.compile(r"[가-힣]")
-_KANA = re.compile(r"[぀-ヿ]")
+_HANGUL = re.compile(r"[가-힣ㄱ-ㅣ]")
+_KANA = re.compile(r"[぀-ヿｦ-ﾟ]")
+_HAN = re.compile(r"[一-鿿]")
 
 
 @dataclass(frozen=True)
@@ -123,12 +124,30 @@ def iter_rows(path: Path, *, source_key: str, target_key: str) -> Iterator[tuple
             yield canonical_text(source), canonical_text(target)
 
 
+def _foreign_script_probe(target_language: str):
+    """Return the predicate for "this target contains the wrong script".
+
+    Hardcoding "Hangul is foreign" only works when the target is Japanese. It
+    reports every row as contaminated when auditing kj->ko, where the target is
+    supposed to be Korean.
+    """
+
+    if target_language == "ja":
+        return lambda text: bool(_HANGUL.search(text))
+    if target_language == "ko":
+        return lambda text: bool(_KANA.search(text) or _HAN.search(text))
+    if target_language == "none":
+        return lambda text: False
+    raise ValueError(f"target_language must be ja, ko or none; got {target_language!r}")
+
+
 def audit_shard(
     path: Path,
     thresholds: Thresholds | None = None,
     *,
     source_key: str = "ko",
     target_key: str = "ja",
+    target_language: str = "ja",
     validation_fraction: float = 0.005,
     test_fraction: float = 0.005,
     examples: int = 3,
@@ -139,6 +158,7 @@ def audit_shard(
     thresholds.validate()
     if examples < 0:
         raise ValueError("examples must be non-negative")
+    is_foreign = _foreign_script_probe(target_language)
     if not path.is_file():
         raise FileNotFoundError(path)
 
@@ -163,11 +183,11 @@ def audit_shard(
         skeletons[source_skeleton] += 1
         for span in _QUOTED.findall(source):
             quoted[span] += 1
-        # A Japanese target must not carry Hangul. The reverse direction is
-        # reported but not gated, because a code-mixed source is legitimate.
-        if _HANGUL.search(target):
+        # The target must be monolingual in its own language. A code-mixed
+        # source is legitimate for 한본어, so that side is reported only.
+        if is_foreign(target):
             foreign_target += 1
-        if _KANA.search(source):
+        if _KANA.search(source) or _HAN.search(source):
             foreign_source += 1
         split = choose_split_for_key(
             normalized_split_key(source),
@@ -241,6 +261,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--json", dest="json_out", help="write the full report to this path")
     parser.add_argument("--source-key", default="ko", help="JSON key holding the source text")
     parser.add_argument("--target-key", default="ja", help="JSON key holding the target text")
+    parser.add_argument(
+        "--target-language",
+        default="ja",
+        choices=("ja", "ko", "none"),
+        help="language the target is expected to be monolingual in",
+    )
     parser.add_argument("--examples", type=int, default=3, help="worst offenders to print")
     parser.add_argument("--min-skeleton-ttr", type=float, default=0.50)
     parser.add_argument("--min-quoted-ttr", type=float, default=0.05)
@@ -279,6 +305,7 @@ def main(argv: list[str] | None = None) -> int:
                     thresholds,
                     source_key=args.source_key,
                     target_key=args.target_key,
+                    target_language=args.target_language,
                     examples=args.examples,
                 )
             )

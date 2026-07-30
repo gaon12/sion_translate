@@ -1,0 +1,61 @@
+{
+  "rows": 5179,
+  "requested_rows": 40000,
+  "seed": 20260730,
+  "max_per_item": 200,
+  "max_per_frame": 2000,
+  "rejected_duplicates": 22388,
+  "rejected_by_caps": 2787,
+  "frames": {
+    "frame_hangul_loanword": 646,
+    "frame_hangul_phrase": 30,
+    "frame_kana_loanword": 80,
+    "frame_kana_loanword_question": 80,
+    "frame_katakana_reaction": 419,
+    "frame_korean_food_in_japanese": 160,
+    "frame_korean_person_in_japanese": 718,
+    "frame_mixed_reply": 718,
+    "frame_negative_clause": 343,
+    "frame_transliterated_clause": 954,
+    "frame_transliterated_plain": 1031
+  },
+  "registers": {
+    "hangul_only": 3004,
+    "kana_only": 1297,
+    "script": 878
+  },
+  "distinct_lexical_items_used": 151,
+  "most_used_lexical_items": [
+    [
+      "弱い",
+      200
+    ],
+    [
+      "マジ",
+      200
+    ],
+    [
+      "美しい",
+      200
+    ],
+    [
+      "うわ",
+      200
+    ],
+    [
+      "有名",
+      200
+    ]
+  ],
+  "lexicon_sizes": {
+    "nouns": 54,
+    "predicates": 33,
+    "interjections": 8,
+    "loanwords": 26,
+    "korean_intensifiers": 6,
+    "korean_nouns": 8,
+    "korean_food": 8,
+    "reactions": 14
+  },
+  "output": "data\\synthetic_hanboneo.jsonl"
+}
