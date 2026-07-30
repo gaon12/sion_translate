@@ -113,9 +113,13 @@ class SelectResult:
     dropped_duplicate_source: int = 0
     dropped_duplicate_target: int = 0
     dropped_missing_score: int = 0
+    dropped_over_fanout: int = 0
+    sources_over_fanout: int = 0
+    max_targets_per_source: int | None = None
     similarity_percentiles: dict[str, float] = field(default_factory=dict)
     dropped_examples: list[dict[str, Any]] = field(default_factory=list)
     resolved_fanout_examples: list[dict[str, Any]] = field(default_factory=list)
+    over_fanout_examples: list[dict[str, Any]] = field(default_factory=list)
 
 
 def read_rows(path: Path) -> Iterable[tuple[int, dict[str, Any] | None]]:
@@ -325,9 +329,11 @@ def select_alignments(
     min_similarity: float,
     unique_source: bool,
     unique_target: bool,
+    max_targets_per_source: int | None,
     seed: str,
 ) -> SelectResult:
     result = SelectResult(path=str(path), output=str(output), min_similarity=min_similarity)
+    result.max_targets_per_source = max_targets_per_source
 
     rows: list[dict[str, Any]] = []
     scores: list[float] = []
@@ -344,6 +350,36 @@ def select_alignments(
         scores.append(float(score))
 
     result.similarity_percentiles = percentiles(scores)
+
+    # Some fan-out is not one translation among several renderings but a
+    # cross product: in data50 all 60 targets of a source share a prefix that
+    # has nothing to do with the source. Picking a winner there manufactures a
+    # pair. Sources over the cap are discarded whole instead.
+    if max_targets_per_source is not None:
+        candidates: Counter[str] = Counter()
+        for row in rows:
+            candidates[canonical_text(str(row.get(source_key, "")))] += 1
+        over_cap = {
+            source for source, count in candidates.items() if count > max_targets_per_source
+        }
+        if over_cap:
+            retained: list[dict[str, Any]] = []
+            for row in rows:
+                source = canonical_text(str(row.get(source_key, "")))
+                if source in over_cap:
+                    result.dropped_over_fanout += 1
+                    if len(result.over_fanout_examples) < 8:
+                        result.over_fanout_examples.append(
+                            {
+                                "candidates": candidates[source],
+                                source_key: str(row.get(source_key, ""))[:70],
+                                target_key: str(row.get(target_key, ""))[:70],
+                            }
+                        )
+                    continue
+                retained.append(row)
+            rows = retained
+            result.sources_over_fanout = len(over_cap)
 
     above: list[dict[str, Any]] = []
     for row in rows:
@@ -450,6 +486,16 @@ def build_parser() -> argparse.ArgumentParser:
     select.add_argument("--min-similarity", type=float, required=True)
     select.add_argument("--score-key", default="semantic_similarity")
     select.add_argument("--unique-source", action="store_true")
+    select.add_argument(
+        "--max-targets-per-source",
+        type=int,
+        help=(
+            "discard a source entirely when it has more than N candidate targets. "
+            "Use 1 to keep only unambiguous joins. Unset resolves fan-out by score "
+            "instead, which is only right when the candidates really are alternative "
+            "renderings of the same source."
+        ),
+    )
     select.add_argument("--unique-target", action="store_true")
     select.add_argument("--seed", default="sion-recover-v1")
     return parser
@@ -501,10 +547,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 min_similarity=args.min_similarity,
                 unique_source=args.unique_source,
                 unique_target=args.unique_target,
+                max_targets_per_source=args.max_targets_per_source,
                 seed=args.seed,
             )
             print(
                 f"{path.name:34} {result.rows_in:>8,} -> {result.rows_out:>8,} rows  "
+                f"overFanout={result.dropped_over_fanout:,} "
                 f"belowThreshold={result.dropped_below_threshold:,} "
                 f"dupSource={result.dropped_duplicate_source:,} "
                 f"dupTarget={result.dropped_duplicate_target:,}"

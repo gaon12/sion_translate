@@ -210,6 +210,7 @@ def test_select_keeps_the_highest_scoring_target_per_source(tmp_path: Path) -> N
         min_similarity=0.40,
         unique_source=True,
         unique_target=False,
+        max_targets_per_source=None,
         seed="t",
     )
     assert result.rows_out == 1
@@ -235,6 +236,7 @@ def test_select_cuts_the_low_similarity_tail(tmp_path: Path) -> None:
         min_similarity=0.80,
         unique_source=True,
         unique_target=False,
+        max_targets_per_source=None,
         seed="t",
     )
     assert result.rows_out == 1
@@ -261,6 +263,7 @@ def test_select_is_independent_of_file_order(tmp_path: Path) -> None:
             min_similarity=0.0,
             unique_source=True,
             unique_target=False,
+            max_targets_per_source=None,
             seed="t",
         )
     assert read_shard(first) == read_shard(second)
@@ -284,6 +287,7 @@ def test_select_can_also_require_unique_targets(tmp_path: Path) -> None:
         min_similarity=0.0,
         unique_source=True,
         unique_target=True,
+        max_targets_per_source=None,
         seed="t",
     )
     assert result.rows_out == 1
@@ -307,6 +311,7 @@ def test_select_reports_the_score_distribution(tmp_path: Path) -> None:
         min_similarity=0.0,
         unique_source=True,
         unique_target=False,
+        max_targets_per_source=None,
         seed="t",
     )
     assert result.similarity_percentiles["minimum"] == 0.0
@@ -332,6 +337,7 @@ def test_select_refuses_rows_without_a_score(tmp_path: Path) -> None:
         min_similarity=0.0,
         unique_source=True,
         unique_target=False,
+        max_targets_per_source=None,
         seed="t",
     )
     assert result.dropped_missing_score == 1
