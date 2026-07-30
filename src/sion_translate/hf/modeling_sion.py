@@ -299,7 +299,7 @@ class SionForConditionalGeneration(PreTrainedModel, GenerationMixin):
                         break
                     best_possible = penalized(
                         float(beam_scores[batch_index].max()),
-                        position + 1,
+                        max_new_tokens if length_penalty > 0 else position + 1,
                     )
                     worst_kept = min(score for score, _ in done[batch_index])
                     if best_possible > worst_kept:

@@ -127,6 +127,51 @@ def test_transformers_wrapper_matches_native_forward_and_config() -> None:
     assert not model.config.gradient_checkpointing
 
 
+def test_hf_multi_return_beam_keeps_positive_penalty_future_winner_alive() -> None:
+    native_config = tiny_model_config()
+    config = SionConfig.from_model_config(
+        native_config,
+        languages=["ko", "ja"],
+        language_pairs=[["ko", "ja"]],
+    )
+    model = SionForConditionalGeneration(config).eval()
+    vocab = native_config.vocab_size
+    eos_id = int(config.eos_token_id)
+
+    step0 = torch.full((1, vocab), float("-inf"))
+    step0[0, eos_id] = torch.log(torch.tensor(0.5))
+    step0[0, 10] = torch.log(torch.tensor(0.499))
+    step0[0, 11] = torch.log(torch.tensor(0.001))
+    step1 = torch.full((1, vocab), float("-inf"))
+    step1[0, eos_id] = torch.log(torch.tensor(0.4))
+    step1[0, 20] = torch.log(torch.tensor(0.3))
+    step1[0, 21] = torch.log(torch.tensor(0.2))
+    step1[0, 22] = torch.log(torch.tensor(0.1))
+    continuation = torch.full((1, vocab), float("-inf"))
+    continuation[0, 30] = 0.0
+    steps = iter([step0, step1, *([continuation] * 4)])
+
+    def scripted_logits(hidden: torch.Tensor) -> torch.Tensor:
+        plan = next(steps)
+        return plan.expand(hidden.shape[0], plan.shape[-1]).clone()
+
+    model.model._logits = scripted_logits  # type: ignore[method-assign]
+    input_ids = torch.randint(4, vocab, (1, 5))
+    attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+
+    output = model._beam_generate_multiple(
+        input_ids,
+        attention_mask,
+        max_new_tokens=6,
+        num_beams=2,
+        num_return_sequences=2,
+        length_penalty=2.0,
+        native_inputs={},
+    )
+
+    assert output[0, :3].tolist() == [int(config.decoder_start_token_id), 10, 20]
+
+
 def test_transformers_checkpoint_auto_classes_and_safe_weights(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

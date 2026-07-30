@@ -1038,6 +1038,11 @@ class SionForConditionalGeneration(nn.Module):
         beam_scores[:, 0] = 0.0
         # 완성된 가설: batch 별 (length-penalty 적용 점수, 토큰 텐서) 목록
         done: list[list[tuple[float, torch.Tensor]]] = [[] for _ in range(batch)]
+        maximum_completion_lengths = (
+            max_new_tokens_per_row.tolist()
+            if max_new_tokens_per_row is not None
+            else [max_new_tokens] * batch
+        )
 
         def penalized(raw_score: float, length: int) -> float:
             # GNMT length penalty: 길이가 짧은 번역이 유리해지는 것을 보정합니다.
@@ -1155,7 +1160,15 @@ class SionForConditionalGeneration(nn.Module):
                 # One reduction and one host transfer instead of one per row.
                 best_alive = beam_scores.amax(dim=1).tolist()
                 for row, hypotheses in enumerate(done):
-                    best_possible = penalized(best_alive[row], position + 1)
+                    # Log-probability can never increase. With a positive
+                    # length penalty, however, dividing that negative score by
+                    # the larger maximum-length penalty can improve its final
+                    # normalized value. Use that optimistic reachable length
+                    # so early stopping never discards a future winner.
+                    optimistic_length = (
+                        maximum_completion_lengths[row] if length_penalty > 0 else position + 1
+                    )
+                    best_possible = penalized(best_alive[row], optimistic_length)
                     if best_possible > min(score for score, _ in hypotheses):
                         all_done = False
                         break

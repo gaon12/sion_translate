@@ -797,6 +797,47 @@ def test_beam_selection_leaves_unfilled_slots_at_their_initial_values() -> None:
     assert eos_id in output[0].tolist()
 
 
+def test_positive_length_penalty_early_stop_keeps_a_future_winner_alive() -> None:
+    """An alive raw score can improve after positive length normalization.
+
+    At step two the completed hypotheses beat the alive beam at its current
+    normalized length, but not at the maximum length it can still reach.
+    """
+
+    vocab = 128
+    eos_id = 3
+    step0 = torch.full((1, vocab), float("-inf"))
+    step0[0, eos_id] = torch.log(torch.tensor(0.5))
+    step0[0, 10] = torch.log(torch.tensor(0.499))
+    step0[0, 11] = torch.log(torch.tensor(0.001))
+
+    step1 = torch.full((1, vocab), float("-inf"))
+    step1[0, eos_id] = torch.log(torch.tensor(0.4))
+    step1[0, 20] = torch.log(torch.tensor(0.3))
+    step1[0, 21] = torch.log(torch.tensor(0.2))
+    step1[0, 22] = torch.log(torch.tensor(0.1))
+
+    continuation = torch.full((1, vocab), float("-inf"))
+    continuation[0, 30] = 0.0
+    model = _controlled_beam_model([step0, step1, *([continuation] * 4)])
+    input_ids = torch.randint(4, vocab, (1, 5))
+    attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+
+    output = model.generate(
+        input_ids,
+        attention_mask,
+        bos_id=2,
+        eos_id=eos_id,
+        max_new_tokens=6,
+        num_beams=2,
+        length_penalty=2.0,
+    )
+
+    # The old current-length bound stopped after step 2 and returned [BOS, EOS].
+    # The admissible maximum-length bound lets token 10's path become the winner.
+    assert output[0, :3].tolist() == [2, 10, 20]
+
+
 def test_beam_search_is_reproducible_across_batch_and_beam_widths() -> None:
     """Rows must not influence each other, whatever the beam width."""
 
