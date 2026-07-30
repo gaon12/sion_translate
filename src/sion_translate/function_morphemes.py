@@ -28,10 +28,32 @@ than the language name:
     the text is first passed through ``collapse_spurious_spaces``; what remains
     is whitespace the segmenter cannot explain.
 
-Known limitation: a hole between two spaceless characters (``恋人の が``) is
-removed by the collapse along with genuine segmenter spacing, so it is not
-detected here. Those rows are caught instead by the spurious-space density check
-in ``recover_shard.py``, which drops targets carrying isolated spacing.
+A stranded particle has two possible causes, and they need opposite treatment:
+
+*the host noun was deleted*
+    ``늦은 밤, 의 숲속에서`` - nothing can host the particle, so the row is
+    unrecoverable and must be dropped.
+
+*the particle was merely spaced off its host*
+    ``금요일 오전 아홉 시 에 깨워줘`` - the noun is right there. Joining restores
+    correct orthography, and dropping would throw away a good row. data37 has 629
+    of these and no deleted nouns at all.
+
+The two are told apart by what precedes the particle: a host that ends in
+punctuation, or no preceding token at all, means the noun is gone.
+:func:`rejoin_orphan_particles` performs the repair, and
+:func:`placeholder_hole_markers` reports only the orphans that cannot be repaired.
+
+Known limitations, both pinned by tests rather than papered over:
+
+* A hole between two spaceless characters (``恋人の が``) is removed by the
+  collapse along with genuine segmenter spacing, so it is not detected here.
+  Those rows are caught by the spurious-space density check in
+  ``recover_shard.py`` instead.
+* Telling ``와서 에`` (a verb form cannot host a case particle, so the noun is
+  gone) from ``시 에`` (a noun that can) needs part-of-speech information. The
+  join heuristic treats both as repairable, so a small number of damaged rows
+  survive prepare and have to be caught by the similarity filter.
 
 The tables are deliberately language-specific and live apart from
 :mod:`sion_translate.scripts_registry`, which stays generic. Languages absent
@@ -112,6 +134,11 @@ _TRIMMED_CATEGORIES = frozenset({"P", "S", "Z", "C"})
 
 _WHITESPACE_RUN = re.compile(r"\s+")
 
+# A particle is never followed by one of these, so if the character after a
+# candidate match is here, the match is really the head of a longer word:
+# ``はっきり`` is an adverb, not the particle ``は`` plus a noun.
+_NON_INITIAL_KANA = frozenset("ぁぃぅぇぉっゃゅょゎァィゥェォッャュョヮーｰ゛゜々")
+
 
 def _strip_punctuation(token: str) -> str:
     """Trim leading and trailing punctuation, symbols and whitespace.
@@ -153,10 +180,16 @@ def _spaceless_scripts_used(language: str) -> bool:
     return bool(resolve_scripts([name]) & SPACELESS_SCRIPTS)
 
 
+def _ends_with_punctuation(token: str) -> bool:
+    return bool(token) and unicodedata.category(token[-1])[0] in _TRIMMED_CATEGORIES
+
+
 def orphan_function_tokens(text: str, language: str) -> tuple[str, ...]:
     """Whitespace-delimited tokens of ``text`` that are bare function morphemes.
 
-    Only meaningful for a language whose script separates words with spaces.
+    Only meaningful for a language whose script separates words with spaces. Both
+    repairable and unrepairable orphans are reported; use
+    :func:`rejoin_orphan_particles` or :func:`orphan_hole_tokens` to separate them.
     """
 
     particles = _particles(language)
@@ -170,11 +203,68 @@ def orphan_function_tokens(text: str, language: str) -> tuple[str, ...]:
     return tuple(found)
 
 
+def rejoin_orphan_particles(text: str, language: str) -> tuple[str, int]:
+    """Reattach particles that were merely spaced off a host that is still there.
+
+    Returns the repaired text and how many particles were joined. A particle
+    whose preceding token ends in punctuation, or which starts the text, is left
+    alone: there is nothing to attach it to, which is the signature of a deleted
+    noun rather than a spacing slip.
+
+    This is a repair for orthography that uses inter-word spaces. A spaceless
+    script has no correct spacing to restore - every space in it is already the
+    business of ``collapse_spurious_spaces`` - so those languages are returned
+    unchanged rather than double-counted by both repairs.
+    """
+
+    particles = _particles(language)
+    if not particles or not text or not _writes_with_spaces(language):
+        return text, 0
+    tokens = text.split()
+    if not tokens:
+        return text, 0
+    rebuilt: list[str] = []
+    joined = 0
+    for raw in tokens:
+        stripped = _strip_punctuation(raw)
+        if (
+            stripped
+            and stripped in particles
+            and rebuilt
+            and not _ends_with_punctuation(rebuilt[-1])
+        ):
+            rebuilt[-1] = rebuilt[-1] + raw
+            joined += 1
+            continue
+        rebuilt.append(raw)
+    return " ".join(rebuilt), joined
+
+
+def orphan_hole_tokens(text: str, language: str) -> tuple[str, ...]:
+    """Orphan particles that no repair can rescue, so the row must be dropped."""
+
+    particles = _particles(language)
+    if not particles or not text:
+        return ()
+    tokens = text.split()
+    found: list[str] = []
+    previous: str | None = None
+    for raw in tokens:
+        stripped = _strip_punctuation(raw)
+        if stripped and stripped in particles:
+            if previous is None or _ends_with_punctuation(previous):
+                found.append(stripped)
+        previous = raw
+    return tuple(found)
+
+
 def stranded_function_markers(text: str, language: str) -> tuple[str, ...]:
     """Particles preceded by whitespace a segmenter cannot account for.
 
     For a spaceless script, any surviving space before a particle is a hole. The
-    collapse runs first so ordinary morpheme segmentation does not fire.
+    collapse runs first so ordinary morpheme segmentation does not fire, and a
+    match is rejected when the next character shows it is really the head of a
+    longer word.
     """
 
     particles = _particles(language)
@@ -187,18 +277,22 @@ def stranded_function_markers(text: str, language: str) -> tuple[str, ...]:
         start = match.end()
         for length in lengths:
             candidate = collapsed[start : start + length]
-            if candidate in particles:
-                found.append(candidate)
+            if candidate not in particles:
+                continue
+            following = collapsed[start + length : start + length + 1]
+            if following and following in _NON_INITIAL_KANA:
                 break
+            found.append(candidate)
+            break
     return tuple(found)
 
 
 def placeholder_hole_markers(text: str, language: str) -> tuple[str, ...]:
-    """Every stranded function morpheme in ``text``, by whichever rule applies."""
+    """Stranded morphemes in ``text`` that indicate an unrecoverable deletion."""
 
     markers: list[str] = []
     if _writes_with_spaces(language):
-        markers.extend(orphan_function_tokens(text, language))
+        markers.extend(orphan_hole_tokens(text, language))
     if _spaceless_scripts_used(language):
         markers.extend(stranded_function_markers(text, language))
     return tuple(markers)
@@ -213,6 +307,8 @@ __all__ = [
     "has_placeholder_hole",
     "known_languages",
     "orphan_function_tokens",
+    "orphan_hole_tokens",
     "placeholder_hole_markers",
+    "rejoin_orphan_particles",
     "stranded_function_markers",
 ]

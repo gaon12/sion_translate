@@ -62,7 +62,10 @@ import sys
 from typing import Any, Iterable, Sequence
 
 from sion_translate.data.quality import QualityPolicy, assess_pair, canonical_text
-from sion_translate.function_morphemes import placeholder_hole_markers
+from sion_translate.function_morphemes import (
+    placeholder_hole_markers,
+    rejoin_orphan_particles,
+)
 from sion_translate.scripts_registry import (
     collapse_spurious_spaces,
     has_foreign_script,
@@ -87,6 +90,8 @@ class PrepareResult:
     dropped_duplicate_pair: int = 0
     dropped_placeholder_hole: int = 0
     dropped_isolated_spacing: int = 0
+    particles_rejoined: int = 0
+    particles_joined: int = 0
     min_space_density: float = 0.0
     quality_reasons: dict[str, int] = field(default_factory=dict)
     foreign_script_examples: list[dict[str, str]] = field(default_factory=list)
@@ -179,6 +184,7 @@ def prepare_shard(
     source_language: str,
     target_language: str,
     min_space_density: float,
+    rejoin_particles: bool,
 ) -> PrepareResult:
     result = PrepareResult(path=str(path), output=str(output))
     result.min_space_density = min_space_density
@@ -201,9 +207,19 @@ def prepare_shard(
             result.dropped_missing_side += 1
             continue
 
+        # A particle spaced off a host that is still present is a spacing slip,
+        # not a deletion, so it is repaired rather than dropped. data37 has 629
+        # of these and no deletions at all.
+        if rejoin_particles:
+            source, source_joined = rejoin_orphan_particles(source, source_language)
+            target, target_joined = rejoin_orphan_particles(target, target_language)
+            if source_joined or target_joined:
+                result.particles_rejoined += 1
+                result.particles_joined += source_joined + target_joined
+
         # A deleted name placeholder leaves the same hole on both sides, so no
-        # similarity check can see it. Drop before repairing: the collapse would
-        # weld `恋人の が` into `恋人のが` and hide the evidence.
+        # similarity check can see it. Check before collapsing spaces: the
+        # collapse would weld `、 の森` into `、の森` and hide the evidence.
         holes = placeholder_hole_markers(source, source_language) + placeholder_hole_markers(
             target, target_language
         )
@@ -224,9 +240,17 @@ def prepare_shard(
         # may be interpolation artifacts or an undetected hole. Drop those rather
         # than guess.
         if repair_spacing:
-            removed = spurious_space_count(source) + spurious_space_count(target)
+            source_removed = spurious_space_count(source)
+            target_removed = spurious_space_count(target)
+            removed = source_removed + target_removed
             if removed:
-                density = removed / max(len(source) + len(target), 1)
+                # Per side, not pooled. Only one side is usually segmented, and
+                # pooling halves its density and pushes a segmented row under the
+                # floor. The segmented side is the one that has to clear it.
+                density = max(
+                    source_removed / max(len(source), 1),
+                    target_removed / max(len(target), 1),
+                )
                 if density < min_space_density:
                     result.dropped_isolated_spacing += 1
                     if len(result.isolated_spacing_examples) < 8:
@@ -419,6 +443,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     prepare.add_argument("--no-repair-spacing", action="store_true")
+    prepare.add_argument("--no-rejoin-particles", action="store_true")
     prepare.add_argument("--no-quality-filter", action="store_true")
 
     select = subparsers.add_parser("select", parents=[common], help="resolve fan-out by score")
@@ -452,10 +477,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 source_language=args.source_language,
                 target_language=args.target_language,
                 min_space_density=args.min_space_density,
+                rejoin_particles=not args.no_rejoin_particles,
             )
             print(
                 f"{path.name:34} {result.rows_in:>8,} -> {result.rows_out:>8,} rows  "
                 f"spacing={result.spacing_repaired:,} ({result.spaces_removed:,} spaces)  "
+                f"rejoined={result.particles_rejoined:,} "
                 f"hole={result.dropped_placeholder_hole:,} "
                 f"isolated={result.dropped_isolated_spacing:,} "
                 f"script={result.dropped_foreign_script:,} "

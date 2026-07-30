@@ -52,6 +52,7 @@ def test_prepare_repairs_segmenter_spacing_without_dropping_the_row(tmp_path: Pa
         source_language="ko",
         target_language="ja",
         min_space_density=0.08,
+        rejoin_particles=True,
     )
     assert result.rows_out == 1
     assert result.spacing_repaired == 1
@@ -78,6 +79,7 @@ def test_prepare_leaves_the_space_using_side_alone(tmp_path: Path) -> None:
         source_language="ko",
         target_language="ja",
         min_space_density=0.08,
+        rejoin_particles=True,
     )
     assert result.spacing_repaired == 0
     assert read_shard(output)[0]["ko"] == "철 원석을 찾는다"
@@ -105,6 +107,7 @@ def test_prepare_drops_rows_whose_target_carries_the_wrong_script(tmp_path: Path
         source_language="ko",
         target_language="ja",
         min_space_density=0.08,
+        rejoin_particles=True,
     )
     assert result.dropped_foreign_script == 1
     assert result.rows_out == 1
@@ -129,6 +132,7 @@ def test_prepare_reports_the_fanout_it_did_not_resolve(tmp_path: Path) -> None:
         source_language="ko",
         target_language="ja",
         min_space_density=0.08,
+        rejoin_particles=True,
     )
     assert result.rows_out == 5
     assert result.distinct_sources == 1
@@ -154,6 +158,7 @@ def test_prepare_drops_exact_duplicate_pairs(tmp_path: Path) -> None:
         source_language="ko",
         target_language="ja",
         min_space_density=0.08,
+        rejoin_particles=True,
     )
     assert result.dropped_duplicate_pair == 3
     assert result.rows_out == 1
@@ -178,6 +183,7 @@ def test_prepare_keeps_unrelated_fields(tmp_path: Path) -> None:
         source_language="ko",
         target_language="ja",
         min_space_density=0.08,
+        rejoin_particles=True,
     )
     row = read_shard(output)[0]
     assert row["domain"] == "r18"
@@ -413,6 +419,7 @@ def prepare(source: Path, output: Path, **overrides: object) -> object:
         "source_language": "ko",
         "target_language": "ja",
         "min_space_density": 0.08,
+        "rejoin_particles": True,
     }
     arguments.update(overrides)
     return RECOVER.prepare_shard(source, output, **arguments)
@@ -501,3 +508,28 @@ def test_an_unconfigured_language_disables_placeholder_detection(tmp_path: Path)
     result = prepare(source, output, source_language="xx", target_language="yy")
     assert result.dropped_placeholder_hole == 0
     assert result.rows_out == 1
+
+
+def test_prepare_rejoins_a_particle_spaced_off_a_present_host(tmp_path: Path) -> None:
+    source = write_shard(
+        tmp_path / "in.jsonl",
+        [{"ko": "금요일 오전 아홉 시 에 깨워줘", "ja": "金曜日の午前九時に起こしてください"}],
+    )
+    output = tmp_path / "out.jsonl"
+    result = prepare(source, output)
+    assert result.particles_rejoined == 1
+    assert result.particles_joined == 1
+    assert result.dropped_placeholder_hole == 0
+    assert result.rows_out == 1
+    assert read_shard(output)[0]["ko"] == "금요일 오전 아홉 시에 깨워줘"
+
+
+def test_rejoining_can_be_turned_off(tmp_path: Path) -> None:
+    source = write_shard(
+        tmp_path / "in.jsonl",
+        [{"ko": "금요일 오전 아홉 시 에 깨워줘", "ja": "金曜日の午前九時に起こしてください"}],
+    )
+    output = tmp_path / "out.jsonl"
+    result = prepare(source, output, rejoin_particles=False)
+    assert result.particles_rejoined == 0
+    assert read_shard(output)[0]["ko"] == "금요일 오전 아홉 시 에 깨워줘"

@@ -16,7 +16,9 @@ from sion_translate.function_morphemes import (
     has_placeholder_hole,
     known_languages,
     orphan_function_tokens,
+    orphan_hole_tokens,
     placeholder_hole_markers,
+    rejoin_orphan_particles,
     stranded_function_markers,
 )
 
@@ -25,8 +27,6 @@ from sion_translate.function_morphemes import (
     "text",
     [
         "늦은 밤, 의 숲속에서 사냥꾼이 집으로 돌아갈 준비를 해.",
-        "아침에 친구가 와서 에 뭔가 이상하다고 했어.",
-        "이상하네, 언제부터인지 으로 가는 다리가 끊어졌어.",
         "(일제히) 의 보물을 찾아라!",
     ],
 )
@@ -109,7 +109,7 @@ def test_punctuation_around_a_stranded_particle_is_ignored() -> None:
 
 
 def test_every_stranded_token_is_reported() -> None:
-    assert placeholder_hole_markers("그건 의 것이고 에 두었다", "ko") == ("의", "에")
+    assert placeholder_hole_markers("그건, 의 것이고 (또) 에 두었다", "ko") == ("의", "에")
     # This row has two holes but only the one after punctuation survives the
     # collapse. Reporting one marker is enough to drop the row, which is the
     # decision the caller actually makes.
@@ -125,7 +125,7 @@ def test_hanboneo_accepts_either_languages_particles() -> None:
     assert ORPHAN_FUNCTION_TOKENS["kj"] == (
         ORPHAN_FUNCTION_TOKENS["ko"] | ORPHAN_FUNCTION_TOKENS["ja"]
     )
-    assert has_placeholder_hole("엌ㅋㅋ 의 유리와 튼튼데스네", "kj")
+    assert has_placeholder_hole("엌ㅋㅋ, 의 유리와 튼튼데스네", "kj")
     assert has_placeholder_hole("엌ㅋㅋ、 の 유리와 튼튼데스네", "kj")
 
 
@@ -147,3 +147,80 @@ def test_empty_input_is_safe() -> None:
 
 def test_listing_helper_covers_the_configured_pairs() -> None:
     assert known_languages() == ("ja", "kj", "ko")
+
+
+@pytest.mark.parametrize(
+    ("damaged", "repaired"),
+    [
+        # data37 (Amazon MASSIVE) spaces the particle off a noun that is present.
+        ("금요일 오전 아홉 시 에 깨워줘", "금요일 오전 아홉 시에 깨워줘"),
+        ("등 초록색 으로 바꿔줘", "등 초록색으로 바꿔줘"),
+        ("나 아침 비행기 를 위해 설정한 알람 있나", "나 아침 비행기를 위해 설정한 알람 있나"),
+        ("주방 불 파란색 으로 바꿔줘", "주방 불 파란색으로 바꿔줘"),
+        (
+            "너 이 원석이 정말 전설의 철 원석 이라고 생각한 거야?",
+            "너 이 원석이 정말 전설의 철 원석이라고 생각한 거야?",
+        ),
+    ],
+)
+def test_a_particle_spaced_off_a_present_host_is_rejoined(damaged: str, repaired: str) -> None:
+    text, joined = rejoin_orphan_particles(damaged, "ko")
+    assert text == repaired
+    assert joined == 1
+    # Repairable, so it must not be reported as an unrecoverable hole.
+    assert placeholder_hole_markers(damaged, "ko") == ()
+
+
+def test_a_particle_with_no_host_is_not_rejoined() -> None:
+    # The preceding token ends in punctuation, so there is nothing to attach to.
+    for text in ["늦은 밤, 의 숲속에서", "(일제히) 의 보물을", "의 숲속에서"]:
+        repaired, joined = rejoin_orphan_particles(text, "ko")
+        assert joined == 0, text
+        assert repaired == text
+        assert orphan_hole_tokens(text, "ko"), text
+
+
+def test_rejoin_reports_how_many_it_joined() -> None:
+    text, joined = rejoin_orphan_particles("아홉 시 에 깨워주고 열 시 에 알려줘", "ko")
+    assert text == "아홉 시에 깨워주고 열 시에 알려줘"
+    assert joined == 2
+
+
+def test_rejoin_preserves_punctuation_attached_to_the_particle() -> None:
+    text, joined = rejoin_orphan_particles("아홉 시 에, 깨워줘", "ko")
+    assert text == "아홉 시에, 깨워줘"
+    assert joined == 1
+
+
+def test_rejoin_leaves_healthy_text_untouched() -> None:
+    for text in ["아홉 시에 깨워줘", "이 사람이 번역가야", "가! 지금 당장 가라고!", ""]:
+        repaired, joined = rejoin_orphan_particles(text, "ko")
+        assert joined == 0, text
+        assert repaired == text, text
+
+
+def test_rejoin_is_disabled_for_an_unconfigured_language() -> None:
+    assert rejoin_orphan_particles("the of a to", "en") == ("the of a to", 0)
+
+
+def test_a_particle_that_heads_a_longer_word_is_not_a_hole() -> None:
+    # はっきり is an adverb, not the particle は followed by a noun. Small kana
+    # cannot start a word, which is what rules the match out.
+    assert stranded_function_markers("胸触りたいんでしょ? はっきり言いなさい。", "ja") == ()
+    assert stranded_function_markers("それで? ちょっと待って", "ja") == ()
+    # The genuine particle case still fires.
+    assert stranded_function_markers("深夜、 の森の中", "ja") == ("の",)
+
+
+def test_rejoin_does_not_touch_a_spaceless_script() -> None:
+    # Every space in segmented Japanese belongs to collapse_spurious_spaces.
+    # Rejoining here would half-repair the text and double-count the fix.
+    text = "甘い 香り が 鼻先 を かすめる"
+    assert rejoin_orphan_particles(text, "ja") == (text, 0)
+
+
+def test_rejoin_still_applies_to_the_mixed_script_variety() -> None:
+    # 한본어 uses Hangul, which does space words, so the repair is meaningful.
+    repaired, joined = rejoin_orphan_particles("닝겐노 유리 는 튼튼데스네", "kj")
+    assert repaired == "닝겐노 유리는 튼튼데스네"
+    assert joined == 1
