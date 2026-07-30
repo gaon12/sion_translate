@@ -18,6 +18,7 @@ from sion_translate.evaluation import (
     results_as_markdown,
     save_results,
     score_translations,
+    structured_tokens,
 )
 from sion_translate.tokenizer import SionTokenizer, train_tokenizer
 
@@ -131,6 +132,20 @@ def test_numeric_tokens_sees_counters_but_not_identifiers() -> None:
     # 식별자 안의 숫자는 값이 아니므로 세지 않는다.
     assert numeric_tokens("config.json의 retry_limit") == []
     assert numeric_tokens("utf8 인코딩") == []
+
+
+def test_structured_tokens_share_the_reversible_protection_parser() -> None:
+    source = (
+        "https://example.com/path의 user@example.com에게 "
+        "{account_name} 값 retry_limit과 250mg을 전송"
+    )
+    tokens = structured_tokens(source)
+
+    assert any(token.startswith("url\0") for token in tokens)
+    assert any(token.startswith("email\0") for token in tokens)
+    assert any(token.startswith("placeholder\0") for token in tokens)
+    assert any(token.startswith("identifier\0") for token in tokens)
+    assert not any(token.startswith("number\0") for token in tokens)
 
 
 def test_number_preservation_catches_altered_values() -> None:

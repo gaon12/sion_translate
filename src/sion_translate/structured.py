@@ -16,7 +16,11 @@ from typing import Iterable, Sequence
 
 _WHITESPACE = re.compile(r"\s+")
 _ENTITY = re.compile(r"&(?:#\d+|#[xX][0-9A-Fa-f]+|[A-Za-z][A-Za-z0-9]+);")
-_EMAIL = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}(?![\w.-])")
+_EMAIL = re.compile(
+    r"(?<![A-Za-z0-9_.+-])"
+    r"[A-Za-z0-9_.+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
+    r"(?![A-Za-z0-9_.-])"
+)
 _URL = re.compile(r"https?://[^\s<>\"']+")
 _NAMED_PERCENT = re.compile(r"%[A-Za-z_][A-Za-z0-9_]{1,}")
 _PRINTF = re.compile(
@@ -25,7 +29,9 @@ _PRINTF = re.compile(
 )
 _IDENTIFIER = re.compile(
     r"(?<![A-Za-z0-9_.-])"
-    r"(?:[A-Za-z][A-Za-z0-9_.-]*\d[A-Za-z0-9_.-]*|"
+    r"(?:[A-Z]{2,}[A-Z0-9_-]*|"
+    r"[A-Za-z][A-Za-z0-9]*(?:[_.-][A-Za-z0-9]+)+|"
+    r"[A-Za-z][A-Za-z0-9_.-]*\d[A-Za-z0-9_.-]*|"
     r"\d[A-Za-z][A-Za-z0-9_.-]*)"
     r"(?![A-Za-z0-9_.-])"
 )
@@ -322,10 +328,22 @@ def _signature_spans(text: str) -> list[StructuredSpan]:
     return result
 
 
-def structured_signature(text: str) -> Counter[str]:
-    """Return a case-sensitive multiset used by corpus quality checks."""
+def structured_signature(
+    text: str,
+    *,
+    include_numbers: bool = True,
+) -> Counter[str]:
+    """Return the authoritative structured-value multiset.
 
-    return Counter(span.key for span in _signature_spans(text))
+    ``include_numbers=False`` is used by rewards that already score numeric
+    preservation separately. Keeping both modes on this parser prevents
+    training, reranking, corpus checks, and reversible masking from maintaining
+    competing regular-expression definitions.
+    """
+
+    return Counter(
+        span.key for span in _signature_spans(text) if include_numbers or span.kind != "number"
+    )
 
 
 def structured_similarity(left: str, right: str) -> tuple[float, bool]:

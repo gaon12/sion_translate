@@ -28,6 +28,7 @@ from typing import Sequence
 
 from sion_translate.data import IndexedParallelDataset
 from sion_translate.data.records import expand_parallel_record, normalize_language_pairs
+from sion_translate.structured import structured_signature
 from sion_translate.tokenizer import SionTokenizer
 
 # 문자 단위 BLEU 를 쓰는 언어 (공백 기반 토큰화가 무의미한 언어)
@@ -43,13 +44,6 @@ CHARACTER_LEVEL_LANGUAGES = {"ko", "ja", "zh"}
 # 앞뒤 ASCII 문자로 걸러냅니다. ``250mg`` 은 첫 분기가 ``250`` 을 잡아냅니다.
 NUMBER_PATTERN = re.compile(
     r"(?<![A-Za-z0-9_])[-+]?\d[\d,.:/%+\-]*\d|(?<![A-Za-z0-9_])[-+]?\d(?![0-9])"
-)
-
-# URL, 이메일, 코드 식별자처럼 번역하지 않고 그대로 옮겨야 하는 문자열.
-STRUCTURED_PATTERN = re.compile(
-    r"https?://[^\s]+|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|"
-    r"(?<![A-Za-z0-9])(?:[A-Z]{2,}[A-Z0-9_-]*|[A-Za-z]+[-_][A-Za-z0-9_-]+)"
-    r"(?![A-Za-z0-9])"
 )
 
 
@@ -74,8 +68,9 @@ def multiset_f1(expected: Sequence[object], actual: Sequence[object]) -> float:
 
 
 def structured_tokens(text: str) -> list[str]:
-    """URL·이메일·식별자처럼 그대로 옮겨야 하는 문자열 목록."""
-    return normalized_matches(STRUCTURED_PATTERN, text)
+    """보존해야 할 구조 토큰 목록. 숫자는 별도 지표이므로 제외합니다."""
+
+    return list(structured_signature(text, include_numbers=False).elements())
 
 
 def has_excessive_repetition(text: str) -> bool:
