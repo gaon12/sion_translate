@@ -124,6 +124,11 @@ class SionBatchCollator:
         rng = self._sample_rng(item)
         denoise = self.denoise_probability > 0 and rng.random() < self.denoise_probability
         if denoise:
+            # Truncate before deriving the target. The two sides are cut to
+            # different limits further down, so restoring an un-truncated
+            # source would ask the model to reconstruct tokens the (truncated)
+            # input never contained.
+            src = src[: self.max_source_length - 2]
             original = src
             src = corrupt_spans(
                 original,

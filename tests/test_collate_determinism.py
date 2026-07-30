@@ -136,3 +136,37 @@ def test_augmentation_is_independent_of_global_rng_order_and_workers() -> None:
         not torch.equal(previous["input_ids"], current["input_ids"])
         for previous, current in zip(serial, next_serial, strict=True)
     )
+
+
+def test_denoise_target_only_contains_tokens_the_input_could_see() -> None:
+    """The denoise target is the restored source, so it must be derived from the
+    already-truncated source rather than from the full one."""
+
+    tokenizer = TinyTokenizer()
+    collator = SionBatchCollator(
+        tokenizer,
+        max_source_length=12,
+        max_target_length=64,
+        denoise_probability=1.0,
+        denoise_noise_density=0.15,
+        denoise_mean_span=2.0,
+    )
+    long_source = list(range(100, 160))
+    item = {
+        "src": long_source,
+        "tgt": list(range(200, 230)),
+        "src_language": "en",
+        "target_language": "de",
+        "src_register": 2,
+        "target_register": 2,
+        "pair_index": 0,
+    }
+
+    batch = collator([item])
+
+    labels = [int(value) for value in batch["labels"][0] if int(value) != -100]
+    assert labels[-1] == tokenizer.eos_id
+    restored = labels[:-1]
+    # Every restored token has to come from the window the encoder actually saw.
+    assert set(restored) <= set(long_source[: 12 - 2])
+    assert len(restored) <= 12 - 2
