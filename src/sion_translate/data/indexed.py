@@ -31,8 +31,10 @@ class IndexedParallelDataset(Dataset):
         lengths: list[np.ndarray] = []
         source_ids: list[np.ndarray] = []
         synthetic_flags: list[np.ndarray] = []
+        forward_only_flags: list[np.ndarray] = []
         self.has_source_metadata = True
         self.has_synthetic_metadata = True
+        self.has_forward_only_metadata = True
         for index in self.indices:
             total += len(index)
             self.cumulative.append(total)
@@ -51,18 +53,56 @@ class IndexedParallelDataset(Dataset):
             else:
                 self.has_synthetic_metadata = False
                 synthetic_flags.append(np.zeros(len(index), dtype=np.bool_))
+            if index.dtype.names is not None and "forward_only" in index.dtype.names:
+                forward_only_flags.append(index["forward_only"].astype(np.bool_))
+            else:
+                # Shards written before the v5 index have no such column, and
+                # every pair in them was trained in both directions.
+                self.has_forward_only_metadata = False
+                forward_only_flags.append(np.zeros(len(index), dtype=np.bool_))
         self.pair_count = total
         self.pair_lengths = np.concatenate(lengths)
         self.pair_source_ids = np.concatenate(source_ids)
         self.pair_synthetic_flags = np.concatenate(synthetic_flags)
+        self.forward_only_count = int(np.count_nonzero(np.concatenate(forward_only_flags)))
         self.source_names = self._load_source_names()
         self.synthetic_sampling_weight = self._load_synthetic_sampling_weight()
         self.language_pairs, self.languages = self._load_language_metadata()
         self.language_pair = self.language_pairs[0]
+        self.source_only_languages = self._load_source_only_languages()
         self._token_cache: dict[tuple[int, str], np.memmap] = {}
+        self._bidirectional_pairs: np.ndarray | None = None
+        self._forward_only_pairs: np.ndarray | None = None
+        self._build_direction_maps()
 
     def _open_indices(self) -> list[np.ndarray]:
         return [np.load(path, mmap_mode="r", allow_pickle=False) for path in self.index_paths]
+
+    def _build_direction_maps(self) -> None:
+        """Split pairs into bidirectional and forward-only virtual index ranges.
+
+        Nothing is allocated when no pair is forward-only, which keeps the memory
+        profile of a plain ko-ja corpus unchanged. When a source-only language is
+        present the two int32 maps let ``__getitem__`` resolve a virtual index in
+        constant time without materializing one entry per direction.
+        """
+
+        if self.forward_only_count == 0:
+            self._bidirectional_pairs = None
+            self._forward_only_pairs = None
+            return
+        flags = np.concatenate(
+            [
+                (
+                    index["forward_only"].astype(np.bool_)
+                    if index.dtype.names is not None and "forward_only" in index.dtype.names
+                    else np.zeros(len(index), dtype=np.bool_)
+                )
+                for index in self.indices
+            ]
+        )
+        self._bidirectional_pairs = np.flatnonzero(~flags).astype(np.int32)
+        self._forward_only_pairs = np.flatnonzero(flags).astype(np.int32)
 
     def __getstate__(self) -> dict:
         """Keep Windows spawn workers from serializing hundreds of MB of memmaps."""
@@ -72,6 +112,8 @@ class IndexedParallelDataset(Dataset):
         state["pair_lengths"] = None
         state["pair_source_ids"] = None
         state["pair_synthetic_flags"] = None
+        state["_bidirectional_pairs"] = None
+        state["_forward_only_pairs"] = None
         state["_token_cache"] = {}
         return state
 
@@ -79,6 +121,9 @@ class IndexedParallelDataset(Dataset):
         self.__dict__.update(state)
         self.indices = self._open_indices()
         self._token_cache = {}
+        # Rebuilding from the reopened memmaps costs one pass over a uint8
+        # column and avoids shipping the maps to every spawned worker.
+        self._build_direction_maps()
 
     def _load_language_metadata(
         self,
@@ -125,6 +170,17 @@ class IndexedParallelDataset(Dataset):
             names[int(source["id"])] = str(source["name"])
         return names
 
+    def _load_source_only_languages(self) -> tuple[str, ...]:
+        manifest_path = self.dataset_root / "manifest.json"
+        if not manifest_path.exists():
+            return ()
+        with manifest_path.open("r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        raw = manifest.get("source_only_languages")
+        if not isinstance(raw, list):
+            return ()
+        return tuple(str(language) for language in raw)
+
     def _load_synthetic_sampling_weight(self) -> float:
         manifest_path = self.dataset_root / "manifest.json"
         if not manifest_path.exists():
@@ -135,7 +191,54 @@ class IndexedParallelDataset(Dataset):
         return float(policy.get("sampling_weight", DEFAULT_SYNTHETIC_SAMPLING_WEIGHT))
 
     def __len__(self) -> int:
-        return self.pair_count * (2 if self.bidirectional else 1)
+        if not self.bidirectional:
+            return self.pair_count
+        # Forward-only pairs contribute one direction instead of two.
+        return 2 * self.pair_count - self.forward_only_count
+
+    @property
+    def direction_count(self) -> int:
+        """Number of distinct (source, target) directions this split can yield."""
+
+        forbidden = set(self.source_only_languages)
+        return sum(
+            1
+            for pair in self.language_pairs
+            for direction in (pair, (pair[1], pair[0]))
+            if direction[1] not in forbidden
+        )
+
+    def _resolve_virtual(self, index: int) -> tuple[int, int]:
+        """Map a virtual index to ``(pair_index, direction)``."""
+
+        if not self.bidirectional:
+            return index, 0
+        if self._bidirectional_pairs is None:
+            return divmod(index, 2)
+        boundary = 2 * len(self._bidirectional_pairs)
+        if index < boundary:
+            local, direction = divmod(index, 2)
+            return int(self._bidirectional_pairs[local]), direction
+        assert self._forward_only_pairs is not None
+        return int(self._forward_only_pairs[index - boundary]), 0
+
+    def _pair_index(self, index: int) -> int:
+        return self._resolve_virtual(index)[0]
+
+    def _pair_indices(self, indices: np.ndarray) -> np.ndarray:
+        """Vectorized ``_pair_index`` for the batch sampler."""
+
+        if not self.bidirectional:
+            return indices
+        if self._bidirectional_pairs is None:
+            return indices // 2
+        assert self._forward_only_pairs is not None
+        boundary = 2 * len(self._bidirectional_pairs)
+        result = np.empty(len(indices), dtype=np.int64)
+        low = indices < boundary
+        result[low] = self._bidirectional_pairs[indices[low] // 2]
+        result[~low] = self._forward_only_pairs[indices[~low] - boundary]
+        return result
 
     def _resolve(self, pair_index: int) -> tuple[int, int]:
         shard = bisect.bisect_right(self.cumulative, pair_index)
@@ -151,7 +254,7 @@ class IndexedParallelDataset(Dataset):
         return self._token_cache[key]
 
     def length_at(self, index: int) -> int:
-        pair_index = index // 2 if self.bidirectional else index
+        pair_index = self._pair_index(index)
         if self.pair_lengths is not None:
             return int(self.pair_lengths[pair_index]) + 4
         shard, local = self._resolve(pair_index)
@@ -163,11 +266,10 @@ class IndexedParallelDataset(Dataset):
     def lengths_for_indices(self, indices: np.ndarray) -> np.ndarray:
         if self.pair_lengths is None:
             raise RuntimeError("Length metadata is unavailable inside a DataLoader worker")
-        pair_indices = indices // 2 if self.bidirectional else indices
-        return self.pair_lengths[pair_indices]
+        return self.pair_lengths[self._pair_indices(indices)]
 
     def source_id_at(self, index: int) -> int:
-        pair_index = index // 2 if self.bidirectional else index
+        pair_index = self._pair_index(index)
         if self.pair_source_ids is not None:
             return int(self.pair_source_ids[pair_index])
         shard, local = self._resolve(pair_index)
@@ -177,7 +279,7 @@ class IndexedParallelDataset(Dataset):
         return 0
 
     def synthetic_at(self, index: int) -> bool:
-        pair_index = index // 2 if self.bidirectional else index
+        pair_index = self._pair_index(index)
         if self.pair_synthetic_flags is not None:
             return bool(self.pair_synthetic_flags[pair_index])
         shard, local = self._resolve(pair_index)
@@ -193,10 +295,7 @@ class IndexedParallelDataset(Dataset):
             index += len(self)
         if index < 0 or index >= len(self):
             raise IndexError(index)
-        if self.bidirectional:
-            pair_index, direction = divmod(index, 2)
-        else:
-            pair_index, direction = index, 0
+        pair_index, direction = self._resolve_virtual(index)
         shard, local = self._resolve(pair_index)
         row = self.indices[shard][local]
 

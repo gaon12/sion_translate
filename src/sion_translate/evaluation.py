@@ -164,7 +164,10 @@ def load_split_pairs(
     shard 에는 토큰 id 만 저장되어 있으므로 토크나이저로 디코딩합니다.
     """
     dataset = IndexedParallelDataset(dataset_dir, split, bidirectional=True)
-    expected_directions = len(dataset.language_pairs) * 2
+    # Source-only languages (한본어 kj) are never a target, so the reachable
+    # direction count is smaller than 2x the pair count and the early exit
+    # below has to use the real number or it never fires.
+    expected_directions = dataset.direction_count
     pairs: dict[tuple[str, str], list[tuple[str, str]]] = {}
     for index in range(len(dataset)):
         item = dataset[index]

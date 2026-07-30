@@ -9,7 +9,7 @@ from typing import Any
 
 
 FINGERPRINT_SCHEMA = "sion-dataset-fingerprint-v2"
-PREPROCESSING_SCHEMA = "sion-prepare-v4"
+PREPROCESSING_SCHEMA = "sion-prepare-v5"
 
 
 def file_sha256(path: str | Path, *, chunk_size: int = 1 << 22) -> str:

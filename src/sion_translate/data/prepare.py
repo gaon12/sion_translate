@@ -33,7 +33,7 @@ from .records import (
     normalize_language_pairs,
 )
 
-INDEX_FORMAT = "sion-indexed-parallel-v4"
+INDEX_FORMAT = "sion-indexed-parallel-v5"
 
 INDEX_DTYPE = np.dtype(
     [
@@ -48,6 +48,9 @@ INDEX_DTYPE = np.dtype(
         ("source_id", "<u2"),
         ("quality_score", "u1"),
         ("synthetic", "u1"),
+        # 1 when the reverse direction must never be trained, because it would
+        # put a source-only language (한본어 kj) on the target side.
+        ("forward_only", "u1"),
     ]
 )
 
@@ -82,6 +85,7 @@ class PrepareStats:
     ja_tokens: int = 0
     quality_score_sum: int = 0
     synthetic_pairs: int = 0
+    forward_only_pairs: int = 0
 
 
 def infer_register(text: str, language: str) -> int:
@@ -166,6 +170,7 @@ class ShardWriter:
         source_id: int,
         quality_score: int,
         synthetic: bool,
+        forward_only: bool = False,
     ) -> None:
         assert self._src_handle is not None and self._tgt_handle is not None
         src_array = np.asarray(src_ids, dtype=np.uint32)
@@ -185,6 +190,7 @@ class ShardWriter:
                 source_id,
                 quality_score,
                 int(synthetic),
+                int(forward_only),
             )
         )
         self.src_offset += len(src_array)
@@ -400,6 +406,7 @@ def prepare_dataset(
     prevent_target_leakage: bool = True,
     dedup_backend: str = "sqlite",
     language_pair: Sequence[str] = ("ko", "ja"),
+    source_only_languages: Sequence[str] = (),
     language_pairs: Sequence[Sequence[str]] | None = None,
     train_only_prefixes: Sequence[str] = DEFAULT_TRAIN_ONLY_PREFIXES,
     synthetic_sampling_weight: float = DEFAULT_SYNTHETIC_SAMPLING_WEIGHT,
@@ -429,6 +436,20 @@ def prepare_dataset(
     train_only_prefixes = normalize_synthetic_prefixes(train_only_prefixes)
     languages = languages_from_pairs(normalized_pairs)
     language_to_id = {language: index for index, language in enumerate(languages)}
+    source_only = tuple(dict.fromkeys(str(language) for language in source_only_languages))
+    unknown_source_only = sorted(set(source_only) - set(languages))
+    if unknown_source_only:
+        raise ValueError(
+            "source_only_languages must appear in the configured language pairs; "
+            f"{unknown_source_only} do not"
+        )
+    for pair in normalized_pairs:
+        if pair[0] in source_only and pair[1] in source_only:
+            raise ValueError(
+                "at most one side of a language pair may be source-only; both sides "
+                f"of {list(pair)!r} are source-only"
+            )
+    source_only_set = frozenset(source_only)
 
     # Validate the model and all required language tags before a large worker pool.
     tokenizer = SionTokenizer(tokenizer_model)
@@ -451,6 +472,7 @@ def prepare_dataset(
             "prevent_target_leakage": prevent_target_leakage,
             "quality_policy": quality_policy.to_dict(),
             "shard_size": shard_size,
+            "source_only_languages": list(source_only),
             "synthetic_sampling_weight": synthetic_sampling_weight,
             "test_fraction": test_fraction,
             "train_only_prefixes": list(train_only_prefixes),
@@ -572,6 +594,19 @@ def prepare_dataset(
                     for target in targets:
                         _increment(target, "ja_no_kana_warnings")
 
+                # A source-only language must sit on side A so that direction 0
+                # translates out of it. Swapping here, before dedup and split
+                # keying, keeps every downstream key consistent with what is
+                # actually written to the shard.
+                forward_only = False
+                if source_only_set:
+                    if language_b in source_only_set:
+                        language_a, language_b = language_b, language_a
+                        text_a, text_b = text_b, text_a
+                        ids_a, ids_b = ids_b, ids_a
+                        register_a, register_b = register_b, register_a
+                    forward_only = language_a in source_only_set
+
                 pair_key = (
                     f"{language_a}\0{dedup_key(text_a)}\0{language_b}\0{dedup_key(text_b)}"
                 ).encode("utf-8")
@@ -620,6 +655,7 @@ def prepare_dataset(
                     source_id,
                     quality_score,
                     is_synthetic,
+                    forward_only,
                 )
                 for target in targets:
                     _increment(target, split)
@@ -629,6 +665,8 @@ def prepare_dataset(
                     _increment(target, "quality_score_sum", quality_score)
                     if is_synthetic:
                         _increment(target, "synthetic_pairs")
+                    if forward_only:
+                        _increment(target, "forward_only_pairs")
     except BaseException:
         if executor is not None:
             executor.shutdown(wait=False, cancel_futures=True)
@@ -671,6 +709,7 @@ def prepare_dataset(
         "language_pairs": [list(pair) for pair in normalized_pairs],
         "languages": list(languages),
         "language_to_id": language_to_id,
+        "source_only_languages": list(source_only),
         "storage_sides": ["src", "tgt"],
         "train_only_prefixes": list(train_only_prefixes),
         "synthetic_policy": {

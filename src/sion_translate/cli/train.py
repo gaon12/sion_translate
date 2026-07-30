@@ -85,6 +85,7 @@ def scan_configured_raw_data(
         language_pairs=config.data.configured_language_pairs(),
         tokenizer_model=tokenizer_path,
         preprocessing_options={
+            "source_only_languages": list(config.data.configured_source_only_languages()),
             "synthetic_sampling_weight": config.data.synthetic_sampling_weight,
             "train_only_prefixes": list(config.data.configured_synthetic_prefixes()),
         },
@@ -548,6 +549,7 @@ def ensure_artifacts(config: AppConfig, context: DistributedContext) -> None:
                     tokenizer_path,
                     dataset_dir,
                     language_pairs=config.data.configured_language_pairs(),
+                    source_only_languages=config.data.configured_source_only_languages(),
                     train_only_prefixes=config.data.configured_synthetic_prefixes(),
                     synthetic_sampling_weight=config.data.synthetic_sampling_weight,
                     num_workers=cpu_plan.dataset_workers,

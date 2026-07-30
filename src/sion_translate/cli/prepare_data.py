@@ -53,6 +53,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="여러 언어쌍을 한 데이터셋에 넣을 때 반복 지정",
     )
     parser.add_argument(
+        "--source-only-language",
+        nargs="+",
+        default=[],
+        metavar="LANG",
+        help=(
+            "원문으로만 쓰고 번역 결과로는 내보내지 않는 언어 "
+            "(예: 한본어 kj). 이 언어가 든 쌍은 단방향으로만 학습됩니다"
+        ),
+    )
+    parser.add_argument(
         "--train-only-prefix",
         nargs="+",
         default=list(DEFAULT_TRAIN_ONLY_PREFIXES),
@@ -87,6 +97,7 @@ def main() -> None:
         dedup_backend=args.dedup_backend,
         language_pair=args.language_pair,
         language_pairs=args.language_pairs,
+        source_only_languages=args.source_only_language,
         train_only_prefixes=args.train_only_prefix,
         num_workers=args.workers,
     )

@@ -174,6 +174,13 @@ class DataConfig:
     # 여러 언어쌍을 한 모델에서 학습할 때 사용합니다. 비어 있으면 위의
     # language_pair 한 쌍만 사용합니다. YAML에서는 둘 중 하나만 적습니다.
     language_pairs: list[list[str]] = field(default_factory=list)
+    # 원문으로만 등장하고 번역 결과로는 절대 나오면 안 되는 언어입니다.
+    # 한본어(kj)처럼 "한국어와 일본어가 섞인 입력"을 받아 각각 단일어로
+    # 번역하는 경우에 씁니다. 여기 등재된 언어가 포함된 쌍은 단방향으로만
+    # 학습되어(kj->ko, kj->ja), 역방향(ko->kj, ja->kj)이 생성되지 않습니다.
+    # 이것을 비워 두면 bidirectional=True 가 혼용문을 target 으로도 학습해
+    # 한국어 출력에 가나를 주입하는 모델이 됩니다.
+    source_only_languages: list[str] = field(default_factory=list)
     # 원문(입력) 쪽 토큰을 낮은 확률로 무작위 탈락시키는 온라인 증강.
     # 소량(0.05 안팎)은 과적합을 줄여 주지만, 큰 값은 오히려 해롭습니다.
     # 검증에는 절대 적용되지 않습니다. 0 이면 끕니다.
@@ -222,6 +229,9 @@ class DataConfig:
             self.synthetic_prefixes,
             legacy_prefix=self.synthetic_prefix,
         )
+
+    def configured_source_only_languages(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(str(language) for language in self.source_only_languages))
 
     @property
     def languages(self) -> tuple[str, ...]:
@@ -369,6 +379,26 @@ class AppConfig:
             if edge in seen_edges:
                 raise ValueError(f"duplicate or reversed language pair: {pair!r}")
             seen_edges.add(edge)
+        source_only = self.data.configured_source_only_languages()
+        if source_only:
+            known = set(self.data.languages)
+            unknown = sorted(set(source_only) - known)
+            if unknown:
+                raise ValueError(
+                    "data.source_only_languages must appear in the configured language "
+                    f"pairs; {unknown} do not (configured languages: {sorted(known)})"
+                )
+            # A pair whose both sides are source-only can be trained in neither
+            # direction, so it would silently contribute nothing. This also
+            # covers "every language is source-only", because any pair then has
+            # two source-only sides.
+            for pair in pairs:
+                if pair[0] in source_only and pair[1] in source_only:
+                    raise ValueError(
+                        "at most one side of a language pair may be source-only; "
+                        f"both sides of {list(pair)!r} are listed in "
+                        "data.source_only_languages"
+                    )
         if not 0.0 <= self.data.source_token_dropout < 0.5:
             raise ValueError("source_token_dropout must be in [0, 0.5)")
         if not self.data.synthetic_prefix:
