@@ -118,6 +118,7 @@ def test_tokenizer_prepare_dataset_and_collate(tmp_path: Path) -> None:
         tokenizer.language_tags["ko"],
         tokenizer.language_tags["ja"],
     ]
+    assert batch["reverse_direction_trained"].tolist() == [True, True]
     assert "src_script_ids" in batch
 
     with pytest.raises(FileExistsError, match="not empty"):

@@ -321,8 +321,8 @@ class MinimumRiskObjective:
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Translate candidates back to each row's source language in one batch.
 
-        The collator marks denoising rows with ``-1`` because a reverse
-        translation direction is undefined for that task. All valid
+        The collator marks denoising rows with ``-1`` and separately carries
+        whether the dataset actually trained the reverse graph edge. All valid
         ``batch × candidates`` rows share one rollout to keep cycle checking
         substantially cheaper than invoking ``generate`` candidate by candidate.
         """
@@ -331,7 +331,17 @@ class MinimumRiskObjective:
             return None, None
 
         batch_size, samples, _ = candidates.shape
-        valid_mask = source_tags.ge(0)[:, None].expand(batch_size, samples)
+        reverse_direction_trained = batch.get("reverse_direction_trained")
+        if reverse_direction_trained is None:
+            eligible_rows = torch.zeros_like(source_tags, dtype=torch.bool)
+        else:
+            if reverse_direction_trained.shape != source_tags.shape:
+                raise ValueError("reverse_direction_trained must match source_language_tag_ids")
+            eligible_rows = source_tags.ge(0) & reverse_direction_trained.to(
+                device=source_tags.device,
+                dtype=torch.bool,
+            )
+        valid_mask = eligible_rows[:, None].expand(batch_size, samples)
         if not bool(valid_mask.any()):
             return None, valid_mask
 
@@ -367,7 +377,7 @@ class MinimumRiskObjective:
         positions = torch.arange(reverse_length, device=candidates.device)
         reverse_mask = positions[None, :] < (content_lengths + 2)[:, None]
 
-        source_lengths = batch["attention_mask"].sum(dim=-1)[source_tags.ge(0)]
+        source_lengths = batch["attention_mask"].sum(dim=-1)[eligible_rows]
         max_new_tokens = min(
             self.config.roundtrip_max_new_tokens,
             base.config.max_seq_len - 1,
@@ -414,6 +424,7 @@ class MinimumRiskObjective:
             "register_labels",
             "alignment_targets",
             "source_language_tag_ids",
+            "reverse_direction_trained",
         }
         return {
             name: value.repeat_interleave(repeats, dim=0)

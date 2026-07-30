@@ -373,10 +373,11 @@ class SionForConditionalGeneration(nn.Module):
         src_coda_ids: torch.Tensor | None = None,
         alignment_targets: torch.Tensor | None = None,
         source_language_tag_ids: torch.Tensor | None = None,
+        reverse_direction_trained: torch.Tensor | None = None,
     ) -> SionOutput:
         # Collator가 제공하는 사후학습용 방향 메타데이터입니다. 일반 SFT
         # forward에서는 의미가 없지만 batch를 그대로 전달할 수 있게 받습니다.
-        del source_language_tag_ids
+        del source_language_tag_ids, reverse_direction_trained
         encoder_states = self.encode(
             input_ids,
             attention_mask,

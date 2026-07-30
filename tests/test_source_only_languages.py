@@ -15,7 +15,11 @@ import numpy as np
 import pytest
 
 from sion_translate.config import AppConfig, DataConfig, config_from_raw
-from sion_translate.data.indexed import IndexedParallelDataset
+from sion_translate.data.collate import SionBatchCollator
+from sion_translate.data.indexed import (
+    DistributedBucketBatchSampler,
+    IndexedParallelDataset,
+)
 from sion_translate.data.prepare import INDEX_DTYPE, prepare_dataset
 from sion_translate.tokenizer import SionTokenizer, train_tokenizer
 
@@ -165,6 +169,76 @@ def test_metadata_accessors_agree_with_getitem(prepared: Path) -> None:
         assert dataset.source_id_at(index) == 0
 
 
+def test_balanced_sampling_maps_physical_pairs_to_valid_virtual_indices(
+    prepared: Path,
+) -> None:
+    dataset = IndexedParallelDataset(prepared, "train", bidirectional=True)
+    sampler = DistributedBucketBatchSampler(
+        dataset,
+        batch_size=17,
+        bucket_size=68,
+        source_sampling_alpha=0.5,
+        seed=73,
+        drop_last=False,
+    )
+
+    sampled = [index for batch in sampler for index in batch]
+
+    assert sampled
+    assert all(0 <= index < len(dataset) for index in sampled)
+    assert all(dataset[index]["target_language"] != "kj" for index in sampled)
+
+    # Exercise the inverse layout mapping directly for both row classes. A
+    # requested reverse direction is honored only when that physical pair has
+    # a trained reverse edge.
+    physical = np.arange(dataset.pair_count, dtype=np.uint32)
+    virtual = dataset._virtual_indices_for_pairs(
+        physical,
+        np.ones(dataset.pair_count, dtype=np.uint32),
+    )
+    resolved = [dataset._resolve_virtual(int(index)) for index in virtual]
+    assert [pair for pair, _ in resolved] == physical.tolist()
+    assert dataset._forward_only_pairs is not None
+    forward_only_pairs = set(map(int, dataset._forward_only_pairs))
+    assert all(
+        direction == (0 if pair in forward_only_pairs else 1) for pair, direction in resolved
+    )
+
+
+def test_reverse_edge_metadata_tracks_source_only_and_dense_pairs(prepared: Path) -> None:
+    dataset = IndexedParallelDataset(prepared, "train", bidirectional=True)
+
+    for index in range(len(dataset)):
+        item = dataset[index]
+        assert item["reverse_direction_trained"] is (item["src_language"] != "kj")
+
+
+def test_collator_preserves_the_dataset_reverse_edge_mask(
+    prepared: Path,
+    kj_tokenizer: Path,
+) -> None:
+    dataset = IndexedParallelDataset(prepared, "train", bidirectional=True)
+    source_only = next(
+        dataset[index]
+        for index in range(len(dataset))
+        if not dataset[index]["reverse_direction_trained"]
+    )
+    bidirectional = next(
+        dataset[index]
+        for index in range(len(dataset))
+        if dataset[index]["reverse_direction_trained"]
+    )
+    collator = SionBatchCollator(
+        SionTokenizer(kj_tokenizer),
+        max_source_length=64,
+        max_target_length=64,
+    )
+
+    batch = collator([source_only, bidirectional])
+
+    assert batch["reverse_direction_trained"].tolist() == [False, True]
+
+
 def test_worker_pickling_rebuilds_the_direction_maps(prepared: Path) -> None:
     dataset = IndexedParallelDataset(prepared, "train", bidirectional=True)
     restored = IndexedParallelDataset.__new__(IndexedParallelDataset)
@@ -182,6 +256,7 @@ def test_unidirectional_reading_is_unaffected(prepared: Path) -> None:
     assert len(dataset) == dataset.pair_count
     for index in range(len(dataset)):
         assert dataset[index]["target_language"] != "kj"
+        assert dataset[index]["reverse_direction_trained"] is False
 
 
 def test_corpus_without_source_only_languages_keeps_the_old_layout(

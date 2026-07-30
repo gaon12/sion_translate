@@ -240,6 +240,64 @@ class IndexedParallelDataset(Dataset):
         result[~low] = self._forward_only_pairs[indices[~low] - boundary]
         return result
 
+    def _virtual_indices_for_pairs(
+        self,
+        pair_indices: np.ndarray,
+        directions: np.ndarray,
+    ) -> np.ndarray:
+        """Map sampled physical pairs to valid virtual dataset indices.
+
+        Forward-only rows occupy a compact, single-direction range after all
+        bidirectional rows. Consequently, ``pair * 2 + direction`` is valid
+        only for the legacy dense layout. This inverse mapping preserves the
+        sampled physical pair while forcing forward-only rows to direction 0.
+        """
+
+        pairs = np.asarray(pair_indices, dtype=np.int64)
+        requested_directions = np.asarray(directions, dtype=np.int64)
+        if pairs.ndim != 1 or requested_directions.shape != pairs.shape:
+            raise ValueError("pair_indices and directions must be matching 1D arrays")
+        if bool(((pairs < 0) | (pairs >= self.pair_count)).any()):
+            raise IndexError("physical pair index is out of range")
+        if bool(((requested_directions < 0) | (requested_directions > 1)).any()):
+            raise ValueError("directions must contain only 0 or 1")
+
+        index_dtype = np.uint32 if len(self) <= np.iinfo(np.uint32).max else np.uint64
+        if not self.bidirectional:
+            return pairs.astype(index_dtype, copy=False)
+        if self._bidirectional_pairs is None:
+            return pairs.astype(index_dtype, copy=False) * index_dtype(
+                2
+            ) + requested_directions.astype(index_dtype, copy=False)
+
+        assert self._forward_only_pairs is not None
+        bidirectional_positions = np.searchsorted(self._bidirectional_pairs, pairs)
+        is_bidirectional = bidirectional_positions < len(self._bidirectional_pairs)
+        matched_positions = np.flatnonzero(is_bidirectional)
+        is_bidirectional[matched_positions] &= (
+            self._bidirectional_pairs[bidirectional_positions[matched_positions]]
+            == pairs[matched_positions]
+        )
+
+        result = np.empty(len(pairs), dtype=index_dtype)
+        result[is_bidirectional] = bidirectional_positions[is_bidirectional].astype(
+            index_dtype, copy=False
+        ) * index_dtype(2) + requested_directions[is_bidirectional].astype(index_dtype, copy=False)
+
+        forward_pairs = pairs[~is_bidirectional]
+        forward_positions = np.searchsorted(self._forward_only_pairs, forward_pairs)
+        if bool(
+            (forward_positions >= len(self._forward_only_pairs)).any()
+            or (self._forward_only_pairs[forward_positions] != forward_pairs).any()
+        ):
+            raise RuntimeError("direction maps do not cover every physical pair")
+        boundary = index_dtype(2 * len(self._bidirectional_pairs))
+        result[~is_bidirectional] = boundary + forward_positions.astype(
+            index_dtype,
+            copy=False,
+        )
+        return result
+
     def _resolve(self, pair_index: int) -> tuple[int, int]:
         shard = bisect.bisect_right(self.cumulative, pair_index)
         previous = 0 if shard == 0 else self.cumulative[shard - 1]
@@ -341,6 +399,11 @@ class IndexedParallelDataset(Dataset):
             src, tgt = side_b, side_a
             src_language, target_language = language_b, language_a
             src_register, target_register = register_b, register_a
+        forward_only = bool(
+            row["forward_only"]
+            if row.dtype.names is not None and "forward_only" in row.dtype.names
+            else False
+        )
         return {
             "src": src,
             "tgt": tgt,
@@ -354,6 +417,10 @@ class IndexedParallelDataset(Dataset):
                 if row.dtype.names is not None and "synthetic" in row.dtype.names
                 else False
             ),
+            # MRT may backtranslate only when this split actually trained the
+            # reverse edge. Language names alone cannot establish that for
+            # source-only rows or a globally unidirectional dataset.
+            "reverse_direction_trained": self.bidirectional and not forward_only,
         }
 
 
@@ -535,7 +602,7 @@ class DistributedBucketBatchSampler(Sampler[list[int]]):
         if not self.dataset.bidirectional:
             return sampled_pairs
         directions = rng.integers(0, 2, size=sample_count, dtype=np.uint32)
-        return sampled_pairs * np.uint32(2) + directions
+        return self.dataset._virtual_indices_for_pairs(sampled_pairs, directions)
 
     def __iter__(self) -> Iterator[list[int]]:
         if self._balance_sources:

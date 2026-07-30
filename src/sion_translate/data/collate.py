@@ -144,10 +144,14 @@ class SionBatchCollator:
             # 단일언어 복원 과제에는 번역 방향이 없으므로 순환 번역 보상을
             # 적용하지 않습니다.
             source_language_tag_id = -1
+            reverse_direction_trained = False
         else:
             # <2xx>: 목표 언어를 지정하는 방향 태그 (양방향 학습의 핵심)
             task_id = self.tokenizer.language_tags[item["target_language"]]
             source_language_tag_id = self.tokenizer.language_tags[item["src_language"]]
+            # Missing graph metadata is treated conservatively: an unknown
+            # reverse edge must not receive a roundtrip reward.
+            reverse_direction_trained = bool(item.get("reverse_direction_trained", False))
             if self.source_token_dropout > 0:
                 # 온라인 증강: 보호 슬롯(<slot_n>)은 남기고, 일반 토큰만
                 # 낮은 확률로 탈락. 최소 1개 토큰은 반드시 남깁니다.
@@ -172,6 +176,7 @@ class SionBatchCollator:
             "register_label": target_register,
             "memory_tokens": memory_tokens[:64],
             "source_language_tag_id": source_language_tag_id,
+            "reverse_direction_trained": reverse_direction_trained,
         }
 
     def __call__(self, items: Sequence[dict]) -> dict[str, torch.Tensor]:
@@ -206,6 +211,7 @@ class SionBatchCollator:
         labels = torch.full((batch_size, tgt_len), -100, dtype=torch.long)
         register_labels = torch.zeros(batch_size, dtype=torch.long)
         source_language_tag_ids = torch.full((batch_size,), -1, dtype=torch.long)
+        reverse_direction_trained = torch.zeros(batch_size, dtype=torch.bool)
         memory_token_ids = torch.full(
             (batch_size, memory_len, 1), self.tokenizer.pad_id, dtype=torch.long
         )
@@ -223,6 +229,7 @@ class SionBatchCollator:
             labels[row, : len(target_label)] = target_label
             register_labels[row] = example["register_label"]
             source_language_tag_ids[row] = example["source_language_tag_id"]
+            reverse_direction_trained[row] = example["reverse_direction_trained"]
             for column, token_id in enumerate(example["memory_tokens"]):
                 memory_token_ids[row, column, 0] = token_id
                 memory_mask[row, column] = True
@@ -238,6 +245,7 @@ class SionBatchCollator:
             # 학습 목적함수 전용 메타데이터입니다. 모델 forward는 이 값을
             # 사용하지 않고, MRT 순환 번역 rollout만 역방향 태그로 씁니다.
             "source_language_tag_ids": source_language_tag_ids,
+            "reverse_direction_trained": reverse_direction_trained,
             "memory_token_ids": memory_token_ids,
             "memory_mask": memory_mask,
             "memory_type_ids": memory_type_ids,

@@ -98,7 +98,7 @@ def test_roundtrip_reward_requires_recovering_the_source() -> None:
     assert result.reward[0, 0] > result.reward[0, 1] + 0.2
 
 
-def test_backtranslation_batches_valid_candidates_and_skips_denoising_rows() -> None:
+def test_backtranslation_skips_rows_without_a_trained_reverse_edge() -> None:
     class RecordingGenerator:
         config = SimpleNamespace(max_seq_len=16)
 
@@ -124,11 +124,15 @@ def test_backtranslation_batches_valid_candidates_and_skips_denoising_rows() -> 
     )
     model = RecordingGenerator()
     batch = {
-        "attention_mask": torch.ones(2, 4, dtype=torch.bool),
-        "source_language_tag_ids": torch.tensor([5, -1]),
+        "attention_mask": torch.ones(3, 4, dtype=torch.bool),
+        "source_language_tag_ids": torch.tensor([5, 5, -1]),
+        # The middle row is a source-only/unidirectional example. The last is
+        # denoising and would be excluded by its -1 tag independently.
+        "reverse_direction_trained": torch.tensor([True, False, True]),
     }
     candidates = torch.tensor(
         [
+            [[2, 20, 21, 3], [2, 20, 22, 3]],
             [[2, 20, 21, 3], [2, 20, 22, 3]],
             [[2, 20, 21, 3], [2, 20, 22, 3]],
         ]
@@ -140,9 +144,35 @@ def test_backtranslation_batches_valid_candidates_and_skips_denoising_rows() -> 
     assert model.inputs.shape[0] == 2
     assert model.inputs[:, 0].tolist() == [5, 5]
     assert mask is not None
-    assert mask.tolist() == [[True, True], [False, False]]
+    assert mask.tolist() == [
+        [True, True],
+        [False, False],
+        [False, False],
+    ]
     assert roundtrips is not None
     assert roundtrips[0, 0].tolist() == [2, 10, 11, 3]
+
+
+def test_backtranslation_is_conservative_without_reverse_graph_metadata() -> None:
+    objective = MinimumRiskObjective(
+        TextTokenizer(),
+        PostTrainingConfig(roundtrip_enabled=True),
+    )
+    batch = {
+        "attention_mask": torch.ones(1, 4, dtype=torch.bool),
+        "source_language_tag_ids": torch.tensor([5]),
+    }
+    candidates = torch.tensor([[[2, 20, 21, 3]]])
+
+    roundtrips, mask = objective._backtranslate_candidates(
+        SimpleNamespace(config=SimpleNamespace(max_seq_len=16)),
+        batch,
+        candidates,
+    )
+
+    assert roundtrips is None
+    assert mask is not None
+    assert not mask.any()
 
 
 def test_multi_pair_preference_loss_uses_reward_ordering() -> None:
