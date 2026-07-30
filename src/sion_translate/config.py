@@ -206,10 +206,10 @@ class DataConfig:
     validation_split: str = "validation"
     bidirectional: bool = True
     # split 배정과 누출 방지를 완전일치 문자열 대신 문자 5-gram MinHash
-    # 버킷으로 수행합니다. 켜면 조사 하나만 다른 근사 중복이 train 과
-    # holdout 을 넘나들지 못합니다. split 경계가 달라져 기존 홀드아웃
-    # 점수와 비교할 수 없으므로 기본은 꺼져 있습니다.
-    approximate_split: bool = False
+    # 버킷으로 수행합니다. 조사 하나만 다른 근사 중복이 train 과 holdout 을
+    # 넘나들지 못하게 하는 안전한 기본값입니다. 과거 exact split을 재현해야
+    # 할 때만 명시적으로 끄십시오. 두 방식의 holdout 점수는 직접 비교할 수 없습니다.
+    approximate_split: bool = True
     max_source_length: int = 512
     max_target_length: int = 512
     # Tensor Core 친화적인 sequence shape을 위해 동적 padding 길이를

@@ -54,11 +54,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--approximate-split",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
             "split 배정을 문자 5-gram MinHash 버킷으로 수행해 근사 중복이 "
-            "train 과 holdout 을 넘나들지 못하게 합니다"
+            "train 과 holdout 을 넘나들지 못하게 합니다 (기본: 활성)"
         ),
+    )
+    parser.add_argument(
+        "--exact-split",
+        action="store_false",
+        dest="approximate_split",
+        help="과거 실험 재현용 완전일치 split (근사 중복 누수 위험)",
     )
     parser.add_argument(
         "--source-only-language",

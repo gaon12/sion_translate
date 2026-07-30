@@ -50,6 +50,7 @@ data:
   raw_dir: data              # 원천 JSONL 폴더 (여기에 파일을 추가하면 자동 인식)
   language_pair: [ko, ja]    # JSONL 키 이름 = 언어쌍. [en, de] 처럼 바꾸면
                              # 토크나이저/전처리/방향 태그가 모두 따라갑니다.
+  approximate_split: true    # 문자 5-gram MinHash로 근사 중복의 split 누수 방지
 # 여러 언어쌍을 한 모델에 넣을 때는 위 language_pair 대신 아래 형식을 씁니다.
 #   language_pairs:
 #     - [ko, ja]

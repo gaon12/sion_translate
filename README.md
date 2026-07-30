@@ -249,14 +249,16 @@ sion-compare \
 도메인의 문장에서는 점수가 크게 낮아집니다. 이 저장소의 데이터 구성으로 측정했을
 때 in-domain chrF와 도메인 밖 chrF의 차이는 20점을 넘었습니다.
 
-**완전일치 split 만으로는 근사 중복이 막히지 않습니다.** `data.approximate_split`
-이 꺼져 있으면 split 배정과 누수 방지가 NFKC·공백 정규화 후 완전일치 문자열로만
-동작하므로, 조사 하나만 다른 문장이 train 과 holdout 에 따로 들어갑니다. 실측하면
+**완전일치 split 만으로는 근사 중복이 막히지 않습니다.** 기본값인
+`data.approximate_split: true`는 문자 5-gram MinHash로 split을 배정합니다.
+이를 `false`로 끄거나 `sion-prepare-data --exact-split`을 사용하면
+NFKC·공백 정규화 후 완전일치 문자열로만 누수를 막으므로, 조사 하나만 다른 문장이
+train 과 holdout 에 따로 들어갈 수 있습니다. 실측하면
 문자 5-gram MinHash split 대비 근사 중복 유출이 두 배였습니다 (data9/29/33/41
 평균 1.12% → 0.48%). 이 저장소가 이전에 보고한 자체 test split ja→ko
 BLEU 81.95 는 이 유출을 포함한 값이므로 인용하지 마십시오 — 같은 체크포인트의
-외부 diagnostic chrF 는 53.43 입니다. 새 run 에서는
-`data.approximate_split: true` 를 켜고, 템플릿성 생성 데이터는
+외부 diagnostic chrF 는 53.43 입니다. 과거 실험 재현 외에는 기본값을 유지하고,
+템플릿성 생성 데이터는
 `scripts/data/resample_generated_shards.py` 로 프레임·인용구 재사용을 먼저
 제한하십시오. MinHash 는 근사 중복용이고 템플릿용이 아닙니다.
 
