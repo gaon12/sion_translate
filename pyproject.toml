@@ -26,6 +26,11 @@ dependencies = [
 dev = ["pytest>=8.3", "ruff>=0.8"]
 baselines = []
 export = ["gguf>=0.19", "torchao>=0.17"]
+# Korean-specific helper used only by scripts/data/build_hanboneo.py for josa
+# selection. The builder falls back to a built-in implementation when it is
+# absent, so this is genuinely optional and the core stack stays
+# language-agnostic.
+hangul = ["hangulpy>=1.4"]
 
 [project.urls]
 Repository = "https://github.com/gaon12/sion_translate"

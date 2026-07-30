@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
 """Build a deterministic 한본어 (Korean-Japanese code-mixed) parallel corpus.
 
-한본어 is internet-register text that mixes Korean and Japanese. Three registers
-occur, and they differ in what can be checked about their script:
+한본어 works because Korean and Japanese are both agglutinative with SOV order,
+so a stem from one language takes an ending from the other and the result still
+parses. Four registers occur, and they differ in what can be asserted about
+their script, so every frame declares which one it produces:
 
-1. ``script``      Hangul next to kana or kanji, e.g. ``오늘 スケジュール 어때``.
-2. ``hangul_only`` a whole Japanese clause transliterated into Hangul, particles
-                   and copula included: ``닝겐노 유리와 튼튼데스네``
-                   = 人間の百合は丈夫ですね.
-3. ``kana_only``   Korean vocabulary written in katakana inside otherwise
-                   Japanese text: ``チンチャそれな``.
+    blend        morphology mixed inside one word
+                 체고카요 = 최고 + かよ, やばいンデ = やばい + ~ㄴ데
+    hangul_only  a Japanese clause transliterated into Hangul
+                 닝겐노 유리와 튼튼데스네 = 人間の百合は丈夫ですね
+    script       Hangul beside kana or kanji
+                 그 スケジュール 어떻게 됐어
+    kana_only    Korean vocabulary in katakana inside Japanese
+                 チンチャそれな
 
-Registers 2 and 3 are uniform in script, so mixing cannot be detected from code
-points and each frame declares which register it produces.
+The last three are uniform or mixed in ways a code-point check can verify;
+``blend`` rows are where the interesting morphology lives and are drawn from a
+hand-written lexicon rather than composed blindly, because the Japanese side is
+often lexical: 대박 + い is やばい, not 大当たりい.
 
 Every row is a triple, because the model has to read the mixture and answer in
 exactly one language:
@@ -21,26 +27,28 @@ exactly one language:
      "ko": "헐ㅋㅋㅋ 인간의 백합은 튼튼하네요ㅋㅋ",
      "ja": "えっｗｗｗ 人間の百合は丈夫ですねｗｗ"}
 
-``kj`` belongs in ``data.source_only_languages``, so kj->ko and kj->ja are
-trained and ko->kj / ja->kj never are. The ``ko`` and ``ja`` fields also yield a
-clean monolingual pair for free.
+The code-mixed key belongs in ``data.source_only_languages``, so mixed->Korean
+and mixed->Japanese are trained and the reverse never is. The two monolingual
+fields also yield a clean pair for free.
 
 Generation is rule-based and seeded rather than sampled from a language model,
 so it is reproducible and every Japanese surface is one a human put in the
-lexicon below. Two things keep the output from degenerating:
+lexicon. Semantic classes keep combinations meaningful and per-item and
+per-frame caps keep the output from becoming the template restatement that
+``audit_generated_shards.py`` rejects. The lexicon therefore bounds the corpus
+size: ask for more rows than the caps allow and the builder stops early and
+reports what it produced.
 
-- semantic classes. Nouns carry a class and predicates declare which classes
-  they accept, so the builder does not emit ``방이 강하다`` or ``시간이 약하다``.
-- caps. Each lexical entry and each frame has a ceiling, so the corpus cannot
-  become the template restatement that ``audit_generated_shards.py`` rejects.
-
-The lexicon size therefore bounds the corpus size. Ask for more rows than the
-caps allow and the builder stops early and reports how many it produced.
+Korean particle selection uses hangulpy when it is installed, which covers 76
+particle pairs including the 으로/로 exception. Without it a built-in fallback
+handles 은/는, 이/가 and 을/를, which is all the frames here need.
 
 Usage::
 
     python scripts/data/build_hanboneo.py --output data/synthetic_hanboneo.jsonl
     python scripts/data/build_hanboneo.py --output out.jsonl --report report.json
+    python scripts/data/build_hanboneo.py --output out.jsonl \
+        --mixed-key mixed --first-key korean --second-key japanese
 
 Exit codes: 0 rows written, 2 nothing could be built.
 """
@@ -49,17 +57,46 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import json
 from pathlib import Path
 import random
 import sys
 import unicodedata
 
+from hanboneo_lexicon import (
+    BLENDS,
+    FOOD,
+    GENITIVE_HEADS,
+    INTERJECTIONS,
+    KOREAN_CONTENT_NOUNS,
+    KOREAN_ENDINGS,
+    KOREAN_FOOD_IN_KATAKANA,
+    KOREAN_INTENSIFIERS_IN_KATAKANA,
+    KOREAN_NOUNS_IN_KATAKANA,
+    LOANWORDS,
+    NOUNS,
+    PERSON,
+    PREDICATES,
+    REACTIONS,
+    Predicate,
+)
+
+from sion_translate.scripts_registry import scripts_in
+
+try:  # Optional: gaon12/hangulpy, MIT, on PyPI as ``hangulpy``.
+    from hangulpy import has_batchim as _hangulpy_has_batchim
+    from hangulpy import josa as _hangulpy_josa
+
+    HANGULPY_AVAILABLE = True
+except ImportError:  # pragma: no cover - exercised by the fallback test
+    _hangulpy_has_batchim = None
+    _hangulpy_josa = None
+    HANGULPY_AVAILABLE = False
+
 
 # ---------------------------------------------------------------------------
-# Hangul jamo arithmetic. Korean internet text fuses a trailing laugh consonant
-# into the last syllable when it has no final consonant: 네 + ㅋ -> 넼.
+# Hangul jamo arithmetic and particle selection.
 # ---------------------------------------------------------------------------
 
 _HANGUL_BASE = 0xAC00
@@ -73,7 +110,11 @@ def _syllable_offset(char: str) -> int | None:
 
 
 def fuse_final_consonant(text: str, jongseong: int) -> str:
-    """Attach a final consonant to the last syllable when it has none."""
+    """Attach a final consonant to the last syllable when it has none.
+
+    Korean internet text fuses a trailing laugh consonant into the preceding
+    open syllable: 네 + ㅋ -> 넼, 어 + ㅋ -> 엌.
+    """
 
     if not 0 < jongseong < 28:
         raise ValueError("jongseong index must be in [1, 27]")
@@ -92,597 +133,96 @@ def fuse_final_consonant(text: str, jongseong: int) -> str:
 def has_final_consonant(word: str) -> bool:
     """True when the last Hangul syllable of ``word`` carries a jongseong."""
 
+    if _hangulpy_has_batchim is not None:
+        last = word[-1:] if word else ""
+        return bool(last) and bool(_hangulpy_has_batchim(last))
     if not word:
         return False
     offset = _syllable_offset(word[-1])
     return offset is not None and offset % 28 != 0
 
 
-def topic_particle(word: str) -> str:
-    """Korean topic marker: 은 after a final consonant, 는 otherwise."""
+def attach_particle(word: str, pair: str) -> str:
+    """Attach a Korean particle, e.g. ``attach_particle("오빠", "은/는")``.
 
-    return "은" if has_final_consonant(word) else "는"
+    hangulpy handles this properly when installed; the fallback covers the three
+    pairs these frames use.
+    """
+
+    if _hangulpy_josa is not None:
+        return str(_hangulpy_josa(word, pair))
+    with_batchim, without_batchim = pair.split("/")
+    return word + (with_batchim if has_final_consonant(word) else without_batchim)
+
+
+def topic_particle(word: str) -> str:
+    return attach_particle(word, "은/는")[len(word) :]
 
 
 def subject_particle(word: str) -> str:
-    """Korean subject marker: 이 after a final consonant, 가 otherwise."""
-
-    return "이" if has_final_consonant(word) else "가"
+    return attach_particle(word, "이/가")[len(word) :]
 
 
 # ---------------------------------------------------------------------------
-# Lexicon. Each entry carries every surface the corpus needs, so both
-# monolingual sides are correct by construction rather than translated at
-# generation time. ``kind`` and ``accepts`` keep combinations meaningful.
+# Row model
 # ---------------------------------------------------------------------------
 
-# Semantic classes. They are finer than they look necessary because a coarse
-# "abstract" bucket lets the builder emit 시간이 어렵다 and 책의 마을은 춥네요.
-PERSON = "person"
-ANIMAL = "animal"
-PLANT = "plant"
-CELESTIAL = "celestial"  # 별 달 태양
-PRECIP = "precipitation"  # 비 눈
-LANDSCAPE = "landscape"  # 바다 산 숲 강
-WIND = "wind"
-PLACE = "place"
-ARTIFACT = "artifact"
-MEDIA = "media"
-FOOD = "food"
-TASK = "task"
-PERCEPT = "percept"  # 목소리 소리 색 맛
-TIME = "time"
-WEATHER = "weather"
-MIND = "mind"
-BODY = "body"
-
-# Which modifier class may take which head class in a ``N1의 N2`` genitive.
-# Without this the builder produces 책의 마을 and 비의 달.
-GENITIVE_HEADS: dict[str, frozenset[str]] = {
-    PERSON: frozenset({BODY, ANIMAL, ARTIFACT, MIND, PERCEPT, TASK, PLACE, FOOD, MEDIA, PLANT}),
-    # No LANDSCAPE head: a shop does not have a sea.
-    PLACE: frozenset({PERCEPT, ARTIFACT, TIME, FOOD, MEDIA, PLANT}),
-    # No MIND head: 영화의 꿈 reads as nonsense.
-    MEDIA: frozenset({PERCEPT}),
-    LANDSCAPE: frozenset({PERCEPT, TIME, WIND, PLANT}),
-    ANIMAL: frozenset({BODY, PERCEPT}),
-}
-
 
 @dataclass(frozen=True)
-class Noun:
-    hangul: str  # Japanese noun transliterated into Hangul
-    kana: str  # the Japanese surface
-    ko: str  # the Korean word
-    kind: str  # semantic class
+class Row:
+    """One generated triple.
+
+    ``mixing`` records which register produced the row, because two of the four
+    are uniform in script and cannot be verified from code points alone.
+    """
+
+    mixed: str
+    first: str  # the Korean rendering
+    second: str  # the Japanese rendering
+    frame: str
+    items: tuple[str, ...]
+    mixing: str = "script"
 
 
-@dataclass(frozen=True)
-class Predicate:
-    hangul: str  # transliterated stem: 튼튼 / 츠요이 / 타베
-    kana: str  # Japanese stem: 丈夫 / 強い / 食べ
-    form: str  # "na", "i" or "verb"
-    ko_polite: str
-    ko_plain: str
-    ko_negative: str  # polite, to match the polite Japanese negative
-    accepts: frozenset[str] = field(default_factory=frozenset)
-    # Dictionary form. Only verbs need it: 食べ->食べる is ichidan, but
-    # 飲み->飲む and 聞き->聞く are godan and cannot be derived by appending る.
-    kana_plain: str = ""
-    hangul_plain: str = ""
-
-    def __post_init__(self) -> None:
-        if self.form == "verb" and not (self.kana_plain and self.hangul_plain):
-            raise ValueError(f"verb {self.kana!r} must declare its dictionary form")
-        if self.form not in {"na", "i", "verb"}:
-            raise ValueError(f"unknown predicate form {self.form!r}")
+def _accepting(kind: str, forms: frozenset[str] | None = None) -> tuple[Predicate, ...]:
+    return tuple(
+        predicate
+        for predicate in PREDICATES
+        if kind in predicate.accepts and (forms is None or predicate.form in forms)
+    )
 
 
-@dataclass(frozen=True)
-class Interjection:
-    hangul: str
-    kana: str
-    ko: str
+def _polite(predicate: Predicate) -> tuple[str, str, str]:
+    if predicate.form == "verb":
+        return f"{predicate.hangul}마스네", f"{predicate.kana}ますね", predicate.ko_polite
+    return f"{predicate.hangul}데스네", f"{predicate.kana}ですね", predicate.ko_polite
 
 
-@dataclass(frozen=True)
-class Loanword:
-    """A Japanese word Koreans drop into Korean sentences."""
-
-    kana: str
-    hangul: str  # its Hangul transliteration
-    ko: str  # the plain Korean equivalent
-    pos: str  # "noun", "adjective" or "phrase"
-
-
-@dataclass(frozen=True)
-class KoreanInKatakana:
-    """A Korean word Japanese speakers write in katakana."""
-
-    katakana: str
-    ko: str
-    ja: str
+def _plain(predicate: Predicate) -> tuple[str, str, str]:
+    if predicate.form == "verb":
+        # Appending る would give 飲みる for a godan verb.
+        return predicate.hangul_plain, predicate.kana_plain, predicate.ko_plain
+    if predicate.form == "na":
+        return f"{predicate.hangul}다", f"{predicate.kana}だ", predicate.ko_plain
+    return predicate.hangul, predicate.kana, predicate.ko_plain
 
 
-@dataclass(frozen=True)
-class Reaction:
-    """A short Japanese reaction phrase, for chat-register one-liners."""
+def _negative(predicate: Predicate) -> tuple[str, str, str]:
+    if predicate.form == "verb":
+        return f"{predicate.hangul}마센", f"{predicate.kana}ません", predicate.ko_negative
+    if predicate.form == "na":
+        return (
+            f"{predicate.hangul}자 아리마센",
+            f"{predicate.kana}じゃありません",
+            predicate.ko_negative,
+        )
+    return (
+        f"{predicate.hangul[:-1]}쿠 나이데스",
+        f"{predicate.kana[:-1]}くないです",
+        predicate.ko_negative,
+    )
 
-    kana: str
-    ko: str
 
-
-NOUNS: tuple[Noun, ...] = (
-    Noun("닝겐", "人間", "인간", PERSON),
-    Noun("센세", "先生", "선생님", PERSON),
-    Noun("토모다치", "友達", "친구", PERSON),
-    Noun("카조쿠", "家族", "가족", PERSON),
-    Noun("코도모", "子供", "아이", PERSON),
-    Noun("네코", "猫", "고양이", ANIMAL),
-    Noun("이누", "犬", "개", ANIMAL),
-    Noun("토리", "鳥", "새", ANIMAL),
-    Noun("유리", "百合", "백합", PLANT),
-    Noun("사쿠라", "桜", "벚꽃", PLANT),
-    Noun("하나", "花", "꽃", PLANT),
-    Noun("호시", "星", "별", CELESTIAL),
-    Noun("츠키", "月", "달", CELESTIAL),
-    Noun("타이요", "太陽", "태양", CELESTIAL),
-    Noun("아메", "雨", "비", PRECIP),
-    Noun("유키", "雪", "눈", PRECIP),
-    Noun("우미", "海", "바다", LANDSCAPE),
-    Noun("야마", "山", "산", LANDSCAPE),
-    Noun("모리", "森", "숲", LANDSCAPE),
-    Noun("카와", "川", "강", LANDSCAPE),
-    Noun("카제", "風", "바람", WIND),
-    Noun("마치", "町", "마을", PLACE),
-    Noun("에키", "駅", "역", PLACE),
-    Noun("가코", "学校", "학교", PLACE),
-    Noun("헤야", "部屋", "방", PLACE),
-    Noun("미세", "店", "가게", PLACE),
-    Noun("혼", "本", "책", ARTIFACT),
-    Noun("샤신", "写真", "사진", ARTIFACT),
-    Noun("가멘", "画面", "화면", ARTIFACT),
-    Noun("쿠루마", "車", "자동차", ARTIFACT),
-    Noun("온가쿠", "音楽", "음악", MEDIA),
-    Noun("에이가", "映画", "영화", MEDIA),
-    Noun("우타", "歌", "노래", MEDIA),
-    Noun("료리", "料理", "요리", FOOD),
-    Noun("판", "パン", "빵", FOOD),
-    Noun("시고토", "仕事", "일", TASK),
-    Noun("슈쿠다이", "宿題", "숙제", TASK),
-    Noun("코에", "声", "목소리", PERCEPT),
-    Noun("오토", "音", "소리", PERCEPT),
-    Noun("이로", "色", "색", PERCEPT),
-    Noun("아지", "味", "맛", PERCEPT),
-    Noun("니오이", "匂い", "냄새", PERCEPT),
-    Noun("지칸", "時間", "시간", TIME),
-    Noun("아사", "朝", "아침", TIME),
-    Noun("요루", "夜", "밤", TIME),
-    Noun("나츠", "夏", "여름", TIME),
-    Noun("후유", "冬", "겨울", TIME),
-    Noun("텐키", "天気", "날씨", WEATHER),
-    Noun("유메", "夢", "꿈", MIND),
-    Noun("키모치", "気持ち", "마음", MIND),
-    Noun("오모이데", "思い出", "추억", MIND),
-    Noun("테", "手", "손", BODY),
-    Noun("메", "目", "눈", BODY),
-    Noun("코코로", "心", "심장", BODY),
-)
-
-PREDICATES: tuple[Predicate, ...] = (
-    Predicate(
-        "튼튼",
-        "丈夫",
-        "na",
-        "튼튼하네요",
-        "튼튼하다",
-        "튼튼하지 않아요",
-        frozenset({ARTIFACT, PLACE, PERSON, ANIMAL, BODY}),
-    ),
-    Predicate(
-        "키레이",
-        "綺麗",
-        "na",
-        "예쁘네요",
-        "예쁘다",
-        "예쁘지 않아요",
-        frozenset({PLANT, CELESTIAL, LANDSCAPE, PLACE, ARTIFACT, PERSON, PERCEPT}),
-    ),
-    Predicate(
-        "겐키",
-        "元気",
-        "na",
-        "활기차네요",
-        "활기차다",
-        "활기차지 않아요",
-        frozenset({PERSON, ANIMAL}),
-    ),
-    Predicate(
-        "시즈카",
-        "静か",
-        "na",
-        "조용하네요",
-        "조용하다",
-        "조용하지 않아요",
-        frozenset({PLACE, LANDSCAPE, PERSON, ANIMAL, TIME}),
-    ),
-    Predicate(
-        "유메이",
-        "有名",
-        "na",
-        "유명하네요",
-        "유명하다",
-        "유명하지 않아요",
-        frozenset({PERSON, PLACE, MEDIA, FOOD}),
-    ),
-    Predicate(
-        "타이헨",
-        "大変",
-        "na",
-        "힘드네요",
-        "힘들다",
-        "힘들지 않아요",
-        frozenset({TASK, MIND}),
-    ),
-    Predicate(
-        "다이지",
-        "大事",
-        "na",
-        "중요하네요",
-        "중요하다",
-        "중요하지 않아요",
-        frozenset({TASK, MIND, PERSON, ARTIFACT, TIME}),
-    ),
-    Predicate(
-        "라쿠",
-        "楽",
-        "na",
-        "편하네요",
-        "편하다",
-        "편하지 않아요",
-        frozenset({TASK, PLACE}),
-    ),
-    Predicate(
-        "스테키",
-        "素敵",
-        "na",
-        "멋지네요",
-        "멋지다",
-        "멋지지 않아요",
-        frozenset({PERSON, MEDIA, ARTIFACT, PLACE, PLANT}),
-    ),
-    Predicate(
-        "츠요이",
-        "強い",
-        "i",
-        "강하네요",
-        "강하다",
-        "강하지 않아요",
-        frozenset({PERSON, ANIMAL, WIND, BODY, PERCEPT}),
-    ),
-    Predicate(
-        "요와이",
-        "弱い",
-        "i",
-        "약하네요",
-        "약하다",
-        "약하지 않아요",
-        frozenset({PERSON, ANIMAL, WIND, BODY, PERCEPT}),
-    ),
-    Predicate(
-        "타카이",
-        "高い",
-        "i",
-        "비싸네요",
-        "비싸다",
-        "비싸지 않아요",
-        frozenset({ARTIFACT, FOOD}),
-    ),
-    Predicate(
-        "야스이",
-        "安い",
-        "i",
-        "싸네요",
-        "싸다",
-        "싸지 않아요",
-        frozenset({ARTIFACT, FOOD}),
-    ),
-    Predicate(
-        "우마이",
-        "うまい",
-        "i",
-        "맛있네요",
-        "맛있다",
-        "맛있지 않아요",
-        frozenset({FOOD}),
-    ),
-    Predicate(
-        "아츠이",
-        "暑い",
-        "i",
-        "덥네요",
-        "덥다",
-        "덥지 않아요",
-        frozenset({WEATHER, TIME, PLACE}),
-    ),
-    Predicate(
-        "사무이",
-        "寒い",
-        "i",
-        "춥네요",
-        "춥다",
-        "춥지 않아요",
-        frozenset({WEATHER, TIME, PLACE}),
-    ),
-    Predicate(
-        "타노시이",
-        "楽しい",
-        "i",
-        "즐겁네요",
-        "즐겁다",
-        "즐겁지 않아요",
-        frozenset({TASK, MEDIA, MIND}),
-    ),
-    Predicate(
-        "무즈카시이",
-        "難しい",
-        "i",
-        "어렵네요",
-        "어렵다",
-        "어렵지 않아요",
-        frozenset({TASK, MEDIA, ARTIFACT}),
-    ),
-    Predicate(
-        "야사시이",
-        "優しい",
-        "i",
-        "친절하네요",
-        "친절하다",
-        "친절하지 않아요",
-        frozenset({PERSON}),
-    ),
-    Predicate(
-        "우츠쿠시이",
-        "美しい",
-        "i",
-        "아름답네요",
-        "아름답다",
-        "아름답지 않아요",
-        frozenset({CELESTIAL, LANDSCAPE, PLANT, MEDIA, PLACE, PERCEPT}),
-    ),
-    Predicate(
-        "하야이",
-        "早い",
-        "i",
-        "빠르네요",
-        "빠르다",
-        "빠르지 않아요",
-        frozenset({TIME, PERSON, ANIMAL}),
-    ),
-    Predicate(
-        "오소이",
-        "遅い",
-        "i",
-        "느리네요",
-        "느리다",
-        "느리지 않아요",
-        frozenset({TIME, PERSON, ANIMAL}),
-    ),
-    Predicate(
-        "나츠카시이",
-        "懐かしい",
-        "i",
-        "그립네요",
-        "그립다",
-        "그립지 않아요",
-        frozenset({MIND, MEDIA, PLACE, TIME}),
-    ),
-    Predicate(
-        "타베",
-        "食べ",
-        "verb",
-        "먹어요",
-        "먹는다",
-        "먹지 않아요",
-        frozenset({PERSON, ANIMAL}),
-        kana_plain="食べる",
-        hangul_plain="타베루",
-    ),
-    Predicate(
-        "노미",
-        "飲み",
-        "verb",
-        "마셔요",
-        "마신다",
-        "마시지 않아요",
-        frozenset({PERSON, ANIMAL}),
-        kana_plain="飲む",
-        hangul_plain="노무",
-    ),
-    Predicate(
-        "미",
-        "見",
-        "verb",
-        "봐요",
-        "본다",
-        "보지 않아요",
-        frozenset({PERSON, ANIMAL}),
-        kana_plain="見る",
-        hangul_plain="미루",
-    ),
-    Predicate(
-        "키키",
-        "聞き",
-        "verb",
-        "들어요",
-        "듣는다",
-        "듣지 않아요",
-        frozenset({PERSON, ANIMAL}),
-        kana_plain="聞く",
-        hangul_plain="키쿠",
-    ),
-    Predicate(
-        "이키",
-        "行き",
-        "verb",
-        "가요",
-        "간다",
-        "가지 않아요",
-        frozenset({PERSON, ANIMAL}),
-        kana_plain="行く",
-        hangul_plain="이쿠",
-    ),
-    Predicate(
-        "카에리",
-        "帰り",
-        "verb",
-        "돌아가요",
-        "돌아간다",
-        "돌아가지 않아요",
-        frozenset({PERSON, ANIMAL}),
-        kana_plain="帰る",
-        hangul_plain="카에루",
-    ),
-    Predicate(
-        "와카리",
-        "分かり",
-        "verb",
-        "알아요",
-        "안다",
-        "알지 않아요",
-        frozenset({PERSON}),
-        kana_plain="分かる",
-        hangul_plain="와카루",
-    ),
-    Predicate(
-        "와라이",
-        "笑い",
-        "verb",
-        "웃어요",
-        "웃는다",
-        "웃지 않아요",
-        frozenset({PERSON}),
-        kana_plain="笑う",
-        hangul_plain="와라우",
-    ),
-    Predicate(
-        "히카리",
-        "光り",
-        "verb",
-        "빛나요",
-        "빛난다",
-        "빛나지 않아요",
-        frozenset({CELESTIAL, ARTIFACT}),
-        kana_plain="光る",
-        hangul_plain="히카루",
-    ),
-    Predicate(
-        "후리",
-        "降り",
-        "verb",
-        "내려요",
-        "내린다",
-        "내리지 않아요",
-        frozenset({PRECIP}),
-        kana_plain="降る",
-        hangul_plain="후루",
-    ),
-)
-
-INTERJECTIONS: tuple[Interjection, ...] = (
-    Interjection("엌", "えっ", "헐"),
-    Interjection("우와", "うわ", "우와"),
-    Interjection("아", "あっ", "아"),
-    Interjection("에", "えー", "에"),
-    Interjection("오오", "おお", "오오"),
-    Interjection("헤에", "へー", "허"),
-    Interjection("야바", "やば", "대박"),
-    Interjection("마지", "マジ", "진짜"),
-)
-
-LOANWORDS: tuple[Loanword, ...] = (
-    Loanword("スケジュール", "스케줄", "일정", "noun"),
-    Loanword("ランチ", "란치", "점심", "noun"),
-    Loanword("ミーティング", "미팅구", "회의", "noun"),
-    Loanword("オタク", "오타쿠", "덕후", "noun"),
-    Loanword("ツンデレ", "츤데레", "츤데레", "noun"),
-    Loanword("イベント", "이벤토", "행사", "noun"),
-    Loanword("バイト", "바이토", "아르바이트", "noun"),
-    Loanword("テンション", "텐션", "분위기", "noun"),
-    Loanword("コンビニ", "콘비니", "편의점", "noun"),
-    Loanword("アニメ", "아니메", "애니", "noun"),
-    Loanword("マンガ", "만가", "만화", "noun"),
-    Loanword("ゲーム", "게무", "게임", "noun"),
-    Loanword("カラオケ", "카라오케", "노래방", "noun"),
-    Loanword("キャラ", "캬라", "캐릭터", "noun"),
-    Loanword("ドラマ", "도라마", "드라마", "noun"),
-    Loanword("グッズ", "굿즈", "굿즈", "noun"),
-    Loanword("やばい", "야바이", "위험한 거", "adjective"),
-    Loanword("かわいい", "카와이", "귀여운 거", "adjective"),
-    Loanword("すごい", "스고이", "대단한 거", "adjective"),
-    Loanword("うるさい", "우루사이", "시끄러운 거", "adjective"),
-    Loanword("おつかれ", "오츠카레", "수고했다는 말", "phrase"),
-    Loanword("がんばれ", "간바레", "힘내라는 말", "phrase"),
-    Loanword("なるほど", "나루호도", "그렇구나 하는 말", "phrase"),
-    Loanword("それな", "소레나", "그거지 하는 말", "phrase"),
-    Loanword("しかたない", "시카타나이", "어쩔 수 없다는 말", "phrase"),
-    Loanword("だいすき", "다이스키", "정말 좋아한다는 말", "phrase"),
-)
-
-# Korean words that work as an intensifier or exclamation in front of a
-# Japanese phrase, which is the ``チンチャそれな`` pattern.
-KOREAN_INTENSIFIERS_IN_KATAKANA: tuple[KoreanInKatakana, ...] = (
-    KoreanInKatakana("チンチャ", "진짜", "ほんとに"),
-    KoreanInKatakana("テバク", "대박", "やばくて"),
-    KoreanInKatakana("アイゴー", "아이고", "あーあ"),
-    KoreanInKatakana("ケンチャナ", "괜찮아", "大丈夫、"),
-    KoreanInKatakana("ワンジョン", "완전", "めっちゃ"),
-    KoreanInKatakana("ノム", "너무", "すごく"),
-)
-
-# Korean nouns Japanese speakers borrow, used inside a Japanese sentence.
-KOREAN_NOUNS_IN_KATAKANA: tuple[KoreanInKatakana, ...] = (
-    KoreanInKatakana("オッパ", "오빠", "お兄さん"),
-    KoreanInKatakana("オンニ", "언니", "お姉さん"),
-    KoreanInKatakana("ヌナ", "누나", "お姉さん"),
-    KoreanInKatakana("アジョシ", "아저씨", "おじさん"),
-    KoreanInKatakana("チング", "친구", "友達"),
-    KoreanInKatakana("ソンベ", "선배", "先輩"),
-    KoreanInKatakana("フベ", "후배", "後輩"),
-    KoreanInKatakana("サジャン", "사장", "社長"),
-)
-
-KOREAN_FOOD_IN_KATAKANA: tuple[KoreanInKatakana, ...] = (
-    KoreanInKatakana("トッポギ", "떡볶이", "トッポギ"),
-    KoreanInKatakana("キムチ", "김치", "キムチ"),
-    KoreanInKatakana("マッコリ", "막걸리", "マッコリ"),
-    KoreanInKatakana("サムギョプサル", "삼겹살", "サムギョプサル"),
-    KoreanInKatakana("ビビンバ", "비빔밥", "ビビンバ"),
-    KoreanInKatakana("チゲ", "찌개", "チゲ"),
-    KoreanInKatakana("ソジュ", "소주", "ソジュ"),
-    KoreanInKatakana("チャプチェ", "잡채", "チャプチェ"),
-)
-
-REACTIONS: tuple[Reaction, ...] = (
-    Reaction("それな", "그거지"),
-    Reaction("わかる", "인정"),
-    Reaction("むり", "무리야"),
-    Reaction("かわいい", "귀여워"),
-    Reaction("すごい", "대단해"),
-    Reaction("おつかれ", "수고했어"),
-    Reaction("がんばれ", "힘내"),
-    Reaction("なるほど", "그렇구나"),
-    Reaction("たのしい", "재밌어"),
-    Reaction("うれしい", "기뻐"),
-    Reaction("ねむい", "졸려"),
-    Reaction("さすが", "역시"),
-    Reaction("ずるい", "치사해"),
-    Reaction("いいね", "좋네"),
-)
-
-# (Korean laughter, Japanese laughter). Korean ㅋ fuses into the preceding
-# syllable; Japanese uses ｗ or ふふ, which is a real localization difference and
-# worth teaching explicitly.
 LAUGHTER: tuple[tuple[str, str], ...] = (
     ("ㅋㅋ", "ｗｗ"),
     ("ㅋㅋㅋ", "ｗｗｗ"),
@@ -696,66 +236,7 @@ _SUBJECT = ("가", "が")
 _GENITIVE = ("노", "の")
 
 
-def _accepting_predicates(kind: str, forms: frozenset[str] | None = None) -> tuple[Predicate, ...]:
-    return tuple(
-        predicate
-        for predicate in PREDICATES
-        if kind in predicate.accepts and (forms is None or predicate.form in forms)
-    )
-
-
-def _predicate_polite(predicate: Predicate) -> tuple[str, str, str]:
-    """The polite ``~ですね`` / ``~ますね`` surfaces as (kj, ja, ko)."""
-
-    if predicate.form == "verb":
-        return f"{predicate.hangul}마스네", f"{predicate.kana}ますね", predicate.ko_polite
-    # Both な- and い-adjectives take ですね; only the stem differs.
-    return f"{predicate.hangul}데스네", f"{predicate.kana}ですね", predicate.ko_polite
-
-
-def _predicate_plain(predicate: Predicate) -> tuple[str, str, str]:
-    if predicate.form == "verb":
-        # Appending る would give 飲みる for a godan verb, so use the declared
-        # dictionary form.
-        return predicate.hangul_plain, predicate.kana_plain, predicate.ko_plain
-    if predicate.form == "na":
-        return f"{predicate.hangul}다", f"{predicate.kana}だ", predicate.ko_plain
-    return predicate.hangul, predicate.kana, predicate.ko_plain
-
-
-def _predicate_negative(predicate: Predicate) -> tuple[str, str, str]:
-    if predicate.form == "verb":
-        return f"{predicate.hangul}마센", f"{predicate.kana}ません", predicate.ko_negative
-    if predicate.form == "na":
-        return (
-            f"{predicate.hangul}자 아리마센",
-            f"{predicate.kana}じゃありません",
-            predicate.ko_negative,
-        )
-    # い-adjective: 強い -> 強くないです, 츠요이 -> 츠요쿠 나이데스
-    return (
-        f"{predicate.hangul[:-1]}쿠 나이데스",
-        f"{predicate.kana[:-1]}くないです",
-        predicate.ko_negative,
-    )
-
-
-@dataclass(frozen=True)
-class Row:
-    kj: str
-    ko: str
-    ja: str
-    frame: str
-    items: tuple[str, ...]
-    mixing: str = "script"
-
-
 def _laugh(rng: random.Random, *, fuse_into: str | None = None) -> tuple[str, str, str]:
-    """Pick a laughter pair and optionally fuse the Korean ㅋ into a word.
-
-    Returns ``(korean_laugh, japanese_laugh, fused_word)``.
-    """
-
     korean, japanese = rng.choice(LAUGHTER)
     word = fuse_into or ""
     if fuse_into is not None and korean.startswith("ㅋ"):
@@ -763,8 +244,112 @@ def _laugh(rng: random.Random, *, fuse_into: str | None = None) -> tuple[str, st
     return korean, japanese, word
 
 
+def register_of(text: str) -> str:
+    """Which register a code-mixed string belongs to, from the scripts present.
+
+    Blends are written out by hand and can land in any of the three: 체고카요 is
+    all Hangul, やばいンデ is all Japanese script, and 마지 스케줄 has both. The
+    frame cannot assume one, so it asks.
+    """
+
+    present = scripts_in(text)
+    has_hangul = "hangul" in present
+    has_japanese = bool(present & {"kana", "han"})
+    if has_hangul and has_japanese:
+        return "script"
+    if has_hangul:
+        return "hangul_only"
+    if has_japanese:
+        return "kana_only"
+    raise ValueError(f"code-mixed text has neither writing system: {text!r}")
+
+
+# ---------------------------------------------------------------------------
+# Frames: morphological blending
+# ---------------------------------------------------------------------------
+
+
+def frame_blend(rng: random.Random) -> Row:
+    """A hand-verified blend: 체고카요, 카와이하다, やばいンデ."""
+
+    blend = rng.choice(BLENDS)
+    laugh_ko, laugh_ja, fused = _laugh(rng, fuse_into=blend.kj)
+    mixed = f"{fused}{laugh_ko}"
+
+    return Row(
+        mixed=mixed,
+        first=blend.ko + laugh_ko,
+        second=blend.ja + laugh_ja,
+        frame="blend",
+        items=(blend.kj,),
+        mixing=register_of(mixed),
+    )
+
+
+def frame_blend_after_interjection(rng: random.Random) -> Row:
+    """A blend opened by an interjection, so it is not always utterance-initial."""
+
+    blend = rng.choice(BLENDS)
+    interjection = rng.choice(INTERJECTIONS)
+    laugh_ko, laugh_ja, fused_lead = _laugh(rng, fuse_into=interjection.hangul)
+    mixed = f"{fused_lead}{laugh_ko} {blend.kj}"
+
+    return Row(
+        mixed=mixed,
+        first=f"{interjection.ko}{laugh_ko} {blend.ko}",
+        second=f"{interjection.kana}{laugh_ja} {blend.ja}",
+        frame="blend_after_interjection",
+        items=(blend.kj, interjection.kana),
+        mixing=register_of(mixed),
+    )
+
+
+def frame_japanese_stem_korean_ending(rng: random.Random) -> Row:
+    """``카와이하다``: a Japanese predicate stem taking a Korean ending."""
+
+    ending = rng.choice(KOREAN_ENDINGS)
+    predicates = [item for item in PREDICATES if item.form in ending.accepts]
+    predicate = rng.choice(predicates)
+    laugh_ko, laugh_ja, fused = _laugh(rng, fuse_into=predicate.hangul + ending.hangul)
+    korean = ending.ko_template.format(
+        ko=predicate.ko_plain, ko_plain=predicate.ko_plain, ko_polite=predicate.ko_polite
+    )
+
+    return Row(
+        mixed=f"{fused}{laugh_ko}",
+        first=korean + laugh_ko,
+        second=ending.ja_template.format(ja=predicate.kana) + laugh_ja,
+        frame="japanese_stem_korean_ending",
+        items=(predicate.kana, ending.katakana),
+        mixing="hangul_only",
+    )
+
+
+def frame_blend_in_a_sentence(rng: random.Random) -> Row:
+    """A blend used inside a carrier sentence, so it is not always utterance-final."""
+
+    blend = rng.choice(BLENDS)
+    noun = rng.choice(KOREAN_NOUNS_IN_KATAKANA)
+    laugh_ko, laugh_ja, _ = _laugh(rng)
+    mixed = f"{noun.katakana} 그거 {blend.kj}{laugh_ko}"
+
+    return Row(
+        mixed=mixed,
+        first=f"{noun.ko} 그거 {blend.ko}{laugh_ko}",
+        second=f"{noun.ja}それ{blend.ja}{laugh_ja}",
+        frame="blend_in_a_sentence",
+        items=(blend.kj, noun.katakana),
+        mixing=register_of(mixed),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Frames: transliterated Japanese clauses
+# ---------------------------------------------------------------------------
+
+
 def frame_transliterated_clause(rng: random.Random) -> Row:
-    """Register 2 with a genitive subject: ``닝겐노 유리와 튼튼데스네``."""
+    """``닝겐노 유리와 튼튼데스네``, with a genitive subject."""
 
     modifier = rng.choice([noun for noun in NOUNS if noun.kind in GENITIVE_HEADS])
     allowed = GENITIVE_HEADS[modifier.kind]
@@ -773,28 +358,28 @@ def frame_transliterated_clause(rng: random.Random) -> Row:
         for noun in NOUNS
         if noun.kind in allowed
         and noun is not modifier
-        and _accepting_predicates(noun.kind, frozenset({"na", "i"}))
+        and _accepting(noun.kind, frozenset({"na", "i"}))
     ]
     if not heads:
         raise LookupError(modifier.kind)
     head = rng.choice(heads)
-    predicate = rng.choice(_accepting_predicates(head.kind, frozenset({"na", "i"})))
+    predicate = rng.choice(_accepting(head.kind, frozenset({"na", "i"})))
     interjection = rng.choice(INTERJECTIONS)
     lead_ko, lead_ja, fused_lead = _laugh(rng, fuse_into=interjection.hangul)
-    tail_ko, tail_ja, fused_tail = _laugh(rng, fuse_into=_predicate_polite(predicate)[0])
-    predicate_kj, predicate_ja, predicate_ko = _predicate_polite(predicate)
+    predicate_kj, predicate_ja, predicate_ko = _polite(predicate)
+    tail_ko, tail_ja, fused_tail = _laugh(rng, fuse_into=predicate_kj)
     subject_ko = f"{modifier.ko}의 {head.ko}"
 
     return Row(
-        kj=(
+        mixed=(
             f"{fused_lead}{lead_ko} {modifier.hangul}{_GENITIVE[0]} "
             f"{head.hangul}{_TOPIC[0]} {fused_tail}{tail_ko}"
         ),
-        ko=(
-            f"{interjection.ko}{lead_ko} {subject_ko}{topic_particle(subject_ko)} "
+        first=(
+            f"{interjection.ko}{lead_ko} {attach_particle(subject_ko, '은/는')} "
             f"{predicate_ko}{tail_ko}"
         ),
-        ja=(
+        second=(
             f"{interjection.kana}{lead_ja} {modifier.kana}{_GENITIVE[1]}"
             f"{head.kana}{_TOPIC[1]}{predicate_ja}{tail_ja}"
         ),
@@ -805,20 +390,18 @@ def frame_transliterated_clause(rng: random.Random) -> Row:
 
 
 def frame_transliterated_plain(rng: random.Random) -> Row:
-    """Register 2 in the plain register with a subject particle."""
-
     noun = rng.choice(NOUNS)
-    candidates = _accepting_predicates(noun.kind)
+    candidates = _accepting(noun.kind)
     if not candidates:
         raise LookupError(noun.kind)
     predicate = rng.choice(candidates)
-    predicate_kj, predicate_ja, predicate_ko = _predicate_plain(predicate)
+    predicate_kj, predicate_ja, predicate_ko = _plain(predicate)
     laugh_ko, laugh_ja, _ = _laugh(rng)
 
     return Row(
-        kj=f"{noun.hangul}{_SUBJECT[0]} {predicate_kj}{laugh_ko}",
-        ko=f"{noun.ko}{subject_particle(noun.ko)} {predicate_ko}{laugh_ko}",
-        ja=f"{noun.kana}{_SUBJECT[1]}{predicate_ja}{laugh_ja}",
+        mixed=f"{noun.hangul}{_SUBJECT[0]} {predicate_kj}{laugh_ko}",
+        first=f"{attach_particle(noun.ko, '이/가')} {predicate_ko}{laugh_ko}",
+        second=f"{noun.kana}{_SUBJECT[1]}{predicate_ja}{laugh_ja}",
         frame="transliterated_plain",
         items=(noun.kana, predicate.kana),
         mixing="hangul_only",
@@ -826,66 +409,100 @@ def frame_transliterated_plain(rng: random.Random) -> Row:
 
 
 def frame_negative_clause(rng: random.Random) -> Row:
-    """Register 2, negated, so the corpus is not uniformly affirmative."""
-
     noun = rng.choice(NOUNS)
-    candidates = _accepting_predicates(noun.kind)
+    candidates = _accepting(noun.kind)
     if not candidates:
         raise LookupError(noun.kind)
     predicate = rng.choice(candidates)
-    tail_kj, tail_ja, tail_ko = _predicate_negative(predicate)
+    tail_kj, tail_ja, tail_ko = _negative(predicate)
 
     return Row(
-        kj=f"{noun.hangul}{_TOPIC[0]} {tail_kj}",
-        ko=f"{noun.ko}{topic_particle(noun.ko)} {tail_ko}",
-        ja=f"{noun.kana}{_TOPIC[1]}{tail_ja}",
+        mixed=f"{noun.hangul}{_TOPIC[0]} {tail_kj}",
+        first=f"{attach_particle(noun.ko, '은/는')} {tail_ko}",
+        second=f"{noun.kana}{_TOPIC[1]}{tail_ja}",
         frame="negative_clause",
         items=(noun.kana, predicate.kana),
         mixing="hangul_only",
     )
 
 
-def frame_kana_loanword(rng: random.Random) -> Row:
-    """Register 1: a Japanese noun left in kana inside a Korean sentence."""
+def frame_particle_carried_clause(rng: random.Random) -> Row:
+    """Japanese grammar in Hangul carrying Korean content words.
 
+    ``친구노 마음와 타이헨데스네``: the nouns stay Korean while the particles and
+    the copula are transliterated Japanese. This is the register the longest
+    examples in the brief use, and it is composed rather than listed because
+    both sides are regular here - the Korean nouns are uninflected and the
+    predicate paradigm is already in the lexicon.
+    """
+
+    modifier = rng.choice([noun for noun in KOREAN_CONTENT_NOUNS if noun.kind in GENITIVE_HEADS])
+    allowed = GENITIVE_HEADS[modifier.kind]
+    heads = [
+        noun
+        for noun in KOREAN_CONTENT_NOUNS
+        if noun.kind in allowed
+        and noun is not modifier
+        and _accepting(noun.kind, frozenset({"na", "i"}))
+    ]
+    if not heads:
+        raise LookupError(modifier.kind)
+    head = rng.choice(heads)
+    predicate = rng.choice(_accepting(head.kind, frozenset({"na", "i"})))
+    predicate_kj, predicate_ja, predicate_ko = _polite(predicate)
+    laugh_ko, laugh_ja, fused_tail = _laugh(rng, fuse_into=predicate_kj)
+    subject_ko = f"{modifier.ko}의 {head.ko}"
+
+    return Row(
+        mixed=(f"{modifier.ko}{_GENITIVE[0]} {head.ko}{_TOPIC[0]} {fused_tail}{laugh_ko}"),
+        first=f"{attach_particle(subject_ko, '은/는')} {predicate_ko}{laugh_ko}",
+        second=(f"{modifier.ja}{_GENITIVE[1]}{head.ja}{_TOPIC[1]}{predicate_ja}{laugh_ja}"),
+        frame="particle_carried_clause",
+        items=(modifier.ko, head.ko, predicate.kana),
+        mixing="hangul_only",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Frames: script mixtures and katakana Korean
+# ---------------------------------------------------------------------------
+
+
+def frame_kana_loanword(rng: random.Random) -> Row:
     loan = rng.choice([word for word in LOANWORDS if word.pos == "noun"])
     laugh_ko, laugh_ja, _ = _laugh(rng)
 
     return Row(
-        kj=f"오늘 {loan.kana} 얘기 좀 하자{laugh_ko}",
-        ko=f"오늘 {loan.ko} 얘기 좀 하자{laugh_ko}",
-        ja=f"今日は{loan.kana}の話を少ししよう{laugh_ja}",
+        mixed=f"오늘 {loan.kana} 얘기 좀 하자{laugh_ko}",
+        first=f"오늘 {loan.ko} 얘기 좀 하자{laugh_ko}",
+        second=f"今日は{loan.kana}の話を少ししよう{laugh_ja}",
         frame="kana_loanword",
         items=(loan.kana,),
     )
 
 
 def frame_kana_loanword_question(rng: random.Random) -> Row:
-    """Register 1 as a question, which is where the mixture actually shows up."""
-
     loan = rng.choice([word for word in LOANWORDS if word.pos == "noun"])
     laugh_ko, laugh_ja, _ = _laugh(rng)
 
     return Row(
-        kj=f"그 {loan.kana} 어떻게 됐어{laugh_ko}",
-        ko=f"그 {loan.ko} 어떻게 됐어{laugh_ko}",
-        ja=f"あの{loan.kana}はどうなった{laugh_ja}",
+        mixed=f"그 {loan.kana} 어떻게 됐어{laugh_ko}",
+        first=f"그 {loan.ko} 어떻게 됐어{laugh_ko}",
+        second=f"あの{loan.kana}はどうなった{laugh_ja}",
         frame="kana_loanword_question",
         items=(loan.kana,),
     )
 
 
 def frame_hangul_loanword(rng: random.Random) -> Row:
-    """Register 2: a Japanese word transliterated into Hangul inside Korean."""
-
     loan = rng.choice([word for word in LOANWORDS if word.pos in {"noun", "adjective"}])
     interjection = rng.choice(INTERJECTIONS)
     laugh_ko, laugh_ja, fused = _laugh(rng, fuse_into=interjection.hangul)
 
     return Row(
-        kj=f"{fused}{laugh_ko} 이거 {loan.hangul} 아니냐",
-        ko=f"{interjection.ko}{laugh_ko} 이거 {loan.ko} 아니냐",
-        ja=f"{interjection.kana}{laugh_ja} これ{loan.kana}じゃないか",
+        mixed=f"{fused}{laugh_ko} 이거 {loan.hangul} 아니냐",
+        first=f"{interjection.ko}{laugh_ko} 이거 {loan.ko} 아니냐",
+        second=f"{interjection.kana}{laugh_ja} これ{loan.kana}じゃないか",
         frame="hangul_loanword",
         items=(loan.kana, interjection.kana),
         mixing="hangul_only",
@@ -893,15 +510,13 @@ def frame_hangul_loanword(rng: random.Random) -> Row:
 
 
 def frame_hangul_phrase(rng: random.Random) -> Row:
-    """Register 2 with a set phrase, e.g. ``오츠카레``."""
-
     loan = rng.choice([word for word in LOANWORDS if word.pos == "phrase"])
     laugh_ko, laugh_ja, fused = _laugh(rng, fuse_into=loan.hangul)
 
     return Row(
-        kj=f"{fused}{laugh_ko}",
-        ko=f"{loan.ko}{laugh_ko}",
-        ja=f"{loan.kana}{laugh_ja}",
+        mixed=f"{fused}{laugh_ko}",
+        first=f"{loan.ko}{laugh_ko}",
+        second=f"{loan.kana}{laugh_ja}",
         frame="hangul_phrase",
         items=(loan.kana,),
         mixing="hangul_only",
@@ -909,17 +524,17 @@ def frame_hangul_phrase(rng: random.Random) -> Row:
 
 
 def frame_katakana_reaction(rng: random.Random) -> Row:
-    """Register 3: ``チンチャそれな``, a Korean intensifier plus a Japanese reaction."""
+    """``チンチャそれな``: a Korean intensifier in katakana plus a Japanese reaction."""
 
     intensifier = rng.choice(KOREAN_INTENSIFIERS_IN_KATAKANA)
-    # Avoid pairs whose Korean glosses collide, which would read as 대박 대박이야.
+    # Skip pairs whose Korean glosses collide, which would read as 대박 대박이야.
     reaction = rng.choice([item for item in REACTIONS if intensifier.ko not in item.ko])
     laugh_ko, laugh_ja, _ = _laugh(rng)
 
     return Row(
-        kj=f"{intensifier.katakana}{reaction.kana}{laugh_ja}",
-        ko=f"{intensifier.ko} {reaction.ko}{laugh_ko}",
-        ja=f"{intensifier.ja}{reaction.kana}{laugh_ja}",
+        mixed=f"{intensifier.katakana}{reaction.kana}{laugh_ja}",
+        first=f"{intensifier.ko} {reaction.ko}{laugh_ko}",
+        second=f"{intensifier.ja}{reaction.kana}{laugh_ja}",
         frame="katakana_reaction",
         items=(intensifier.katakana, reaction.kana),
         mixing="kana_only",
@@ -927,17 +542,15 @@ def frame_katakana_reaction(rng: random.Random) -> Row:
 
 
 def frame_korean_person_in_japanese(rng: random.Random) -> Row:
-    """Register 3: a borrowed Korean kinship term inside a Japanese sentence."""
-
     word = rng.choice(KOREAN_NOUNS_IN_KATAKANA)
-    predicate = rng.choice(_accepting_predicates(PERSON))
-    _, predicate_ja, predicate_ko = _predicate_polite(predicate)
+    predicate = rng.choice(_accepting(PERSON))
+    _, predicate_ja, predicate_ko = _polite(predicate)
     laugh_ko, laugh_ja, _ = _laugh(rng)
 
     return Row(
-        kj=f"{word.katakana}{_TOPIC[1]}{predicate_ja}{laugh_ja}",
-        ko=f"{word.ko}{topic_particle(word.ko)} {predicate_ko}{laugh_ko}",
-        ja=f"{word.ja}{_TOPIC[1]}{predicate_ja}{laugh_ja}",
+        mixed=f"{word.katakana}{_TOPIC[1]}{predicate_ja}{laugh_ja}",
+        first=f"{attach_particle(word.ko, '은/는')} {predicate_ko}{laugh_ko}",
+        second=f"{word.ja}{_TOPIC[1]}{predicate_ja}{laugh_ja}",
         frame="korean_person_in_japanese",
         items=(word.katakana, predicate.kana),
         mixing="kana_only",
@@ -945,17 +558,15 @@ def frame_korean_person_in_japanese(rng: random.Random) -> Row:
 
 
 def frame_korean_food_in_japanese(rng: random.Random) -> Row:
-    """Register 3: a Korean dish name, which keeps its katakana form in Japanese."""
-
     food = rng.choice(KOREAN_FOOD_IN_KATAKANA)
-    predicate = rng.choice(_accepting_predicates(FOOD, frozenset({"na", "i"})))
-    _, predicate_ja, predicate_ko = _predicate_polite(predicate)
+    predicate = rng.choice(_accepting(FOOD, frozenset({"na", "i"})))
+    _, predicate_ja, predicate_ko = _polite(predicate)
     laugh_ko, laugh_ja, _ = _laugh(rng)
 
     return Row(
-        kj=f"{food.katakana}{_TOPIC[1]}{predicate_ja}{laugh_ja}",
-        ko=f"{food.ko}{topic_particle(food.ko)} {predicate_ko}{laugh_ko}",
-        ja=f"{food.ja}{_TOPIC[1]}{predicate_ja}{laugh_ja}",
+        mixed=f"{food.katakana}{_TOPIC[1]}{predicate_ja}{laugh_ja}",
+        first=f"{attach_particle(food.ko, '은/는')} {predicate_ko}{laugh_ko}",
+        second=f"{food.ja}{_TOPIC[1]}{predicate_ja}{laugh_ja}",
         frame="korean_food_in_japanese",
         items=(food.katakana, predicate.kana),
         mixing="kana_only",
@@ -963,23 +574,26 @@ def frame_korean_food_in_japanese(rng: random.Random) -> Row:
 
 
 def frame_mixed_reply(rng: random.Random) -> Row:
-    """Register 1: a katakana Korean term plus a Hangul-transliterated predicate."""
-
     word = rng.choice(KOREAN_NOUNS_IN_KATAKANA)
-    predicate = rng.choice(_accepting_predicates(PERSON))
-    predicate_kj, predicate_ja, predicate_ko = _predicate_polite(predicate)
+    predicate = rng.choice(_accepting(PERSON))
+    predicate_kj, predicate_ja, predicate_ko = _polite(predicate)
     laugh_ko, laugh_ja, fused = _laugh(rng, fuse_into=predicate_kj)
 
     return Row(
-        kj=f"{word.katakana} 그거 {fused}{laugh_ko}",
-        ko=f"{word.ko} 그거 {predicate_ko}{laugh_ko}",
-        ja=f"{word.ja}それ{predicate_ja}{laugh_ja}",
+        mixed=f"{word.katakana} 그거 {fused}{laugh_ko}",
+        first=f"{word.ko} 그거 {predicate_ko}{laugh_ko}",
+        second=f"{word.ja}それ{predicate_ja}{laugh_ja}",
         frame="mixed_reply",
         items=(word.katakana, predicate.kana),
     )
 
 
 FRAMES = (
+    frame_blend,
+    frame_blend_after_interjection,
+    frame_blend_in_a_sentence,
+    frame_japanese_stem_korean_ending,
+    frame_particle_carried_clause,
     frame_transliterated_clause,
     frame_transliterated_plain,
     frame_negative_clause,
@@ -993,53 +607,54 @@ FRAMES = (
     frame_mixed_reply,
 )
 
-
-def _has_hangul(text: str) -> bool:
-    return any("가" <= char <= "힣" or "ㄱ" <= char <= "ㅣ" for char in text)
-
-
-def _has_kana(text: str) -> bool:
-    return any("぀" <= char <= "ヿ" or "ｦ" <= char <= "ﾟ" for char in text)
-
-
-def _has_han(text: str) -> bool:
-    return any("一" <= char <= "鿿" for char in text)
+FIRST_SCRIPTS = frozenset({"hangul"})
+SECOND_SCRIPTS = frozenset({"kana", "han", "latin"})
+MIXED_REGISTERS = frozenset({"blend", "hangul_only", "script", "kana_only"})
 
 
 def validate_row(row: Row) -> None:
-    """Reject a row whose sides break the invariant the corpus exists to teach.
+    """Reject a row that breaks the invariant the corpus exists to teach.
 
-    A generator bug has to fail the build rather than reach the training set,
-    because a code-mixed target is exactly the failure mode kj was introduced
-    to prevent.
+    A code-mixed target is exactly the failure mode a source-only language was
+    introduced to prevent, so a generator bug must fail the build rather than
+    reach the training set.
     """
 
-    if _has_kana(row.ko) or _has_han(row.ko):
-        raise ValueError(f"Korean side is not monolingual: {row.ko!r} (frame {row.frame})")
-    if _has_hangul(row.ja):
-        raise ValueError(f"Japanese side is not monolingual: {row.ja!r} (frame {row.frame})")
+    first_scripts = scripts_in(row.first)
+    if not first_scripts <= FIRST_SCRIPTS:
+        raise ValueError(
+            f"Korean side is not monolingual: {row.first!r} "
+            f"({sorted(first_scripts - FIRST_SCRIPTS)}, frame {row.frame})"
+        )
+    second_scripts = scripts_in(row.second)
+    if not second_scripts <= SECOND_SCRIPTS:
+        raise ValueError(
+            f"Japanese side is not monolingual: {row.second!r} "
+            f"({sorted(second_scripts - SECOND_SCRIPTS)}, frame {row.frame})"
+        )
 
-    has_hangul = _has_hangul(row.kj)
-    has_japanese = _has_kana(row.kj) or _has_han(row.kj)
+    mixed_scripts = scripts_in(row.mixed)
+    has_hangul = "hangul" in mixed_scripts
+    has_japanese = bool(mixed_scripts & {"kana", "han"})
     if row.mixing == "script":
         if not (has_hangul and has_japanese):
             raise ValueError(
-                f"script mixture needs Hangul and Japanese: {row.kj!r} (frame {row.frame})"
+                f"script mixture needs Hangul and Japanese: {row.mixed!r} (frame {row.frame})"
             )
     elif row.mixing == "hangul_only":
         if not has_hangul or has_japanese:
             raise ValueError(
-                f"transliterated mixture must be all Hangul: {row.kj!r} (frame {row.frame})"
+                f"transliterated mixture must be all Hangul: {row.mixed!r} (frame {row.frame})"
             )
     elif row.mixing == "kana_only":
         if has_hangul or not has_japanese:
             raise ValueError(
-                f"katakana mixture must be all Japanese script: {row.kj!r} (frame {row.frame})"
+                f"katakana mixture must be all Japanese script: {row.mixed!r} (frame {row.frame})"
             )
     else:
         raise ValueError(f"unknown mixing mode {row.mixing!r} (frame {row.frame})")
 
-    for name, value in (("kj", row.kj), ("ko", row.ko), ("ja", row.ja)):
+    for name, value in (("mixed", row.mixed), ("first", row.first), ("second", row.second)):
         if not value.strip():
             raise ValueError(f"empty {name} field in frame {row.frame}")
         if any(unicodedata.category(char) == "Cc" for char in value):
@@ -1054,12 +669,7 @@ def build(
     max_per_frame: int,
     attempts_per_row: int = 200,
 ) -> tuple[list[Row], dict[str, object]]:
-    """Generate rows under per-item and per-frame caps.
-
-    The caps are what keep this from becoming template restatement, and they
-    also bound the corpus: the lexicon, not ``max_rows``, decides how many
-    distinct rows exist.
-    """
+    """Generate rows under per-item and per-frame caps."""
 
     if max_rows < 1:
         raise ValueError("max_rows must be positive")
@@ -1084,13 +694,13 @@ def build(
                 continue
             row = frame(rng)
             validate_row(row)
-            if row.kj in seen:
+            if row.mixed in seen:
                 duplicates += 1
                 continue
             if any(item_counts[item] >= max_per_item for item in row.items):
                 capped += 1
                 continue
-            seen.add(row.kj)
+            seen.add(row.mixed)
             rows.append(row)
             frame_counts[frame.__name__] += 1
             for item in row.items:
@@ -1106,6 +716,7 @@ def build(
         "seed": seed,
         "max_per_item": max_per_item,
         "max_per_frame": max_per_frame,
+        "hangulpy": HANGULPY_AVAILABLE,
         "rejected_duplicates": duplicates,
         "rejected_by_caps": capped,
         "frames": dict(sorted(frame_counts.items())),
@@ -1117,6 +728,9 @@ def build(
             "predicates": len(PREDICATES),
             "interjections": len(INTERJECTIONS),
             "loanwords": len(LOANWORDS),
+            "korean_content_nouns": len(KOREAN_CONTENT_NOUNS),
+            "korean_endings": len(KOREAN_ENDINGS),
+            "blends": len(BLENDS),
             "korean_intensifiers": len(KOREAN_INTENSIFIERS_IN_KATAKANA),
             "korean_nouns": len(KOREAN_NOUNS_IN_KATAKANA),
             "korean_food": len(KOREAN_FOOD_IN_KATAKANA),
@@ -1126,16 +740,30 @@ def build(
     return rows, report
 
 
-def write_rows(rows: list[Row], output: Path) -> None:
+def write_rows(
+    rows: list[Row],
+    output: Path,
+    *,
+    mixed_key: str,
+    first_key: str,
+    second_key: str,
+) -> None:
     """Write atomically so an interrupted build never leaves a partial shard."""
 
+    if len({mixed_key, first_key, second_key}) != 3:
+        raise ValueError("mixed, first and second keys must be distinct")
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_suffix(output.suffix + ".part")
     with temporary.open("w", encoding="utf-8", newline="\n") as handle:
         for row in rows:
             handle.write(
                 json.dumps(
-                    {"kj": row.kj, "ko": row.ko, "ja": row.ja, "synthetic": True},
+                    {
+                        mixed_key: row.mixed,
+                        first_key: row.first,
+                        second_key: row.second,
+                        "synthetic": True,
+                    },
                     ensure_ascii=False,
                 )
                 + "\n"
@@ -1147,20 +775,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Build a deterministic 한본어 parallel corpus.")
     parser.add_argument("--output", required=True, help="destination JSONL path")
     parser.add_argument("--report", help="write the build report JSON here")
-    parser.add_argument("--max-rows", type=int, default=20_000, help="upper bound on rows")
+    parser.add_argument("--max-rows", type=int, default=40_000, help="upper bound on rows")
     parser.add_argument("--seed", type=int, default=20260730)
     parser.add_argument(
         "--max-per-item",
         type=int,
-        default=120,
+        default=200,
         help="cap on how often one lexical entry may appear",
     )
     parser.add_argument(
         "--max-per-frame",
         type=int,
-        default=2_000,
+        default=6_000,
         help="cap on how many rows one sentence frame may produce",
     )
+    parser.add_argument(
+        "--mixed-key", default="kj", help="JSON key for the code-mixed side (default kj)"
+    )
+    parser.add_argument("--first-key", default="ko", help="JSON key for the Korean rendering")
+    parser.add_argument("--second-key", default="ja", help="JSON key for the Japanese rendering")
     return parser
 
 
@@ -1181,17 +814,28 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     output = Path(args.output)
-    write_rows(rows, output)
+    try:
+        write_rows(
+            rows,
+            output,
+            mixed_key=args.mixed_key,
+            first_key=args.first_key,
+            second_key=args.second_key,
+        )
+    except (OSError, ValueError) as error:
+        print(f"write failed: {error}", file=sys.stderr)
+        return 2
     report["output"] = str(output)
+    report["keys"] = [args.mixed_key, args.first_key, args.second_key]
     if args.report:
         Path(args.report).write_text(
             json.dumps(report, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
     print(
-        f"{output}: {report['rows']:,} rows "
-        f"(requested {report['requested_rows']:,}), "
+        f"{output}: {report['rows']:,} rows (requested {report['requested_rows']:,}), "
         f"{report['distinct_lexical_items_used']} lexical entries, "
+        f"hangulpy={'yes' if HANGULPY_AVAILABLE else 'no'}, "
         f"registers={report['registers']}"
     )
     return 0
