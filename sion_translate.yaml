@@ -56,17 +56,29 @@ data:
 #     - [ko, ja]
 #     - [en, ru]
 #
-# 한본어(kj) 지원. kj 는 한국어와 일본어가 섞인 입력이고, 번역 결과물은 항상
-# 한국어 또는 일본어 단일어여야 합니다. source_only_languages 에 등재하면
-# kj->ko 와 kj->ja 만 학습되고 ko->kj / ja->kj 는 만들어지지 않습니다.
-# 등재하지 않으면 bidirectional 이 혼용문을 target 으로도 학습해서
-# 한국어 출력에 가나를 주입하는 모델이 됩니다.
-# 코퍼스는 scripts/data/build_hanboneo.py 로 만듭니다.
+# 한본어(kj)와 지역 방언(kd, jd) 지원.
+#
+# kj 는 한국어와 일본어가 섞인 입력이고, 번역 결과물은 항상 한국어 또는 일본어
+# 단일어여야 합니다. kd 는 한국어 지역 방언, jd 는 일본어 지역 방언 입력입니다.
+# 세 태그 모두 source_only_languages 에 등재해야 합니다. 등재하면 kj->ko,
+# kd->ja 처럼 "이해" 방향만 학습되고 ko->kj / ko->kd 는 만들어지지 않습니다.
+# 등재하지 않으면 bidirectional 이 혼용문과 방언을 target 으로도 학습해서
+# 표준 한국어를 요청했는데 가나가 섞이거나 사투리가 나오는 모델이 됩니다.
+#
+# 방언은 지역이 태그가 아니라 행 메타데이터(dialect_region)입니다. 표준 입력에
+# 특정 지역 방언으로 답하게 하려면 별도 태그 스킴이 필요하고, 그건 아직 없습니다.
+#
+# 코퍼스는 scripts/data/build_hanboneo.py 와
+# scripts/data/build_dialect_corpus.py 로 만듭니다.
 #   language_pairs:
 #     - [kj, ko]
 #     - [kj, ja]
+#     - [kd, ko]
+#     - [kd, ja]
+#     - [jd, ko]
+#     - [jd, ja]
 #     - [ko, ja]
-#   source_only_languages: [kj]
+#   source_only_languages: [kj, kd, jd]
 #   source_token_dropout: 0.05  # 온라인 증강(원문 토큰 탈락) 확률. 0 이면 끔
 #   synthetic_prefix: bt_    # 역번역 합성 파일 접두사 (train 전용 + 자동 다운웨이트)
 #   glossary: glossary.json  # 용어집 JSON. 지정 시 번역/평가에서 용어 강제
