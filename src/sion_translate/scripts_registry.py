@@ -69,6 +69,12 @@ LANGUAGE_SCRIPTS: dict[str, tuple[str, ...]] = {
     "he": ("hebrew",),
     # 한본어: a code-mixed variety, so both writing systems are expected.
     "kj": ("hangul", "kana", "han"),
+    # Regional varieties. Same writing system as the standard language, so the
+    # script checks are identical; they exist as separate tags only so that
+    # ``data.source_only_languages`` can stop the model learning to *produce*
+    # dialect from a standard prompt. The region is row metadata, not a tag.
+    "kd": ("hangul",),
+    "jd": ("kana", "han"),
 }
 
 # Writing systems that do not separate words with spaces. A space between two
