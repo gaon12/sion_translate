@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -33,6 +34,151 @@ from typing import Sequence
 # 단어 경계가 없는(띄어쓰기로 단어를 나누지 않는) 언어.
 # 이 언어들은 부분 문자열 매칭을, 그 외(라틴 문자 등)는 단어 경계 매칭을 씁니다.
 NON_WORD_BOUNDARY_LANGUAGES = {"ko", "ja", "zh"}
+
+# ---------------------------------------------------------------------------
+# Soft hint format
+# ---------------------------------------------------------------------------
+#
+# The slot mechanism above is a hard constraint applied at inference time: the
+# term is cut out of the source and pasted back afterwards. That guarantees the
+# surface but the model never sees the term, so it cannot inflect around it —
+# ``<slot_0>를`` may need 을 rather than 를 once the surface is restored.
+#
+# A soft hint instead shows the model both sides and lets it produce agreeing
+# morphology. It has to be trained for, which is why it only becomes available
+# with a from-scratch run.
+#
+# The prefix uses control tokens the tokenizer already reserves, so no
+# vocabulary change is needed:
+#
+#     <glossary> 사과 <protect> Apple <glossary> 배 <protect> Pear <seg> 원문
+#
+# Both the training-data builder and the serving path must produce byte-identical
+# prefixes, so the format is defined once here. A mismatch between the two is the
+# quiet failure mode that makes a hint feature look trained when it is not.
+GLOSSARY_TOKEN = "<glossary>"
+PROTECT_TOKEN = "<protect>"
+SEGMENT_TOKEN = "<seg>"
+
+_HINT_PREFIX = re.compile(
+    rf"^\s*(?:{re.escape(GLOSSARY_TOKEN)}\s*(?P<body>.*?))?\s*{re.escape(SEGMENT_TOKEN)}\s*",
+    re.DOTALL,
+)
+
+
+def format_hint_prefix(pairs: Sequence[tuple[str, str]]) -> str:
+    """Render glossary hints as an encoder-input prefix.
+
+    ``pairs`` is ``[(source_term, target_term), ...]``. Returns the empty string
+    for no pairs, so callers can prepend unconditionally.
+    """
+
+    if not pairs:
+        return ""
+    parts: list[str] = []
+    for source_term, target_term in pairs:
+        source_term, target_term = source_term.strip(), target_term.strip()
+        if not source_term or not target_term:
+            raise ValueError(f"hint terms must be non-empty; got {(source_term, target_term)!r}")
+        for term in (source_term, target_term):
+            if any(token in term for token in (GLOSSARY_TOKEN, PROTECT_TOKEN, SEGMENT_TOKEN)):
+                raise ValueError(f"hint term must not contain a control token: {term!r}")
+        parts.append(f"{GLOSSARY_TOKEN} {source_term} {PROTECT_TOKEN} {target_term}")
+    return " ".join(parts) + f" {SEGMENT_TOKEN} "
+
+
+def build_hinted_source(text: str, pairs: Sequence[tuple[str, str]]) -> str:
+    """``text`` with a hint prefix, or unchanged when there are no pairs."""
+
+    prefix = format_hint_prefix(pairs)
+    return f"{prefix}{text}" if prefix else text
+
+
+def parse_hinted_source(text: str) -> tuple[list[tuple[str, str]], str]:
+    """Inverse of :func:`build_hinted_source`.
+
+    Returns ``(pairs, source_text)``. Text without a ``<seg>`` marker is returned
+    unchanged with no pairs, so this is safe to call on ordinary input.
+    """
+
+    match = _HINT_PREFIX.match(text)
+    if match is None:
+        return [], text
+    body = match.group("body") or ""
+    remainder = text[match.end() :]
+    pairs: list[tuple[str, str]] = []
+    for chunk in body.split(GLOSSARY_TOKEN):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if PROTECT_TOKEN not in chunk:
+            raise ValueError(f"hint entry is missing {PROTECT_TOKEN}: {chunk!r}")
+        source_term, target_term = chunk.split(PROTECT_TOKEN, 1)
+        pairs.append((source_term.strip(), target_term.strip()))
+    return pairs, remainder
+
+
+def adherence(
+    hypotheses: Sequence[str],
+    required: Sequence[Sequence[str]],
+    *,
+    case_insensitive: bool = False,
+) -> dict[str, float | int]:
+    """How often required target terms actually appear in the output.
+
+    ``required[i]`` lists the target surfaces sentence ``i`` was hinted with.
+    A soft hint is not a guarantee, so this has to be measured rather than
+    assumed; sentences with no requirement count as satisfied because there was
+    nothing to violate.
+    """
+
+    if len(hypotheses) != len(required):
+        raise ValueError(f"{len(hypotheses)} hypotheses against {len(required)} requirement lists")
+    term_total = 0
+    term_hits = 0
+    sentence_total = 0
+    sentence_hits = 0
+    for hypothesis, terms in zip(hypotheses, required, strict=True):
+        haystack = hypothesis.casefold() if case_insensitive else hypothesis
+        present = 0
+        for term in terms:
+            needle = term.casefold() if case_insensitive else term
+            term_total += 1
+            if needle and needle in haystack:
+                term_hits += 1
+                present += 1
+        sentence_total += 1
+        if present == len(terms):
+            sentence_hits += 1
+    return {
+        "terms": term_total,
+        "term_hits": term_hits,
+        "term_rate": term_hits / term_total if term_total else 1.0,
+        "sentences": sentence_total,
+        "sentence_hits": sentence_hits,
+        "sentence_rate": sentence_hits / sentence_total if sentence_total else 1.0,
+    }
+
+
+def rank_terms_for_hinting(
+    pairs: Sequence[tuple[str, str]],
+    corpus_counts: Counter[str] | None = None,
+) -> list[tuple[str, str]]:
+    """Order term pairs by how much a hint is likely to help.
+
+    Rarer source terms and longer target surfaces come first: a common word the
+    model already translates correctly gains nothing from a hint, while a rare
+    proper noun or a multi-word target is exactly where it fails. Ties fall back
+    to the source surface so the order is deterministic.
+    """
+
+    counts = corpus_counts or Counter()
+
+    def key(pair: tuple[str, str]) -> tuple[int, int, str]:
+        source_term, target_term = pair
+        return (counts.get(source_term, 0), -len(target_term), source_term)
+
+    return sorted(pairs, key=key)
 
 
 @dataclass(frozen=True)
