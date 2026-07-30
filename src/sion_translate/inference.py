@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import math
 import warnings
 from collections.abc import Mapping
@@ -27,7 +26,7 @@ from sion_translate.tokenizer import (
     load_tokenizer_metadata,
     tokenizer_split_digits_policy,
 )
-from sion_translate.training.export import load_exported_model
+from sion_translate.training.export import load_exported_model, resolve_manifest_artifact
 
 
 def _language_pairs_from_metadata(
@@ -95,28 +94,8 @@ def _translation_directions_from_metadata(
 
 
 def _manifest_artifact(directory: Path, *, int8: bool) -> Path | None:
-    manifest_path = directory / "export_manifest.json"
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(manifest, Mapping):
-        return None
-    formats = manifest.get("formats")
-    if not isinstance(formats, Mapping):
-        return None
     format_names = ("int8",) if int8 else ("fp32", "bf16", "fp16")
-    for format_name in format_names:
-        entry = formats.get(format_name)
-        if not isinstance(entry, Mapping) or entry.get("status") != "ok":
-            continue
-        filename = entry.get("file")
-        if not isinstance(filename, str):
-            continue
-        artifact = directory / filename
-        if artifact.is_file():
-            return artifact
-    return None
+    return resolve_manifest_artifact(directory, format_names)
 
 
 def find_exported_model(
@@ -142,6 +121,10 @@ def find_exported_model(
             manifested = _manifest_artifact(directory, int8=int8)
             if manifested is not None:
                 return manifested
+            # A v2 manifest is authoritative. If it has no successful requested
+            # format, do not silently select a stale file that it did not verify.
+            if (directory / "export_manifest.json").exists():
+                continue
             for filename in filenames:
                 candidate = directory / filename
                 if candidate.exists():

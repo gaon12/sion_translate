@@ -245,14 +245,21 @@ def test_find_exported_model_preserves_best_semantic_priority(tmp_path: Path) ->
         directory.mkdir(parents=True)
         artifact = directory / "model.pt"
         artifact.touch()
+        artifact_set_id = "a" * 64
         (directory / "export_manifest.json").write_text(
             json.dumps(
                 {
+                    "schema": "sion-export-manifest-v2",
                     "created_unix": timestamp,
+                    "state_sha256": "b" * 64,
+                    "artifact_set_id": artifact_set_id,
                     "formats": {
                         "fp32": {
                             "status": "ok",
                             "file": artifact.name,
+                            "size": artifact.stat().st_size,
+                            "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                            "artifact_set_id": artifact_set_id,
                         }
                     },
                 }
@@ -264,6 +271,75 @@ def test_find_exported_model_preserves_best_semantic_priority(tmp_path: Path) ->
     best = write_export("best", 10.0)
     write_export("latest", 20.0)
     assert inference.find_exported_model(tmp_path / "run") == best
+
+
+def test_find_exported_model_rejects_manifest_artifact_tampering(tmp_path: Path) -> None:
+    directory = tmp_path / "run" / "exports" / "best"
+    directory.mkdir(parents=True)
+    artifact = directory / "model.pt"
+    artifact.write_bytes(b"original")
+    artifact_set_id = "a" * 64
+    (directory / "export_manifest.json").write_text(
+        json.dumps(
+            {
+                "schema": "sion-export-manifest-v2",
+                "state_sha256": "b" * 64,
+                "artifact_set_id": artifact_set_id,
+                "formats": {
+                    "fp32": {
+                        "status": "ok",
+                        "file": artifact.name,
+                        "size": artifact.stat().st_size,
+                        "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                        "artifact_set_id": artifact_set_id,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    artifact.write_bytes(b"tampered")
+
+    with pytest.raises(ValueError, match="size or SHA256"):
+        inference.find_exported_model(tmp_path / "run")
+
+
+def test_find_exported_model_rejects_manifest_path_escape(tmp_path: Path) -> None:
+    directory = tmp_path / "run" / "exports" / "best"
+    directory.mkdir(parents=True)
+    outside = tmp_path / "outside.pt"
+    outside.write_bytes(b"outside")
+    artifact_set_id = "a" * 64
+    (directory / "export_manifest.json").write_text(
+        json.dumps(
+            {
+                "schema": "sion-export-manifest-v2",
+                "state_sha256": "b" * 64,
+                "artifact_set_id": artifact_set_id,
+                "formats": {
+                    "fp32": {
+                        "status": "ok",
+                        "file": "../../../../outside.pt",
+                        "size": outside.stat().st_size,
+                        "sha256": hashlib.sha256(outside.read_bytes()).hexdigest(),
+                        "artifact_set_id": artifact_set_id,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="escapes export directory"):
+        inference.find_exported_model(tmp_path / "run")
+
+
+def test_find_exported_model_keeps_legacy_no_manifest_fallback(tmp_path: Path) -> None:
+    artifact = tmp_path / "run" / "exports" / "best" / "model.pt"
+    artifact.parent.mkdir(parents=True)
+    artifact.touch()
+
+    assert inference.find_exported_model(tmp_path / "run") == artifact
 
 
 def test_translator_sampling_seed_builds_reproducible_generator(

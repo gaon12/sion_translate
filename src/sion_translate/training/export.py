@@ -4,7 +4,9 @@ Training checkpoints contain optimizer and scheduler state.  Files produced here
 contain only what inference needs and are deliberately self-describing so that a
 model/tokenizer mismatch fails loudly instead of producing plausible bad output.
 
-The native ``.pt`` formats are executable by :func:`load_exported_model`.
+The native ``.pt`` formats contain state dictionaries accepted by PyTorch's
+weights-only loader. Legacy module pickles require an explicit unsafe migration
+opt-in and are never loaded by the normal inference path.
 The custom GGUF file is a real mixed Q4_K_M container, but llama.cpp does not
 implement the Sion encoder-decoder architecture; it is therefore an honest
 storage/interchange artifact rather than a falsely advertised llama.cpp model.
@@ -24,6 +26,7 @@ import sys
 import time
 import types
 import uuid
+import warnings
 import zipfile
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
@@ -1095,6 +1098,65 @@ def _existing_entry_is_valid(directory: Path, entry: Mapping[str, Any]) -> bool:
     return actual["sha256"] == entry["sha256"]
 
 
+def resolve_manifest_artifact(
+    directory: str | Path,
+    format_names: Sequence[str],
+) -> Path | None:
+    """Resolve one declared artifact after validating its manifest identity.
+
+    ``None`` means that no manifest exists, or that none of the requested
+    formats is marked successful. An existing but malformed/tampered manifest
+    raises instead of allowing callers to fall back to an unverified stale file.
+    """
+
+    directory = Path(directory)
+    manifest_path = directory / "export_manifest.json"
+    if not manifest_path.exists():
+        return None
+    manifest = _read_manifest(manifest_path)
+    if manifest is None:
+        raise ValueError(f"missing or invalid export manifest: {manifest_path}")
+    for field in ("state_sha256", "artifact_set_id"):
+        if not _is_sha256(manifest.get(field)):
+            raise ValueError(f"manifest.{field} must be a SHA256 digest")
+    formats = manifest.get("formats")
+    if not isinstance(formats, Mapping):
+        raise ValueError("manifest.formats must be an object")
+
+    root = directory.resolve()
+    for format_name in format_names:
+        raw_entry = formats.get(format_name)
+        if raw_entry is None:
+            continue
+        if not isinstance(raw_entry, Mapping):
+            raise ValueError(f"manifest format {format_name!r} must be an object")
+        if raw_entry.get("status") != "ok":
+            continue
+        if raw_entry.get("artifact_set_id") != manifest["artifact_set_id"]:
+            raise ValueError(f"manifest format {format_name!r} has a mismatched artifact_set_id")
+        size = raw_entry.get("size")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise ValueError(f"manifest format {format_name!r} has an invalid size")
+        if not _is_sha256(raw_entry.get("sha256")):
+            raise ValueError(f"manifest format {format_name!r} has an invalid SHA256")
+        filename = raw_entry.get("file")
+        if not isinstance(filename, str) or not filename:
+            raise ValueError(f"manifest format {format_name!r} has no artifact path")
+        artifact = (directory / filename).resolve()
+        try:
+            artifact.relative_to(root)
+        except ValueError as error:
+            raise ValueError("artifact path escapes export directory") from error
+        if not artifact.is_file():
+            raise ValueError(f"manifest format {format_name!r} does not point to a regular file")
+        if not _existing_entry_is_valid(directory, raw_entry):
+            raise ValueError(
+                f"manifest format {format_name!r} size or SHA256 does not match the artifact"
+            )
+        return artifact
+    return None
+
+
 def _failure_entry(
     error: Exception,
     artifact_set_id: str,
@@ -1408,7 +1470,10 @@ def convert_export(
 
     source = Path(source)
     requested = _normalize_formats(formats)
-    payload = torch.load(source, map_location="cpu", weights_only=False, mmap=True)
+    try:
+        payload = torch.load(source, map_location="cpu", weights_only=True, mmap=True)
+    except Exception as error:
+        raise ValueError(f"{source} cannot be read as a safe weights-only Sion export") from error
     if not isinstance(payload, dict) or "model_config" not in payload:
         raise ValueError(f"{source} is not a Sion inference export")
     stored = payload.get("model")
@@ -1493,12 +1558,34 @@ def load_exported_model(
     *,
     return_metadata: bool = False,
     allow_legacy: bool = True,
+    unsafe_allow_pickle: bool = False,
 ) -> tuple[nn.Module, ModelConfig, int] | tuple[nn.Module, ModelConfig, int, dict[str, Any]]:
-    """Load native precision, TorchAO INT8/INT4, packed INT4, or legacy exports."""
+    """Load native precision, TorchAO INT8/INT4, packed INT4, or legacy exports.
+
+    The default loader accepts only PyTorch's weights-only representation.
+    ``unsafe_allow_pickle`` exists solely for an explicit, one-time migration of
+    a trusted legacy bundle that pickled an ``nn.Module``.
+    """
 
     path = Path(path)
-    with _legacy_kjx_pickle_aliases():
-        payload = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
+    if unsafe_allow_pickle:
+        warnings.warn(
+            "unsafe_allow_pickle=True can execute code embedded in the model file. "
+            "Use it only to migrate a file whose origin and contents you trust.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        with _legacy_kjx_pickle_aliases():
+            payload = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
+    else:
+        try:
+            payload = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+        except Exception as error:
+            raise ValueError(
+                f"{path} cannot be read with the safe weights-only loader. "
+                "Refusing executable pickle; trusted legacy migrations must explicitly "
+                "pass unsafe_allow_pickle=True."
+            ) from error
     if not isinstance(payload, dict):
         raise ValueError(f"{path} does not contain an export payload")
     schema = payload.get("schema")

@@ -92,7 +92,13 @@ def test_loader_resolves_pre_rename_kjx_module_pickles(tmp_path: Path) -> None:
         for name in reversed(temporary_modules):
             sys.modules.pop(name, None)
 
-    loaded, loaded_config, pad_id = load_exported_model(path)
+    with pytest.raises(ValueError, match="safe weights-only loader"):
+        load_exported_model(path)
+    with pytest.warns(RuntimeWarning, match="execute code"):
+        loaded, loaded_config, pad_id = load_exported_model(
+            path,
+            unsafe_allow_pickle=True,
+        )
 
     assert type(loaded) is SionForConditionalGeneration
     assert loaded_config == config
@@ -165,7 +171,7 @@ def test_stable_precision_and_packed_int4_exports_reload(tmp_path: Path) -> None
     )
     assert all(entry["status"] == "ok" for entry in manifest["formats"].values())
     assert manifest["formats"]["transformers"]["revision_trained"] is False
-    packed_payload = torch.load(tmp_path / "model_int4.pt", weights_only=False)
+    packed_payload = torch.load(tmp_path / "model_int4.pt", weights_only=True)
     assert packed_payload["schema"] == EXPORT_SCHEMA
     assert not isinstance(packed_payload["model"], torch.nn.Module)
     assert packed_payload["quantization"]["backend"] == "sion-packed"
@@ -287,7 +293,7 @@ def test_conversion_inherits_source_tokenizer_hash_when_path_is_omitted(
         formats=("fp16",),
     )
     assert converted["metadata"]["tokenizer"] == metadata["tokenizer"]
-    payload = torch.load(tmp_path / "converted" / "model_fp16.pt", weights_only=False)
+    payload = torch.load(tmp_path / "converted" / "model_fp16.pt", weights_only=True)
     assert payload["metadata"]["tokenizer"] == metadata["tokenizer"]
 
     (source_dir / tokenizer.name).unlink()
