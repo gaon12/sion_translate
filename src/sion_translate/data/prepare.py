@@ -15,7 +15,11 @@ import numpy as np
 
 from sion_translate.fingerprint import PREPROCESSING_SCHEMA, build_dataset_fingerprint
 from sion_translate.performance import bounded_ordered_map, build_cpu_plan
-from sion_translate.splitting import TargetSplitGuard, choose_split_for_key
+from sion_translate.splitting import (
+    TargetSplitGuard,
+    approximate_split_key,
+    choose_split_for_key,
+)
 from sion_translate.structured import protect_shared_structured_spans
 from sion_translate.synthetic import (
     DEFAULT_SYNTHETIC_PREFIXES,
@@ -404,6 +408,7 @@ def prepare_dataset(
     quality_policy: QualityPolicy | None = None,
     filter_quality: bool = True,
     prevent_target_leakage: bool = True,
+    approximate_split: bool = False,
     dedup_backend: str = "sqlite",
     language_pair: Sequence[str] = ("ko", "ja"),
     source_only_languages: Sequence[str] = (),
@@ -469,6 +474,7 @@ def prepare_dataset(
             "filter_quality": filter_quality,
             "index_dtype": INDEX_DTYPE.descr,
             "max_tokens_per_side": max_tokens_per_side,
+            "approximate_split": approximate_split,
             "prevent_target_leakage": prevent_target_leakage,
             "quality_policy": quality_policy.to_dict(),
             "shard_size": shard_size,
@@ -628,7 +634,9 @@ def prepare_dataset(
                 if is_synthetic:
                     split = "train"
                 else:
-                    source_key = dedup_key(text_a)
+                    source_key = (
+                        approximate_split_key(text_a) if approximate_split else dedup_key(text_a)
+                    )
                     if len(normalized_pairs) > 1:
                         source_key = f"record\0{record_group_key}"
                     split = choose_split_for_key(
@@ -637,7 +645,9 @@ def prepare_dataset(
                         test_fraction,
                     )
                 if target_split_guard is not None:
-                    target_key = dedup_key(text_b)
+                    target_key = (
+                        approximate_split_key(text_b) if approximate_split else dedup_key(text_b)
+                    )
                     if len(normalized_pairs) > 1:
                         target_key = f"{language_b}\0{target_key}"
                     target_digest = hashlib.sha256(target_key.encode("utf-8")).digest()
@@ -745,6 +755,8 @@ def prepare_dataset(
         "quality_policy": quality_policy.to_dict(),
         "target_leakage_guard_enabled": prevent_target_leakage,
         "target_leakage_guard": "bloom-v1",
+        "approximate_split": approximate_split,
+        "split_key": "minhash-char5-v1" if approximate_split else "exact",
         "dedup_backend": dedup_backend,
         "atomic_build": True,
     }

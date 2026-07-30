@@ -53,6 +53,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="여러 언어쌍을 한 데이터셋에 넣을 때 반복 지정",
     )
     parser.add_argument(
+        "--approximate-split",
+        action="store_true",
+        help=(
+            "split 배정을 문자 5-gram MinHash 버킷으로 수행해 근사 중복이 "
+            "train 과 holdout 을 넘나들지 못하게 합니다"
+        ),
+    )
+    parser.add_argument(
         "--source-only-language",
         nargs="+",
         default=[],
@@ -94,6 +102,7 @@ def main() -> None:
         ),
         filter_quality=not args.no_quality_filter,
         prevent_target_leakage=not args.allow_target_leakage,
+        approximate_split=args.approximate_split,
         dedup_backend=args.dedup_backend,
         language_pair=args.language_pair,
         language_pairs=args.language_pairs,
