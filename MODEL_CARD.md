@@ -69,17 +69,40 @@ directions and provides a common scorer for sion_translate, LibreTranslate, Papa
 DeepL, M2M100 418M, and NLLB-200. No universal quality claim is made from that small set.
 
 Scores from the repository's own test split are in-domain: the split is drawn from the same
-sources as the training data. Leakage is guarded, but domain overlap is not, so quality on
-unseen domains is substantially lower. Any single reported figure should state which of the two
-it is.
+sources as the training data, so quality on unseen domains is substantially lower. Any single
+reported figure should state which of the two it is.
+
+Exact-duplicate leakage is guarded; near-duplicate leakage was not. The split key used for this
+release was an exact normalized string, so two rows differing by one particle were assigned
+independently. Measured against a character 5-gram MinHash key, near-duplicate leakage into the
+holdout was roughly twice as high (1.12% against 0.48%, averaged over four training shards).
+Treat the repository's own ja->ko test-split figures accordingly: the same checkpoint scores
+chrF 53.43 on an out-of-domain diagnostic set.
 
 ## Limitations
 
 - **Numbers can change value.** This release's tokenizer was trained without digit splitting, so
-  the model treats numbers as memorised pieces rather than sequences of digits. It may silently
-  substitute a plausible wrong value instead of dropping it: `250mg` → `1200mg`, `0.5mL` →
-  `120ml`, `38,720円` → `38,000엔`. Beam width does not change this. Verify every amount, dosage,
-  date and identifier against the source. Loading the tokenizer emits a warning to this effect.
+  the model treats numbers as memorised pieces rather than sequences of digits. It substitutes a
+  plausible wrong value rather than dropping it. Eight of ten numeric probe sentences are
+  corrupted at beam 4:
+
+  | source | output |
+  |---|---|
+  | `0.0037mg/L 이하로` | `1.337mg/L以下に` |
+  | `250mg씩 하루 두 번` | `1200mgずつ1日2回` |
+  | `35%에서 62.5%로` | `０．７％から６．７％に` |
+  | `부가세 15%가 포함` | `付加税1,500ウォンが含まれる` |
+  | `110-482-937561` | `1、0、482-937561` |
+  | `38,720개에서 7,842,913개로` | `3万3千5百個から1万4千9十三個に` |
+  | `±0.05mm 이내` | `0.00.05mm以内` |
+
+  Every failure involves a merged multi-digit piece: `35%` is a single token and `62.5kg` splits
+  as `▁6 | 2.5 | kg`, so the boundary between the number and its unit falls inside a token. Beam
+  width does not change this, and neither does post-training: the representation does not expose
+  digits, so `reward_number_weight` has no signal to optimise. Verify every amount, dosage, date
+  and identifier against the source. Loading the tokenizer emits a warning, and `sion-train`
+  refuses it outright, so this checkpoint cannot be trained further — fixing it requires a new
+  tokenizer and therefore a new model, because the tied embedding is 18.4% of the parameters.
 - Proper nouns are memorised, not generalised. Names and places present in training are accurate,
   while unseen ones get translated morpheme by morpheme (`五十嵐大輔` → `50폭풍 대장`). Supply a
   glossary for names that matter.
