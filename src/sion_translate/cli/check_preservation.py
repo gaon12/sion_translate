@@ -12,6 +12,15 @@ match both the translation-queue result format and a plain parallel shard::
         --target-scripts ko data/synthetic_hanboneo.jsonl
     sion-check-preservation --json report.json --max-violation-rate 0.02 out.jsonl
 
+``--write-passing`` turns the report into a gate that also produces the cleaned
+file, which is what recovering a shard needs: data23 renders ``원`` as ``銭``, an
+obsolete Japanese currency subunit, in 19 rows, and no similarity or chrF check
+can see a wrong unit. Only one input path may be given with it, since the output
+is a single file::
+
+    sion-check-preservation --source-key ko --target-key ja \\
+        --write-passing clean.jsonl --checks unit,sign,number staged.jsonl
+
 Exit codes: 0 within thresholds, 1 a threshold was exceeded, 2 bad input.
 """
 
@@ -23,11 +32,14 @@ from pathlib import Path
 import sys
 
 from sion_translate.console import configure_stdio
-from sion_translate.preservation import check_corpus, format_report
+from sion_translate.preservation import check_corpus, check_pair, format_report
 from sion_translate.scripts_registry import resolve_scripts
 
 DEFAULT_SOURCE_KEYS = ("source", "ko", "src")
 DEFAULT_TARGET_KEYS = ("translation", "hypothesis", "ja", "tgt")
+
+# The per-pair verdicts ``check_pair`` reports, in the order the summary prints.
+CHECK_NAMES = ("number", "sign", "unit", "script")
 
 
 def script_list(value: str) -> tuple[str, ...]:
@@ -36,6 +48,48 @@ def script_list(value: str) -> tuple[str, ...]:
     names = tuple(part.strip() for part in value.split(",") if part.strip())
     resolve_scripts(names)
     return names
+
+
+def check_list(value: str) -> tuple[str, ...]:
+    """Parse a comma-separated list of check names."""
+
+    names = tuple(part.strip().lower() for part in value.split(",") if part.strip())
+    unknown = [name for name in names if name not in CHECK_NAMES]
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            f"unknown check(s) {unknown}; valid: {', '.join(CHECK_NAMES)}"
+        )
+    if not names:
+        raise argparse.ArgumentTypeError("--checks needs at least one name")
+    return names
+
+
+def pair_passes(
+    source: str,
+    target: str,
+    *,
+    target_scripts: tuple[str, ...],
+    checks: tuple[str, ...],
+) -> bool:
+    """True when ``source``/``target`` satisfies every named check."""
+
+    result = check_pair(source, target, target_scripts=target_scripts)
+    for name in checks:
+        if name == "script":
+            if result["foreign_scripts"]:
+                return False
+        elif not result[f"{name}_ok"]:
+            return False
+    return True
+
+
+def write_rows(path: Path, rows: list[dict[str, object]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".part")
+    with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+    temporary.replace(path)
 
 
 def read_rows(path: Path) -> list[dict[str, object]]:
@@ -98,6 +152,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         help="fail when any check exceeds this fraction of sentences",
     )
+    parser.add_argument(
+        "--write-passing",
+        metavar="PATH",
+        help=(
+            "write rows that pass every selected check to PATH. "
+            "accepts exactly one input path, since the output is one file"
+        ),
+    )
+    parser.add_argument(
+        "--checks",
+        type=check_list,
+        default=CHECK_NAMES,
+        metavar="LIST",
+        help=(
+            "checks --write-passing must satisfy, comma separated "
+            f"(default: {','.join(CHECK_NAMES)})"
+        ),
+    )
     return parser
 
 
@@ -109,6 +181,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if args.max_violation_rate is not None and not 0.0 <= args.max_violation_rate <= 1.0:
         print("--max-violation-rate must be in [0, 1]", file=sys.stderr)
+        return 2
+    if args.write_passing and len(args.paths) != 1:
+        print("--write-passing takes exactly one input path", file=sys.stderr)
         return 2
 
     source_keys = tuple(args.source_key or DEFAULT_SOURCE_KEYS)
@@ -141,6 +216,28 @@ def main(argv: list[str] | None = None) -> int:
         print(format_report(counts, title=path.name))
         payload = counts.to_dict()
         payload["path"] = str(path)
+
+        if args.write_passing:
+            passing = [
+                row
+                for row, source, target in zip(rows, sources, targets, strict=True)
+                if pair_passes(
+                    source,
+                    target,
+                    target_scripts=args.target_scripts,
+                    checks=args.checks,
+                )
+            ]
+            write_rows(Path(args.write_passing), passing)
+            removed = len(rows) - len(passing)
+            print(
+                f"  wrote {len(passing):,} rows to {args.write_passing} "
+                f"(removed {removed:,} failing {'/'.join(args.checks)})"
+            )
+            payload["written_rows"] = len(passing)
+            payload["removed_rows"] = removed
+            payload["checks_enforced"] = list(args.checks)
+
         reports.append(payload)
 
         if args.max_violation_rate is not None and counts.sentences:
