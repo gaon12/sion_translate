@@ -23,6 +23,11 @@ Usage::
     python scripts/data/resample_generated_shards.py \
         --max-per-skeleton 8 --in-place --report r.json data/data4[3458].jsonl
 
+``--in-place`` preserves each original under ``--backup-dir`` (by default
+``<input dir>/excluded/resampled_original/``) and resamples from there, so
+re-running with a tighter cap does not compound on an already-reduced file.
+That matters because the generator is not available to regenerate from.
+
 Exit codes: 0 written, 2 bad input.
 """
 
@@ -235,7 +240,18 @@ def build_parser() -> argparse.ArgumentParser:
     destination.add_argument(
         "--in-place",
         action="store_true",
-        help="overwrite each input after keeping a .orig copy",
+        help=(
+            "overwrite each input, preserving the original under --backup-dir. "
+            "Re-running with a different cap resamples the preserved original "
+            "rather than the already-reduced file, so caps never compound"
+        ),
+    )
+    parser.add_argument(
+        "--backup-dir",
+        help=(
+            "where --in-place preserves originals "
+            "(default: <input dir>/excluded/<input stem prefix>_original)"
+        ),
     )
     parser.add_argument("--max-per-skeleton", type=int, default=8)
     parser.add_argument(
@@ -270,13 +286,28 @@ def main(argv: list[str] | None = None) -> int:
         print("--max-per-quoted-span must be positive", file=sys.stderr)
         return 2
 
+    if args.backup_dir and not args.in_place:
+        print("--backup-dir only applies to --in-place", file=sys.stderr)
+        return 2
+
     results: list[ShardResult] = []
     for raw_path in args.paths:
         path = Path(raw_path)
         if args.in_place:
-            backup = path.with_suffix(path.suffix + ".orig")
+            # Preserve the original in a directory rather than as a sibling
+            # file, matching how this repository already keeps
+            # data/excluded/original_unfiltered/ and friends. A sibling copy
+            # would also sit inside the corpus directory that the training
+            # pipeline globs.
+            backup_dir = (
+                Path(args.backup_dir)
+                if args.backup_dir
+                else path.parent / "excluded" / "resampled_original"
+            )
+            backup = backup_dir / path.name
             if not backup.exists():
                 try:
+                    backup_dir.mkdir(parents=True, exist_ok=True)
                     backup.write_bytes(path.read_bytes())
                 except OSError as error:
                     print(f"{raw_path}: cannot back up ({error})", file=sys.stderr)

@@ -246,26 +246,70 @@ def test_main_writes_to_an_output_directory(tmp_path: Path, capsys) -> None:
     assert "data44.jsonl" in capsys.readouterr().out
 
 
-def test_main_in_place_keeps_an_original_copy(tmp_path: Path) -> None:
+def test_main_in_place_preserves_the_original_in_a_directory(tmp_path: Path) -> None:
+    """Originals go in a directory, matching data/excluded/original_unfiltered/.
+
+    A sibling copy would also sit inside the corpus directory the training
+    pipeline globs.
+    """
+
     rows = [(f'표현 "{index}"을 옮긴다.', f"表現「{index}」を訳す。") for index in range(40)]
     source = write_shard(tmp_path / "data44.jsonl", rows)
 
     assert RESAMPLE.main(["--in-place", "--max-per-skeleton", "4", str(source)]) == 0
 
     assert len(read_shard(source)) == 4
-    assert len(read_shard(tmp_path / "data44.jsonl.orig")) == 40
+    assert len(read_shard(tmp_path / "excluded" / "resampled_original" / "data44.jsonl")) == 40
+    assert not list(tmp_path.glob("*.orig"))
 
 
-def test_main_in_place_is_idempotent(tmp_path: Path) -> None:
+def test_main_in_place_accepts_an_explicit_backup_dir(tmp_path: Path) -> None:
+    rows = [(f'표현 "{index}"을 옮긴다.', f"表現「{index}」を訳す。") for index in range(40)]
+    source = write_shard(tmp_path / "data44.jsonl", rows)
+    backup = tmp_path / "keep" / "here"
+
+    assert (
+        RESAMPLE.main(
+            ["--in-place", "--backup-dir", str(backup), "--max-per-skeleton", "4", str(source)]
+        )
+        == 0
+    )
+
+    assert len(read_shard(backup / "data44.jsonl")) == 40
+
+
+def test_backup_dir_requires_in_place(tmp_path: Path) -> None:
+    source = write_shard(tmp_path / "data44.jsonl", [("가나다라.", "アイウ。")])
+
+    assert (
+        RESAMPLE.main(
+            ["--output-dir", str(tmp_path / "out"), "--backup-dir", str(tmp_path), str(source)]
+        )
+        == 2
+    )
+
+
+def test_main_in_place_does_not_compound_caps(tmp_path: Path) -> None:
+    """Re-running with a tighter cap must resample the preserved original.
+
+    data44 and data45 were resampled at cap 6 and then at cap 1; without this
+    the second pass would have capped an already-capped set and the rows could
+    not be recovered, since the generator is gone.
+    """
+
     rows = [(f'표현 "{index}"을 옮긴다.', f"表現「{index}」を訳す。") for index in range(40)]
     source = write_shard(tmp_path / "data44.jsonl", rows)
 
     RESAMPLE.main(["--in-place", "--max-per-skeleton", "4", str(source)])
-    first = source.read_bytes()
+    at_four = source.read_bytes()
     RESAMPLE.main(["--in-place", "--max-per-skeleton", "4", str(source)])
+    assert source.read_bytes() == at_four
 
-    # The second run must resample the preserved original, not the reduced file.
-    assert source.read_bytes() == first
+    RESAMPLE.main(["--in-place", "--max-per-skeleton", "2", str(source)])
+    assert len(read_shard(source)) == 2
+    # Widening again recovers rows, which is only possible from the original.
+    RESAMPLE.main(["--in-place", "--max-per-skeleton", "4", str(source)])
+    assert source.read_bytes() == at_four
 
 
 def test_main_reports_bad_input(tmp_path: Path) -> None:
