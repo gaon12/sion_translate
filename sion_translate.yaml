@@ -48,6 +48,18 @@ data:
 #   language_pairs:
 #     - [ko, ja]
 #     - [en, ru]
+#
+# 한본어(kj) 지원. kj 는 한국어와 일본어가 섞인 입력이고, 번역 결과물은 항상
+# 한국어 또는 일본어 단일어여야 합니다. source_only_languages 에 등재하면
+# kj->ko 와 kj->ja 만 학습되고 ko->kj / ja->kj 는 만들어지지 않습니다.
+# 등재하지 않으면 bidirectional 이 혼용문을 target 으로도 학습해서
+# 한국어 출력에 가나를 주입하는 모델이 됩니다.
+# 코퍼스는 scripts/data/build_hanboneo.py 로 만듭니다.
+#   language_pairs:
+#     - [kj, ko]
+#     - [kj, ja]
+#     - [ko, ja]
+#   source_only_languages: [kj]
 #   source_token_dropout: 0.05  # 온라인 증강(원문 토큰 탈락) 확률. 0 이면 끔
 #   synthetic_prefix: bt_    # 역번역 합성 파일 접두사 (train 전용 + 자동 다운웨이트)
 #   glossary: glossary.json  # 용어집 JSON. 지정 시 번역/평가에서 용어 강제
