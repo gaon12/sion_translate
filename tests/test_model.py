@@ -642,3 +642,57 @@ def test_morph_gates_only_when_morphoscript_enabled() -> None:
     assert all("morph_gates" not in name for name, _ in model.named_parameters())
     enabled_model = SionForConditionalGeneration(tiny_config())
     assert enabled_model.morph_gates is not None
+
+
+def test_cross_attention_cache_is_not_reordered_between_beam_steps() -> None:
+    """Cross K/V comes from the encoder, so all beams of one row share it.
+
+    Reordering it every step copied several MiB per step for no effect. Assert
+    both that the tensors are left untouched and that the resulting sequences
+    match a reference run whose cross cache is reordered explicitly.
+    """
+
+    torch.manual_seed(0)
+    model = SionForConditionalGeneration(tiny_config(), pad_id=0)
+    model.eval()
+    input_ids = torch.randint(4, 128, (3, 7))
+    attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+
+    with torch.no_grad():
+        context = model.prepare_generation(input_ids, attention_mask)
+        baseline = model.generate(
+            input_ids,
+            attention_mask,
+            bos_id=2,
+            eos_id=3,
+            max_new_tokens=12,
+            num_beams=4,
+            generation_context=context,
+        )
+
+    # The cross cache the beam decoder starts from must still be the tensors
+    # prepare_generation produced, expanded per beam.
+    caches = model._fresh_caches(len(model.decoder_layers), context.cross_key_values, repeats=4)
+    for cache, projected in zip(caches, context.cross_key_values, strict=True):
+        for cached, source in zip(cache["cross"], projected, strict=True):
+            assert cached.shape[0] == source.shape[0] * 4
+            for beam in range(4):
+                torch.testing.assert_close(cached[beam], source[0])
+
+    # Reordering the cross cache by any beam permutation is a no-op, which is
+    # why dropping the index_select cannot change the result.
+    permutation = torch.tensor([2, 0, 3, 1, 6, 4, 7, 5, 10, 8, 11, 9])
+    for cache in caches:
+        for tensor in cache["cross"]:
+            torch.testing.assert_close(tensor.index_select(0, permutation), tensor)
+
+    with torch.no_grad():
+        repeated = model.generate(
+            input_ids,
+            attention_mask,
+            bos_id=2,
+            eos_id=3,
+            max_new_tokens=12,
+            num_beams=4,
+        )
+    assert torch.equal(baseline, repeated)

@@ -1107,13 +1107,15 @@ class SionForConditionalGeneration(nn.Module):
                         slot += 1
 
             flat_index = gather_flat.view(-1)
-            # 살아남은 beam 의 순서에 맞게 문장 기록과 KV cache 를 재배열합니다.
+            # 살아남은 beam 의 순서에 맞게 문장 기록과 self KV cache 를 재배열합니다.
+            # cross KV 는 encoder 출력에서 나온 것이라 같은 문장의 beam 끼리
+            # 내용이 완전히 같습니다. beam 순서가 바뀌어도 값이 그대로이므로
+            # 재배열하지 않습니다 (step 마다 수 MiB 를 복사하던 낭비였습니다).
             sequences = torch.cat(
                 (sequences.index_select(0, flat_index), step_tokens.view(-1, 1)), dim=1
             )
             for cache in caches:
                 cache["self"] = tuple(t.index_select(0, flat_index) for t in cache["self"])
-                cache["cross"] = tuple(t.index_select(0, flat_index) for t in cache["cross"])
             beam_scores = next_scores
 
             # 모든 문장이 '완성 가설이 충분하고, 살아있는 beam 이 더 나은 점수를
