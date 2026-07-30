@@ -49,6 +49,9 @@ def test_prepare_repairs_segmenter_spacing_without_dropping_the_row(tmp_path: Pa
         repair_spacing=True,
         policy=RECOVER.QualityPolicy(),
         apply_quality=True,
+        source_language="ko",
+        target_language="ja",
+        min_space_density=0.08,
     )
     assert result.rows_out == 1
     assert result.spacing_repaired == 1
@@ -72,6 +75,9 @@ def test_prepare_leaves_the_space_using_side_alone(tmp_path: Path) -> None:
         repair_spacing=True,
         policy=RECOVER.QualityPolicy(),
         apply_quality=True,
+        source_language="ko",
+        target_language="ja",
+        min_space_density=0.08,
     )
     assert result.spacing_repaired == 0
     assert read_shard(output)[0]["ko"] == "철 원석을 찾는다"
@@ -96,6 +102,9 @@ def test_prepare_drops_rows_whose_target_carries_the_wrong_script(tmp_path: Path
         repair_spacing=True,
         policy=RECOVER.QualityPolicy(),
         apply_quality=True,
+        source_language="ko",
+        target_language="ja",
+        min_space_density=0.08,
     )
     assert result.dropped_foreign_script == 1
     assert result.rows_out == 1
@@ -117,6 +126,9 @@ def test_prepare_reports_the_fanout_it_did_not_resolve(tmp_path: Path) -> None:
         repair_spacing=True,
         policy=RECOVER.QualityPolicy(),
         apply_quality=True,
+        source_language="ko",
+        target_language="ja",
+        min_space_density=0.08,
     )
     assert result.rows_out == 5
     assert result.distinct_sources == 1
@@ -139,6 +151,9 @@ def test_prepare_drops_exact_duplicate_pairs(tmp_path: Path) -> None:
         repair_spacing=True,
         policy=RECOVER.QualityPolicy(),
         apply_quality=True,
+        source_language="ko",
+        target_language="ja",
+        min_space_density=0.08,
     )
     assert result.dropped_duplicate_pair == 3
     assert result.rows_out == 1
@@ -160,6 +175,9 @@ def test_prepare_keeps_unrelated_fields(tmp_path: Path) -> None:
         repair_spacing=True,
         policy=RECOVER.QualityPolicy(),
         apply_quality=True,
+        source_language="ko",
+        target_language="ja",
+        min_space_density=0.08,
     )
     row = read_shard(output)[0]
     assert row["domain"] == "r18"
@@ -381,3 +399,105 @@ def test_cli_rejects_a_missing_input(tmp_path: Path) -> None:
         )
         == 2
     )
+
+
+def prepare(source: Path, output: Path, **overrides: object) -> object:
+    arguments: dict[str, object] = {
+        "source_key": "ko",
+        "target_key": "ja",
+        "source_scripts": ["ko"],
+        "target_scripts": ["ja"],
+        "repair_spacing": True,
+        "policy": RECOVER.QualityPolicy(),
+        "apply_quality": True,
+        "source_language": "ko",
+        "target_language": "ja",
+        "min_space_density": 0.08,
+    }
+    arguments.update(overrides)
+    return RECOVER.prepare_shard(source, output, **arguments)
+
+
+def test_prepare_drops_rows_with_a_deleted_name_placeholder(tmp_path: Path) -> None:
+    source = write_shard(
+        tmp_path / "in.jsonl",
+        [
+            # Both sides lost the same noun, so no similarity check can see it.
+            {
+                "ko": "늦은 밤, 의 숲속에서 사냥꾼이 집으로 돌아갈 준비를 해.",
+                "ja": "深夜、 の森の中、猟師が家に帰る準備してる.",
+            },
+            {
+                "ko": "늦은 밤, 마을의 숲속에서 사냥꾼이 집으로 돌아갈 준비를 해.",
+                "ja": "深夜、村の森の中、猟師が家に帰る準備してる.",
+            },
+        ],
+    )
+    output = tmp_path / "out.jsonl"
+    result = prepare(source, output)
+    assert result.dropped_placeholder_hole == 1
+    assert result.rows_out == 1
+    assert result.placeholder_hole_examples[0]["markers"]
+    assert read_shard(output)[0]["ja"] == "深夜、村の森の中、猟師が家に帰る準備してる."
+
+
+def test_placeholder_detection_runs_before_the_collapse(tmp_path: Path) -> None:
+    # Collapsing first would weld `、 の森` into `、の森` and destroy the evidence.
+    source = write_shard(
+        tmp_path / "in.jsonl",
+        [{"ko": "(일제히) 의 보물을 찾아라!", "ja": "（全員） の宝探しだ!"}],
+    )
+    output = tmp_path / "out.jsonl"
+    result = prepare(source, output)
+    assert result.dropped_placeholder_hole == 1
+    assert result.rows_out == 0
+
+
+def test_prepare_drops_isolated_spacing_but_repairs_segmented_rows(tmp_path: Path) -> None:
+    source = write_shard(
+        tmp_path / "in.jsonl",
+        [
+            # Segmented: a space at every boundary, density well above the floor.
+            {"ko": "서로의 체온이 전해졌다", "ja": "お互い の 体温 が 伝わり"},
+            # Isolated: one space in otherwise unsegmented text. Ambiguous, so it
+            # goes rather than being welded shut on a guess.
+            {
+                "ko": "이 광석은 지구에 오랫동안 쌓였고 형성 과정이 매우 독특하고 복잡하다",
+                "ja": "この鉱石、地球で長い間堆積してて、形成プロセスがめっちゃ 独特で複雑だ",
+            },
+        ],
+    )
+    output = tmp_path / "out.jsonl"
+    result = prepare(source, output)
+    assert result.spacing_repaired == 1
+    assert result.dropped_isolated_spacing == 1
+    assert result.rows_out == 1
+    assert read_shard(output)[0]["ja"] == "お互いの体温が伝わり"
+    assert result.isolated_spacing_examples[0]["density"] < 0.08
+
+
+def test_the_density_floor_is_configurable(tmp_path: Path) -> None:
+    rows = [
+        {
+            "ko": "이 광석은 지구에 오랫동안 쌓였고 형성 과정이 매우 독특하고 복잡하다",
+            "ja": "この鉱石、地球で長い間堆積してて、形成プロセスがめっちゃ 独特で複雑だ",
+        }
+    ]
+    source = write_shard(tmp_path / "in.jsonl", rows)
+    kept = prepare(source, tmp_path / "kept.jsonl", min_space_density=0.0)
+    assert kept.dropped_isolated_spacing == 0
+    assert kept.spacing_repaired == 1
+    dropped = prepare(source, tmp_path / "dropped.jsonl", min_space_density=0.5)
+    assert dropped.dropped_isolated_spacing == 1
+    assert dropped.rows_out == 0
+
+
+def test_an_unconfigured_language_disables_placeholder_detection(tmp_path: Path) -> None:
+    source = write_shard(
+        tmp_path / "in.jsonl",
+        [{"ko": "늦은 밤, 의 숲속에서", "ja": "深夜、村の森の中"}],
+    )
+    output = tmp_path / "out.jsonl"
+    result = prepare(source, output, source_language="xx", target_language="yy")
+    assert result.dropped_placeholder_hole == 0
+    assert result.rows_out == 1

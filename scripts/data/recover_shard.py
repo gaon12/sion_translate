@@ -62,6 +62,7 @@ import sys
 from typing import Any, Iterable, Sequence
 
 from sion_translate.data.quality import QualityPolicy, assess_pair, canonical_text
+from sion_translate.function_morphemes import placeholder_hole_markers
 from sion_translate.scripts_registry import (
     collapse_spurious_spaces,
     has_foreign_script,
@@ -84,9 +85,14 @@ class PrepareResult:
     dropped_foreign_script: int = 0
     dropped_quality: int = 0
     dropped_duplicate_pair: int = 0
+    dropped_placeholder_hole: int = 0
+    dropped_isolated_spacing: int = 0
+    min_space_density: float = 0.0
     quality_reasons: dict[str, int] = field(default_factory=dict)
     foreign_script_examples: list[dict[str, str]] = field(default_factory=list)
     spacing_examples: list[dict[str, str]] = field(default_factory=list)
+    placeholder_hole_examples: list[dict[str, str]] = field(default_factory=list)
+    isolated_spacing_examples: list[dict[str, Any]] = field(default_factory=list)
     distinct_sources: int = 0
     max_targets_per_source: int = 0
 
@@ -170,8 +176,12 @@ def prepare_shard(
     repair_spacing: bool,
     policy: QualityPolicy,
     apply_quality: bool,
+    source_language: str,
+    target_language: str,
+    min_space_density: float,
 ) -> PrepareResult:
     result = PrepareResult(path=str(path), output=str(output))
+    result.min_space_density = min_space_density
     permitted_source = resolve_scripts(source_scripts) if source_scripts else frozenset()
     permitted_target = resolve_scripts(target_scripts) if target_scripts else frozenset()
 
@@ -191,9 +201,43 @@ def prepare_shard(
             result.dropped_missing_side += 1
             continue
 
+        # A deleted name placeholder leaves the same hole on both sides, so no
+        # similarity check can see it. Drop before repairing: the collapse would
+        # weld `恋人の が` into `恋人のが` and hide the evidence.
+        holes = placeholder_hole_markers(source, source_language) + placeholder_hole_markers(
+            target, target_language
+        )
+        if holes:
+            result.dropped_placeholder_hole += 1
+            if len(result.placeholder_hole_examples) < 8:
+                result.placeholder_hole_examples.append(
+                    {
+                        "markers": " ".join(holes),
+                        source_key: source[:90],
+                        target_key: target[:90],
+                    }
+                )
+            continue
+
+        # Segmenter spacing marks every boundary, so its density is high. One or
+        # two isolated spaces in otherwise unsegmented text are ambiguous: they
+        # may be interpolation artifacts or an undetected hole. Drop those rather
+        # than guess.
         if repair_spacing:
             removed = spurious_space_count(source) + spurious_space_count(target)
             if removed:
+                density = removed / max(len(source) + len(target), 1)
+                if density < min_space_density:
+                    result.dropped_isolated_spacing += 1
+                    if len(result.isolated_spacing_examples) < 8:
+                        result.isolated_spacing_examples.append(
+                            {
+                                "density": round(density, 5),
+                                source_key: source[:90],
+                                target_key: target[:90],
+                            }
+                        )
+                    continue
                 if len(result.spacing_examples) < 8:
                     result.spacing_examples.append({"before": target[:90]})
                 source = collapse_spurious_spaces(source)
@@ -357,6 +401,23 @@ def build_parser() -> argparse.ArgumentParser:
     prepare = subparsers.add_parser("prepare", parents=[common], help="deterministic repairs")
     prepare.add_argument("--source-scripts", type=script_list, default=[])
     prepare.add_argument("--target-scripts", type=script_list, default=[])
+    prepare.add_argument(
+        "--source-language",
+        default="ko",
+        help="language tag used for stranded-particle detection; unknown tags are not checked",
+    )
+    prepare.add_argument("--target-language", default="ja")
+    prepare.add_argument(
+        "--min-space-density",
+        type=float,
+        default=0.08,
+        help=(
+            "spurious spaces per character below which spacing counts as isolated "
+            "rather than segmented. Segmented rows are repaired; isolated ones are "
+            "dropped, because an isolated space may be an undetected placeholder hole. "
+            "Measured on data50: segmented median 0.14, isolated median 0.02."
+        ),
+    )
     prepare.add_argument("--no-repair-spacing", action="store_true")
     prepare.add_argument("--no-quality-filter", action="store_true")
 
@@ -388,10 +449,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 repair_spacing=not args.no_repair_spacing,
                 policy=QualityPolicy(),
                 apply_quality=not args.no_quality_filter,
+                source_language=args.source_language,
+                target_language=args.target_language,
+                min_space_density=args.min_space_density,
             )
             print(
                 f"{path.name:34} {result.rows_in:>8,} -> {result.rows_out:>8,} rows  "
                 f"spacing={result.spacing_repaired:,} ({result.spaces_removed:,} spaces)  "
+                f"hole={result.dropped_placeholder_hole:,} "
+                f"isolated={result.dropped_isolated_spacing:,} "
                 f"script={result.dropped_foreign_script:,} "
                 f"quality={result.dropped_quality:,} "
                 f"dup={result.dropped_duplicate_pair:,}  "
