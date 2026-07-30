@@ -696,3 +696,132 @@ def test_cross_attention_cache_is_not_reordered_between_beam_steps() -> None:
             num_beams=4,
         )
     assert torch.equal(baseline, repeated)
+
+
+def _controlled_beam_model(logit_plan: list[torch.Tensor]) -> SionForConditionalGeneration:
+    """A model whose decoder logits follow a fixed per-step script.
+
+    Beam bookkeeping is easiest to pin down when the scores are chosen rather
+    than sampled, so this replaces _logits with a scripted sequence.
+    """
+
+    torch.manual_seed(0)
+    model = SionForConditionalGeneration(tiny_config(), pad_id=0)
+    model.eval()
+    steps = iter(logit_plan)
+
+    def scripted_logits(hidden: torch.Tensor) -> torch.Tensor:
+        plan = next(steps)
+        rows = hidden.shape[0]
+        # _beam_decode slices the last position before calling _logits, so the
+        # incoming tensor is (rows, d_model) or (rows, 1, d_model).
+        return plan.to(dtype=torch.float32).expand(rows, plan.shape[-1]).clone()
+
+    model._logits = scripted_logits  # type: ignore[method-assign]
+    return model
+
+
+def test_beam_selection_keeps_the_highest_scoring_alive_candidates() -> None:
+    """EOS candidates become hypotheses; the rest fill beams in score order.
+
+    The candidate loop used to read batch x 2*beams scalars to the host every
+    step. Selecting with cumsum ranks has to preserve exactly which candidates
+    survive and in which slot.
+    """
+
+    vocab = 128
+    eos_id = 3
+    # Step 0: token 10 best, then EOS, then token 11, then token 12.
+    step0 = torch.full((1, vocab), -1e4)
+    step0[0, 10] = 0.0
+    step0[0, eos_id] = -1.0
+    step0[0, 11] = -2.0
+    step0[0, 12] = -3.0
+    # Step 1: everything collapses to EOS so the search terminates.
+    step1 = torch.full((1, vocab), -1e4)
+    step1[0, eos_id] = 0.0
+
+    model = _controlled_beam_model([step0, step1, step1, step1])
+    input_ids = torch.randint(4, 128, (1, 5))
+    attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+
+    with torch.no_grad():
+        output = model.generate(
+            input_ids,
+            attention_mask,
+            bos_id=2,
+            eos_id=eos_id,
+            max_new_tokens=3,
+            num_beams=2,
+        )
+
+    tokens = output[0].tolist()
+    # The winning hypothesis opens with the best non-EOS token, not with the
+    # EOS candidate that scored second.
+    assert tokens[0] == 2
+    assert tokens[1] == 10
+    assert eos_id in tokens
+
+
+def test_beam_selection_leaves_unfilled_slots_at_their_initial_values() -> None:
+    """With fewer alive candidates than beams, the spare slots must stay dead.
+
+    A slot that is never written keeps score -inf, source 0 and token EOS, which
+    is what the finalizer relies on to ignore it.
+    """
+
+    vocab = 128
+    eos_id = 3
+    # Only two candidates are viable and one of them is EOS, so at four beams
+    # most slots cannot be filled.
+    step = torch.full((1, vocab), float("-inf"))
+    step[0, 10] = 0.0
+    step[0, eos_id] = -0.5
+
+    model = _controlled_beam_model([step] * 6)
+    input_ids = torch.randint(4, 128, (1, 5))
+    attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+
+    with torch.no_grad():
+        output = model.generate(
+            input_ids,
+            attention_mask,
+            bos_id=2,
+            eos_id=eos_id,
+            max_new_tokens=4,
+            num_beams=4,
+        )
+
+    assert output.shape[0] == 1
+    assert output[0, 0].item() == 2
+    assert eos_id in output[0].tolist()
+
+
+def test_beam_search_is_reproducible_across_batch_and_beam_widths() -> None:
+    """Rows must not influence each other, whatever the beam width."""
+
+    torch.manual_seed(3)
+    model = SionForConditionalGeneration(tiny_config(), pad_id=0)
+    model.eval()
+    rows = torch.randint(4, 128, (4, 6))
+    mask = torch.ones_like(rows, dtype=torch.bool)
+
+    for num_beams in (2, 3, 4):
+        with torch.no_grad():
+            batched = model.generate(
+                rows, mask, bos_id=2, eos_id=3, max_new_tokens=6, num_beams=num_beams
+            )
+            singles = [
+                model.generate(
+                    rows[index : index + 1],
+                    mask[index : index + 1],
+                    bos_id=2,
+                    eos_id=3,
+                    max_new_tokens=6,
+                    num_beams=num_beams,
+                )
+                for index in range(rows.shape[0])
+            ]
+        for index, single in enumerate(singles):
+            shared = min(batched.shape[1], single.shape[1])
+            assert torch.equal(batched[index, :shared], single[0, :shared]), (num_beams, index)

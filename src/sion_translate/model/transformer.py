@@ -1079,40 +1079,69 @@ class SionForConditionalGeneration(nn.Module):
             source_beams = top_indices // vocab  # 어느 beam 에서 나온 후보인지
             new_tokens = top_indices % vocab
 
-            next_scores = torch.full_like(beam_scores, float("-inf"))
-            gather_flat = torch.zeros(batch, num_beams, dtype=torch.long, device=device)
-            step_tokens = torch.full((batch, num_beams), eos_id, dtype=torch.long, device=device)
-            for b in range(batch):
-                slot = 0
-                for cand in range(2 * num_beams):
-                    score = float(top_scores[b, cand])
-                    if score == float("-inf"):
-                        continue
-                    token = int(new_tokens[b, cand])
-                    flat_source = b * num_beams + int(source_beams[b, cand])
-                    if token == eos_id:
-                        # 완성 가설로 저장 (BOS 제외한 생성 길이 = position+1)
-                        finished_seq = torch.cat(
-                            (
-                                sequences[flat_source],
-                                torch.tensor([eos_id], device=device),
-                            )
-                        )
-                        done[b].append((penalized(score, position + 1), finished_seq))
-                        continue
-                    if slot < num_beams:
-                        next_scores[b, slot] = score
-                        gather_flat[b, slot] = flat_source
-                        step_tokens[b, slot] = token
-                        slot += 1
+            # 후보 선별을 텐서 연산으로 처리합니다. 이전 구현은 step 마다
+            # batch × 2·beams × 3 번 스칼라를 host 로 읽어 왔고, GPU 에서는
+            # 그 하나하나가 device 동기화입니다.
+            #
+            # topk 결과는 점수 내림차순이므로 "살아있는 후보 중 앞쪽 num_beams
+            # 개"가 곧 "점수가 가장 높은 num_beams 개"입니다. cumsum 으로 각
+            # 후보의 생존 순위를 구해 그 순위를 목적지 슬롯으로 씁니다.
+            finite = top_scores.ne(float("-inf"))
+            ends_here = new_tokens.eq(eos_id)
+            alive = finite & ~ends_here
+            alive_rank = alive.cumsum(dim=1) - 1
+            keep = alive & alive_rank.lt(num_beams)
+            flat_sources = (
+                torch.arange(batch, device=device).unsqueeze(1) * num_beams + source_beams
+            )
+            # 채택되지 않은 후보는 여분의 마지막 열로 흘려보내고 잘라 버립니다.
+            # scatter 의 목적지가 겹치지 않아야 하는데, 채택된 후보의 순위는
+            # 서로 다르므로 충돌이 없습니다.
+            spill = torch.where(keep, alive_rank, torch.full_like(alive_rank, num_beams))
+            width = num_beams + 1
+            score_buffer = torch.full((batch, width), float("-inf"), device=device)
+            source_buffer = torch.zeros((batch, width), dtype=torch.long, device=device)
+            token_buffer = torch.full((batch, width), eos_id, dtype=torch.long, device=device)
+            score_buffer.scatter_(1, spill, top_scores)
+            source_buffer.scatter_(1, spill, flat_sources)
+            token_buffer.scatter_(1, spill, new_tokens)
+            # (batch, num_beams) each, so making them contiguous costs the same
+            # allocation the previous implementation did up front, and keeps
+            # later view() calls valid.
+            next_scores = score_buffer[:, :num_beams].contiguous()
+            gather_flat = source_buffer[:, :num_beams].contiguous()
+            step_tokens = token_buffer[:, :num_beams].contiguous()
 
-            flat_index = gather_flat.view(-1)
+            # 완성 가설만 host 로 내립니다. 보통 step 당 0~2개이므로 한 번의
+            # 동기화로 끝나고, nonzero 는 row-major 라 (batch, 후보) 순서가
+            # 기존 이중 루프와 같습니다 — max() 의 동점 처리 순서가 유지됩니다.
+            finished = (finite & ends_here).nonzero(as_tuple=False)
+            if finished.numel():
+                finished_rows = finished[:, 0]
+                finished_scores = top_scores[finished_rows, finished[:, 1]].tolist()
+                finished_sources = flat_sources[finished_rows, finished[:, 1]].tolist()
+                eos_column = torch.tensor([eos_id], device=device)
+                for row, score, source in zip(
+                    finished_rows.tolist(),
+                    finished_scores,
+                    finished_sources,
+                    strict=True,
+                ):
+                    # 완성 가설 (BOS 제외한 생성 길이 = position+1)
+                    done[row].append(
+                        (
+                            penalized(score, position + 1),
+                            torch.cat((sequences[source], eos_column)),
+                        )
+                    )
+
+            flat_index = gather_flat.reshape(-1)
             # 살아남은 beam 의 순서에 맞게 문장 기록과 self KV cache 를 재배열합니다.
             # cross KV 는 encoder 출력에서 나온 것이라 같은 문장의 beam 끼리
             # 내용이 완전히 같습니다. beam 순서가 바뀌어도 값이 그대로이므로
             # 재배열하지 않습니다 (step 마다 수 MiB 를 복사하던 낭비였습니다).
             sequences = torch.cat(
-                (sequences.index_select(0, flat_index), step_tokens.view(-1, 1)), dim=1
+                (sequences.index_select(0, flat_index), step_tokens.reshape(-1, 1)), dim=1
             )
             for cache in caches:
                 cache["self"] = tuple(t.index_select(0, flat_index) for t in cache["self"])
@@ -1120,17 +1149,15 @@ class SionForConditionalGeneration(nn.Module):
 
             # 모든 문장이 '완성 가설이 충분하고, 살아있는 beam 이 더 나은 점수를
             # 낼 가능성이 없는' 상태면 일찍 종료합니다.
-            all_done = True
-            for b in range(batch):
-                if len(done[b]) < num_beams:
-                    all_done = False
-                    break
-                best_alive = float(beam_scores[b].max())
-                best_possible = penalized(best_alive, position + 1)
-                worst_kept = min(score for score, _ in done[b])
-                if best_possible > worst_kept:
-                    all_done = False
-                    break
+            all_done = all(len(hypotheses) >= num_beams for hypotheses in done)
+            if all_done:
+                # One reduction and one host transfer instead of one per row.
+                best_alive = beam_scores.amax(dim=1).tolist()
+                for row, hypotheses in enumerate(done):
+                    best_possible = penalized(best_alive[row], position + 1)
+                    if best_possible > min(score for score, _ in hypotheses):
+                        all_done = False
+                        break
             if (
                 _all_ranks_finished(all_done, device)
                 if self._synchronize_generation_across_ranks
