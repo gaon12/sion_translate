@@ -45,6 +45,8 @@ models/
 reports/
 comparison_outputs/
 glossary_input.json
+# Mined from the local game corpora, which are themselves not redistributed.
+glossary_mined.json
 *.log
 
 # Data acquisition helpers are intentionally kept local. The public project
