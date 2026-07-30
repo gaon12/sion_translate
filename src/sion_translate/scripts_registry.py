@@ -13,6 +13,7 @@ listing scripts explicitly.
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
+import re
 
 # Unicode ranges per script. Kept explicit rather than pulled from
 # unicodedata.name lookups, which are far slower per character.
@@ -69,6 +70,14 @@ LANGUAGE_SCRIPTS: dict[str, tuple[str, ...]] = {
     # 한본어: a code-mixed variety, so both writing systems are expected.
     "kj": ("hangul", "kana", "han"),
 }
+
+# Writing systems that do not separate words with spaces. A space between two
+# characters that both belong to such a script carries no information, so it is
+# a segmentation artifact from whatever tool produced the text. Hangul is not
+# listed: Korean does use inter-word spaces, and collapsing them changes meaning.
+SPACELESS_SCRIPTS: frozenset[str] = frozenset({"han", "kana", "thai"})
+
+_WHITESPACE_RUN = re.compile(r"\s+")
 
 
 def known_scripts() -> tuple[str, ...]:
@@ -147,6 +156,68 @@ def has_foreign_script(text: str, allowed: Iterable[str]) -> bool:
     return bool(foreign_scripts(text, allowed))
 
 
+def is_spaceless(script: str | None) -> bool:
+    """True when ``script`` writes words without separating spaces."""
+
+    return script in SPACELESS_SCRIPTS
+
+
+def collapse_spurious_spaces(text: str) -> str:
+    """Remove whitespace that sits between two characters of a spaceless script.
+
+    Morpheme-segmented corpora often arrive with the segmenter's spaces left in
+    (``甘い 香り が 鼻先 を``). Those spaces are not content, and a model trained on
+    them learns to emit them. Whitespace next to punctuation, digits or a
+    space-using script is left alone, because there it may well be intentional.
+    """
+
+    if not text:
+        return text
+
+    result: list[str] = []
+    index = 0
+    length = len(text)
+    while index < length:
+        match = _WHITESPACE_RUN.match(text, index)
+        if match is None:
+            result.append(text[index])
+            index += 1
+            continue
+        previous = script_of(result[-1]) if result else None
+        following = script_of(text[match.end()]) if match.end() < length else None
+        if is_spaceless(previous) and is_spaceless(following):
+            index = match.end()
+            continue
+        result.append(match.group())
+        index = match.end()
+    return "".join(result)
+
+
+def spurious_space_count(text: str) -> int:
+    """How many whitespace runs ``collapse_spurious_spaces`` would remove."""
+
+    if not text:
+        return 0
+    removed = 0
+    kept: list[str] = []
+    index = 0
+    length = len(text)
+    while index < length:
+        match = _WHITESPACE_RUN.match(text, index)
+        if match is None:
+            kept.append(text[index])
+            index += 1
+            continue
+        previous = script_of(kept[-1]) if kept else None
+        following = script_of(text[match.end()]) if match.end() < length else None
+        if is_spaceless(previous) and is_spaceless(following):
+            removed += 1
+        else:
+            kept.append(match.group())
+        index = match.end()
+    return removed
+
+
 def is_monolingual(text: str, allowed: Sequence[str]) -> bool:
     """True when ``text`` uses only permitted scripts and at least one of them."""
 
@@ -160,12 +231,16 @@ def is_monolingual(text: str, allowed: Sequence[str]) -> bool:
 __all__ = [
     "LANGUAGE_SCRIPTS",
     "SCRIPT_RANGES",
+    "SPACELESS_SCRIPTS",
+    "collapse_spurious_spaces",
     "foreign_scripts",
     "has_foreign_script",
     "is_monolingual",
+    "is_spaceless",
     "known_languages",
     "known_scripts",
     "resolve_scripts",
     "script_of",
     "scripts_in",
+    "spurious_space_count",
 ]

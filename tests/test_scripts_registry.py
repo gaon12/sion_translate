@@ -12,12 +12,16 @@ import pytest
 from sion_translate.scripts_registry import (
     LANGUAGE_SCRIPTS,
     SCRIPT_RANGES,
+    SPACELESS_SCRIPTS,
+    collapse_spurious_spaces,
     foreign_scripts,
     has_foreign_script,
     is_monolingual,
+    is_spaceless,
     known_languages,
     known_scripts,
     resolve_scripts,
+    spurious_space_count,
     script_of,
     scripts_in,
 )
@@ -130,3 +134,57 @@ def test_listing_helpers_are_sorted() -> None:
     assert known_languages() == tuple(sorted(known_languages()))
     assert "hangul" in known_scripts()
     assert "kj" in known_languages()
+
+
+def test_spaceless_scripts_exclude_hangul() -> None:
+    # Korean uses inter-word spaces, so collapsing them would change meaning.
+    assert not is_spaceless("hangul")
+    assert not is_spaceless("latin")
+    assert not is_spaceless(None)
+    assert is_spaceless("han")
+    assert is_spaceless("kana")
+    for script in SPACELESS_SCRIPTS:
+        assert script in SCRIPT_RANGES, script
+
+
+def test_collapse_removes_segmenter_spaces_inside_japanese() -> None:
+    assert collapse_spurious_spaces("甘い 香り が 鼻先 を") == "甘い香りが鼻先を"
+    assert collapse_spurious_spaces("鉄 原石 を 探す") == "鉄原石を探す"
+    # A full-width space is still a segmenter artifact.
+    assert collapse_spurious_spaces("報酬　もらいに　来た") == "報酬もらいに来た"
+
+
+def test_collapse_preserves_korean_word_boundaries() -> None:
+    assert collapse_spurious_spaces("철 원석을 찾는다") == "철 원석을 찾는다"
+    assert collapse_spurious_spaces("나는 강하다") == "나는 강하다"
+
+
+def test_collapse_preserves_spaces_next_to_non_spaceless_neighbours() -> None:
+    # Punctuation and digits carry no script, so the space may be intentional.
+    assert collapse_spurious_spaces("え？ 何？") == "え？ 何？"
+    assert collapse_spurious_spaces("鉄 3 個") == "鉄 3 個"
+    # Latin uses spaces, so a boundary with Latin must survive.
+    assert collapse_spurious_spaces("HP が 回復") == "HP が回復"
+    assert collapse_spurious_spaces("Mia 관장") == "Mia 관장"
+    # A mixed-script pair keeps the boundary the space-using side needs.
+    assert collapse_spurious_spaces("人間の 유리는 튼튼") == "人間の 유리는 튼튼"
+
+
+def test_collapse_is_idempotent_and_safe_on_edges() -> None:
+    once = collapse_spurious_spaces("甘い 香り が 鼻先 を")
+    assert collapse_spurious_spaces(once) == once
+    assert collapse_spurious_spaces("") == ""
+    assert collapse_spurious_spaces("   ") == "   "
+    assert collapse_spurious_spaces(" 香り") == " 香り"
+    assert collapse_spurious_spaces("香り ") == "香り "
+
+
+def test_spurious_space_count_matches_what_collapse_removes() -> None:
+    assert spurious_space_count("甘い 香り が 鼻先 を") == 4
+    assert spurious_space_count("철 원석을 찾는다") == 0
+    assert spurious_space_count("え？ 何？") == 0
+    assert spurious_space_count("HP が 回復") == 1
+    for text in ["甘い 香り が 鼻先 を", "HP が 回復", "철 원석을 찾는다", "", "  "]:
+        removed = spurious_space_count(text)
+        collapsed = collapse_spurious_spaces(text)
+        assert (removed > 0) == (collapsed != text), text
