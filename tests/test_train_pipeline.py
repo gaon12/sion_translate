@@ -18,8 +18,14 @@ from sion_translate.cli.train import (
     tokenizer_policy_problem,
     validate_training_capacity,
 )
-from sion_translate.config import AppConfig, config_from_raw
+from sion_translate.config import (
+    AppConfig,
+    ExperimentalConfig,
+    ModelConfig,
+    config_from_raw,
+)
 from sion_translate.fingerprint import file_sha256
+from sion_translate.model.transformer import SionForConditionalGeneration
 from sion_translate.training.distributed import DistributedContext
 from sion_translate.training.distributed import (
     fsdp_reduce_dtype,
@@ -202,25 +208,25 @@ def test_cuda_multi_gpu_fails_before_process_group_without_nccl(monkeypatch) -> 
 def test_fsdp2_registers_custom_generation_forward_methods(monkeypatch) -> None:
     from torch.distributed import fsdp as fsdp_api
 
-    class GeneratingModel(torch.nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.projection = torch.nn.Linear(2, 2)
-
-        def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-            return self.projection(inputs)
-
-        def generate(self, inputs: torch.Tensor) -> torch.Tensor:
-            return self.forward(inputs)
-
-        def sample(self, inputs: torch.Tensor) -> torch.Tensor:
-            return self.forward(inputs)
-
     class Policy:
         def __init__(self, **_kwargs: object) -> None:
             pass
 
-    model = GeneratingModel()
+    model = SionForConditionalGeneration(
+        ModelConfig(
+            vocab_size=32,
+            d_model=16,
+            encoder_layers=1,
+            decoder_layers=1,
+            num_heads=4,
+            num_kv_heads=2,
+            d_ff=32,
+            max_seq_len=16,
+            dropout=0.0,
+        )
+    )
+    encoder_layer = model.encoder_layers[0]
+    decoder_layer = model.decoder_layers[0]
     events: list[tuple[str, object]] = []
 
     def fully_shard(module: torch.nn.Module, **_kwargs: object) -> None:
@@ -253,10 +259,121 @@ def test_fsdp2_registers_custom_generation_forward_methods(monkeypatch) -> None:
     assert result is model
     assert model._synchronize_generation_across_ranks is True
     assert events == [
+        ("shard", encoder_layer),
+        ("shard", decoder_layer),
         ("shard", model),
+        ("project_cross_key_value", decoder_layer),
+        ("forward_step", decoder_layer),
         ("generate", model),
         ("sample", model),
     ]
+
+
+def test_fsdp2_cpu_gloo_forward_generate_and_sample_smoke(tmp_path: Path) -> None:
+    if not torch.distributed.is_available() or not torch.distributed.is_gloo_available():
+        pytest.skip("CPU FSDP2 smoke test requires torch.distributed with Gloo")
+    if torch.distributed.is_initialized():
+        pytest.skip("test requires ownership of the default process group")
+
+    rendezvous = (tmp_path / "fsdp2-rendezvous").resolve().as_uri()
+    torch.distributed.init_process_group(
+        backend="gloo",
+        init_method=rendezvous,
+        rank=0,
+        world_size=1,
+    )
+    try:
+        model = SionForConditionalGeneration(
+            ModelConfig(
+                vocab_size=32,
+                d_model=16,
+                encoder_layers=1,
+                decoder_layers=1,
+                num_heads=4,
+                num_kv_heads=2,
+                d_ff=32,
+                max_seq_len=16,
+                dropout=0.0,
+                label_smoothing=0.0,
+                z_loss_weight=0.0,
+                experimental=ExperimentalConfig(
+                    core_enabled=True,
+                    tetm_enabled=True,
+                ),
+            )
+        )
+        assert model.register_state is not None
+        assert model.typed_memory is not None
+        assert model.register_state.inject_gate.shape == (1,)
+        assert model.typed_memory.gate.shape == (1,)
+
+        context = DistributedContext(
+            rank=0,
+            local_rank=0,
+            world_size=1,
+            device=torch.device("cpu"),
+            distributed=True,
+            backend="gloo",
+        )
+        model = parallelize_model(
+            model,
+            context,
+            strategy="fsdp2",
+            precision="fp32",
+            reduce_dtype="fp32",
+            reshard_after_forward=True,
+            materialize_meta=False,
+        )
+
+        input_ids = torch.tensor([[4, 5, 3]])
+        attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+        decoder_input_ids = torch.tensor([[2, 6, 7]])
+        labels = torch.tensor([[6, 7, 3]])
+        memory_inputs = {
+            "memory_token_ids": torch.tensor([[[8, 9], [10, 0]]]),
+            "memory_mask": torch.tensor([[True, True]]),
+            "memory_type_ids": torch.tensor([[1, 8]]),
+            "memory_mode_ids": torch.tensor([[1, 4]]),
+        }
+
+        output = model(
+            input_ids,
+            attention_mask,
+            decoder_input_ids,
+            labels,
+            register_labels=torch.tensor([1]),
+            **memory_inputs,
+        )
+        assert output.loss is not None
+        assert torch.isfinite(output.loss)
+        output.loss.backward()
+        assert model.register_state.inject_gate.grad is not None
+        assert model.typed_memory.gate.grad is not None
+
+        generated = model.generate(
+            input_ids,
+            attention_mask,
+            bos_id=2,
+            eos_id=3,
+            max_new_tokens=3,
+            num_beams=1,
+            min_new_tokens=2,
+            **memory_inputs,
+        )
+        sampled = model.sample(
+            input_ids,
+            attention_mask,
+            bos_id=2,
+            eos_id=3,
+            num_samples=2,
+            max_new_tokens=3,
+            min_new_tokens=2,
+            **memory_inputs,
+        )
+        assert generated.shape == (1, 4)
+        assert sampled.shape == (1, 2, 4)
+    finally:
+        torch.distributed.destroy_process_group()
 
 
 def test_fsdp2_reports_missing_custom_forward_registration_api(

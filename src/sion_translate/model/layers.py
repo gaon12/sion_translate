@@ -400,6 +400,21 @@ class DecoderLayer(nn.Module):
         )
         return x + self.dropout(self.ffn(self.ffn_norm(x)))
 
+    def project_cross_key_value(
+        self,
+        encoder_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project reusable cross-attention state through this layer's FSDP unit.
+
+        Generation used to call ``cross_attn.project_key_value`` directly. When
+        this decoder layer is an FSDP2 child shard, that bypasses the layer's
+        pre-forward all-gather hook and leaves the projection weights as
+        DTensors. Exposing the operation on the owning layer lets the
+        distributed setup register it as a custom FSDP forward method.
+        """
+
+        return self.cross_attn.project_key_value(encoder_states)
+
     def forward_step(
         self,
         x: torch.Tensor,

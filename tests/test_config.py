@@ -3,10 +3,17 @@
 from __future__ import annotations
 
 import warnings
+from pathlib import Path
 
 import pytest
 
-from sion_translate.config import AppConfig, DataConfig, ExperimentalConfig, config_from_raw
+from sion_translate.config import (
+    AppConfig,
+    DataConfig,
+    ExperimentalConfig,
+    config_from_raw,
+    load_config,
+)
 
 
 def _warnings_from(config: ExperimentalConfig) -> list[str]:
@@ -46,6 +53,18 @@ def test_warns_when_core_is_enabled_without_register_loss_weight() -> None:
 
 def test_no_core_warning_with_default_register_loss_weight() -> None:
     assert _warnings_from(ExperimentalConfig(core_enabled=True)) == []
+
+
+def test_root_config_enables_experimental_modules_with_training_signal() -> None:
+    root_config = Path(__file__).resolve().parents[1] / "sion_translate.yaml"
+    experimental = load_config(root_config).model.experimental
+
+    assert experimental.bats_enabled is True
+    assert experimental.bats_coverage_weight > 0
+    assert experimental.core_enabled is True
+    assert experimental.register_loss_weight > 0
+    assert experimental.tetm_enabled is True
+    assert experimental.morphoscript_enabled is True
 
 
 def test_negative_loss_weight_is_still_an_error() -> None:

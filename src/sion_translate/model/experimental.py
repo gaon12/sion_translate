@@ -48,7 +48,10 @@ class ContentRegisterState(nn.Module):
         self.classifier = nn.Linear(d_model, register_classes)
         self.register_embeddings = nn.Embedding(register_classes, d_model)
         self.content_proj = nn.Linear(d_model, d_model, bias=False)
-        self.inject_gate = nn.Parameter(torch.zeros(()))
+        # FSDP2 cannot shard scalar parameters. A one-element vector has the
+        # same broadcast semantics against ``(batch, d_model)`` contexts while
+        # remaining a shardable parameter.
+        self.inject_gate = nn.Parameter(torch.zeros(1))
 
     def forward(
         self,
@@ -100,7 +103,10 @@ class TypedEntityMemory(nn.Module):
             norm_eps=norm_eps,
             rope=None,
         )
-        self.gate = nn.Parameter(torch.zeros(()))
+        # Keep this gate one-dimensional for FSDP2 compatibility. Shape ``(1,)``
+        # still broadcasts exactly like the former scalar over
+        # ``(batch, target_length, d_model)`` attention outputs.
+        self.gate = nn.Parameter(torch.zeros(1))
 
     def forward(
         self,

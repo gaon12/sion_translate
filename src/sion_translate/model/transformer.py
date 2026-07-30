@@ -563,7 +563,7 @@ class SionForConditionalGeneration(nn.Module):
                     register_labels=None,
                 )
             cross_key_values = tuple(
-                layer.cross_attn.project_key_value(encoder_states) for layer in self.decoder_layers
+                layer.project_cross_key_value(encoder_states) for layer in self.decoder_layers
             )
             return GenerationContext(
                 encoder_states=encoder_states,

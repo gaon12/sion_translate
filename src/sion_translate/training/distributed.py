@@ -210,8 +210,13 @@ def parallelize_model(
             model.to_empty(device=context.device)
             model.init_weights()
         # FSDP2 installs all-gather/reshard hooks on ``forward`` by default.
-        # Sion's post-training path invokes these custom root methods directly,
-        # so register them through the public API before any generation call.
+        # Cached decoding invokes custom methods on child DecoderLayer shards,
+        # so those methods must be registered on the parameter-owning child
+        # units as well as generate/sample on the root unit.
+        for module in model.modules():
+            if isinstance(module, DecoderLayer):
+                register_fsdp_forward_method(module, "project_cross_key_value")
+                register_fsdp_forward_method(module, "forward_step")
         for method_name in ("generate", "sample"):
             if hasattr(model, method_name):
                 register_fsdp_forward_method(model, method_name)
