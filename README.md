@@ -16,11 +16,24 @@ joint SentencePiece, GQA, RoPE, pre-RMSNorm, QK-norm, SwiGLU, EMA, 양방향 번
 
 Python 3.11 이상에서 설치합니다.
 
+Linux/macOS:
+
 ```bash
 python -m venv .venv
-python -m pip install -e ".[dev]"
-python -m pytest -q
+.venv/bin/python -m pip install -e ".[dev,export]"
+.venv/bin/python -m pytest -q
 ```
+
+Windows PowerShell:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e ".[dev,export]"
+.\.venv\Scripts\python.exe -m pytest -q
+```
+
+`export` extra는 기본 최종 산출물인 INT8과 GGUF 변환에 필요합니다. 요청한 포맷의
+의존성이 없으면 `sion-train`이 데이터 준비나 학습을 시작하기 전에 중단합니다.
 
 `data/`에 UTF-8 JSONL 파일을 하나 이상 둡니다. 파일 이름은 자유롭고, 빈 줄 없이
 한 줄에 한 번역쌍을 기록합니다.
@@ -34,12 +47,13 @@ python -m pytest -q
 있습니다. 실제 데이터는 `.gitignore`로 차단됩니다.
 
 ```bash
-python easy_run.py
+.venv/bin/python easy_run.py
 ```
 
 `easy_run.py`는 입력 JSONL과 실행 환경을 감지해 토크나이저 준비, 품질 필터링,
 중복 제거, split 생성, 모델 크기·배치·정밀도 선택, SFT와 사후학습, 체크포인트 재개를
-순서대로 처리합니다. 세부 GPU 서버 실행법은 [`how_to_run.txt`](how_to_run.txt),
+순서대로 처리합니다. 이 자동 실행기는 Linux CUDA GPU 서버용이며 CPU나 Windows에서는
+수동 CLI 경로를 사용해야 합니다. 세부 GPU 서버 실행법은 [`how_to_run.txt`](how_to_run.txt),
 사후학습 설계는 [`POSTTRAINING.md`](POSTTRAINING.md)를 참고하세요. H100
 단일·다중 GPU 용량 점검과 7종 내보내기는
 [`docs/H100_TRAINING.md`](docs/H100_TRAINING.md), 데이터 정비 현황과 1억 쌍

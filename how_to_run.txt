@@ -33,7 +33,7 @@ Vast.ai에서는 Python 3.11 이상과 CUDA용 PyTorch 2.8 이상이 들어 있�
 PyTorch 이미지를 사용하는 것이 가장 간단합니다.
 
 python3 -m pip install --upgrade pip
-python3 -m pip install -e ".[dev]"
+python3 -m pip install -e ".[dev,export]"
 
 python3 -c "import torch; assert torch.cuda.is_available(), 'CUDA를 찾지 못했습니다'; print('PyTorch:', torch.__version__, '| CUDA:', torch.version.cuda, '| GPU 수:', torch.cuda.device_count())"
 

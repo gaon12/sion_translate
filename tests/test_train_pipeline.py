@@ -12,6 +12,8 @@ from sion_translate.cli.train import (
     dataloader_runtime_kwargs,
     export_final_model,
     find_existing_checkpoint,
+    missing_final_export_dependencies,
+    preflight_final_export_dependencies,
     release_stage_resources,
     requires_ddp_unused_parameter_detection,
     shutdown_dataloader,
@@ -67,6 +69,29 @@ def test_dataloader_runtime_settings_separate_training_and_validation() -> None:
         "prefetch_factor": 2,
     }
     assert single_process == {"num_workers": 0, "pin_memory": False}
+
+
+def test_final_export_dependency_preflight_fails_before_training(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    available = {"torchao": False, "gguf": False}
+    monkeypatch.setattr(
+        train_module.importlib.util,
+        "find_spec",
+        lambda name: object() if available.get(name, True) else None,
+    )
+
+    assert missing_final_export_dependencies(["fp32", "transformers"]) == {}
+    assert missing_final_export_dependencies(["int8", "gguf_q4_k_m"]) == {
+        "int8": "torchao",
+        "gguf_q4_k_m": "gguf-python",
+    }
+    with pytest.raises(RuntimeError, match=r"int8.*torchao.*gguf_q4_k_m.*gguf-python"):
+        preflight_final_export_dependencies(["int8", "gguf_q4_k_m"])
+
+    available["torchao"] = True
+    available["gguf"] = True
+    preflight_final_export_dependencies(["int8", "gguf_q4_k_m"])
 
 
 def test_stage_release_stops_persistent_workers_on_cpu() -> None:

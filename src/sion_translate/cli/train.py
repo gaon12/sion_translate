@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import copy
 import gc
+import importlib.util
 import math
 import random
 from pathlib import Path
@@ -71,6 +72,43 @@ from sion_translate.training.trainer import announce, train
 from sion_translate.performance import build_cpu_plan
 
 DEFAULT_CONFIG_FILE = "sion_translate.yaml"
+FINAL_EXPORT_DEPENDENCIES = {
+    "int8": ("torchao", "torchao"),
+    "gguf_q4_k_m": ("gguf", "gguf-python"),
+}
+
+
+def missing_final_export_dependencies(formats: list[str] | tuple[str, ...]) -> dict[str, str]:
+    """Return requested final formats whose optional modules are unavailable."""
+
+    missing: dict[str, str] = {}
+    for format_name in formats:
+        dependency = FINAL_EXPORT_DEPENDENCIES.get(format_name)
+        if dependency is None:
+            continue
+        module_name, distribution_name = dependency
+        try:
+            available = importlib.util.find_spec(module_name) is not None
+        except (ImportError, ModuleNotFoundError, ValueError):
+            available = False
+        if not available:
+            missing[format_name] = distribution_name
+    return missing
+
+
+def preflight_final_export_dependencies(formats: list[str] | tuple[str, ...]) -> None:
+    """Fail before data preparation or training when strict export cannot finish."""
+
+    missing = missing_final_export_dependencies(formats)
+    if not missing:
+        return
+    details = ", ".join(f"{format_name} → {package}" for format_name, package in missing.items())
+    raise RuntimeError(
+        "요청한 최종 export 포맷의 의존성이 없습니다: "
+        f"{details}. 장기 학습을 시작하기 전에 "
+        'python -m pip install -e ".[export]" 로 설치하거나 '
+        "training.final_export_formats에서 해당 포맷을 제거하세요."
+    )
 
 
 def scan_configured_raw_data(
@@ -587,6 +625,8 @@ def main() -> None:
         announce(f"준비 ②: 설정 로드 — {source}", context)
 
         # ── 단계 ③: 원천 데이터 인식 + 토크나이저/데이터셋 자동 준비 ──
+        if not args.prepare_only:
+            preflight_final_export_dependencies(config.training.final_export_formats)
         announce("준비 ③: 원천 데이터를 확인합니다.", context)
         ensure_artifacts(config, context)
         if args.prepare_only:
