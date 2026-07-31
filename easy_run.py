@@ -23,44 +23,47 @@ import yaml
 ROOT = Path(__file__).resolve().parent
 PERSISTENT_ARTIFACTS = ROOT / "artifacts"
 MIN_RAM_HEADROOM = 8 * 2**30
-TMUX_SESSION = "sion"
 
 
-def _install_tmux() -> None:
-    """Install tmux on the root-based Debian/Ubuntu images commonly used by Vast.ai."""
+def _tmux_session_name() -> str:
+    """Return a stable session name that cannot collide with another checkout."""
 
-    if shutil.which("tmux"):
-        return
-    apt_get = shutil.which("apt-get")
-    if apt_get is None:
-        raise SystemExit("tmux가 없고 apt-get도 찾지 못했습니다. tmux를 설치한 뒤 다시 실행하세요.")
-    command_prefix: list[str] = []
-    if hasattr(os, "geteuid") and os.geteuid() != 0:
-        sudo = shutil.which("sudo")
-        if sudo is None:
-            raise SystemExit(
-                "tmux 설치에 root 권한이 필요하지만 sudo가 없습니다. "
-                "관리자 권한으로 tmux를 설치하세요."
-            )
-        command_prefix = [sudo]
-    print("[easy_run] tmux가 없어 자동으로 설치합니다.", flush=True)
-    subprocess.run([*command_prefix, apt_get, "update"], check=True)
-    subprocess.run([*command_prefix, apt_get, "install", "-y", "tmux"], check=True)
-    if not shutil.which("tmux"):
-        raise SystemExit("tmux 설치 명령은 끝났지만 실행 파일을 찾지 못했습니다.")
+    identity = hashlib.sha256(str(ROOT.resolve()).encode("utf-8")).hexdigest()[:8]
+    return f"sion-{identity}"
+
+
+def _install_tmux() -> str | None:
+    """Return an existing tmux binary without mutating the host system."""
+
+    tmux = shutil.which("tmux")
+    if tmux is None:
+        print(
+            "[easy_run] tmux가 없어 현재 프로세스에서 계속합니다. "
+            "지속 세션이 필요하면 tmux를 설치하거나 nohup/Slurm을 사용하세요.",
+            flush=True,
+        )
+    return tmux
 
 
 def _enter_tmux() -> None:
     """Re-exec easy_run inside a durable tmux session when launched interactively."""
 
-    if os.name == "nt" or os.environ.get("TMUX") or os.environ.get("SION_TMUX_ACTIVE") == "1":
+    if (
+        os.name == "nt"
+        or os.environ.get("TMUX")
+        or os.environ.get("SION_TMUX_ACTIVE") == "1"
+        or os.environ.get("SION_NO_TMUX") == "1"
+        or not sys.stdin.isatty()
+        or not sys.stdout.isatty()
+    ):
         return
-    _install_tmux()
-    tmux = shutil.which("tmux")
-    assert tmux is not None
+    tmux = _install_tmux()
+    if tmux is None:
+        return
+    session = _tmux_session_name()
     existing = (
         subprocess.run(
-            [tmux, "has-session", "-t", TMUX_SESSION],
+            [tmux, "has-session", "-t", session],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=False,
@@ -69,14 +72,14 @@ def _enter_tmux() -> None:
     )
     if existing:
         print(
-            f"[easy_run] 기존 tmux 세션 '{TMUX_SESSION}'에 재접속합니다. "
-            f"나중에는 tmux attach -t {TMUX_SESSION}",
+            f"[easy_run] 기존 tmux 세션 '{session}'에 재접속합니다. "
+            f"나중에는 tmux attach -t {session}",
             flush=True,
         )
-        os.execv(tmux, [tmux, "attach-session", "-t", TMUX_SESSION])
+        os.execv(tmux, [tmux, "attach-session", "-t", session])
 
     print(
-        f"[easy_run] tmux 세션 '{TMUX_SESSION}'을 만들고 학습을 시작합니다. 분리: Ctrl+B, D",
+        f"[easy_run] tmux 세션 '{session}'을 만들고 학습을 시작합니다. 분리: Ctrl+B, D",
         flush=True,
     )
     environment = os.environ.copy()
@@ -87,7 +90,7 @@ def _enter_tmux() -> None:
             tmux,
             "new-session",
             "-s",
-            TMUX_SESSION,
+            session,
             shlex.join([sys.executable, str(Path(__file__).resolve())]),
         ],
         environment,
@@ -117,11 +120,22 @@ def _atomic_sync_directory(source: Path, destination: Path) -> None:
     backup = destination.with_name(f".{destination.name}.previous-{os.getpid()}")
     shutil.rmtree(temporary, ignore_errors=True)
     shutil.rmtree(backup, ignore_errors=True)
-    shutil.copytree(source, temporary)
-    if destination.exists():
-        destination.replace(backup)
-    temporary.replace(destination)
-    shutil.rmtree(backup, ignore_errors=True)
+    published = False
+    try:
+        shutil.copytree(source, temporary)
+        if destination.exists():
+            destination.replace(backup)
+        try:
+            temporary.replace(destination)
+            published = True
+        except BaseException:
+            if backup.exists() and not destination.exists():
+                backup.replace(destination)
+            raise
+    finally:
+        shutil.rmtree(temporary, ignore_errors=True)
+        if published:
+            shutil.rmtree(backup, ignore_errors=True)
 
 
 def _ram_workspace(required_bytes: int) -> Path | None:
@@ -165,6 +179,21 @@ def _generated_config(raw_dir: Path, artifacts_dir: Path) -> Path:
 def _run(command: list[str], env: dict[str, str]) -> None:
     print("[easy_run] 실행:", " ".join(command), flush=True)
     subprocess.run(command, cwd=ROOT, env=env, check=True)
+
+
+def _validate_gpu_runtime(torch_module) -> tuple[int, tuple[str, ...]]:
+    """Fail before preprocessing when the CUDA runtime cannot launch training."""
+
+    gpu_count = int(torch_module.cuda.device_count())
+    if not torch_module.cuda.is_available() or gpu_count < 1:
+        raise SystemExit("CUDA GPU를 찾지 못했습니다. CUDA 지원 PyTorch 환경을 확인하세요.")
+    if gpu_count > 1 and not torch_module.distributed.is_nccl_available():
+        raise SystemExit(
+            f"CUDA GPU {gpu_count}개를 찾았지만 PyTorch에 NCCL 지원이 없습니다. "
+            "다중 GPU용 CUDA PyTorch 패키지를 설치하세요."
+        )
+    names = tuple(sorted({torch_module.cuda.get_device_name(index) for index in range(gpu_count)}))
+    return gpu_count, names
 
 
 def _check_shard_keys(env: dict[str, str]) -> None:
@@ -296,9 +325,7 @@ def main() -> None:
 
     import torch
 
-    gpu_count = torch.cuda.device_count()
-    if gpu_count < 1:
-        raise SystemExit("CUDA GPU를 찾지 못했습니다. H100 CUDA 환경에서 실행하세요.")
+    gpu_count, gpu_names = _validate_gpu_runtime(torch)
 
     source_data = ROOT / "data"
     raw_files = list(source_data.glob("*.jsonl"))
@@ -367,7 +394,7 @@ def main() -> None:
             "--config",
             str(generated_config),
         ]
-        print(f"[easy_run] H100 GPU {gpu_count}개로 학습을 시작합니다.")
+        print(f"[easy_run] CUDA GPU {gpu_count}개({', '.join(gpu_names)})로 학습을 시작합니다.")
         _run(command, env)
     finally:
         generated_config.unlink(missing_ok=True)
