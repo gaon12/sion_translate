@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import random
 from pathlib import Path
 
@@ -8,7 +9,7 @@ import pytest
 import torch
 
 import sion_translate.training.checkpoint as checkpoint_module
-from sion_translate.config import ExperimentalConfig, ModelConfig
+from sion_translate.config import DataConfig, ExperimentalConfig, ModelConfig
 from sion_translate.model import SionForConditionalGeneration
 from sion_translate.training.checkpoint import (
     CHECKPOINT_SCHEMA,
@@ -153,6 +154,65 @@ def test_checkpoint_identity_mismatch_fails_before_model_mutation(tmp_path: Path
         )
 
     torch.testing.assert_close(model.token_embedding.weight, before_load)
+
+
+def _identity_fixture(root: Path, *, approximate_split: bool = True) -> dict:
+    tokenizer = root / "artifacts" / "tokenizer" / "sion.model"
+    dataset = root / "artifacts" / "dataset"
+    tokenizer.parent.mkdir(parents=True)
+    dataset.mkdir(parents=True)
+    tokenizer.write_bytes(b"portable tokenizer")
+    (dataset / "manifest.json").write_text('{"format":"test"}\n', encoding="utf-8")
+    (dataset / "raw_fingerprint.json").write_text(
+        '{"schema":"test","sha256":"abc"}\n',
+        encoding="utf-8",
+    )
+    data_config = DataConfig(
+        raw_dir=str(root / "data"),
+        tokenizer_model=str(tokenizer),
+        tokenizer_features=str(tokenizer.parent / "token_features.npz"),
+        dataset_dir=str(dataset),
+        approximate_split=approximate_split,
+    )
+    return checkpoint_module.build_checkpoint_identity(
+        model_config=ModelConfig(vocab_size=64),
+        tokenizer_path=tokenizer,
+        token_features_path=None,
+        dataset_dir=dataset,
+        data_config=data_config,
+    )
+
+
+def test_checkpoint_identity_ignores_runtime_storage_locations(tmp_path: Path) -> None:
+    disk_identity = _identity_fixture(tmp_path / "disk")
+    ram_identity = _identity_fixture(tmp_path / "dev-shm")
+
+    assert disk_identity == ram_identity
+
+
+def test_legacy_path_bearing_identity_normalizes_during_resume(tmp_path: Path) -> None:
+    expected = _identity_fixture(tmp_path / "current")
+    legacy = deepcopy(expected)
+    legacy_config = legacy["data"]["config"]
+    legacy_config.update(
+        {
+            "raw_dir": "/dev/shm/sion/data",
+            "tokenizer_model": "/dev/shm/sion/artifacts/tokenizer/sion.model",
+            "tokenizer_features": "/dev/shm/sion/artifacts/tokenizer/token_features.npz",
+            "dataset_dir": "/dev/shm/sion/artifacts/dataset",
+        }
+    )
+    legacy["data"]["config_sha256"] = "legacy-path-dependent-hash"
+
+    checkpoint_module._validate_identity({"identity": legacy}, expected)
+
+
+def test_checkpoint_identity_still_rejects_semantic_data_changes(tmp_path: Path) -> None:
+    expected = _identity_fixture(tmp_path / "expected", approximate_split=True)
+    incompatible = _identity_fixture(tmp_path / "incompatible", approximate_split=False)
+
+    with pytest.raises(ValueError, match="identity does not match"):
+        checkpoint_module._validate_identity({"identity": incompatible}, expected)
 
 
 def test_local_checkpoint_restores_python_numpy_and_torch_rng(tmp_path: Path) -> None:

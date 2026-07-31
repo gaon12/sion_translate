@@ -35,6 +35,14 @@ from .distributed import DistributedContext, barrier
 CHECKPOINT_SCHEMA = "sion-training-checkpoint-v2"
 CHECKPOINT_IDENTITY_SCHEMA = "sion-checkpoint-identity-v1"
 DCP_COMPLETION_FILENAME = ".sion_checkpoint_complete.json"
+RUNTIME_DATA_PATH_FIELDS = frozenset(
+    {
+        "raw_dir",
+        "tokenizer_model",
+        "tokenizer_features",
+        "dataset_dir",
+    }
+)
 
 
 def _json_compatible(value: Any) -> Any:
@@ -96,6 +104,17 @@ def _file_identity(path: Path) -> dict[str, Any]:
     return identity
 
 
+def _portable_data_config(data_config: Any) -> Any:
+    """Remove storage locations while retaining every semantic data setting."""
+
+    payload = _json_compatible(data_config)
+    if not isinstance(payload, Mapping):
+        return payload
+    return {
+        key: value for key, value in payload.items() if str(key) not in RUNTIME_DATA_PATH_FIELDS
+    }
+
+
 def build_checkpoint_identity(
     *,
     model_config: Any,
@@ -110,13 +129,13 @@ def build_checkpoint_identity(
     """Build a portable identity for the model, tokenizer, and prepared data.
 
     File identities use portable names and content hashes. The effective
-    model/data configuration is retained verbatim, including any explicitly
-    configured paths, so a changed run layout must be acknowledged as a new run
-    instead of silently resuming with different artifacts.
+    model/data configuration retains semantic preprocessing and sampling fields,
+    while runtime-only artifact locations are excluded so an identical run can
+    move between ``/dev/shm`` and persistent storage.
     """
 
     model_payload = _json_compatible(model_config)
-    data_payload = _json_compatible(data_config) if data_config is not None else None
+    data_payload = _portable_data_config(data_config) if data_config is not None else None
     dataset_path = Path(dataset_dir)
     tokenizer_model_path = Path(tokenizer_path)
     data_identity: dict[str, Any] = {
@@ -153,6 +172,24 @@ def build_checkpoint_identity(
         },
         "data": data_identity,
     }
+
+
+def _normalize_identity_for_comparison(identity: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize legacy path-bearing identities to the portable representation."""
+
+    payload = _json_compatible(identity)
+    data_identity = payload.get("data")
+    if not isinstance(data_identity, dict):
+        return payload
+    data_config = data_identity.get("config")
+    if data_config is None:
+        return payload
+    portable_config = _portable_data_config(data_config)
+    data_identity["config"] = portable_config
+    data_identity["config_sha256"] = hashlib.sha256(
+        _canonical_json(portable_config).encode("utf-8")
+    ).hexdigest()
+    return payload
 
 
 def _identity_differences(expected: Any, actual: Any, path: str = "identity") -> list[str]:
@@ -203,8 +240,8 @@ def _validate_identity(
         return
     if not isinstance(stored_identity, Mapping):
         raise ValueError("checkpoint identity must be an object")
-    expected = _json_compatible(expected_identity)
-    actual = _json_compatible(stored_identity)
+    expected = _normalize_identity_for_comparison(expected_identity)
+    actual = _normalize_identity_for_comparison(stored_identity)
     if expected != actual:
         differences = _identity_differences(expected, actual)
         detail = ", ".join(differences) if differences else "unknown fields"
