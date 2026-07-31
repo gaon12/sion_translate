@@ -535,6 +535,9 @@ def ensure_artifacts(config: AppConfig, context: DistributedContext) -> None:
                     tokenizer_path.parent,
                     vocab_size=vocab_size,
                     language_pairs=config.data.configured_language_pairs(),
+                    approximate_split=config.data.approximate_split,
+                    source_only_languages=config.data.configured_source_only_languages(),
+                    train_only_prefixes=config.data.configured_synthetic_prefixes(),
                     num_workers=cpu_plan.preprocess_workers,
                     num_threads=cpu_plan.sentencepiece_threads,
                 )

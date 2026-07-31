@@ -27,6 +27,12 @@ from sion_translate.splitting import (
     endpoint_split_digest,
     endpoint_split_key,
 )
+from sion_translate.synthetic import (
+    DEFAULT_SYNTHETIC_PREFIXES,
+    normalize_synthetic_prefixes,
+    synthetic_path,
+    synthetic_record,
+)
 
 
 DEFAULT_LANGUAGE_PAIR = ("ko", "ja")
@@ -216,9 +222,25 @@ def expand_inputs(patterns: Sequence[str]) -> list[Path]:
 
 
 def _filter_text_batch(
-    batch: tuple[list[bytes], tuple[tuple[str, str], ...], float, float],
+    batch: tuple[
+        list[bytes],
+        tuple[tuple[str, str], ...],
+        float,
+        float,
+        bool,
+        frozenset[str],
+        bool,
+    ],
 ) -> list[tuple[str, str, str, bytes, bytes]]:
-    lines, language_pairs, validation_fraction, test_fraction = batch
+    (
+        lines,
+        language_pairs,
+        validation_fraction,
+        test_fraction,
+        approximate_split,
+        source_only_languages,
+        source_is_synthetic,
+    ) = batch
     policy = QualityPolicy()
     accepted: list[tuple[str, str, str, bytes, bytes]] = []
     for raw_line in lines:
@@ -230,20 +252,43 @@ def _filter_text_batch(
         expansion = expand_parallel_record(row, language_pairs)
         for pair in expansion.pairs:
             text_a, text_b = canonical_text(pair.text_a), canonical_text(pair.text_b)
-            languages = (pair.language_a, pair.language_b)
+            language_a, language_b = pair.language_a, pair.language_b
+            languages = (language_a, language_b)
             if not assess_pair(text_a, text_b, policy, languages=languages).accepted:
                 continue
-            if len(language_pairs) > 1:
+            if language_b in source_only_languages:
+                language_a, language_b = language_b, language_a
+                text_a, text_b = text_b, text_a
+            if source_is_synthetic or synthetic_record(row):
+                split = "train"
+            elif len(language_pairs) > 1:
                 candidate_key = f"record\0{record_group_key}"
+                split = choose_split_for_key(
+                    candidate_key,
+                    validation_fraction,
+                    test_fraction,
+                )
             else:
-                candidate_key = endpoint_split_key(pair.language_a, text_a)
-            split = choose_split_for_key(
-                candidate_key,
-                validation_fraction,
-                test_fraction,
+                candidate_key = endpoint_split_key(
+                    language_a,
+                    text_a,
+                    approximate=approximate_split,
+                )
+                split = choose_split_for_key(
+                    candidate_key,
+                    validation_fraction,
+                    test_fraction,
+                )
+            source_digest = endpoint_split_digest(
+                language_a,
+                text_a,
+                approximate=approximate_split,
             )
-            source_digest = endpoint_split_digest(pair.language_a, text_a)
-            target_digest = endpoint_split_digest(pair.language_b, text_b)
+            target_digest = endpoint_split_digest(
+                language_b,
+                text_b,
+                approximate=approximate_split,
+            )
             accepted.append((text_a, text_b, split, source_digest, target_digest))
     return accepted
 
@@ -255,10 +300,10 @@ def _raw_batches(paths: Sequence[Path], batch_size: int = 512):
             for raw_line in handle:
                 batch.append(raw_line)
                 if len(batch) >= batch_size:
-                    yield batch
+                    yield path, batch
                     batch = []
             if batch:
-                yield batch
+                yield path, batch
 
 
 def iter_parallel_text(
@@ -268,6 +313,9 @@ def iter_parallel_text(
     test_fraction: float = 0.005,
     language_pair: Sequence[str] = DEFAULT_LANGUAGE_PAIR,
     language_pairs: Sequence[Sequence[str]] | None = None,
+    approximate_split: bool = False,
+    source_only_languages: Sequence[str] = (),
+    train_only_prefixes: Sequence[str] = DEFAULT_SYNTHETIC_PREFIXES,
     num_workers: int | None = None,
 ) -> Iterator[str]:
     """Yield train-partition text without first materializing a temporary corpus."""
@@ -278,9 +326,28 @@ def iter_parallel_text(
     target_split_guard = TargetSplitGuard(estimated_pairs, validation_fraction, test_fraction)
     workers = num_workers or build_cpu_plan(input_files=len(paths)).preprocess_workers
     normalized_pairs = normalize_language_pairs(language_pair, language_pairs)
+    languages = frozenset(languages_from_pairs(normalized_pairs))
+    source_only = frozenset(str(language) for language in source_only_languages)
+    unknown_source_only = sorted(source_only - languages)
+    if unknown_source_only:
+        raise ValueError(
+            "source_only_languages must appear in the configured language pairs; "
+            f"{unknown_source_only} do not"
+        )
+    if any(set(pair) <= source_only for pair in normalized_pairs):
+        raise ValueError("both sides of a language pair cannot be source-only")
+    synthetic_prefixes = normalize_synthetic_prefixes(train_only_prefixes)
     inputs = (
-        (batch, normalized_pairs, validation_fraction, test_fraction)
-        for batch in _raw_batches(paths)
+        (
+            batch,
+            normalized_pairs,
+            validation_fraction,
+            test_fraction,
+            approximate_split,
+            source_only,
+            synthetic_path(path, synthetic_prefixes),
+        )
+        for path, batch in _raw_batches(paths)
     )
     if workers <= 1:
         results = map(_filter_text_batch, inputs)
@@ -420,6 +487,9 @@ def corpus_character_counts(
     language_pairs: Sequence[Sequence[str]],
     validation_fraction: float = 0.005,
     test_fraction: float = 0.005,
+    approximate_split: bool = False,
+    source_only_languages: Sequence[str] = (),
+    train_only_prefixes: Sequence[str] = DEFAULT_SYNTHETIC_PREFIXES,
     num_workers: int | None = None,
 ) -> Counter[str]:
     """Count every character in the training partition of ``paths``."""
@@ -430,6 +500,9 @@ def corpus_character_counts(
         validation_fraction=validation_fraction,
         test_fraction=test_fraction,
         language_pairs=language_pairs,
+        approximate_split=approximate_split,
+        source_only_languages=source_only_languages,
+        train_only_prefixes=train_only_prefixes,
         num_workers=num_workers,
     ):
         counts.update(text)
@@ -481,6 +554,9 @@ def train_tokenizer(
     test_fraction: float = 0.005,
     language_pair: Sequence[str] = DEFAULT_LANGUAGE_PAIR,
     language_pairs: Sequence[Sequence[str]] | None = None,
+    approximate_split: bool = False,
+    source_only_languages: Sequence[str] = (),
+    train_only_prefixes: Sequence[str] = DEFAULT_SYNTHETIC_PREFIXES,
     num_workers: int | None = None,
     num_threads: int | None = None,
     split_digits: bool = True,
@@ -520,6 +596,9 @@ def train_tokenizer(
             language_pairs=normalized_pairs,
             validation_fraction=validation_fraction,
             test_fraction=test_fraction,
+            approximate_split=approximate_split,
+            source_only_languages=source_only_languages,
+            train_only_prefixes=train_only_prefixes,
             num_workers=workers,
         )
         required_characters = required_characters_from_counts(
@@ -545,6 +624,9 @@ def train_tokenizer(
             validation_fraction=validation_fraction,
             test_fraction=test_fraction,
             language_pairs=normalized_pairs,
+            approximate_split=approximate_split,
+            source_only_languages=source_only_languages,
+            train_only_prefixes=train_only_prefixes,
             num_workers=workers,
         ),
         model_prefix=str(model_prefix),

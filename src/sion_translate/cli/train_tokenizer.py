@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 
 from sion_translate.console import configure_stdio
+from sion_translate.synthetic import DEFAULT_SYNTHETIC_PREFIXES
 from sion_translate.tokenizer import train_tokenizer
 
 
@@ -50,6 +51,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="여러 언어쌍을 학습할 때 반복 지정",
     )
     parser.add_argument(
+        "--approximate-split",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="데이터 준비와 같은 MinHash 근사 중복 split 정책을 사용합니다 (기본: 활성)",
+    )
+    parser.add_argument(
+        "--exact-split",
+        action="store_false",
+        dest="approximate_split",
+        help="과거 실험 재현용 완전일치 split",
+    )
+    parser.add_argument(
+        "--source-only-language",
+        nargs="+",
+        default=[],
+        metavar="LANG",
+        help="원문으로만 사용할 언어. 데이터 준비 설정과 같아야 합니다",
+    )
+    parser.add_argument(
+        "--train-only-prefix",
+        nargs="+",
+        default=list(DEFAULT_SYNTHETIC_PREFIXES),
+        metavar="PREFIX",
+        help="합성 입력 파일을 train 전용으로 판정할 접두어",
+    )
+    parser.add_argument(
         "--no-split-digits",
         dest="split_digits",
         action="store_false",
@@ -75,6 +102,9 @@ def main() -> None:
         test_fraction=args.test_fraction,
         language_pair=args.language_pair,
         language_pairs=args.language_pairs,
+        approximate_split=args.approximate_split,
+        source_only_languages=args.source_only_language,
+        train_only_prefixes=args.train_only_prefix,
         num_workers=args.workers,
         num_threads=args.threads,
         split_digits=args.split_digits,
