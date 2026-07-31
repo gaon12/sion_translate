@@ -49,6 +49,40 @@ PY
 2026-07-31 기준 **8,977,552행 / 50 shard**입니다. 숫자가 크게 다르면 코퍼스
 업로드가 덜 끝난 것입니다.
 
+### 키 이름 확인 — 반드시 하십시오
+
+행 수가 맞아도 학습에 안 들어갈 수 있습니다. JSONL의 키 이름이 설정된 언어와
+다르면 그 파일은 **0문장**을 내놓고 로그에 아무 말도 남지 않습니다.
+
+```bash
+python scripts/data/check_shard_keys.py
+```
+
+종료코드가 0이 아니면 그 파일은 학습에서 빠집니다. 실제로 `data40.jsonl`이
+키를 `한국어`/`일본어`로 써서 10,075행이 통째로 빠지는 상태였습니다.
+
+고치는 방법은 **JSONL의 키를 바꾸는 것 하나뿐**입니다. 언어쌍에 추가하는 것은
+불가능합니다 — 언어 키는 1~16자 ASCII 영숫자여야 하므로 `한국어`는 언어 키가
+될 수 없습니다.
+
+```bash
+python - <<'PY'
+import io, json
+src, dst = "data/data40.jsonl", "data/data40.fixed.jsonl"
+with io.open(src, encoding="utf-8-sig") as fin, io.open(dst, "w", encoding="utf-8", newline="\n") as fout:
+    for line in fin:
+        line = line.strip()
+        if not line:
+            continue
+        row = json.loads(line)
+        fout.write(json.dumps({"ko": row["한국어"], "ja": row["일본어"]}, ensure_ascii=False) + "\n")
+print("wrote", dst)
+PY
+```
+
+바꾼 뒤 `check_shard_keys.py`를 다시 돌려 0이 나오는지 보고, 원본은 지우거나
+`data/` 밖으로 옮기십시오. 둘 다 남으면 같은 내용이 중복 학습됩니다.
+
 ## 3. 토크나이저
 
 ```bash
