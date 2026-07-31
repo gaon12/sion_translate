@@ -226,7 +226,32 @@ greedy). MRT 생성 시간이 늘어납니다.
 끄고 싶다면 `roundtrip_enabled: false`로 바꾸고, 남은 7개 성분의 가중치 합이
 달라진다는 점만 유의하십시오(정규화되므로 비율은 유지됩니다).
 
-## 8. 평가
+## 8. 산출물 위치
+
+```
+runs/auto/
+├── pretrain/
+│   ├── checkpoints/      best / latest / final
+│   └── exports/best/     fp32 fp16 bf16 int8 int4 gguf_q4_k_m transformers
+└── posttrain/            MRT 사후학습
+    ├── checkpoints/
+    └── exports/best/
+artifacts/
+├── tokenizer/            sion.model, token_features.npz
+└── dataset/              전처리된 indexed 데이터
+```
+
+`posttraining.enabled`가 true이므로 **최종 산출물은
+`runs/auto/posttrain/exports/best/`** 입니다. `pretrain/` 쪽은 MRT 이전
+단계이고 비교할 때만 씁니다.
+
+체크포인트는 `best`(validation 기준), `latest`(재시작용), `final`(마지막 step)
+입니다. 쓸 것은 `best`입니다.
+
+가중치를 가져갈 때는 **토크나이저를 반드시 함께** 가져가십시오. vocab이
+맞지 않으면 가중치만으로는 아무것도 못 합니다.
+
+## 9. 평가
 
 ```bash
 sion-evaluate --help
@@ -243,7 +268,7 @@ sion-translate --help
 beam은 4를 쓰십시오. 실측에서 1→2→4가 chrF 77.28→77.36→77.50이고 16에서
 심한 반복 붕괴가 일어났습니다.
 
-## 9. 되돌아볼 만한 실패 지점
+## 10. 되돌아볼 만한 실패 지점
 
 - 토크나이저를 다시 만들면 `artifacts/dataset`과 체크포인트를 재사용할 수
   없습니다. 3~5단계를 순서대로 다시 돌려야 합니다.
@@ -251,7 +276,7 @@ beam은 4를 쓰십시오. 실측에서 1→2→4가 chrF 77.28→77.36→77.50�
   나옵니다. yaml 주석 처리된 예시를 실제로 풀어야 합니다.
 - `approximate_split`을 끄면 홀드아웃 점수가 번역 품질을 재지 않습니다.
 
-## 10. 선택 사항 — exposure bias
+## 11. 선택 사항 — exposure bias
 
 `data.decoder_input_noise`가 0(꺼짐)입니다. teacher forcing이 정답 접두사만
 보여 주는 문제의 본학습 단계 대책인데, 디코더 조건부를 바꾸는 개입이라
