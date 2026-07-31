@@ -1,123 +1,113 @@
-Vast.ai 터미널에서 학습 실행하기
+sion_translate.zip을 GPU 서버에서 실행하는 방법
 
-프로젝트와 data/*.jsonl 파일을 Vast.ai 인스턴스에 올린 상태를 기준으로 합니다.
-아래 명령은 모두 프로젝트 루트에서 실행하세요.
+전제
+----
 
-권장 한 줄 실행 (H100, 자동 RAM 디스크/CPU/GPU 설정):
+- ZIP에는 프로젝트와 data/*.jsonl, data/evaluation_only가 함께 들어 있습니다.
+- data/excluded, 과거 artifacts/runs/checkpoint는 의도적으로 들어 있지 않습니다.
+- Python 3.11 또는 3.12, NVIDIA 드라이버와 CUDA 지원 PyTorch 2.8 이상을
+  권장합니다.
+
+
+1. ZIP 검증과 압축 해제
+-----------------------
+
+배포자가 전달한 SHA-256과 첫 명령의 출력이 같은지 확인하세요.
+
+sha256sum sion_translate.zip
+python3 -m zipfile -t sion_translate.zip
+unzip sion_translate.zip
+cd sion_translate
+python3 scripts/package_gpu_bundle.py verify-tree .
+
+검증이 실패하면 파일이 빠졌거나 전송 중 손상된 것이므로 진행하지 마세요.
+
+
+2. 패키지 설치와 CUDA 확인
+--------------------------
+
+nvidia-smi
+python3 -m pip install --upgrade pip
+python3 -m pip install -e ".[dev,export,hangul]"
+
+python3 - <<'PY'
+from importlib.metadata import version
+import torch
+parsed = tuple(map(int, version("torch").split("+")[0].split(".")[:2]))
+assert parsed >= (2, 8), torch.__version__
+assert torch.cuda.is_available(), "CUDA 지원 PyTorch가 아닙니다"
+print("PyTorch:", torch.__version__, "CUDA:", torch.version.cuda)
+print("GPU:", [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())])
+print("NCCL:", torch.distributed.is_nccl_available())
+PY
+
+PyTorch가 없다면 https://pytorch.org/get-started/locally/ 의 공식 선택기에서
+Linux/Pip/서버에 맞는 CUDA 빌드를 먼저 설치하세요. nvidia-smi에 보이는 숫자만
+보고 임의의 wheel URL을 선택하지 마세요.
+
+
+3. 실행
+-------
 
 python3 easy_run.py
 
-이 명령은 가능한 경우 /dev/shm RAM 디스크에서 전처리와 dataset 읽기를 수행하고,
-완성된 artifacts를 일반 디스크에도 보존한 뒤 모든 GPU로 학습합니다.
-tmux가 없으면 자동 설치하고 sion 세션 안에서 실행하므로 터미널 연결이 끊겨도
-학습은 계속됩니다. 재접속 명령은 tmux attach -t sion 입니다.
-아래 단계별 명령은 문제 해결이나 수동 실행이 필요할 때 사용하세요.
+설치 뒤 학습 명령은 위 한 줄뿐입니다. 이 명령은 CUDA/NCCL 확인, shard 구조
+검사, 선택적 RAM 디스크 복사, tokenizer와 dataset 생성, byte-fallback 및
+MorphoScript sidecar 검증, 모든 GPU를 사용한 SFT 사전학습, MRT 사후학습을
+순서대로 수행합니다.
+
+대화형 셸이고 tmux가 이미 있으면 체크아웃마다 고유한 세션에서 재실행합니다.
+tmux가 없으면 설치를 강제하지 않고 현재 프로세스에서 계속합니다. Slurm/nohup/
+컨테이너에서는 자동으로 foreground 경로를 사용합니다.
+
+tmux를 명시적으로 끄기:
+
+SION_NO_TMUX=1 python3 easy_run.py
 
 
-1. 프로젝트와 GPU 확인
+4. 자동 GPU 정책
+----------------
 
-# 경로가 다르면 이 줄만 실제 경로로 바꾸세요.
-cd /workspace/sion_translate
+- A100/H100을 포함해 보이는 CUDA GPU를 모두 사용합니다.
+- 모든 rank가 native BF16이면 BF16, 하나라도 아니면 자동 설정은 FP16입니다.
+- 가장 작은 GPU VRAM을 기준으로 batch와 activation checkpointing을 정합니다.
+- 여러 GPU인데 NCCL이 없으면 긴 전처리 전에 중단합니다.
+- 사후학습의 후보 생성은 micro-batch 1로 시작합니다.
+- torch.compile은 사용자가 설정에서 명시하지 않는 한 자동으로 켜지 않습니다.
 
-python3 -c "import sys; assert sys.version_info >= (3, 11), 'Python 3.11 이상이 필요합니다'; print(sys.version)"
-nvidia-smi
-find data -maxdepth 1 -name '*.jsonl' -type f | wc -l
-
-JSONL 파일은 Git에 포함되지 않으므로 0이 나오면 사용 권한을 확인한 병렬 말뭉치를
-data/ 폴더에 먼저 업로드해야 합니다.
-
-
-2. 설치 (인스턴스마다 최초 1회)
-
-Vast.ai에서는 Python 3.11 이상과 CUDA용 PyTorch 2.8 이상이 들어 있는
-PyTorch 이미지를 사용하는 것이 가장 간단합니다.
-
-python3 -m pip install --upgrade pip
-python3 -m pip install -e ".[dev,export]"
-
-python3 -c "import torch; assert torch.cuda.is_available(), 'CUDA를 찾지 못했습니다'; print('PyTorch:', torch.__version__, '| CUDA:', torch.version.cuda, '| GPU 수:', torch.cuda.device_count())"
-
-마지막 명령이 오류 없이 GPU 수를 출력하면 설치가 끝난 것입니다.
-CUDA를 찾지 못했다면 학습을 시작하지 말고 CUDA용 PyTorch가 포함된 Vast.ai 이미지로
-인스턴스를 다시 만드는 편이 가장 쉽습니다. nvidia-smi에 나온 숫자만 보고 특정 CUDA
-wheel을 덮어 설치하지 마세요.
-
-선택 확인:
-
-python3 -m pytest -q
+configs/sion_1_3b.yaml, sion_8b.yaml, sion_32b.yaml은 파일 주석에 적힌 80GB급
+GPU 수를 전제로 한 수동 용량 기준입니다. easy_run.py는 이 파일을 자동으로
+선택하지 않고 sion_translate.yaml의 보수적인 자동 경로를 사용합니다.
 
 
-3. tmux 시작
+5. 상태, 결과와 재개
+--------------------
 
-학습 중 브라우저 터미널이 끊겨도 계속 실행되게 tmux 안에서 진행합니다.
-
-tmux new -s sion
-
-tmux가 없다면 먼저 아래 명령으로 설치한 뒤 다시 실행하세요.
-
-apt-get update && apt-get install -y tmux
-
-
-4. 토크나이저와 데이터셋 준비 (처음 한 번만)
-
-sion-train-tokenizer --input "data/*.jsonl" --output-dir artifacts/tokenizer --vocab-size 48000
-
-sion-prepare-data --input "data/*.jsonl" --tokenizer artifacts/tokenizer/sion.model --output-dir artifacts/dataset
-
-처리 시간은 JSONL 크기에 따라 달라집니다. 두 명령이 모두 끝나면
-artifacts/tokenizer와 artifacts/dataset이 생깁니다. 입력이 바뀌지 않았다면 이후에는
-이 단계를 다시 하지 않아도 됩니다.
-
-sion-train-tokenizer는 숫자를 한 자리씩 분리해 학습합니다(기본값). 이 옵션 없이 만든
-토크나이저는 금액·용량·날짜를 다른 값으로 바꿔 쓰는 오역을 일으키므로,
---no-split-digits는 기존 산출물을 재현할 때만 쓰십시오.
-
-토크나이저를 다시 만들면 vocab이 바뀝니다. 그러면 artifacts/dataset의 기존 shard와
-이전 체크포인트는 그대로 쓸 수 없으므로, 4단계를 처음부터 다시 실행하고 학습도
-새로 시작해야 합니다.
-
-
-5. 보이는 GPU를 모두 사용해 학습
-
-GPU_COUNT=$(python3 -c "import torch; print(torch.cuda.device_count())")
-echo "사용할 GPU 수: $GPU_COUNT"
-torchrun --standalone --nproc-per-node="$GPU_COUNT" -m sion_translate.cli.train
-
-별도 인자 없이 실행하면 sion_translate.yaml을 읽고 모델 크기, 배치 크기, 정밀도와 학습 step을
-자동으로 정합니다.
-
-
-6. 터미널 재접속과 학습 재개
-
-tmux 화면에서 빠져나오기: Ctrl+B를 누른 뒤 D
-tmux로 돌아가기:
-
-tmux attach -t sion
-
-학습이 중단됐다면 프로젝트 폴더에서 5번 명령을 다시 실행하세요.
-runs/auto/pretrain/checkpoints/latest와 runs/auto/posttrain/checkpoints/latest를
-단계별로 확인해 자동으로 이어서 학습합니다.
-tmux는 터미널 연결 끊김만 막아 줍니다. Vast.ai 인스턴스를 종료하거나 삭제하기 전에는
-반드시 결과를 내려받으세요.
-
-
-7. 상태와 결과
-
-다른 터미널에서 GPU 상태 보기:
+GPU 상태:
 
 watch -n 2 nvidia-smi
 
-주요 결과 위치:
+주요 결과:
 
-- 사전학습 모델: runs/auto/pretrain/exports/best
-- 사후학습 모델(추론 우선): runs/auto/posttrain/exports/best
-- 최근 재개 체크포인트: 각 단계의 checkpoints/latest
-- 토크나이저: artifacts/tokenizer
+- SFT best: runs/auto/pretrain/exports/best
+- 최종 MRT best: runs/auto/posttrain/exports/best
+- 재개 checkpoint: 각 단계의 checkpoints/latest
+- tokenizer/sidecar: artifacts/tokenizer
+- indexed dataset: artifacts/dataset
 
-다운로드하기 쉽게 결과 묶기:
+중단되면 같은 `python3 easy_run.py`를 다시 실행하세요. 단계별 latest에서
+자동으로 재개합니다. 인스턴스를 종료하기 전에는 runs/와
+artifacts/tokenizer/를 반드시 내려받으세요.
 
-tar -czf sion-result.tar.gz runs/auto/pretrain/exports/best runs/auto/posttrain/exports/best artifacts/tokenizer
 
+6. 선택 검증
+------------
 
-한 줄 요약:
-프로젝트 이동 → 설치 → tmux → 토크나이저/데이터 준비 1회 → torchrun으로 학습
+ruff format --check .
+ruff check .
+python3 -m pytest -p no:cacheprovider
+
+실제 GPU 오류를 보고할 때는 전체 traceback과 함께 다음을 보존하세요.
+
+nvidia-smi
+python3 -m torch.utils.collect_env

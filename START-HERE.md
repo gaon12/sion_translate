@@ -1,81 +1,118 @@
 # GPU 서버 시작 안내
 
-2026-07-31 패키징. 이 압축본은 **git이 추적하는 파일만** 담고 있습니다.
-코퍼스와 가중치는 들어 있지 않습니다.
+`sion_translate.zip` 하나에 실행 코드와 이번 학습용 코퍼스가 함께 들어 있습니다.
+압축을 푼 뒤 의존성을 설치하고 `easy_run.py`만 실행하면 토크나이저 학습부터
+사전학습과 MRT 사후학습까지 순서대로 진행됩니다.
 
-## 세 줄 요약
+## 1. 업로드 전에 무결성 확인
+
+배포자가 함께 전달한 ZIP SHA-256과 서버에서 계산한 값이 같아야 합니다.
 
 ```bash
-pip install -e ".[dev,export,hangul]"
-python easy_run.py
+sha256sum sion_translate.zip
+python3 -m zipfile -t sion_translate.zip
+unzip sion_translate.zip
+cd sion_translate
+python3 scripts/package_gpu_bundle.py verify-tree .
 ```
 
-`easy_run.py` 하나가 전부 합니다. 다른 명령을 칠 필요가 없습니다.
+`verify-tree`는 모든 파일의 SHA-256, 파일 집합, Git commit/tree를
+`PACKAGE_MANIFEST.json`과 `SHA256SUMS`에 대조합니다. 하나라도 다르면 설치하거나
+학습하지 말고 ZIP을 다시 업로드하십시오.
 
-## 함께 올려야 할 것
+ZIP에는 다음이 포함됩니다.
 
-| 항목 | 크기 | 비고 |
-|---|---:|---|
-| `data/*.jsonl` | **약 2.26 GB** | 51개 파일, 8,978,338행. 이게 없으면 아무것도 못 합니다 |
-| `data/evaluation_only/` | 작음 | FLORES-200. 학습에서 격리된 평가 전용 |
+- Git이 추적하는 소스·설정·테스트·문서
+- `data/` 바로 아래의 학습 JSONL 51개
+- 학습에서 격리된 `data/evaluation_only/`
 
-`data/excluded/`(약 0.66 GB)는 **올리지 마십시오.** 품질 문제로 제외한
-원본 보관분이라 학습에 쓰이지 않습니다.
+품질 문제로 제외한 `data/excluded/`, 과거 `artifacts/`, `runs/`, 체크포인트,
+가상환경과 캐시는 포함되지 않습니다. 서버에서 현재 코드와 데이터로 새로 만듭니다.
 
-`artifacts/`, `runs/`, `checkpoints/`는 서버에서 새로 만들어집니다.
+## 2. GPU 환경과 패키지 설치
 
-## easy_run.py가 하는 일
+Python 3.11 또는 3.12와 CUDA 지원 PyTorch 2.8 이상이 설치된 NVIDIA GPU 이미지를
+권장합니다. A100·H100 모두 같은 진입점을 사용합니다. PyTorch가 없다면 임의의
+CUDA wheel을 추측하지 말고 [PyTorch 공식 설치 선택기](https://pytorch.org/get-started/locally/)에서
+서버 환경에 맞는 명령을 먼저 실행하십시오.
 
-1. **tmux 세션 생성** (없으면 자동 설치) — 접속이 끊겨도 학습이 계속됩니다.
-   분리는 `Ctrl+B, D`, 재접속은 `tmux attach -t sion`
-2. **shard 키 검사** — 설정된 언어쌍으로 읽히지 않는 shard가 있으면 즉시 중단.
-   그런 파일은 0문장을 내놓고 아무 말도 하지 않기 때문입니다
-3. `/dev/shm` 여유가 있으면 코퍼스를 RAM 디스크로 복사
-4. **토크나이저 학습** (없을 때) + 데이터셋 준비
-5. **byte fallback 검사** — 코퍼스 표본에서 비율을 재고 상한을 넘으면 중단
-6. GPU 개수만큼 분산 학습
-7. 학습 뒤 **MRT 사후학습** (`posttraining.enabled` 기본 true)
+```bash
+nvidia-smi
+python3 -m pip install --upgrade pip
+python3 -m pip install -e ".[dev,export,hangul]"
+python3 - <<'PY'
+from importlib.metadata import version
+import torch
+torch_version = tuple(map(int, version("torch").split("+")[0].split(".")[:2]))
+assert torch_version >= (2, 8), f"PyTorch 2.8 이상이 필요합니다: {torch.__version__}"
+assert torch.cuda.is_available(), "CUDA 지원 PyTorch가 아닙니다"
+print("PyTorch:", torch.__version__)
+print("CUDA runtime:", torch.version.cuda)
+print("GPU:", [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())])
+print("NCCL:", torch.distributed.is_nccl_available())
+PY
+```
 
-2번과 5번이 이번에 추가된 관문입니다. 둘 다 조용히 실패하는 종류라서,
-GPU 시간을 쓰기 전에 잡는 것이 요점입니다.
+여러 GPU를 쓸 때는 NCCL이 필수입니다. `easy_run.py`도 전처리 전에 이를 검사합니다.
 
-## 설정 요약
+## 3. 실행
 
-`sion_translate.yaml`이 이번 run의 설정이고 이미 맞춰져 있습니다.
+```bash
+python3 easy_run.py
+```
 
-| 항목 | 값 |
-|---|---|
-| 언어쌍 | kj→ko, kj→ja, kd→ko, kd→ja, jd→ko, jd→ja, ko→ja |
-| `source_only_languages` | `[kj, kd, jd]` |
-| `approximate_split` | `true` |
-| 토크나이저 vocab | 48,000 (코퍼스 규모로 자동) |
-| `input_sentence_size` | 0 (전량) |
-| 모델 | `base(~200M)` — d_model 768 / enc16 / dec8 |
-| 실험 모듈 | CoRe만 검증 대상. MorphoScript·TETM은 off |
+설치가 끝난 뒤 필요한 학습 명령은 이것 하나입니다. 자동 실행기는 다음을 수행합니다.
 
-`source_only_languages`를 빼면 표준 한국어를 요청해도 사투리가 나옵니다.
-`approximate_split`을 끄면 홀드아웃 점수가 번역 품질을 재지 않습니다.
+1. CUDA/NCCL과 보이는 모든 GPU를 확인합니다.
+2. JSONL shard 구조를 빠르게 검사합니다.
+3. 여유가 충분하면 원천 데이터와 전처리 산출물을 `/dev/shm`에서 처리합니다.
+4. 현재 split 정책으로 SentencePiece와 MorphoScript sidecar를 생성·검증합니다.
+5. 품질 필터, 중복 제거와 누수 방지 split으로 indexed dataset을 만듭니다.
+6. GPU 중 가장 작은 VRAM과 가장 낮은 BF16 능력에 맞춰 공통 설정을 선택합니다.
+7. SFT 사전학습을 실행하고 체크포인트를 저장합니다.
+8. best SFT 모델에서 MRT 사후학습을 실행하고 별도로 저장합니다.
 
-## 학습 중 볼 것
+대화형 터미널이고 `tmux`가 이미 설치돼 있으면 체크아웃별 세션을 만듭니다.
+Slurm, `nohup`, 컨테이너 또는 비대화형 SSH에서는 현재 프로세스로 그대로 실행합니다.
+명시적으로 끄려면 다음처럼 실행합니다.
 
-- **train/val loss.** train이 계속 떨어지는데 val이 따라오면 underfit이라
-  모델을 키울 근거가 됩니다. 현재 200M은 양방향 target 토큰
-  357,344,643/epoch에 잘 맞는 크기입니다
-- **register loss.** 떨어지지 않으면 CoRe가 신호를 못 찾는 것이므로 끄십시오
+```bash
+SION_NO_TMUX=1 python3 easy_run.py
+```
 
-## 평가할 때
+## 4. GPU별 동작
 
-자체 test split 점수는 신뢰하지 마십시오. 과거 근사 중복 유출로 부풀려져
-있었습니다(test split chrF 77.50 대 실제 진단 61.79). `approximate_split: true`가
-이번에는 완화하지만, 진짜 기준선은 격리해 둔 `data/evaluation_only/`입니다.
+- 모든 GPU가 native BF16을 지원하면 BF16을 사용합니다.
+- 하나라도 BF16을 지원하지 않으면 자동 설정은 FP16으로 통일합니다.
+- VRAM이 작을수록 micro-batch를 1까지 낮추고 activation checkpointing을 켭니다.
+- 사후학습은 후보 생성 변동폭을 고려해 기본 micro-batch 1을 사용합니다.
+- 다중 GPU는 DDP 또는 필요 시 FSDP2를 사용합니다.
+- `torch.compile`은 드라이버·컨테이너 조합별 검증 없이 자동으로 켜지 않습니다.
 
-beam은 4를 쓰십시오. 실측에서 1→2→4가 77.28→77.36→77.50이고 16에서 반복
-붕괴가 일어났습니다.
+`configs/sion_1_3b.yaml`, `sion_8b.yaml`, `sion_32b.yaml`은 일반 자동 설정이 아니라
+주석에 적힌 80GB급 GPU 수를 전제로 한 용량 기준 설정입니다. `easy_run.py`는 기본
+`sion_translate.yaml`과 자동 설정을 사용하므로 이 파일들을 자동 선택하지 않습니다.
 
-## 더 읽을 것
+## 5. 결과와 재개
 
-- [`docs/retraining-runbook.md`](docs/retraining-runbook.md) — 단계별 수동 절차,
-  중간 산출물 확인, 되돌아볼 만한 실패 지점
-- [`docs/corpus-gaps.md`](docs/corpus-gaps.md) — 아직 비어 있는 도메인과
-  실데이터 확보처
-- [`README.md`](README.md) — 언어쌍 설정 방법
+```text
+runs/auto/
+├── pretrain/
+│   ├── checkpoints/
+│   └── exports/best/
+└── posttrain/
+    ├── checkpoints/
+    └── exports/best/
+artifacts/
+├── tokenizer/
+└── dataset/
+```
+
+사후학습이 활성화돼 있으므로 최종 추론 모델은
+`runs/auto/posttrain/exports/best/`입니다. 중단 뒤 같은 명령을 다시 실행하면 각
+단계의 `checkpoints/latest`에서 재개합니다. 인스턴스를 삭제하기 전에 `runs/`와
+`artifacts/tokenizer/`를 내려받으십시오.
+
+실제 A100/H100에서의 최종 smoke test는 서버의 드라이버, CUDA 이미지, GPU 수와
+VRAM에 의존합니다. 오류가 나면 전체 traceback, `nvidia-smi`, 위 PyTorch 확인
+출력을 보존하십시오.
