@@ -174,6 +174,46 @@ def test_local_checkpoint_restores_python_numpy_and_torch_rng(tmp_path: Path) ->
     torch.testing.assert_close(actual[2], expected[2])
 
 
+def test_cuda_rng_capture_reads_only_the_current_device(monkeypatch) -> None:
+    expected = torch.tensor([1, 2, 3], dtype=torch.uint8)
+    monkeypatch.setattr(checkpoint_module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(checkpoint_module.torch.cuda, "get_rng_state", lambda: expected)
+    monkeypatch.setattr(
+        checkpoint_module.torch.cuda,
+        "get_rng_state_all",
+        lambda: (_ for _ in ()).throw(AssertionError("must not touch peer devices")),
+    )
+
+    state = checkpoint_module._capture_rng_state()
+
+    torch.testing.assert_close(state["torch_cuda"], expected)
+
+
+def test_legacy_cuda_rng_lists_restore_only_the_current_device(monkeypatch) -> None:
+    state = checkpoint_module._capture_rng_state()
+    first = torch.tensor([1, 2], dtype=torch.uint8)
+    second = torch.tensor([3, 4], dtype=torch.uint8)
+    state["torch_cuda"] = [first, second]
+    restored: list[torch.Tensor] = []
+    monkeypatch.setattr(checkpoint_module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(checkpoint_module.torch.cuda, "current_device", lambda: 1)
+    monkeypatch.setattr(
+        checkpoint_module.torch.cuda,
+        "set_rng_state",
+        lambda value: restored.append(value.clone()),
+    )
+    monkeypatch.setattr(
+        checkpoint_module.torch.cuda,
+        "set_rng_state_all",
+        lambda values: (_ for _ in ()).throw(AssertionError(f"unexpected states: {values}")),
+    )
+
+    checkpoint_module._restore_rng_state(state)
+
+    assert len(restored) == 1
+    torch.testing.assert_close(restored[0], second)
+
+
 def test_distributed_checkpoint_publishes_complete_directory_and_falls_back(
     tmp_path: Path,
 ) -> None:

@@ -228,7 +228,10 @@ def _capture_rng_state() -> dict[str, Any]:
         "torch_cpu": torch.get_rng_state(),
     }
     if torch.cuda.is_available():
-        state["torch_cuda"] = [item.cpu() for item in torch.cuda.get_rng_state_all()]
+        # Each distributed rank owns one current CUDA device. Capturing every
+        # visible device here creates CUDA contexts on peer GPUs and couples a
+        # rank-local RNG file to the machine's total device count.
+        state["torch_cuda"] = torch.cuda.get_rng_state().cpu()
     return state
 
 
@@ -256,17 +259,25 @@ def _restore_rng_state(state: Mapping[str, Any]) -> None:
         )
     )
     torch.set_rng_state(torch_cpu_state.detach().cpu())
-    cuda_states = state.get("torch_cuda")
-    if cuda_states is not None and torch.cuda.is_available():
-        if not isinstance(cuda_states, list) or not all(
-            isinstance(item, torch.Tensor) for item in cuda_states
+    cuda_state = state.get("torch_cuda")
+    if cuda_state is not None and torch.cuda.is_available():
+        if isinstance(cuda_state, torch.Tensor):
+            selected_cuda_state = cuda_state
+        elif isinstance(cuda_state, list) and all(
+            isinstance(item, torch.Tensor) for item in cuda_state
         ):
+            # Backward compatibility for checkpoints that stored every visible
+            # device. Restore only this rank's current device instead of
+            # initializing or overwriting RNG streams owned by other ranks.
+            current_device = torch.cuda.current_device()
+            if current_device >= len(cuda_state):
+                raise ValueError(
+                    "legacy checkpoint CUDA RNG state has no entry for the current device"
+                )
+            selected_cuda_state = cuda_state[current_device]
+        else:
             raise ValueError("checkpoint CUDA RNG state is invalid")
-        if len(cuda_states) != torch.cuda.device_count():
-            raise ValueError(
-                "checkpoint CUDA RNG state count does not match the current CUDA device count"
-            )
-        torch.cuda.set_rng_state_all([item.detach().cpu() for item in cuda_states])
+        torch.cuda.set_rng_state(selected_cuda_state.detach().cpu())
 
 
 def _atomic_torch_save(payload: Mapping[str, Any], destination: Path) -> None:
