@@ -23,14 +23,42 @@
 
 model:
   experimental:
-    # Kimi K3 SiTU-GLU: FFN activation 폭주를 부드럽게 제한
+    # ── 켠 것 ────────────────────────────────────────────────────────────
+    # Kimi K3 SiTU-GLU: FFN activation 폭주를 부드럽게 제한합니다.
+    # projection 모양이 그대로라 위험이 가장 낮습니다.
     situglu_enabled: true
+
+    # BATS 정렬/커버리지: 누락과 중복을 동시에 제어하려면 정렬 신호가
+    # 필요합니다. loss_weight 는 0 이고 coverage 만 약하게 겁니다.
     bats_enabled: true
     bats_coverage_weight: 0.01
+
+    # CoRe: 목표문의 경어체를 분류하는 보조 loss 입니다. 코퍼스 실측에서
+    # 한국어 반말이 존댓말의 2.1배(41.28% 대 19.45%)이고, "존댓말을 요청했는데
+    # 반말이 섞이는" 실패가 여기서 옵니다. register_classes 4 가 prepare 의
+    # infer_register 4개 클래스와 정확히 일치합니다.
+    # 안전 장치: ContentRegisterState 의 inject_gate 가 0 에서 시작하므로
+    # step 0 에서는 forward 에 아무 영향이 없고 보조 loss 만 흐릅니다.
+    # 즉 모델이 이 신호를 쓸지 말지를 학습으로 정합니다.
     core_enabled: true
     register_loss_weight: 0.05
-    tetm_enabled: true
-    morphoscript_enabled: true
+
+    # ── 끈 것 ────────────────────────────────────────────────────────────
+    # MorphoScript(문자체계 임베딩 융합): 끕니다. 문자체계 정보는 이미
+    # token_features.npz 로 토크나이저에서 나오고, 무엇보다 **지금 실패하지
+    # 않는 문제**입니다 — 방언·구어·정형 shard 전부 보존 검사에서 script
+    # 위반 0 건이었습니다. 인코더 16층 중 4층마다 융합하는 비용을 지금 낼
+    # 이유가 없습니다. script 실패가 실제로 관측되면 그때 켜십시오.
+    morphoscript_enabled: false
+
+    # TETM(typed entity memory): 끕니다. 아래 "한 번에 하나씩" 원칙에 따라
+    # 이번 run 에서 검증할 모듈을 CoRe 하나로 좁힙니다.
+    tetm_enabled: false
+
+# 실험 모듈은 한 번에 하나씩만 켜서 baseline 과 비교하십시오. 여러 개를 동시에
+# 켜면 좋아지거나 나빠졌을 때 무엇 때문인지 알 수 없습니다. 위 조합은
+# 이번 재학습에서 CoRe 하나를 검증 대상으로 삼은 것입니다.
+
 # 아래 모델 크기는 직접 고정하고 싶을 때만 주석 해제 (기본: 데이터 규모로 자동)
 #   d_model: 768
 #   encoder_layers: 16
@@ -40,11 +68,7 @@ model:
 #   d_ff: 2048
 #   dropout: 0.10
 #   label_smoothing: 0.10
-#   experimental:            # 실험 모듈 (baseline 검증 후 하나씩만 켜서 비교)
-#     bats_enabled: false
-#     core_enabled: false
-#     tetm_enabled: false
-#     morphoscript_enabled: false
+#   experimental:            # 위 model.experimental 이 실제 설정입니다
 
 data:
   raw_dir: data              # 원천 JSONL 폴더 (여기에 파일을 추가하면 자동 인식)
