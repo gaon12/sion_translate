@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 import torch
 
+import sion_translate.training.trainer as trainer_module
 from sion_translate.config import (
     AppConfig,
     DataConfig,
@@ -18,7 +20,12 @@ from sion_translate.model import SionForConditionalGeneration
 from sion_translate.training.distributed import DistributedContext
 from sion_translate.training.export import load_exported_model
 from sion_translate.training.objectives import MinimumRiskObjective
-from sion_translate.training.trainer import build_optimizer_param_groups, cosine_scheduler, train
+from sion_translate.training.trainer import (
+    build_optimizer_param_groups,
+    cosine_scheduler,
+    evaluate,
+    train,
+)
 
 
 def tiny_model_config() -> ModelConfig:
@@ -114,6 +121,43 @@ def test_single_step_training_loop(tmp_path: Path) -> None:
     for name in ("best", "latest"):
         assert (tmp_path / "run" / "exports" / name / "model_ema.pt").exists()
         assert not (tmp_path / "run" / "exports" / name / "model.pt").exists()
+
+
+def test_posttraining_validation_metrics_share_the_autocast_context(monkeypatch) -> None:
+    active = False
+
+    @contextmanager
+    def recording_autocast(precision: str, device: torch.device):
+        nonlocal active
+        assert precision == "bf16"
+        assert device.type == "cpu"
+        active = True
+        try:
+            yield
+        finally:
+            active = False
+
+    class ProbeObjective:
+        def validation_metrics(self, model, batch):
+            del model, batch
+            assert active, "generation metrics escaped the validation autocast context"
+            return {"reward": torch.tensor(0.75)}
+
+    monkeypatch.setattr(trainer_module, "_autocast_context", recording_autocast)
+    model = SionForConditionalGeneration(tiny_model_config())
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+
+    metrics = evaluate(
+        model,
+        [tiny_batch()],
+        context,
+        max_batches=1,
+        precision="bf16",
+        objective=ProbeObjective(),
+    )
+
+    assert metrics["validation_reward"] == pytest.approx(0.75)
+    assert not active
 
 
 def test_mid_epoch_resume_uses_saved_batch_cursor(

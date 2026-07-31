@@ -203,14 +203,16 @@ def evaluate(
     try:
         for batch in loader:
             batch = move_to_device(batch, context.device)
+            validation_metrics = getattr(objective, "validation_metrics", None)
             with _autocast_context(precision, context.device):
                 output = model(**batch)
+                generated_metrics = (
+                    validation_metrics(model, batch) if validation_metrics is not None else None
+                )
             loss_sum += output.lm_loss_sum.detach().double()
             token_count += output.token_count.detach().double()
             aux_sum += output.auxiliary_loss.detach().double()
-            validation_metrics = getattr(objective, "validation_metrics", None)
-            if validation_metrics is not None:
-                generated_metrics = validation_metrics(model, batch)
+            if generated_metrics is not None:
                 source_count = float(batch["input_ids"].shape[0])
                 objective_count += source_count
                 for name, value in generated_metrics.items():
