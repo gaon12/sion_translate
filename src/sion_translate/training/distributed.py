@@ -106,6 +106,30 @@ def precision_dtype(name: str, device: torch.device) -> torch.dtype:
     raise ValueError(f"Unsupported precision: {name}")
 
 
+def distributed_precision_dtype(
+    name: str,
+    context: DistributedContext,
+) -> torch.dtype:
+    """Resolve precision only after every rank agrees it is supported."""
+
+    normalized = name.lower()
+    if normalized not in {"bf16", "fp16", "fp32"}:
+        raise ValueError(f"Unsupported precision: {name}")
+    if context.distributed and context.device.type == "cuda" and normalized == "bf16":
+        native_support = torch.tensor(
+            int(torch.cuda.is_bf16_supported()),
+            device=context.device,
+            dtype=torch.int32,
+        )
+        dist.all_reduce(native_support, op=dist.ReduceOp.MIN)
+        if not bool(native_support.item()):
+            raise RuntimeError(
+                "bf16 precision was requested, but at least one distributed CUDA "
+                "rank does not support it"
+            )
+    return precision_dtype(normalized, context.device)
+
+
 def resolve_parallel_strategy(
     strategy: str,
     context: DistributedContext,
@@ -178,7 +202,7 @@ def parallelize_model(
     materialize_meta: bool,
     find_unused_parameters: bool = False,
 ) -> nn.Module:
-    dtype = precision_dtype(precision, context.device)
+    dtype = distributed_precision_dtype(precision, context)
     resolved_strategy = resolve_parallel_strategy(
         strategy,
         context,

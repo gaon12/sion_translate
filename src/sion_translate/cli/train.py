@@ -41,6 +41,7 @@ from sion_translate.auto import (
     probe_environment,
     scan_raw_data,
     stored_fingerprint,
+    synchronize_environment,
     write_fingerprint,
 )
 from sion_translate.config import AppConfig, config_from_raw, load_raw_config
@@ -636,6 +637,7 @@ def main() -> None:
     try:
         # ── 단계 ①: 환경 자동 인식 ──────────────────────────────────────
         env = probe_environment()
+        env = synchronize_environment(env, context)
         announce(f"준비 ①: 실행 환경 — {describe_environment(env)}", context)
 
         # ── 단계 ②: 설정 로드 ───────────────────────────────────────────

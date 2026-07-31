@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import sion_translate.auto as auto_module
 from sion_translate.auto import (
     EnvironmentInfo,
     _all_devices_support_native_bf16,
@@ -18,6 +19,7 @@ from sion_translate.auto import (
     pick_vocab_size,
     scan_raw_data,
     stored_fingerprint,
+    synchronize_environment,
     write_fingerprint,
 )
 from sion_translate.config import AppConfig
@@ -47,6 +49,39 @@ def gpu_environment(vram: float = 24.0, world_size: int = 8) -> EnvironmentInfo:
         bf16=True,
         cpu_count=32,
         os_name="Linux",
+    )
+
+
+def test_distributed_environment_uses_the_least_capable_rank(monkeypatch) -> None:
+    context = SimpleNamespace(distributed=True, device=torch.device("cpu"))
+
+    def reduce_to_cluster_minimum(values: torch.Tensor, **_kwargs: object) -> None:
+        values.copy_(torch.tensor([40.0, 0.0], dtype=values.dtype))
+
+    monkeypatch.setattr(auto_module.torch.distributed, "all_reduce", reduce_to_cluster_minimum)
+    synchronized = synchronize_environment(
+        gpu_environment(vram=80.0),
+        context,
+    )
+    assert synchronized.min_vram_gib == 40.0
+    assert synchronized.bf16 is False
+
+
+def test_single_process_environment_needs_no_collective(monkeypatch) -> None:
+    environment = gpu_environment(vram=80.0, world_size=1)
+    monkeypatch.setattr(
+        auto_module.torch.distributed,
+        "all_reduce",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("single-process probing must not communicate")
+        ),
+    )
+    assert (
+        synchronize_environment(
+            environment,
+            SimpleNamespace(distributed=False, device=torch.device("cpu")),
+        )
+        is environment
     )
 
 

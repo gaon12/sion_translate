@@ -20,7 +20,7 @@ import platform as platform_module
 import shutil
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -89,6 +89,27 @@ def probe_environment() -> EnvironmentInfo:
         bf16=bf16,
         cpu_count=available_cpu_count(),
         os_name=platform_module.system(),
+    )
+
+
+def synchronize_environment(
+    env: EnvironmentInfo,
+    context: Any,
+) -> EnvironmentInfo:
+    """Use the least-capable rank for settings shared by a distributed job."""
+
+    if not context.distributed or not env.cuda:
+        return env
+    minimums = torch.tensor(
+        [env.min_vram_gib, float(env.bf16)],
+        device=context.device,
+        dtype=torch.float64,
+    )
+    torch.distributed.all_reduce(minimums, op=torch.distributed.ReduceOp.MIN)
+    return replace(
+        env,
+        min_vram_gib=float(minimums[0].item()),
+        bf16=bool(minimums[1].item()),
     )
 
 

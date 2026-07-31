@@ -7,6 +7,7 @@ import pytest
 import torch
 
 import sion_translate.cli.train as train_module
+import sion_translate.training.distributed as distributed_module
 from sion_translate.cli.train import (
     construct_training_model,
     dataloader_runtime_kwargs,
@@ -30,6 +31,7 @@ from sion_translate.fingerprint import file_sha256
 from sion_translate.model.transformer import SionForConditionalGeneration
 from sion_translate.training.distributed import DistributedContext
 from sion_translate.training.distributed import (
+    distributed_precision_dtype,
     fsdp_reduce_dtype,
     initialize_distributed,
     parallelize_model,
@@ -177,6 +179,39 @@ def test_parallel_strategy_prefers_ddp_and_supports_legacy_fsdp() -> None:
     assert resolve_parallel_strategy("fsdp2", single) == "single"
     assert fsdp_reduce_dtype("auto", torch.bfloat16) == torch.bfloat16
     assert fsdp_reduce_dtype("auto", torch.float32) == torch.float32
+
+
+def test_distributed_bf16_support_is_resolved_collectively(monkeypatch) -> None:
+    context = DistributedContext(
+        rank=0,
+        local_rank=0,
+        world_size=2,
+        device=torch.device("cuda"),
+        distributed=True,
+        backend="nccl",
+    )
+    original_tensor = torch.tensor
+    monkeypatch.setattr(
+        distributed_module.torch,
+        "tensor",
+        lambda value, **kwargs: original_tensor(value, dtype=kwargs.get("dtype")),
+    )
+    monkeypatch.setattr(distributed_module.torch.cuda, "is_bf16_supported", lambda: True)
+
+    monkeypatch.setattr(
+        distributed_module.dist,
+        "all_reduce",
+        lambda value, **_kwargs: value.fill_(1),
+    )
+    assert distributed_precision_dtype("bf16", context) == torch.bfloat16
+
+    monkeypatch.setattr(
+        distributed_module.dist,
+        "all_reduce",
+        lambda value, **_kwargs: value.fill_(0),
+    )
+    with pytest.raises(RuntimeError, match="at least one distributed CUDA rank"):
+        distributed_precision_dtype("bf16", context)
 
 
 def test_parallel_strategy_config_rejects_ambiguous_legacy_override() -> None:
