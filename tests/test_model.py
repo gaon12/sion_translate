@@ -66,6 +66,25 @@ def make_batch() -> dict[str, torch.Tensor]:
     }
 
 
+def test_gradient_checkpointing_is_bypassed_for_no_grad_rollouts(monkeypatch) -> None:
+    config = tiny_config()
+    config.gradient_checkpointing = True
+    model = SionForConditionalGeneration(config)
+    layer = torch.nn.Identity()
+    hidden = torch.randn(2, 3, config.d_model)
+
+    def fail_checkpoint(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("no-grad rollout must not enter activation checkpointing")
+
+    monkeypatch.setattr(transformer_module, "checkpoint", fail_checkpoint)
+    model.train()
+    with torch.no_grad():
+        output = model._checkpoint(layer, hidden)
+
+    assert output is hidden
+
+
 def test_forward_backward_all_experimental_modules() -> None:
     model = SionForConditionalGeneration(tiny_config())
     output = model(**make_batch())

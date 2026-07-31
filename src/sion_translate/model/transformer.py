@@ -269,7 +269,7 @@ class SionForConditionalGeneration(nn.Module):
         return self.embedding_dropout(hidden)
 
     def _checkpoint(self, layer: nn.Module, *args: torch.Tensor) -> torch.Tensor:
-        if self.config.gradient_checkpointing and self.training:
+        if self.config.gradient_checkpointing and self.training and torch.is_grad_enabled():
             return checkpoint(layer, *args, use_reentrant=False)
         return layer(*args)
 
