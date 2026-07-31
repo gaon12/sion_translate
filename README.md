@@ -301,6 +301,72 @@ sion-train --config configs/sion_data_fit.yaml
 토크나이저를 다시 만들면 vocab이 달라지므로 `artifacts/dataset`과 기존 체크포인트는
 재사용할 수 없습니다. 위 세 단계를 순서대로 다시 실행해야 합니다.
 
+### 언어쌍 바꾸기 / 늘리기
+
+언어쌍은 코드에 고정돼 있지 않습니다. JSONL의 키 이름이 곧 언어 이름이고,
+`sion_translate.yaml`만 고치면 토크나이저의 `<2xx>`·`<denoise_xx>` 제어 토큰,
+전처리, 방향 태그가 전부 따라갑니다.
+
+한 쌍만 쓸 때는 `data.language_pair`를 바꿉니다.
+
+```yaml
+data:
+  language_pair: [en, de]    # JSONL 이 {"en": ..., "de": ...} 형태여야 합니다
+```
+
+여러 쌍을 한 모델에 넣을 때는 `language_pair` 대신 `language_pairs`를 씁니다.
+
+```yaml
+data:
+  language_pairs:
+    - [ko, ja]
+    - [en, ko]
+```
+
+#### source 전용 언어
+
+일부 언어는 **입력으로만** 받아야 합니다. 한본어(`kj`)는 한국어와 일본어가
+섞인 입력이고 번역 결과는 항상 한쪽 단일어여야 합니다. 지역 방언(`kd`, `jd`)도
+목표가 방언을 *이해*하는 것이지 표준 입력에 사투리로 답하는 것이 아닙니다.
+
+`source_only_languages`에 등재하면 `kj->ko`, `kd->ja` 같은 이해 방향만
+학습되고 역방향은 만들어지지 않습니다. **등재하지 않으면** bidirectional 학습이
+혼용문과 방언을 target 으로도 배워서, 표준 한국어를 요청했는데 가나가 섞이거나
+사투리가 나오는 모델이 됩니다.
+
+```yaml
+data:
+  language_pairs:
+    - [kj, ko]
+    - [kj, ja]
+    - [kd, ko]
+    - [kd, ja]
+    - [jd, ko]
+    - [jd, ja]
+    - [ko, ja]
+  source_only_languages: [kj, kd, jd]
+```
+
+방언 shard 는 지역을 태그가 아니라 행 메타데이터(`dialect_region`)로 담습니다.
+특정 지역 방언으로 *생성*하게 하려면 별도 태그 스킴이 필요하고, 그것은 아직
+구현돼 있지 않습니다.
+
+### 재학습 전 확인할 설정
+
+처음부터 다시 학습할 때 놓치면 결과가 무의미해지는 항목입니다.
+
+| 설정 | 값 | 안 하면 |
+|---|---|---|
+| `data.approximate_split` | `true` | 근사 중복이 holdout 으로 새어 점수가 번역 품질을 재지 않습니다 |
+| `data.source_only_languages` | `[kj, kd, jd]` | 표준어를 요청해도 혼용문·사투리가 나옵니다 |
+| 토크나이저 `split_digits` | `true` (기본) | 숫자가 덩어리로 병합돼 금액·용량이 다른 값으로 바뀝니다 |
+| `--input-sentence-size` | `0` (기본) | 코퍼스 일부만 보고 어휘를 정합니다 |
+
+`--input-sentence-size 0` 은 전량을 뜻합니다. 상한을 두면 균등 무작위 추출이라
+작은 shard 가 비중만큼만 보이고, 거기서만 흔한 문자가 어휘에서 빠질 수 있습니다.
+`--required-character-min-occurrences`(기본 25)는 그 문자가 byte fallback 으로
+쪼개지지 않도록 어휘에 못을 박습니다.
+
 ### 다문장 입력 학습 (문장 이어붙이기)
 
 원문 코퍼스가 전부 한 문장짜리면 모델은 여러 문장을 한 번에 받았을 때 뒤쪽을
