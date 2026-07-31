@@ -167,6 +167,130 @@ def _run(command: list[str], env: dict[str, str]) -> None:
     subprocess.run(command, cwd=ROOT, env=env, check=True)
 
 
+def _check_shard_keys(env: dict[str, str]) -> None:
+    """Refuse to start when a shard's keys match no configured language pair.
+
+    Such a shard yields zero sentences and says nothing about it, so the loss is
+    invisible until someone counts. One shard in this corpus shipped with the
+    keys 한국어/일본어 and would have dropped 10,075 rows in silence.
+    """
+
+    checker = ROOT / "scripts" / "data" / "check_shard_keys.py"
+    if not checker.exists():
+        return
+    print("[easy_run] shard 키 이름을 확인합니다 (설정된 언어쌍과 맞는지).", flush=True)
+    result = subprocess.run(
+        [sys.executable, str(checker)],
+        cwd=ROOT,
+        env=env,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise SystemExit(
+            "[easy_run] 위 shard 는 설정된 언어쌍으로 읽히지 않아 학습에서 조용히 빠집니다.\n"
+            "           JSONL 의 키 이름을 고치거나 sion_translate.yaml 의 "
+            "data.language_pairs 를 맞춘 뒤 다시 실행하세요."
+        )
+
+
+def _verify_tokenizer(
+    tokenizer_model: Path,
+    data_dir: Path,
+    *,
+    sample_rows: int = 20_000,
+    max_fallback_rate: float = 0.002,
+) -> None:
+    """Fail when the tokenizer splits too much of the corpus into raw bytes.
+
+    A character that falls back to bytes costs three tokens where one would do
+    and the model never sees it as a unit. The previously shipped tokenizer
+    rendered the 한본어 fused syllable 넼 as ``<0xEB> <0x84> <0xBC>`` because that
+    corpus did not exist when it was trained.
+
+    The check samples the corpus rather than testing fixed strings: hardcoded
+    probes would be wrong for any other language pair, and the corpus is what the
+    model actually has to encode. Some fallback is expected and correct - genuinely
+    rare characters are exactly what byte fallback is for - so the gate is a rate,
+    and the offending characters are always printed so the rate can be judged.
+    """
+
+    try:
+        import sentencepiece as spm
+    except ImportError:
+        print("[easy_run] sentencepiece 를 불러오지 못해 토크나이저 검증을 건너뜁니다.")
+        return
+    if not tokenizer_model.exists():
+        print(f"[easy_run] 토크나이저를 찾지 못해 검증을 건너뜁니다: {tokenizer_model}")
+        return
+
+    import json
+    from collections import Counter
+
+    processor = spm.SentencePieceProcessor()
+    processor.Load(str(tokenizer_model))
+
+    shards = sorted(data_dir.glob("*.jsonl"))
+    if not shards:
+        print("[easy_run] 코퍼스를 찾지 못해 토크나이저 검증을 건너뜁니다.")
+        return
+    per_shard = max(1, sample_rows // len(shards))
+
+    total_tokens = 0
+    fallback_tokens = 0
+    offenders: Counter[str] = Counter()
+    for shard in shards:
+        with shard.open("r", encoding="utf-8-sig") as handle:
+            for index, line in enumerate(handle):
+                if index >= per_shard:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                for value in row.values():
+                    if not isinstance(value, str) or not value:
+                        continue
+                    pieces = processor.EncodeAsPieces(value)
+                    total_tokens += len(pieces)
+                    hits = sum(1 for piece in pieces if piece.startswith("<0x"))
+                    if not hits:
+                        continue
+                    fallback_tokens += hits
+                    # Name the characters, not the byte pieces: a byte piece on
+                    # its own says nothing about what to fix.
+                    for character in value:
+                        encoded = processor.EncodeAsPieces(character)
+                        if any(piece.startswith("<0x") for piece in encoded):
+                            offenders[character] += 1
+
+    if total_tokens == 0:
+        print("[easy_run] 표본에서 토큰을 얻지 못해 검증을 건너뜁니다.")
+        return
+
+    rate = fallback_tokens / total_tokens
+    print(
+        f"[easy_run] 토크나이저 검증: vocab {processor.vocab_size():,}, "
+        f"표본 {total_tokens:,} 토큰 중 byte fallback {fallback_tokens:,} ({rate:.4%})",
+        flush=True,
+    )
+    for character, count in offenders.most_common(10):
+        print(f"           U+{ord(character):04X} {character!r}  {count:,}회")
+    if rate > max_fallback_rate:
+        raise SystemExit(
+            f"[easy_run] byte fallback 비율 {rate:.4%} 이 상한 {max_fallback_rate:.4%} 을 넘습니다. "
+            "학습을 중단합니다.\n"
+            "           artifacts/tokenizer 를 지우고 다시 실행하거나, "
+            "sion-train-tokenizer 를 --required-character-min-occurrences 를 낮춰 직접 "
+            "실행하세요."
+        )
+    print("[easy_run] byte fallback 비율이 허용 범위입니다. 계속합니다.", flush=True)
+
+
 def main() -> None:
     _enter_tmux()
 
@@ -203,6 +327,9 @@ def main() -> None:
     env = os.environ.copy()
     src_path = str(ROOT / "src")
     env["PYTHONPATH"] = src_path + os.pathsep + env.get("PYTHONPATH", "")
+    # Before anything expensive: a shard the pipeline cannot read is worth
+    # catching now rather than after hours of training.
+    _check_shard_keys(env)
     try:
         # 전처리를 단일 rank에서 끝내야 torchrun worker가 장시간 barrier에서
         # 기다리거나 통신 timeout에 걸리지 않습니다.
@@ -217,6 +344,11 @@ def main() -> None:
             ],
             env,
         )
+        # The tokenizer exists now, whether it was reused or just trained. Check
+        # it before spending GPU hours on a vocabulary that cannot represent the
+        # corpus.
+        _verify_tokenizer(runtime_artifacts / "tokenizer" / "sion.model", runtime_data)
+
         if ram is not None:
             print("[easy_run] tokenizer/dataset을 일반 디스크 artifacts/에 보존합니다.")
             _atomic_sync_directory(
