@@ -520,6 +520,18 @@ def train_tokenizer(
             counts,
             min_occurrences=required_character_min_occurrences,
         )
+        # SentencePiece refuses when required_chars plus its meta pieces exceed
+        # vocab_size, and it only says so after the corpus scan. Say it here, with
+        # the number to change, rather than after a long wait.
+        reserved = len(required_characters) + len(symbols) + 256
+        if reserved >= vocab_size:
+            raise ValueError(
+                f"required characters ({len(required_characters):,}) plus control symbols "
+                f"({len(symbols):,}) and byte fallback (256) need {reserved:,} slots, but "
+                f"vocab_size is {vocab_size:,}. Raise vocab_size or raise "
+                f"required_character_min_occurrences (currently "
+                f"{required_character_min_occurrences})."
+            )
 
     spm.SentencePieceTrainer.train(
         sentence_iterator=iter_parallel_text(

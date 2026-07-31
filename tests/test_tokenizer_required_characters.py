@@ -65,3 +65,43 @@ def test_a_non_positive_threshold_is_rejected() -> None:
     # noise. The caller disables the feature at the train_tokenizer level.
     with pytest.raises(ValueError, match="min_occurrences must be positive"):
         required_characters_from_counts(Counter({"가": 1}), min_occurrences=0)
+
+
+def test_the_vocab_floor_is_reported_before_the_corpus_scan(tmp_path, monkeypatch) -> None:
+    """SentencePiece only complains after reading the corpus; say it sooner.
+
+    required_chars plus the control symbols plus 256 byte-fallback pieces have to
+    fit inside vocab_size. Hitting that limit after a full pass over a nine
+    million row corpus wastes the whole scan, and the SentencePiece message does
+    not name the setting to change.
+    """
+
+    import json
+
+    from sion_translate import tokenizer as tokenizer_module
+
+    shard = tmp_path / "mini.jsonl"
+    with shard.open("w", encoding="utf-8", newline="\n") as handle:
+        for index in range(50):
+            handle.write(
+                json.dumps(
+                    {"ko": f"문장 {index} 입니다", "ja": f"文 {index} です"}, ensure_ascii=False
+                )
+                + "\n"
+            )
+
+    trained: list[object] = []
+    monkeypatch.setattr(
+        tokenizer_module.spm.SentencePieceTrainer,
+        "train",
+        lambda **kwargs: trained.append(kwargs),
+    )
+
+    with pytest.raises(ValueError, match="required_character_min_occurrences"):
+        tokenizer_module.train_tokenizer(
+            [str(shard)],
+            tmp_path / "out",
+            vocab_size=300,
+            required_character_min_occurrences=1,
+        )
+    assert not trained, "training must not start once the floor is known to fail"
