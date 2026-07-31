@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Report shards whose JSONL keys no shipped language pair can read.
+"""Report shards whose JSONL structure no shipped language pair can read.
 
 A shard whose keys do not match any configured pair contributes nothing and says
 nothing about it: ``iter_parallel_text`` simply yields no sentences for it. That
@@ -7,9 +7,10 @@ is silent data loss, and it is easy to cause - one shard in this corpus arrived
 with the keys ``한국어``/``일본어`` instead of ``ko``/``ja`` and would have been
 dropped whole.
 
-The check is language-generic. It reads the configured pairs, asks how many
-sentences each file actually yields, and reports the files that yield none along
-with the keys they do carry, so the fix is obvious.
+The check is language-generic. It reads the configured pairs and inspects a
+bounded sample from each file for a structurally valid parallel record. It does
+not run quality filtering, split assignment, or duplicate detection: those
+operations are expensive and can reject otherwise correctly keyed records.
 
 Usage::
 
@@ -29,10 +30,13 @@ from pathlib import Path
 import sys
 from typing import Sequence
 
-from sion_translate.tokenizer import iter_parallel_text
+from sion_translate.data.records import expand_parallel_record, normalize_language_pairs
 
 
-def observed_keys(path: Path, *, limit: int = 2000) -> list[str]:
+DEFAULT_SCAN_LINES = 2000
+
+
+def observed_keys(path: Path, *, limit: int = DEFAULT_SCAN_LINES) -> list[str]:
     """The JSON keys this file actually uses, most common first."""
 
     counts: Counter[str] = Counter()
@@ -52,13 +56,49 @@ def observed_keys(path: Path, *, limit: int = 2000) -> list[str]:
     return [key for key, _ in counts.most_common()]
 
 
-def configured_pairs(config_path: Path | None, explicit: Sequence[Sequence[str]]) -> tuple:
+def inspect_shard(
+    path: Path,
+    *,
+    pairs: Sequence[Sequence[str]],
+    limit: int = DEFAULT_SCAN_LINES,
+) -> tuple[bool, list[str], int]:
+    """Return whether a bounded sample contains a configured parallel record."""
+
+    if limit < 1:
+        raise ValueError("scan line limit must be positive")
+    counts: Counter[str] = Counter()
+    scanned = 0
+    with path.open("r", encoding="utf-8-sig") as handle:
+        for line in handle:
+            if scanned >= limit:
+                break
+            scanned += 1
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict):
+                counts.update(key for key, value in row.items() if isinstance(value, str))
+            if expand_parallel_record(row, pairs).pairs:
+                return True, [key for key, _ in counts.most_common()], scanned
+    return False, [key for key, _ in counts.most_common()], scanned
+
+
+def configured_pairs(
+    config_path: Path | None,
+    explicit: Sequence[Sequence[str]],
+) -> tuple[tuple[str, str], ...]:
     if explicit:
-        return tuple(tuple(pair) for pair in explicit)
+        return normalize_language_pairs(language_pairs=explicit)
     from sion_translate.config import load_config
 
     path = config_path or Path("sion_translate.yaml")
-    return load_config(path).data.configured_language_pairs()
+    return normalize_language_pairs(
+        language_pairs=load_config(path).data.configured_language_pairs()
+    )
 
 
 def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
@@ -75,6 +115,13 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         default=[],
         metavar=("LANG_A", "LANG_B"),
         help="language pair, repeatable; overrides --config",
+    )
+    parser.add_argument(
+        "--scan-lines",
+        type=int,
+        default=DEFAULT_SCAN_LINES,
+        metavar="N",
+        help=f"maximum physical lines inspected per shard (default: {DEFAULT_SCAN_LINES})",
     )
     return parser.parse_args(argv)
 
@@ -97,34 +144,39 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"pairs: {', '.join('->'.join(pair) for pair in pairs)}")
     print()
 
-    unreadable: list[tuple[Path, list[str]]] = []
-    total = 0
+    unreadable: list[tuple[Path, list[str], int]] = []
     for path in paths:
         try:
-            sentences = sum(
-                1 for _ in iter_parallel_text([path], language_pairs=pairs, num_workers=1)
+            readable, keys, scanned = inspect_shard(
+                path,
+                pairs=pairs,
+                limit=args.scan_lines,
             )
         except (OSError, ValueError) as error:
             print(f"{path.name:36} cannot read ({error})", file=sys.stderr)
             return 2
-        total += sentences
-        if sentences == 0:
-            keys = observed_keys(path)
-            unreadable.append((path, keys))
-            print(f"  {path.name:36} {sentences:>10,}   <-- yields nothing")
+        if not readable:
+            unreadable.append((path, keys, scanned))
+            print(
+                f"  {path.name:36} no pair in {scanned:>6,} sampled line(s)"
+                "   <-- structurally unreadable"
+            )
         else:
-            print(f"  {path.name:36} {sentences:>10,}")
+            print(f"  {path.name:36} readable after {scanned:>6,} line(s)")
 
     print()
-    print(f"total sentences: {total:,}")
     if not unreadable:
-        print("every shard is readable with the configured pairs.")
+        print(
+            "every shard sample contains a structurally readable record "
+            "(quality filtering was intentionally not run)."
+        )
         return 0
 
     print()
-    print(f"{len(unreadable)} shard(s) contribute nothing:")
-    for path, keys in unreadable:
+    print(f"{len(unreadable)} shard sample(s) contain no configured pair:")
+    for path, keys, scanned in unreadable:
         print(f"  {path}")
+        print(f"      lines sampled: {scanned:,}")
         print(f"      keys present : {', '.join(keys) if keys else '(none)'}")
         print(f"      keys expected: {', '.join(languages)}")
     print()

@@ -40,6 +40,13 @@ def test_a_readable_shard_passes(tmp_path: Path) -> None:
     assert CHECK.main([str(shard), "--pair", "ko", "ja"]) == 0
 
 
+def test_structural_check_does_not_confuse_quality_rejection_with_bad_keys(
+    tmp_path: Path,
+) -> None:
+    shard = write_shard(tmp_path / "short.jsonl", [{"ko": "x", "ja": "y"}])
+    assert CHECK.main([str(shard), "--pair", "ko", "ja"]) == 0
+
+
 def test_a_shard_with_unmatched_keys_fails(tmp_path: Path) -> None:
     shard = write_shard(tmp_path / "renamed.jsonl", KOREAN_KEYS)
     assert CHECK.main([str(shard), "--pair", "ko", "ja"]) == 1
@@ -77,8 +84,41 @@ def test_a_mixed_run_reports_only_the_broken_shard(tmp_path: Path, capsys) -> No
     bad = write_shard(tmp_path / "bad.jsonl", KOREAN_KEYS)
     assert CHECK.main([str(good), str(bad), "--pair", "ko", "ja"]) == 1
     output = capsys.readouterr().out
-    assert "yields nothing" in output
-    assert output.count("yields nothing") == 1
+    assert "structurally unreadable" in output
+    assert output.count("structurally unreadable") == 1
+
+
+def test_scan_limit_bounds_work_and_is_configurable(tmp_path: Path) -> None:
+    shard = write_shard(
+        tmp_path / "late.jsonl",
+        [*KOREAN_KEYS[:3], {"ko": "문장입니다", "ja": "文です"}],
+    )
+    assert (
+        CHECK.main(
+            [
+                str(shard),
+                "--pair",
+                "ko",
+                "ja",
+                "--scan-lines",
+                "3",
+            ]
+        )
+        == 1
+    )
+    assert (
+        CHECK.main(
+            [
+                str(shard),
+                "--pair",
+                "ko",
+                "ja",
+                "--scan-lines",
+                "4",
+            ]
+        )
+        == 0
+    )
 
 
 def test_observed_keys_ignores_non_string_values(tmp_path: Path) -> None:
