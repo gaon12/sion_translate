@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 import unicodedata
+from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
@@ -407,13 +408,69 @@ class SionTokenizer:
         return self.processor.decode([int(token_id) for token_id in ids])
 
 
+def corpus_character_counts(
+    paths: Sequence[Path],
+    *,
+    language_pairs: Sequence[Sequence[str]],
+    validation_fraction: float = 0.005,
+    test_fraction: float = 0.005,
+    num_workers: int | None = None,
+) -> Counter[str]:
+    """Count every character in the training partition of ``paths``."""
+
+    counts: Counter[str] = Counter()
+    for text in iter_parallel_text(
+        paths,
+        validation_fraction=validation_fraction,
+        test_fraction=test_fraction,
+        language_pairs=language_pairs,
+        num_workers=num_workers,
+    ):
+        counts.update(text)
+    return counts
+
+
+def required_characters_from_counts(
+    counts: Counter[str],
+    *,
+    min_occurrences: int = 25,
+) -> list[str]:
+    """Characters frequent enough that byte fallback would be a regression.
+
+    A character seen this often carries content, so splitting it into raw bytes
+    costs the model three tokens where one would do. The 한본어 corpus produces
+    fused syllables (``네`` + ``ㅋ`` -> ``넼``) that appear over a thousand times
+    yet are absent from any tokenizer trained before that corpus existed; the
+    shipped one renders ``넼`` as three ``<0x..>`` pieces.
+
+    The threshold is a floor on *content*, not a guess about any one language:
+    below it a character is genuinely incidental and byte fallback is the right
+    answer, which is what byte fallback is for. Nothing here names a script, so a
+    new language pair gets the same protection without a code change.
+    """
+
+    if min_occurrences < 1:
+        raise ValueError("min_occurrences must be positive")
+    return sorted(
+        character
+        for character, count in counts.items()
+        if count >= min_occurrences and not character.isspace()
+    )
+
+
 def train_tokenizer(
     input_patterns: Sequence[str],
     output_dir: str | Path,
     *,
     vocab_size: int = 48000,
-    input_sentence_size: int = 4_000_000,
+    # 0 means "use every sentence". The corpus is now large enough that the old
+    # 4,000,000 cap covered only 22.2% of it, and uniform sampling shrinks a
+    # small shard in proportion: the 한본어 corpus is 0.11% of all sentences, so
+    # the fused syllables it exists to teach were sampled a few hundred times and
+    # could be pruned out of the vocabulary by chance.
+    input_sentence_size: int = 0,
     seed_sentencepiece_size: int = 1_000_000,
+    required_character_min_occurrences: int = 25,
     validation_fraction: float = 0.005,
     test_fraction: float = 0.005,
     language_pair: Sequence[str] = DEFAULT_LANGUAGE_PAIR,
@@ -445,6 +502,25 @@ def train_tokenizer(
     plan = build_cpu_plan(input_files=len(paths))
     workers = num_workers or plan.preprocess_workers
     threads = num_threads or plan.sentencepiece_threads
+
+    # Reserve the characters that carry content. This costs one pass over the
+    # corpus and is worth it: `character_coverage` alone decides coverage from a
+    # sample, so a character can be dropped for being rare in the sample even
+    # when it is common in a shard that matters.
+    required_characters: list[str] = []
+    if required_character_min_occurrences > 0:
+        counts = corpus_character_counts(
+            paths,
+            language_pairs=normalized_pairs,
+            validation_fraction=validation_fraction,
+            test_fraction=test_fraction,
+            num_workers=workers,
+        )
+        required_characters = required_characters_from_counts(
+            counts,
+            min_occurrences=required_character_min_occurrences,
+        )
+
     spm.SentencePieceTrainer.train(
         sentence_iterator=iter_parallel_text(
             paths,
@@ -465,6 +541,7 @@ def train_tokenizer(
         bos_id=2,
         eos_id=3,
         user_defined_symbols=symbols,
+        required_chars="".join(required_characters),
         input_sentence_size=input_sentence_size,
         seed_sentencepiece_size=seed_sentencepiece_size,
         shuffle_input_sentence=True,

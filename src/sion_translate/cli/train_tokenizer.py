@@ -11,7 +11,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input", nargs="+", required=True, help="JSONL files or glob patterns")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--vocab-size", type=int, default=48000)
-    parser.add_argument("--input-sentence-size", type=int, default=4_000_000)
+    parser.add_argument(
+        "--input-sentence-size",
+        type=int,
+        default=0,
+        help=(
+            "SentencePiece 가 볼 문장 수. 0 이면 전량. 상한을 두면 균등 "
+            "무작위 추출이라 작은 shard 가 비중만큼 작게 보입니다"
+        ),
+    )
+    parser.add_argument(
+        "--required-character-min-occurrences",
+        type=int,
+        default=25,
+        help=(
+            "이 횟수 이상 나오는 문자는 반드시 어휘에 넣습니다(byte fallback 방지). 0 이면 끕니다"
+        ),
+    )
     parser.add_argument("--seed-sentencepiece-size", type=int, default=1_000_000)
     parser.add_argument("--workers", type=int, default=None, help="전처리 프로세스 수 (기본: 자동)")
     parser.add_argument(
@@ -53,6 +69,7 @@ def main() -> None:
         args.output_dir,
         vocab_size=args.vocab_size,
         input_sentence_size=args.input_sentence_size,
+        required_character_min_occurrences=args.required_character_min_occurrences,
         seed_sentencepiece_size=args.seed_sentencepiece_size,
         validation_fraction=args.validation_fraction,
         test_fraction=args.test_fraction,
