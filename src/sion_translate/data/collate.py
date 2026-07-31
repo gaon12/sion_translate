@@ -11,6 +11,56 @@ import torch
 from sion_translate.tokenizer import SionTokenizer
 
 
+_TOKEN_FEATURE_NAMES = ("script", "onset", "vowel", "coda")
+_TOKEN_FEATURE_CLASS_COUNTS = {
+    "onset": 20,
+    "vowel": 22,
+    "coda": 29,
+}
+
+
+def load_morphoscript_token_features(
+    path: str | Path,
+    *,
+    vocab_size: int,
+    script_classes: int,
+) -> dict[str, torch.Tensor]:
+    """Load and validate token-indexed MorphoScript feature tables."""
+
+    feature_path = Path(path)
+    if not feature_path.is_file():
+        raise FileNotFoundError(
+            f"MorphoScript is enabled, but its token feature file does not exist: {feature_path}"
+        )
+
+    maximum_ids = {
+        "script": script_classes,
+        **_TOKEN_FEATURE_CLASS_COUNTS,
+    }
+    features: dict[str, torch.Tensor] = {}
+    with np.load(feature_path, allow_pickle=False) as loaded:
+        if set(loaded.files) != set(_TOKEN_FEATURE_NAMES):
+            raise ValueError(
+                "token feature file must contain exactly "
+                f"{', '.join(_TOKEN_FEATURE_NAMES)}; got {sorted(loaded.files)}"
+            )
+        for name in _TOKEN_FEATURE_NAMES:
+            values = np.asarray(loaded[name])
+            expected_shape = (vocab_size,)
+            if values.shape != expected_shape:
+                raise ValueError(
+                    f"token feature {name} has shape {values.shape}; expected {expected_shape}"
+                )
+            if not np.issubdtype(values.dtype, np.integer):
+                raise ValueError(f"token feature {name} must use an integer dtype")
+            values = values.astype(np.int64, copy=True)
+            maximum_id = maximum_ids[name]
+            if values.size and (int(values.min()) < 0 or int(values.max()) >= maximum_id):
+                raise ValueError(f"token feature {name} contains IDs outside [0, {maximum_id})")
+            features[name] = torch.from_numpy(values)
+    return features
+
+
 def corrupt_spans(
     token_ids: Sequence[int],
     mask_id: int,
@@ -63,6 +113,7 @@ class SionBatchCollator:
         augmentation_seed: int = 0,
         augmentation_key: int = 0,
         token_features: str | Path | None = None,
+        script_classes: int = 9,
     ):
         self.tokenizer = tokenizer
         self.max_source_length = max_source_length
@@ -102,11 +153,12 @@ class SionBatchCollator:
         ).share_memory_()
         self.slot_ids = set(tokenizer.slot_ids)
         self.features = None
-        if token_features and Path(token_features).exists():
-            loaded = np.load(token_features, allow_pickle=False)
-            self.features = {
-                name: torch.from_numpy(loaded[name].astype(np.int64)) for name in loaded.files
-            }
+        if token_features is not None:
+            self.features = load_morphoscript_token_features(
+                token_features,
+                vocab_size=len(tokenizer),
+                script_classes=script_classes,
+            )
 
     @property
     def augmentation_key(self) -> int:

@@ -50,6 +50,7 @@ from sion_translate.data import (
     IndexedParallelDataset,
     SionBatchCollator,
 )
+from sion_translate.data.collate import load_morphoscript_token_features
 from sion_translate.fingerprint import DatasetFingerprint, file_sha256
 from sion_translate.model import SionForConditionalGeneration
 from sion_translate.tokenizer import (
@@ -109,6 +110,22 @@ def preflight_final_export_dependencies(formats: list[str] | tuple[str, ...]) ->
         f"{details}. 장기 학습을 시작하기 전에 "
         'python -m pip install -e ".[export]" 로 설치하거나 '
         "training.final_export_formats에서 해당 포맷을 제거하세요."
+    )
+
+
+def preflight_morphoscript_token_features(
+    config: AppConfig,
+    tokenizer: SionTokenizer,
+) -> None:
+    """Require a model-compatible MorphoScript sidecar before training starts."""
+
+    experimental = config.model.experimental
+    if not experimental.morphoscript_enabled:
+        return
+    load_morphoscript_token_features(
+        config.data.tokenizer_features,
+        vocab_size=len(tokenizer),
+        script_classes=experimental.script_classes,
     )
 
 
@@ -630,6 +647,9 @@ def main() -> None:
             preflight_final_export_dependencies(config.training.final_export_formats)
         announce("준비 ③: 원천 데이터를 확인합니다.", context)
         ensure_artifacts(config, context)
+        tokenizer = SionTokenizer(config.data.tokenizer_model)
+        config.model.vocab_size = len(tokenizer)
+        preflight_morphoscript_token_features(config, tokenizer)
         if args.prepare_only:
             announce("전처리 전용 실행 완료.", context)
             return
@@ -637,8 +657,6 @@ def main() -> None:
         # 모델 파라미터 초기화는 world size 와 무관하게 같은 시드(rank 0 기준)로
         # 수행합니다. 실행 시점 난수는 모델 생성 후에 rank 별로 다시 시드합니다.
         seed_everything(config.training.seed, 0)
-        tokenizer = SionTokenizer(config.data.tokenizer_model)
-        config.model.vocab_size = len(tokenizer)
 
         train_dataset = IndexedParallelDataset(
             config.data.dataset_dir,
@@ -706,7 +724,12 @@ def main() -> None:
             denoise_noise_density=config.data.denoise_noise_density,
             denoise_mean_span=config.data.denoise_mean_span,
             augmentation_seed=config.training.seed,
-            token_features=config.data.tokenizer_features,
+            token_features=(
+                config.data.tokenizer_features
+                if config.model.experimental.morphoscript_enabled
+                else None
+            ),
+            script_classes=config.model.experimental.script_classes,
         )
         train_collator = SionBatchCollator(
             **collator_args,
