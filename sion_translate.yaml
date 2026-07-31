@@ -72,38 +72,45 @@ model:
 
 data:
   raw_dir: data              # 원천 JSONL 폴더 (여기에 파일을 추가하면 자동 인식)
-  language_pair: [ko, ja]    # JSONL 키 이름 = 언어쌍. [en, de] 처럼 바꾸면
-                             # 토크나이저/전처리/방향 태그가 모두 따라갑니다.
   approximate_split: true    # 문자 5-gram MinHash로 근사 중복의 split 누수 방지
-# 여러 언어쌍을 한 모델에 넣을 때는 위 language_pair 대신 아래 형식을 씁니다.
-#   language_pairs:
-#     - [ko, ja]
-#     - [en, ru]
-#
-# 한본어(kj)와 지역 방언(kd, jd) 지원.
-#
-# kj 는 한국어와 일본어가 섞인 입력이고, 번역 결과물은 항상 한국어 또는 일본어
-# 단일어여야 합니다. kd 는 한국어 지역 방언, jd 는 일본어 지역 방언 입력입니다.
-# 세 태그 모두 source_only_languages 에 등재해야 합니다. 등재하면 kj->ko,
-# kd->ja 처럼 "이해" 방향만 학습되고 ko->kj / ko->kd 는 만들어지지 않습니다.
-# 등재하지 않으면 bidirectional 이 혼용문과 방언을 target 으로도 학습해서
-# 표준 한국어를 요청했는데 가나가 섞이거나 사투리가 나오는 모델이 됩니다.
-#
-# 방언은 지역이 태그가 아니라 행 메타데이터(dialect_region)입니다. 표준 입력에
-# 특정 지역 방언으로 답하게 하려면 별도 태그 스킴이 필요하고, 그건 아직 없습니다.
-#
-# 코퍼스는 scripts/data/build_hanboneo.py 와
-# scripts/data/build_dialect_corpus.py 로 만듭니다.
-#   language_pairs:
-#     - [kj, ko]
-#     - [kj, ja]
-#     - [kd, ko]
-#     - [kd, ja]
-#     - [jd, ko]
-#     - [jd, ja]
-#     - [ko, ja]
-#   source_only_languages: [kj, kd, jd]
+
+  # JSONL 키 이름이 곧 언어 이름입니다. 여기를 바꾸면 토크나이저의 <2xx>/
+  # <denoise_xx> 제어 토큰, 전처리, 방향 태그가 전부 따라갑니다.
+  #
+  # 한 쌍만 쓸 때는 language_pairs 대신 language_pair: [en, de] 형식을 씁니다.
+  #
+  # data/ 에 한본어(kj)와 지역 방언(kd, jd) shard 가 있으므로 아래 7쌍을
+  # 씁니다. 이 목록에서 어떤 쌍을 빼면 그 shard 는 학습되지 않습니다.
+  language_pairs:
+    - [kj, ko]
+    - [kj, ja]
+    - [kd, ko]
+    - [kd, ja]
+    - [jd, ko]
+    - [jd, ja]
+    - [ko, ja]
+
+  # 입력으로만 받을 언어입니다. **이 줄을 빼면 안 됩니다.**
+  #
+  # kj 는 한국어와 일본어가 섞인 입력이고 번역 결과는 항상 한쪽 단일어여야
+  # 합니다. kd/jd 는 지역 방언 입력이고, 목표는 방언을 *이해*하는 것이지
+  # 표준 입력에 사투리로 답하는 것이 아닙니다.
+  #
+  # 등재하면 kj->ko, kd->ja 같은 이해 방향만 학습되고 역방향은 만들어지지
+  # 않습니다. 등재하지 않으면 bidirectional 학습이 혼용문과 방언을 target
+  # 으로도 배워서, 표준 한국어를 요청했는데 가나가 섞이거나 사투리가 나오는
+  # 모델이 됩니다.
+  source_only_languages: [kj, kd, jd]
+
+  # 방언 shard 는 지역을 태그가 아니라 행 메타데이터(dialect_region)로 담습니다.
+  # 특정 지역 방언으로 *생성*하게 하려면 별도 태그 스킴이 필요하고 아직 없습니다.
+  #
+  # 코퍼스 생성기: scripts/data/build_hanboneo.py,
+  # scripts/data/build_dialect_corpus.py, scripts/data/build_netspeak_corpus.py,
+  # scripts/data/build_formulaic_corpus.py
 #   source_token_dropout: 0.05  # 온라인 증강(원문 토큰 탈락) 확률. 0 이면 끔
+#   decoder_input_noise: 0.0    # 디코더 입력 교란(exposure bias 완화). 기본 0.
+#                               # 측정 없이 켜지 마십시오 — 0.1 부터 A/B
 #   synthetic_prefix: bt_    # 역번역 합성 파일 접두사 (train 전용 + 자동 다운웨이트)
 #   glossary: glossary.json  # 용어집 JSON. 지정 시 번역/평가에서 용어 강제
 #                            # 형식: [{"ko": "인공지능", "ja": "人工知能"}, ...]
