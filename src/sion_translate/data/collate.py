@@ -59,6 +59,7 @@ class SionBatchCollator:
         denoise_noise_density: float = 0.15,
         denoise_mean_span: float = 3.0,
         source_token_dropout: float = 0.0,
+        decoder_input_noise: float = 0.0,
         augmentation_seed: int = 0,
         augmentation_key: int = 0,
         token_features: str | Path | None = None,
@@ -76,6 +77,23 @@ class SionBatchCollator:
         # 단어가 빠진 입력에도 견고해지게 합니다. 학습 collator 에만 적용하고
         # 검증 collator 에는 0 을 넣어야 합니다.
         self.source_token_dropout = source_token_dropout
+        # Exposure bias mitigation for the supervised stage. Teacher forcing only
+        # ever shows the decoder gold prefixes, so at inference the first error
+        # puts it in a state it never trained on and the errors compound. Post
+        # training (MRT) samples from the model and does address this, but it runs
+        # after the fact and for a few thousand steps; the main run has no such
+        # mechanism at all.
+        #
+        # Replacing a fraction of the decoder *input* tokens makes the model
+        # recover from a wrong prefix. The labels stay clean - the target it must
+        # produce never changes - so this is teacher forcing over a noisy prefix,
+        # not a change of objective. Unlike scheduled sampling it needs no second
+        # forward pass.
+        #
+        # Defaults to 0. It is off until someone measures it: this changes what
+        # the decoder conditions on, and turning it on untested before a
+        # from-scratch run would be a guess.
+        self.decoder_input_noise = decoder_input_noise
         self.augmentation_seed = int(augmentation_seed)
         # shared-memory scalar라 persistent DataLoader worker에도 epoch 변경이
         # 전달됩니다. 각 샘플은 이 값과 pair identity로 독립 RNG를 만듭니다.
@@ -166,7 +184,7 @@ class SionBatchCollator:
         src = src[: self.max_source_length - 2]
         tgt = tgt[: self.max_target_length - 1]
         input_ids = [task_id, *src, self.tokenizer.eos_id]
-        decoder_input_ids = [self.tokenizer.bos_id, *tgt]
+        decoder_input_ids = [self.tokenizer.bos_id, *self._noise_decoder_input(tgt, rng)]
         labels = [*tgt, self.tokenizer.eos_id]
         memory_tokens = [token_id for token_id in src if token_id in self.slot_ids]
         return {
@@ -178,6 +196,32 @@ class SionBatchCollator:
             "source_language_tag_id": source_language_tag_id,
             "reverse_direction_trained": reverse_direction_trained,
         }
+
+    def _noise_decoder_input(self, target: Sequence[int], rng: random.Random) -> list[int]:
+        """Corrupt a fraction of the decoder input, leaving the labels alone.
+
+        Protected slots keep their surface, because the point of a slot is that
+        it survives verbatim; corrupting one would train the model to break the
+        guarantee the slot exists to make.
+        """
+
+        if self.decoder_input_noise <= 0:
+            return list(target)
+        vocab_size = self.tokenizer.vocab_size
+        noised: list[int] = []
+        for token_id in target:
+            if token_id in self.slot_ids or rng.random() >= self.decoder_input_noise:
+                noised.append(token_id)
+                continue
+            # Half the time show <mask>, which says "something was here";
+            # half the time show a wrong token, which is what a real decoding
+            # error looks like. Only the second teaches recovery from a
+            # confident mistake, and only the first is a clean signal.
+            if rng.random() < 0.5:
+                noised.append(self.tokenizer.mask_id)
+            else:
+                noised.append(rng.randrange(vocab_size))
+        return noised
 
     def __call__(self, items: Sequence[dict]) -> dict[str, torch.Tensor]:
         examples = [self._make_example(item) for item in items]

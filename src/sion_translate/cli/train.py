@@ -713,11 +713,13 @@ def main() -> None:
             denoise_probability=config.data.denoise_probability,
             # 온라인 증강(원문 토큰 dropout)은 학습에만 적용합니다.
             source_token_dropout=config.data.source_token_dropout,
+            decoder_input_noise=config.data.decoder_input_noise,
         )
         validation_collator = SionBatchCollator(
             **collator_args,
             denoise_probability=config.data.validation_denoise_probability,
             source_token_dropout=0.0,  # 검증은 항상 깨끗한 입력으로
+            decoder_input_noise=0.0,
         )
         # sampler: 비슷한 길이끼리 묶어(bucket) 패딩 낭비를 줄이고,
         # 분산 학습에서 rank 별로 겹치지 않게 배치를 나눕니다.
@@ -862,6 +864,7 @@ def main() -> None:
                 **collator_args,
                 denoise_probability=0.0,
                 source_token_dropout=0.0,
+                decoder_input_noise=0.0,
             )
             post_sampler = DistributedBucketBatchSampler(
                 train_dataset,

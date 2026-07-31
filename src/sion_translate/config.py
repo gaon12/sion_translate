@@ -185,6 +185,19 @@ class DataConfig:
     # 소량(0.05 안팎)은 과적합을 줄여 주지만, 큰 값은 오히려 해롭습니다.
     # 검증에는 절대 적용되지 않습니다. 0 이면 끕니다.
     source_token_dropout: float = 0.05
+    # 디코더 입력 토큰을 낮은 확률로 교란하는 exposure bias 완화 장치.
+    # teacher forcing 은 항상 정답 접두사만 보여 주므로, 추론에서 첫 오류가
+    # 나면 모델이 학습한 적 없는 상태에 놓이고 오류가 누적됩니다. 사후학습(MRT)
+    # 이 이 문제를 다루지만 그건 본학습이 끝난 뒤 수천 스텝짜리 미세조정이고,
+    # 본학습 자체에는 대책이 없습니다.
+    #
+    # 정답(labels)은 건드리지 않습니다. 바뀌는 것은 디코더가 무엇을 보고
+    # 다음 토큰을 예측하느냐뿐이라, 목적함수는 그대로입니다.
+    #
+    # 기본값 0(끔). 측정 전에는 켜지 않습니다 — 디코더의 조건부를 바꾸는
+    # 개입이라 처음부터 학습하는 run 에서 검증 없이 켜는 것은 도박입니다.
+    # 시도한다면 0.1 부터 보고 검증 loss 로 A/B 하십시오.
+    decoder_input_noise: float = 0.0
     # 역번역(backtranslation) 등 합성 데이터 파일의 이름 접두사.
     # 이 접두사로 시작하는 파일은 ① 항상 train split 에만 들어가고
     # ② 샘플링 가중치가 자동으로 낮아집니다 (합성 데이터 과다 방지).
@@ -406,6 +419,8 @@ class AppConfig:
                     )
         if not 0.0 <= self.data.source_token_dropout < 0.5:
             raise ValueError("source_token_dropout must be in [0, 0.5)")
+        if not 0.0 <= self.data.decoder_input_noise < 0.5:
+            raise ValueError("decoder_input_noise must be in [0, 0.5)")
         if not self.data.synthetic_prefix:
             raise ValueError("synthetic_prefix must be non-empty")
         self.data.configured_synthetic_prefixes()
