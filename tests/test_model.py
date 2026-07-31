@@ -661,6 +661,9 @@ def test_morph_gates_only_when_morphoscript_enabled() -> None:
     assert all("morph_gates" not in name for name, _ in model.named_parameters())
     enabled_model = SionForConditionalGeneration(tiny_config())
     assert enabled_model.morph_gates is not None
+    assert all(
+        "register_state.content_proj" not in name for name, _ in enabled_model.named_parameters()
+    )
 
 
 def test_cross_attention_cache_is_not_reordered_between_beam_steps() -> None:

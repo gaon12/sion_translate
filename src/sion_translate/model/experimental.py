@@ -47,7 +47,6 @@ class ContentRegisterState(nn.Module):
         self.norm = RMSNorm(d_model)
         self.classifier = nn.Linear(d_model, register_classes)
         self.register_embeddings = nn.Embedding(register_classes, d_model)
-        self.content_proj = nn.Linear(d_model, d_model, bias=False)
         # FSDP2 cannot shard scalar parameters. A one-element vector has the
         # same broadcast semantics against ``(batch, d_model)`` contexts while
         # remaining a shardable parameter.
@@ -72,8 +71,7 @@ class ContentRegisterState(nn.Module):
             context = torch.where(known[:, None], gold_context, predicted_context)
         else:
             context = predicted_context
-        content = self.content_proj(pooled)
-        return content, torch.tanh(self.inject_gate) * context, logits
+        return pooled, torch.tanh(self.inject_gate) * context, logits
 
 
 class TypedEntityMemory(nn.Module):
