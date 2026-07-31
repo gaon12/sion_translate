@@ -55,16 +55,47 @@ def test_no_core_warning_with_default_register_loss_weight() -> None:
     assert _warnings_from(ExperimentalConfig(core_enabled=True)) == []
 
 
-def test_root_config_enables_experimental_modules_with_training_signal() -> None:
+def test_root_config_gives_every_enabled_module_a_training_signal() -> None:
+    """A module that is on must have a non-zero weight, or it is pure cost.
+
+    This is the invariant worth pinning. Which modules are on is a per-run
+    decision - the from-scratch run narrowed it to CoRe so a change in quality
+    has one candidate cause - but any module that *is* on has to be learning
+    something.
+    """
+
     root_config = Path(__file__).resolve().parents[1] / "sion_translate.yaml"
     experimental = load_config(root_config).model.experimental
 
-    assert experimental.bats_enabled is True
-    assert experimental.bats_coverage_weight > 0
-    assert experimental.core_enabled is True
-    assert experimental.register_loss_weight > 0
-    assert experimental.tetm_enabled is True
-    assert experimental.morphoscript_enabled is True
+    if experimental.bats_enabled:
+        assert experimental.bats_coverage_weight > 0 or experimental.bats_loss_weight > 0
+    if experimental.core_enabled:
+        assert experimental.register_loss_weight > 0
+
+
+def test_root_config_keeps_the_experimental_surface_small() -> None:
+    """Several modules at once makes a quality change impossible to attribute.
+
+    The yaml says to enable one at a time and used to contradict itself by
+    enabling five. SiTU-GLU is excluded from the count: it reshapes an existing
+    activation rather than adding a module, so it cannot be the thing that moved
+    a score on its own.
+    """
+
+    root_config = Path(__file__).resolve().parents[1] / "sion_translate.yaml"
+    experimental = load_config(root_config).model.experimental
+
+    enabled = [
+        name
+        for name, active in (
+            ("bats", experimental.bats_enabled),
+            ("core", experimental.core_enabled),
+            ("tetm", experimental.tetm_enabled),
+            ("morphoscript", experimental.morphoscript_enabled),
+        )
+        if active
+    ]
+    assert len(enabled) <= 2, enabled
 
 
 def test_negative_loss_weight_is_still_an_error() -> None:
