@@ -6,7 +6,9 @@ joint SentencePiece, GQA, RoPE, pre-RMSNorm, QK-norm, SwiGLU, EMA, 양방향 번
 
 학습 데이터, 전처리 산출물, 체크포인트, 모델 가중치와 로컬 평가 결과는 Git 저장소에
 포함하지 않습니다. 사용자는 이용·가공·재배포 권한을 직접 확인한 JSONL만 준비해야
-합니다. 공개 모델 가중치는 별도
+합니다. 유지관리자가 별도로 만드는 `sion_translate.zip`은 권한 확인이 끝난 특정
+학습 snapshot을 코드와 함께 전달하는 GPU 실행물이며 Git 저장소와는 구분됩니다.
+공개 모델 가중치는 별도
 [Hugging Face 저장소](https://huggingface.co/gaon12/sion_translate)에서 제공합니다.
 모델 페이지의 widget에는 양방향 입력 예시와 그에 대해 미리 생성해 둔 출력이 적혀
 있습니다. 이 모델은 Transformers `AutoModel` 체크포인트가 아니므로 hosted inference로
@@ -53,12 +55,31 @@ python -m venv .venv
 `easy_run.py`는 입력 JSONL과 실행 환경을 감지해 토크나이저 준비, 품질 필터링,
 중복 제거, split 생성, 모델 크기·배치·정밀도 선택, SFT와 사후학습, 체크포인트 재개를
 순서대로 처리합니다. 이 자동 실행기는 Linux CUDA GPU 서버용이며 CPU나 Windows에서는
-수동 CLI 경로를 사용해야 합니다. 세부 GPU 서버 실행법은 [`how_to_run.txt`](how_to_run.txt),
-사후학습 설계는 [`POSTTRAINING.md`](POSTTRAINING.md)를 참고하세요. H100
-단일·다중 GPU 용량 점검과 7종 내보내기는
+수동 CLI 경로를 사용해야 합니다. 세부 GPU 서버 실행법은 [`START-HERE.md`](START-HERE.md)와
+[`how_to_run.txt`](how_to_run.txt), 사후학습 설계는
+[`POSTTRAINING.md`](POSTTRAINING.md)를 참고하세요. 80GB급 GPU의 수동 용량 점검과
+7종 내보내기는
 [`docs/H100_TRAINING.md`](docs/H100_TRAINING.md), 데이터 정비 현황과 1억 쌍
 분야별 확장량은 [`docs/DATA_EXPANSION_PLAN.md`](docs/DATA_EXPANSION_PLAN.md)에
 정리되어 있습니다.
+
+### 자체 포함 GPU ZIP 만들기
+
+모든 코드·문서 변경을 커밋하고 추적 파일이 깨끗한 상태에서 실행합니다.
+
+```bash
+python scripts/package_gpu_bundle.py build \
+  --output sion_translate.zip \
+  --overwrite
+python scripts/package_gpu_bundle.py verify-archive sion_translate.zip
+```
+
+빌더는 Git stage-0 일반 파일, `data/*.jsonl`, `data/evaluation_only/**`만 선택해
+단일 `sion_translate/` 루트의 ZIP64 archive를 만듭니다. `data/excluded`,
+`artifacts`, `runs`, 체크포인트, 가상환경과 캐시는 포함될 수 없습니다.
+`PACKAGE_MANIFEST.json`에는 Git commit/tree와 각 파일의 크기·mode·SHA-256이,
+`SHA256SUMS`에는 추출 후 검증값이 기록됩니다. 완성 ZIP 전체 SHA-256은 빌드
+출력에서 별도로 전달합니다.
 
 ## 번역
 

@@ -9,27 +9,39 @@ GPU 서버에서 토크나이저부터 사후학습까지 순서대로 돌리는
 `split_digits=False` 토크나이저로 학습돼 `sion-train`이 거부하므로, 어차피
 토크나이저부터 새로 만들어야 합니다.
 
-`data/`는 저장소에 포함되지 않습니다(`.gitignore`). 코퍼스를 서버로 따로
-올려야 합니다.
+`data/`는 Git 저장소에 포함되지 않습니다(`.gitignore`). 일반 clone에서는
+권한을 확인한 코퍼스를 별도로 준비해야 합니다. 유지관리자가 만든
+`sion_translate.zip`에는 manifest에 기록된 학습 snapshot과
+`data/evaluation_only/`가 이미 포함됩니다.
 
 ## 1. 가장 짧은 경로
 
-GPU 서버에서는 이것 하나면 됩니다.
+GPU ZIP을 서버에 올린 경우 먼저 압축과 내부 checksum을 검증합니다.
 
 ```bash
+sha256sum sion_translate.zip  # 배포자가 전달한 값과 비교
+python -m zipfile -t sion_translate.zip
+unzip sion_translate.zip
+cd sion_translate
+python scripts/package_gpu_bundle.py verify-tree .
+
 pip install -e ".[dev,export,hangul]"
 python easy_run.py
 ```
 
-`easy_run.py`가 전부 합니다.
+설치 뒤 학습 명령은 `easy_run.py` 하나입니다.
 
-1. tmux 세션 생성 (없으면 자동 설치). 접속이 끊겨도 학습이 계속됩니다
-2. **shard 키 검사** — 읽히지 않는 shard 가 있으면 즉시 중단
+1. CUDA와 다중 GPU NCCL 사전검사
+2. **shard 구조 검사** — 설정된 언어쌍 레코드가 표본에 없으면 즉시 중단
 3. `/dev/shm` 여유가 있으면 코퍼스를 RAM 디스크로 복사
 4. 토크나이저 학습 (없을 때) + 데이터셋 준비
-5. **byte fallback 검사** — 비율이 상한을 넘으면 중단
-6. GPU 개수만큼 분산 학습
-7. 학습 뒤 MRT 사후학습 (`posttraining.enabled` 기본 true)
+5. **byte fallback/MorphoScript 검사** — 잘못된 sidecar나 표현력 부족이면 중단
+6. 모든 rank의 최소 VRAM/BF16 능력으로 공통 설정 후 분산 SFT
+7. best SFT 모델에서 MRT 사후학습 (`posttraining.enabled` 기본 true)
+
+대화형 셸에 `tmux`가 이미 있으면 체크아웃별 세션을 사용합니다. 비대화형
+Slurm/nohup/container 또는 tmux가 없는 서버에서는 설치를 강제하지 않고 현재
+프로세스에서 계속합니다.
 
 아래 2절부터는 수동으로 단계를 나눠 돌리거나 중간 산출물을 확인할 때
 읽으십시오.
@@ -48,7 +60,7 @@ CI가 Python 3.11과 3.12에서 돕니다. 그 외 버전은 검증되지 않았
 설치 확인:
 
 ```bash
-python -m pytest -q          # 911개 통과해야 합니다
+python -m pytest -p no:cacheprovider
 ruff format --check . && ruff check .
 ```
 
@@ -80,9 +92,11 @@ PY
 python scripts/data/check_shard_keys.py
 ```
 
-종료코드가 0이 아니면 그 파일은 학습에서 빠집니다. 실제로 `data40.jsonl`이
-키를 `한국어`/`일본어`로 써서 10,075행이 빠지고 있었고, 지금은 고쳐졌습니다.
-전량 스캔에서 51개 shard 전부 읽히고 총 18,124,108문장입니다.
+종료코드가 0이 아니면 그 파일은 학습에서 빠질 가능성이 있습니다. 검사는 각
+shard에서 최대 2,000개 물리 행만 구조적으로 확인하고, 정상 파일은 첫 유효
+레코드에서 멈춥니다. 품질 필터와 split을 다시 실행하지 않으므로 대용량 코퍼스를
+두 번 전처리하거나 저품질 문장을 키 오류로 오진하지 않습니다. 실제로
+`data40.jsonl`이 키를 `한국어`/`일본어`로 써서 빠지던 문제를 이 검사로 찾았습니다.
 
 `easy_run.py`가 이 검사를 학습 전에 자동으로 돌리므로, 수동 실행은 미리
 확인하고 싶을 때만 하면 됩니다.
@@ -121,7 +135,10 @@ sion-train-tokenizer \
   --language-pairs kj ko --language-pairs kj ja \
   --language-pairs kd ko --language-pairs kd ja \
   --language-pairs jd ko --language-pairs jd ja \
-  --language-pairs ko ja
+  --language-pairs ko ja \
+  --approximate-split \
+  --source-only-language kj kd jd \
+  --train-only-prefix bt_ concat_ revise_ synthetic_
 ```
 
 `--input-sentence-size 0`이 핵심입니다. 기본 상한을 두면 SentencePiece가
@@ -165,7 +182,14 @@ fallback 대상이고, 그것이 byte fallback의 용도입니다. 기본 상한
 sion-prepare-data \
   --input "data/*.jsonl" \
   --tokenizer artifacts/tokenizer/sion.model \
-  --output-dir artifacts/dataset
+  --output-dir artifacts/dataset \
+  --language-pairs kj ko --language-pairs kj ja \
+  --language-pairs kd ko --language-pairs kd ja \
+  --language-pairs jd ko --language-pairs jd ja \
+  --language-pairs ko ja \
+  --approximate-split \
+  --source-only-language kj kd jd \
+  --train-only-prefix bt_ concat_ revise_ synthetic_
 ```
 
 `sion-train`을 인자 없이 돌리면 이 단계가 자동으로 실행되므로 건너뛰어도
