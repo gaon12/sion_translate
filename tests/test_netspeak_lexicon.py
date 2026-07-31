@@ -52,7 +52,9 @@ def test_a_polite_pair_is_refused(ko: str, ja: str) -> None:
 
 def test_a_dictionary_form_ending_is_not_chat() -> None:
     # A quest objective is not something anyone types in a chat window.
-    assert not LEXICON.is_casual_pair("메인 스토리 누적 20 회 클리어", "累計でメインストーリーを20回クリアする")
+    assert not LEXICON.is_casual_pair(
+        "메인 스토리 누적 20 회 클리어", "累計でメインストーリーを20回クリアする"
+    )
 
 
 @pytest.mark.parametrize(
