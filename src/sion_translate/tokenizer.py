@@ -21,7 +21,12 @@ from sion_translate.data.records import (
 from sion_translate.data.quality import QualityPolicy, assess_pair, canonical_text
 from sion_translate.fingerprint import file_sha256
 from sion_translate.performance import bounded_ordered_map, build_cpu_plan
-from sion_translate.splitting import TargetSplitGuard, choose_split_for_key, normalized_split_key
+from sion_translate.splitting import (
+    TargetSplitGuard,
+    choose_split_for_key,
+    endpoint_split_digest,
+    endpoint_split_key,
+)
 
 
 DEFAULT_LANGUAGE_PAIR = ("ko", "ja")
@@ -212,33 +217,34 @@ def expand_inputs(patterns: Sequence[str]) -> list[Path]:
 
 def _filter_text_batch(
     batch: tuple[list[bytes], tuple[tuple[str, str], ...], float, float],
-) -> list[tuple[str, str, str, bytes]]:
+) -> list[tuple[str, str, str, bytes, bytes]]:
     lines, language_pairs, validation_fraction, test_fraction = batch
     policy = QualityPolicy()
-    accepted: list[tuple[str, str, str, bytes]] = []
+    accepted: list[tuple[str, str, str, bytes, bytes]] = []
     for raw_line in lines:
         try:
             row = json.loads(raw_line.decode("utf-8-sig"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             continue
+        record_group_key = hashlib.sha256(raw_line.strip()).hexdigest()
         expansion = expand_parallel_record(row, language_pairs)
         for pair in expansion.pairs:
             text_a, text_b = canonical_text(pair.text_a), canonical_text(pair.text_b)
             languages = (pair.language_a, pair.language_b)
             if not assess_pair(text_a, text_b, policy, languages=languages).accepted:
                 continue
-            source_key = normalized_split_key(text_a)
-            target_key = normalized_split_key(text_b)
             if len(language_pairs) > 1:
-                source_key = f"{pair.language_a}\0{source_key}"
-                target_key = f"{pair.language_b}\0{target_key}"
+                candidate_key = f"record\0{record_group_key}"
+            else:
+                candidate_key = endpoint_split_key(pair.language_a, text_a)
             split = choose_split_for_key(
-                source_key,
+                candidate_key,
                 validation_fraction,
                 test_fraction,
             )
-            target_digest = hashlib.sha256(target_key.encode("utf-8")).digest()
-            accepted.append((text_a, text_b, split, target_digest))
+            source_digest = endpoint_split_digest(pair.language_a, text_a)
+            target_digest = endpoint_split_digest(pair.language_b, text_b)
+            accepted.append((text_a, text_b, split, source_digest, target_digest))
     return accepted
 
 
@@ -284,8 +290,8 @@ def iter_parallel_text(
         results = bounded_ordered_map(executor, _filter_text_batch, inputs, max_pending=workers * 2)
     try:
         for candidates in results:
-            for text_a, text_b, split, target_digest in candidates:
-                if not target_split_guard.accept(split, target_digest):
+            for text_a, text_b, split, source_digest, target_digest in candidates:
+                if not target_split_guard.accept_many(split, (source_digest, target_digest)):
                     continue
                 if split != "train":
                     continue

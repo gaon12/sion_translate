@@ -17,8 +17,9 @@ from sion_translate.fingerprint import PREPROCESSING_SCHEMA, build_dataset_finge
 from sion_translate.performance import bounded_ordered_map, build_cpu_plan
 from sion_translate.splitting import (
     TargetSplitGuard,
-    approximate_split_key,
     choose_split_for_key,
+    endpoint_split_digest,
+    endpoint_split_key,
 )
 from sion_translate.structured import protect_shared_structured_spans
 from sion_translate.synthetic import (
@@ -438,6 +439,10 @@ def prepare_dataset(
     quality_policy = quality_policy or QualityPolicy()
     quality_policy.validate()
     normalized_pairs = normalize_language_pairs(language_pair, language_pairs)
+    endpoint_key_schema = (
+        "language-prefixed-minhash-char5-v1" if approximate_split else "language-prefixed-exact-v1"
+    )
+    split_key_schema = "record-sha256-v1" if len(normalized_pairs) > 1 else endpoint_key_schema
     train_only_prefixes = normalize_synthetic_prefixes(train_only_prefixes)
     languages = languages_from_pairs(normalized_pairs)
     language_to_id = {language: index for index, language in enumerate(languages)}
@@ -475,6 +480,8 @@ def prepare_dataset(
             "index_dtype": INDEX_DTYPE.descr,
             "max_tokens_per_side": max_tokens_per_side,
             "approximate_split": approximate_split,
+            "endpoint_leakage_guard": "language-endpoint-bloom-v2",
+            "endpoint_leakage_key": endpoint_key_schema,
             "prevent_target_leakage": prevent_target_leakage,
             "quality_policy": quality_policy.to_dict(),
             "shard_size": shard_size,
@@ -613,6 +620,57 @@ def prepare_dataset(
                         register_a, register_b = register_b, register_a
                     forward_only = language_a in source_only_set
 
+                # A row that can never be written must not reserve endpoint
+                # ownership and suppress a usable row encountered later.
+                if len(ids_a) > max_tokens_per_side or len(ids_b) > max_tokens_per_side:
+                    for target in targets:
+                        _increment(target, "too_long")
+                    continue
+
+                # Approve the row's partition before it can affect pair dedup.
+                # Both language-scoped endpoints participate so a surface
+                # cannot leak when it changes role across configured pairs.
+                is_synthetic = record_is_synthetic or synthetic_path(
+                    paths[source_id], train_only_prefixes
+                )
+                if is_synthetic:
+                    split = "train"
+                elif len(normalized_pairs) > 1:
+                    split_key = f"record\0{record_group_key}"
+                    split = choose_split_for_key(
+                        split_key,
+                        validation_fraction,
+                        test_fraction,
+                    )
+                else:
+                    split_key = endpoint_split_key(
+                        language_a,
+                        text_a,
+                        approximate=approximate_split,
+                    )
+                    split = choose_split_for_key(
+                        split_key,
+                        validation_fraction,
+                        test_fraction,
+                    )
+                if target_split_guard is not None:
+                    endpoint_digests = (
+                        endpoint_split_digest(
+                            language_a,
+                            text_a,
+                            approximate=approximate_split,
+                        ),
+                        endpoint_split_digest(
+                            language_b,
+                            text_b,
+                            approximate=approximate_split,
+                        ),
+                    )
+                    if not target_split_guard.accept_many(split, endpoint_digests):
+                        for target in targets:
+                            _increment(target, "split_conflicts")
+                        continue
+
                 pair_key = (
                     f"{language_a}\0{dedup_key(text_a)}\0{language_b}\0{dedup_key(text_b)}"
                 ).encode("utf-8")
@@ -622,39 +680,6 @@ def prepare_dataset(
                         _increment(target, "duplicates")
                     continue
 
-                if len(ids_a) > max_tokens_per_side or len(ids_b) > max_tokens_per_side:
-                    for target in targets:
-                        _increment(target, "too_long")
-                    continue
-
-                # Group all translations sharing a source text in one split.
-                is_synthetic = record_is_synthetic or synthetic_path(
-                    paths[source_id], train_only_prefixes
-                )
-                if is_synthetic:
-                    split = "train"
-                else:
-                    source_key = (
-                        approximate_split_key(text_a) if approximate_split else dedup_key(text_a)
-                    )
-                    if len(normalized_pairs) > 1:
-                        source_key = f"record\0{record_group_key}"
-                    split = choose_split_for_key(
-                        source_key,
-                        validation_fraction,
-                        test_fraction,
-                    )
-                if target_split_guard is not None:
-                    target_key = (
-                        approximate_split_key(text_b) if approximate_split else dedup_key(text_b)
-                    )
-                    if len(normalized_pairs) > 1:
-                        target_key = f"{language_b}\0{target_key}"
-                    target_digest = hashlib.sha256(target_key.encode("utf-8")).digest()
-                    if not target_split_guard.accept(split, target_digest):
-                        for target in targets:
-                            _increment(target, "split_conflicts")
-                        continue
                 writers[split].add(
                     ids_a,
                     ids_b,
@@ -754,9 +779,10 @@ def prepare_dataset(
         "quality_filter_enabled": filter_quality,
         "quality_policy": quality_policy.to_dict(),
         "target_leakage_guard_enabled": prevent_target_leakage,
-        "target_leakage_guard": "bloom-v1",
+        "target_leakage_guard": "language-endpoint-bloom-v2",
+        "endpoint_leakage_key": endpoint_key_schema,
         "approximate_split": approximate_split,
-        "split_key": "minhash-char5-v1" if approximate_split else "exact",
+        "split_key": split_key_schema,
         "dedup_backend": dedup_backend,
         "atomic_build": True,
     }

@@ -7,7 +7,7 @@ import pytest
 import sentencepiece as spm
 
 from sion_translate.fingerprint import file_sha256
-from sion_translate.splitting import choose_split_for_text
+from sion_translate.splitting import choose_split_for_key, endpoint_split_key
 from sion_translate.tokenizer import (
     TOKENIZER_METADATA_VERSION,
     SionTokenizer,
@@ -21,7 +21,7 @@ from sion_translate.tokenizer import (
 def _pair_for_split(split: str) -> tuple[str, str]:
     for index in range(100_000):
         ko = f"분할 검증을 위한 한국어 문장 {index}입니다."
-        if choose_split_for_text(ko) == split:
+        if choose_split_for_key(endpoint_split_key("ko", ko)) == split:
             return ko, f"分割検証用の日本語文{index}です。"
     raise AssertionError(f"Could not find text assigned to {split}")
 
@@ -29,7 +29,7 @@ def _pair_for_split(split: str) -> tuple[str, str]:
 def _damaged_pair_in_train_split() -> tuple[str, str]:
     for index in range(100_000):
         text = f"OpenAI identical text {index}"
-        if choose_split_for_text(text) == "train":
+        if choose_split_for_key(endpoint_split_key("ko", text)) == "train":
             return text, text
     raise AssertionError("Could not find damaged text assigned to train")
 
@@ -38,7 +38,7 @@ def _repeated_pair_in_train_split() -> tuple[str, str]:
     for index in range(100_000):
         ko = f"오류오류오류오류오류오류 {index}"
         ja = f"エラーエラーエラーエラーエラーエラー {index}"
-        if choose_split_for_text(ko) == "train":
+        if choose_split_for_key(endpoint_split_key("ko", ko)) == "train":
             return ko, ja
     raise AssertionError("Could not find repeated text assigned to train")
 

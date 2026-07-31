@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import re
 import unicodedata
+from collections.abc import Iterable
 
 
 _WHITESPACE = re.compile(r"\s+")
@@ -103,6 +104,36 @@ def approximate_split_key(text: str, *, num_perm: int = SIGNATURE_LENGTH) -> str
     return "minhash\0" + "".join(f"{value:016x}" for value in signature)
 
 
+def endpoint_split_key(
+    language: str,
+    text: str,
+    *,
+    approximate: bool = False,
+) -> str:
+    """Return a language-scoped key for one parallel-text endpoint.
+
+    A surface may appear as either the source or target of different language
+    pairs.  Prefixing every endpoint, including two-language corpora, makes
+    those appearances comparable without conflating identical spelling in
+    different languages.
+    """
+
+    text_key = approximate_split_key(text) if approximate else normalized_split_key(text)
+    return f"{language}\0{text_key}"
+
+
+def endpoint_split_digest(
+    language: str,
+    text: str,
+    *,
+    approximate: bool = False,
+) -> bytes:
+    """Return the stable SHA-256 digest used by endpoint leakage guards."""
+
+    key = endpoint_split_key(language, text, approximate=approximate)
+    return hashlib.sha256(key.encode("utf-8")).digest()
+
+
 def choose_split_for_key(
     key: str,
     validation_fraction: float = 0.005,
@@ -161,7 +192,11 @@ class BloomFilter:
 
 
 class TargetSplitGuard:
-    """Prevent one normalized target surface from crossing data splits."""
+    """Prevent one normalized language endpoint from crossing data splits.
+
+    The historical class name remains public for compatibility.  Callers now
+    register both source and target endpoint digests.
+    """
 
     def __init__(
         self,
@@ -173,25 +208,40 @@ class TargetSplitGuard:
             requested = max(minimum, capacity * bits_per_item)
             return 1 << (requested - 1).bit_length()
 
+        # Every accepted pair now registers both language-scoped endpoints.
+        # Size the filters for endpoint count so the v2 guard retains the same
+        # false-positive budget as the historical target-only guard.
+        estimated_endpoints = estimated_pairs * 2
         train_capacity = max(
-            1, round(estimated_pairs * (1.0 - validation_fraction - test_fraction))
+            1,
+            round(estimated_endpoints * (1.0 - validation_fraction - test_fraction)),
         )
-        validation_capacity = max(1, round(estimated_pairs * validation_fraction))
-        test_capacity = max(1, round(estimated_pairs * test_fraction))
+        validation_capacity = max(1, round(estimated_endpoints * validation_fraction))
+        test_capacity = max(1, round(estimated_endpoints * test_fraction))
         self.filters = {
             "train": BloomFilter(bit_count(train_capacity, 24, 1 << 16)),
             "validation": BloomFilter(bit_count(validation_capacity, 32, 1 << 14)),
             "test": BloomFilter(bit_count(test_capacity, 32, 1 << 14)),
         }
 
-    def accept(self, split: str, digest: bytes) -> bool:
+    def accept_many(self, split: str, digests: Iterable[bytes]) -> bool:
+        """Atomically register all ``digests`` in ``split`` when conflict-free."""
+
+        destination = self.filters[split]
+        unique_digests = tuple(dict.fromkeys(digests))
         if any(
-            other != split and membership.contains(digest)
+            membership.contains(digest)
             for other, membership in self.filters.items()
+            if other != split
+            for digest in unique_digests
         ):
             return False
-        self.filters[split].add(digest)
+        for digest in unique_digests:
+            destination.add(digest)
         return True
+
+    def accept(self, split: str, digest: bytes) -> bool:
+        return self.accept_many(split, (digest,))
 
 
 __all__ = [
@@ -200,6 +250,8 @@ __all__ = [
     "character_shingles",
     "choose_split_for_key",
     "choose_split_for_text",
+    "endpoint_split_digest",
+    "endpoint_split_key",
     "minhash_signature",
     "normalized_split_key",
     "BloomFilter",
