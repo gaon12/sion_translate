@@ -12,7 +12,29 @@ GPU 서버에서 토크나이저부터 사후학습까지 순서대로 돌리는
 `data/`는 저장소에 포함되지 않습니다(`.gitignore`). 코퍼스를 서버로 따로
 올려야 합니다.
 
-## 1. 환경
+## 1. 가장 짧은 경로
+
+GPU 서버에서는 이것 하나면 됩니다.
+
+```bash
+pip install -e ".[dev,export,hangul]"
+python easy_run.py
+```
+
+`easy_run.py`가 전부 합니다.
+
+1. tmux 세션 생성 (없으면 자동 설치). 접속이 끊겨도 학습이 계속됩니다
+2. **shard 키 검사** — 읽히지 않는 shard 가 있으면 즉시 중단
+3. `/dev/shm` 여유가 있으면 코퍼스를 RAM 디스크로 복사
+4. 토크나이저 학습 (없을 때) + 데이터셋 준비
+5. **byte fallback 검사** — 비율이 상한을 넘으면 중단
+6. GPU 개수만큼 분산 학습
+7. 학습 뒤 MRT 사후학습 (`posttraining.enabled` 기본 true)
+
+아래 2절부터는 수동으로 단계를 나눠 돌리거나 중간 산출물을 확인할 때
+읽으십시오.
+
+## 2. 환경
 
 ```bash
 python -m pip install --upgrade pip
@@ -26,11 +48,11 @@ CI가 Python 3.11과 3.12에서 돕니다. 그 외 버전은 검증되지 않았
 설치 확인:
 
 ```bash
-python -m pytest -q          # 890개 통과해야 합니다
+python -m pytest -q          # 911개 통과해야 합니다
 ruff format --check . && ruff check .
 ```
 
-## 2. 코퍼스 확인
+## 3. 코퍼스 확인
 
 학습 전에 실제로 무엇이 들어가는지 세십시오.
 
@@ -46,7 +68,7 @@ print(f"{'TOTAL':44} {total:>10,}")
 PY
 ```
 
-2026-07-31 기준 **8,977,552행 / 50 shard**입니다. 숫자가 크게 다르면 코퍼스
+2026-07-31 기준 **8,978,338행 / 51 shard**입니다. 숫자가 크게 다르면 코퍼스
 업로드가 덜 끝난 것입니다.
 
 ### 키 이름 확인 — 반드시 하십시오
@@ -59,7 +81,11 @@ python scripts/data/check_shard_keys.py
 ```
 
 종료코드가 0이 아니면 그 파일은 학습에서 빠집니다. 실제로 `data40.jsonl`이
-키를 `한국어`/`일본어`로 써서 10,075행이 통째로 빠지는 상태였습니다.
+키를 `한국어`/`일본어`로 써서 10,075행이 빠지고 있었고, 지금은 고쳐졌습니다.
+전량 스캔에서 51개 shard 전부 읽히고 총 18,124,108문장입니다.
+
+`easy_run.py`가 이 검사를 학습 전에 자동으로 돌리므로, 수동 실행은 미리
+확인하고 싶을 때만 하면 됩니다.
 
 고치는 방법은 **JSONL의 키를 바꾸는 것 하나뿐**입니다. 언어쌍에 추가하는 것은
 불가능합니다 — 언어 키는 1~16자 ASCII 영숫자여야 하므로 `한국어`는 언어 키가
@@ -83,7 +109,7 @@ PY
 바꾼 뒤 `check_shard_keys.py`를 다시 돌려 0이 나오는지 보고, 원본은 지우거나
 `data/` 밖으로 옮기십시오. 둘 다 남으면 같은 내용이 중복 학습됩니다.
 
-## 3. 토크나이저
+## 4. 토크나이저
 
 ```bash
 sion-train-tokenizer \
@@ -109,29 +135,31 @@ sion-train-tokenizer \
 
 ### 끝나면 반드시 확인할 것
 
+`easy_run.py`가 자동으로 검사하므로 보통은 따로 할 일이 없습니다. 수동으로
+확인하려면:
+
 ```bash
 python - <<'PY'
-import sentencepiece as spm
-sp = spm.SentencePieceProcessor()
-sp.Load("artifacts/tokenizer/sion.model")
-print("vocab", sp.vocab_size())
-for probe in ["엌ㅋㅋㅋ 닝겐노 유리와 튼튼데스넼ㅋㅋ",
-              "밥 먹었나? 지금 어디 가노?",
-              "이거 ㄹㅇ 대박이다ㅋㅋ",
-              "0.0037mg/L 를 ±0.05mm 로 보정"]:
-    pieces = sp.EncodeAsPieces(probe)
-    fallback = sum(1 for p in pieces if p.startswith("<0x"))
-    print(f"  fallback={fallback:2}  {len(pieces):3}조각  {probe}")
-    if fallback:
-        print("     ", " ".join(pieces))
+import sys
+sys.path.insert(0, ".")
+from pathlib import Path
+import easy_run
+easy_run._verify_tokenizer(Path("artifacts/tokenizer/sion.model"), Path("data"))
 PY
 ```
 
-**byte fallback이 0이어야 합니다.** 배포된 토크나이저는 `넼`을
-`<0xEB> <0x84> <0xBC>` 세 조각으로 쪼갰습니다. 0이 아니면
-`--required-character-min-occurrences`를 낮추거나 vocab을 키우십시오.
+코퍼스에서 표본을 뽑아 byte fallback 비율을 재고, 원인 문자를 코드포인트와
+함께 출력합니다. 고정된 프로브 문자열을 쓰지 않으므로 다른 언어쌍에서도
+그대로 동작합니다.
 
-## 4. 데이터셋 준비
+판정은 0이 아니라 **비율**입니다. 임계값 25 미만 문자는 의도적으로 byte
+fallback 대상이고, 그것이 byte fallback의 용도입니다. 기본 상한은 0.2%입니다.
+
+비율이 높으면 `--required-character-min-occurrences`를 낮추거나 vocab을
+키우십시오. 다만 required 문자 수 + 제어 심볼 + byte fallback 256이 vocab을
+넘으면 학습이 시작 전에 거부됩니다.
+
+## 5. 데이터셋 준비
 
 ```bash
 sion-prepare-data \
@@ -143,7 +171,7 @@ sion-prepare-data \
 `sion-train`을 인자 없이 돌리면 이 단계가 자동으로 실행되므로 건너뛰어도
 됩니다. 수동으로 돌리면 중간 산출물을 확인할 수 있습니다.
 
-## 5. 학습
+## 6. 학습
 
 ```bash
 # 단일 GPU
@@ -177,7 +205,7 @@ forward 기여가 정확히 0이고 보조 loss만 흐릅니다. 모델이 이 �
   양방향 target 토큰 357,344,643/epoch에 대해 잘 맞는 크기입니다.
 - **register loss.** 떨어지지 않으면 CoRe가 신호를 못 찾는 것이므로 끄십시오.
 
-## 6. 사후학습 (MRT)
+## 7. 사후학습 (MRT)
 
 `posttraining.enabled`가 기본 true라 학습 뒤 자동으로 이어집니다.
 복합 보상 7종(chrF / token_f1 / number / structured / slot / language / length)에
@@ -187,7 +215,7 @@ forward 기여가 정확히 0이고 보조 loss만 흐릅니다. 모델이 이 �
 적합성과 역상관으로 측정됐습니다. 켜려면 독립 계열 QE로 게이트를 다시
 설계해야 합니다.
 
-## 7. 평가
+## 8. 평가
 
 ```bash
 sion-evaluate --help
@@ -204,7 +232,7 @@ sion-translate --help
 beam은 4를 쓰십시오. 실측에서 1→2→4가 chrF 77.28→77.36→77.50이고 16에서
 심한 반복 붕괴가 일어났습니다.
 
-## 8. 되돌아볼 만한 실패 지점
+## 9. 되돌아볼 만한 실패 지점
 
 - 토크나이저를 다시 만들면 `artifacts/dataset`과 체크포인트를 재사용할 수
   없습니다. 3~5단계를 순서대로 다시 돌려야 합니다.
@@ -212,7 +240,7 @@ beam은 4를 쓰십시오. 실측에서 1→2→4가 chrF 77.28→77.36→77.50�
   나옵니다. yaml 주석 처리된 예시를 실제로 풀어야 합니다.
 - `approximate_split`을 끄면 홀드아웃 점수가 번역 품질을 재지 않습니다.
 
-## 9. 선택 사항 — exposure bias
+## 10. 선택 사항 — exposure bias
 
 `data.decoder_input_noise`가 0(꺼짐)입니다. teacher forcing이 정답 접두사만
 보여 주는 문제의 본학습 단계 대책인데, 디코더 조건부를 바꾸는 개입이라
