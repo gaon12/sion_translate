@@ -104,6 +104,17 @@ def _file_identity(path: Path) -> dict[str, Any]:
     return identity
 
 
+def _unwrap_compiled_model(model: nn.Module) -> nn.Module:
+    """Return the model below torch.compile without unwrapping DDP or FSDP."""
+
+    unwrapped = model
+    while True:
+        original = getattr(unwrapped, "_orig_mod", None)
+        if not isinstance(original, nn.Module):
+            return unwrapped
+        unwrapped = original
+
+
 def _portable_data_config(data_config: Any) -> Any:
     """Remove storage locations while retaining every semantic data setting."""
 
@@ -526,7 +537,8 @@ def save_checkpoint(
             _remove_path(staging)
             staging.mkdir(parents=True)
         barrier(context)
-        model_state, optimizer_state = get_state_dict(model, optimizer)
+        checkpoint_model = _unwrap_compiled_model(model)
+        model_state, optimizer_state = get_state_dict(checkpoint_model, optimizer)
         state["model"] = model_state
         state["optimizer"] = optimizer_state
         dcp.save(state, checkpoint_id=staging)
@@ -540,7 +552,7 @@ def save_checkpoint(
             _publish_dcp_staging(staging, path)
     elif context.is_main:
         # 단일 프로세스: 파일 하나로 충분합니다.
-        state["model"] = model.state_dict()
+        state["model"] = _unwrap_compiled_model(model).state_dict()
         state["optimizer"] = optimizer.state_dict()
         # RNG state를 함께 저장하면 같은 데이터 위치에서 재개할 때 Python,
         # NumPy, torch의 확률적 연산도 중단 전 상태에서 이어집니다.
@@ -573,7 +585,8 @@ def load_checkpoint(
         from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
 
         path = _resolve_dcp_checkpoint(path, world_size=context.world_size)
-        model_state, optimizer_state = get_state_dict(model, optimizer)
+        checkpoint_model = _unwrap_compiled_model(model)
+        model_state, optimizer_state = get_state_dict(checkpoint_model, optimizer)
         state: dict[str, Any] = {
             "model": model_state,
             "optimizer": optimizer_state,
@@ -596,7 +609,7 @@ def load_checkpoint(
         _validate_loaded_state(state)
         _validate_identity(state, expected_identity)
         set_state_dict(
-            model,
+            checkpoint_model,
             optimizer,
             model_state_dict=state["model"],
             optim_state_dict=state["optimizer"],
@@ -639,7 +652,7 @@ def load_checkpoint(
     state = _validate_loaded_state(loaded)
     # 모델/optimizer를 변경하기 전에 현재 실행과 체크포인트의 정체성을 비교합니다.
     _validate_identity(state, expected_identity)
-    model.load_state_dict(state["model"])
+    _unwrap_compiled_model(model).load_state_dict(state["model"])
     optimizer.load_state_dict(state["optimizer"])
     scheduler.load_state_dict(state["scheduler"])
     if scaler is not None and state.get("scaler"):

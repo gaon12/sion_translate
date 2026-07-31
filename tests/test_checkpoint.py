@@ -17,6 +17,7 @@ from sion_translate.training.checkpoint import (
     save_checkpoint,
 )
 from sion_translate.training.distributed import DistributedContext
+from sion_translate.training.ema import EMAWeights
 from sion_translate.training.trainer import cosine_scheduler
 
 
@@ -213,6 +214,70 @@ def test_checkpoint_identity_still_rejects_semantic_data_changes(tmp_path: Path)
 
     with pytest.raises(ValueError, match="identity does not match"):
         checkpoint_module._validate_identity({"identity": incompatible}, expected)
+
+
+@pytest.mark.parametrize(
+    ("compiled_at_save", "compiled_at_load"),
+    [(False, False), (True, False), (False, True), (True, True)],
+)
+def test_checkpoint_model_and_ema_keys_are_compile_independent(
+    tmp_path: Path,
+    compiled_at_save: bool,
+    compiled_at_load: bool,
+) -> None:
+    source, source_optimizer, source_scheduler, context = _components()
+    source_model = torch.compile(source, backend="eager") if compiled_at_save else source
+    source_optimizer = torch.optim.AdamW(source_model.parameters(), lr=1e-3)
+    source_scheduler = cosine_scheduler(
+        source_optimizer,
+        warmup_steps=0,
+        max_steps=2,
+        min_ratio=0.1,
+    )
+    source_ema = EMAWeights(source_model, 0.9)
+    with torch.no_grad():
+        for parameter in source_model.parameters():
+            parameter.add_(0.25)
+    source_ema.update(source_model)
+    checkpoint = tmp_path / f"{compiled_at_save}-{compiled_at_load}"
+    save_checkpoint(
+        checkpoint,
+        source_model,
+        source_optimizer,
+        source_scheduler,
+        1,
+        context,
+        ema=source_ema,
+    )
+
+    target, target_optimizer, target_scheduler, _ = _components()
+    target_model = torch.compile(target, backend="eager") if compiled_at_load else target
+    target_optimizer = torch.optim.AdamW(target_model.parameters(), lr=1e-3)
+    target_scheduler = cosine_scheduler(
+        target_optimizer,
+        warmup_steps=0,
+        max_steps=2,
+        min_ratio=0.1,
+    )
+    target_ema = EMAWeights(target_model, 0.9)
+    load_checkpoint(
+        checkpoint,
+        target_model,
+        target_optimizer,
+        target_scheduler,
+        context,
+        ema=target_ema,
+    )
+
+    source_state = checkpoint_module._unwrap_compiled_model(source_model).state_dict()
+    target_state = checkpoint_module._unwrap_compiled_model(target_model).state_dict()
+    assert source_state.keys() == target_state.keys()
+    assert all(not name.startswith("_orig_mod.") for name in source_state)
+    for name in source_state:
+        torch.testing.assert_close(target_state[name], source_state[name])
+    assert source_ema.shadow.keys() == target_ema.shadow.keys()
+    for name in source_ema.shadow:
+        torch.testing.assert_close(target_ema.shadow[name], source_ema.shadow[name])
 
 
 def test_local_checkpoint_restores_python_numpy_and_torch_rng(tmp_path: Path) -> None:

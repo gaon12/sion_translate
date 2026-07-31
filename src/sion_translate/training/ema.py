@@ -25,6 +25,18 @@ import torch
 from torch import nn
 
 
+def _named_parameters_below_compile(model: nn.Module):
+    """Yield stable names from below any torch.compile wrapper."""
+
+    unwrapped = model
+    while True:
+        original = getattr(unwrapped, "_orig_mod", None)
+        if not isinstance(original, nn.Module):
+            break
+        unwrapped = original
+    return unwrapped.named_parameters()
+
+
 class EMAWeights:
     """모델 파라미터의 EMA shadow 복사본을 유지합니다.
 
@@ -44,7 +56,7 @@ class EMAWeights:
         # 학습 대상 파라미터만 따라갑니다 (버퍼는 이 모델에 학습 상태가 없음).
         self.shadow: dict[str, torch.Tensor] = {
             name: parameter.detach().clone()
-            for name, parameter in model.named_parameters()
+            for name, parameter in _named_parameters_below_compile(model)
             if parameter.requires_grad
         }
 
@@ -52,7 +64,7 @@ class EMAWeights:
     def update(self, model: nn.Module) -> None:
         """shadow ← decay·shadow + (1-decay)·param. optimizer step 뒤에 호출합니다."""
         one_minus_decay = 1.0 - self.decay
-        for name, parameter in model.named_parameters():
+        for name, parameter in _named_parameters_below_compile(model):
             shadow = self.shadow.get(name)
             if shadow is not None:
                 shadow.lerp_(parameter.detach(), one_minus_decay)
@@ -76,7 +88,7 @@ class EMAWeights:
         """
         swapped: list[tuple[torch.Tensor, torch.Tensor]] = []
         try:
-            for name, parameter in model.named_parameters():
+            for name, parameter in _named_parameters_below_compile(model):
                 shadow = self.shadow.get(name)
                 if shadow is not None:
                     self._exchange(parameter, shadow)
@@ -90,7 +102,7 @@ class EMAWeights:
     def copy_to(self, model: nn.Module) -> None:
         """Permanently copy EMA weights into a model without allocating a backup."""
 
-        for name, parameter in model.named_parameters():
+        for name, parameter in _named_parameters_below_compile(model):
             shadow = self.shadow.get(name)
             if shadow is not None:
                 parameter.copy_(shadow)
@@ -101,5 +113,8 @@ class EMAWeights:
 
     def load_state_dict(self, state: dict[str, torch.Tensor]) -> None:
         for name, tensor in state.items():
-            if name in self.shadow:
-                self.shadow[name].copy_(tensor)
+            canonical_name = name
+            while canonical_name.startswith("_orig_mod."):
+                canonical_name = canonical_name.removeprefix("_orig_mod.")
+            if canonical_name in self.shadow:
+                self.shadow[canonical_name].copy_(tensor)
