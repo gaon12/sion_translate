@@ -175,6 +175,51 @@ def test_backtranslation_is_conservative_without_reverse_graph_metadata() -> Non
     assert not mask.any()
 
 
+def test_backtranslation_keeps_fsdp_rank_in_collectives_without_local_reverse_rows() -> None:
+    class RecordingGenerator:
+        config = SimpleNamespace(max_seq_len=16)
+        _synchronize_generation_across_ranks = True
+
+        def __init__(self) -> None:
+            self.inputs: torch.Tensor | None = None
+
+        def generate(
+            self,
+            input_ids: torch.Tensor,
+            attention_mask: torch.Tensor,
+            **kwargs,
+        ) -> torch.Tensor:
+            del attention_mask, kwargs
+            self.inputs = input_ids
+            return torch.tensor([[2, 10, 11, 3]], device=input_ids.device)
+
+    objective = MinimumRiskObjective(
+        TextTokenizer(),
+        PostTrainingConfig(roundtrip_enabled=True),
+    )
+    model = RecordingGenerator()
+    batch = {
+        "attention_mask": torch.ones(2, 4, dtype=torch.bool),
+        "source_language_tag_ids": torch.tensor([5, -1]),
+        "reverse_direction_trained": torch.tensor([False, True]),
+    }
+    candidates = torch.tensor(
+        [
+            [[2, 20, 21, 3], [2, 20, 22, 3]],
+            [[2, 20, 21, 3], [2, 20, 22, 3]],
+        ]
+    )
+
+    roundtrips, mask = objective._backtranslate_candidates(model, batch, candidates)
+
+    assert model.inputs is not None
+    assert model.inputs.shape[0] == 1
+    assert model.inputs[0, 0].item() in TextTokenizer.language_tags.values()
+    assert roundtrips is not None
+    assert mask is not None
+    assert not mask.any()
+
+
 def test_multi_pair_preference_loss_uses_reward_ordering() -> None:
     objective = MinimumRiskObjective(TextTokenizer(), PostTrainingConfig())
     rewards = torch.tensor([[0.9, 0.6, 0.2]])

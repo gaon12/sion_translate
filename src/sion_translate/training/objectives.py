@@ -342,13 +342,39 @@ class MinimumRiskObjective:
                 dtype=torch.bool,
             )
         valid_mask = eligible_rows[:, None].expand(batch_size, samples)
-        if not bool(valid_mask.any()):
+        flat_valid_mask = valid_mask.reshape(-1)
+        has_local_candidates = bool(flat_valid_mask.any())
+        synchronize_generation = bool(getattr(base, "_synchronize_generation_across_ranks", False))
+        if not has_local_candidates and not synchronize_generation:
             return None, valid_mask
 
-        flat_candidates = candidates.reshape(batch_size * samples, -1)[valid_mask.reshape(-1)]
-        flat_tags = (
-            source_tags[:, None].expand(batch_size, samples).reshape(-1)[valid_mask.reshape(-1)]
-        )
+        if has_local_candidates:
+            flat_candidates = candidates.reshape(batch_size * samples, -1)[flat_valid_mask]
+            flat_tags = (
+                source_tags[:, None].expand(batch_size, samples).reshape(-1)[flat_valid_mask]
+            )
+            source_lengths = batch["attention_mask"].sum(dim=-1)[eligible_rows]
+        else:
+            # FSDP2 generation all-gathers parameters and synchronizes decode
+            # termination on every rank. A rank whose local batch contains only
+            # denoising or source-only rows must therefore enter generate() too,
+            # or peers with eligible rows will wait forever in a collective.
+            # This dummy rollout is masked out of the reward below.
+            try:
+                fallback_tag = next(iter(self.tokenizer.language_tags.values()))
+            except StopIteration as error:
+                raise RuntimeError(
+                    "round-trip generation requires at least one language tag"
+                ) from error
+            flat_candidates = candidates.reshape(batch_size * samples, -1)[:1]
+            flat_tags = torch.full(
+                (1,),
+                fallback_tag,
+                dtype=source_tags.dtype,
+                device=source_tags.device,
+            )
+            source_lengths = batch["attention_mask"].sum(dim=-1)[:1]
+
         # BOS와 기존 EOS를 제거한 후보 본문 뒤에 EOS를 정확히 한 번 붙입니다.
         max_content = max(0, base.config.max_seq_len - 2)
         raw_content = flat_candidates[:, 1 : 1 + max_content]
@@ -377,7 +403,6 @@ class MinimumRiskObjective:
         positions = torch.arange(reverse_length, device=candidates.device)
         reverse_mask = positions[None, :] < (content_lengths + 2)[:, None]
 
-        source_lengths = batch["attention_mask"].sum(dim=-1)[eligible_rows]
         max_new_tokens = min(
             self.config.roundtrip_max_new_tokens,
             base.config.max_seq_len - 1,
@@ -397,7 +422,8 @@ class MinimumRiskObjective:
             dtype=torch.long,
             device=candidates.device,
         )
-        roundtrips[valid_mask.reshape(-1)] = generated
+        if has_local_candidates:
+            roundtrips[flat_valid_mask] = generated
         return roundtrips.view(batch_size, samples, -1), valid_mask
 
     def _pairwise_preference_loss(
