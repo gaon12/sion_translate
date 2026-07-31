@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from sion_translate.auto import (
     EnvironmentInfo,
+    _all_devices_support_native_bf16,
     apply_auto_settings,
     pick_model_preset,
     pick_parallel_strategy,
@@ -70,7 +72,8 @@ def test_auto_settings_fill_unspecified_fields() -> None:
     assert decisions
     assert config.model.d_model == 768  # 11M쌍 → base 프리셋
     assert config.training.precision == "bf16"
-    assert config.training.batch_size_per_gpu == 16  # 24GiB 기준
+    assert config.model.gradient_checkpointing is True
+    assert config.training.batch_size_per_gpu == 8  # 24GiB 기준
     # effective batch 가 목표(256) 근처가 되도록 accumulation 조정
     effective = config.training.batch_size_per_gpu * 8 * config.training.gradient_accumulation_steps
     assert effective == 256
@@ -108,6 +111,31 @@ def test_h100_defaults_leave_memory_headroom_without_checkpointing() -> None:
     assert config.model.gradient_checkpointing is False
     assert config.training.batch_size_per_gpu == 32
     assert config.training.gradient_accumulation_steps == 8
+
+
+def test_a100_40g_defaults_trade_compute_for_memory_headroom() -> None:
+    config = AppConfig()
+    apply_auto_settings(
+        config,
+        raw={},
+        env=gpu_environment(vram=40.0, world_size=1),
+        train_examples=22_000_000,
+        validation_examples=110_000,
+    )
+    assert config.model.gradient_checkpointing is True
+    assert config.training.batch_size_per_gpu == 16
+    assert config.training.gradient_accumulation_steps == 16
+    assert config.training.compile is False
+
+
+def test_native_bf16_requires_every_visible_device_to_support_it() -> None:
+    ampere = SimpleNamespace(major=8)
+    hopper = SimpleNamespace(major=9)
+    turing = SimpleNamespace(major=7)
+
+    assert _all_devices_support_native_bf16([ampere, hopper])
+    assert not _all_devices_support_native_bf16([ampere, turing])
+    assert not _all_devices_support_native_bf16([])
 
 
 def test_multi_h100_prefers_ddp_and_bf16_collectives() -> None:

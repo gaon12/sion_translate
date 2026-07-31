@@ -53,6 +53,16 @@ class EnvironmentInfo:
     os_name: str  # "Windows" / "Linux" / "Darwin"
 
 
+def _all_devices_support_native_bf16(properties: Sequence[Any]) -> bool:
+    """Use BF16 only when every visible accelerator supports it natively."""
+
+    if not properties:
+        return False
+    if torch.version.hip is not None:
+        return True
+    return all(int(getattr(device, "major", 0)) >= 8 for device in properties)
+
+
 def probe_environment() -> EnvironmentInfo:
     """현재 머신의 하드웨어를 조사합니다."""
     cuda = torch.cuda.is_available()
@@ -61,8 +71,11 @@ def probe_environment() -> EnvironmentInfo:
     if cuda:
         properties = [torch.cuda.get_device_properties(index) for index in range(device_count)]
         min_vram_gib = min(p.total_memory for p in properties) / (1024**3)
-        device_name = properties[0].name
-        bf16 = torch.cuda.is_bf16_supported()
+        device_names = tuple(dict.fromkeys(str(device.name) for device in properties))
+        device_name = (
+            device_names[0] if len(device_names) == 1 else "mixed: " + " / ".join(device_names)
+        )
+        bf16 = _all_devices_support_native_bf16(properties)
     else:
         min_vram_gib = 0.0
         device_name = "CPU"
@@ -308,20 +321,20 @@ def pick_batch_size(env: EnvironmentInfo, d_model: int) -> int:
         return 2  # CPU 는 스모크 테스트 용도
     vram = env.min_vram_gib
     if vram >= 70:
-        # H100-class cards run the baseline without checkpointing by default.
+        # 80 GiB-class cards run the baseline without checkpointing by default.
         # Keep headroom for rare 512-token buckets instead of selecting 64 from
         # short-sentence averages and failing late in the run.
         base = 32
     elif vram >= 40:
-        base = 32
-    elif vram >= 22:
         base = 16
-    elif vram >= 14:
-        base = 12
-    elif vram >= 10:
+    elif vram >= 22:
         base = 8
-    else:
+    elif vram >= 14:
         base = 4
+    elif vram >= 10:
+        base = 2
+    else:
+        base = 1
     # base 프리셋(768)보다 큰 모델이면 배치를 줄입니다.
     if d_model > 1024:
         base = max(1, base // 4)
@@ -379,6 +392,10 @@ def apply_auto_settings(
         for key, value in preset.items():
             setattr(config.model, key, value)
         decisions.append(f"모델 크기: {name} — 학습쌍 {pair_count:,}개 기준")
+    if auto(raw_model, "gradient_checkpointing"):
+        config.model.gradient_checkpointing = env.cuda and env.min_vram_gib < 70
+        if config.model.gradient_checkpointing:
+            decisions.append("activation checkpointing: 활성 (70GiB 미만 GPU 메모리 보호)")
 
     # ── 정밀도: bf16 > fp16 > fp32 ──────────────────────────────────────
     if auto(raw_training, "precision"):
@@ -452,10 +469,10 @@ def apply_auto_settings(
         # benefit even on an 80 GiB H100; users may still opt out explicitly.
         config.training.reshard_after_forward = True
     if auto(raw_training, "compile"):
-        # torch.compile 은 Linux CUDA 에서 안정적으로 이득이 있습니다.
-        config.training.compile = env.cuda and env.os_name == "Linux"
-        if config.training.compile:
-            decisions.append("torch.compile: 활성 (Linux CUDA)")
+        # Compiler/backend support varies across CUDA architectures and container
+        # builds. Reliability-first automatic runs stay eager; measured profiles
+        # can still opt in with ``training.compile: true``.
+        config.training.compile = False
     if auto(raw_data, "num_workers"):
         per_rank = max(1, env.cpu_count // max(1, env.world_size))
         config.data.num_workers = min(16, max(0, per_rank - 1))

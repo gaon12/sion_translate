@@ -8,10 +8,12 @@
 # 자동으로 결정되는 것들:
 #   - 모델 크기 (번역쌍 수 기준: ~60M / ~120M / ~200M / ~450M 파라미터)
 #   - 정밀도 (bf16 지원 GPU → bf16, 아니면 fp16, CPU → fp32)
-#   - GPU당 배치 크기 (VRAM 기준), gradient accumulation (effective 256 목표)
+#   - GPU당 배치 크기와 activation checkpointing (VRAM 기준),
+#     gradient accumulation (effective 256 목표)
 #   - max_steps (corpus 약 4회 통과 예산, early stopping 으로 조기 종료)
 #   - warmup / eval_every / save_every / eval_batches (step 예산에 비례)
-#   - DataLoader worker 수, DDP/FSDP2 (다중 GPU 시), torch.compile (Linux CUDA 시)
+#   - DataLoader worker 수, DDP/FSDP2 (다중 GPU 시)
+#   - torch.compile은 GPU/컨테이너별 검증 뒤 training.compile로 명시적으로 활성화
 #
 # 데이터 자동 인식:
 #   - data/ 폴더의 *.jsonl 을 스캔합니다. 파일을 추가하거나 내용이 바뀌면
@@ -141,8 +143,10 @@ posttraining:
   enabled: true
   method: mrt
   max_steps: 5000
-  batch_size_per_gpu: 4
-  gradient_accumulation_steps: 4
+  # 후보 생성은 SFT보다 메모리 변동폭이 큽니다. micro-batch 1로 모든 VRAM
+  # 등급에서 안전 여유를 두고 accumulation으로 기존 effective batch를 유지합니다.
+  batch_size_per_gpu: 1
+  gradient_accumulation_steps: 16
   learning_rate: 0.00003
   warmup_steps: 200
   samples_per_source: 4
