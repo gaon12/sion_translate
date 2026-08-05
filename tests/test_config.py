@@ -6,6 +6,7 @@ import warnings
 from pathlib import Path
 
 import pytest
+import yaml
 
 from sion_translate.config import (
     AppConfig,
@@ -24,23 +25,67 @@ def _warnings_from(config: ExperimentalConfig) -> list[str]:
     return [str(entry.message) for entry in caught]
 
 
-def test_default_data_paths_use_the_current_compatible_artifact_layout() -> None:
+def test_default_paths_use_the_stable_public_layout() -> None:
     config = DataConfig()
-    assert config.tokenizer_model == "artifacts/sion-v6/tokenizer/sion.model"
-    assert config.tokenizer_features == "artifacts/sion-v6/tokenizer/token_features.npz"
-    assert config.dataset_dir == "artifacts/sion-v6/dataset"
-    assert TrainingConfig().output_dir == "runs/sion-v6"
+    assert config.tokenizer_model == "artifacts/tokenizer/sion.model"
+    assert config.tokenizer_features == "artifacts/tokenizer/token_features.npz"
+    assert config.dataset_dir == "artifacts/dataset"
+    assert TrainingConfig().output_dir == "runs/auto"
 
 
-def test_shipped_configs_never_point_at_the_legacy_artifact_layout() -> None:
+def test_shipped_configs_keep_canonical_paths_without_release_namespaces() -> None:
     config_root = Path(__file__).resolve().parents[1] / "configs"
+    root_data = load_config(config_root.parent / "sion_translate.yaml").data
+    expected_runs = {
+        "debug.yaml": "runs/debug",
+        "sion_1_3b.yaml": "runs/sion-1.3b",
+        "sion_8b.yaml": "runs/sion-8b",
+        "sion_32b.yaml": "runs/sion-32b",
+        "sion_data_fit.yaml": "runs/sion-data-fit",
+    }
     for config_path in sorted(config_root.glob("*.yaml")):
         config = load_config(config_path)
         data = config.data
-        assert data.tokenizer_model.startswith("artifacts/sion-v6/"), config_path
-        assert data.tokenizer_features.startswith("artifacts/sion-v6/"), config_path
-        assert data.dataset_dir.startswith("artifacts/sion-v6/"), config_path
-        assert config.training.output_dir.startswith("runs/sion-v6"), config_path
+        assert data.tokenizer_model == "artifacts/tokenizer/sion.model", config_path
+        assert data.tokenizer_features == "artifacts/tokenizer/token_features.npz", config_path
+        assert data.dataset_dir == "artifacts/dataset", config_path
+        assert config.training.output_dir == expected_runs[config_path.name], config_path
+        assert data.configured_language_pairs() == root_data.configured_language_pairs(), (
+            config_path
+        )
+        assert (
+            data.configured_source_only_languages() == root_data.configured_source_only_languages()
+        ), config_path
+
+
+def test_config_file_rejects_unknown_top_level_key(tmp_path: Path) -> None:
+    config_path = tmp_path / "typo.yaml"
+    config_path.write_text("trainng:\n  max_steps: 12\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"unknown top-level config key.*trainng"):
+        load_config(config_path)
+
+
+def test_config_file_rejects_duplicate_yaml_key(tmp_path: Path) -> None:
+    config_path = tmp_path / "duplicate.yaml"
+    config_path.write_text(
+        "training:\n  max_steps: 12\n  max_steps: 24\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(yaml.YAMLError, match=r"duplicate key 'max_steps'"):
+        load_config(config_path)
+
+
+def test_config_from_raw_remains_permissive_for_direct_callers() -> None:
+    config = config_from_raw(
+        {
+            "training": {"max_steps": 12},
+            "caller_metadata": {"experiment": "compatibility"},
+        }
+    )
+
+    assert config.training.max_steps == 12
 
 
 def test_warns_when_bats_is_enabled_without_any_loss_weight() -> None:
@@ -132,10 +177,9 @@ def test_root_config_gives_every_enabled_module_a_training_signal() -> None:
 def test_root_config_keeps_the_experimental_surface_small() -> None:
     """Several modules at once makes a quality change impossible to attribute.
 
-    The yaml says to enable one at a time and used to contradict itself by
-    enabling five. SiTU-GLU is excluded from the count: it reshapes an existing
-    activation rather than adding a module, so it cannot be the thing that moved
-    a score on its own.
+    The yaml says to enable one intervention at a time. SiTU-GLU changes the
+    activation and optimization path even though state shapes are unchanged, so
+    it counts as an intervention too.
     """
 
     root_config = Path(__file__).resolve().parents[1] / "sion_translate.yaml"
@@ -144,6 +188,7 @@ def test_root_config_keeps_the_experimental_surface_small() -> None:
     enabled = [
         name
         for name, active in (
+            ("situglu", experimental.situglu_enabled),
             ("bats", experimental.bats_enabled),
             ("core", experimental.core_enabled),
             ("tetm", experimental.tetm_enabled),
@@ -153,7 +198,23 @@ def test_root_config_keeps_the_experimental_surface_small() -> None:
         )
         if active
     ]
-    assert len(enabled) <= 2, enabled
+    assert enabled == ["core"]
+
+
+def test_capacity_presets_are_clean_architecture_baselines() -> None:
+    config_root = Path(__file__).resolve().parents[1] / "configs"
+    for name in ("sion_1_3b.yaml", "sion_8b.yaml", "sion_32b.yaml", "sion_data_fit.yaml"):
+        experimental = load_config(config_root / name).model.experimental
+        enabled = {
+            "situglu": experimental.situglu_enabled,
+            "bats": experimental.bats_enabled,
+            "core": experimental.core_enabled,
+            "tetm": experimental.tetm_enabled,
+            "morphoscript": experimental.morphoscript_enabled,
+            "evidence_repair": experimental.evidence_repair_enabled,
+            "semantic_parity": experimental.semantic_parity_enabled,
+        }
+        assert not any(enabled.values()), (name, enabled)
 
 
 def test_negative_loss_weight_is_still_an_error() -> None:

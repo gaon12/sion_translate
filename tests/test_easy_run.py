@@ -7,17 +7,31 @@ import easy_run
 import pytest
 
 
-def test_persistent_artifacts_are_isolated_from_the_legacy_layout() -> None:
-    legacy_root = easy_run.ROOT / "artifacts"
+def test_persistent_artifacts_use_the_stable_public_layout() -> None:
+    artifact_root = easy_run.ROOT / "artifacts"
 
-    assert easy_run.ARTIFACT_LAYOUT_VERSION == "sion-v6"
-    assert easy_run.PERSISTENT_ARTIFACTS == legacy_root / "sion-v6"
-    assert easy_run.PERSISTENT_ARTIFACTS != legacy_root
-    assert easy_run._runtime_artifact_directory(None) == legacy_root / "sion-v6"
+    assert easy_run.DEFAULT_ARTIFACT_ROOT == "artifacts"
+    assert easy_run.PERSISTENT_ARTIFACTS == artifact_root
+    assert easy_run._runtime_artifact_directory(None) == artifact_root
 
 
-def test_ram_artifacts_use_the_same_versioned_layout(tmp_path: Path) -> None:
-    assert easy_run._runtime_artifact_directory(tmp_path) == (tmp_path / "artifacts" / "sion-v6")
+def test_ram_artifacts_use_the_same_stable_layout(tmp_path: Path) -> None:
+    assert easy_run._runtime_artifact_directory(tmp_path) == tmp_path / "artifacts"
+
+
+def test_ram_restore_excludes_historical_artifact_backups(tmp_path: Path) -> None:
+    persistent = tmp_path / "persistent"
+    runtime = tmp_path / "runtime"
+    (persistent / "tokenizer").mkdir(parents=True)
+    (persistent / "dataset").mkdir()
+    (persistent / "tokenizer.incompatible-old").mkdir()
+    (persistent / "tokenizer" / "sion.model").write_bytes(b"active")
+
+    easy_run._restore_active_artifacts(persistent, runtime)
+
+    assert (runtime / "tokenizer" / "sion.model").read_bytes() == b"active"
+    assert (runtime / "dataset").is_dir()
+    assert not (runtime / "tokenizer.incompatible-old").exists()
 
 
 def test_atomic_sync_directory_replaces_complete_cache(tmp_path: Path) -> None:

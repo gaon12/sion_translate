@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from yaml.constructor import ConstructorError
+from yaml.nodes import MappingNode
 
 from sion_translate.artifacts import (
     DEFAULT_DATASET_DIRECTORY,
@@ -672,10 +674,54 @@ def _construct_dataclass(cls: type, values: dict[str, Any] | None):
     return cls(**values)
 
 
+_CONFIG_TOP_LEVEL_KEYS = frozenset({"model", "data", "training", "posttraining"})
+
+
+class _UniqueKeySafeLoader(yaml.SafeLoader):
+    """Safe YAML loader that rejects duplicate keys instead of keeping the last one."""
+
+    def construct_mapping(
+        self,
+        node: MappingNode,
+        deep: bool = False,
+    ) -> dict[Any, Any]:
+        self.flatten_mapping(node)
+        mapping: dict[Any, Any] = {}
+        for key_node, value_node in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            try:
+                duplicate = key in mapping
+            except TypeError as error:
+                raise ConstructorError(
+                    "while constructing a mapping",
+                    node.start_mark,
+                    "found an unhashable mapping key",
+                    key_node.start_mark,
+                ) from error
+            if duplicate:
+                raise ConstructorError(
+                    "while constructing a mapping",
+                    node.start_mark,
+                    f"found duplicate key {key!r}",
+                    key_node.start_mark,
+                )
+            mapping[key] = self.construct_object(value_node, deep=deep)
+        return mapping
+
+
 def load_raw_config(path: str | Path) -> dict[str, Any]:
-    """YAML 파일을 dict 그대로 읽습니다 (없는 키 = 자동 결정 대상)."""
+    """Read a config file and reject ambiguous or misspelled top-level keys."""
     with Path(path).open("r", encoding="utf-8") as handle:
-        return yaml.safe_load(handle) or {}
+        raw = yaml.load(handle, Loader=_UniqueKeySafeLoader) or {}
+    if not isinstance(raw, dict):
+        raise ValueError("config root must be a mapping")
+
+    unknown = set(raw) - _CONFIG_TOP_LEVEL_KEYS
+    if unknown:
+        rendered = ", ".join(sorted(repr(key) for key in unknown))
+        expected = ", ".join(sorted(_CONFIG_TOP_LEVEL_KEYS))
+        raise ValueError(f"unknown top-level config key(s): {rendered}; expected only: {expected}")
+    return raw
 
 
 def config_from_raw(raw: dict[str, Any]) -> AppConfig:

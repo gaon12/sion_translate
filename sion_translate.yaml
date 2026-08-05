@@ -25,20 +25,24 @@
 
 model:
   experimental:
-    # ── 켠 것 ────────────────────────────────────────────────────────────
+    # ── 이번 ablation에서 끈 것 ─────────────────────────────────────────
     # Kimi K3 SiTU-GLU: FFN activation 폭주를 부드럽게 제한합니다.
-    # projection 모양이 그대로라 위험이 가장 낮습니다.
-    situglu_enabled: true
+    # state shape는 같아도 activation과 최적화 경로가 바뀌므로 CoRe와 동시에
+    # 켜지 않고 별도 실험에서 검증합니다.
+    situglu_enabled: false
 
-    # BATS 정렬/커버리지: 누락과 중복을 동시에 제어하려면 정렬 신호가
-    # 필요합니다. loss_weight 는 0 이고 coverage 만 약하게 겁니다.
-    bats_enabled: true
-    bats_coverage_weight: 0.01
+    # BATS: 내장 collator에는 supervised alignment label 공급자가 없습니다.
+    # coverage-only 목적은 uniform alignment에서도 0이 될 수 있으므로 기본 run에서
+    # 학습 신호라고 간주하지 않습니다. 정렬 label을 연결한 별도 실험에서 켭니다.
+    bats_enabled: false
+    bats_coverage_weight: 0.0
 
+    # ── 이번 ablation에서 켠 것 ─────────────────────────────────────────
     # CoRe: 목표문의 경어체를 분류하는 보조 loss 입니다. 코퍼스 실측에서
     # 한국어 반말이 존댓말의 2.1배(41.28% 대 19.45%)이고, "존댓말을 요청했는데
-    # 반말이 섞이는" 실패가 여기서 옵니다. register_classes 4 가 prepare 의
-    # infer_register 4개 클래스와 정확히 일치합니다.
+    # 반말이 섞이는" 실패가 여기서 옵니다. register_classes 4 는 prepare 의
+    # infer_register ID 범위와 맞습니다. 다만 suffix 규칙에 걸리지 않는 class 0은
+    # 미상으로 loss에서 제외되므로, 알려진 1~3 class에 대한 ablation입니다.
     # 안전 장치: ContentRegisterState 의 inject_gate 가 0 에서 시작하므로
     # step 0 에서는 forward 에 아무 영향이 없고 보조 loss 만 흐릅니다.
     # 즉 모델이 이 신호를 쓸지 말지를 학습으로 정합니다.
@@ -68,7 +72,7 @@ model:
 
 # 실험 모듈은 한 번에 하나씩만 켜서 baseline 과 비교하십시오. 여러 개를 동시에
 # 켜면 좋아지거나 나빠졌을 때 무엇 때문인지 알 수 없습니다. 위 조합은
-# 이번 재학습에서 CoRe 하나를 검증 대상으로 삼은 것입니다.
+# 이번 재학습에서 실제 동작을 바꾸는 것은 CoRe 하나뿐입니다.
 
 # 아래 모델 크기는 직접 고정하고 싶을 때만 주석 해제 (기본: 데이터 규모로 자동)
 #   d_model: 768
@@ -83,11 +87,11 @@ model:
 
 data:
   raw_dir: data              # 원천 JSONL 폴더 (여기에 파일을 추가하면 자동 인식)
-  # v6 아래 세 산출물은 하나의 호환 단위입니다. 과거 artifacts/tokenizer 와
-  # artifacts/dataset 은 숫자 분리·언어 태그·index schema가 달라 재사용하지 않습니다.
-  tokenizer_model: artifacts/sion-v6/tokenizer/sion.model
-  tokenizer_features: artifacts/sion-v6/tokenizer/token_features.npz
-  dataset_dir: artifacts/sion-v6/dataset
+  # 아래 세 산출물은 하나의 호환 단위입니다. 재사용 전 숫자 분리 정책, 언어 태그,
+  # tokenizer SHA-256, index schema와 원천 데이터 지문을 검사합니다.
+  tokenizer_model: artifacts/tokenizer/sion.model
+  tokenizer_features: artifacts/tokenizer/token_features.npz
+  dataset_dir: artifacts/dataset
   approximate_split: true    # 문자 5-gram MinHash로 근사 중복의 split 누수 방지
 
   # JSONL 키 이름이 곧 언어 이름입니다. 여기를 바꾸면 토크나이저의 <2xx>/
@@ -138,7 +142,7 @@ data:
 #   num_workers: 8           # 기본은 실제 할당 CPU/GPU 수에 맞춰 자동 결정
 
 training:
-  output_dir: runs/sion-v6   # 구형 vocab/checkpoint와 격리된 저장 위치
+  output_dir: runs/auto      # 체크포인트/로그 저장 위치
 #   learning_rate: 0.0003
 #   batch_size_per_gpu: 16   # OOM 이 나면 이 값을 낮추세요
 #   max_steps: 120000
@@ -152,7 +156,7 @@ training:
 #   final_export_formats: [fp32, fp16, bf16, int8, int4, gguf_q4_k_m, transformers]
 
 # SFT 뒤 복합 보상 MRT + 다중 후보 선호학습을 자동 실행합니다.
-# 두 단계 모델은 runs/sion-v6/pretrain 과 runs/sion-v6/posttrain 에 각각 저장됩니다.
+# 두 단계 모델은 runs/auto/pretrain 과 runs/auto/posttrain 에 각각 저장됩니다.
 posttraining:
   enabled: true
   method: mrt

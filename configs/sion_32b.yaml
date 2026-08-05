@@ -13,27 +13,36 @@ model:
   gradient_checkpointing: true
   init_std: 0.0125
   experimental:
-    situglu_enabled: true
-    bats_enabled: true
+    situglu_enabled: false
+    bats_enabled: false
     bats_dim: 512
     bats_loss_weight: 0.0
-    bats_coverage_weight: 0.01
+    bats_coverage_weight: 0.0
     bats_stride: 8
     bats_max_positions: 1024
-    core_enabled: true
+    core_enabled: false
     register_classes: 4
-    register_loss_weight: 0.05
-    tetm_enabled: true
+    register_loss_weight: 0.0
+    tetm_enabled: false
     tetm_types: 10
     tetm_modes: 5
-    morphoscript_enabled: true
+    morphoscript_enabled: false
     morphoscript_interval: 4
     script_classes: 9
 
 data:
-  tokenizer_model: artifacts/sion-v6/tokenizer/sion.model
-  tokenizer_features: artifacts/sion-v6/tokenizer/token_features.npz
-  dataset_dir: artifacts/sion-v6/dataset
+  tokenizer_model: artifacts/tokenizer/sion.model
+  tokenizer_features: artifacts/tokenizer/token_features.npz
+  dataset_dir: artifacts/dataset
+  language_pairs:
+    - [kj, ko]
+    - [kj, ja]
+    - [kd, ko]
+    - [kd, ja]
+    - [jd, ko]
+    - [jd, ja]
+    - [ko, ja]
+  source_only_languages: [kj, kd, jd]
   max_source_length: 512
   max_target_length: 512
   denoise_probability: 0.10
@@ -46,7 +55,7 @@ data:
   max_source_upsampling: 3.0
 
 training:
-  output_dir: runs/sion-v6-32b
+  output_dir: runs/sion-32b
   max_steps: 400000
   batch_size_per_gpu: 1
   gradient_accumulation_steps: 4

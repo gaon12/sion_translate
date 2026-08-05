@@ -1,9 +1,8 @@
 """인자 없이 실행하는 sion_translate 고성능 학습 진입점.
 
 Linux에서 충분한 /dev/shm 공간이 있으면 원천 데이터와 전처리 산출물을 RAM
-디스크에 배치합니다. tokenizer/dataset은 학습 전에 버전이 고정된 일반 디스크
-artifacts/sion-v6/에도 원자적으로 동기화하고, checkpoints/exports는 항상 일반
-디스크에 기록합니다.
+디스크에 배치합니다. tokenizer/dataset은 학습 전에 일반 디스크 artifacts/에도
+원자적으로 동기화하고, checkpoints/exports는 항상 일반 디스크에 기록합니다.
 """
 
 from __future__ import annotations
@@ -20,11 +19,11 @@ from pathlib import Path
 
 import yaml
 
-from sion_translate.artifacts import ARTIFACT_LAYOUT_VERSION
+from sion_translate.artifacts import DEFAULT_ARTIFACT_ROOT
 
 
 ROOT = Path(__file__).resolve().parent
-PERSISTENT_ARTIFACTS = ROOT / "artifacts" / ARTIFACT_LAYOUT_VERSION
+PERSISTENT_ARTIFACTS = ROOT / DEFAULT_ARTIFACT_ROOT
 EXPRESSIVE_CORPUS_NAME = "synthetic_expressive_cultural.jsonl"
 MIN_RAM_HEADROOM = 8 * 2**30
 
@@ -160,11 +159,21 @@ def _ram_workspace(required_bytes: int) -> Path | None:
 
 
 def _runtime_artifact_directory(ram_workspace: Path | None) -> Path:
-    """Resolve only the current artifact layout on disk or in shared memory."""
+    """Resolve the canonical artifact root on disk or in shared memory."""
 
     if ram_workspace is None:
         return PERSISTENT_ARTIFACTS
-    return ram_workspace / "artifacts" / ARTIFACT_LAYOUT_VERSION
+    return ram_workspace / DEFAULT_ARTIFACT_ROOT
+
+
+def _restore_active_artifacts(source: Path, destination: Path) -> None:
+    """Restore only live tokenizer/dataset directories into a RAM workspace."""
+
+    destination.mkdir(parents=True, exist_ok=True)
+    for name in ("tokenizer", "dataset"):
+        active = source / name
+        if active.exists():
+            shutil.copytree(active, destination / name)
 
 
 def _generated_config(raw_dir: Path, artifacts_dir: Path) -> Path:
@@ -373,7 +382,7 @@ def _verify_tokenizer(
         raise SystemExit(
             f"[easy_run] byte fallback 비율 {rate:.4%} 이 상한 {max_fallback_rate:.4%} 을 넘습니다. "
             "학습을 중단합니다.\n"
-            f"           artifacts/{ARTIFACT_LAYOUT_VERSION}/tokenizer 를 지우고 "
+            f"           {DEFAULT_ARTIFACT_ROOT}/tokenizer 를 지우고 "
             "다시 실행하거나, "
             "sion-train-tokenizer 를 --required-character-min-occurrences 를 낮춰 직접 "
             "실행하세요."
@@ -396,7 +405,10 @@ def main() -> None:
     raw_files = _discover_raw_files(source_data, env)
 
     required = sum(path.stat().st_size for path in raw_files)
-    required += max(_directory_size(PERSISTENT_ARTIFACTS), required * 3)
+    active_artifact_size = sum(
+        _directory_size(PERSISTENT_ARTIFACTS / name) for name in ("tokenizer", "dataset")
+    )
+    required += max(active_artifact_size, required * 3)
     ram = _ram_workspace(required)
     runtime_artifacts = _runtime_artifact_directory(ram)
     if ram is None:
@@ -412,7 +424,7 @@ def main() -> None:
         # survive a crashed run. Never inherit an orphaned cache implicitly.
         shutil.rmtree(runtime_artifacts, ignore_errors=True)
         if PERSISTENT_ARTIFACTS.exists():
-            shutil.copytree(PERSISTENT_ARTIFACTS, runtime_artifacts)
+            _restore_active_artifacts(PERSISTENT_ARTIFACTS, runtime_artifacts)
 
     generated_config = _generated_config(runtime_data, runtime_artifacts)
     # Before anything expensive: a shard the pipeline cannot read is worth
@@ -439,8 +451,7 @@ def main() -> None:
 
         if ram is not None:
             print(
-                "[easy_run] tokenizer/dataset을 일반 디스크 "
-                f"artifacts/{ARTIFACT_LAYOUT_VERSION}/에 보존합니다."
+                f"[easy_run] tokenizer/dataset을 일반 디스크 {DEFAULT_ARTIFACT_ROOT}/에 보존합니다."
             )
             _atomic_sync_directory(
                 runtime_artifacts / "tokenizer", PERSISTENT_ARTIFACTS / "tokenizer"

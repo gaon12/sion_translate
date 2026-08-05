@@ -17,16 +17,25 @@ model:
   gradient_checkpointing: false
   init_std: 0.02
   experimental:
-    situglu_enabled: true
+    situglu_enabled: false
     bats_enabled: false
     core_enabled: false
     tetm_enabled: false
     morphoscript_enabled: false
 
 data:
-  tokenizer_model: artifacts/sion-v6/tokenizer/sion.model
-  tokenizer_features: artifacts/sion-v6/tokenizer/token_features.npz
-  dataset_dir: artifacts/sion-v6/dataset
+  tokenizer_model: artifacts/tokenizer/sion.model
+  tokenizer_features: artifacts/tokenizer/token_features.npz
+  dataset_dir: artifacts/dataset
+  language_pairs:
+    - [kj, ko]
+    - [kj, ja]
+    - [kd, ko]
+    - [kd, ja]
+    - [jd, ko]
+    - [jd, ja]
+    - [ko, ja]
+  source_only_languages: [kj, kd, jd]
   bidirectional: true
   max_source_length: 512
   max_target_length: 512
@@ -41,7 +50,7 @@ data:
   max_source_upsampling: 3.0
 
 training:
-  output_dir: runs/sion-v6-data-fit
+  output_dir: runs/sion-data-fit
   seed: 20260711
   # H100 80GB: use the headroom observed with batch 16. On 8 GPUs this remains
   # an effective batch of 256 sequences/update without an extra accumulation pass.

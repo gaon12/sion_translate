@@ -426,6 +426,12 @@ def tokenizer_policy_problem(
             "tokenizer_metadata.json의 language_pairs가 현재 설정과 다릅니다 "
             f"(metadata={recorded_pairs}, config={language_pairs})"
         )
+    expected_languages = {language for pair in language_pairs for language in pair}
+    if set(tokenizer.languages) != expected_languages:
+        return (
+            "토크나이저 제어 토큰의 언어 집합이 현재 설정과 다릅니다 "
+            f"(tokenizer={sorted(tokenizer.languages)}, config={sorted(expected_languages)})"
+        )
     return None
 
 
@@ -496,8 +502,9 @@ def resolve_config(args: argparse.Namespace) -> tuple[AppConfig, dict, str]:
 def ensure_artifacts(config: AppConfig, context: DistributedContext) -> None:
     """토크나이저와 준비된 데이터셋이 없거나 낡았으면 자동으로 만듭니다.
 
-    - 토크나이저: 없을 때만 학습합니다. (다시 학습하면 vocab 이 바뀌어
-      기존 체크포인트와 호환되지 않으므로, 데이터가 바뀌어도 유지합니다.)
+    - 토크나이저: 없을 때만 학습합니다. 기존 vocabulary를 사용하는 다른 run을
+      깨뜨릴 수 있으므로 내용 계약에 맞지 않는 산출물은 자동 이동하거나 덮어쓰지
+      않고, 운영자가 관련 checkpoint를 확인할 수 있도록 구체적인 오류를 냅니다.
     - 데이터셋: ``data/`` 의 파일 이름+크기 지문을 기록해 두고, 지문이
       달라지면(파일 추가/변경) 기존 데이터셋을 옆으로 보관한 뒤 다시 만듭니다.
 
@@ -601,18 +608,10 @@ def ensure_artifacts(config: AppConfig, context: DistributedContext) -> None:
                     )
                     raise RuntimeError(
                         f"{policy_problem}.{checkpoint_detail} tokenizer_model, dataset_dir, "
-                        "training.output_dir을 새 경로로 지정하고 split_digits=True로 "
-                        "토크나이저부터 재학습하는 새 run을 시작하세요."
+                        "training.output_dir을 함께 검토하세요. 새 학습이라면 관련 run이 "
+                        "이 vocabulary를 쓰지 않는지 확인한 뒤 기존 tokenizer/dataset을 "
+                        "별도 백업으로 옮기고 split_digits=True로 다시 준비하십시오."
                     )
-            existing_tokenizer = SionTokenizer(tokenizer_path)
-            if set(existing_tokenizer.languages) != set(config.data.languages):
-                raise RuntimeError(
-                    "기존 토크나이저의 언어 태그가 현재 data.language_pairs와 "
-                    "다릅니다. 기존 체크포인트와 vocab 호환성을 확인한 뒤 "
-                    "tokenizer_model과 dataset_dir을 새 경로로 지정해 재학습하세요. "
-                    f"tokenizer={sorted(existing_tokenizer.languages)}, "
-                    f"config={sorted(config.data.languages)}"
-                )
             stored = stored_fingerprint(dataset_dir) if dataset_ready else None
             if not dataset_ready or stored != files:
                 from sion_translate.data.prepare import prepare_dataset

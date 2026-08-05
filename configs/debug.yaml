@@ -27,9 +27,18 @@ model:
     script_classes: 9
 
 data:
-  tokenizer_model: artifacts/sion-v6/tokenizer/sion.model
-  tokenizer_features: artifacts/sion-v6/tokenizer/token_features.npz
-  dataset_dir: artifacts/sion-v6/dataset
+  tokenizer_model: artifacts/tokenizer/sion.model
+  tokenizer_features: artifacts/tokenizer/token_features.npz
+  dataset_dir: artifacts/dataset
+  language_pairs:
+    - [kj, ko]
+    - [kj, ja]
+    - [kd, ko]
+    - [kd, ja]
+    - [jd, ko]
+    - [jd, ja]
+    - [ko, ja]
+  source_only_languages: [kj, kd, jd]
   max_source_length: 96
   max_target_length: 96
   denoise_probability: 0.20
@@ -38,7 +47,7 @@ data:
   bucket_size: 128
 
 training:
-  output_dir: runs/sion-v6-debug
+  output_dir: runs/debug
   max_steps: 4
   batch_size_per_gpu: 2
   gradient_accumulation_steps: 1
