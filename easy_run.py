@@ -1,8 +1,9 @@
 """인자 없이 실행하는 sion_translate 고성능 학습 진입점.
 
 Linux에서 충분한 /dev/shm 공간이 있으면 원천 데이터와 전처리 산출물을 RAM
-디스크에 배치합니다. tokenizer/dataset은 학습 전에 일반 디스크 artifacts/에도
-원자적으로 동기화하고, checkpoints/exports는 항상 일반 디스크에 기록합니다.
+디스크에 배치합니다. tokenizer/dataset은 학습 전에 버전이 고정된 일반 디스크
+artifacts/sion-v6/에도 원자적으로 동기화하고, checkpoints/exports는 항상 일반
+디스크에 기록합니다.
 """
 
 from __future__ import annotations
@@ -21,7 +22,9 @@ import yaml
 
 
 ROOT = Path(__file__).resolve().parent
-PERSISTENT_ARTIFACTS = ROOT / "artifacts"
+ARTIFACT_LAYOUT_VERSION = "sion-v6"
+PERSISTENT_ARTIFACTS = ROOT / "artifacts" / ARTIFACT_LAYOUT_VERSION
+EXPRESSIVE_CORPUS_NAME = "synthetic_expressive_cultural.jsonl"
 MIN_RAM_HEADROOM = 8 * 2**30
 
 
@@ -155,6 +158,14 @@ def _ram_workspace(required_bytes: int) -> Path | None:
     return workspace
 
 
+def _runtime_artifact_directory(ram_workspace: Path | None) -> Path:
+    """Resolve only the current artifact layout on disk or in shared memory."""
+
+    if ram_workspace is None:
+        return PERSISTENT_ARTIFACTS
+    return ram_workspace / "artifacts" / ARTIFACT_LAYOUT_VERSION
+
+
 def _generated_config(raw_dir: Path, artifacts_dir: Path) -> Path:
     config_path = ROOT / "sion_translate.yaml"
     raw = {}
@@ -179,6 +190,54 @@ def _generated_config(raw_dir: Path, artifacts_dir: Path) -> Path:
 def _run(command: list[str], env: dict[str, str]) -> None:
     print("[easy_run] 실행:", " ".join(command), flush=True)
     subprocess.run(command, cwd=ROOT, env=env, check=True)
+
+
+def _build_expressive_cultural_corpus(data_dir: Path, env: dict[str, str]) -> Path:
+    """Materialize the curated train split before corpus discovery.
+
+    The builder owns the leakage boundary between its training pairs and the
+    bidirectional challenge set. Running it on every launch is inexpensive and
+    makes the generated training shard reproducible from the reviewed seed file.
+    """
+
+    builder = ROOT / "scripts" / "data" / "build_expressive_cultural_corpus.py"
+    seed = ROOT / "examples" / "expressive_cultural_seed_pairs.jsonl"
+    training_output = data_dir / EXPRESSIVE_CORPUS_NAME
+    challenge_output = ROOT / "examples" / "expressive_cultural_cases.jsonl"
+    if not builder.is_file() or not seed.is_file():
+        raise SystemExit(
+            f"[easy_run] 표현·문화 데이터 빌더 또는 시드 파일이 없습니다: {builder}, {seed}"
+        )
+
+    print("[easy_run] 표현·문화 학습 코퍼스를 재현 가능하게 빌드합니다.", flush=True)
+    _run(
+        [
+            sys.executable,
+            str(builder),
+            "--seed",
+            str(seed),
+            "--training-output",
+            str(training_output),
+            "--challenge-output",
+            str(challenge_output),
+        ],
+        env,
+    )
+    if not training_output.is_file():
+        raise SystemExit(
+            f"[easy_run] 표현·문화 코퍼스 빌더가 성공했지만 출력이 없습니다: {training_output}"
+        )
+    return training_output
+
+
+def _discover_raw_files(data_dir: Path, env: dict[str, str]) -> list[Path]:
+    """Build required generated shards, then return a stable corpus listing."""
+
+    _build_expressive_cultural_corpus(data_dir, env)
+    raw_files = sorted(data_dir.glob("*.jsonl"))
+    if not raw_files:
+        raise SystemExit("data/*.jsonl 파일이 없습니다.")
+    return raw_files
 
 
 def _validate_gpu_runtime(torch_module) -> tuple[int, tuple[str, ...]]:
@@ -313,7 +372,8 @@ def _verify_tokenizer(
         raise SystemExit(
             f"[easy_run] byte fallback 비율 {rate:.4%} 이 상한 {max_fallback_rate:.4%} 을 넘습니다. "
             "학습을 중단합니다.\n"
-            "           artifacts/tokenizer 를 지우고 다시 실행하거나, "
+            f"           artifacts/{ARTIFACT_LAYOUT_VERSION}/tokenizer 를 지우고 "
+            "다시 실행하거나, "
             "sion-train-tokenizer 를 --required-character-min-occurrences 를 낮춰 직접 "
             "실행하세요."
         )
@@ -327,33 +387,33 @@ def main() -> None:
 
     gpu_count, gpu_names = _validate_gpu_runtime(torch)
 
+    env = os.environ.copy()
+    src_path = str(ROOT / "src")
+    env["PYTHONPATH"] = src_path + os.pathsep + env.get("PYTHONPATH", "")
+
     source_data = ROOT / "data"
-    raw_files = list(source_data.glob("*.jsonl"))
-    if not raw_files:
-        raise SystemExit("data/*.jsonl 파일이 없습니다.")
+    raw_files = _discover_raw_files(source_data, env)
 
     required = sum(path.stat().st_size for path in raw_files)
     required += max(_directory_size(PERSISTENT_ARTIFACTS), required * 3)
     ram = _ram_workspace(required)
+    runtime_artifacts = _runtime_artifact_directory(ram)
     if ram is None:
         runtime_data = source_data
-        runtime_artifacts = PERSISTENT_ARTIFACTS
         print("[easy_run] RAM 디스크 없이 일반 디스크에서 실행합니다.")
     else:
         runtime_data = ram / "data"
-        runtime_artifacts = ram / "artifacts"
         print(f"[easy_run] RAM 디스크 사용: {ram}")
         print(f"[easy_run] 원천 데이터 {len(raw_files)}개를 RAM으로 복사합니다.")
         shutil.rmtree(runtime_data, ignore_errors=True)
         _copy_files_parallel(source_data, runtime_data)
+        # The /dev/shm workspace has a stable checkout-derived name and can
+        # survive a crashed run. Never inherit an orphaned cache implicitly.
+        shutil.rmtree(runtime_artifacts, ignore_errors=True)
         if PERSISTENT_ARTIFACTS.exists():
-            shutil.rmtree(runtime_artifacts, ignore_errors=True)
             shutil.copytree(PERSISTENT_ARTIFACTS, runtime_artifacts)
 
     generated_config = _generated_config(runtime_data, runtime_artifacts)
-    env = os.environ.copy()
-    src_path = str(ROOT / "src")
-    env["PYTHONPATH"] = src_path + os.pathsep + env.get("PYTHONPATH", "")
     # Before anything expensive: a shard the pipeline cannot read is worth
     # catching now rather than after hours of training.
     _check_shard_keys(env)
@@ -377,7 +437,10 @@ def main() -> None:
         _verify_tokenizer(runtime_artifacts / "tokenizer" / "sion.model", runtime_data)
 
         if ram is not None:
-            print("[easy_run] tokenizer/dataset을 일반 디스크 artifacts/에 보존합니다.")
+            print(
+                "[easy_run] tokenizer/dataset을 일반 디스크 "
+                f"artifacts/{ARTIFACT_LAYOUT_VERSION}/에 보존합니다."
+            )
             _atomic_sync_directory(
                 runtime_artifacts / "tokenizer", PERSISTENT_ARTIFACTS / "tokenizer"
             )

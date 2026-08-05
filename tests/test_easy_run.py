@@ -7,6 +7,19 @@ import easy_run
 import pytest
 
 
+def test_persistent_artifacts_are_isolated_from_the_legacy_layout() -> None:
+    legacy_root = easy_run.ROOT / "artifacts"
+
+    assert easy_run.ARTIFACT_LAYOUT_VERSION == "sion-v6"
+    assert easy_run.PERSISTENT_ARTIFACTS == legacy_root / "sion-v6"
+    assert easy_run.PERSISTENT_ARTIFACTS != legacy_root
+    assert easy_run._runtime_artifact_directory(None) == legacy_root / "sion-v6"
+
+
+def test_ram_artifacts_use_the_same_versioned_layout(tmp_path: Path) -> None:
+    assert easy_run._runtime_artifact_directory(tmp_path) == (tmp_path / "artifacts" / "sion-v6")
+
+
 def test_atomic_sync_directory_replaces_complete_cache(tmp_path: Path) -> None:
     source = tmp_path / "ram" / "dataset"
     destination = tmp_path / "disk" / "dataset"
@@ -85,6 +98,68 @@ def test_generated_config_preserves_explicit_source_sampling_alpha(
         assert raw["data"]["source_sampling_alpha"] == 0.75
     finally:
         config_path.unlink(missing_ok=True)
+
+
+def test_expressive_cultural_corpus_builder_targets_training_and_challenge_outputs(
+    tmp_path: Path, monkeypatch
+) -> None:
+    root = tmp_path / "project"
+    data_dir = root / "data"
+    builder = root / "scripts" / "data" / "build_expressive_cultural_corpus.py"
+    seed = root / "examples" / "expressive_cultural_seed_pairs.jsonl"
+    builder.parent.mkdir(parents=True)
+    seed.parent.mkdir(parents=True)
+    data_dir.mkdir(parents=True)
+    builder.write_text("# test builder\n", encoding="utf-8")
+    seed.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(easy_run, "ROOT", root)
+    calls: list[tuple[list[str], dict[str, str]]] = []
+
+    def fake_run(command: list[str], env: dict[str, str]) -> None:
+        calls.append((command, env))
+        output_index = command.index("--training-output") + 1
+        Path(command[output_index]).write_text("generated\n", encoding="utf-8")
+
+    monkeypatch.setattr(easy_run, "_run", fake_run)
+    env = {"PYTHONPATH": "test-src"}
+
+    output = easy_run._build_expressive_cultural_corpus(data_dir, env)
+
+    assert output == data_dir / easy_run.EXPRESSIVE_CORPUS_NAME
+    assert output.read_text(encoding="utf-8") == "generated\n"
+    assert len(calls) == 1
+    command, forwarded_env = calls[0]
+    assert command == [
+        easy_run.sys.executable,
+        str(builder),
+        "--seed",
+        str(seed),
+        "--training-output",
+        str(output),
+        "--challenge-output",
+        str(root / "examples" / "expressive_cultural_cases.jsonl"),
+    ]
+    assert forwarded_env is env
+
+
+def test_raw_discovery_builds_generated_corpus_before_listing(tmp_path: Path, monkeypatch) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    observed: list[Path] = []
+
+    def build_first(path: Path, env: dict[str, str]) -> Path:
+        assert not list(path.glob("*.jsonl"))
+        output = path / easy_run.EXPRESSIVE_CORPUS_NAME
+        output.write_text("generated\n", encoding="utf-8")
+        observed.append(output)
+        return output
+
+    monkeypatch.setattr(easy_run, "_build_expressive_cultural_corpus", build_first)
+
+    raw_files = easy_run._discover_raw_files(data_dir, {"PYTHONPATH": "test-src"})
+
+    assert observed == [data_dir / easy_run.EXPRESSIVE_CORPUS_NAME]
+    assert raw_files == observed
 
 
 def test_enter_tmux_is_noop_inside_existing_tmux(monkeypatch) -> None:
