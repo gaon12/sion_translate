@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import re
 from typing import Sequence
+
+from .record_metadata import inherit_record_metadata
 
 
 _LANGUAGE = re.compile(r"^[A-Za-z][A-Za-z0-9]{0,15}$")
@@ -19,6 +21,7 @@ class ParallelText:
     text_a: str
     language_b: str
     text_b: str
+    metadata: dict[str, object] = field(default_factory=dict, hash=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +124,7 @@ def expand_parallel_record(
         value_a: object,
         language_b: str,
         value_b: object,
+        metadata: dict[str, object],
     ) -> None:
         edge = frozenset((language_a, language_b))
         canonical_pair = configured_edges.get(edge)
@@ -144,9 +148,13 @@ def expand_parallel_record(
             if key in seen:
                 continue
             seen.add(key)
-            output.append(ParallelText(*key))
+            output.append(ParallelText(*key, metadata=inherit_record_metadata({}, metadata)))
 
-    def emit_explicit(mapping: dict, context: tuple[str, str] | None) -> bool:
+    def emit_explicit(
+        mapping: dict,
+        context: tuple[str, str] | None,
+        metadata: dict[str, object],
+    ) -> bool:
         source_language = mapping.get("source_language", mapping.get("src_language"))
         target_language = mapping.get("target_language", mapping.get("tgt_language"))
         if source_language is not None or target_language is not None:
@@ -161,7 +169,7 @@ def expand_parallel_record(
             if source is None or target is None:
                 issue("missing_text")
             else:
-                emit(source_language, source, target_language, target)
+                emit(source_language, source, target_language, target, metadata)
             return True
         if context is not None:
             source = _first_value(mapping, _SOURCE_KEYS)
@@ -170,27 +178,38 @@ def expand_parallel_record(
                 if source is None or target is None:
                     issue("missing_text")
                 else:
-                    emit(context[0], source, context[1], target)
+                    emit(context[0], source, context[1], target, metadata)
                 return True
         return False
 
-    def walk(node: object, context: tuple[str, str] | None = None) -> None:
+    def walk(
+        node: object,
+        context: tuple[str, str] | None = None,
+        inherited_metadata: dict[str, object] | None = None,
+    ) -> None:
         if isinstance(node, (list, tuple)):
             for item in node:
-                walk(item, context)
+                walk(item, context, inherited_metadata)
             return
         if not isinstance(node, dict):
             issue("invalid_record")
             return
 
-        explicit = emit_explicit(node, context)
+        metadata = inherit_record_metadata(node, inherited_metadata)
+        explicit = emit_explicit(node, context, metadata)
         if not explicit:
             for language_a, language_b in configured:
                 if language_a in node or language_b in node:
                     if language_a not in node or language_b not in node:
                         issue("missing_text")
                     else:
-                        emit(language_a, node[language_a], language_b, node[language_b])
+                        emit(
+                            language_a,
+                            node[language_a],
+                            language_b,
+                            node[language_b],
+                            metadata,
+                        )
 
         nested: dict[str, tuple[str, str]] = {}
         for language_a, language_b in configured:
@@ -205,14 +224,14 @@ def expand_parallel_record(
 
         for key, value in node.items():
             if key in nested:
-                walk(value, nested[key])
+                walk(value, nested[key], metadata)
             elif key in _CONTAINER_KEYS:
-                walk(value, context)
+                walk(value, context, metadata)
             elif key == "translation" and not explicit and isinstance(value, (dict, list, tuple)):
                 # Hugging Face translation datasets conventionally wrap their
                 # language map in a singular ``translation`` field.  Keep the
                 # scalar field reserved for explicit source/target records.
-                walk(value, context)
+                walk(value, context, metadata)
 
     walk(record)
     if not output and not issues:

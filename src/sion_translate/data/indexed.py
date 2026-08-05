@@ -11,16 +11,33 @@ from torch.utils.data import Dataset, Sampler
 
 from sion_translate.synthetic import DEFAULT_SYNTHETIC_SAMPLING_WEIGHT
 
+from .record_metadata import (
+    RECORD_METADATA_DATA_SUFFIX,
+    RECORD_METADATA_INDEX_DTYPE,
+    RECORD_METADATA_INDEX_SUFFIX,
+    decode_record_metadata,
+)
+
 
 class IndexedParallelDataset(Dataset):
-    def __init__(self, root: str | Path, split: str, *, bidirectional: bool = True):
+    def __init__(
+        self,
+        root: str | Path,
+        split: str,
+        *,
+        bidirectional: bool = True,
+        include_metadata: bool = False,
+    ):
         self.root = Path(root) / split
         self.dataset_root = Path(root)
         self.bidirectional = bidirectional
+        self.include_metadata = include_metadata
         self.index_paths = sorted(self.root.glob("*.idx.npy"))
         if not self.index_paths:
             raise FileNotFoundError(f"No index shards found under {self.root}")
         self.indices = self._open_indices()
+        self.record_metadata_indices = self._open_record_metadata_indices()
+        self.has_record_metadata = any(index is not None for index in self.record_metadata_indices)
         self.is_v3 = bool(
             self.indices
             and self.indices[0].dtype.names
@@ -71,12 +88,45 @@ class IndexedParallelDataset(Dataset):
         self.language_pair = self.language_pairs[0]
         self.source_only_languages = self._load_source_only_languages()
         self._token_cache: dict[tuple[int, str], np.memmap] = {}
+        self._record_metadata_cache: dict[int, np.memmap] = {}
         self._bidirectional_pairs: np.ndarray | None = None
         self._forward_only_pairs: np.ndarray | None = None
         self._build_direction_maps()
 
     def _open_indices(self) -> list[np.ndarray]:
         return [np.load(path, mmap_mode="r", allow_pickle=False) for path in self.index_paths]
+
+    def _open_record_metadata_indices(self) -> list[np.ndarray | None]:
+        result: list[np.ndarray | None] = []
+        for index_path, index in zip(self.index_paths, self.indices, strict=True):
+            prefix = index_path.name.removesuffix(".idx.npy")
+            metadata_index_path = self.root / f"{prefix}{RECORD_METADATA_INDEX_SUFFIX}"
+            metadata_data_path = self.root / f"{prefix}{RECORD_METADATA_DATA_SUFFIX}"
+            if not metadata_index_path.exists() and not metadata_data_path.exists():
+                result.append(None)
+                continue
+            if not metadata_index_path.is_file() or not metadata_data_path.is_file():
+                raise ValueError(f"Incomplete record metadata sidecar for {index_path}")
+            metadata_index = np.load(metadata_index_path, mmap_mode="r", allow_pickle=False)
+            if metadata_index.dtype != RECORD_METADATA_INDEX_DTYPE:
+                raise ValueError(
+                    f"Unsupported record metadata index dtype in {metadata_index_path}: "
+                    f"{metadata_index.dtype.descr!r}"
+                )
+            if len(metadata_index) != len(index):
+                raise ValueError(
+                    f"Record metadata row count does not match {index_path}: "
+                    f"{len(metadata_index)} != {len(index)}"
+                )
+            data_size = metadata_data_path.stat().st_size
+            if len(metadata_index):
+                ends = metadata_index["offset"].astype(np.uint64) + metadata_index["length"].astype(
+                    np.uint64
+                )
+                if bool((ends > data_size).any()):
+                    raise ValueError(f"Record metadata offset exceeds {metadata_data_path}")
+            result.append(metadata_index)
+        return result
 
     def _build_direction_maps(self) -> None:
         """Split pairs into bidirectional and forward-only virtual index ranges.
@@ -109,18 +159,24 @@ class IndexedParallelDataset(Dataset):
 
         state = self.__dict__.copy()
         state["indices"] = None
+        state["record_metadata_indices"] = None
         state["pair_lengths"] = None
         state["pair_source_ids"] = None
         state["pair_synthetic_flags"] = None
         state["_bidirectional_pairs"] = None
         state["_forward_only_pairs"] = None
         state["_token_cache"] = {}
+        state["_record_metadata_cache"] = {}
         return state
 
     def __setstate__(self, state: dict) -> None:
         self.__dict__.update(state)
+        # Pickles created before row sidecars predate the opt-in flag.
+        self.include_metadata = bool(getattr(self, "include_metadata", False))
         self.indices = self._open_indices()
+        self.record_metadata_indices = self._open_record_metadata_indices()
         self._token_cache = {}
+        self._record_metadata_cache = {}
         # Rebuilding from the reopened memmaps costs one pass over a uint8
         # column and avoids shipping the maps to every spawned worker.
         self._build_direction_maps()
@@ -311,6 +367,33 @@ class IndexedParallelDataset(Dataset):
             self._token_cache[key] = np.memmap(path, dtype=np.uint32, mode="r")
         return self._token_cache[key]
 
+    def _record_metadata_bytes(self, shard: int) -> np.memmap:
+        if shard not in self._record_metadata_cache:
+            prefix = self.index_paths[shard].name.removesuffix(".idx.npy")
+            path = self.root / f"{prefix}{RECORD_METADATA_DATA_SUFFIX}"
+            self._record_metadata_cache[shard] = np.memmap(path, dtype=np.uint8, mode="r")
+        return self._record_metadata_cache[shard]
+
+    def metadata_at(self, index: int) -> dict[str, object]:
+        """Return preserved raw-record annotations for one virtual sample."""
+
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
+        pair_index = self._pair_index(index)
+        shard, local = self._resolve(pair_index)
+        metadata_index = self.record_metadata_indices[shard]
+        if metadata_index is None:
+            return {}
+        row = metadata_index[local]
+        offset, length = int(row["offset"]), int(row["length"])
+        if length == 0:
+            return {}
+        store = self._record_metadata_bytes(shard)
+        payload = np.asarray(store[offset : offset + length], dtype=np.uint8).tobytes()
+        return decode_record_metadata(payload)
+
     def length_at(self, index: int) -> int:
         pair_index = self._pair_index(index)
         if self.pair_lengths is not None:
@@ -404,7 +487,7 @@ class IndexedParallelDataset(Dataset):
             if row.dtype.names is not None and "forward_only" in row.dtype.names
             else False
         )
-        return {
+        item = {
             "src": src,
             "tgt": tgt,
             "src_language": src_language,
@@ -422,6 +505,11 @@ class IndexedParallelDataset(Dataset):
             # source-only rows or a globally unidirectional dataset.
             "reverse_direction_trained": self.bidirectional and not forward_only,
         }
+        if self.include_metadata:
+            metadata = self.metadata_at(index)
+            item["metadata"] = metadata
+            item.update(metadata)
+        return item
 
 
 class DistributedBucketBatchSampler(Sampler[list[int]]):

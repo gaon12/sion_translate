@@ -32,6 +32,14 @@ from sion_translate.synthetic import (
 from sion_translate.tokenizer import SLOT_SYMBOLS, SionTokenizer, expand_inputs
 
 from .quality import QualityPolicy, assess_pair, canonical_text, dedup_key
+from .record_metadata import (
+    RECORD_METADATA_DATA_SUFFIX,
+    RECORD_METADATA_FIELDS,
+    RECORD_METADATA_FORMAT,
+    RECORD_METADATA_INDEX_DTYPE,
+    RECORD_METADATA_INDEX_SUFFIX,
+    encode_record_metadata,
+)
 from .records import (
     expand_parallel_record,
     languages_from_pairs,
@@ -147,6 +155,7 @@ class ShardWriter:
         self.language_to_id = language_to_id
         self.shard_index = 0
         self.records: list[tuple[int, ...]] = []
+        self.record_metadata: list[bytes] = []
         self.src_offset = 0
         self.tgt_offset = 0
         self.total_records = 0
@@ -161,6 +170,7 @@ class ShardWriter:
         self._src_handle = (self.root / f"{self._prefix()}.src.bin").open("wb")
         self._tgt_handle = (self.root / f"{self._prefix()}.tgt.bin").open("wb")
         self.records = []
+        self.record_metadata = []
         self.src_offset = 0
         self.tgt_offset = 0
 
@@ -176,8 +186,10 @@ class ShardWriter:
         quality_score: int,
         synthetic: bool,
         forward_only: bool = False,
+        metadata: dict[str, object] | None = None,
     ) -> None:
         assert self._src_handle is not None and self._tgt_handle is not None
+        metadata_payload = encode_record_metadata(metadata)
         src_array = np.asarray(src_ids, dtype=np.uint32)
         tgt_array = np.asarray(tgt_ids, dtype=np.uint32)
         src_array.tofile(self._src_handle)
@@ -198,6 +210,7 @@ class ShardWriter:
                 int(forward_only),
             )
         )
+        self.record_metadata.append(metadata_payload)
         self.src_offset += len(src_array)
         self.tgt_offset += len(tgt_array)
         self.total_records += 1
@@ -216,6 +229,20 @@ class ShardWriter:
                 np.asarray(self.records, dtype=INDEX_DTYPE),
                 allow_pickle=False,
             )
+            if any(self.record_metadata):
+                metadata_rows: list[tuple[int, int]] = []
+                offset = 0
+                data_path = self.root / f"{self._prefix()}{RECORD_METADATA_DATA_SUFFIX}"
+                with data_path.open("wb") as handle:
+                    for payload in self.record_metadata:
+                        handle.write(payload)
+                        metadata_rows.append((offset, len(payload)))
+                        offset += len(payload)
+                np.save(
+                    self.root / f"{self._prefix()}{RECORD_METADATA_INDEX_SUFFIX}",
+                    np.asarray(metadata_rows, dtype=RECORD_METADATA_INDEX_DTYPE),
+                    allow_pickle=False,
+                )
         else:
             for side in ("src", "tgt"):
                 (self.root / f"{self._prefix()}.{side}.bin").unlink(missing_ok=True)
@@ -303,6 +330,7 @@ def _process_prepare_batch(args):
                         record_is_synthetic,
                         pair.language_a,
                         pair.language_b,
+                        pair.metadata,
                         text_a,
                         text_b,
                         tokenizer.encode(encoded_a),
@@ -478,6 +506,8 @@ def prepare_dataset(
             "dedup_backend": dedup_backend,
             "filter_quality": filter_quality,
             "index_dtype": INDEX_DTYPE.descr,
+            "record_metadata_fields": list(RECORD_METADATA_FIELDS),
+            "record_metadata_format": RECORD_METADATA_FORMAT,
             "max_tokens_per_side": max_tokens_per_side,
             "approximate_split": approximate_split,
             "endpoint_leakage_guard": "language-endpoint-bloom-v2",
@@ -589,6 +619,7 @@ def prepare_dataset(
                     record_is_synthetic,
                     language_a,
                     language_b,
+                    metadata,
                     text_a,
                     text_b,
                     ids_a,
@@ -691,6 +722,7 @@ def prepare_dataset(
                     quality_score,
                     is_synthetic,
                     forward_only,
+                    metadata,
                 )
                 for target in targets:
                     _increment(target, split)
@@ -746,6 +778,14 @@ def prepare_dataset(
         "language_to_id": language_to_id,
         "source_only_languages": list(source_only),
         "storage_sides": ["src", "tgt"],
+        "record_metadata": {
+            "format": RECORD_METADATA_FORMAT,
+            "fields": list(RECORD_METADATA_FIELDS),
+            "optional": True,
+            "index_suffix": RECORD_METADATA_INDEX_SUFFIX,
+            "data_suffix": RECORD_METADATA_DATA_SUFFIX,
+            "index_dtype": RECORD_METADATA_INDEX_DTYPE.descr,
+        },
         "train_only_prefixes": list(train_only_prefixes),
         "synthetic_policy": {
             "record_field": "synthetic",
