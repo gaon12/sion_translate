@@ -8,10 +8,12 @@ from pathlib import Path
 import pytest
 
 from sion_translate.comparison import (
+    category_results_as_markdown,
     comparison_as_markdown,
     load_comparison_cases,
     load_system_translations,
     save_comparison,
+    score_system_categories,
     score_systems,
     write_system_translations,
 )
@@ -21,6 +23,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 SHIPPED_CASE_FILES = [
     REPOSITORY_ROOT / "examples" / "comparison_cases.jsonl",
     REPOSITORY_ROOT / "examples" / "diagnostic_cases.jsonl",
+    REPOSITORY_ROOT / "examples" / "expressive_cultural_cases.jsonl",
 ]
 
 
@@ -125,4 +128,58 @@ def test_score_and_report_multiple_systems(tmp_path: Path) -> None:
     save_comparison(tmp_path / "comparison", cases, systems, results)
     payload = json.loads((tmp_path / "comparison.json").read_text(encoding="utf-8"))
     assert payload["schema"] == "sion-translation-comparison-v1"
+    assert len(payload["category_results"]) == 4
     assert (tmp_path / "comparison.md").exists()
+
+
+def test_category_scoring_is_additive_and_preserves_aggregate_callers() -> None:
+    cases = load_comparison_cases(REPOSITORY_ROOT / "examples" / "expressive_cultural_cases.jsonl")
+    translations = {case.id: case.reference for case in cases}
+
+    aggregate = score_systems(cases, {"perfect": translations})
+    categories = score_system_categories(cases, {"perfect": translations})
+
+    # The legacy function remains direction-only; category scoring is a separate
+    # additive API so existing callers and result types do not change.
+    assert len(aggregate) == 2
+    assert {result.direction for result in aggregate} == {"ko-ja", "ja-ko"}
+    assert len(categories) == 6
+    assert {result.category for result in categories} == {
+        "profanity_slang",
+        "interjection_moan",
+        "idiom_culture",
+    }
+    assert all(result.samples == 4 for result in categories)
+    assert all(result.chrf == 100.0 for result in categories)
+    markdown = category_results_as_markdown(categories)
+    assert "| perfect | ja-ko | profanity_slang | 4 | 100.00 |" in markdown
+
+
+def test_expressive_case_metadata_survives_loading_and_reporting() -> None:
+    cases = load_comparison_cases(REPOSITORY_ROOT / "examples" / "expressive_cultural_cases.jsonl")
+    case = next(item for item in cases if item.id == "ko-ja-profanity-slang-challenge-01")
+
+    assert case.subcategory == "strong_profanity"
+    assert case.intensity == 5
+    assert case.register == "vulgar_casual"
+    assert case.localization_strategy == "intensity_equivalent"
+
+
+def test_invalid_comparison_intensity_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "cases.jsonl"
+    _write_jsonl(
+        path,
+        [
+            {
+                "id": "bad-intensity",
+                "source_language": "ko",
+                "target_language": "ja",
+                "source": "젠장",
+                "reference": "ちくしょう",
+                "intensity": 6,
+            }
+        ],
+    )
+
+    with pytest.raises(ValueError, match="intensity"):
+        load_comparison_cases(path)

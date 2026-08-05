@@ -6,9 +6,11 @@ import argparse
 import time
 
 from sion_translate.comparison import (
+    category_results_as_markdown,
     load_comparison_cases,
     load_system_translations,
     save_comparison,
+    score_system_categories,
     score_systems,
 )
 from sion_translate.console import configure_stdio
@@ -44,12 +46,21 @@ def main() -> None:
                 raise ValueError(f"중복 시스템 이름: {name}")
             systems[name] = load_system_translations(path.strip(), cases)
         results = score_systems(cases, systems)
+        category_results = score_system_categories(cases, systems)
         output = args.output or f"reports/comparison-{time.strftime('%Y%m%d-%H%M%S')}"
-        save_comparison(output, cases, systems, results)
+        save_comparison(
+            output,
+            cases,
+            systems,
+            results,
+            category_results=category_results,
+        )
     except (OSError, UnicodeError, ValueError) as error:
         raise SystemExit(str(error)) from error
 
     print(results_as_markdown(results))
+    print()
+    print(category_results_as_markdown(category_results))
     print(f"저장: {output}.json / {output}.md")
 
 
