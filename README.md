@@ -53,15 +53,18 @@ python -m venv .venv
 ```
 
 `easy_run.py`는 입력 JSONL과 실행 환경을 감지해 토크나이저 준비, 품질 필터링,
-중복 제거, split 생성, 모델 크기·배치·정밀도 선택, SFT와 사후학습, 체크포인트 재개를
-순서대로 처리합니다. 이 자동 실행기는 Linux CUDA GPU 서버용이며 CPU나 Windows에서는
+표현·문화 seed의 train/challenge 분리, 중복 제거, split 생성, 모델 크기·배치·정밀도
+선택, SFT와 사후학습, 체크포인트 재개를 순서대로 처리합니다. 구형 산출물과 섞이지
+않도록 tokenizer와 dataset은 `artifacts/sion-v6/`에 만듭니다. 이 자동 실행기는 Linux CUDA GPU 서버용이며 CPU나 Windows에서는
 수동 CLI 경로를 사용해야 합니다. 세부 GPU 서버 실행법은 [`START-HERE.md`](START-HERE.md)와
 [`how_to_run.txt`](how_to_run.txt), 사후학습 설계는
 [`POSTTRAINING.md`](POSTTRAINING.md)를 참고하세요. 80GB급 GPU의 수동 용량 점검과
 7종 내보내기는
 [`docs/H100_TRAINING.md`](docs/H100_TRAINING.md), 데이터 정비 현황과 1억 쌍
 분야별 확장량은 [`docs/DATA_EXPANSION_PLAN.md`](docs/DATA_EXPANSION_PLAN.md)에
-정리되어 있습니다.
+정리되어 있습니다. 방향별 품질 원인, 구형 48k vocabulary의 실제 target 노출,
+표현 데이터 계약과 evidence/parity ablation 범위는
+[`docs/QUALITY_OVERHAUL.md`](docs/QUALITY_OVERHAUL.md)를 먼저 확인하십시오.
 
 ### 자체 포함 GPU ZIP 만들기
 
@@ -188,12 +191,12 @@ model:
 직접 모델 파일을 지정할 수도 있습니다.
 
 ```bash
-sion-translate --model runs/auto/posttrain/exports/best/model_ema.pt --to ja "안녕하세요."
+sion-translate --model runs/sion-v6/posttrain/exports/best/model_ema.pt --to ja "안녕하세요."
 ```
 
 ## 여러 번역 시스템 비교
 
-저장소는 두 개의 진단셋을 제공합니다. 모두 이 프로젝트용으로 새로 작성한 합성
+저장소는 세 개의 진단셋을 제공합니다. 모두 이 프로젝트용으로 새로 작성한 합성
 문장이며 어떤 학습 코퍼스에도 포함되지 않습니다.
 
 - [`examples/comparison_cases.jsonl`](examples/comparison_cases.jsonl) — 16문장.
@@ -202,8 +205,11 @@ sion-translate --model runs/auto/posttrain/exports/best/model_ema.pt --to ja "�
   위 항목에 의료, 법률, 행정, 관광, 학술, 부정 표현을 더하고 고유명사·숫자 케이스를
   늘렸습니다. 학습 데이터에 없는 도메인에서 품질이 얼마나 떨어지는지 보기 위한
   셋이므로, 자체 holdout 점수와 함께 보면 일반화 격차를 가늠할 수 있습니다.
+- [`examples/expressive_cultural_cases.jsonl`](examples/expressive_cultural_cases.jsonl) —
+  24문장. 욕설·인터넷 비속어, 감탄·신음, 관용구·문화 현지화를 각각 양방향으로
+  평가합니다. seed의 train 행과 ID·표면형이 분리돼 있습니다.
 
-둘 다 한국어→일본어와 일본어→한국어를 같은 수로 담고 있고 스키마가 같으므로
+세 파일 모두 한국어→일본어와 일본어→한국어를 같은 수로 담고 있고 스키마가 같으므로
 `--cases`만 바꿔 끼우면 됩니다.
 
 비교 대상은 sion_translate, LibreTranslate, Papago, Google Cloud Translation, DeepL,
@@ -231,8 +237,8 @@ mkdir -p comparison_outputs
 sion-translate-cases \
   --backend sion \
   --cases examples/comparison_cases.jsonl \
-  --model runs/auto/posttrain/exports/best/model_ema.pt \
-  --tokenizer artifacts/tokenizer/sion.model \
+  --model runs/sion-v6/posttrain/exports/best/model_ema.pt \
+  --tokenizer artifacts/sion-v6/tokenizer/sion.model \
   --output comparison_outputs/sion.jsonl
 
 python -m pip install -e ".[baselines]"
@@ -312,15 +318,17 @@ FLORES-200을 학습에 포함했다면 `sion-prepare-benchmark`로 만든 FLORE
 JSONL 키, 방향 태그와 품질 검사에 사용됩니다.
 
 ```bash
-sion-train-tokenizer --input "data/*.jsonl" --output-dir artifacts/tokenizer
+sion-train-tokenizer --input "data/*.jsonl" --output-dir artifacts/sion-v6/tokenizer
 sion-prepare-data --input "data/*.jsonl" \
-  --tokenizer artifacts/tokenizer/sion.model \
-  --output-dir artifacts/dataset
+  --tokenizer artifacts/sion-v6/tokenizer/sion.model \
+  --output-dir artifacts/sion-v6/dataset
 sion-train --config configs/sion_data_fit.yaml
 ```
 
-토크나이저를 다시 만들면 vocab이 달라지므로 `artifacts/dataset`과 기존 체크포인트는
-재사용할 수 없습니다. 위 세 단계를 순서대로 다시 실행해야 합니다.
+토크나이저를 다시 만들면 vocab이 달라지므로 `artifacts/sion-v6/dataset`과 기존
+체크포인트는 재사용할 수 없습니다. 위 세 단계를 순서대로 다시 실행해야 합니다.
+루트의 과거 `artifacts/tokenizer`와 `artifacts/dataset`은 호환되지 않는 legacy
+진단용이며 새 설정의 입력으로 사용하지 않습니다.
 
 ### 언어쌍 바꾸기 / 늘리기
 
@@ -397,7 +405,7 @@ data:
 ```bash
 sion-concat --input "data/*.jsonl" --output data/concat_multi.jsonl \
   --count 300000 --min-sentences 2 --max-sentences 4 \
-  --tokenizer artifacts/tokenizer/sion.model --max-tokens 510
+  --tokenizer artifacts/sion-v6/tokenizer/sion.model --max-tokens 510
 ```
 
 무관한 문장을 쓰는 것이 핵심입니다. 문맥이 이어지는 문단을 쓰면 모델이 앞 문장으로

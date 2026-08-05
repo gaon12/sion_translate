@@ -57,11 +57,11 @@ sion-train --config configs/sion_data_fit.yaml --prepare-only
 
 ```bash
 sion-train-tokenizer --input "data/*.jsonl" \
-  --output-dir artifacts/tokenizer
+  --output-dir artifacts/sion-v6/tokenizer
 
 sion-prepare-data --input "data/*.jsonl" \
-  --tokenizer artifacts/tokenizer/sion.model \
-  --output-dir artifacts/dataset
+  --tokenizer artifacts/sion-v6/tokenizer/sion.model \
+  --output-dir artifacts/sion-v6/dataset
 ```
 
 다국어라면 두 명령 모두 같은 언어쌍을 반복해서 지정해야 한다.
@@ -313,10 +313,10 @@ EMA가 켜졌다면 이 최종 일곱 형식은 복원된 best EMA 가중치 기
 
 ```bash
 sion-export \
-  runs/sion-data-fit/posttrain/exports/best/model_ema.pt \
-  --output runs/sion-data-fit/recovered-export \
-  --tokenizer artifacts/tokenizer/sion.model \
-  --token-features artifacts/tokenizer/token_features.npz \
+  runs/sion-v6-data-fit/posttrain/exports/best/model_ema.pt \
+  --output runs/sion-v6-data-fit/recovered-export \
+  --tokenizer artifacts/sion-v6/tokenizer/sion.model \
+  --token-features artifacts/sion-v6/tokenizer/token_features.npz \
   --language-pair ko ja
 ```
 
@@ -369,7 +369,7 @@ custom AutoClass 코드를 포함한다. 로컬 로딩은 다음처럼 검증한
 import torch
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
-path = "runs/sion-data-fit/posttrain/exports/best/transformers"
+path = "runs/sion-v6-data-fit/posttrain/exports/best/transformers"
 tokenizer = AutoTokenizer.from_pretrained(
     path,
     trust_remote_code=True,
@@ -394,7 +394,7 @@ print(tokenizer.batch_decode(generated, skip_special_tokens=True))
 모든 성공 artifact를 실제 loader로 열어 보는 검증을 실행한다.
 
 ```bash
-python -c "import json,sys; from sion_translate.training.export import validate_export_directory; r=validate_export_directory('runs/sion-data-fit/posttrain/exports/best'); print(json.dumps(r, ensure_ascii=False, indent=2)); sys.exit(0 if r['valid'] else 1)"
+python -c "import json,sys; from sion_translate.training.export import validate_export_directory; r=validate_export_directory('runs/sion-v6-data-fit/posttrain/exports/best'); print(json.dumps(r, ensure_ascii=False, indent=2)); sys.exit(0 if r['valid'] else 1)"
 ```
 
 검증이 실패한 디렉터리는 업로드하지 않는다. 특히 아래를 확인한다.

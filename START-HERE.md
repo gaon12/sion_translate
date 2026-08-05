@@ -64,13 +64,14 @@ python3 easy_run.py
 설치가 끝난 뒤 필요한 학습 명령은 이것 하나입니다. 자동 실행기는 다음을 수행합니다.
 
 1. CUDA/NCCL과 보이는 모든 GPU를 확인합니다.
-2. JSONL shard 구조를 빠르게 검사합니다.
-3. 여유가 충분하면 원천 데이터와 전처리 산출물을 `/dev/shm`에서 처리합니다.
-4. 현재 split 정책으로 SentencePiece와 MorphoScript sidecar를 생성·검증합니다.
-5. 품질 필터, 중복 제거와 누수 방지 split으로 indexed dataset을 만듭니다.
-6. GPU 중 가장 작은 VRAM과 가장 낮은 BF16 능력에 맞춰 공통 설정을 선택합니다.
-7. SFT 사전학습을 실행하고 체크포인트를 저장합니다.
-8. best SFT 모델에서 MRT 사후학습을 실행하고 별도로 저장합니다.
+2. 검토된 표현·문화 seed의 train shard를 만들고 challenge 문장은 학습에서 격리합니다.
+3. 여유가 충분하면 원천 데이터와 전처리 산출물을 `/dev/shm`로 복사합니다.
+4. 실행 위치의 JSONL shard 구조를 빠르게 검사합니다.
+5. 현재 split 정책으로 SentencePiece와 MorphoScript sidecar를 생성·검증합니다.
+6. 품질 필터, 중복 제거와 누수 방지 split으로 indexed dataset을 만듭니다.
+7. GPU 중 가장 작은 VRAM과 가장 낮은 BF16 능력에 맞춰 공통 설정을 선택합니다.
+8. SFT 사전학습을 실행하고 체크포인트를 저장합니다.
+9. best SFT 모델에서 MRT 사후학습을 실행하고 별도로 저장합니다.
 
 대화형 터미널이고 `tmux`가 이미 설치돼 있으면 체크아웃별 세션을 만듭니다.
 Slurm, `nohup`, 컨테이너 또는 비대화형 SSH에서는 현재 프로세스로 그대로 실행합니다.
@@ -96,22 +97,23 @@ SION_NO_TMUX=1 python3 easy_run.py
 ## 5. 결과와 재개
 
 ```text
-runs/auto/
+runs/sion-v6/
 ├── pretrain/
 │   ├── checkpoints/
 │   └── exports/best/
 └── posttrain/
     ├── checkpoints/
     └── exports/best/
-artifacts/
+artifacts/sion-v6/
 ├── tokenizer/
 └── dataset/
 ```
 
 사후학습이 활성화돼 있으므로 최종 추론 모델은
-`runs/auto/posttrain/exports/best/`입니다. 중단 뒤 같은 명령을 다시 실행하면 각
+`runs/sion-v6/posttrain/exports/best/`입니다. 중단 뒤 같은 명령을 다시 실행하면 각
 단계의 `checkpoints/latest`에서 재개합니다. 인스턴스를 삭제하기 전에 `runs/`와
-`artifacts/tokenizer/`를 내려받으십시오.
+`artifacts/sion-v6/tokenizer/`를 내려받으십시오. 루트의 과거
+`artifacts/tokenizer/`와 `artifacts/dataset/`은 새 run이 재사용하지 않습니다.
 
 실제 A100/H100에서의 최종 smoke test는 서버의 드라이버, CUDA 이미지, GPU 수와
 VRAM에 의존합니다. 오류가 나면 전체 traceback, `nvidia-smi`, 위 PyTorch 확인
