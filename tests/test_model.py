@@ -8,6 +8,7 @@ import torch
 import sion_translate.model.transformer as transformer_module
 from sion_translate.config import ExperimentalConfig, ModelConfig
 from sion_translate.model import SionForConditionalGeneration
+from sion_translate.model.experimental import ContentRegisterState
 from sion_translate.model.layers import SwiGLU
 
 
@@ -97,6 +98,80 @@ def test_forward_backward_all_experimental_modules() -> None:
     assert model.token_embedding.weight.grad is not None
 
 
+def test_evidence_repair_and_semantic_parity_are_trainable_and_cached() -> None:
+    config = ModelConfig(
+        vocab_size=128,
+        d_model=64,
+        encoder_layers=2,
+        decoder_layers=2,
+        num_heads=4,
+        num_kv_heads=2,
+        d_ff=160,
+        max_seq_len=32,
+        dropout=0.0,
+        gradient_checkpointing=False,
+        experimental=ExperimentalConfig(
+            evidence_repair_enabled=True,
+            evidence_uncertainty_loss_weight=0.02,
+            evidence_budget_loss_weight=0.001,
+            evidence_budget_target=0.25,
+            semantic_parity_enabled=True,
+            semantic_parity_dim=16,
+            semantic_parity_temperature=0.1,
+            semantic_parity_loss_weight=0.05,
+        ),
+    )
+    model = SionForConditionalGeneration(config)
+    batch = make_batch()
+    output = model(
+        input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
+        decoder_input_ids=batch["decoder_input_ids"],
+        labels=batch["labels"],
+    )
+
+    assert torch.isfinite(output.loss)
+    assert output.uncertainty_loss.item() > 0
+    assert output.evidence_budget_loss.item() >= 0
+    assert 0 <= output.evidence_request_rate.item() <= 1
+    assert torch.isfinite(output.semantic_parity_loss)
+    assert -1 <= output.semantic_parity_score.item() <= 1
+    output.loss.backward()
+    assert model.evidence_repair is not None
+    assert model.evidence_repair.repair_scale.grad is not None
+    assert model.evidence_repair.uncertainty_head.weight.grad is not None
+    assert model.semantic_parity is not None
+    assert model.semantic_parity.source_proj.weight.grad is not None
+
+    empty_output = model(
+        input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
+        decoder_input_ids=batch["decoder_input_ids"],
+        labels=torch.full_like(batch["labels"], -100),
+    )
+    assert empty_output.uncertainty_loss.item() == 0.0
+    assert empty_output.evidence_budget_loss.item() == 0.0
+    assert empty_output.evidence_request_rate.item() == 0.0
+    assert empty_output.semantic_parity_loss.item() == 0.0
+    assert torch.isfinite(empty_output.loss)
+
+    context = model.prepare_generation(batch["input_ids"], batch["attention_mask"])
+    assert context.evidence_key_value is not None
+    key, value = context.evidence_key_value
+    assert key.shape[0] == batch["input_ids"].shape[0]
+    assert value.shape == key.shape
+    generated = model.generate(
+        batch["input_ids"],
+        batch["attention_mask"],
+        bos_id=2,
+        eos_id=3,
+        max_new_tokens=3,
+        num_beams=2,
+        generation_context=context,
+    )
+    assert generated.shape[0] == batch["input_ids"].shape[0]
+
+
 def test_situglu_bounds_activations_and_keeps_swiglu_state_compatible() -> None:
     torch.manual_seed(11)
     swiglu = SwiGLU(8, 16, 0.0)
@@ -170,6 +245,28 @@ def test_auxiliary_loss_masks_are_compile_safe_and_keep_empty_batches_finite() -
     assert torch.isfinite(empty_output.loss)
     empty_output.loss.backward()
     assert model.token_embedding.weight.grad is not None
+
+
+def test_content_register_decoder_context_never_uses_oracle_labels() -> None:
+    torch.manual_seed(19)
+    register_state = ContentRegisterState(d_model=16, register_classes=4)
+    register_state.inject_gate.data.fill_(1.0)
+    encoder_states = torch.randn(2, 5, 16)
+    source_mask = torch.tensor([[True, True, True, False, False], [True, True, True, True, True]])
+
+    _, training_context, training_logits = register_state(
+        encoder_states,
+        source_mask,
+        register_labels=torch.tensor([1, 3]),
+    )
+    _, inference_context, inference_logits = register_state(
+        encoder_states,
+        source_mask,
+        register_labels=None,
+    )
+
+    torch.testing.assert_close(training_context, inference_context)
+    torch.testing.assert_close(training_logits, inference_logits)
 
 
 def test_greedy_generation() -> None:

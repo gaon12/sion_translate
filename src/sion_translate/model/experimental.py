@@ -8,6 +8,152 @@ from torch import nn
 from .layers import GQAAttention, RMSNorm
 
 
+class ActiveEvidenceRepair(nn.Module):
+    """Uncertainty-gated source re-reading and local decoder-state repair.
+
+    The regular decoder cross-attention has already read the source. This module
+    is an optional second evidence path after the decoder stack: each target
+    position predicts whether it needs more evidence, attends to the encoder
+    again, and applies a bounded residual repair. A learned request budget keeps
+    the gate from degenerating into "always re-read" during supervised training.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        num_kv_heads: int,
+        *,
+        dropout: float,
+        qk_norm: bool,
+        norm_eps: float,
+    ):
+        super().__init__()
+        self.query_norm = RMSNorm(d_model, norm_eps)
+        self.evidence_norm = RMSNorm(d_model, norm_eps)
+        self.attention = GQAAttention(
+            d_model,
+            num_heads,
+            num_kv_heads,
+            dropout=dropout,
+            qk_norm=qk_norm,
+            norm_eps=norm_eps,
+            rope=None,
+        )
+        self.uncertainty_head = nn.Linear(d_model, 1)
+        self.repair = nn.Sequential(
+            nn.Linear(2 * d_model, d_model, bias=False),
+            nn.SiLU(),
+            nn.Linear(d_model, d_model, bias=False),
+        )
+        # Start checkpoint-compatibly as an identity residual. Shape (1,) is
+        # shardable by FSDP2 and broadcasts over (batch, length, d_model).
+        self.repair_scale = nn.Parameter(torch.zeros(1))
+
+    def project_key_value(
+        self,
+        encoder_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project encoder evidence once for cached autoregressive decoding."""
+
+        return self.attention.project_key_value(self.evidence_norm(encoder_states))
+
+    def forward(
+        self,
+        decoder_states: torch.Tensor,
+        encoder_states: torch.Tensor,
+        source_mask: torch.Tensor,
+        *,
+        evidence_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        query = self.query_norm(decoder_states)
+        uncertainty_logits = self.uncertainty_head(query).squeeze(-1)
+        request_probabilities = uncertainty_logits.sigmoid()
+        # ``key_value_states`` keeps this on the cross-attention path. Its
+        # contents are ignored when the projected cache is supplied, so avoid
+        # normalizing the full encoder sequence on every generated token.
+        evidence_states = (
+            encoder_states if evidence_key_value is not None else self.evidence_norm(encoder_states)
+        )
+        evidence = self.attention(
+            query,
+            key_value_states=evidence_states,
+            key_padding_mask=source_mask,
+            past_key_value=evidence_key_value,
+        )
+        proposal = self.repair(torch.cat((decoder_states, evidence), dim=-1))
+        repaired = decoder_states + (
+            torch.tanh(self.repair_scale)
+            * request_probabilities.unsqueeze(-1).to(proposal.dtype)
+            * proposal
+        )
+        return repaired, uncertainty_logits, request_probabilities
+
+
+class SemanticParityHead(nn.Module):
+    """A train-time semantic checksum shared by source and target states."""
+
+    def __init__(
+        self,
+        d_model: int,
+        parity_dim: int,
+        temperature: float,
+        *,
+        norm_eps: float,
+    ):
+        super().__init__()
+        self.source_norm = RMSNorm(d_model, norm_eps)
+        self.target_norm = RMSNorm(d_model, norm_eps)
+        self.source_proj = nn.Linear(d_model, parity_dim, bias=False)
+        self.target_proj = nn.Linear(d_model, parity_dim, bias=False)
+        self.temperature = temperature
+
+    @staticmethod
+    def _pool(states: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        weights = mask.unsqueeze(-1).to(states.dtype)
+        return (states * weights).sum(1) / weights.sum(1).clamp_min(1.0)
+
+    def forward(
+        self,
+        source_states: torch.Tensor,
+        target_states: torch.Tensor,
+        source_mask: torch.Tensor,
+        target_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        source = F.normalize(
+            self.source_proj(self._pool(self.source_norm(source_states), source_mask)),
+            dim=-1,
+        )
+        target = F.normalize(
+            self.target_proj(self._pool(self.target_norm(target_states), target_mask)),
+            dim=-1,
+        )
+        similarity = source @ target.transpose(0, 1)
+        labels = torch.arange(similarity.shape[0], device=similarity.device)
+        valid_rows = target_mask.any(-1)
+        valid_weights = valid_rows.to(similarity.dtype)
+        denominator = valid_weights.sum().clamp_min(1.0)
+        scaled = similarity.float() / self.temperature
+        minimum = torch.finfo(scaled.dtype).min
+        source_to_target = scaled.masked_fill(~valid_rows[None, :], minimum)
+        target_to_source = scaled.transpose(0, 1).masked_fill(~valid_rows[None, :], minimum)
+        # The sentinel is finite, so even a completely padded micro-batch has a
+        # well-defined softmax. Invalid query rows are removed by the weights;
+        # invalid paired examples are also masked as candidates in both
+        # directions, rather than becoming accidental hard negatives.
+        contrastive_values = 0.5 * (
+            F.cross_entropy(source_to_target, labels, reduction="none")
+            + F.cross_entropy(target_to_source, labels, reduction="none")
+        )
+        contrastive = (contrastive_values * valid_weights).sum() / denominator
+        positive_similarity = (similarity.diagonal() * valid_weights).sum() / denominator
+        # The positive cosine term gives a useful signal for batch size one,
+        # where the in-batch contrastive objective is exactly zero.
+        has_any_target = valid_rows.any().to(similarity.dtype)
+        loss = (contrastive + (1.0 - positive_similarity)) * has_any_target
+        return loss, positive_similarity
+
+
 class MorphoScriptFusion(nn.Module):
     def __init__(self, d_model: int, script_classes: int):
         super().__init__()
@@ -63,14 +209,15 @@ class ContentRegisterState(nn.Module):
         pooled = self.norm(pooled)
         logits = self.classifier(pooled)
         probabilities = logits.softmax(-1)
-        predicted_context = probabilities @ self.register_embeddings.weight
-        if register_labels is not None:
-            safe_labels = register_labels.clamp_min(0)
-            known = register_labels > 0
-            gold_context = self.register_embeddings(safe_labels)
-            context = torch.where(known[:, None], gold_context, predicted_context)
-        else:
-            context = predicted_context
+        # Decoder conditioning must be identical in training and generation.
+        # Earlier versions injected the gold register embedding whenever a
+        # label was available, but generation can only use the classifier's
+        # prediction. That oracle path taught the decoder to depend on context
+        # it never receives at inference time, which is especially damaging to
+        # style-sensitive short expressions. Labels remain useful to supervise
+        # ``logits`` in the parent model; they never select decoder features.
+        del register_labels
+        context = probabilities @ self.register_embeddings.weight
         return pooled, torch.tanh(self.inject_gate) * context, logits
 
 

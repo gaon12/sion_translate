@@ -198,6 +198,14 @@ class SionForConditionalGeneration(PreTrainedModel, GenerationMixin):
                     attention_mask,
                     register_labels=None,
                 )
+            cross_key_values = tuple(
+                layer.project_cross_key_value(encoder_states) for layer in model.decoder_layers
+            )
+            evidence_key_value = (
+                model.evidence_repair.project_key_value(encoder_states)
+                if model.evidence_repair is not None
+                else None
+            )
 
             batch = encoder_states.shape[0]
             device = encoder_states.device
@@ -206,13 +214,21 @@ class SionForConditionalGeneration(PreTrainedModel, GenerationMixin):
             source_mask = attention_mask.repeat_interleave(num_beams, dim=0)
             if register_context is not None:
                 register_context = register_context.repeat_interleave(num_beams, dim=0)
+            if evidence_key_value is not None:
+                evidence_key_value = tuple(
+                    value.repeat_interleave(num_beams, dim=0) for value in evidence_key_value
+                )
             memory = {
                 name: value.repeat_interleave(num_beams, dim=0) for name, value in memory.items()
             }
 
             bos_id = int(self.config.decoder_start_token_id)
             eos_id = int(self.config.eos_token_id)
-            caches = model._fresh_caches(len(model.decoder_layers))
+            caches = model._fresh_caches(
+                len(model.decoder_layers),
+                cross_key_values,
+                repeats=num_beams,
+            )
             sequences = torch.full((total, 1), bos_id, dtype=torch.long, device=device)
             beam_scores = torch.full((batch, num_beams), float("-inf"), device=device)
             beam_scores[:, 0] = 0.0
@@ -229,6 +245,7 @@ class SionForConditionalGeneration(PreTrainedModel, GenerationMixin):
                     caches,
                     position,
                     register_context,
+                    evidence_key_value=evidence_key_value,
                     **memory,
                 )
                 logits = model._apply_decode_constraints(

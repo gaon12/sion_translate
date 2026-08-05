@@ -240,15 +240,16 @@ def requires_ddp_unused_parameter_detection(config: AppConfig) -> bool:
     """Return whether one DDP wrapper spans changing parameter-use graphs."""
 
     experimental = config.model.experimental
-    if not experimental.bats_enabled:
-        return False
-    unused_during_sft = (
+    bats_unused_during_sft = experimental.bats_enabled and (
         experimental.bats_loss_weight == 0 and experimental.bats_coverage_weight == 0
     )
-    # MRT scores candidates through label-free forwards, so BATS parameters
-    # used by supervised losses become unused after the SFT stage. The same
-    # DDP wrapper spans both stages and therefore cannot use a static graph.
-    return unused_during_sft or config.posttraining.enabled
+    # MRT interleaves label-free candidate forwards with a supervised reference
+    # forward. BATS and semantic parity only run on the latter, so the same DDP
+    # wrapper observes a changing parameter-use graph and cannot be static.
+    supervised_only_during_mrt = config.posttraining.enabled and (
+        experimental.bats_enabled or experimental.semantic_parity_enabled
+    )
+    return bats_unused_during_sft or supervised_only_during_mrt
 
 
 def validate_training_capacity(

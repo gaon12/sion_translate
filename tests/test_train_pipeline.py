@@ -485,7 +485,7 @@ def test_fsdp2_reports_missing_custom_forward_registration_api(
         )
 
 
-def test_ddp_unused_parameter_detection_covers_bats_stage_transition() -> None:
+def test_ddp_unused_parameter_detection_covers_supervised_only_heads() -> None:
     config = AppConfig()
     config.model.experimental.bats_enabled = True
     config.model.experimental.bats_coverage_weight = 0.01
@@ -500,6 +500,12 @@ def test_ddp_unused_parameter_detection_covers_bats_stage_transition() -> None:
 
     config.model.experimental.bats_enabled = False
     config.posttraining.enabled = True
+    assert requires_ddp_unused_parameter_detection(config) is False
+
+    config.model.experimental.semantic_parity_enabled = True
+    assert requires_ddp_unused_parameter_detection(config) is True
+
+    config.posttraining.enabled = False
     assert requires_ddp_unused_parameter_detection(config) is False
 
 

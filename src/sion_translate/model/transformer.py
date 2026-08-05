@@ -12,9 +12,11 @@ from torch.utils.checkpoint import checkpoint
 from sion_translate.config import ModelConfig
 
 from .experimental import (
+    ActiveEvidenceRepair,
     BilingualAlignmentTransport,
     ContentRegisterState,
     MorphoScriptFusion,
+    SemanticParityHead,
     TypedEntityMemory,
 )
 from .layers import DecoderLayer, EncoderLayer, GQAAttention, RMSNorm, RotaryEmbedding, SwiGLU
@@ -91,7 +93,9 @@ class SionOutput:
     - lm_loss_sum / token_count: loss 의 분자/분모.
       trainer 가 gradient accumulation 시 '토큰 수 기준'으로 정확히
       정규화할 수 있도록 합계 형태로 따로 내보냅니다.
-    - auxiliary_loss: z-loss + 실험 기능(register/alignment 등) 보조 loss 합
+    - auxiliary_loss: z-loss + 실험 기능(register/alignment/evidence/parity) 보조 loss 합
+    - evidence_*: 불확실성 오차 위치와 원문 재참조 budget 진단
+    - semantic_parity_*: 원문/정답 표현의 의미 checksum 보조 목적과 cosine 점수
     """
 
     logits: torch.Tensor
@@ -102,6 +106,11 @@ class SionOutput:
     register_loss: torch.Tensor | None = None
     alignment_loss: torch.Tensor | None = None
     coverage_loss: torch.Tensor | None = None
+    uncertainty_loss: torch.Tensor | None = None
+    evidence_budget_loss: torch.Tensor | None = None
+    evidence_request_rate: torch.Tensor | None = None
+    semantic_parity_loss: torch.Tensor | None = None
+    semantic_parity_score: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -112,6 +121,7 @@ class GenerationContext:
     source_mask: torch.Tensor
     register_context: torch.Tensor | None
     cross_key_values: tuple[tuple[torch.Tensor, torch.Tensor], ...]
+    evidence_key_value: tuple[torch.Tensor, torch.Tensor] | None = None
     memory_token_ids: torch.Tensor | None = None
     memory_mask: torch.Tensor | None = None
     memory_type_ids: torch.Tensor | None = None
@@ -220,6 +230,28 @@ class SionForConditionalGeneration(nn.Module):
         )
         self.alignment_head = (
             BilingualAlignmentTransport(config.d_model, exp.bats_dim) if exp.bats_enabled else None
+        )
+        self.evidence_repair = (
+            ActiveEvidenceRepair(
+                config.d_model,
+                config.num_heads,
+                config.num_kv_heads,
+                dropout=config.dropout,
+                qk_norm=config.qk_norm,
+                norm_eps=config.rms_norm_eps,
+            )
+            if exp.evidence_repair_enabled
+            else None
+        )
+        self.semantic_parity = (
+            SemanticParityHead(
+                config.d_model,
+                exp.semantic_parity_dim,
+                exp.semantic_parity_temperature,
+                norm_eps=config.rms_norm_eps,
+            )
+            if exp.semantic_parity_enabled
+            else None
         )
         self.init_weights()
 
@@ -356,6 +388,23 @@ class SionForConditionalGeneration(nn.Module):
             self.pad_id,
         )
 
+    def _apply_evidence_repair(
+        self,
+        decoder_states: torch.Tensor,
+        encoder_states: torch.Tensor,
+        source_mask: torch.Tensor,
+        *,
+        evidence_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        if self.evidence_repair is None:
+            return decoder_states, None, None
+        return self.evidence_repair(
+            decoder_states,
+            encoder_states,
+            source_mask,
+            evidence_key_value=evidence_key_value,
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -405,10 +454,16 @@ class SionForConditionalGeneration(nn.Module):
             memory_type_ids=memory_type_ids,
             memory_mode_ids=memory_mode_ids,
         )
+        decoder_states, uncertainty_logits, evidence_requests = self._apply_evidence_repair(
+            decoder_states,
+            encoder_states,
+            attention_mask,
+        )
         logits = self._logits(decoder_states)
 
         if labels is None:
-            return SionOutput(logits=logits)
+            request_rate = evidence_requests.mean() if evidence_requests is not None else None
+            return SionOutput(logits=logits, evidence_request_rate=request_rate)
         # label 이 -100 인 위치(패딩)는 loss 계산에서 제외합니다.
         token_count = labels.ne(-100).sum()
         lm_loss_sum = F.cross_entropy(
@@ -445,6 +500,11 @@ class SionForConditionalGeneration(nn.Module):
 
         alignment_loss = logits.new_zeros(())
         coverage_loss = logits.new_zeros(())
+        uncertainty_loss = logits.new_zeros(())
+        evidence_budget_loss = logits.new_zeros(())
+        evidence_request_rate = logits.new_zeros(())
+        semantic_parity_loss = logits.new_zeros(())
+        semantic_parity_score = logits.new_zeros(())
         exp = self.config.experimental
         if self.alignment_head is not None and (
             alignment_targets is not None
@@ -464,6 +524,42 @@ class SionForConditionalGeneration(nn.Module):
             auxiliary_loss = auxiliary_loss + exp.bats_loss_weight * alignment_loss
             auxiliary_loss = auxiliary_loss + exp.bats_coverage_weight * coverage_loss
 
+        target_mask = labels.ne(-100)
+        if uncertainty_logits is not None and evidence_requests is not None:
+            # Error targets are detached: this branch learns to locate tokens
+            # that remain wrong after repair without backpropagating through an
+            # argmax decision. The repair proposal itself is trained by LM loss.
+            error_targets = logits.detach().argmax(-1).ne(labels).to(logits.dtype)
+            valid = target_mask.to(logits.dtype)
+            uncertainty_values = F.binary_cross_entropy_with_logits(
+                uncertainty_logits.float(),
+                error_targets.float(),
+                reduction="none",
+            )
+            uncertainty_loss = (uncertainty_values * valid).sum() / valid.sum().clamp_min(1.0)
+            evidence_request_rate = (evidence_requests * valid).sum() / valid.sum().clamp_min(1.0)
+            has_target = target_mask.any().to(logits.dtype)
+            evidence_budget_loss = (
+                evidence_request_rate - exp.evidence_budget_target
+            ).square() * has_target
+            auxiliary_loss = auxiliary_loss + (
+                exp.evidence_uncertainty_loss_weight * uncertainty_loss
+            )
+            auxiliary_loss = auxiliary_loss + (
+                exp.evidence_budget_loss_weight * evidence_budget_loss
+            )
+
+        if self.semantic_parity is not None:
+            semantic_parity_loss, semantic_parity_score = self.semantic_parity(
+                encoder_states,
+                decoder_states,
+                attention_mask,
+                target_mask,
+            )
+            auxiliary_loss = auxiliary_loss + (
+                exp.semantic_parity_loss_weight * semantic_parity_loss
+            )
+
         mean_lm_loss = lm_loss_sum / token_count.clamp_min(1)
         return SionOutput(
             logits=logits,
@@ -474,6 +570,11 @@ class SionForConditionalGeneration(nn.Module):
             register_loss=register_loss,
             alignment_loss=alignment_loss,
             coverage_loss=coverage_loss,
+            uncertainty_loss=uncertainty_loss,
+            evidence_budget_loss=evidence_budget_loss,
+            evidence_request_rate=evidence_request_rate,
+            semantic_parity_loss=semantic_parity_loss,
+            semantic_parity_score=semantic_parity_score,
         )
 
     def _decoder_step(
@@ -485,6 +586,7 @@ class SionForConditionalGeneration(nn.Module):
         position: int,
         register_context: torch.Tensor | None,
         *,
+        evidence_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
         memory_token_ids: torch.Tensor | None = None,
         memory_mask: torch.Tensor | None = None,
         memory_type_ids: torch.Tensor | None = None,
@@ -508,13 +610,20 @@ class SionForConditionalGeneration(nn.Module):
                 position_offset=position,
             )
         hidden = self.decoder_norm(hidden)
-        return self._apply_typed_memory(
+        hidden = self._apply_typed_memory(
             hidden,
             memory_token_ids=memory_token_ids,
             memory_mask=memory_mask,
             memory_type_ids=memory_type_ids,
             memory_mode_ids=memory_mode_ids,
         )
+        hidden, _, _ = self._apply_evidence_repair(
+            hidden,
+            encoder_states,
+            source_mask,
+            evidence_key_value=evidence_key_value,
+        )
+        return hidden
 
     @staticmethod
     def _fresh_caches(
@@ -566,11 +675,17 @@ class SionForConditionalGeneration(nn.Module):
             cross_key_values = tuple(
                 layer.project_cross_key_value(encoder_states) for layer in self.decoder_layers
             )
+            evidence_key_value = (
+                self.evidence_repair.project_key_value(encoder_states)
+                if self.evidence_repair is not None
+                else None
+            )
             return GenerationContext(
                 encoder_states=encoder_states,
                 source_mask=attention_mask,
                 register_context=register_context,
                 cross_key_values=cross_key_values,
+                evidence_key_value=evidence_key_value,
                 memory_token_ids=memory_token_ids,
                 memory_mask=memory_mask,
                 memory_type_ids=memory_type_ids,
@@ -716,6 +831,7 @@ class SionForConditionalGeneration(nn.Module):
                     eos_id=eos_id,
                     max_new_tokens=max_new_tokens,
                     cross_key_values=generation_context.cross_key_values,
+                    evidence_key_value=generation_context.evidence_key_value,
                     forbidden_token_ids=forbidden_token_ids,
                     min_new_tokens=min_new_tokens,
                     no_repeat_ngram_size=no_repeat_ngram_size,
@@ -735,6 +851,7 @@ class SionForConditionalGeneration(nn.Module):
                 num_beams=num_beams,
                 length_penalty=length_penalty,
                 cross_key_values=generation_context.cross_key_values,
+                evidence_key_value=generation_context.evidence_key_value,
                 forbidden_token_ids=forbidden_token_ids,
                 min_new_tokens=min_new_tokens,
                 no_repeat_ngram_size=no_repeat_ngram_size,
@@ -821,6 +938,7 @@ class SionForConditionalGeneration(nn.Module):
             encoder_states = generation_context.encoder_states
             source_mask = generation_context.source_mask
             register_context = generation_context.register_context
+            evidence_key_value = generation_context.evidence_key_value
             memory_token_ids = generation_context.memory_token_ids
             memory_mask = generation_context.memory_mask
             memory_type_ids = generation_context.memory_type_ids
@@ -829,6 +947,10 @@ class SionForConditionalGeneration(nn.Module):
             source_mask = source_mask.repeat_interleave(num_samples, dim=0)
             if register_context is not None:
                 register_context = register_context.repeat_interleave(num_samples, dim=0)
+            if evidence_key_value is not None:
+                evidence_key_value = tuple(
+                    value.repeat_interleave(num_samples, dim=0) for value in evidence_key_value
+                )
             if memory_token_ids is not None:
                 memory_token_ids = memory_token_ids.repeat_interleave(num_samples, dim=0)
             if memory_mask is not None:
@@ -860,6 +982,7 @@ class SionForConditionalGeneration(nn.Module):
                     caches,
                     position,
                     register_context,
+                    evidence_key_value=evidence_key_value,
                     memory_token_ids=memory_token_ids,
                     memory_mask=memory_mask,
                     memory_type_ids=memory_type_ids,
@@ -914,6 +1037,7 @@ class SionForConditionalGeneration(nn.Module):
         eos_id: int,
         max_new_tokens: int,
         cross_key_values: tuple[tuple[torch.Tensor, torch.Tensor], ...] | None = None,
+        evidence_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
         forbidden_token_ids: tuple[int, ...] = (),
         min_new_tokens: int = 0,
         no_repeat_ngram_size: int = 0,
@@ -940,6 +1064,7 @@ class SionForConditionalGeneration(nn.Module):
                 caches,
                 position,
                 register_context,
+                evidence_key_value=evidence_key_value,
                 memory_token_ids=memory_token_ids,
                 memory_mask=memory_mask,
                 memory_type_ids=memory_type_ids,
@@ -987,6 +1112,7 @@ class SionForConditionalGeneration(nn.Module):
         num_beams: int,
         length_penalty: float,
         cross_key_values: tuple[tuple[torch.Tensor, torch.Tensor], ...] | None = None,
+        evidence_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
         forbidden_token_ids: tuple[int, ...] = (),
         min_new_tokens: int = 0,
         no_repeat_ngram_size: int = 0,
@@ -1012,6 +1138,10 @@ class SionForConditionalGeneration(nn.Module):
         source_mask = source_mask.repeat_interleave(num_beams, dim=0)
         if register_context is not None:
             register_context = register_context.repeat_interleave(num_beams, dim=0)
+        if evidence_key_value is not None:
+            evidence_key_value = tuple(
+                value.repeat_interleave(num_beams, dim=0) for value in evidence_key_value
+            )
         if memory_token_ids is not None:
             memory_token_ids = memory_token_ids.repeat_interleave(num_beams, dim=0)
         if memory_mask is not None:
@@ -1056,6 +1186,7 @@ class SionForConditionalGeneration(nn.Module):
                 caches,
                 position,
                 register_context,
+                evidence_key_value=evidence_key_value,
                 memory_token_ids=memory_token_ids,
                 memory_mask=memory_mask,
                 memory_type_ids=memory_type_ids,
