@@ -41,7 +41,7 @@ data:
   max_source_upsampling: 3.0
 
 training:
-  output_dir: runs/sion-data-fit
+  output_dir: runs/sion-v6-data-fit
   seed: 20260711
   # H100 80GB: use the headroom observed with batch 16. On 8 GPUs this remains
   # an effective batch of 256 sequences/update without an extra accumulation pass.

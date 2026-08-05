@@ -38,7 +38,7 @@ data:
   max_source_upsampling: 3.0
 
 training:
-  output_dir: runs/sion-1.3b
+  output_dir: runs/sion-v6-1.3b
   max_steps: 40000
   batch_size_per_gpu: 16
   gradient_accumulation_steps: 1

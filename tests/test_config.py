@@ -11,6 +11,7 @@ from sion_translate.config import (
     AppConfig,
     DataConfig,
     ExperimentalConfig,
+    TrainingConfig,
     config_from_raw,
     load_config,
 )
@@ -28,15 +29,18 @@ def test_default_data_paths_use_the_current_compatible_artifact_layout() -> None
     assert config.tokenizer_model == "artifacts/sion-v6/tokenizer/sion.model"
     assert config.tokenizer_features == "artifacts/sion-v6/tokenizer/token_features.npz"
     assert config.dataset_dir == "artifacts/sion-v6/dataset"
+    assert TrainingConfig().output_dir == "runs/sion-v6"
 
 
 def test_shipped_configs_never_point_at_the_legacy_artifact_layout() -> None:
     config_root = Path(__file__).resolve().parents[1] / "configs"
     for config_path in sorted(config_root.glob("*.yaml")):
-        data = load_config(config_path).data
+        config = load_config(config_path)
+        data = config.data
         assert data.tokenizer_model.startswith("artifacts/sion-v6/"), config_path
         assert data.tokenizer_features.startswith("artifacts/sion-v6/"), config_path
         assert data.dataset_dir.startswith("artifacts/sion-v6/"), config_path
+        assert config.training.output_dir.startswith("runs/sion-v6"), config_path
 
 
 def test_warns_when_bats_is_enabled_without_any_loss_weight() -> None:

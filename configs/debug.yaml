@@ -38,7 +38,7 @@ data:
   bucket_size: 128
 
 training:
-  output_dir: runs/debug
+  output_dir: runs/sion-v6-debug
   max_steps: 4
   batch_size_per_gpu: 2
   gradient_accumulation_steps: 1

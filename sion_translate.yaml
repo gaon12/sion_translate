@@ -138,7 +138,7 @@ data:
 #   num_workers: 8           # 기본은 실제 할당 CPU/GPU 수에 맞춰 자동 결정
 
 training:
-  output_dir: runs/auto      # 체크포인트/로그 저장 위치
+  output_dir: runs/sion-v6   # 구형 vocab/checkpoint와 격리된 저장 위치
 #   learning_rate: 0.0003
 #   batch_size_per_gpu: 16   # OOM 이 나면 이 값을 낮추세요
 #   max_steps: 120000
@@ -152,7 +152,7 @@ training:
 #   final_export_formats: [fp32, fp16, bf16, int8, int4, gguf_q4_k_m, transformers]
 
 # SFT 뒤 복합 보상 MRT + 다중 후보 선호학습을 자동 실행합니다.
-# 두 단계 모델은 runs/auto/pretrain 과 runs/auto/posttrain 에 각각 저장됩니다.
+# 두 단계 모델은 runs/sion-v6/pretrain 과 runs/sion-v6/posttrain 에 각각 저장됩니다.
 posttraining:
   enabled: true
   method: mrt

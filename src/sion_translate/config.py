@@ -9,6 +9,7 @@ import yaml
 
 from sion_translate.artifacts import (
     DEFAULT_DATASET_DIRECTORY,
+    DEFAULT_RUN_DIRECTORY,
     DEFAULT_TOKENIZER_FEATURES,
     DEFAULT_TOKENIZER_MODEL,
 )
@@ -294,7 +295,7 @@ class DataConfig:
 class TrainingConfig:
     # 학습 산출물(체크포인트/로그/exports) 위치. sion-translate 와 sion-augment 도
     # 같은 기본값을 보고 모델을 자동으로 찾으므로 함께 움직입니다.
-    output_dir: str = "runs/auto"
+    output_dir: str = DEFAULT_RUN_DIRECTORY
     seed: int = 20260710
     max_steps: int = 1000
     batch_size_per_gpu: int = 8
