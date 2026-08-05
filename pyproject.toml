@@ -41,6 +41,7 @@ Model = "https://huggingface.co/gaon12/sion_translate"
 
 [project.scripts]
 sion-audit-data = "sion_translate.cli.audit_data:main"
+sion-audit-tokens = "sion_translate.cli.audit_tokens:main"
 sion-train-tokenizer = "sion_translate.cli.train_tokenizer:main"
 sion-prepare-data = "sion_translate.cli.prepare_data:main"
 sion-train = "sion_translate.cli.train:main"
