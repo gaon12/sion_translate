@@ -31,9 +31,9 @@ model:
     script_classes: 9
 
 data:
-  tokenizer_model: artifacts/tokenizer/sion.model
-  tokenizer_features: artifacts/tokenizer/token_features.npz
-  dataset_dir: artifacts/dataset
+  tokenizer_model: artifacts/sion-v6/tokenizer/sion.model
+  tokenizer_features: artifacts/sion-v6/tokenizer/token_features.npz
+  dataset_dir: artifacts/sion-v6/dataset
   max_source_length: 512
   max_target_length: 512
   denoise_probability: 0.10

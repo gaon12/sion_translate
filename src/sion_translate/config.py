@@ -7,6 +7,11 @@ from typing import Any
 
 import yaml
 
+from sion_translate.artifacts import (
+    DEFAULT_DATASET_DIRECTORY,
+    DEFAULT_TOKENIZER_FEATURES,
+    DEFAULT_TOKENIZER_MODEL,
+)
 from sion_translate.synthetic import (
     DEFAULT_SYNTHETIC_PREFIXES,
     DEFAULT_SYNTHETIC_SAMPLING_WEIGHT,
@@ -237,9 +242,9 @@ class DataConfig:
     # 글로서리(용어집) JSON 경로. 지정하면 sion-translate/evaluate 가 이 파일을
     # 기본으로 불러와 지정한 용어를 정해진 대응어로 강제합니다. 빈 문자열이면 끔.
     glossary: str = ""
-    tokenizer_model: str = "artifacts/tokenizer/sion.model"
-    tokenizer_features: str = "artifacts/tokenizer/token_features.npz"
-    dataset_dir: str = "artifacts/dataset"
+    tokenizer_model: str = DEFAULT_TOKENIZER_MODEL
+    tokenizer_features: str = DEFAULT_TOKENIZER_FEATURES
+    dataset_dir: str = DEFAULT_DATASET_DIRECTORY
     train_split: str = "train"
     validation_split: str = "validation"
     bidirectional: bool = True

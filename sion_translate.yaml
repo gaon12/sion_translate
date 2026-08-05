@@ -57,6 +57,15 @@ model:
     # 이번 run 에서 검증할 모듈을 CoRe 하나로 좁힙니다.
     tetm_enabled: false
 
+    # 첨부 설계를 검증하기 위한 1차 ablation 구현입니다. evidence_repair 는
+    # decoder 뒤에서 encoder를 한 번 더 읽고, 수정 전 오류·수정 이득·요청 상한으로
+    # gate를 학습합니다. 아직 입력 일부만 재인코딩하거나 출력 구간을 반복 수정하는
+    # 완전한 폐루프는 아니므로 기본 run에서는 끕니다.
+    evidence_repair_enabled: false
+    # 원문 pooled state와 teacher-forced decoder state를 맞추는 학습용 대조 목적입니다.
+    # 생성 결과를 독립적으로 다시 인코딩하는 checksum은 아니므로 별도 A/B 후 켭니다.
+    semantic_parity_enabled: false
+
 # 실험 모듈은 한 번에 하나씩만 켜서 baseline 과 비교하십시오. 여러 개를 동시에
 # 켜면 좋아지거나 나빠졌을 때 무엇 때문인지 알 수 없습니다. 위 조합은
 # 이번 재학습에서 CoRe 하나를 검증 대상으로 삼은 것입니다.
@@ -74,6 +83,11 @@ model:
 
 data:
   raw_dir: data              # 원천 JSONL 폴더 (여기에 파일을 추가하면 자동 인식)
+  # v6 아래 세 산출물은 하나의 호환 단위입니다. 과거 artifacts/tokenizer 와
+  # artifacts/dataset 은 숫자 분리·언어 태그·index schema가 달라 재사용하지 않습니다.
+  tokenizer_model: artifacts/sion-v6/tokenizer/sion.model
+  tokenizer_features: artifacts/sion-v6/tokenizer/token_features.npz
+  dataset_dir: artifacts/sion-v6/dataset
   approximate_split: true    # 문자 5-gram MinHash로 근사 중복의 split 누수 방지
 
   # JSONL 키 이름이 곧 언어 이름입니다. 여기를 바꾸면 토크나이저의 <2xx>/

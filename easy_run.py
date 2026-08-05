@@ -20,9 +20,10 @@ from pathlib import Path
 
 import yaml
 
+from sion_translate.artifacts import ARTIFACT_LAYOUT_VERSION
+
 
 ROOT = Path(__file__).resolve().parent
-ARTIFACT_LAYOUT_VERSION = "sion-v6"
 PERSISTENT_ARTIFACTS = ROOT / "artifacts" / ARTIFACT_LAYOUT_VERSION
 EXPRESSIVE_CORPUS_NAME = "synthetic_expressive_cultural.jsonl"
 MIN_RAM_HEADROOM = 8 * 2**30

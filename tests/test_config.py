@@ -23,6 +23,22 @@ def _warnings_from(config: ExperimentalConfig) -> list[str]:
     return [str(entry.message) for entry in caught]
 
 
+def test_default_data_paths_use_the_current_compatible_artifact_layout() -> None:
+    config = DataConfig()
+    assert config.tokenizer_model == "artifacts/sion-v6/tokenizer/sion.model"
+    assert config.tokenizer_features == "artifacts/sion-v6/tokenizer/token_features.npz"
+    assert config.dataset_dir == "artifacts/sion-v6/dataset"
+
+
+def test_shipped_configs_never_point_at_the_legacy_artifact_layout() -> None:
+    config_root = Path(__file__).resolve().parents[1] / "configs"
+    for config_path in sorted(config_root.glob("*.yaml")):
+        data = load_config(config_path).data
+        assert data.tokenizer_model.startswith("artifacts/sion-v6/"), config_path
+        assert data.tokenizer_features.startswith("artifacts/sion-v6/"), config_path
+        assert data.dataset_dir.startswith("artifacts/sion-v6/"), config_path
+
+
 def test_warns_when_bats_is_enabled_without_any_loss_weight() -> None:
     # 순전파 비용과 파라미터만 늘고 학습 신호는 없는 조합이다.
     messages = _warnings_from(
@@ -105,6 +121,8 @@ def test_root_config_gives_every_enabled_module_a_training_signal() -> None:
         assert experimental.bats_coverage_weight > 0 or experimental.bats_loss_weight > 0
     if experimental.core_enabled:
         assert experimental.register_loss_weight > 0
+    if experimental.semantic_parity_enabled:
+        assert experimental.semantic_parity_loss_weight > 0
 
 
 def test_root_config_keeps_the_experimental_surface_small() -> None:
@@ -126,6 +144,8 @@ def test_root_config_keeps_the_experimental_surface_small() -> None:
             ("core", experimental.core_enabled),
             ("tetm", experimental.tetm_enabled),
             ("morphoscript", experimental.morphoscript_enabled),
+            ("evidence_repair", experimental.evidence_repair_enabled),
+            ("semantic_parity", experimental.semantic_parity_enabled),
         )
         if active
     ]
