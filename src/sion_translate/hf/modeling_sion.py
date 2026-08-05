@@ -159,6 +159,8 @@ class SionForConditionalGeneration(PreTrainedModel, GenerationMixin):
         num_return_sequences: int,
         length_penalty: float,
         native_inputs: dict[str, torch.Tensor],
+        forbidden_token_ids: tuple[int, ...] = (),
+        no_repeat_ngram_size: int = 0,
     ) -> torch.Tensor:
         """Return multiple ranked hypotheses using the native cached decoder."""
 
@@ -229,7 +231,16 @@ class SionForConditionalGeneration(PreTrainedModel, GenerationMixin):
                     register_context,
                     **memory,
                 )
-                log_probs = torch.log_softmax(model._logits(hidden[:, -1]).float(), dim=-1)
+                logits = model._apply_decode_constraints(
+                    model._logits(hidden[:, -1]).float(),
+                    sequences,
+                    eos_id=eos_id,
+                    position=position,
+                    min_new_tokens=0,
+                    forbidden_token_ids=forbidden_token_ids,
+                    no_repeat_ngram_size=no_repeat_ngram_size,
+                )
+                log_probs = torch.log_softmax(logits, dim=-1)
                 vocab = log_probs.shape[-1]
                 candidates = (beam_scores.view(-1, 1) + log_probs).view(
                     batch,
@@ -353,6 +364,8 @@ class SionForConditionalGeneration(PreTrainedModel, GenerationMixin):
         do_sample: bool | None = None,
         temperature: float | None = None,
         top_k: int | None = None,
+        no_repeat_ngram_size: int | None = None,
+        suppress_tokens: list[int] | tuple[int, ...] | None = None,
         num_return_sequences: int | None = None,
         return_dict_in_generate: bool | None = None,
         output_scores: bool | None = None,
@@ -361,6 +374,15 @@ class SionForConditionalGeneration(PreTrainedModel, GenerationMixin):
         synced_gpus: bool | None = None,
         **kwargs: Any,
     ) -> torch.Tensor | GenerateEncoderDecoderOutput:
+        """Generate with the native cached decoder and HF-compatible options.
+
+        The exported ``generation_config.json`` supplies the validated global
+        translation defaults. Sion's native ``Translator`` additionally offers
+        a per-row source/output length ratio and degeneration retries; those
+        policies have no standard Transformers ``GenerationConfig`` equivalent
+        and intentionally remain native-runtime features.
+        """
+
         inputs = kwargs.pop("inputs", None)
         if inputs is not None:
             if input_ids is not None:
@@ -382,7 +404,6 @@ class SionForConditionalGeneration(PreTrainedModel, GenerationMixin):
                 ("eta_cutoff", 0.0),
                 ("repetition_penalty", 1.0),
                 ("encoder_repetition_penalty", 1.0),
-                ("no_repeat_ngram_size", 0),
                 ("diversity_penalty", 0.0),
                 ("num_beam_groups", 1),
                 ("min_length", 0),
@@ -408,7 +429,6 @@ class SionForConditionalGeneration(PreTrainedModel, GenerationMixin):
             "forced_bos_token_id",
             "forced_eos_token_id",
             "exponential_decay_length_penalty",
-            "suppress_tokens",
             "begin_suppress_tokens",
             "sequence_bias",
             "guidance_scale",
@@ -433,11 +453,36 @@ class SionForConditionalGeneration(PreTrainedModel, GenerationMixin):
             configured_value = getattr(active_generation_config, name, None)
             return fallback if configured_value is None else configured_value
 
+        explicit_num_beams = num_beams is not None
+        explicit_do_sample = do_sample is not None
         num_beams = int(configured(num_beams, "num_beams", 1))
         length_penalty = float(configured(length_penalty, "length_penalty", 1.0))
         do_sample = bool(configured(do_sample, "do_sample", False))
+        if do_sample and explicit_do_sample and not explicit_num_beams:
+            # The validated translation default is beam 4. An explicit request
+            # for sampling selects the native sampling path, which does not
+            # implement beam sampling, unless the caller also chose a beam count.
+            num_beams = 1
         temperature = float(configured(temperature, "temperature", 1.0))
         top_k = int(configured(top_k, "top_k", 0))
+        no_repeat_ngram_size = int(configured(no_repeat_ngram_size, "no_repeat_ngram_size", 0))
+        raw_suppress_tokens = configured(suppress_tokens, "suppress_tokens", ())
+        if isinstance(raw_suppress_tokens, (str, bytes)) or not isinstance(
+            raw_suppress_tokens,
+            (list, tuple),
+        ):
+            raise TypeError("suppress_tokens must be a list or tuple of token IDs")
+        if any(
+            isinstance(token_id, bool) or not isinstance(token_id, int)
+            for token_id in raw_suppress_tokens
+        ):
+            raise TypeError("suppress_tokens must contain only integer token IDs")
+        forbidden_token_ids = tuple(dict.fromkeys(raw_suppress_tokens))
+        if any(
+            token_id < 0 or token_id >= int(self.config.vocab_size)
+            for token_id in forbidden_token_ids
+        ):
+            raise ValueError("suppress_tokens contains an ID outside the model vocabulary")
         num_return_sequences = int(configured(num_return_sequences, "num_return_sequences", 1))
         return_dict_in_generate = bool(
             configured(return_dict_in_generate, "return_dict_in_generate", False)
@@ -464,7 +509,6 @@ class SionForConditionalGeneration(PreTrainedModel, GenerationMixin):
                 "penalty_alpha",
                 "repetition_penalty",
                 "encoder_repetition_penalty",
-                "no_repeat_ngram_size",
                 "bad_words_ids",
                 "force_words_ids",
                 "constraints",
@@ -544,6 +588,8 @@ class SionForConditionalGeneration(PreTrainedModel, GenerationMixin):
             raise ValueError("temperature must be positive")
         if top_k < 0:
             raise ValueError("top_k must be non-negative")
+        if no_repeat_ngram_size < 0:
+            raise ValueError("no_repeat_ngram_size must be non-negative")
         if do_sample and num_beams != 1:
             raise NotImplementedError("Sion does not implement beam sampling; set num_beams=1")
         if not do_sample and num_return_sequences > num_beams:
@@ -590,6 +636,8 @@ class SionForConditionalGeneration(PreTrainedModel, GenerationMixin):
                 temperature=temperature,
                 top_k=top_k,
                 generator=generator,
+                forbidden_token_ids=forbidden_token_ids,
+                no_repeat_ngram_size=no_repeat_ngram_size,
                 **native_inputs,
             )
             sequences = sampled.reshape(-1, sampled.shape[-1])
@@ -601,6 +649,8 @@ class SionForConditionalGeneration(PreTrainedModel, GenerationMixin):
                 num_beams=num_beams,
                 num_return_sequences=num_return_sequences,
                 length_penalty=length_penalty,
+                forbidden_token_ids=forbidden_token_ids,
+                no_repeat_ngram_size=no_repeat_ngram_size,
                 native_inputs=native_inputs,
             )
         else:
@@ -612,6 +662,8 @@ class SionForConditionalGeneration(PreTrainedModel, GenerationMixin):
                 max_new_tokens=max_new_tokens,
                 num_beams=num_beams,
                 length_penalty=length_penalty,
+                forbidden_token_ids=forbidden_token_ids,
+                no_repeat_ngram_size=no_repeat_ngram_size,
                 **native_inputs,
             )
         sequences = sequences[:, : max_new_tokens + 1]

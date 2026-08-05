@@ -260,6 +260,53 @@ def test_transformers_checkpoint_auto_classes_and_safe_weights(
     assert local_config.revision_trained is True
     export_metadata = json.loads((output_dir / "sion_export.json").read_text(encoding="utf-8"))
     assert export_metadata["capabilities"]["revision_trained"] is True
+
+    for text in (
+        "  앞뒤 공백  ",
+        "\u1100\u1161",  # decomposed Hangul: NFC must match the native tokenizer
+        "\r\n줄바꿈과 탭\t",
+        "한국어 <slot_0> 번역",
+    ):
+        assert local_tokenizer(text, add_special_tokens=False).input_ids == tokenizer.encode(text)
+
+    for source_language, target_language, source_text in (
+        ("ko", "ja", "양방향 한국어 입력"),
+        ("ja", "ko", "双方向の日本語入力"),
+    ):
+        directional = local_tokenizer._build_translation_inputs(
+            source_text,
+            return_tensors="pt",
+            src_lang=source_language,
+            tgt_lang=target_language,
+        )
+        assert directional.input_ids[0].tolist() == [
+            local_tokenizer.language_tags[target_language],
+            *tokenizer.encode(source_text),
+            tokenizer.eos_id,
+        ]
+        shifted = local_model.prepare_decoder_input_ids_from_labels(
+            torch.tensor([[17, tokenizer.eos_id]])
+        )
+        assert shifted[0, 0].item() == tokenizer.bos_id
+
+    generation_config = local_model.generation_config
+    assert generation_config.num_beams == 4
+    assert generation_config.length_penalty == 1.0
+    assert generation_config.max_new_tokens == min(256, native_config.max_seq_len)
+    assert generation_config.no_repeat_ngram_size == 4
+    suppressed = set(generation_config.suppress_tokens)
+    expected_control_ids = {
+        tokenizer.pad_id,
+        tokenizer.unk_id,
+        tokenizer.bos_id,
+        tokenizer.mask_id,
+        *tokenizer.language_tags.values(),
+        *tokenizer.denoise_tags.values(),
+    }
+    assert expected_control_ids <= suppressed
+    assert tokenizer.eos_id not in suppressed
+    assert tokenizer.slot_ids[0] not in suppressed
+
     local_tokenizer.src_lang = "ko"
     local_tokenizer.tgt_lang = "ja"
     encoded = local_tokenizer(
@@ -288,6 +335,9 @@ def test_transformers_checkpoint_auto_classes_and_safe_weights(
     monkeypatch.setattr(local_model.model, "generate", capture_generate)
     generated = local_model.generate(**encoded, max_new_tokens=2)
     assert generated.shape == (1, 3)
+    assert captured_generate["num_beams"] == 4
+    assert captured_generate["no_repeat_ngram_size"] == 4
+    assert set(captured_generate["forbidden_token_ids"]) == suppressed
     assert {
         "src_script_ids",
         "src_onset_ids",
@@ -298,6 +348,18 @@ def test_transformers_checkpoint_auto_classes_and_safe_weights(
         "memory_type_ids",
         "memory_mode_ids",
     } <= captured_generate.keys()
+    captured_generate.clear()
+    explicitly_overridden = local_model.generate(
+        **encoded,
+        max_new_tokens=2,
+        num_beams=1,
+        no_repeat_ngram_size=0,
+        suppress_tokens=[],
+    )
+    assert explicitly_overridden.shape == (1, 3)
+    assert captured_generate["num_beams"] == 1
+    assert captured_generate["no_repeat_ngram_size"] == 0
+    assert captured_generate["forbidden_token_ids"] == ()
     trainer_style = local_model.generate(
         **encoded,
         labels=torch.tensor([[11, 3]]),

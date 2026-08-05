@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 import shutil
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -199,6 +200,10 @@ class SionTokenizer(PreTrainedTokenizer):
         kwargs.setdefault("bos_token", "<s>")
         kwargs.setdefault("eos_token", "</s>")
         kwargs.setdefault("additional_special_tokens", additional)
+        # Every Sion control symbol is a SentencePiece user-defined symbol.
+        # Let SentencePiece see the complete normalized string so whitespace
+        # boundaries around slots/control tags match the native tokenizer.
+        kwargs.setdefault("split_special_tokens", True)
         kwargs.setdefault(
             "token_features_file",
             feature_path.name if feature_path is not None else None,
@@ -403,6 +408,23 @@ class SionTokenizer(PreTrainedTokenizer):
         }
         vocab.update(self.added_tokens_encoder)
         return vocab
+
+    def prepare_for_tokenization(
+        self,
+        text: str,
+        is_split_into_words: bool = False,
+        **kwargs: Any,
+    ) -> tuple[str, dict[str, Any]]:
+        """Apply the exact normalization used by the native tokenizer.
+
+        SentencePiece does not compose decomposed Hangul with this model's
+        normalizer.  The native runtime therefore NFC-normalizes and trims the
+        complete input before encoding.  Doing this here, before Transformers
+        splits added control tokens, keeps Hub and native input IDs identical.
+        """
+
+        del is_split_into_words
+        return unicodedata.normalize("NFC", text).strip(), kwargs
 
     def _tokenize(self, text: str, **kwargs: Any) -> list[str]:
         del kwargs

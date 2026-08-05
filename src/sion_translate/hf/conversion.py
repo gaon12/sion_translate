@@ -12,7 +12,11 @@ import numpy as np
 import torch
 
 from sion_translate.config import ModelConfig
-from sion_translate.tokenizer import SionTokenizer as NativeSionTokenizer
+from sion_translate.tokenizer import (
+    OPTIONAL_CONTROL_SYMBOLS,
+    SHARED_CONTROL_SYMBOLS,
+    SionTokenizer as NativeSionTokenizer,
+)
 
 from .configuration_sion import SionConfig
 from .modeling_sion import SionForConditionalGeneration
@@ -196,6 +200,32 @@ def _translation_directions(
     return directions
 
 
+def _generation_suppress_tokens(
+    tokenizer: NativeSionTokenizer | None,
+    *,
+    pad_id: int,
+    bos_id: int,
+    eos_id: int,
+) -> list[int]:
+    """Return source-only control IDs that must not enter decoder output."""
+
+    suppressed = {int(pad_id), int(bos_id)}
+    if tokenizer is not None:
+        suppressed.add(int(tokenizer.unk_id))
+        suppressed.update(map(int, tokenizer.language_tags.values()))
+        suppressed.update(map(int, tokenizer.denoise_tags.values()))
+        for symbol in (*SHARED_CONTROL_SYMBOLS, *OPTIONAL_CONTROL_SYMBOLS):
+            token_id = tokenizer.piece_id(symbol)
+            if token_id >= 0 and tokenizer.processor.id_to_piece(token_id) == symbol:
+                suppressed.add(token_id)
+    # EOS remains the normal completion path, and protected slot tokens must
+    # remain generatable so structured values and glossary entries can survive.
+    suppressed.discard(int(eos_id))
+    if tokenizer is not None:
+        suppressed.difference_update(map(int, tokenizer.slot_ids))
+    return sorted(suppressed)
+
+
 def save_transformers_checkpoint(
     output_dir: str | Path,
     state_dict: dict[str, torch.Tensor],
@@ -283,6 +313,16 @@ def save_transformers_checkpoint(
         model = SionForConditionalGeneration(config)
     model.model.load_state_dict(state_dict, strict=True, assign=True)
     model.eval()
+    model.generation_config.num_beams = 4
+    model.generation_config.length_penalty = 1.0
+    model.generation_config.max_new_tokens = min(256, model_config.max_seq_len)
+    model.generation_config.no_repeat_ngram_size = 4
+    model.generation_config.suppress_tokens = _generation_suppress_tokens(
+        tokenizer,
+        pad_id=pad_id,
+        bos_id=bos_id,
+        eos_id=eos_id,
+    )
     model.save_pretrained(
         output_dir,
         safe_serialization=True,
