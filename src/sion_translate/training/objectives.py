@@ -178,9 +178,15 @@ class CompositeTranslationReward:
         weight_sum = sum(active_weights.values())
         reward = sum(active_weights[name] * components[name] for name in active_weights)
         reward /= weight_sum
-        if has_excessive_repetition(hypothesis):
+        # Repeated laughter, cries and prolonged vowels are legitimate when the
+        # reference contains the same expressive device. Penalize degeneration,
+        # not the very phenomenon the model is being taught to preserve.
+        if has_excessive_repetition(hypothesis) and not has_excessive_repetition(reference_text):
             reward -= self.config.reward_repetition_penalty
-        if canonical_text(source_text).casefold() == canonical_text(hypothesis).casefold():
+        source_key = canonical_text(source_text).casefold()
+        hypothesis_key = canonical_text(hypothesis).casefold()
+        reference_key = canonical_text(reference_text).casefold()
+        if source_key == hypothesis_key and source_key != reference_key:
             reward -= self.config.reward_copy_penalty
         if roundtrip_ids is not None and "roundtrip" in components:
             threshold = self.config.roundtrip_min_score

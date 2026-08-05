@@ -58,6 +58,32 @@ def test_composite_reward_applies_repetition_and_source_copy_penalties() -> None
         reward_repetition_penalty=0.4,
         reward_copy_penalty=0.4,
     )
+    source = torch.tensor([[4, 10, 11, 3]])
+    reference = torch.tensor([[20, 21, 3]])
+    candidates = torch.tensor([[[2, 23, 3, 3], [2, 10, 11, 3]]])
+
+    base_score = CompositeTranslationReward(TextTokenizer(), base)(
+        candidates, source, reference
+    ).reward[0]
+    penalized_score = CompositeTranslationReward(TextTokenizer(), penalized)(
+        candidates, source, reference
+    ).reward[0]
+
+    assert penalized_score[0] < base_score[0]
+    assert penalized_score[1] < base_score[1]
+
+
+def test_composite_reward_preserves_reference_backed_expressive_repetition_and_copy() -> None:
+    base = PostTrainingConfig(
+        reward_repetition_penalty=0.0,
+        reward_copy_penalty=0.0,
+    )
+    penalized = PostTrainingConfig(
+        reward_repetition_penalty=0.4,
+        reward_copy_penalty=0.4,
+    )
+    # Some laughter/cry forms and onomatopoeia are intentionally identical on
+    # both sides. A reference-backed match is not generation collapse or lazy copy.
     source = torch.tensor([[4, 23, 3]])
     reference = torch.tensor([[23, 3]])
     candidates = torch.tensor([[[2, 23, 3]]])
@@ -70,7 +96,7 @@ def test_composite_reward_applies_repetition_and_source_copy_penalties() -> None
     ).reward.item()
 
     assert base_score == 1.0
-    assert penalized_score < base_score - 0.7
+    assert penalized_score == base_score
 
 
 def test_roundtrip_reward_requires_recovering_the_source() -> None:
