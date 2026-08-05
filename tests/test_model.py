@@ -681,6 +681,41 @@ def test_tied_embedding_output() -> None:
     assert model.parameter_count() > 0
 
 
+def test_same_seed_core_ablation_preserves_the_shared_backbone_and_logits() -> None:
+    baseline_config = tiny_config()
+    baseline_config.experimental = ExperimentalConfig()
+    core_config = tiny_config()
+    core_config.experimental = ExperimentalConfig(core_enabled=True)
+
+    torch.manual_seed(20260805)
+    baseline = SionForConditionalGeneration(baseline_config)
+    torch.manual_seed(20260805)
+    core = SionForConditionalGeneration(core_config)
+
+    baseline_state = baseline.state_dict()
+    core_state = core.state_dict()
+    common_names = sorted(set(baseline_state) & set(core_state))
+    assert common_names
+    for name in common_names:
+        torch.testing.assert_close(baseline_state[name], core_state[name], rtol=0, atol=0)
+
+    batch = make_batch()
+    baseline.eval()
+    core.eval()
+    with torch.no_grad():
+        baseline_logits = baseline(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            decoder_input_ids=batch["decoder_input_ids"],
+        ).logits
+        core_logits = core(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            decoder_input_ids=batch["decoder_input_ids"],
+        ).logits
+    torch.testing.assert_close(baseline_logits, core_logits, rtol=0, atol=0)
+
+
 def test_bf16_autocast_keeps_encoder_decoder_residuals_in_bf16() -> None:
     config = tiny_config()
     model = SionForConditionalGeneration(config)
@@ -711,7 +746,8 @@ def test_bf16_autocast_keeps_encoder_decoder_residuals_in_bf16() -> None:
 
 def test_meta_materialization_rebuilds_rope_buffers() -> None:
     config = tiny_config()
-    config.experimental = ExperimentalConfig()
+    config.experimental.evidence_repair_enabled = True
+    config.experimental.semantic_parity_enabled = True
     reference = SionForConditionalGeneration(config)
 
     with torch.device("meta"):
@@ -722,6 +758,24 @@ def test_meta_materialization_rebuilds_rope_buffers() -> None:
     materialized.to_empty(device="cpu")
     materialized.init_weights()
 
+    assert all(torch.isfinite(parameter).all() for parameter in materialized.parameters())
+    torch.testing.assert_close(materialized.morph_gates, torch.zeros_like(materialized.morph_gates))
+    torch.testing.assert_close(
+        materialized.evidence_repair.repair_scale,
+        torch.zeros_like(materialized.evidence_repair.repair_scale),
+    )
+    torch.testing.assert_close(
+        materialized.register_state.inject_gate,
+        torch.zeros_like(materialized.register_state.inject_gate),
+    )
+    torch.testing.assert_close(
+        materialized.typed_memory.gate,
+        torch.zeros_like(materialized.typed_memory.gate),
+    )
+    torch.testing.assert_close(
+        materialized.alignment_head.null_source,
+        torch.zeros_like(materialized.alignment_head.null_source),
+    )
     assert not materialized.encoder_rope.cos.is_meta
     assert not materialized.decoder_rope.sin.is_meta
     torch.testing.assert_close(materialized.encoder_rope.cos, reference.encoder_rope.cos)
@@ -730,11 +784,7 @@ def test_meta_materialization_rebuilds_rope_buffers() -> None:
     torch.testing.assert_close(materialized.decoder_rope.sin, reference.decoder_rope.sin)
 
     batch = make_batch()
-    output = materialized(
-        input_ids=batch["input_ids"],
-        attention_mask=batch["attention_mask"],
-        decoder_input_ids=batch["decoder_input_ids"],
-    )
+    output = materialized(**batch)
     assert torch.isfinite(output.logits).all()
 
 

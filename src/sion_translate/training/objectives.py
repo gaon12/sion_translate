@@ -567,6 +567,9 @@ class MinimumRiskObjective:
         diagnostics = {
             name: value.detach()
             for name in (
+                "register_loss",
+                "alignment_loss",
+                "coverage_loss",
                 "uncertainty_loss",
                 "evidence_budget_loss",
                 "evidence_request_rate",

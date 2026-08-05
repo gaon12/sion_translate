@@ -366,25 +366,32 @@ def test_fsdp2_cpu_gloo_forward_generate_and_sample_smoke(tmp_path: Path) -> Non
         world_size=1,
     )
     try:
-        model = SionForConditionalGeneration(
-            ModelConfig(
-                vocab_size=32,
-                d_model=16,
-                encoder_layers=1,
-                decoder_layers=1,
-                num_heads=4,
-                num_kv_heads=2,
-                d_ff=32,
-                max_seq_len=16,
-                dropout=0.0,
-                label_smoothing=0.0,
-                z_loss_weight=0.0,
-                experimental=ExperimentalConfig(
-                    core_enabled=True,
-                    tetm_enabled=True,
-                ),
+        with torch.device("meta"):
+            model = SionForConditionalGeneration(
+                ModelConfig(
+                    vocab_size=32,
+                    d_model=16,
+                    encoder_layers=1,
+                    decoder_layers=1,
+                    num_heads=4,
+                    num_kv_heads=2,
+                    d_ff=32,
+                    max_seq_len=16,
+                    dropout=0.0,
+                    label_smoothing=0.0,
+                    z_loss_weight=0.0,
+                    experimental=ExperimentalConfig(
+                        bats_enabled=True,
+                        bats_coverage_weight=0.01,
+                        core_enabled=True,
+                        tetm_enabled=True,
+                        morphoscript_enabled=True,
+                        morphoscript_interval=1,
+                        evidence_repair_enabled=True,
+                        semantic_parity_enabled=True,
+                    ),
+                )
             )
-        )
         assert model.register_state is not None
         assert model.typed_memory is not None
         assert model.register_state.inject_gate.shape == (1,)
@@ -405,8 +412,14 @@ def test_fsdp2_cpu_gloo_forward_generate_and_sample_smoke(tmp_path: Path) -> Non
             precision="fp32",
             reduce_dtype="fp32",
             reshard_after_forward=True,
-            materialize_meta=False,
+            materialize_meta=True,
         )
+        assert all(torch.isfinite(parameter).all() for parameter in model.parameters())
+        assert torch.count_nonzero(model.morph_gates) == 0
+        assert torch.count_nonzero(model.evidence_repair.repair_scale) == 0
+        assert torch.count_nonzero(model.register_state.inject_gate) == 0
+        assert torch.count_nonzero(model.typed_memory.gate) == 0
+        assert torch.count_nonzero(model.alignment_head.null_source) == 0
 
         input_ids = torch.tensor([[4, 5, 3]])
         attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
@@ -418,6 +431,12 @@ def test_fsdp2_cpu_gloo_forward_generate_and_sample_smoke(tmp_path: Path) -> Non
             "memory_type_ids": torch.tensor([[1, 8]]),
             "memory_mode_ids": torch.tensor([[1, 4]]),
         }
+        morphoscript_inputs = {
+            "src_script_ids": torch.zeros_like(input_ids),
+            "src_onset_ids": torch.zeros_like(input_ids),
+            "src_vowel_ids": torch.zeros_like(input_ids),
+            "src_coda_ids": torch.zeros_like(input_ids),
+        }
 
         output = model(
             input_ids,
@@ -426,10 +445,15 @@ def test_fsdp2_cpu_gloo_forward_generate_and_sample_smoke(tmp_path: Path) -> Non
             labels,
             register_labels=torch.tensor([1]),
             **memory_inputs,
+            **morphoscript_inputs,
         )
         assert output.loss is not None
         assert torch.isfinite(output.loss)
         output.loss.backward()
+        assert all(
+            parameter.grad is None or torch.isfinite(parameter.grad).all()
+            for parameter in model.parameters()
+        )
         assert model.register_state.inject_gate.grad is not None
         assert model.typed_memory.gate.grad is not None
 
@@ -442,6 +466,7 @@ def test_fsdp2_cpu_gloo_forward_generate_and_sample_smoke(tmp_path: Path) -> Non
             num_beams=1,
             min_new_tokens=2,
             **memory_inputs,
+            **morphoscript_inputs,
         )
         sampled = model.sample(
             input_ids,
@@ -452,6 +477,7 @@ def test_fsdp2_cpu_gloo_forward_generate_and_sample_smoke(tmp_path: Path) -> Non
             max_new_tokens=3,
             min_new_tokens=2,
             **memory_inputs,
+            **morphoscript_inputs,
         )
         assert generated.shape == (1, 4)
         assert sampled.shape == (1, 2, 4)
@@ -618,6 +644,7 @@ def test_tokenizer_policy_requires_digit_splitting_and_matching_identity(
 
     class DigitTokenizer:
         splits_digits = True
+        languages = ("ko", "ja")
 
     metadata = {
         "version": 2,
@@ -645,3 +672,13 @@ def test_tokenizer_policy_requires_digit_splitting_and_matching_identity(
         lambda _: MergedDigitTokenizer(),
     )
     assert "split_digits=False" in str(tokenizer_policy_problem(model_path, pairs))
+
+    class WrongLanguageTokenizer:
+        splits_digits = True
+        languages = ("ko",)
+
+    monkeypatch.setattr(
+        "sion_translate.cli.train.SionTokenizer",
+        lambda _: WrongLanguageTokenizer(),
+    )
+    assert "언어 집합" in str(tokenizer_policy_problem(model_path, pairs))

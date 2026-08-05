@@ -866,6 +866,9 @@ def train(
                             objective_metrics = {
                                 name: value
                                 for name in (
+                                    "register_loss",
+                                    "alignment_loss",
+                                    "coverage_loss",
                                     "uncertainty_loss",
                                     "evidence_budget_loss",
                                     "evidence_request_rate",

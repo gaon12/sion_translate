@@ -201,6 +201,15 @@ class SionForConditionalGeneration(nn.Module):
             else nn.Linear(config.d_model, config.vocab_size, bias=False)
         )
 
+        # Optional heads are constructed after the shared backbone. Preserve
+        # the CPU RNG position across their framework-default initialization so
+        # ``init_weights`` starts common parameters from the same state in a
+        # same-seed baseline/ablation pair. Every optional parameter is then
+        # deliberately initialized by ``init_weights`` below.
+        initialization_rng_state = torch.get_rng_state()
+        initialization_cuda_rng_states = (
+            torch.cuda.get_rng_state_all() if torch.cuda.is_initialized() else None
+        )
         exp = config.experimental
         self.morphoscript = (
             MorphoScriptFusion(config.d_model, exp.script_classes)
@@ -255,6 +264,9 @@ class SionForConditionalGeneration(nn.Module):
             if exp.semantic_parity_enabled
             else None
         )
+        torch.set_rng_state(initialization_rng_state)
+        if initialization_cuda_rng_states is not None:
+            torch.cuda.set_rng_state_all(initialization_cuda_rng_states)
         self.init_weights()
 
     def init_weights(self) -> None:
@@ -262,6 +274,9 @@ class SionForConditionalGeneration(nn.Module):
         잔차 경로로 합쳐지는 출력 projection(out_proj/down_proj)은
         층 수에 비례해 더 작게 초기화해 깊은 모델의 초기 발산을 막습니다."""
         std = self.config.init_std
+        residual_std = (
+            std / (2 * max(self.config.encoder_layers, self.config.decoder_layers)) ** 0.5
+        )
 
         def initialize(module: nn.Module) -> None:
             if isinstance(module, nn.Linear):
@@ -275,13 +290,7 @@ class SionForConditionalGeneration(nn.Module):
                         module.weight[module.padding_idx].zero_()
             elif isinstance(module, RMSNorm):
                 nn.init.ones_(module.weight)
-
-        self.apply(initialize)
-        residual_std = (
-            std / (2 * max(self.config.encoder_layers, self.config.decoder_layers)) ** 0.5
-        )
-        for module in self.modules():
-            if isinstance(module, GQAAttention):
+            elif isinstance(module, GQAAttention):
                 nn.init.normal_(module.out_proj.weight, mean=0.0, std=residual_std)
             elif isinstance(module, SwiGLU):
                 nn.init.normal_(module.down_proj.weight, mean=0.0, std=residual_std)
@@ -289,9 +298,19 @@ class SionForConditionalGeneration(nn.Module):
                 # Meta-device construction followed by ``to_empty`` leaves
                 # derived, non-persistent RoPE buffers uninitialized.
                 module.reset_parameters()
-        if self.morph_gates is not None:
-            with torch.no_grad():
+
+        self.apply(initialize)
+        with torch.no_grad():
+            if self.morph_gates is not None:
                 self.morph_gates.zero_()
+            if self.evidence_repair is not None:
+                self.evidence_repair.repair_scale.zero_()
+            if self.register_state is not None:
+                self.register_state.inject_gate.zero_()
+            if self.typed_memory is not None:
+                self.typed_memory.gate.zero_()
+            if self.alignment_head is not None:
+                self.alignment_head.null_source.zero_()
 
     def _embed(self, token_ids: torch.Tensor) -> torch.Tensor:
         hidden = self.token_embedding(token_ids)

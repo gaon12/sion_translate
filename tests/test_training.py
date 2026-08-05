@@ -493,6 +493,9 @@ def test_sft_json_log_exposes_native_auxiliary_diagnostics(
     json_records = [json.loads(message) for message in messages if message.startswith("{")]
     train_record = next(record for record in json_records if "learning_rate" in record)
     assert {
+        "register_loss",
+        "alignment_loss",
+        "coverage_loss",
         "uncertainty_loss",
         "evidence_budget_loss",
         "evidence_request_rate",
