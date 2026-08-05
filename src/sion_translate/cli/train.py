@@ -130,6 +130,30 @@ def preflight_morphoscript_token_features(
     )
 
 
+def build_collator_args(
+    config: AppConfig,
+    tokenizer: SionTokenizer,
+) -> dict[str, Any]:
+    """Build the common train/validation/post-training collator contract."""
+
+    return {
+        "tokenizer": tokenizer,
+        "max_source_length": config.data.max_source_length,
+        "max_target_length": config.data.max_target_length,
+        "pad_to_multiple_of": config.data.pad_to_multiple_of,
+        "denoise_noise_density": config.data.denoise_noise_density,
+        "denoise_mean_span": config.data.denoise_mean_span,
+        "source_only_languages": config.data.configured_source_only_languages(),
+        "augmentation_seed": config.training.seed,
+        "token_features": (
+            config.data.tokenizer_features
+            if config.model.experimental.morphoscript_enabled
+            else None
+        ),
+        "script_classes": config.model.experimental.script_classes,
+    }
+
+
 def scan_configured_raw_data(
     config: AppConfig,
     data_dir: Path,
@@ -646,6 +670,11 @@ def main() -> None:
         # ── 단계 ②: 설정 로드 ───────────────────────────────────────────
         config, raw, source = resolve_config(args)
         announce(f"준비 ②: 설정 로드 — {source}", context)
+        if not args.prepare_only:
+            # The built-in collator has no dense alignment-label provider.
+            # Reject a permanently-zero BATS alignment objective before doing
+            # artifact preparation or allocating model parameters.
+            config.validate_training_supervision(alignment_targets_available=False)
 
         # ── 단계 ③: 원천 데이터 인식 + 토크나이저/데이터셋 자동 준비 ──
         if not args.prepare_only:
@@ -721,21 +750,7 @@ def main() -> None:
 
         # ── DataLoader 구성 ──────────────────────────────────────────────
         # collator: 원문/번역문을 토큰화하고 패딩해 텐서 배치로 만듭니다.
-        collator_args = dict(
-            tokenizer=tokenizer,
-            max_source_length=config.data.max_source_length,
-            max_target_length=config.data.max_target_length,
-            pad_to_multiple_of=config.data.pad_to_multiple_of,
-            denoise_noise_density=config.data.denoise_noise_density,
-            denoise_mean_span=config.data.denoise_mean_span,
-            augmentation_seed=config.training.seed,
-            token_features=(
-                config.data.tokenizer_features
-                if config.model.experimental.morphoscript_enabled
-                else None
-            ),
-            script_classes=config.model.experimental.script_classes,
-        )
+        collator_args = build_collator_args(config, tokenizer)
         train_collator = SionBatchCollator(
             **collator_args,
             denoise_probability=config.data.denoise_probability,
@@ -851,6 +866,7 @@ def main() -> None:
             pretrain_config,
             context,
             stage_name="pretrain/SFT",
+            language_tags=tokenizer.language_tags,
         )
         barrier(context)
         memory = release_stage_resources(context, train_loader, validation_loader)
@@ -941,6 +957,7 @@ def main() -> None:
                 context,
                 objective=objective,
                 stage_name="posttrain/composite-MRT+preference",
+                language_tags=tokenizer.language_tags,
             )
             barrier(context)
             memory = release_stage_resources(

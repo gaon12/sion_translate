@@ -3,6 +3,7 @@ from __future__ import annotations
 import random
 from collections.abc import Iterable
 
+import pytest
 import torch
 from torch.utils.data import DataLoader
 
@@ -17,6 +18,27 @@ class TinyTokenizer:
     language_tags = {"de": 10, "en": 11}
     denoise_tags = {"en": 12, "de": 13}
     slot_ids = [90]
+
+
+class SourceOnlyTokenizer(TinyTokenizer):
+    language_tags = {
+        "de": 10,
+        "en": 11,
+        "kj": 14,
+        "kd": 15,
+        "jd": 16,
+        "ko": 17,
+        "ja": 18,
+    }
+    denoise_tags = {
+        "en": 12,
+        "de": 13,
+        "kj": 24,
+        "kd": 25,
+        "jd": 26,
+        "ko": 27,
+        "ja": 28,
+    }
 
 
 def _items() -> list[dict]:
@@ -170,3 +192,50 @@ def test_denoise_target_only_contains_tokens_the_input_could_see() -> None:
     # Every restored token has to come from the window the encoder actually saw.
     assert set(restored) <= set(long_source[: 12 - 2])
     assert len(restored) <= 12 - 2
+
+
+@pytest.mark.parametrize("source_language", ["kj", "kd", "jd"])
+def test_source_only_inputs_never_become_denoise_tasks(source_language: str) -> None:
+    tokenizer = SourceOnlyTokenizer()
+    collator = SionBatchCollator(
+        tokenizer,
+        max_source_length=16,
+        max_target_length=16,
+        denoise_probability=1.0,
+        source_only_languages=("kj", "kd", "jd"),
+    )
+    source_only_item = {
+        "src": [30, 31],
+        "tgt": [40, 41],
+        "src_language": source_language,
+        "target_language": "ko",
+        "src_register": 0,
+        "target_register": 1,
+        "pair_index": 1,
+        "reverse_direction_trained": False,
+    }
+    ordinary_item = {
+        "src": [50, 51],
+        "tgt": [60, 61],
+        "src_language": "ko",
+        "target_language": "ja",
+        "src_register": 2,
+        "target_register": 3,
+        "pair_index": 2,
+        "reverse_direction_trained": True,
+    }
+
+    batch = collator([source_only_item, ordinary_item])
+
+    # A source-only row stays a translation row even when denoising is otherwise
+    # certain: the labels remain the configured monolingual target.
+    assert batch["input_ids"][0, 0].item() == tokenizer.language_tags["ko"]
+    assert batch["labels"][0, :3].tolist() == [40, 41, tokenizer.eos_id]
+    assert batch["source_language_tag_ids"][0].item() == tokenizer.language_tags[source_language]
+    assert batch["reverse_direction_trained"][0].item() is False
+
+    # An ordinary ko/ja row still follows the existing denoising path.
+    assert batch["input_ids"][1, 0].item() == tokenizer.denoise_tags["ko"]
+    assert batch["labels"][1, :3].tolist() == [50, 51, tokenizer.eos_id]
+    assert batch["source_language_tag_ids"][1].item() == -1
+    assert batch["reverse_direction_trained"][1].item() is False

@@ -108,6 +108,7 @@ class SionBatchCollator:
         denoise_probability: float = 0.0,
         denoise_noise_density: float = 0.15,
         denoise_mean_span: float = 3.0,
+        source_only_languages: Sequence[str] = (),
         source_token_dropout: float = 0.0,
         decoder_input_noise: float = 0.0,
         augmentation_seed: int = 0,
@@ -124,6 +125,12 @@ class SionBatchCollator:
         self.denoise_probability = denoise_probability
         self.denoise_noise_density = denoise_noise_density
         self.denoise_mean_span = denoise_mean_span
+        # Source-only varieties (for example mixed-language ``kj`` or dialect
+        # ``kd``/``jd``) are defined only as inputs to a translation edge.  A
+        # denoising sample would instead put that variety on the label side and
+        # teach the decoder to generate exactly the output the data contract
+        # forbids.  Keep the empty default for ordinary bilingual callers.
+        self.source_only_languages = frozenset(map(str, source_only_languages))
         # 온라인 증강: 원문 토큰을 이 확률로 무작위 탈락시켜 모델이 일부
         # 단어가 빠진 입력에도 견고해지게 합니다. 학습 collator 에만 적용하고
         # 검증 collator 에는 0 을 넣어야 합니다.
@@ -192,7 +199,11 @@ class SionBatchCollator:
         tgt = list(map(int, item["tgt"]))
         target_register = int(item["target_register"])
         rng = self._sample_rng(item)
-        denoise = self.denoise_probability > 0 and rng.random() < self.denoise_probability
+        denoise = (
+            item["src_language"] not in self.source_only_languages
+            and self.denoise_probability > 0
+            and rng.random() < self.denoise_probability
+        )
         if denoise:
             # Truncate before deriving the target. The two sides are cut to
             # different limits further down, so restoring an un-truncated

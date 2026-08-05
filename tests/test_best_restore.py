@@ -75,13 +75,17 @@ def test_training_returns_best_ema_weights_for_the_next_stage(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    losses = iter((1.2, 1.0, 2.2, 2.0))
+    # Global NLL improves on step 2, while the direction-balanced NLL gets
+    # worse. The configured macro metric must therefore keep step 1 as best.
+    evaluations = iter(((2.2, 1.2), (2.0, 1.0), (1.2, 2.2), (1.0, 2.0)))
 
     def fake_evaluate(*args, **kwargs) -> dict[str, float]:
-        loss = next(losses)
+        nll, macro_direction_nll = next(evaluations)
         return {
-            "validation_loss": loss,
-            "validation_perplexity": float(torch.exp(torch.tensor(loss))),
+            "validation_loss": nll,
+            "validation_nll": nll,
+            "validation_macro_direction_nll": macro_direction_nll,
+            "validation_perplexity": float(torch.exp(torch.tensor(nll))),
             "validation_auxiliary_loss": 0.0,
             "validation_tokens": 1.0,
         }
@@ -111,3 +115,4 @@ def test_training_returns_best_ema_weights_for_the_next_stage(
     for name, expected in best["ema"].items():
         torch.testing.assert_close(live[name], expected)
     assert any(not torch.equal(live[name], final["model"][name]) for name in live)
+    assert best["step"] == 1

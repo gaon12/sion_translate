@@ -22,10 +22,11 @@ import math
 import time
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 from tqdm.auto import tqdm
 
 from sion_translate.config import AppConfig, TrainingConfig
@@ -165,6 +166,85 @@ def _fail_if_known_empty(loader: Iterable[dict[str, torch.Tensor]], name: str) -
         raise ValueError(f"{name} loader is empty")
 
 
+def _language_metric_layout(
+    language_tags: Mapping[str, int] | None,
+) -> tuple[tuple[str, int], ...]:
+    """Return a rank-stable language order for packed distributed statistics."""
+
+    if not language_tags:
+        return ()
+    layout = tuple(
+        sorted((str(language), int(tag_id)) for language, tag_id in language_tags.items())
+    )
+    tag_ids = [tag_id for _, tag_id in layout]
+    if len(tag_ids) != len(set(tag_ids)):
+        raise ValueError("language_tags must assign a unique token id to every language")
+    return layout
+
+
+def _perplexity(nll: float) -> float:
+    """Exponentiate token NLL, representing an unreportably large value as infinity."""
+
+    try:
+        return math.exp(nll)
+    except OverflowError:
+        return float("inf")
+
+
+def _validation_metric_suffix(key: str) -> str:
+    prefix = "validation_ema_" if key.startswith("validation_ema_") else "validation_"
+    return key.removeprefix(prefix)
+
+
+def _select_sft_validation_metric(
+    metrics: Mapping[str, float],
+    configured_metric: str,
+    *,
+    prefer_ema: bool,
+) -> tuple[float, str, bool]:
+    """Choose a finite SFT metric, falling back without making training unselectable.
+
+    Direction metrics can legitimately be absent when a bounded validation slice
+    contains only denoising rows or when a custom caller did not provide language
+    tag metadata. The fallback order keeps the requested direction metric first,
+    then true global NLL, and only then the legacy label-smoothed loss.
+    """
+
+    suffix_by_setting = {
+        "global_nll": "nll",
+        "macro_direction_nll": "macro_direction_nll",
+        "worst_direction_nll": "worst_direction_nll",
+    }
+    configured_suffix = suffix_by_setting[configured_metric.lower()]
+    prefixes = ["validation_ema_", "validation_"] if prefer_ema else ["validation_"]
+    candidate_keys: list[str] = []
+    for suffix in (configured_suffix, "nll", "loss"):
+        for prefix in prefixes:
+            key = f"{prefix}{suffix}"
+            if key not in candidate_keys:
+                candidate_keys.append(key)
+    for key in candidate_keys:
+        if key not in metrics:
+            continue
+        value = float(metrics[key])
+        if math.isfinite(value):
+            return value, key, _validation_metric_suffix(key) != configured_suffix
+    requested_prefix = prefixes[0]
+    return float("inf"), f"{requested_prefix}{configured_suffix}", True
+
+
+def _selection_metric_label(key: str) -> str:
+    ema = key.startswith("validation_ema_")
+    labels = {
+        "macro_direction_nll": "방향 균형 macro NLL",
+        "worst_direction_nll": "최저 성능 방향 NLL",
+        "nll": "전체 token NLL",
+        "loss": "검증 loss",
+    }
+    label = labels.get(_validation_metric_suffix(key), key)
+    return f"EMA {label}" if ema else label
+
+
 @torch.no_grad()
 def evaluate(
     model: nn.Module,
@@ -175,20 +255,34 @@ def evaluate(
     precision: str = "fp32",
     show_progress: bool = False,
     objective: Callable[[nn.Module, dict[str, torch.Tensor]], ObjectiveOutput] | None = None,
+    language_tags: Mapping[str, int] | None = None,
 ) -> dict[str, float]:
-    """검증 데이터로 CE와 선택적 생성 품질 보상을 계산합니다 (gradient 없음).
+    """검증 데이터로 CE/NLL과 선택적 생성 품질 보상을 계산합니다 (gradient 없음).
 
-    - loss 는 '토큰당 평균'으로 계산합니다: 배치별 평균을 다시 평균하면
-      짧은 배치가 과대평가되므로, 합계를 모았다가 마지막에 한 번 나눕니다.
+    - ``validation_loss`` 는 학습과 같은 label-smoothed CE를 유지합니다.
+    - perplexity와 언어/방향 지표는 smoothing 없는 실제 token NLL입니다.
+    - 방향 통계는 모든 rank가 같은 고정 layout tensor를 reduce하므로, 특정
+      rank에 한 방향의 표본이 하나도 없어도 collective 순서가 어긋나지 않습니다.
     - 분산 학습에서는 모든 rank 의 합계를 all-reduce 로 모아 전체 평균을 냅니다.
     """
     was_training = model.training
     model.eval()
     loss_sum = torch.zeros((), device=context.device, dtype=torch.float64)
     token_count = torch.zeros((), device=context.device, dtype=torch.float64)
+    nll_sum = torch.zeros((), device=context.device, dtype=torch.float64)
+    nll_token_count = torch.zeros((), device=context.device, dtype=torch.float64)
     aux_sum = torch.zeros((), device=context.device, dtype=torch.float64)
     objective_sums: dict[str, torch.Tensor] = {}
     objective_count = torch.zeros((), device=context.device, dtype=torch.float64)
+    language_layout = _language_metric_layout(language_tags)
+    language_count = len(language_layout)
+    # First N rows are target-language stats; the remaining N*N rows are
+    # source-major explicit direction stats. Each row is [NLL sum, token count].
+    language_stats = torch.zeros(
+        (language_count + language_count * language_count, 2),
+        device=context.device,
+        dtype=torch.float64,
+    )
     batches = 0
 
     # 검증에도 작은 progress bar 를 표시합니다 (rank 0 전용, 끝나면 지워짐).
@@ -209,9 +303,37 @@ def evaluate(
                 generated_metrics = (
                     validation_metrics(model, batch) if validation_metrics is not None else None
                 )
+            labels = batch["labels"]
+            token_nll = F.cross_entropy(
+                output.logits.detach().float().reshape(-1, output.logits.shape[-1]),
+                labels.reshape(-1),
+                ignore_index=-100,
+                reduction="none",
+            ).reshape_as(labels)
+            valid_tokens = labels.ne(-100)
+            row_nll = token_nll.sum(dim=1).double()
+            row_token_count = valid_tokens.sum(dim=1).double()
             loss_sum += output.lm_loss_sum.detach().double()
             token_count += output.token_count.detach().double()
+            nll_sum += row_nll.sum()
+            nll_token_count += row_token_count.sum()
             aux_sum += output.auxiliary_loss.detach().double()
+            if language_layout:
+                target_tag_ids = batch["input_ids"][:, 0]
+                source_tag_ids = batch.get("source_language_tag_ids")
+                for target_index, (_, target_tag_id) in enumerate(language_layout):
+                    target_rows = target_tag_ids.eq(target_tag_id)
+                    language_stats[target_index, 0] += row_nll[target_rows].sum()
+                    language_stats[target_index, 1] += row_token_count[target_rows].sum()
+                    if source_tag_ids is None:
+                        continue
+                    for source_index, (_, source_tag_id) in enumerate(language_layout):
+                        direction_rows = target_rows & source_tag_ids.eq(source_tag_id)
+                        direction_index = (
+                            language_count + source_index * language_count + target_index
+                        )
+                        language_stats[direction_index, 0] += row_nll[direction_rows].sum()
+                        language_stats[direction_index, 1] += row_token_count[direction_rows].sum()
             if generated_metrics is not None:
                 source_count = float(batch["input_ids"].shape[0])
                 objective_count += source_count
@@ -235,21 +357,60 @@ def evaluate(
         raise ValueError("validation loader produced no batches")
     reduce_sum(loss_sum, context)
     reduce_sum(token_count, context)
+    reduce_sum(nll_sum, context)
+    reduce_sum(nll_token_count, context)
     reduce_sum(aux_sum, context)
     reduce_sum(objective_count, context)
+    # One fixed-size collective covers every language/direction, including rows
+    # that are locally zero but observed on another DDP rank.
+    if language_layout:
+        reduce_sum(language_stats, context)
     for value in objective_sums.values():
         reduce_sum(value, context)
     batch_tensor = torch.tensor(float(batches), device=context.device, dtype=torch.float64)
     reduce_sum(batch_tensor, context)
     model.train(was_training)
     mean_loss = (loss_sum / token_count.clamp_min(1)).item()
+    mean_nll = (nll_sum / nll_token_count.clamp_min(1)).item()
     metrics = {
         "validation_loss": mean_loss,
-        # exp(loss) 가 너무 커져 overflow 하지 않도록 loss 를 20으로 제한합니다.
-        "validation_perplexity": math.exp(min(mean_loss, 20.0)),
+        "validation_nll": mean_nll,
+        "validation_perplexity": _perplexity(mean_nll),
         "validation_auxiliary_loss": (aux_sum / batch_tensor.clamp_min(1)).item(),
-        "validation_tokens": token_count.item(),
+        "validation_tokens": nll_token_count.item(),
     }
+    direction_nlls: list[float] = []
+    for target_index, (target_language, _) in enumerate(language_layout):
+        target_tokens = language_stats[target_index, 1].item()
+        if target_tokens > 0:
+            target_nll = (language_stats[target_index, 0] / target_tokens).item()
+            prefix = f"validation_target_{target_language}"
+            metrics[f"{prefix}_nll"] = target_nll
+            metrics[f"{prefix}_perplexity"] = _perplexity(target_nll)
+            metrics[f"{prefix}_tokens"] = target_tokens
+        for source_index, (source_language, _) in enumerate(language_layout):
+            direction_index = language_count + source_index * language_count + target_index
+            direction_tokens = language_stats[direction_index, 1].item()
+            if direction_tokens <= 0:
+                continue
+            direction_nll = (language_stats[direction_index, 0] / direction_tokens).item()
+            direction_nlls.append(direction_nll)
+            prefix = f"validation_direction_{source_language}_to_{target_language}"
+            metrics[f"{prefix}_nll"] = direction_nll
+            metrics[f"{prefix}_perplexity"] = _perplexity(direction_nll)
+            metrics[f"{prefix}_tokens"] = direction_tokens
+    if direction_nlls:
+        macro_direction_nll = sum(direction_nlls) / len(direction_nlls)
+        worst_direction_nll = max(direction_nlls)
+        metrics.update(
+            {
+                "validation_macro_direction_nll": macro_direction_nll,
+                "validation_macro_direction_perplexity": _perplexity(macro_direction_nll),
+                "validation_worst_direction_nll": worst_direction_nll,
+                "validation_worst_direction_perplexity": _perplexity(worst_direction_nll),
+                "validation_direction_count": float(len(direction_nlls)),
+            }
+        )
     if objective_sums:
         denominator = objective_count.clamp_min(1)
         metrics.update(
@@ -271,8 +432,9 @@ def train(
     start_step: int = 0,
     objective: Callable[[nn.Module, dict[str, torch.Tensor]], ObjectiveOutput] | None = None,
     stage_name: str = "pretrain",
-) -> dict[str, float | int | bool]:
-    """sion_translate 학습의 본체. 반환값은 마지막 step/epoch 과 best 검증 loss 요약입니다."""
+    language_tags: Mapping[str, int] | None = None,
+) -> dict[str, float | int | bool | str]:
+    """sion_translate 학습의 본체. 반환값은 진행 상태와 best 선택 지표 요약입니다."""
     config.validate()
     _fail_if_known_empty(train_loader, "training")
     _fail_if_known_empty(validation_loader, "validation")
@@ -332,6 +494,9 @@ def train(
     ema = EMAWeights(model, training.ema_decay) if training.ema_decay > 0 else None
     if ema is not None:
         announce(f"EMA 가중치 평균 활성화 (decay={training.ema_decay})", context)
+    configured_selection_metric = (
+        "validation_reward" if objective is not None else training.sft_selection_metric.lower()
+    )
     training_state: dict[str, Any] = {
         "best_validation_loss": float("inf"),
         "best_step": -1,
@@ -355,8 +520,33 @@ def train(
             expected_identity=checkpoint_identity,
         )
         announce(f"재개 완료: step {start_step} 부터 다시 시작합니다.", context)
+        loaded_metric = training_state.get("configured_selection_metric")
+        loaded_best_metric = training_state.get("best_selection_metric")
+        loaded_best_step = int(training_state.get("best_step", -1))
+        loaded_best_value = float(training_state.get("best_validation_loss", float("inf")))
+        has_recorded_best = loaded_best_step >= 0 or math.isfinite(loaded_best_value)
+        selection_metadata_matches = loaded_metric == configured_selection_metric and (
+            not has_recorded_best or isinstance(loaded_best_metric, str)
+        )
+        if not selection_metadata_matches:
+            previous = loaded_metric if loaded_metric is not None else "legacy/unknown"
+            announce(
+                "체크포인트의 best 선택 지표가 현재 설정과 호환되지 않아 "
+                f"best/early-stopping 기록을 초기화합니다 ({previous!r} → "
+                f"{configured_selection_metric!r}).",
+                context,
+            )
+            training_state.update(
+                {
+                    "best_validation_loss": float("inf"),
+                    "best_step": -1,
+                    "early_stopping_bad_evals": 0,
+                    "best_selection_metric": None,
+                }
+            )
     else:
         announce("단계 2/4: 재개할 체크포인트가 없어 처음부터 학습합니다.", context)
+    training_state["configured_selection_metric"] = configured_selection_metric
 
     writer = _make_summary_writer(training, output_dir, context, start_step)
     step = start_step
@@ -367,6 +557,10 @@ def train(
     best_validation_loss = float(training_state.get("best_validation_loss", float("inf")))
     best_step = int(training_state.get("best_step", -1))
     bad_evals = int(training_state.get("early_stopping_bad_evals", 0))
+    loaded_best_selection_metric = training_state.get("best_selection_metric")
+    best_selection_metric = (
+        loaded_best_selection_metric if isinstance(loaded_best_selection_metric, str) else None
+    )
     stopped_early = False
     last_eval_step = -1
     last_train_loss: float | None = None
@@ -387,6 +581,8 @@ def train(
             "best_validation_loss": best_validation_loss,
             "best_step": best_step,
             "early_stopping_bad_evals": bad_evals,
+            "configured_selection_metric": configured_selection_metric,
+            "best_selection_metric": best_selection_metric,
             "epoch": epoch,
             "batch_in_epoch": batch_in_epoch,
         }
@@ -460,6 +656,7 @@ def train(
         반환값이 True 면 '더 이상 개선이 없어 학습을 멈춰야 한다'는 뜻입니다.
         """
         nonlocal best_validation_loss, best_step, bad_evals, last_eval_step
+        nonlocal best_selection_metric
         announce(f"검증 시작 (step {step})", context)
         metrics = evaluate(
             model,
@@ -469,6 +666,7 @@ def train(
             precision=training.precision,
             show_progress=True,
             objective=objective,
+            language_tags=language_tags,
         )
         if ema is not None:
             # EMA 가중치로도 한 번 더 검증합니다. best 선택과 early stopping 은
@@ -482,6 +680,7 @@ def train(
                     precision=training.precision,
                     show_progress=True,
                     objective=objective,
+                    language_tags=language_tags,
                 )
             for name, value in ema_metrics.items():
                 if name.startswith("validation_"):
@@ -491,9 +690,19 @@ def train(
             metrics["generalization_gap"] = float(metrics["validation_loss"]) - last_train_loss
         last_eval_step = step
         if context.is_main:
-            summary = "검증 결과: loss={:.4f}, perplexity={:.2f}".format(
-                metrics["validation_loss"], metrics["validation_perplexity"]
+            summary = "검증 결과: loss={:.4f}, NLL={:.4f}, perplexity={:.2f}".format(
+                metrics["validation_loss"],
+                metrics.get("validation_nll", metrics["validation_loss"]),
+                metrics["validation_perplexity"],
             )
+            if "validation_macro_direction_nll" in metrics:
+                summary += ", 방향 macro NLL={:.4f}".format(
+                    metrics["validation_macro_direction_nll"]
+                )
+            if "validation_worst_direction_nll" in metrics:
+                summary += ", 최저 방향 NLL={:.4f}".format(
+                    metrics["validation_worst_direction_nll"]
+                )
             if "validation_ema_loss" in metrics:
                 summary += ", EMA loss={:.4f}".format(metrics["validation_ema_loss"])
             if "validation_reward" in metrics:
@@ -508,24 +717,48 @@ def train(
 
         # best 갱신 판단은 rank 0 에서만 하고, 그 결과를 모든 rank 에 방송해
         # 전 rank 가 같은 시점에 저장/종료하도록 맞춥니다.
-        # 사후학습은 실제 생성 reward를 최대화하고, SFT는 CE loss를 최소화합니다.
+        # 사후학습은 실제 생성 reward를 최대화하고, SFT는 설정된 NLL 지표를 최소화합니다.
         # 기존 체크포인트 상태와 호환하기 위해 최대화 지표는 음수로 저장합니다.
         if objective is not None and "validation_reward" in metrics:
-            selection_value = float(
-                metrics.get("validation_ema_reward", metrics["validation_reward"])
+            selection_key = (
+                "validation_ema_reward"
+                if "validation_ema_reward" in metrics
+                else "validation_reward"
             )
+            selection_value = float(metrics[selection_key])
             candidate = -selection_value
             selection_name = "생성 복합 reward"
         else:
-            candidate = float(metrics.get("validation_ema_loss", metrics["validation_loss"]))
+            candidate, selection_key, used_fallback = _select_sft_validation_metric(
+                metrics,
+                training.sft_selection_metric,
+                prefer_ema=ema is not None,
+            )
             selection_value = candidate
-            selection_name = "검증 loss"
+            selection_name = _selection_metric_label(selection_key)
+            if used_fallback:
+                announce(
+                    f"SFT 선택 지표 {training.sft_selection_metric!r}를 계산할 수 없어 "
+                    f"{selection_name}(으)로 대체합니다.",
+                    context,
+                )
+        if best_selection_metric is not None and selection_key != best_selection_metric:
+            announce(
+                "검증 선택 지표가 이전 best 기록과 달라져 비교 기준을 초기화합니다 "
+                f"({best_selection_metric!r} → {selection_key!r}).",
+                context,
+            )
+            best_validation_loss = float("inf")
+            best_step = -1
+            bad_evals = 0
+            best_selection_metric = None
         improved_here = candidate < best_validation_loss - training.early_stopping_min_delta
         improved = broadcast_bool(improved_here if context.is_main else False, context)
         if improved:
             best_validation_loss = candidate
             best_step = step
             bad_evals = 0
+            best_selection_metric = selection_key
             announce(
                 f"{selection_name} 최고 기록 갱신 ({selection_value:.4f}) → best 저장",
                 context,
@@ -543,10 +776,10 @@ def train(
         )
         should_stop = broadcast_bool(should_stop_here if context.is_main else False, context)
         if context.is_main and writer is not None:
-            if objective is not None:
-                writer.add_scalar("validation/best_reward", -best_validation_loss, step)
-            else:
-                writer.add_scalar("validation/best_loss", best_validation_loss, step)
+            best_selection_value = (
+                -best_validation_loss if objective is not None else best_validation_loss
+            )
+            writer.add_scalar("validation/best_selection_value", best_selection_value, step)
             writer.add_scalar("validation/early_stopping_bad_evals", bad_evals, step)
             writer.flush()
         return should_stop
@@ -626,7 +859,21 @@ def train(
                             normalizer = output.token_count.detach()
                             processed_tokens = output.token_count.detach()
                             auxiliary_loss = output.auxiliary_loss.detach()
-                            objective_metrics: dict[str, torch.Tensor] = {}
+                            # Native optional modules expose their own diagnostics
+                            # in addition to the combined auxiliary loss. Recording
+                            # only non-None values keeps older/custom model outputs
+                            # compatible while making A/B behavior observable.
+                            objective_metrics = {
+                                name: value
+                                for name in (
+                                    "uncertainty_loss",
+                                    "evidence_budget_loss",
+                                    "evidence_request_rate",
+                                    "semantic_parity_loss",
+                                    "semantic_parity_score",
+                                )
+                                if (value := getattr(output, name, None)) is not None
+                            }
                         else:
                             objective_output = objective(model, batch)
                             loss_sum = objective_output.loss_sum
@@ -812,9 +1059,12 @@ def train(
         save(output_dir / "checkpoints" / "latest")
         export_models("latest")
         best_checkpoint = output_dir / "checkpoints" / "best"
-        best_exists_here = (best_checkpoint / "checkpoint.pt").is_file() or (
+        best_file_exists_here = (best_checkpoint / "checkpoint.pt").is_file() or (
             best_checkpoint / ".metadata"
         ).exists()
+        best_exists_here = (
+            best_step >= 0 and best_selection_metric is not None and best_file_exists_here
+        )
         best_exists = broadcast_bool(
             best_exists_here if context.is_main else False,
             context,
@@ -842,14 +1092,16 @@ def train(
             # A non-finite validation metric can prevent a best checkpoint.
             # In that exceptional case the live final weights are selected.
             best_step = step
+        if objective is not None:
+            final_selection_name = "생성 복합 reward"
+            final_selection_value = -best_validation_loss
+        else:
+            final_metric_key = best_selection_metric or f"validation_{configured_selection_metric}"
+            final_selection_name = _selection_metric_label(final_metric_key)
+            final_selection_value = best_validation_loss
         announce(
-            f"학습 종료: step {step}, best "
-            + (
-                f"생성 복합 reward {-best_validation_loss:.4f}"
-                if objective is not None
-                else f"검증 loss {best_validation_loss:.4f}"
-            )
-            + (" (early stopping)" if stopped_early else ""),
+            f"학습 종료: step {step}, best {final_selection_name} "
+            f"{final_selection_value:.4f}" + (" (early stopping)" if stopped_early else ""),
             context,
         )
     finally:
@@ -857,12 +1109,19 @@ def train(
         if writer is not None:
             writer.close()
 
-    result: dict[str, float | int | bool] = {
+    result: dict[str, float | int | bool | str] = {
         "step": step,
         "best_step": best_step,
         "selected_step": best_step,
         "epoch": epoch,
+        # Legacy key retained for checkpoint/API compatibility. For SFT this is
+        # the selected minimizing metric; for reward objectives it is negated.
         "best_validation_loss": best_validation_loss,
+        "configured_selection_metric": configured_selection_metric,
+        "best_selection_metric": best_selection_metric or configured_selection_metric,
+        "best_selection_value": (
+            -best_validation_loss if objective is not None else best_validation_loss
+        ),
         "early_stopping_bad_evals": bad_evals,
         "stopped_early": stopped_early,
     }

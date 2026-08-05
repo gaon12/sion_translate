@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
+import math
 from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 import torch
+from torch import nn
 
 import sion_translate.training.trainer as trainer_module
 from sion_translate.config import (
@@ -75,6 +78,41 @@ class FakeTokenizer:
     @staticmethod
     def decode(ids) -> str:
         return "".join(chr(0x3041 + int(token_id) % 80) for token_id in ids)
+
+
+class FixedValidationModel(nn.Module):
+    """Emit controlled token probabilities while exposing the trainer output contract."""
+
+    def __init__(self, target_probabilities: torch.Tensor, *, smoothed_loss_sum: float = 30.0):
+        super().__init__()
+        self.register_buffer("target_probabilities", target_probabilities)
+        self.smoothed_loss_sum = smoothed_loss_sum
+
+    def forward(self, **batch):
+        labels = batch["labels"]
+        probabilities = self.target_probabilities[: labels.shape[0], : labels.shape[1]]
+        logits = torch.stack((probabilities.log(), (1.0 - probabilities).log()), dim=-1)
+        return type(
+            "ValidationOutput",
+            (),
+            {
+                "logits": logits,
+                "lm_loss_sum": logits.new_tensor(self.smoothed_loss_sum),
+                "token_count": labels.ne(-100).sum(),
+                "auxiliary_loss": logits.new_zeros(()),
+            },
+        )()
+
+
+def direction_validation_batch() -> dict[str, torch.Tensor]:
+    return {
+        # Row 0 is ja->ko and row 1 is ko->ja. The first input token is target.
+        "input_ids": torch.tensor([[5, 10], [4, 11]]),
+        "attention_mask": torch.ones(2, 2, dtype=torch.bool),
+        "decoder_input_ids": torch.zeros(2, 2, dtype=torch.long),
+        "labels": torch.tensor([[0, 0], [0, -100]]),
+        "source_language_tag_ids": torch.tensor([4, 5]),
+    }
 
 
 def tiny_app_config(tmp_path: Path, **training_overrides) -> AppConfig:
@@ -158,6 +196,168 @@ def test_posttraining_validation_metrics_share_the_autocast_context(monkeypatch)
 
     assert metrics["validation_reward"] == pytest.approx(0.75)
     assert not active
+
+
+def test_validation_reports_true_nll_for_each_target_and_direction() -> None:
+    model = FixedValidationModel(torch.tensor([[0.8, 0.8], [0.25, 0.5]]))
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+
+    metrics = evaluate(
+        model,
+        [direction_validation_batch()],
+        context,
+        max_batches=1,
+        language_tags=FakeTokenizer.language_tags,
+    )
+
+    ja_to_ko_nll = -math.log(0.8)
+    ko_to_ja_nll = -math.log(0.25)
+    global_nll = (2 * ja_to_ko_nll + ko_to_ja_nll) / 3
+    macro_nll = (ja_to_ko_nll + ko_to_ja_nll) / 2
+    # The model's reported training loss was deliberately 30 / 3 = 10. PPL
+    # must instead come from the independently recomputed, unsmoothed NLL.
+    assert metrics["validation_loss"] == pytest.approx(10.0)
+    assert metrics["validation_nll"] == pytest.approx(global_nll)
+    assert metrics["validation_perplexity"] == pytest.approx(math.exp(global_nll))
+    assert metrics["validation_target_ko_nll"] == pytest.approx(ja_to_ko_nll)
+    assert metrics["validation_target_ko_tokens"] == 2
+    assert metrics["validation_target_ja_nll"] == pytest.approx(ko_to_ja_nll)
+    assert metrics["validation_target_ja_tokens"] == 1
+    assert metrics["validation_direction_ja_to_ko_nll"] == pytest.approx(ja_to_ko_nll)
+    assert metrics["validation_direction_ko_to_ja_nll"] == pytest.approx(ko_to_ja_nll)
+    assert metrics["validation_macro_direction_nll"] == pytest.approx(macro_nll)
+    assert metrics["validation_worst_direction_nll"] == pytest.approx(ko_to_ja_nll)
+    assert metrics["validation_direction_count"] == 2
+
+
+def test_direction_statistics_have_a_fixed_ddp_reduction_layout(monkeypatch) -> None:
+    model = FixedValidationModel(torch.tensor([[0.8, 0.8]]), smoothed_loss_sum=2.0)
+    local_batch = {name: value[:1].clone() for name, value in direction_validation_batch().items()}
+    context = DistributedContext(0, 0, 2, torch.device("cpu"), True, "gloo")
+    packed_reductions = 0
+    remote_nll = -math.log(0.25)
+
+    def simulate_all_reduce(tensor: torch.Tensor, _context: DistributedContext) -> torch.Tensor:
+        nonlocal packed_reductions
+        # Sorted layout is [ja target, ko target, ja->ja, ja->ko,
+        # ko->ja, ko->ko]. Rank 0 has only ja->ko; inject rank 1's
+        # ko->ja row into the same preallocated tensor.
+        if tensor.shape == (6, 2):
+            packed_reductions += 1
+            tensor[0] += tensor.new_tensor([remote_nll, 1.0])
+            tensor[4] += tensor.new_tensor([remote_nll, 1.0])
+        return tensor
+
+    monkeypatch.setattr(trainer_module, "reduce_sum", simulate_all_reduce)
+    metrics = evaluate(
+        model,
+        [local_batch],
+        context,
+        max_batches=1,
+        language_tags=FakeTokenizer.language_tags,
+    )
+
+    assert packed_reductions == 1
+    assert metrics["validation_direction_ja_to_ko_tokens"] == 2
+    assert metrics["validation_direction_ko_to_ja_tokens"] == 1
+    assert metrics["validation_direction_count"] == 2
+    assert metrics["validation_worst_direction_nll"] == pytest.approx(remote_nll)
+
+
+def test_sft_direction_selection_falls_back_to_a_finite_global_nll() -> None:
+    metrics = {
+        "validation_ema_macro_direction_nll": float("nan"),
+        "validation_macro_direction_nll": float("inf"),
+        "validation_ema_nll": 0.75,
+        "validation_nll": 0.8,
+        "validation_ema_loss": 0.5,
+        "validation_loss": 0.6,
+    }
+
+    value, key, used_fallback = trainer_module._select_sft_validation_metric(
+        metrics,
+        "macro_direction_nll",
+        prefer_ema=True,
+    )
+
+    assert value == pytest.approx(0.75)
+    assert key == "validation_ema_nll"
+    assert used_fallback is True
+
+
+def test_sft_selection_keeps_direction_balance_ahead_of_lower_global_nll() -> None:
+    metrics = {
+        "validation_ema_macro_direction_nll": 1.1,
+        "validation_macro_direction_nll": 1.0,
+        "validation_ema_nll": 0.2,
+        "validation_nll": 0.1,
+    }
+
+    value, key, used_fallback = trainer_module._select_sft_validation_metric(
+        metrics,
+        "macro_direction_nll",
+        prefer_ema=True,
+    )
+
+    assert value == pytest.approx(1.1)
+    assert key == "validation_ema_macro_direction_nll"
+    assert used_fallback is False
+
+
+@pytest.mark.parametrize(
+    "checkpoint_metric",
+    (None, "global_nll"),
+    ids=("legacy-missing", "configured-mismatch"),
+)
+def test_resume_resets_an_incompatible_best_selection_metric(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    checkpoint_metric: str | None,
+) -> None:
+    monkeypatch.setattr(
+        "sion_translate.training.trainer.export_inference_models",
+        lambda *args, **kwargs: None,
+    )
+    config = tiny_app_config(tmp_path, max_steps=1, ema_decay=0.0)
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+    train(
+        SionForConditionalGeneration(config.model),
+        [tiny_batch()],
+        [tiny_batch()],
+        config,
+        context,
+    )
+    latest_path = tmp_path / "run" / "checkpoints" / "latest"
+    checkpoint_file = latest_path / "checkpoint.pt"
+    payload = torch.load(checkpoint_file, map_location="cpu", weights_only=True)
+    state = payload["training_state"]
+    assert state["configured_selection_metric"] == "macro_direction_nll"
+    assert state["best_selection_metric"] == "validation_nll"
+    state["best_validation_loss"] = -100.0
+    state["best_step"] = 777
+    state["early_stopping_bad_evals"] = 99
+    if checkpoint_metric is None:
+        state.pop("configured_selection_metric", None)
+        state.pop("best_selection_metric", None)
+    else:
+        state["configured_selection_metric"] = checkpoint_metric
+        state["best_selection_metric"] = "validation_nll"
+    torch.save(payload, checkpoint_file)
+
+    config.training.max_steps = 2
+    config.training.resume_from = str(latest_path)
+    result = train(
+        SionForConditionalGeneration(config.model),
+        [tiny_batch()],
+        [tiny_batch()],
+        config,
+        context,
+    )
+
+    assert result["configured_selection_metric"] == "macro_direction_nll"
+    assert result["best_selection_metric"] == "validation_nll"
+    assert result["best_step"] == 2
+    assert result["early_stopping_bad_evals"] == 0
 
 
 def test_mid_epoch_resume_uses_saved_batch_cursor(
@@ -274,6 +474,33 @@ def test_tensorboard_writes_main_rank_scalars(tmp_path: Path) -> None:
     assert all(path.stat().st_size > 0 for path in event_files)
 
 
+def test_sft_json_log_exposes_native_auxiliary_diagnostics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    messages: list[str] = []
+    monkeypatch.setattr(trainer_module.tqdm, "write", lambda message: messages.append(str(message)))
+    monkeypatch.setattr(
+        "sion_translate.training.trainer.export_inference_models",
+        lambda *args, **kwargs: None,
+    )
+    config = tiny_app_config(tmp_path, ema_decay=0.0)
+    model = SionForConditionalGeneration(config.model)
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+
+    train(model, [tiny_batch()], [tiny_batch()], config, context)
+
+    json_records = [json.loads(message) for message in messages if message.startswith("{")]
+    train_record = next(record for record in json_records if "learning_rate" in record)
+    assert {
+        "uncertainty_loss",
+        "evidence_budget_loss",
+        "evidence_request_rate",
+        "semantic_parity_loss",
+        "semantic_parity_score",
+    } <= train_record.keys()
+
+
 def test_empty_training_loader_fails_fast(tmp_path: Path) -> None:
     config = tiny_app_config(tmp_path)
     model = SionForConditionalGeneration(config.model)
@@ -374,6 +601,8 @@ def test_mrt_posttraining_objective_and_stage_save(tmp_path: Path) -> None:
     )
     assert result["step"] == 1
     assert 0.0 <= result["best_validation_reward"] <= 1.0
+    assert result["configured_selection_metric"] == "validation_reward"
+    assert result["best_selection_metric"] == "validation_ema_reward"
     assert (tmp_path / "run" / "posttrain" / "checkpoints" / "final" / "checkpoint.pt").exists()
     assert (tmp_path / "run" / "posttrain" / "exports" / "latest" / "model_ema.pt").exists()
 

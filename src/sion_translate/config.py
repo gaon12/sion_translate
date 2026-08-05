@@ -31,6 +31,18 @@ class ExperimentalConfig:
     morphoscript_enabled: bool = False
     morphoscript_interval: int = 4
     script_classes: int = 9
+    # Decoder가 불확실한 위치에서 encoder evidence를 한 번 더 조회하고,
+    # 요청 비율이 무제한으로 커지지 않도록 uncertainty/budget loss로 제어합니다.
+    evidence_repair_enabled: bool = False
+    evidence_uncertainty_loss_weight: float = 0.02
+    evidence_budget_loss_weight: float = 0.001
+    evidence_budget_target: float = 0.25
+    # 원문/정답의 pooled semantic representation을 대조 학습해 직역 표면형이
+    # 달라도 의미가 보존되도록 하는 보조 목적입니다.
+    semantic_parity_enabled: bool = False
+    semantic_parity_dim: int = 256
+    semantic_parity_temperature: float = 0.07
+    semantic_parity_loss_weight: float = 0.05
     # 공유 블록 반복(latent reasoning): 인코더 마지막 N개 층을 같은 가중치로
     # 여러 번 통과시켜, 파라미터를 늘리지 않고 깊이만 늘립니다. 명시적 사고
     # 토큰 없이 hidden state 안에서 추가 계산을 하게 하는 구조입니다.
@@ -69,9 +81,12 @@ class ExperimentalConfig:
             ("tetm_modes", self.tetm_modes),
             ("morphoscript_interval", self.morphoscript_interval),
             ("script_classes", self.script_classes),
+            ("semantic_parity_dim", self.semantic_parity_dim),
         ):
             if value <= 0:
                 raise ValueError(f"experimental.{name} must be positive")
+        if self.semantic_parity_temperature <= 0:
+            raise ValueError("experimental.semantic_parity_temperature must be positive")
         if self.tetm_enabled and self.tetm_types < 9:
             raise ValueError(
                 "experimental.tetm_types must be at least 9 when TETM is enabled "
@@ -86,9 +101,14 @@ class ExperimentalConfig:
             ("bats_loss_weight", self.bats_loss_weight),
             ("bats_coverage_weight", self.bats_coverage_weight),
             ("register_loss_weight", self.register_loss_weight),
+            ("evidence_uncertainty_loss_weight", self.evidence_uncertainty_loss_weight),
+            ("evidence_budget_loss_weight", self.evidence_budget_loss_weight),
+            ("semantic_parity_loss_weight", self.semantic_parity_loss_weight),
         ):
             if value < 0:
                 raise ValueError(f"experimental.{name} must be non-negative")
+        if not 0.0 <= self.evidence_budget_target <= 1.0:
+            raise ValueError("experimental.evidence_budget_target must be in [0, 1]")
 
         # 모듈을 켜 두고 그 보조 손실 가중치를 모두 0으로 두면 파라미터와 순전파
         # 비용만 늘고 학습 신호는 없습니다. 조용히 낭비되므로 알려 줍니다.
@@ -292,6 +312,10 @@ class TrainingConfig:
     save_every: int = 500
     early_stopping_patience: int = 5
     early_stopping_min_delta: float = 0.0
+    # SFT best/early stopping 기준. 방향별 token NLL을 같은 비중으로 평균하면
+    # 데이터가 많은 방향이 적은 방향의 품질 저하를 평균값으로 가리지 못합니다.
+    # 방향 메타데이터가 없는 custom caller에서는 trainer가 global NLL로 fallback합니다.
+    sft_selection_metric: str = "macro_direction_nll"
     # 가중치 지수이동평균(EMA). 매 step 뒤 shadow 가중치를
     # shadow = decay*shadow + (1-decay)*param 으로 갱신합니다.
     # 번역 모델에서 검증 loss/BLEU 를 안정적으로 개선하는 검증된 기법입니다.
@@ -498,6 +522,16 @@ class AppConfig:
             raise ValueError("early_stopping_patience must be non-negative")
         if self.training.early_stopping_min_delta < 0:
             raise ValueError("early_stopping_min_delta must be non-negative")
+        supported_sft_selection_metrics = {
+            "global_nll",
+            "macro_direction_nll",
+            "worst_direction_nll",
+        }
+        if self.training.sft_selection_metric.lower() not in supported_sft_selection_metrics:
+            raise ValueError(
+                "sft_selection_metric must be one of: "
+                + ", ".join(sorted(supported_sft_selection_metrics))
+            )
         if not 0.0 <= self.training.ema_decay < 1.0:
             raise ValueError("ema_decay must be in [0, 1)")
         supported_export_formats = {
@@ -590,6 +624,33 @@ class AppConfig:
             raise ValueError("posttraining.warmup_steps must be between 0 and max_steps")
         if post.early_stopping_patience < 0:
             raise ValueError("posttraining.early_stopping_patience must be non-negative")
+
+    def validate_training_supervision(
+        self,
+        *,
+        alignment_targets_available: bool,
+    ) -> None:
+        """Validate losses whose labels are supplied by the training pipeline.
+
+        ``ModelConfig`` deliberately permits a positive BATS alignment weight:
+        research callers can pass ``alignment_targets`` directly to the model.
+        The built-in collator does not create those dense alignment matrices,
+        however, so the standard CLI must reject that configuration instead of
+        silently optimizing a permanently-zero alignment loss.
+        """
+
+        experimental = self.model.experimental
+        if (
+            experimental.bats_enabled
+            and experimental.bats_loss_weight > 0
+            and not alignment_targets_available
+        ):
+            raise ValueError(
+                "experimental.bats_loss_weight is positive, but this training pipeline "
+                "does not provide alignment_targets. Set bats_loss_weight=0, add an "
+                "alignment-aware collator/training caller, or explicitly validate the "
+                "custom pipeline with alignment_targets_available=True."
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

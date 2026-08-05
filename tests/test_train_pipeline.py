@@ -9,6 +9,7 @@ import torch
 import sion_translate.cli.train as train_module
 import sion_translate.training.distributed as distributed_module
 from sion_translate.cli.train import (
+    build_collator_args,
     construct_training_model,
     dataloader_runtime_kwargs,
     export_final_model,
@@ -71,6 +72,28 @@ def test_dataloader_runtime_settings_separate_training_and_validation() -> None:
         "prefetch_factor": 2,
     }
     assert single_process == {"num_workers": 0, "pin_memory": False}
+
+
+def test_collator_pipeline_passes_configured_source_only_languages() -> None:
+    config = config_from_raw(
+        {
+            "data": {
+                "language_pairs": [
+                    ["kj", "ko"],
+                    ["kj", "ja"],
+                    ["kd", "ko"],
+                    ["jd", "ja"],
+                    ["ko", "ja"],
+                ],
+                "source_only_languages": ["kj", "kd", "jd"],
+            }
+        }
+    )
+    tokenizer = SimpleNamespace()
+
+    args = build_collator_args(config, tokenizer)  # type: ignore[arg-type]
+
+    assert args["source_only_languages"] == ("kj", "kd", "jd")
 
 
 def test_final_export_dependency_preflight_fails_before_training(

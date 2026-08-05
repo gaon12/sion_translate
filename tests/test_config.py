@@ -45,6 +45,40 @@ def test_no_bats_warning_when_module_is_disabled() -> None:
     assert _warnings_from(ExperimentalConfig(bats_enabled=False)) == []
 
 
+def test_builtin_training_contract_rejects_unsupplied_bats_alignments() -> None:
+    config = AppConfig()
+    config.model.experimental = ExperimentalConfig(
+        bats_enabled=True,
+        bats_loss_weight=0.05,
+        bats_coverage_weight=0.0,
+    )
+
+    with pytest.raises(ValueError, match="alignment_targets"):
+        config.validate_training_supervision(alignment_targets_available=False)
+
+
+def test_custom_alignment_provider_can_enable_bats_alignment_loss() -> None:
+    config = AppConfig()
+    config.model.experimental = ExperimentalConfig(
+        bats_enabled=True,
+        bats_loss_weight=0.05,
+        bats_coverage_weight=0.0,
+    )
+
+    config.validate_training_supervision(alignment_targets_available=True)
+
+
+def test_bats_coverage_only_needs_no_external_alignment_labels() -> None:
+    config = AppConfig()
+    config.model.experimental = ExperimentalConfig(
+        bats_enabled=True,
+        bats_loss_weight=0.0,
+        bats_coverage_weight=0.01,
+    )
+
+    config.validate_training_supervision(alignment_targets_available=False)
+
+
 def test_warns_when_core_is_enabled_without_register_loss_weight() -> None:
     messages = _warnings_from(ExperimentalConfig(core_enabled=True, register_loss_weight=0.0))
     assert len(messages) == 1
@@ -101,6 +135,44 @@ def test_root_config_keeps_the_experimental_surface_small() -> None:
 def test_negative_loss_weight_is_still_an_error() -> None:
     with pytest.raises(ValueError, match="bats_loss_weight"):
         ExperimentalConfig(bats_loss_weight=-0.1).validate()
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "evidence_uncertainty_loss_weight",
+        "evidence_budget_loss_weight",
+        "semantic_parity_loss_weight",
+    ),
+)
+def test_new_auxiliary_loss_weights_must_be_non_negative(field: str) -> None:
+    config = ExperimentalConfig()
+    setattr(config, field, -0.1)
+    with pytest.raises(ValueError, match=field):
+        config.validate()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("semantic_parity_dim", 0),
+        ("semantic_parity_temperature", 0.0),
+    ),
+)
+def test_semantic_parity_shape_and_temperature_must_be_positive(
+    field: str,
+    value: float,
+) -> None:
+    config = ExperimentalConfig()
+    setattr(config, field, value)
+    with pytest.raises(ValueError, match=field):
+        config.validate()
+
+
+@pytest.mark.parametrize("target", (-0.01, 1.01))
+def test_evidence_budget_target_must_be_a_probability(target: float) -> None:
+    with pytest.raises(ValueError, match="evidence_budget_target"):
+        ExperimentalConfig(evidence_budget_target=target).validate()
 
 
 @pytest.mark.parametrize("field", ("situglu_gate_beta", "situglu_up_beta"))
@@ -202,6 +274,23 @@ def test_padding_multiple_must_be_positive() -> None:
     config = AppConfig()
     config.data.pad_to_multiple_of = 0
     with pytest.raises(ValueError, match="pad_to_multiple_of"):
+        config.validate()
+
+
+@pytest.mark.parametrize(
+    "metric",
+    ("global_nll", "macro_direction_nll", "worst_direction_nll"),
+)
+def test_supported_sft_selection_metrics_are_valid(metric: str) -> None:
+    config = AppConfig()
+    config.training.sft_selection_metric = metric
+    config.validate()
+
+
+def test_unknown_sft_selection_metric_is_rejected() -> None:
+    config = AppConfig()
+    config.training.sft_selection_metric = "bleu"
+    with pytest.raises(ValueError, match="sft_selection_metric"):
         config.validate()
 
 
