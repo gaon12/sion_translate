@@ -109,6 +109,8 @@ class SionOutput:
     uncertainty_loss: torch.Tensor | None = None
     evidence_budget_loss: torch.Tensor | None = None
     evidence_request_rate: torch.Tensor | None = None
+    evidence_repair_gain_loss: torch.Tensor | None = None
+    evidence_repair_gain: torch.Tensor | None = None
     semantic_parity_loss: torch.Tensor | None = None
     semantic_parity_score: torch.Tensor | None = None
 
@@ -455,13 +457,21 @@ class SionForConditionalGeneration(nn.Module):
             memory_mode_ids=memory_mode_ids,
         )
         pre_repair_error_targets = None
+        pre_repair_token_nll = None
         if labels is not None and self.evidence_repair is not None:
             # Supervise "should I re-read?" from the base decoder, before the
             # request itself can change the answer. A post-repair target is
             # self-negating: once a useful repair fixes a token it would teach
             # the gate that the successful request should not have happened.
             with torch.no_grad():
-                pre_repair_error_targets = self._logits(decoder_states).argmax(-1).ne(labels)
+                pre_repair_logits = self._logits(decoder_states).float()
+                pre_repair_error_targets = pre_repair_logits.argmax(-1).ne(labels)
+                pre_repair_token_nll = F.cross_entropy(
+                    pre_repair_logits.transpose(1, 2),
+                    labels,
+                    ignore_index=-100,
+                    reduction="none",
+                )
         decoder_states, uncertainty_logits, evidence_requests = self._apply_evidence_repair(
             decoder_states,
             encoder_states,
@@ -511,6 +521,8 @@ class SionForConditionalGeneration(nn.Module):
         uncertainty_loss = logits.new_zeros(())
         evidence_budget_loss = logits.new_zeros(())
         evidence_request_rate = logits.new_zeros(())
+        evidence_repair_gain_loss = logits.new_zeros(())
+        evidence_repair_gain = logits.new_zeros(())
         semantic_parity_loss = logits.new_zeros(())
         semantic_parity_score = logits.new_zeros(())
         exp = self.config.experimental
@@ -535,6 +547,7 @@ class SionForConditionalGeneration(nn.Module):
         target_mask = labels.ne(-100)
         if uncertainty_logits is not None and evidence_requests is not None:
             assert pre_repair_error_targets is not None
+            assert pre_repair_token_nll is not None
             # The detached pre-repair argmax is a stable error map; the repair
             # proposal itself remains trained by the final LM loss.
             error_targets = pre_repair_error_targets.to(logits.dtype)
@@ -548,13 +561,28 @@ class SionForConditionalGeneration(nn.Module):
             evidence_request_rate = (evidence_requests * valid).sum() / valid.sum().clamp_min(1.0)
             has_target = target_mask.any().to(logits.dtype)
             evidence_budget_loss = (
-                evidence_request_rate - exp.evidence_budget_target
-            ).square() * has_target
+                F.relu(evidence_request_rate - exp.evidence_budget_target).square() * has_target
+            )
+            post_repair_token_nll = F.cross_entropy(
+                logits.float().transpose(1, 2),
+                labels,
+                ignore_index=-100,
+                reduction="none",
+            )
+            token_gain = (pre_repair_token_nll - post_repair_token_nll).detach()
+            evidence_repair_gain = (token_gain * valid).sum() / valid.sum().clamp_min(1.0)
+            unproductive_request_cost = F.relu(exp.evidence_minimum_gain - token_gain)
+            evidence_repair_gain_loss = (
+                evidence_requests * unproductive_request_cost * valid
+            ).sum() / valid.sum().clamp_min(1.0)
             auxiliary_loss = auxiliary_loss + (
                 exp.evidence_uncertainty_loss_weight * uncertainty_loss
             )
             auxiliary_loss = auxiliary_loss + (
                 exp.evidence_budget_loss_weight * evidence_budget_loss
+            )
+            auxiliary_loss = auxiliary_loss + (
+                exp.evidence_repair_gain_loss_weight * evidence_repair_gain_loss
             )
 
         if self.semantic_parity is not None:
@@ -581,6 +609,8 @@ class SionForConditionalGeneration(nn.Module):
             uncertainty_loss=uncertainty_loss,
             evidence_budget_loss=evidence_budget_loss,
             evidence_request_rate=evidence_request_rate,
+            evidence_repair_gain_loss=evidence_repair_gain_loss,
+            evidence_repair_gain=evidence_repair_gain,
             semantic_parity_loss=semantic_parity_loss,
             semantic_parity_score=semantic_parity_score,
         )

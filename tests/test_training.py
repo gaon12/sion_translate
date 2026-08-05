@@ -496,6 +496,8 @@ def test_sft_json_log_exposes_native_auxiliary_diagnostics(
         "uncertainty_loss",
         "evidence_budget_loss",
         "evidence_request_rate",
+        "evidence_repair_gain_loss",
+        "evidence_repair_gain",
         "semantic_parity_loss",
         "semantic_parity_score",
     } <= train_record.keys()

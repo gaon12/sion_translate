@@ -142,6 +142,7 @@ def test_negative_loss_weight_is_still_an_error() -> None:
     (
         "evidence_uncertainty_loss_weight",
         "evidence_budget_loss_weight",
+        "evidence_repair_gain_loss_weight",
         "semantic_parity_loss_weight",
     ),
 )
@@ -173,6 +174,11 @@ def test_semantic_parity_shape_and_temperature_must_be_positive(
 def test_evidence_budget_target_must_be_a_probability(target: float) -> None:
     with pytest.raises(ValueError, match="evidence_budget_target"):
         ExperimentalConfig(evidence_budget_target=target).validate()
+
+
+def test_evidence_minimum_gain_must_be_non_negative() -> None:
+    with pytest.raises(ValueError, match="evidence_minimum_gain"):
+        ExperimentalConfig(evidence_minimum_gain=-0.01).validate()
 
 
 @pytest.mark.parametrize("field", ("situglu_gate_beta", "situglu_up_beta"))

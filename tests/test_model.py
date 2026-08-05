@@ -134,6 +134,8 @@ def test_evidence_repair_and_semantic_parity_are_trainable_and_cached() -> None:
     assert output.uncertainty_loss.item() > 0
     assert output.evidence_budget_loss.item() >= 0
     assert 0 <= output.evidence_request_rate.item() <= 1
+    assert torch.isfinite(output.evidence_repair_gain_loss)
+    assert torch.isfinite(output.evidence_repair_gain)
     assert torch.isfinite(output.semantic_parity_loss)
     assert -1 <= output.semantic_parity_score.item() <= 1
     output.loss.backward()
@@ -152,6 +154,8 @@ def test_evidence_repair_and_semantic_parity_are_trainable_and_cached() -> None:
     assert empty_output.uncertainty_loss.item() == 0.0
     assert empty_output.evidence_budget_loss.item() == 0.0
     assert empty_output.evidence_request_rate.item() == 0.0
+    assert empty_output.evidence_repair_gain_loss.item() == 0.0
+    assert empty_output.evidence_repair_gain.item() == 0.0
     assert empty_output.semantic_parity_loss.item() == 0.0
     assert torch.isfinite(empty_output.loss)
 
@@ -231,6 +235,8 @@ def test_evidence_uncertainty_targets_pre_repair_errors() -> None:
     )
     assert logits_calls == 2
     torch.testing.assert_close(output.uncertainty_loss, expected)
+    assert output.evidence_repair_gain.item() > 0
+    assert output.evidence_repair_gain_loss.item() == 0.0
 
 
 def test_situglu_bounds_activations_and_keeps_swiglu_state_compatible() -> None:

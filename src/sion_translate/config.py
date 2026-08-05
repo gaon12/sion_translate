@@ -37,6 +37,8 @@ class ExperimentalConfig:
     evidence_uncertainty_loss_weight: float = 0.02
     evidence_budget_loss_weight: float = 0.001
     evidence_budget_target: float = 0.25
+    evidence_repair_gain_loss_weight: float = 0.005
+    evidence_minimum_gain: float = 0.01
     # 원문/정답의 pooled semantic representation을 대조 학습해 직역 표면형이
     # 달라도 의미가 보존되도록 하는 보조 목적입니다.
     semantic_parity_enabled: bool = False
@@ -103,12 +105,15 @@ class ExperimentalConfig:
             ("register_loss_weight", self.register_loss_weight),
             ("evidence_uncertainty_loss_weight", self.evidence_uncertainty_loss_weight),
             ("evidence_budget_loss_weight", self.evidence_budget_loss_weight),
+            ("evidence_repair_gain_loss_weight", self.evidence_repair_gain_loss_weight),
             ("semantic_parity_loss_weight", self.semantic_parity_loss_weight),
         ):
             if value < 0:
                 raise ValueError(f"experimental.{name} must be non-negative")
         if not 0.0 <= self.evidence_budget_target <= 1.0:
             raise ValueError("experimental.evidence_budget_target must be in [0, 1]")
+        if self.evidence_minimum_gain < 0:
+            raise ValueError("experimental.evidence_minimum_gain must be non-negative")
 
         # 모듈을 켜 두고 그 보조 손실 가중치를 모두 0으로 두면 파라미터와 순전파
         # 비용만 늘고 학습 신호는 없습니다. 조용히 낭비되므로 알려 줍니다.
