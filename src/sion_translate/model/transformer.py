@@ -454,6 +454,14 @@ class SionForConditionalGeneration(nn.Module):
             memory_type_ids=memory_type_ids,
             memory_mode_ids=memory_mode_ids,
         )
+        pre_repair_error_targets = None
+        if labels is not None and self.evidence_repair is not None:
+            # Supervise "should I re-read?" from the base decoder, before the
+            # request itself can change the answer. A post-repair target is
+            # self-negating: once a useful repair fixes a token it would teach
+            # the gate that the successful request should not have happened.
+            with torch.no_grad():
+                pre_repair_error_targets = self._logits(decoder_states).argmax(-1).ne(labels)
         decoder_states, uncertainty_logits, evidence_requests = self._apply_evidence_repair(
             decoder_states,
             encoder_states,
@@ -526,10 +534,10 @@ class SionForConditionalGeneration(nn.Module):
 
         target_mask = labels.ne(-100)
         if uncertainty_logits is not None and evidence_requests is not None:
-            # Error targets are detached: this branch learns to locate tokens
-            # that remain wrong after repair without backpropagating through an
-            # argmax decision. The repair proposal itself is trained by LM loss.
-            error_targets = logits.detach().argmax(-1).ne(labels).to(logits.dtype)
+            assert pre_repair_error_targets is not None
+            # The detached pre-repair argmax is a stable error map; the repair
+            # proposal itself remains trained by the final LM loss.
+            error_targets = pre_repair_error_targets.to(logits.dtype)
             valid = target_mask.to(logits.dtype)
             uncertainty_values = F.binary_cross_entropy_with_logits(
                 uncertainty_logits.float(),

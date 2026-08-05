@@ -172,6 +172,67 @@ def test_evidence_repair_and_semantic_parity_are_trainable_and_cached() -> None:
     assert generated.shape[0] == batch["input_ids"].shape[0]
 
 
+def test_evidence_uncertainty_targets_pre_repair_errors() -> None:
+    config = ModelConfig(
+        vocab_size=128,
+        d_model=32,
+        encoder_layers=1,
+        decoder_layers=1,
+        num_heads=4,
+        num_kv_heads=2,
+        d_ff=64,
+        max_seq_len=16,
+        dropout=0.0,
+        gradient_checkpointing=False,
+        experimental=ExperimentalConfig(evidence_repair_enabled=True),
+    )
+    model = SionForConditionalGeneration(config)
+    batch = make_batch()
+    logits_calls = 0
+
+    def controlled_logits(
+        _self: SionForConditionalGeneration,
+        hidden: torch.Tensor,
+    ) -> torch.Tensor:
+        nonlocal logits_calls
+        logits_calls += 1
+        logits = hidden.new_zeros((*hidden.shape[:-1], config.vocab_size))
+        if logits_calls == 1:
+            # Token 1 is wrong at every valid target position in this fixture.
+            logits[..., 1] = 4.0
+        else:
+            safe_labels = batch["labels"].clamp_min(0)
+            logits.scatter_(-1, safe_labels.unsqueeze(-1), 4.0)
+        return logits
+
+    def controlled_repair(
+        _self: SionForConditionalGeneration,
+        decoder_states: torch.Tensor,
+        encoder_states: torch.Tensor,
+        source_mask: torch.Tensor,
+        **_kwargs: object,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        del encoder_states, source_mask
+        uncertainty = decoder_states.new_full(decoder_states.shape[:-1], 2.0)
+        return decoder_states, uncertainty, uncertainty.sigmoid()
+
+    model._logits = types.MethodType(controlled_logits, model)
+    model._apply_evidence_repair = types.MethodType(controlled_repair, model)
+    output = model(
+        input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
+        decoder_input_ids=batch["decoder_input_ids"],
+        labels=batch["labels"],
+    )
+
+    expected = torch.nn.functional.binary_cross_entropy_with_logits(
+        torch.tensor(2.0),
+        torch.tensor(1.0),
+    )
+    assert logits_calls == 2
+    torch.testing.assert_close(output.uncertainty_loss, expected)
+
+
 def test_situglu_bounds_activations_and_keeps_swiglu_state_compatible() -> None:
     torch.manual_seed(11)
     swiglu = SwiGLU(8, 16, 0.0)
