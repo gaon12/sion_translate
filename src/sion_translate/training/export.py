@@ -454,6 +454,8 @@ def build_export_metadata(
         "core": bool(experimental.core_enabled),
         "tetm": bool(experimental.tetm_enabled),
         "morphoscript": bool(experimental.morphoscript_enabled),
+        "evidence_repair": bool(experimental.evidence_repair_enabled),
+        "semantic_parity": bool(experimental.semantic_parity_enabled),
         "situglu": bool(experimental.situglu_enabled),
         "recurrent_block": bool(
             getattr(

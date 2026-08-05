@@ -250,6 +250,17 @@ def test_export_metadata_records_tokenizer_hash(tmp_path: Path) -> None:
     assert metadata["capabilities"]["revision_trained"] is True
 
 
+def test_export_metadata_records_evidence_and_parity_architecture() -> None:
+    config = export_config()
+    config.experimental.evidence_repair_enabled = True
+    config.experimental.semantic_parity_enabled = True
+
+    metadata = build_export_metadata(config)
+
+    assert metadata["feature_flags"]["evidence_repair"] is True
+    assert metadata["feature_flags"]["semantic_parity"] is True
+
+
 def test_export_metadata_records_exact_trained_translation_directions() -> None:
     metadata = build_export_metadata(
         export_config(),

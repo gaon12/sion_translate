@@ -114,6 +114,8 @@ def make_translator(
             "core": config.experimental.core_enabled,
             "tetm": config.experimental.tetm_enabled,
             "morphoscript": config.experimental.morphoscript_enabled,
+            "evidence_repair": config.experimental.evidence_repair_enabled,
+            "semantic_parity": config.experimental.semantic_parity_enabled,
             "situglu": config.experimental.situglu_enabled,
             "recurrent_block": False,
         },
