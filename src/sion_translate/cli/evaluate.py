@@ -180,7 +180,7 @@ def main() -> None:
         chrf, bleu, tokenize = score_translations(
             hypotheses, references, target_language=target_language
         )
-        number_result = number_preservation_details(hypotheses, references)
+        number_result = number_preservation_details(hypotheses, sources=sources)
         results.append(
             DirectionResult(
                 system="sion",
@@ -225,7 +225,7 @@ def main() -> None:
             chrf, bleu, tokenize = score_translations(
                 hypotheses, references, target_language=target_language
             )
-            number_result = number_preservation_details(hypotheses, references)
+            number_result = number_preservation_details(hypotheses, sources=sources)
             results.append(
                 DirectionResult(
                     system=name,

@@ -189,6 +189,7 @@ def score_systems(
     results: list[DirectionResult] = []
     for system_name, translations in systems.items():
         for (source_language, target_language), direction_cases in directions.items():
+            sources = [case.source for case in direction_cases]
             hypotheses = [translations[case.id] for case in direction_cases]
             references = [case.reference for case in direction_cases]
             chrf, bleu, tokenize = score_translations(
@@ -196,7 +197,7 @@ def score_systems(
                 references,
                 target_language=target_language,
             )
-            number_result = number_preservation_details(hypotheses, references)
+            number_result = number_preservation_details(hypotheses, sources=sources)
             results.append(
                 DirectionResult(
                     system=system_name,
@@ -228,6 +229,7 @@ def score_system_categories(
     results: list[CategoryResult] = []
     for system_name, translations in systems.items():
         for (source_language, target_language, category), group_cases in groups.items():
+            sources = [case.source for case in group_cases]
             hypotheses = [translations[case.id] for case in group_cases]
             references = [case.reference for case in group_cases]
             chrf, bleu, tokenize = score_translations(
@@ -235,7 +237,7 @@ def score_system_categories(
                 references,
                 target_language=target_language,
             )
-            number_result = number_preservation_details(hypotheses, references)
+            number_result = number_preservation_details(hypotheses, sources=sources)
             results.append(
                 CategoryResult(
                     system=system_name,

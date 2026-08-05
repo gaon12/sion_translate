@@ -104,31 +104,37 @@ class NumberPreservationResult:
 
 def number_preservation_details(
     hypotheses: Sequence[str],
-    references: Sequence[str],
+    sources: Sequence[str],
 ) -> NumberPreservationResult:
-    """숫자 관련 문장만을 분모로 보존율과 환각 횟수를 계산합니다.
+    """원문 숫자의 보존율과 번역문이 발명한 숫자의 문장 수를 계산합니다.
 
     숫자가 없는 깨끗한 문장을 정답으로 대량 집계하면 실제 숫자 오역이
-    희석됩니다. 대신 reference 또는 hypothesis 어느 한쪽에라도 숫자가 있는
-    문장만 ``samples``에 포함하고, reference에 없던 숫자가 생성된 문장은
-    ``inventions``로 별도 집계합니다.
+    희석됩니다. 대신 source 또는 hypothesis 어느 한쪽에라도 숫자가 있는
+    문장만 ``samples``에 포함합니다. ``inventions``는 hypothesis의 숫자
+    multiset에 source보다 많은 값이 하나라도 있는 문장의 수입니다.
+
+    Reference는 chrF/BLEU처럼 번역 품질을 채점하는 데 사용하며 이 함수의
+    보존 기준이 아닙니다. 숫자·단위처럼 원문에서 유지해야 하는 값은 source와
+    hypothesis를 직접 비교해야 reference의 표기 변환이나 오류에 좌우되지 않습니다.
     """
 
-    if len(hypotheses) != len(references):
-        raise ValueError(f"번역문 {len(hypotheses)}개와 정답 {len(references)}개의 수가 다릅니다")
+    if len(hypotheses) != len(sources):
+        raise ValueError(f"번역문 {len(hypotheses)}개와 원문 {len(sources)}개의 수가 다릅니다")
 
     scores: list[float] = []
     exact = 0
     inventions = 0
-    for hypothesis, reference in zip(hypotheses, references, strict=True):
-        expected = numeric_tokens(reference)
+    for hypothesis, source in zip(hypotheses, sources, strict=True):
+        expected = numeric_tokens(source)
         actual = numeric_tokens(hypothesis)
         if not expected and not actual:
             continue
         scores.append(multiset_f1(expected, actual))
-        if Counter(expected) == Counter(actual):
+        expected_counts = Counter(expected)
+        actual_counts = Counter(actual)
+        if expected_counts == actual_counts:
             exact += 1
-        if not expected and actual:
+        if actual_counts - expected_counts:
             inventions += 1
 
     if not scores:
@@ -143,15 +149,16 @@ def number_preservation_details(
 
 def number_preservation(
     hypotheses: Sequence[str],
-    references: Sequence[str],
+    sources: Sequence[str],
 ) -> tuple[float, int]:
     """하위 호환용 ``(숫자 F1, 숫자 일치 문장 수)`` 요약을 반환합니다.
 
-    두 값 모두 숫자 관련 문장에 한정됩니다. 보고서에서 정확한 분모와 숫자
-    환각 횟수가 필요하면 :func:`number_preservation_details`를 사용하십시오.
+    Hypothesis를 source와 직접 비교하며 두 값 모두 숫자 관련 문장에 한정됩니다.
+    보고서에서 정확한 분모와 숫자 환각 횟수가 필요하면
+    :func:`number_preservation_details`를 사용하십시오.
     """
 
-    result = number_preservation_details(hypotheses, references)
+    result = number_preservation_details(hypotheses, sources=sources)
     return result.f1, result.exact
 
 
@@ -167,8 +174,8 @@ class DirectionResult:
     bleu_tokenize: str  # BLEU 토큰화 방식 (재현성 기록용)
     number_f1: float = 0.0  # 숫자 보존 F1 평균 (0~100)
     number_exact: int = 0  # 숫자가 모두 일치한 문장 수
-    number_samples: int = 0  # reference/hypothesis 중 숫자가 있는 문장 수
-    number_inventions: int = 0  # reference에 없던 숫자를 생성한 문장 수
+    number_samples: int = 0  # source/hypothesis 중 숫자가 있는 문장 수
+    number_inventions: int = 0  # source보다 많은 숫자를 생성한 문장 수
 
 
 def score_translations(

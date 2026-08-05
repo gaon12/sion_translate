@@ -132,6 +132,50 @@ def test_score_and_report_multiple_systems(tmp_path: Path) -> None:
     assert (tmp_path / "comparison.md").exists()
 
 
+def test_number_preservation_uses_source_in_aggregate_and_category_scores(tmp_path: Path) -> None:
+    path = tmp_path / "numeric-cases.jsonl"
+    _write_jsonl(
+        path,
+        [
+            {
+                "id": "spelled-out-reference",
+                "source_language": "ko",
+                "target_language": "ja",
+                "category": "numbers",
+                "source": "수량은 1개입니다.",
+                "reference": "数量は一つです。",
+            },
+            {
+                "id": "additional-invention",
+                "source_language": "ko",
+                "target_language": "ja",
+                "category": "numbers",
+                "source": "수량은 1개입니다.",
+                "reference": "数量は1個です。",
+            },
+        ],
+    )
+    cases = load_comparison_cases(path)
+    systems = {
+        "candidate": {
+            "spelled-out-reference": "数量は1個です。",
+            "additional-invention": "数量は1個で、価格は999円です。",
+        }
+    }
+
+    aggregate = score_systems(cases, systems)[0]
+    category = score_system_categories(cases, systems)[0]
+
+    assert 0.0 < aggregate.number_f1 < 100.0
+    assert aggregate.number_exact == 1
+    assert aggregate.number_samples == 2
+    assert aggregate.number_inventions == 1
+    assert 0.0 < category.number_f1 < 100.0
+    assert category.number_exact == 1
+    assert category.number_samples == 2
+    assert category.number_inventions == 1
+
+
 def test_category_scoring_is_additive_and_preserves_aggregate_callers() -> None:
     cases = load_comparison_cases(REPOSITORY_ROOT / "examples" / "expressive_cultural_cases.jsonl")
     translations = {case.id: case.reference for case in cases}

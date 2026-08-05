@@ -150,7 +150,7 @@ def test_structured_tokens_share_the_reversible_protection_parser() -> None:
 
 def test_number_preservation_catches_altered_values() -> None:
     # 실제 관측된 오역: 용량과 금액이 그럴듯한 다른 값으로 바뀐다.
-    references = [
+    sources = [
         "1회 250mg씩 복용하세요.",
         "합계 금액은 38,720엔입니다.",
         "48시간 이상 간격을 두세요.",
@@ -160,47 +160,48 @@ def test_number_preservation_catches_altered_values() -> None:
         "합계 금액은 38,000엔입니다.",
         "48시간 이상 간격을 두세요.",
     ]
-    f1, exact = number_preservation(corrupted, references)
+    f1, exact = number_preservation(corrupted, sources)
     assert exact == 1
     assert f1 < 70.0
 
-    perfect_f1, perfect_exact = number_preservation(references, references)
+    perfect_f1, perfect_exact = number_preservation(sources, sources)
     assert perfect_f1 == pytest.approx(100.0)
-    assert perfect_exact == len(references)
+    assert perfect_exact == len(sources)
 
 
 def test_number_preservation_scores_missing_and_invented_numbers() -> None:
     # 누락(재현율)과 환각(정밀도)이 모두 F1 을 낮춰야 한다.
-    dropped = number_preservation(["금액은 미정입니다."], ["금액은 38,720엔입니다."])[0]
+    dropped = number_preservation(["금액은 미정입니다."], sources=["금액은 38,720엔입니다."])[0]
     invented = number_preservation(
-        ["금액은 38,720엔이고 수량은 50개입니다."], ["금액은 38,720엔입니다."]
+        ["금액은 38,720엔이고 수량은 50개입니다."],
+        sources=["금액은 38,720엔입니다."],
     )[0]
     assert dropped == pytest.approx(0.0)
     assert 0.0 < invented < 100.0
 
 
 def test_number_preservation_treats_numberless_pairs_as_clean() -> None:
-    f1, exact = number_preservation(["번역문입니다."], ["정답 문장입니다."])
+    f1, exact = number_preservation(["번역문입니다."], sources=["원문입니다."])
     assert f1 == pytest.approx(100.0)
     assert exact == 0
 
 
 def test_number_preservation_does_not_dilute_numeric_failures() -> None:
     hypotheses = ["숫자 없는 번역"] * 19 + ["용량은 1200mg입니다."]
-    references = ["숫자 없는 정답"] * 19 + ["용량은 250mg입니다."]
+    sources = ["숫자 없는 원문"] * 19 + ["용량은 250mg입니다."]
 
-    result = number_preservation_details(hypotheses, references)
+    result = number_preservation_details(hypotheses, sources=sources)
 
     assert result.f1 == pytest.approx(0.0)
     assert result.exact == 0
     assert result.samples == 1
-    assert result.inventions == 0
+    assert result.inventions == 1
 
 
 def test_number_preservation_reports_invented_numbers_separately() -> None:
     result = number_preservation_details(
         ["금액은 38,720엔입니다."],
-        ["금액은 미정입니다."],
+        sources=["금액은 미정입니다."],
     )
 
     assert result.f1 == pytest.approx(0.0)
@@ -209,9 +210,21 @@ def test_number_preservation_reports_invented_numbers_separately() -> None:
     assert result.inventions == 1
 
 
+def test_number_preservation_reports_additional_invention_when_source_has_number() -> None:
+    result = number_preservation_details(
+        ["수량은 1개이고 가격은 999엔입니다."],
+        sources=["수량은 1개입니다."],
+    )
+
+    assert 0.0 < result.f1 < 100.0
+    assert result.exact == 0
+    assert result.samples == 1
+    assert result.inventions == 1
+
+
 def test_number_preservation_rejects_length_mismatch() -> None:
     with pytest.raises(ValueError, match="수가 다릅니다"):
-        number_preservation(["a"], ["a", "b"])
+        number_preservation(["a"], sources=["a", "b"])
 
 
 def test_results_saved_as_json_and_markdown(tmp_path: Path) -> None:
