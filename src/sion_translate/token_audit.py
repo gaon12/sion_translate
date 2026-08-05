@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 from collections import Counter
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Iterator, Sequence
 
 import numpy as np
 
@@ -22,6 +22,7 @@ from sion_translate.data.records import (
     languages_from_pairs,
     normalize_language_pairs,
 )
+from sion_translate.fingerprint import file_sha256
 from sion_translate.tokenizer import SionTokenizer, expand_inputs
 
 
@@ -33,6 +34,7 @@ def _frequency_summary(counts: np.ndarray, eligible: np.ndarray) -> dict[str, in
     values = counts[eligible]
     observed = values[values > 0]
     return {
+        "total_occurrences": int(values.sum(dtype=np.uint64)),
         "eligible_pieces": int(values.size),
         "observed_pieces": int(observed.size),
         "unused_pieces": int(np.count_nonzero(values == 0)),
@@ -42,6 +44,205 @@ def _frequency_summary(counts: np.ndarray, eligible: np.ndarray) -> dict[str, in
         "median_observed_count": float(np.median(observed)) if observed.size else 0.0,
         "p10_observed_count": float(np.percentile(observed, 10)) if observed.size else 0.0,
     }
+
+
+def _load_indexed_manifest(dataset_root: Path) -> dict[str, Any]:
+    manifest_path = dataset_root / "manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Indexed dataset manifest not found: {manifest_path}")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise ValueError(f"Invalid indexed dataset manifest: {manifest_path}") from error
+    if not isinstance(manifest, dict):
+        raise ValueError(f"Indexed dataset manifest must contain a JSON object: {manifest_path}")
+    return manifest
+
+
+def _indexed_tokenizer_identity(
+    manifest: dict[str, Any],
+    tokenizer_model: Path,
+) -> dict[str, str | bool | None]:
+    """Verify the tokenizer mapping when an indexed manifest has an identity."""
+
+    expected_sha256 = None
+    identity_source = None
+    fingerprint = manifest.get("fingerprint")
+    if isinstance(fingerprint, dict) and isinstance(fingerprint.get("tokenizer_sha256"), str):
+        expected_sha256 = fingerprint["tokenizer_sha256"].lower()
+        identity_source = "manifest.fingerprint.tokenizer_sha256"
+    else:
+        recorded_path = manifest.get("tokenizer_model")
+        if isinstance(recorded_path, str) and Path(recorded_path).is_file():
+            expected_sha256 = file_sha256(recorded_path).lower()
+            identity_source = "manifest.tokenizer_model"
+
+    actual_sha256 = file_sha256(tokenizer_model).lower()
+    if expected_sha256 is not None and actual_sha256 != expected_sha256:
+        raise ValueError(
+            "Tokenizer SHA-256 does not match the indexed dataset: "
+            f"{actual_sha256} != {expected_sha256}"
+        )
+    return {
+        "sha256": actual_sha256,
+        "verified_against_manifest": expected_sha256 is not None,
+        "identity_source": identity_source,
+    }
+
+
+def _indexed_languages(manifest: dict[str, Any], *, modern: bool) -> tuple[str, ...]:
+    raw_languages = manifest.get("languages")
+    if isinstance(raw_languages, list) and raw_languages:
+        languages = tuple(str(language) for language in raw_languages)
+    else:
+        raw_pair = manifest.get("language_pair", ["ko", "ja"])
+        if not isinstance(raw_pair, list) or len(raw_pair) != 2:
+            raise ValueError("Indexed dataset manifest has no valid language metadata")
+        languages = tuple(dict.fromkeys(str(language) for language in raw_pair))
+    if any(not language for language in languages) or len(set(languages)) != len(languages):
+        raise ValueError("Indexed dataset languages must be unique, non-empty strings")
+    if modern and len(languages) > np.iinfo(np.uint16).max:
+        raise ValueError("Indexed dataset has too many languages for uint16 language ids")
+    return languages
+
+
+def _row_blocks(lengths: np.ndarray, maximum_tokens: int = 4_000_000) -> Iterator[slice]:
+    """Yield row slices whose expanded token metadata stays memory-bounded."""
+
+    if len(lengths) == 0:
+        return
+    cumulative = np.cumsum(lengths, dtype=np.uint64)
+    start = 0
+    while start < len(lengths):
+        before = 0 if start == 0 else int(cumulative[start - 1])
+        end = int(np.searchsorted(cumulative, before + maximum_tokens, side="right"))
+        end = max(start + 1, end)
+        yield slice(start, min(end, len(lengths)))
+        start = end
+
+
+def _open_indexed_token_store(
+    path: Path,
+    offsets: np.ndarray,
+    lengths: np.ndarray,
+) -> np.ndarray:
+    if not path.is_file():
+        raise FileNotFoundError(f"Indexed token shard not found: {path}")
+    byte_size = path.stat().st_size
+    if byte_size % np.dtype(np.uint32).itemsize:
+        raise ValueError(f"Indexed token shard has a partial uint32 value: {path}")
+    token_count = byte_size // np.dtype(np.uint32).itemsize
+    expected_offsets = np.cumsum(
+        np.concatenate((np.zeros(1, dtype=np.uint64), lengths[:-1].astype(np.uint64))),
+        dtype=np.uint64,
+    )
+    if not np.array_equal(offsets.astype(np.uint64), expected_offsets):
+        raise ValueError(f"Indexed token offsets are not contiguous in {path}")
+    expected_tokens = int(lengths.sum(dtype=np.uint64))
+    if token_count != expected_tokens:
+        raise ValueError(
+            f"Indexed token count does not match its index in {path}: "
+            f"{token_count} != {expected_tokens}"
+        )
+    if token_count == 0:
+        return np.empty(0, dtype=np.uint32)
+    return np.memmap(path, dtype=np.uint32, mode="r")
+
+
+def _accumulate_indexed_side(
+    store: np.ndarray,
+    lengths: np.ndarray,
+    language_ids: np.ndarray,
+    target_rows: np.ndarray,
+    physical_counts: list[np.ndarray],
+    target_counts: list[np.ndarray],
+    *,
+    vocab_size: int,
+) -> None:
+    """Count a stored side once physically and when it is a decoder target."""
+
+    token_offset = 0
+    for block in _row_blocks(lengths):
+        block_lengths = lengths[block].astype(np.int64, copy=False)
+        block_size = int(block_lengths.sum(dtype=np.int64))
+        block_tokens = np.asarray(store[token_offset : token_offset + block_size])
+        token_offset += block_size
+        if block_size == 0:
+            continue
+        maximum_id = int(block_tokens.max(initial=0))
+        if maximum_id >= vocab_size:
+            raise ValueError(
+                f"Indexed token id {maximum_id} exceeds tokenizer vocabulary size {vocab_size}"
+            )
+        row_languages = language_ids[block]
+        row_targets = target_rows[block]
+        unique_languages = np.unique(row_languages)
+        if len(unique_languages) == 1:
+            language_id = int(unique_languages[0])
+            all_counts = np.bincount(
+                block_tokens.astype(np.int64, copy=False),
+                minlength=vocab_size,
+            ).astype(np.uint64, copy=False)
+            physical_counts[language_id] += all_counts
+            if bool(row_targets.all()):
+                target_counts[language_id] += all_counts
+            elif bool(row_targets.any()):
+                token_targets = np.repeat(row_targets, block_lengths)
+                decoder_tokens = block_tokens[token_targets].astype(np.int64, copy=False)
+                target_counts[language_id] += np.bincount(
+                    decoder_tokens,
+                    minlength=vocab_size,
+                ).astype(np.uint64, copy=False)
+            continue
+
+        token_languages = np.repeat(row_languages, block_lengths)
+        token_targets = None if bool(row_targets.all()) else np.repeat(row_targets, block_lengths)
+        for language_id in unique_languages:
+            language_mask = token_languages == language_id
+            language_tokens = block_tokens[language_mask].astype(np.int64, copy=False)
+            all_counts = np.bincount(
+                language_tokens,
+                minlength=vocab_size,
+            ).astype(np.uint64, copy=False)
+            physical_counts[int(language_id)] += all_counts
+            if token_targets is None:
+                target_counts[int(language_id)] += all_counts
+                continue
+            decoder_mask = language_mask & token_targets
+            if bool(decoder_mask.any()):
+                decoder_tokens = block_tokens[decoder_mask].astype(np.int64, copy=False)
+                target_counts[int(language_id)] += np.bincount(
+                    decoder_tokens,
+                    minlength=vocab_size,
+                ).astype(np.uint64, copy=False)
+
+
+def _add_direction_totals(
+    totals: dict[str, Counter[str]],
+    source_languages: np.ndarray,
+    target_languages: np.ndarray,
+    source_lengths: np.ndarray,
+    target_lengths: np.ndarray,
+    enabled: np.ndarray,
+    languages: Sequence[str],
+) -> int:
+    examples = 0
+    enabled_indices = np.flatnonzero(enabled)
+    if not enabled_indices.size:
+        return examples
+    pair_keys = source_languages[enabled_indices].astype(np.uint64) * np.uint64(
+        len(languages)
+    ) + target_languages[enabled_indices].astype(np.uint64)
+    for pair_key in np.unique(pair_keys):
+        selected = enabled_indices[pair_keys == pair_key]
+        source_id, target_id = divmod(int(pair_key), len(languages))
+        direction = f"{languages[source_id]}-{languages[target_id]}"
+        direction_totals = totals.setdefault(direction, Counter())
+        direction_totals["examples"] += len(selected)
+        direction_totals["source_tokens"] += int(source_lengths[selected].sum(dtype=np.uint64))
+        direction_totals["target_tokens"] += int(target_lengths[selected].sum(dtype=np.uint64))
+        examples += len(selected)
+    return examples
 
 
 def _rare_piece_examples(
@@ -235,6 +436,7 @@ def audit_token_exposure(
         language_reports[language] = {
             **{name: int(value) for name, value in totals.items()},
             "target_enabled": target_enabled,
+            "target_tokens": int(target_counts[language].sum(dtype=np.uint64)),
             "tokens_per_character": round(tokens / max(characters, 1), 6),
             "byte_fallback_rate": round(totals["byte_fallback_tokens"] / max(tokens, 1), 8),
             "target_frequency": target_summary,
@@ -264,6 +466,7 @@ def audit_token_exposure(
     # update at all. Per-language summaries remain corpus-conditioned so Japanese
     # pieces are not misleadingly labelled as unused Korean targets (and vice versa).
     global_summary = _frequency_summary(global_target, eligible)
+    global_summary["all_target_tokens"] = int(global_target.sum(dtype=np.uint64))
     global_summary["corpus_observed_pieces"] = int(np.count_nonzero(global_corpus_observed))
     global_summary["rare_threshold"] = rare_threshold
     global_summary["rare_observed_pieces"] = int(
@@ -298,4 +501,307 @@ def audit_token_exposure(
     }
 
 
-__all__ = ["audit_token_exposure"]
+def audit_indexed_token_exposure(
+    dataset_root: str | Path,
+    tokenizer_model: str | Path,
+    *,
+    split: str = "train",
+    bidirectional: bool = True,
+    rare_threshold: int = 25,
+    max_piece_examples: int = 50,
+) -> dict[str, Any]:
+    """Audit exact decoder-target exposure from already indexed token shards.
+
+    The scan follows the indexed dataset's virtual-direction semantics without
+    decoding or re-tokenizing text. Side B is a target for the stored forward
+    direction. Side A is additionally a target only when bidirectional loading
+    is enabled, the row is not ``forward_only``, and its language is not listed
+    as source-only in the manifest. Runtime-added BOS/EOS/language control tokens
+    are intentionally outside this content-piece audit.
+    """
+
+    if not split or split in {".", ".."} or Path(split).name != split:
+        raise ValueError("split must be one directory name")
+    if rare_threshold < 1:
+        raise ValueError("rare_threshold must be positive")
+    if max_piece_examples < 0:
+        raise ValueError("max_piece_examples must be non-negative")
+
+    root = Path(dataset_root)
+    manifest = _load_indexed_manifest(root)
+    tokenizer_path = Path(tokenizer_model)
+    tokenizer_identity = _indexed_tokenizer_identity(manifest, tokenizer_path)
+    split_root = root / split
+    index_paths = sorted(split_root.glob("*.idx.npy"))
+    if not index_paths:
+        raise FileNotFoundError(f"No index shards found under {split_root}")
+
+    first_index = np.load(index_paths[0], mmap_mode="r", allow_pickle=False)
+    first_fields = frozenset(first_index.dtype.names or ())
+    modern = {"src_offset", "src_length", "tgt_offset", "tgt_length"}.issubset(first_fields)
+    legacy = {"ko_offset", "ko_length", "ja_offset", "ja_length"}.issubset(first_fields)
+    if modern == legacy:
+        raise ValueError(
+            f"Unsupported indexed shard layout in {index_paths[0]}: {first_index.dtype.descr!r}"
+        )
+
+    languages = _indexed_languages(manifest, modern=modern)
+    language_to_id = {language: index for index, language in enumerate(languages)}
+    raw_source_only = manifest.get("source_only_languages", [])
+    if not isinstance(raw_source_only, list):
+        raise ValueError("Indexed dataset source_only_languages must be a list")
+    source_only = frozenset(str(value) for value in raw_source_only)
+    unknown_source_only = sorted(source_only - set(languages))
+    if unknown_source_only:
+        raise ValueError(
+            f"Indexed dataset manifest has unknown source-only languages: {unknown_source_only}"
+        )
+    source_only_ids = np.asarray(
+        [language_to_id[language] for language in source_only],
+        dtype=np.uint16,
+    )
+
+    if legacy:
+        raw_pair = manifest.get("language_pair", ["ko", "ja"])
+        if not isinstance(raw_pair, list) or len(raw_pair) != 2:
+            raise ValueError("Legacy indexed dataset requires a two-language language_pair")
+        legacy_pair = (str(raw_pair[0]), str(raw_pair[1]))
+        missing_pair_languages = sorted(set(legacy_pair) - set(languages))
+        if missing_pair_languages:
+            raise ValueError(
+                "Legacy indexed language_pair is absent from language metadata: "
+                f"{missing_pair_languages}"
+            )
+    else:
+        legacy_pair = None
+
+    tokenizer = SionTokenizer(tokenizer_path)
+    vocab_size = len(tokenizer)
+    physical_counts = [np.zeros(vocab_size, dtype=np.uint64) for _ in languages]
+    target_counts = [np.zeros(vocab_size, dtype=np.uint64) for _ in languages]
+    physical_sentences = np.zeros(len(languages), dtype=np.uint64)
+    direction_totals: dict[str, Counter[str]] = {}
+    physical_pairs = 0
+    virtual_examples = 0
+    forward_only_pairs = 0
+
+    for index_path in index_paths:
+        index = np.load(index_path, mmap_mode="r", allow_pickle=False)
+        fields = frozenset(index.dtype.names or ())
+        shard_modern = {"src_offset", "src_length", "tgt_offset", "tgt_length"}.issubset(fields)
+        shard_legacy = {"ko_offset", "ko_length", "ja_offset", "ja_length"}.issubset(fields)
+        if shard_modern != modern or shard_legacy != legacy:
+            raise ValueError(f"Indexed shard layouts are inconsistent at {index_path}")
+
+        row_count = len(index)
+        physical_pairs += row_count
+        if modern:
+            required_metadata = {"src_language_id", "tgt_language_id"}
+            if not required_metadata.issubset(fields):
+                raise ValueError(f"Modern indexed shard lacks language ids: {index_path}")
+            side_a_offsets = index["src_offset"]
+            side_a_lengths = index["src_length"]
+            side_b_offsets = index["tgt_offset"]
+            side_b_lengths = index["tgt_length"]
+            side_a_languages = index["src_language_id"].astype(np.uint16)
+            side_b_languages = index["tgt_language_id"].astype(np.uint16)
+            prefix = index_path.name.removesuffix(".idx.npy")
+            side_a_path = split_root / f"{prefix}.src.bin"
+            side_b_path = split_root / f"{prefix}.tgt.bin"
+        else:
+            assert legacy_pair is not None
+            side_a_offsets = index["ko_offset"]
+            side_a_lengths = index["ko_length"]
+            side_b_offsets = index["ja_offset"]
+            side_b_lengths = index["ja_length"]
+            side_a_languages = np.full(
+                row_count,
+                language_to_id[legacy_pair[0]],
+                dtype=np.uint16,
+            )
+            side_b_languages = np.full(
+                row_count,
+                language_to_id[legacy_pair[1]],
+                dtype=np.uint16,
+            )
+            prefix = index_path.name.removesuffix(".idx.npy")
+            side_a_path = split_root / f"{prefix}.{legacy_pair[0]}.bin"
+            side_b_path = split_root / f"{prefix}.{legacy_pair[1]}.bin"
+
+        if row_count:
+            maximum_language_id = max(
+                int(side_a_languages.max(initial=0)),
+                int(side_b_languages.max(initial=0)),
+            )
+            if maximum_language_id >= len(languages):
+                raise ValueError(
+                    f"Indexed language id {maximum_language_id} exceeds manifest metadata at "
+                    f"{index_path}"
+                )
+        forward_only = (
+            index["forward_only"].astype(np.bool_)
+            if "forward_only" in fields
+            else np.zeros(row_count, dtype=np.bool_)
+        )
+        forward_only_pairs += int(np.count_nonzero(forward_only))
+        side_a_source_only = np.isin(side_a_languages, source_only_ids)
+        side_b_source_only = np.isin(side_b_languages, source_only_ids)
+        forward_enabled = ~side_b_source_only
+        reverse_enabled = (
+            np.asarray(bidirectional & ~forward_only & ~side_a_source_only, dtype=np.bool_)
+            if row_count
+            else np.empty(0, dtype=np.bool_)
+        )
+
+        side_a_store = _open_indexed_token_store(
+            side_a_path,
+            side_a_offsets,
+            side_a_lengths,
+        )
+        side_b_store = _open_indexed_token_store(
+            side_b_path,
+            side_b_offsets,
+            side_b_lengths,
+        )
+        _accumulate_indexed_side(
+            side_a_store,
+            side_a_lengths,
+            side_a_languages,
+            reverse_enabled,
+            physical_counts,
+            target_counts,
+            vocab_size=vocab_size,
+        )
+        _accumulate_indexed_side(
+            side_b_store,
+            side_b_lengths,
+            side_b_languages,
+            forward_enabled,
+            physical_counts,
+            target_counts,
+            vocab_size=vocab_size,
+        )
+
+        physical_sentences += np.bincount(
+            np.concatenate((side_a_languages, side_b_languages)).astype(np.int64),
+            minlength=len(languages),
+        ).astype(np.uint64, copy=False)
+        virtual_examples += _add_direction_totals(
+            direction_totals,
+            side_a_languages,
+            side_b_languages,
+            side_a_lengths,
+            side_b_lengths,
+            forward_enabled,
+            languages,
+        )
+        virtual_examples += _add_direction_totals(
+            direction_totals,
+            side_b_languages,
+            side_a_languages,
+            side_b_lengths,
+            side_a_lengths,
+            reverse_enabled,
+            languages,
+        )
+
+    special = np.array(
+        [_piece_is_special(tokenizer.processor.id_to_piece(i)) for i in range(vocab_size)],
+        dtype=np.bool_,
+    )
+    byte = np.array(
+        [tokenizer.processor.id_to_piece(i).startswith("<0x") for i in range(vocab_size)],
+        dtype=np.bool_,
+    )
+    eligible = ~(special | byte)
+    global_physical = np.zeros(vocab_size, dtype=np.uint64)
+    global_target = np.zeros(vocab_size, dtype=np.uint64)
+    for language_id in range(len(languages)):
+        global_physical += physical_counts[language_id]
+        global_target += target_counts[language_id]
+
+    language_reports: dict[str, Any] = {}
+    for language_id, language in enumerate(languages):
+        physical = physical_counts[language_id]
+        target = target_counts[language_id]
+        physical_tokens = int(physical.sum(dtype=np.uint64))
+        target_enabled = language not in source_only
+        target_eligible = (
+            eligible & (physical > 0) if target_enabled else np.zeros(vocab_size, dtype=np.bool_)
+        )
+        target_summary = _frequency_summary(target, target_eligible)
+        target_summary["rare_threshold"] = rare_threshold
+        target_summary["rare_observed_pieces"] = int(
+            np.count_nonzero(target_eligible & (target > 0) & (target < rare_threshold))
+        )
+        byte_tokens = int(physical[byte].sum(dtype=np.uint64))
+        language_reports[language] = {
+            "physical_sentences": int(physical_sentences[language_id]),
+            "physical_tokens": physical_tokens,
+            "byte_fallback_tokens": byte_tokens,
+            "unknown_tokens": int(physical[tokenizer.unk_id]),
+            "target_enabled": target_enabled,
+            "target_tokens": int(target.sum(dtype=np.uint64)),
+            "byte_fallback_rate": round(byte_tokens / max(physical_tokens, 1), 8),
+            "target_frequency": target_summary,
+            "lowest_target_exposure": _rare_piece_examples(
+                tokenizer,
+                target,
+                target_eligible,
+                maximum=max_piece_examples,
+                include_unused=True,
+            ),
+        }
+
+    direction_report = {
+        direction: {
+            **{name: int(value) for name, value in totals.items()},
+            "mean_target_tokens": round(
+                totals["target_tokens"] / max(totals["examples"], 1),
+                6,
+            ),
+        }
+        for direction, totals in sorted(direction_totals.items())
+    }
+    global_summary = _frequency_summary(global_target, eligible)
+    global_summary["all_target_tokens"] = int(global_target.sum(dtype=np.uint64))
+    global_summary["corpus_observed_pieces"] = int(
+        np.count_nonzero(eligible & (global_physical > 0))
+    )
+    global_summary["rare_threshold"] = rare_threshold
+    global_summary["rare_observed_pieces"] = int(
+        np.count_nonzero(eligible & (global_target > 0) & (global_target < rare_threshold))
+    )
+    return {
+        "schema": "sion-indexed-token-exposure-audit-v1",
+        "complete_scan": True,
+        "count_basis": "stored_target_content_tokens",
+        "runtime_control_tokens_included": False,
+        "parameters": {
+            "dataset_root": str(root.resolve()),
+            "dataset_format": str(manifest.get("format", "unknown")),
+            "tokenizer_model": str(tokenizer_path.resolve()),
+            "tokenizer_identity": tokenizer_identity,
+            "split": split,
+            "source_only_languages": sorted(source_only),
+            "bidirectional": bidirectional,
+            "rare_threshold": rare_threshold,
+        },
+        "vocab_size": vocab_size,
+        "physical_pairs": physical_pairs,
+        "forward_only_pairs": forward_only_pairs,
+        "virtual_translation_examples": virtual_examples,
+        "directions": direction_report,
+        "languages": language_reports,
+        "global_target_frequency": global_summary,
+        "lowest_global_target_exposure": _rare_piece_examples(
+            tokenizer,
+            global_target,
+            eligible,
+            maximum=max_piece_examples,
+            include_unused=True,
+        ),
+    }
+
+
+__all__ = ["audit_indexed_token_exposure", "audit_token_exposure"]

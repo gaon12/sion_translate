@@ -5,15 +5,25 @@ import json
 from pathlib import Path
 
 from sion_translate.console import configure_stdio
-from sion_translate.token_audit import audit_token_exposure
+from sion_translate.token_audit import audit_indexed_token_exposure, audit_token_exposure
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Audit byte fallback and decoder-target token exposure"
     )
-    parser.add_argument("--input", nargs="+", required=True, help="JSONL files or glob patterns")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--input", nargs="+", help="JSONL files or glob patterns")
+    source.add_argument(
+        "--dataset",
+        help="already indexed dataset root; counts stored decoder targets without re-tokenizing",
+    )
     parser.add_argument("--tokenizer", required=True, help="SentencePiece .model path")
+    parser.add_argument(
+        "--split",
+        default="train",
+        help="indexed dataset split to scan with --dataset (default: train)",
+    )
     parser.add_argument("--language-pair", nargs=2, default=["ko", "ja"])
     parser.add_argument("--language-pairs", nargs=2, action="append")
     parser.add_argument("--source-only-language", nargs="+", default=[])
@@ -50,18 +60,30 @@ def main() -> None:
         raise SystemExit("--fail-byte-rate must be in [0, 1]")
     if args.fail_rare_pieces is not None and args.fail_rare_pieces < 0:
         raise SystemExit("--fail-rare-pieces must be non-negative")
-    report = audit_token_exposure(
-        args.input,
-        args.tokenizer,
-        language_pair=args.language_pair,
-        language_pairs=args.language_pairs,
-        source_only_languages=args.source_only_language,
-        bidirectional=args.bidirectional,
-        max_physical_pairs=args.max_physical_pairs,
-        rare_threshold=args.rare_threshold,
-        max_piece_examples=args.max_piece_examples,
-        filter_quality=args.filter_quality,
-    )
+    if args.dataset:
+        if args.max_physical_pairs:
+            raise SystemExit("--max-physical-pairs applies only to raw --input scans")
+        report = audit_indexed_token_exposure(
+            args.dataset,
+            args.tokenizer,
+            split=args.split,
+            bidirectional=args.bidirectional,
+            rare_threshold=args.rare_threshold,
+            max_piece_examples=args.max_piece_examples,
+        )
+    else:
+        report = audit_token_exposure(
+            args.input,
+            args.tokenizer,
+            language_pair=args.language_pair,
+            language_pairs=args.language_pairs,
+            source_only_languages=args.source_only_language,
+            bidirectional=args.bidirectional,
+            max_physical_pairs=args.max_physical_pairs,
+            rare_threshold=args.rare_threshold,
+            max_piece_examples=args.max_piece_examples,
+            filter_quality=args.filter_quality,
+        )
     rendered = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
     if args.output:
         output = Path(args.output)
