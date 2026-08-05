@@ -14,7 +14,11 @@ from sion_translate.data import (
     SionBatchCollator,
     prepare_dataset,
 )
-from sion_translate.data.quality import QualityPolicy, assess_pair
+from sion_translate.data.quality import (
+    QualityPolicy,
+    apply_record_quality_profile,
+    assess_pair,
+)
 from sion_translate.data.prepare import protect_shared_spans
 from sion_translate.glossary import restore_targets
 from sion_translate.structured import (
@@ -188,6 +192,23 @@ def test_pair_quality_rejects_obvious_damage() -> None:
     )
     assert not repeated.accepted
     assert "excessive_repetition" in repeated.rejection_reasons
+
+
+def test_expressive_quality_profile_only_waives_short_and_repeated_reactions() -> None:
+    short = assess_pair("아", "あ")
+    assert short.rejection_reasons == ("too_short",)
+    profiled_short = apply_record_quality_profile(short, "expressive_v1")
+    assert profiled_short.accepted
+    assert profiled_short.score == 100
+
+    repeated = assess_pair("아" * 12, "あ" * 12)
+    assert repeated.rejection_reasons == ("excessive_repetition",)
+    assert apply_record_quality_profile(repeated, "expressive_v1").accepted
+
+    unsafe = assess_pair("아\u0001", "あ")
+    profiled_unsafe = apply_record_quality_profile(unsafe, "expressive_v1")
+    assert not profiled_unsafe.accepted
+    assert profiled_unsafe.rejection_reasons == ("control_characters",)
 
 
 def test_source_temperature_sampling_is_deterministic_and_balanced() -> None:

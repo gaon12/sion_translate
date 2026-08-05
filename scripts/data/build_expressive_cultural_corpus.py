@@ -147,6 +147,7 @@ def _training_row(pair: SeedPair) -> dict[str, Any]:
         "localization_strategy": pair.localization_strategy,
         "pair_id": pair.id,
         "provenance": SOURCE_NAME,
+        "quality_profile": "expressive_v1",
         "register": pair.register,
         "subcategory": pair.subcategory,
         # Human-authored seed data is still synthetic rather than naturally

@@ -31,7 +31,13 @@ from sion_translate.synthetic import (
 )
 from sion_translate.tokenizer import SLOT_SYMBOLS, SionTokenizer, expand_inputs
 
-from .quality import QualityPolicy, assess_pair, canonical_text, dedup_key
+from .quality import (
+    QualityPolicy,
+    apply_record_quality_profile,
+    assess_pair,
+    canonical_text,
+    dedup_key,
+)
 from .record_metadata import (
     RECORD_METADATA_DATA_SUFFIX,
     RECORD_METADATA_FIELDS,
@@ -306,6 +312,10 @@ def _process_prepare_batch(args):
                 text_b,
                 quality_policy,
                 languages=language_pair,
+            )
+            assessment = apply_record_quality_profile(
+                assessment,
+                pair.metadata.get("quality_profile"),
             )
             unsafe = "control_characters" in assessment.rejection_reasons
             if not assessment.accepted and (filter_quality or unsafe):

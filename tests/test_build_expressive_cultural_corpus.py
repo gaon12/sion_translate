@@ -62,6 +62,7 @@ def test_training_and_challenge_splits_do_not_leak(tmp_path: Path) -> None:
         "profanity_slang": 6,
     }
     assert all(row["synthetic"] is True and row["bidirectional"] is True for row in train_rows)
+    assert all(row["quality_profile"] == "expressive_v1" for row in train_rows)
     assert all(1 <= row["intensity"] <= 5 for row in train_rows)
     assert all(row["register"] and row["localization_strategy"] for row in train_rows)
     train_surfaces = {(row["ko"], row["ja"]) for row in train_rows}

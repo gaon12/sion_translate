@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import re
 import unicodedata
 
@@ -10,6 +10,21 @@ from sion_translate.structured import structured_similarity
 
 
 _WHITESPACE = re.compile(r"\s+")
+
+_QUALITY_PENALTIES = {
+    "too_short": 45,
+    "length_ratio": 25,
+    "identical_text": 50,
+    "ko_script_mismatch": 35,
+    "ja_script_mismatch": 35,
+    "control_characters": 40,
+    "excessive_repetition": 40,
+    "structured_span_mismatch": 10,
+    "ja_no_kana": 10,
+}
+
+_EXPRESSIVE_QUALITY_PROFILE = "expressive_v1"
+_EXPRESSIVE_ALLOWED_REJECTIONS = frozenset({"too_short", "excessive_repetition"})
 
 
 @dataclass(frozen=True)
@@ -59,6 +74,40 @@ class PairAssessment:
     length_ratio: float
     ko_language_fraction: float
     ja_language_fraction: float
+
+
+def apply_record_quality_profile(
+    assessment: PairAssessment,
+    profile: object,
+) -> PairAssessment:
+    """Apply a narrow, explicit exception for curated expressive records.
+
+    One-character reactions and deliberately prolonged cries are valid language,
+    but indistinguishable from noise to a generic length/repetition filter. The
+    profile waives only those two reasons; script mismatches, controls, identical
+    pairs, structural corruption, and extreme length ratios remain protected.
+    """
+
+    if profile != _EXPRESSIVE_QUALITY_PROFILE:
+        return assessment
+    kept = tuple(
+        reason
+        for reason in assessment.rejection_reasons
+        if reason not in _EXPRESSIVE_ALLOWED_REJECTIONS
+    )
+    removed = set(assessment.rejection_reasons) - set(kept)
+    if not removed:
+        return assessment
+    restored_score = min(
+        100,
+        assessment.score + sum(_QUALITY_PENALTIES[reason] for reason in removed),
+    )
+    return replace(
+        assessment,
+        accepted=not kept,
+        score=restored_score,
+        rejection_reasons=kept,
+    )
 
 
 def canonical_text(text: str) -> str:
@@ -218,22 +267,11 @@ def assess_pair(
     if critical_mismatch or structured_score < 0.5:
         warnings.append("structured_span_mismatch")
 
-    penalties = {
-        "too_short": 45,
-        "length_ratio": 25,
-        "identical_text": 50,
-        "ko_script_mismatch": 35,
-        "ja_script_mismatch": 35,
-        "control_characters": 40,
-        "excessive_repetition": 40,
-        "structured_span_mismatch": 10,
-        "ja_no_kana": 10,
-    }
     score = max(
         0,
         100
-        - sum(penalties[reason] for reason in rejections)
-        - sum(penalties[reason] for reason in warnings),
+        - sum(_QUALITY_PENALTIES[reason] for reason in rejections)
+        - sum(_QUALITY_PENALTIES[reason] for reason in warnings),
     )
     return PairAssessment(
         accepted=not rejections,
