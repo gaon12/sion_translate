@@ -68,6 +68,12 @@ The GitHub repository includes a small, independently authored diagnostic JSONL 
 directions and provides a common scorer for sion_translate, LibreTranslate, Papago, Google Translation,
 DeepL, M2M100 418M, and NLLB-200. No universal quality claim is made from that small set.
 
+On the repository's 20-sentence-per-direction beam-4 probe, the uploaded release scored chrF
+59.81 for ko→ja and 49.87 for ja→ko. The roughly ten-point gap is material: Japanese→Korean is
+the weaker direction and should not be described as equivalent to Korean→Japanese. The current
+repository contains direction-balanced checkpoint selection and a from-scratch v6 retraining
+pipeline, but those code changes do not retroactively improve the weights in this release.
+
 Scores from the repository's own test split are in-domain: the split is drawn from the same
 sources as the training data, so quality on unseen domains is substantially lower. Any single
 reported figure should state which of the two it is.
@@ -108,6 +114,9 @@ chrF 53.43 on an out-of-domain diagnostic set.
   glossary for names that matter.
 - Machine translations can omit, add, or reverse meaning. Rare vocabulary can be replaced by an
   unrelated similar-looking word.
+- Profanity, internet slang, non-lexical vocalizations, and culture-bound idioms are
+  style-sensitive. This release was not accepted against the repository's newer isolated
+  expressive/cultural challenge set; literal, weakened, or over-strong renderings require review.
 - Short context-dependent utterances, specialist terminology, and long inputs need human review.
 - Do not use unreviewed output for medical, legal, safety-critical, or certified translation.
 - The custom architecture requires the repository code; hosted Transformers inference is not

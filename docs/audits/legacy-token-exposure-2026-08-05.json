@@ -1,0 +1,100 @@
+{
+  "schema": "sion-indexed-token-exposure-audit-v1",
+  "complete_scan": true,
+  "count_basis": "stored_target_content_tokens",
+  "runtime_control_tokens_included": false,
+  "parameters": {
+    "dataset_root": "artifacts/dataset",
+    "dataset_format": "kjx-indexed-parallel-v2",
+    "tokenizer_model": "artifacts/tokenizer/sion.model",
+    "tokenizer_sha256": "c1b5447e08692bf7a7d2e485ba7b71b3ff5584c96844ecac07e25c9d1340db50",
+    "tokenizer_identity_verified_against_manifest": true,
+    "split": "train",
+    "source_only_languages": [],
+    "bidirectional": true,
+    "rare_threshold": 25
+  },
+  "legacy_artifact_findings": {
+    "tokenizer_vocab_size": 48000,
+    "tokenizer_languages": [
+      "ja",
+      "ko"
+    ],
+    "tokenizer_splits_digits": false,
+    "tokenizer_metadata_present": false,
+    "manifest_inputs": 29,
+    "current_raw_jsonl_files_at_audit": 51
+  },
+  "physical_pairs": 11129222,
+  "virtual_translation_examples": 22258444,
+  "directions": {
+    "ja-ko": {
+      "examples": 11129222,
+      "source_tokens": 185729708,
+      "target_tokens": 194729731,
+      "mean_target_tokens": 17.497156
+    },
+    "ko-ja": {
+      "examples": 11129222,
+      "source_tokens": 194729731,
+      "target_tokens": 185729708,
+      "mean_target_tokens": 16.688472
+    }
+  },
+  "languages": {
+    "ko": {
+      "physical_tokens": 194729731,
+      "target_tokens": 194729731,
+      "byte_fallback_tokens": 5378,
+      "byte_fallback_rate": 0.00002762,
+      "target_frequency": {
+        "total_occurrences": 192200900,
+        "eligible_pieces": 29456,
+        "observed_pieces": 29456,
+        "unused_pieces": 0,
+        "seen_once": 2071,
+        "seen_1_to_9": 5710,
+        "seen_1_to_24": 7055,
+        "median_observed_count": 1785.0,
+        "p10_observed_count": 2.0
+      }
+    },
+    "ja": {
+      "physical_tokens": 185729708,
+      "target_tokens": 185729708,
+      "byte_fallback_tokens": 12364,
+      "byte_fallback_rate": 0.00006657,
+      "target_frequency": {
+        "total_occurrences": 183189282,
+        "eligible_pieces": 28591,
+        "observed_pieces": 28591,
+        "unused_pieces": 0,
+        "seen_once": 642,
+        "seen_1_to_9": 1975,
+        "seen_1_to_24": 2784,
+        "median_observed_count": 2096.0,
+        "p10_observed_count": 27.0
+      }
+    }
+  },
+  "global_target_frequency": {
+    "total_occurrences": 375390182,
+    "all_target_tokens": 380459439,
+    "eligible_pieces": 47663,
+    "corpus_observed_pieces": 47652,
+    "observed_pieces": 47652,
+    "unused_pieces": 11,
+    "seen_once": 194,
+    "seen_1_to_9": 1376,
+    "seen_1_to_24": 2295,
+    "median_observed_count": 2503.0,
+    "p10_observed_count": 350.0,
+    "rare_threshold": 25,
+    "rare_observed_pieces": 2295
+  },
+  "limitations": [
+    "Counts cover one traversal of stored content tokens, not sampler reweighting or repeated epochs.",
+    "Runtime BOS, EOS, language tags, denoising, and collator truncation are not included.",
+    "Per-language eligible pieces are conditioned on pieces physically observed on that language side."
+  ]
+}
