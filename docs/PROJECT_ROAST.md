@@ -129,8 +129,8 @@ expressive category gate, 다중 reference와 사람 MQM.
 
 register suffix heuristic에 걸리지 않은 fragment·욕설·감탄사는 class 0이 되지만 loss는
 `labels > 0`만 학습합니다. class 0은 positive supervision이 없는데 모든 문장에는 4-way
-예측 embedding을 조건으로 넣습니다. register/alignment/coverage loss도 현재 trainer의
-주요 로그 목록에 빠져 있어 runbook이 “register loss를 보라”고 해도 관측하기 어렵습니다.
+예측 embedding을 조건으로 넣습니다. register/alignment/coverage loss의 주요 로그 노출은
+이번 감사에서 추가했지만, class 0 감독 공백 자체는 별도 설계·ablation이 필요합니다.
 
 ## P1: 운영·배포 문제
 
