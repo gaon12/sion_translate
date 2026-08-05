@@ -535,21 +535,52 @@ class MinimumRiskObjective:
         labels: torch.Tensor,
         *,
         label_smoothing: float,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        reference_inputs = self._repeated_model_inputs(batch, 1)
+        # Candidate scoring deliberately excludes target-side annotations. The
+        # single reference pass can safely retain them, preserving CoRe/BATS
+        # supervision alongside evidence and semantic-parity objectives.
+        for name in ("register_labels", "alignment_targets"):
+            if name in batch:
+                reference_inputs[name] = batch[name]
         output = model(
-            **self._repeated_model_inputs(batch, 1),
+            **reference_inputs,
             decoder_input_ids=decoder_input_ids,
-            labels=None,
-        )
-        ce_sum = F.cross_entropy(
-            output.logits.float().reshape(-1, output.logits.shape[-1]),
-            labels.reshape(-1),
-            ignore_index=-100,
-            reduction="sum",
-            label_smoothing=label_smoothing,
+            # Supplying labels lets native auxiliary heads (semantic parity and
+            # uncertainty/evidence budgeting) receive their supervised signal
+            # during MRT instead of becoming unused post-training parameters.
+            labels=labels,
         )
         reference_tokens = labels.ne(-100).sum()
-        return ce_sum / reference_tokens.clamp_min(1), reference_tokens
+        lm_loss_sum = getattr(output, "lm_loss_sum", None)
+        if lm_loss_sum is None:
+            lm_loss_sum = F.cross_entropy(
+                output.logits.float().reshape(-1, output.logits.shape[-1]),
+                labels.reshape(-1),
+                ignore_index=-100,
+                reduction="sum",
+                label_smoothing=label_smoothing,
+            )
+        auxiliary_loss = getattr(output, "auxiliary_loss", None)
+        if auxiliary_loss is None:
+            auxiliary_loss = output.logits.new_zeros(())
+        diagnostics = {
+            name: value.detach()
+            for name in (
+                "uncertainty_loss",
+                "evidence_budget_loss",
+                "evidence_request_rate",
+                "semantic_parity_loss",
+                "semantic_parity_score",
+            )
+            if (value := getattr(output, name, None)) is not None
+        }
+        return (
+            lm_loss_sum / reference_tokens.clamp_min(1),
+            reference_tokens,
+            auxiliary_loss,
+            diagnostics,
+        )
 
     @torch.no_grad()
     def validation_metrics(
@@ -683,7 +714,12 @@ class MinimumRiskObjective:
                 for start in range(0, samples, self.config.candidate_micro_batch)
             ]
             generated_scores = torch.cat(score_chunks, dim=1)
-            ce_loss, reference_tokens = self._reference_cross_entropy(
+            (
+                ce_loss,
+                reference_tokens,
+                reference_auxiliary_loss,
+                reference_diagnostics,
+            ) = self._reference_cross_entropy(
                 model,
                 batch,
                 decoder_inputs[:, samples],
@@ -725,12 +761,14 @@ class MinimumRiskObjective:
 
         total_loss = (
             ce_loss
+            + reference_auxiliary_loss
             + self.config.risk_weight * risk
             + self.config.preference_weight * preference_loss
         )
         normalizer = torch.tensor(float(batch_size), device=sampled.device)
         metrics = {
             "ce_loss": ce_loss.detach(),
+            "reference_auxiliary_loss": reference_auxiliary_loss.detach(),
             "risk": risk.detach(),
             "preference_loss": preference_loss.detach(),
             "preference_pair_weight": pair_weight.detach(),
@@ -777,12 +815,15 @@ class MinimumRiskObjective:
                 for name, values in reward_output.components.items()
             }
         )
+        metrics.update(reference_diagnostics)
         return ObjectiveOutput(
             loss_sum=total_loss * normalizer,
             normalizer=normalizer,
             processed_tokens=reference_tokens.detach(),
             auxiliary_loss=(
-                self.config.risk_weight * risk + self.config.preference_weight * preference_loss
+                reference_auxiliary_loss
+                + self.config.risk_weight * risk
+                + self.config.preference_weight * preference_loss
             ).detach(),
             metrics=metrics,
         )

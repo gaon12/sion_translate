@@ -285,6 +285,63 @@ class TinyCandidateScorer(nn.Module):
         return SimpleNamespace(logits=self.projection(hidden))
 
 
+class ReferenceAuxiliaryScorer(TinyCandidateScorer):
+    def __init__(self) -> None:
+        super().__init__()
+        self.aux_scale = nn.Parameter(torch.tensor(0.5))
+        self.reference_register_labels: torch.Tensor | None = None
+        self.reference_alignment_targets: torch.Tensor | None = None
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        decoder_input_ids: torch.Tensor,
+        labels: torch.Tensor | None = None,
+        register_labels: torch.Tensor | None = None,
+        alignment_targets: torch.Tensor | None = None,
+    ):
+        self.reference_register_labels = register_labels
+        self.reference_alignment_targets = alignment_targets
+        output = super().forward(input_ids, attention_mask, decoder_input_ids, labels)
+        if labels is not None:
+            output.lm_loss_sum = F.cross_entropy(
+                output.logits.reshape(-1, output.logits.shape[-1]),
+                labels.reshape(-1),
+                ignore_index=-100,
+                reduction="sum",
+            )
+            output.auxiliary_loss = self.aux_scale.square()
+            output.evidence_request_rate = self.aux_scale.sigmoid()
+        return output
+
+
+def test_mrt_reference_pass_keeps_native_auxiliary_supervision() -> None:
+    objective = MinimumRiskObjective(TextTokenizer(), PostTrainingConfig())
+    model = ReferenceAuxiliaryScorer()
+    batch = posttraining_batch()
+    batch["register_labels"] = torch.tensor([2])
+    batch["alignment_targets"] = torch.tensor([[[0, 1], [1, 2]]])
+
+    ce, tokens, auxiliary, diagnostics = objective._reference_cross_entropy(
+        model,
+        batch,
+        batch["decoder_input_ids"],
+        batch["labels"],
+        label_smoothing=0.1,
+    )
+    (ce + auxiliary).backward()
+
+    assert tokens.item() == 3
+    assert auxiliary.item() == pytest.approx(0.25)
+    assert diagnostics["evidence_request_rate"].item() == pytest.approx(
+        torch.sigmoid(torch.tensor(0.5)).item()
+    )
+    assert model.aux_scale.grad is not None
+    torch.testing.assert_close(model.reference_register_labels, batch["register_labels"])
+    torch.testing.assert_close(model.reference_alignment_targets, batch["alignment_targets"])
+
+
 class ConcurrentCandidateScorer(TinyCandidateScorer):
     def __init__(
         self,
@@ -611,7 +668,7 @@ def test_candidate_micro_batches_match_legacy_loss_and_gradients() -> None:
         for start in range(0, config.samples_per_source, config.candidate_micro_batch)
     ]
     chunked_scores = torch.cat(score_chunks, dim=1)
-    ce_loss, _ = objective._reference_cross_entropy(
+    ce_loss, _, reference_auxiliary_loss, _ = objective._reference_cross_entropy(
         chunked_model,
         batch,
         decoder_inputs[:, config.samples_per_source],
@@ -621,7 +678,12 @@ def test_candidate_micro_batches_match_legacy_loss_and_gradients() -> None:
     distribution = torch.softmax(config.mrt_alpha * chunked_scores, dim=-1)
     risk = (distribution * (1.0 - rewards)).sum(-1).mean()
     preference_loss, _ = objective._pairwise_preference_loss(chunked_scores, rewards)
-    chunked_loss = ce_loss + config.risk_weight * risk + config.preference_weight * preference_loss
+    chunked_loss = (
+        ce_loss
+        + reference_auxiliary_loss
+        + config.risk_weight * risk
+        + config.preference_weight * preference_loss
+    )
 
     torch.testing.assert_close(chunked_scores, legacy_scores)
     torch.testing.assert_close(chunked_loss, legacy_loss)
