@@ -303,6 +303,69 @@ class ConcurrentCandidateScorer(TinyCandidateScorer):
         )
 
 
+class MemoryAwareCandidateScorer(TinyCandidateScorer):
+    """Small objective double that records source-side generation context."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.config = SimpleNamespace(label_smoothing=0.1, max_seq_len=16, vocab_size=64)
+        self.sample_memory: dict[str, torch.Tensor] = {}
+        self.generate_memory: dict[str, torch.Tensor] = {}
+        self.scoring_memory: list[torch.Tensor] = []
+
+    @staticmethod
+    def _memory_from(kwargs: dict) -> dict[str, torch.Tensor]:
+        names = (
+            "memory_token_ids",
+            "memory_mask",
+            "memory_type_ids",
+            "memory_mode_ids",
+        )
+        return {name: kwargs[name].detach().clone() for name in names if name in kwargs}
+
+    def sample(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        *,
+        num_samples: int,
+        **kwargs,
+    ) -> torch.Tensor:
+        del attention_mask
+        self.sample_memory = self._memory_from(kwargs)
+        candidates = torch.tensor(
+            [[2, 20, 21, 3], [2, 20, 22, 3]],
+            device=input_ids.device,
+        )
+        return candidates[:num_samples].unsqueeze(0).expand(input_ids.shape[0], -1, -1)
+
+    def generate(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        del attention_mask
+        self.generate_memory = self._memory_from(kwargs)
+        return torch.tensor(
+            [[2, 20, 21, 3]],
+            device=input_ids.device,
+        ).expand(input_ids.shape[0], -1)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        decoder_input_ids: torch.Tensor,
+        labels: torch.Tensor | None = None,
+        **kwargs,
+    ):
+        memory_token_ids = kwargs.get("memory_token_ids")
+        if memory_token_ids is not None:
+            self.scoring_memory.append(memory_token_ids.detach().clone())
+        return super().forward(input_ids, attention_mask, decoder_input_ids, labels)
+
+
 def posttraining_batch() -> dict[str, torch.Tensor]:
     return {
         "input_ids": torch.tensor([[4, 10, 11, 3]]),
@@ -310,6 +373,43 @@ def posttraining_batch() -> dict[str, torch.Tensor]:
         "decoder_input_ids": torch.tensor([[2, 20, 21]]),
         "labels": torch.tensor([[20, 21, 3]]),
     }
+
+
+def test_tetm_memory_is_shared_by_sampling_scoring_and_validation_generation() -> None:
+    config = PostTrainingConfig(
+        samples_per_source=2,
+        candidate_micro_batch=1,
+        candidate_gradient_checkpointing=False,
+        max_new_tokens=4,
+        validation_num_beams=1,
+    )
+    objective = MinimumRiskObjective(TextTokenizer(), config)
+    model = MemoryAwareCandidateScorer()
+    batch = posttraining_batch()
+    batch.update(
+        memory_token_ids=torch.tensor([[[30]]]),
+        memory_mask=torch.tensor([[True]]),
+        memory_type_ids=torch.tensor([[8]]),
+        memory_mode_ids=torch.tensor([[4]]),
+    )
+
+    objective(model, batch)
+    expected_names = {
+        "memory_token_ids",
+        "memory_mask",
+        "memory_type_ids",
+        "memory_mode_ids",
+    }
+    assert set(model.sample_memory) == expected_names
+    for name in expected_names:
+        torch.testing.assert_close(model.sample_memory[name], batch[name])
+    assert model.scoring_memory
+    assert all(memory.shape[-2:] == (1, 1) for memory in model.scoring_memory)
+
+    objective.validation_metrics(model, batch)
+    assert set(model.generate_memory) == expected_names
+    for name in expected_names:
+        torch.testing.assert_close(model.generate_memory[name], batch[name])
 
 
 def test_reward_cpu_work_overlaps_candidate_scoring_and_reports_wait_telemetry() -> None:

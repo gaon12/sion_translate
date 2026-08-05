@@ -308,8 +308,21 @@ class MinimumRiskObjective:
         )
 
     @staticmethod
-    def _encoder_features(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        names = ("src_script_ids", "src_onset_ids", "src_vowel_ids", "src_coda_ids")
+    def _generation_features(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        # Candidate scoring receives every non-target batch tensor through
+        # ``_repeated_model_inputs``. Candidate generation must use the same
+        # source-side context, otherwise a TETM-enabled model samples without
+        # protected memory and then scores those candidates with it.
+        names = (
+            "src_script_ids",
+            "src_onset_ids",
+            "src_vowel_ids",
+            "src_coda_ids",
+            "memory_token_ids",
+            "memory_mask",
+            "memory_type_ids",
+            "memory_mode_ids",
+        )
         return {name: batch[name] for name in names if name in batch}
 
     @torch.no_grad()
@@ -545,7 +558,7 @@ class MinimumRiskObjective:
             eos_id=self.tokenizer.eos_id,
             max_new_tokens=self._max_new_tokens(base, batch["labels"]),
             num_beams=self.config.validation_num_beams,
-            **self._encoder_features(batch),
+            **self._generation_features(batch),
         )
         roundtrip_candidates, roundtrip_mask = self._backtranslate_candidates(
             base,
@@ -569,7 +582,7 @@ class MinimumRiskObjective:
         base = unwrap_model(model)
         reference_labels = batch["labels"]
         batch_size = reference_labels.shape[0]
-        encoder_features = self._encoder_features(batch)
+        generation_features = self._generation_features(batch)
         forbidden = tuple(
             sorted(
                 token_id
@@ -587,7 +600,7 @@ class MinimumRiskObjective:
             temperature=self.config.sampling_temperature,
             top_k=self.config.top_k,
             forbidden_token_ids=forbidden,
-            **encoder_features,
+            **generation_features,
         )
         roundtrip_started = time.perf_counter()
         roundtrip_candidates, roundtrip_mask = self._backtranslate_candidates(
