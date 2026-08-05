@@ -89,16 +89,16 @@ watch -n 2 nvidia-smi
 
 주요 결과:
 
-- SFT best: runs/sion-v6/pretrain/exports/best
-- 최종 MRT best: runs/sion-v6/posttrain/exports/best
+- SFT best: runs/auto/pretrain/exports/best
+- 최종 MRT best: runs/auto/posttrain/exports/best
 - 재개 checkpoint: 각 단계의 checkpoints/latest
-- tokenizer/sidecar: artifacts/sion-v6/tokenizer
-- indexed dataset: artifacts/sion-v6/dataset
+- tokenizer/sidecar: artifacts/tokenizer
+- indexed dataset: artifacts/dataset
 
 중단되면 같은 `python3 easy_run.py`를 다시 실행하세요. 단계별 latest에서
 자동으로 재개합니다. 인스턴스를 종료하기 전에는 runs/와
-artifacts/sion-v6/tokenizer/를 반드시 내려받으세요. 과거 artifacts/tokenizer와
-artifacts/dataset은 새 설정과 호환되지 않으며 자동 재사용되지 않습니다.
+artifacts/tokenizer/를 반드시 내려받으세요. 메타데이터·SHA-256·언어 태그·
+숫자 분리 정책이 현재 설정과 다르면 기존 산출물은 자동 재사용되지 않습니다.
 
 
 6. 선택 검증

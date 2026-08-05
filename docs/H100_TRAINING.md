@@ -43,8 +43,10 @@ Windows/CPU 환경은 H100 성능이나 NCCL 동작을 검증할 수 없으므�
 
 숫자 분리 정책이나 언어 명칭·언어쌍이 바뀐 토크나이저는 기존 체크포인트와
 호환되지 않는다. 현재 코드는 토크나이저 SHA256, 크기, 숫자 분리 정책,
-`language_pairs`, vocab 크기가 맞지 않으면 명시적으로 중단한다. 예전
-`artifacts/tokenizer`, `artifacts/dataset`, `runs/*`를 새 학습에 섞지 않는다.
+`language_pairs`, vocab 크기가 맞지 않으면 명시적으로 중단한다. 공개 경로는
+`artifacts/tokenizer`, `artifacts/dataset`, `runs/*`로 유지한다. 기존 산출물이
+내용 검사에 실패하면 자동 교체하지 않는다. 모든 관련 run을 확인한 뒤 운영자가
+복구 가능한 별도 위치로 직접 옮기고 같은 공개 경로를 다시 만든다.
 
 대규모 분산 작업 전에 단일 프로세스로 전처리를 끝내 두면 다른 rank가 전처리
 barrier에서 오래 기다리는 일을 피할 수 있다.
@@ -57,11 +59,11 @@ sion-train --config configs/sion_data_fit.yaml --prepare-only
 
 ```bash
 sion-train-tokenizer --input "data/*.jsonl" \
-  --output-dir artifacts/sion-v6/tokenizer
+  --output-dir artifacts/tokenizer
 
 sion-prepare-data --input "data/*.jsonl" \
-  --tokenizer artifacts/sion-v6/tokenizer/sion.model \
-  --output-dir artifacts/sion-v6/dataset
+  --tokenizer artifacts/tokenizer/sion.model \
+  --output-dir artifacts/dataset
 ```
 
 다국어라면 두 명령 모두 같은 언어쌍을 반복해서 지정해야 한다.
@@ -313,10 +315,10 @@ EMA가 켜졌다면 이 최종 일곱 형식은 복원된 best EMA 가중치 기
 
 ```bash
 sion-export \
-  runs/sion-v6-data-fit/posttrain/exports/best/model_ema.pt \
-  --output runs/sion-v6-data-fit/recovered-export \
-  --tokenizer artifacts/sion-v6/tokenizer/sion.model \
-  --token-features artifacts/sion-v6/tokenizer/token_features.npz \
+  runs/sion-data-fit/posttrain/exports/best/model_ema.pt \
+  --output runs/sion-data-fit/recovered-export \
+  --tokenizer artifacts/tokenizer/sion.model \
+  --token-features artifacts/tokenizer/token_features.npz \
   --language-pair ko ja
 ```
 
@@ -369,7 +371,7 @@ custom AutoClass 코드를 포함한다. 로컬 로딩은 다음처럼 검증한
 import torch
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
-path = "runs/sion-v6-data-fit/posttrain/exports/best/transformers"
+path = "runs/sion-data-fit/posttrain/exports/best/transformers"
 tokenizer = AutoTokenizer.from_pretrained(
     path,
     trust_remote_code=True,
@@ -394,7 +396,7 @@ print(tokenizer.batch_decode(generated, skip_special_tokens=True))
 모든 성공 artifact를 실제 loader로 열어 보는 검증을 실행한다.
 
 ```bash
-python -c "import json,sys; from sion_translate.training.export import validate_export_directory; r=validate_export_directory('runs/sion-v6-data-fit/posttrain/exports/best'); print(json.dumps(r, ensure_ascii=False, indent=2)); sys.exit(0 if r['valid'] else 1)"
+python -c "import json,sys; from sion_translate.training.export import validate_export_directory; r=validate_export_directory('runs/sion-data-fit/posttrain/exports/best'); print(json.dumps(r, ensure_ascii=False, indent=2)); sys.exit(0 if r['valid'] else 1)"
 ```
 
 검증이 실패한 디렉터리는 업로드하지 않는다. 특히 아래를 확인한다.

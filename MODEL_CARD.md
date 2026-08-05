@@ -71,7 +71,7 @@ DeepL, M2M100 418M, and NLLB-200. No universal quality claim is made from that s
 On the repository's 20-sentence-per-direction beam-4 probe, the uploaded release scored chrF
 59.81 for ko→ja and 49.87 for ja→ko. The roughly ten-point gap is material: Japanese→Korean is
 the weaker direction and should not be described as equivalent to Korean→Japanese. The current
-repository contains direction-balanced checkpoint selection and a from-scratch v6 retraining
+repository contains direction-balanced checkpoint selection and a compatibility-checked retraining
 pipeline, but those code changes do not retroactively improve the weights in this release.
 
 Scores from the repository's own test split are in-domain: the split is drawn from the same

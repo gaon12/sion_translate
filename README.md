@@ -54,8 +54,9 @@ python -m venv .venv
 
 `easy_run.py`는 입력 JSONL과 실행 환경을 감지해 토크나이저 준비, 품질 필터링,
 표현·문화 seed의 train/challenge 분리, 중복 제거, split 생성, 모델 크기·배치·정밀도
-선택, SFT와 사후학습, 체크포인트 재개를 순서대로 처리합니다. 구형 산출물과 섞이지
-않도록 tokenizer와 dataset은 `artifacts/sion-v6/`에 만듭니다. 이 자동 실행기는 Linux CUDA GPU 서버용이며 CPU나 Windows에서는
+선택, SFT와 사후학습, 체크포인트 재개를 순서대로 처리합니다. tokenizer와 dataset은
+안정된 공개 경로인 `artifacts/`에 만들며, 재사용 전 메타데이터·SHA-256·언어 태그·
+숫자 분리 정책·dataset 지문을 검사합니다. 이 자동 실행기는 Linux CUDA GPU 서버용이며 CPU나 Windows에서는
 수동 CLI 경로를 사용해야 합니다. 세부 GPU 서버 실행법은 [`START-HERE.md`](START-HERE.md)와
 [`how_to_run.txt`](how_to_run.txt), 사후학습 설계는
 [`POSTTRAINING.md`](POSTTRAINING.md)를 참고하세요. 80GB급 GPU의 수동 용량 점검과
@@ -64,7 +65,9 @@ python -m venv .venv
 분야별 확장량은 [`docs/DATA_EXPANSION_PLAN.md`](docs/DATA_EXPANSION_PLAN.md)에
 정리되어 있습니다. 방향별 품질 원인, 구형 48k vocabulary의 실제 target 노출,
 표현 데이터 계약과 evidence/parity ablation 범위는
-[`docs/QUALITY_OVERHAUL.md`](docs/QUALITY_OVERHAUL.md)를 먼저 확인하십시오.
+[`docs/QUALITY_OVERHAUL.md`](docs/QUALITY_OVERHAUL.md)를 먼저 확인하십시오. 학습·데이터·
+평가·운영 전반의 미해결 출고 차단 사유는
+[`docs/PROJECT_ROAST.md`](docs/PROJECT_ROAST.md)에 우선순위별로 정리했습니다.
 
 ### 자체 포함 GPU ZIP 만들기
 
@@ -191,7 +194,7 @@ model:
 직접 모델 파일을 지정할 수도 있습니다.
 
 ```bash
-sion-translate --model runs/sion-v6/posttrain/exports/best/model_ema.pt --to ja "안녕하세요."
+sion-translate --model runs/auto/posttrain/exports/best/model_ema.pt --to ja "안녕하세요."
 ```
 
 ## 여러 번역 시스템 비교
@@ -237,8 +240,8 @@ mkdir -p comparison_outputs
 sion-translate-cases \
   --backend sion \
   --cases examples/comparison_cases.jsonl \
-  --model runs/sion-v6/posttrain/exports/best/model_ema.pt \
-  --tokenizer artifacts/sion-v6/tokenizer/sion.model \
+  --model runs/auto/posttrain/exports/best/model_ema.pt \
+  --tokenizer artifacts/tokenizer/sion.model \
   --output comparison_outputs/sion.jsonl
 
 python -m pip install -e ".[baselines]"
@@ -318,17 +321,17 @@ FLORES-200을 학습에 포함했다면 `sion-prepare-benchmark`로 만든 FLORE
 JSONL 키, 방향 태그와 품질 검사에 사용됩니다.
 
 ```bash
-sion-train-tokenizer --input "data/*.jsonl" --output-dir artifacts/sion-v6/tokenizer
+sion-train-tokenizer --input "data/*.jsonl" --output-dir artifacts/tokenizer
 sion-prepare-data --input "data/*.jsonl" \
-  --tokenizer artifacts/sion-v6/tokenizer/sion.model \
-  --output-dir artifacts/sion-v6/dataset
+  --tokenizer artifacts/tokenizer/sion.model \
+  --output-dir artifacts/dataset
 sion-train --config configs/sion_data_fit.yaml
 ```
 
-토크나이저를 다시 만들면 vocab이 달라지므로 `artifacts/sion-v6/dataset`과 기존
+토크나이저를 다시 만들면 vocab이 달라지므로 `artifacts/dataset`과 기존
 체크포인트는 재사용할 수 없습니다. 위 세 단계를 순서대로 다시 실행해야 합니다.
-루트의 과거 `artifacts/tokenizer`와 `artifacts/dataset`은 호환되지 않는 legacy
-진단용이며 새 설정의 입력으로 사용하지 않습니다.
+해당 경로에 호환되지 않는 과거 산출물이 있다면 먼저 별도 백업 경로로 옮기십시오.
+학습기는 호환성을 경로 이름으로 추측하지 않고 실제 내용이 다르면 시작을 거부합니다.
 
 ### 언어쌍 바꾸기 / 늘리기
 
@@ -405,7 +408,7 @@ data:
 ```bash
 sion-concat --input "data/*.jsonl" --output data/concat_multi.jsonl \
   --count 300000 --min-sentences 2 --max-sentences 4 \
-  --tokenizer artifacts/sion-v6/tokenizer/sion.model --max-tokens 510
+  --tokenizer artifacts/tokenizer/sion.model --max-tokens 510
 ```
 
 무관한 문장을 쓰는 것이 핵심입니다. 문맥이 이어지는 문단을 쓰면 모델이 앞 문장으로

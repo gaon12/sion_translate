@@ -36,8 +36,8 @@
 ```bash
 sion-translate-cases --backend sion \
   --cases examples/diagnostic_cases.jsonl \
-  --model runs/sion-v6/posttrain/exports/best/model_ema.pt \
-  --tokenizer artifacts/sion-v6/tokenizer/sion.model \
+  --model runs/auto/posttrain/exports/best/model_ema.pt \
+  --tokenizer artifacts/tokenizer/sion.model \
   --output comparison_outputs/sion-diagnostic.jsonl
 ```
 

@@ -4,7 +4,8 @@
 결과, 이번 코드 개편이 해결한 문제, 그리고 새 모델을 검증하는 절차를 기록합니다.
 가장 중요한 결론은 하나입니다. **코드가 고쳐져도 기존 가중치의 품질은 바뀌지
 않습니다.** 과거 토크나이저와 indexed dataset은 새 설정과 호환되지 않으므로
-`artifacts/sion-v6`에서 처음부터 다시 학습해야 합니다.
+복구 가능한 백업으로 격리한 뒤 표준 `artifacts/` 경로에서 처음부터 다시 학습해야
+합니다.
 
 ## 확인된 원인과 조치
 
@@ -18,7 +19,7 @@
 | 짧고 반복적인 표현 | `아!`, `으아아아`, `ㅋㅋ`, 신음처럼 정상적인 표현이 `too_short`나 `excessive_repetition`으로 제거될 수 있었습니다. | 검토된 `expressive_v1` 행에 한해 두 사유만 완화합니다. 제어 문자, 언어 mismatch, 구조 손상 같은 안전 검사는 그대로 유지합니다. |
 | MRT 보상 | 정답 자체가 반복형 감탄사이거나 원문 유지가 정답인 경우에도 repetition/copy penalty가 걸렸습니다. | reference가 뒷받침하는 반복과 복사는 벌점에서 제외합니다. |
 | 데이터 누수 | 표현 예제를 학습과 평가에 함께 넣으면 개선을 측정할 수 없습니다. | 사람이 검토한 seed를 train 18쌍과 challenge 12쌍으로 고정 분리하고 challenge만 양방향 24 case로 확장합니다. `easy_run.py`가 train shard만 자동 생성합니다. |
-| 아티팩트 재사용 | 로컬 `artifacts/`는 구형 2언어 토크나이저와 v2 dataset이지만 현재 설정은 5언어와 source-only 정책을 사용합니다. | 모든 기본 경로와 자동 실행을 `artifacts/sion-v6`로 옮겨 구형 산출물을 묵시적으로 재사용하지 못하게 했습니다. |
+| 아티팩트 재사용 | 로컬 `artifacts/`는 구형 2언어 토크나이저와 v2 dataset이지만 현재 설정은 5언어와 source-only 정책을 사용합니다. | 공개 경로는 `artifacts/`로 유지합니다. 대신 tokenizer SHA-256, 숫자 분리, 언어쌍·제어 토큰, dataset schema·원천 지문을 검사합니다. 여러 run이 이 경로를 공유할 수 있으므로 불일치 산출물을 자동 이동·덮어쓰기하지 않고 중단합니다. 운영자가 관련 checkpoint 전체를 확인한 뒤 직접 백업해야 합니다. |
 
 ## 실제 구형 토큰 노출 감사
 
@@ -67,16 +68,16 @@ sion-audit-tokens \
   --output legacy-token-audit.json
 ```
 
-새 dataset을 준비한 뒤에는 경로만 v6로 바꿉니다.
+새 dataset을 준비한 뒤에는 같은 공개 경로에서 새 내용 지문을 감사합니다.
 
 ```bash
 sion-audit-tokens \
-  --dataset artifacts/sion-v6/dataset \
-  --tokenizer artifacts/sion-v6/tokenizer/sion.model \
+  --dataset artifacts/dataset \
+  --tokenizer artifacts/tokenizer/sion.model \
   --split train \
   --rare-threshold 25 \
   --fail-byte-rate 0.001 \
-  --output sion-v6-token-audit.json
+  --output current-token-audit.json
 ```
 
 `--fail-rare-pieces`는 corpus와 vocab 크기에 따라 기준이 달라지므로 첫 full scan을
@@ -109,8 +110,8 @@ challenge 평가는 전체 평균과 세 category를 함께 봅니다.
 sion-translate-cases \
   --backend sion \
   --cases examples/expressive_cultural_cases.jsonl \
-  --model runs/sion-v6/posttrain/exports/best/model_ema.pt \
-  --tokenizer artifacts/sion-v6/tokenizer/sion.model \
+  --model runs/auto/posttrain/exports/best/model_ema.pt \
+  --tokenizer artifacts/tokenizer/sion.model \
   --output comparison_outputs/sion-expressive.jsonl
 
 sion-compare \
@@ -136,7 +137,7 @@ sion-compare \
 
 권장 실험 순서는 다음과 같습니다.
 
-1. 같은 v6 tokenizer/data/seed로 baseline을 학습합니다.
+1. 같은 tokenizer/data/seed로 baseline을 학습합니다.
 2. `evidence_repair_enabled: true`만 켭니다.
 3. 새 초기화로 `semantic_parity_enabled: true`만 켭니다.
 4. 각각의 이득이 재현된 경우에만 둘을 함께 켭니다.
@@ -149,21 +150,23 @@ sion-compare \
 
 ## 새 학습 절차
 
-GPU 서버에서는 다음 한 명령이 표현 seed 생성부터 새 v6 tokenizer/dataset, SFT,
+GPU 서버에서는 다음 한 명령이 표현 seed 생성부터 새 tokenizer/dataset, SFT,
 MRT까지 연결합니다.
 
 ```bash
 python3 easy_run.py
 ```
 
-구형 `artifacts/tokenizer`, `artifacts/dataset`, 기존 checkpoint는 삭제하지 않고
-그대로 남습니다. 새 실행은 오직 아래 경로를 사용합니다.
+구형 `artifacts/tokenizer`, `artifacts/dataset`이 내용 검사에 실패하면 학습기는
+자동 교체하지 않고 중단합니다. 여러 run이 같은 vocabulary를 공유할 수 있으므로
+관련 checkpoint를 확인한 운영자가 두 디렉터리를 복구 가능한 별도 위치로 직접
+옮겨야 합니다. 정상 실행은 아래의 안정된 공개 경로를 사용합니다.
 
 ```text
-artifacts/sion-v6/tokenizer/
-artifacts/sion-v6/dataset/
-runs/sion-v6/pretrain/
-runs/sion-v6/posttrain/
+artifacts/tokenizer/
+artifacts/dataset/
+runs/auto/pretrain/
+runs/auto/posttrain/
 ```
 
 학습 완료라는 판정은 코드 test 통과가 아니라 새 가중치의 고정 challenge 결과까지

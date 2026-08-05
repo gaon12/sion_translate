@@ -97,23 +97,23 @@ SION_NO_TMUX=1 python3 easy_run.py
 ## 5. 결과와 재개
 
 ```text
-runs/sion-v6/
+runs/auto/
 ├── pretrain/
 │   ├── checkpoints/
 │   └── exports/best/
 └── posttrain/
     ├── checkpoints/
     └── exports/best/
-artifacts/sion-v6/
+artifacts/
 ├── tokenizer/
 └── dataset/
 ```
 
 사후학습이 활성화돼 있으므로 최종 추론 모델은
-`runs/sion-v6/posttrain/exports/best/`입니다. 중단 뒤 같은 명령을 다시 실행하면 각
+`runs/auto/posttrain/exports/best/`입니다. 중단 뒤 같은 명령을 다시 실행하면 각
 단계의 `checkpoints/latest`에서 재개합니다. 인스턴스를 삭제하기 전에 `runs/`와
-`artifacts/sion-v6/tokenizer/`를 내려받으십시오. 루트의 과거
-`artifacts/tokenizer/`와 `artifacts/dataset/`은 새 run이 재사용하지 않습니다.
+`artifacts/tokenizer/`를 내려받으십시오. 기존 산출물의 메타데이터와 현재 설정이
+다르면 학습기는 재사용하지 않고 구체적인 호환성 오류와 함께 중단합니다.
 
 실제 A100/H100에서의 최종 smoke test는 서버의 드라이버, CUDA 이미지, GPU 수와
 VRAM에 의존합니다. 오류가 나면 전체 traceback, `nvidia-smi`, 위 PyTorch 확인

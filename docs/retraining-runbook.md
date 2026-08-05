@@ -128,7 +128,7 @@ PY
 ```bash
 sion-train-tokenizer \
   --input "data/*.jsonl" \
-  --output-dir artifacts/sion-v6/tokenizer \
+  --output-dir artifacts/tokenizer \
   --vocab-size 48000 \
   --input-sentence-size 0 \
   --required-character-min-occurrences 25 \
@@ -161,7 +161,7 @@ import sys
 sys.path.insert(0, ".")
 from pathlib import Path
 import easy_run
-easy_run._verify_tokenizer(Path("artifacts/sion-v6/tokenizer/sion.model"), Path("data"))
+easy_run._verify_tokenizer(Path("artifacts/tokenizer/sion.model"), Path("data"))
 PY
 ```
 
@@ -181,8 +181,8 @@ fallback 대상이고, 그것이 byte fallback의 용도입니다. 기본 상한
 ```bash
 sion-prepare-data \
   --input "data/*.jsonl" \
-  --tokenizer artifacts/sion-v6/tokenizer/sion.model \
-  --output-dir artifacts/sion-v6/dataset \
+  --tokenizer artifacts/tokenizer/sion.model \
+  --output-dir artifacts/dataset \
   --language-pairs kj ko --language-pairs kj ja \
   --language-pairs kd ko --language-pairs kd ja \
   --language-pairs jd ko --language-pairs jd ja \
@@ -212,8 +212,8 @@ step 예산, 정밀도)은 GPU와 데이터 규모를 보고 자동 결정됩니
 
 | 모듈 | 상태 | 이유 |
 |---|---|---|
-| SiTU-GLU | on | projection 모양 그대로. 위험 최소 |
-| BATS coverage 0.01 | on | 누락·중복 제어에 정렬 신호가 필요 |
+| SiTU-GLU | off | shape가 같아도 activation을 바꾸므로 CoRe와 별도 검증 |
+| BATS | off | 내장 collator에 정렬 label이 없고 coverage-only 목적은 uniform 해가 존재 |
 | CoRe (register) | **on — 검증 대상** | 반말이 존댓말의 2.1배라 register 혼입이 실측된 실패 |
 | TETM | off | 한 번에 하나씩 원칙 |
 | MorphoScript | off | script 위반이 현재 0%. 실패하지 않는 문제 |
@@ -253,7 +253,7 @@ greedy). MRT 생성 시간이 늘어납니다.
 ## 8. 산출물 위치
 
 ```
-runs/sion-v6/
+runs/auto/
 ├── pretrain/
 │   ├── checkpoints/      best / latest / final
 │   └── exports/best/     fp32 fp16 bf16 int8 int4 gguf_q4_k_m transformers
@@ -266,7 +266,7 @@ artifacts/
 ```
 
 `posttraining.enabled`가 true이므로 **최종 산출물은
-`runs/sion-v6/posttrain/exports/best/`** 입니다. `pretrain/` 쪽은 MRT 이전
+`runs/auto/posttrain/exports/best/`** 입니다. `pretrain/` 쪽은 MRT 이전
 단계이고 비교할 때만 씁니다.
 
 체크포인트는 `best`(validation 기준), `latest`(재시작용), `final`(마지막 step)
@@ -294,7 +294,7 @@ beam은 4를 쓰십시오. 실측에서 1→2→4가 chrF 77.28→77.36→77.50�
 
 ## 10. 되돌아볼 만한 실패 지점
 
-- 토크나이저를 다시 만들면 `artifacts/sion-v6/dataset`과 체크포인트를 재사용할 수
+- 토크나이저를 다시 만들면 `artifacts/dataset`과 체크포인트를 재사용할 수
   없습니다. 3~5단계를 순서대로 다시 돌려야 합니다.
 - `source_only_languages`를 빠뜨리면 표준 한국어를 요청해도 혼용문·사투리가
   나옵니다. yaml 주석 처리된 예시를 실제로 풀어야 합니다.
