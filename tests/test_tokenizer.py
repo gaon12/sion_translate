@@ -202,3 +202,81 @@ def test_tokenizer_guard_excludes_target_owned_by_holdout(tmp_path: Path) -> Non
     )
 
     assert list(iter_parallel_text([source])) == []
+
+
+class _StubProcessor:
+    """제어 토큰 구간이 256 ID 를 넘는 vocab 을 흉내 냅니다.
+
+    SentencePiece 배치 순서: pad/unk/bos/eos → user_defined_symbols →
+    byte fallback 256개 → 학습된 조각.
+    """
+
+    def __init__(self, languages: list[str]) -> None:
+        from sion_translate.tokenizer import (
+            OPTIONAL_CONTROL_SYMBOLS,
+            SHARED_CONTROL_SYMBOLS,
+            SLOT_SYMBOLS,
+        )
+
+        self._pieces = ["<pad>", "<unk>", "<s>", "</s>"]
+        self._pieces += [f"<2{language}>" for language in languages]
+        self._pieces += [f"<denoise_{language}>" for language in languages]
+        self._pieces += SHARED_CONTROL_SYMBOLS + OPTIONAL_CONTROL_SYMBOLS + SLOT_SYMBOLS
+        self._pieces += [f"<0x{value:02X}>" for value in range(256)]
+        # 학습된 조각. 예약 구간 밖에서 제어 토큰처럼 보이는 것도 하나 섞습니다.
+        self._pieces += ["▁가", "▁나", "<2zz>", "▁다"]
+        self._index = {piece: identifier for identifier, piece in enumerate(self._pieces)}
+
+    def vocab_size(self) -> int:
+        return len(self._pieces)
+
+    def id_to_piece(self, identifier: int) -> str:
+        return self._pieces[identifier]
+
+    def piece_to_id(self, piece: str) -> int:
+        return self._index.get(piece, 1)
+
+    def pad_id(self) -> int:
+        return 0
+
+    def unk_id(self) -> int:
+        return 1
+
+    def bos_id(self) -> int:
+        return 2
+
+    def eos_id(self) -> int:
+        return 3
+
+
+def test_control_tokens_are_found_past_the_first_256_ids(monkeypatch) -> None:
+    """예약 구간이 256 ID 를 넘어도 모든 언어 태그를 찾아야 한다.
+
+    고정 상한을 쓰면 스캔이 예약 구간 중간에서 끊기고, 증상이 예외가 아니라
+    '일부 언어만 감지됨' 이라 조용히 잘못된 모델을 학습하게 됩니다.
+    """
+    import sion_translate.tokenizer as tokenizer_module
+
+    languages = [f"l{index:03d}" for index in range(150)]
+    stub = _StubProcessor(languages)
+    # 제어 토큰 **자체**가 256 ID 를 넘어가야 회귀를 잡는다.
+    assert stub.piece_to_id(f"<denoise_{languages[-1]}>") > 256
+
+    monkeypatch.setattr(tokenizer_module.spm, "SentencePieceProcessor", lambda model_file: stub)
+    tokenizer = SionTokenizer("stub.model")
+
+    assert set(tokenizer.languages) == set(languages)
+    assert set(tokenizer.denoise_tags) == set(languages)
+
+
+def test_a_learned_piece_that_looks_like_a_tag_is_not_mistaken_for_one(monkeypatch) -> None:
+    """byte fallback 조각 이후는 학습된 구간이므로 스캔하지 않는다."""
+    import sion_translate.tokenizer as tokenizer_module
+
+    stub = _StubProcessor(["ko", "ja"])
+    monkeypatch.setattr(tokenizer_module.spm, "SentencePieceProcessor", lambda model_file: stub)
+    tokenizer = SionTokenizer("stub.model")
+
+    # '<2zz>' 는 예약 구간 밖의 학습된 조각이다.
+    assert "zz" not in tokenizer.language_tags
+    assert set(tokenizer.languages) == {"ko", "ja"}

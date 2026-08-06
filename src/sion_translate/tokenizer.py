@@ -395,10 +395,18 @@ class SionTokenizer:
         self.denoise_tags: dict[str, int] = {}  # {"ko": <denoise_ko> 토큰 id, ...}
         lang_pattern = re.compile(r"^<2([A-Za-z0-9]+)>$")
         denoise_pattern = re.compile(r"^<denoise_([A-Za-z0-9]+)>$")
-        # 제어 토큰은 vocab 앞부분에 예약되므로 앞쪽 일부만 훑으면 충분합니다.
-        scan_limit = min(self.processor.vocab_size(), 256)
-        for token_id in range(scan_limit):
+        byte_pattern = re.compile(r"^<0x[0-9A-Fa-f]{2}>$")
+        # 예약 구간의 끝은 첫 byte fallback 조각입니다. SentencePiece 는
+        # pad/unk/bos/eos → user_defined_symbols → byte 조각 → 학습된 조각
+        # 순으로 배치하므로, 여기서 멈추면 제어 토큰은 전부 보면서 학습된
+        # 조각을 <2xx> 로 오인할 일도 없습니다.
+        #
+        # 고정 상한(예전 256)을 쓰면 언어 수가 늘 때 스캔이 예약 구간 중간에서
+        # 끊기고, 증상이 예외가 아니라 "일부 언어만 감지됨" 이라 조용합니다.
+        for token_id in range(self.processor.vocab_size()):
             piece = self.processor.id_to_piece(token_id)
+            if byte_pattern.match(piece):
+                break
             if match := lang_pattern.match(piece):
                 self.language_tags[match.group(1)] = token_id
             elif match := denoise_pattern.match(piece):
