@@ -562,6 +562,118 @@ def save_checkpoint(
     barrier(context)
 
 
+def initialize_model_from_checkpoint(
+    path: str | Path,
+    model: nn.Module,
+    context: DistributedContext,
+    *,
+    expected_identity: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """다른 **단계**의 체크포인트에서 가중치만 가져온다 (재개가 아님).
+
+    foundation → SFT 처럼 단계가 바뀔 때 쓰는 경로입니다. ``load_checkpoint``
+    와 의도적으로 다릅니다.
+
+    - optimizer/scheduler/scaler/EMA/RNG/step 을 **복원하지 않습니다.** 새
+      단계는 새 목적함수와 새 LR schedule 을 가지므로, 이전 단계의 Adam
+      moment 와 step 카운터를 이어받으면 warmup 이 건너뛰어지고 momentum 이
+      다른 loss 표면의 것을 가리킵니다.
+    - dataset identity 를 비교하지 않습니다. 두 단계는 서로 다른 데이터셋을
+      쓰는 것이 정상입니다(단일어 대 병렬).
+    - 대신 **tokenizer 와 model config 는 반드시 같아야 합니다.** 토크나이저가
+      다르면 임베딩 행이 가리키는 것이 달라져 가중치 인계가 조용히 무의미해지고,
+      model config 가 다르면 애초에 모양이 맞지 않습니다.
+
+    반환값은 출처 정보(step, stage)로, 호출자가 provenance 에 기록합니다.
+    """
+
+    path = Path(path)
+    if context.distributed:
+        import torch.distributed.checkpoint as dcp
+        from torch.distributed.checkpoint.state_dict import (
+            get_model_state_dict,
+            set_model_state_dict,
+        )
+
+        resolved = _resolve_dcp_checkpoint(path, world_size=context.world_size)
+        checkpoint_model = _unwrap_compiled_model(model)
+        # DCP 는 여기 넣어 둔 값 '안으로' 읽어들이므로, 가져올 것만 등록합니다.
+        # optimizer/scheduler/EMA 를 등록하지 않는 것이 곧 "가중치만" 입니다.
+        state: dict[str, Any] = {"model": get_model_state_dict(checkpoint_model), "step": 0}
+        if expected_identity is not None:
+            state["identity"] = _json_compatible(expected_identity)
+        dcp.load(state, checkpoint_id=resolved)
+        _validate_stage_transfer(state, expected_identity, source=resolved)
+        set_model_state_dict(checkpoint_model, state["model"])
+        return {
+            "source": str(resolved),
+            "step": int(state.get("step") or 0),
+            "stage": (state.get("identity") or {}).get("stage"),
+        }
+
+    try:
+        loaded = torch.load(
+            path / "checkpoint.pt",
+            map_location=context.device,
+            weights_only=True,
+            mmap=True,
+        )
+    except Exception as error:
+        raise RuntimeError(
+            "stage-transfer checkpoint could not be loaded with PyTorch's safe "
+            "weights-only loader; refusing to fall back to executable pickle"
+        ) from error
+    state = _validate_loaded_state(loaded)
+    _validate_stage_transfer(state, expected_identity, source=path)
+    _unwrap_compiled_model(model).load_state_dict(state["model"])
+    return {
+        "source": str(path),
+        "step": int(state.get("step") or 0),
+        "stage": (state.get("identity") or {}).get("stage"),
+    }
+
+
+def _validate_stage_transfer(
+    state: Mapping[str, Any],
+    expected_identity: Mapping[str, Any] | None,
+    *,
+    source: Path,
+) -> None:
+    """단계 인계에서 반드시 같아야 하는 것만 비교한다.
+
+    데이터셋은 달라야 정상이므로 비교하지 않습니다. tokenizer 와 model config
+    가 다르면 인계 자체가 뜻을 잃으므로 여기서 막습니다.
+    """
+
+    if expected_identity is None:
+        return
+    recorded = state.get("identity")
+    if not isinstance(recorded, Mapping):
+        raise ValueError(
+            f"stage-transfer checkpoint has no recorded identity: {source}. "
+            "Refusing to inherit weights whose tokenizer cannot be verified."
+        )
+    recorded = _normalize_identity_for_comparison(recorded)
+    expected = _normalize_identity_for_comparison(expected_identity)
+    differences: list[str] = []
+    for section in ("tokenizer", "model"):
+        differences.extend(
+            _identity_differences(
+                expected.get(section),
+                recorded.get(section),
+                path=f"identity.{section}",
+            )
+        )
+    if differences:
+        rendered = "\n  - ".join(differences)
+        raise ValueError(
+            "stage-transfer checkpoint does not match this run's tokenizer/model "
+            f"identity ({source}):\n  - {rendered}\n"
+            "Weight transfer across stages is only meaningful when both stages "
+            "share a tokenizer and a model architecture."
+        )
+
+
 def load_checkpoint(
     path: str | Path,
     model: nn.Module,

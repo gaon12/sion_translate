@@ -12,6 +12,8 @@ import sion_translate.training.checkpoint as checkpoint_module
 from sion_translate.config import DataConfig, ExperimentalConfig, ModelConfig
 from sion_translate.model import SionForConditionalGeneration
 from sion_translate.training.checkpoint import (
+    build_checkpoint_identity,
+    initialize_model_from_checkpoint,
     CHECKPOINT_SCHEMA,
     load_checkpoint,
     save_checkpoint,
@@ -412,3 +414,142 @@ def test_distributed_checkpoint_publishes_complete_directory_and_falls_back(
         torch.testing.assert_close(model.token_embedding.weight, first_weight)
     finally:
         torch.distributed.destroy_process_group()
+
+
+# ── 단계 인계 (foundation → SFT) ────────────────────────────────────────
+
+
+def _identity(model, tmp_path: Path, *, dataset_name: str, stage: str) -> dict:
+    tokenizer = tmp_path / "tok" / "sion.model"
+    tokenizer.parent.mkdir(parents=True, exist_ok=True)
+    if not tokenizer.exists():
+        tokenizer.write_bytes(b"tokenizer-bytes")
+    dataset = tmp_path / dataset_name
+    dataset.mkdir(parents=True, exist_ok=True)
+    (dataset / "manifest.json").write_text(f'{{"name": "{dataset_name}"}}', encoding="utf-8")
+    return build_checkpoint_identity(
+        model_config=model.config,
+        tokenizer_path=tokenizer,
+        token_features_path=None,
+        dataset_dir=dataset,
+        stage_name=stage,
+    )
+
+
+def test_stage_transfer_loads_weights_without_optimizer_or_step(tmp_path: Path) -> None:
+    """foundation → SFT 는 재개가 아니다.
+
+    새 단계는 새 목적함수와 새 LR schedule 을 갖습니다. 이전 단계의 Adam
+    moment 와 step 카운터를 이어받으면 warmup 이 건너뛰어지고 momentum 이
+    다른 loss 표면의 것을 가리킵니다.
+    """
+    model, optimizer, scheduler, context = _components()
+    checkpoint = tmp_path / "foundation"
+    with torch.no_grad():
+        model.token_embedding.weight.fill_(0.5)
+    trained = model.token_embedding.weight.detach().clone()
+    for _ in range(5):
+        scheduler.step()
+    save_checkpoint(checkpoint, model, optimizer, scheduler, 4200, context)
+
+    fresh, fresh_optimizer, fresh_scheduler, _ = _components()
+    with torch.no_grad():
+        fresh.token_embedding.weight.fill_(-1.0)
+    scheduler_before = deepcopy(fresh_scheduler.state_dict())
+    optimizer_before = deepcopy(fresh_optimizer.state_dict())
+
+    provenance = initialize_model_from_checkpoint(checkpoint, fresh, context)
+
+    assert torch.allclose(fresh.token_embedding.weight, trained)
+    # step 은 반환값으로만 알려 주고, 새 단계는 0 에서 시작한다.
+    assert provenance["step"] == 4200
+    assert fresh_scheduler.state_dict() == scheduler_before
+    assert fresh_optimizer.state_dict() == optimizer_before
+
+
+def test_stage_transfer_accepts_a_different_dataset(tmp_path: Path) -> None:
+    """두 단계가 서로 다른 데이터셋을 쓰는 것은 정상이다 (단일어 대 병렬)."""
+    model, optimizer, scheduler, context = _components()
+    checkpoint = tmp_path / "foundation"
+    save_checkpoint(
+        checkpoint,
+        model,
+        optimizer,
+        scheduler,
+        1,
+        context,
+        identity=_identity(model, tmp_path, dataset_name="foundation_dataset", stage="foundation"),
+    )
+
+    fresh, _, _, _ = _components()
+    initialize_model_from_checkpoint(
+        checkpoint,
+        fresh,
+        context,
+        expected_identity=_identity(model, tmp_path, dataset_name="dataset", stage="pretrain"),
+    )
+
+
+def test_stage_transfer_refuses_a_different_tokenizer(tmp_path: Path) -> None:
+    """토크나이저가 다르면 임베딩 행이 가리키는 것이 달라진다.
+
+    모양은 맞으므로 load_state_dict 는 성공합니다. 즉 막지 않으면 조용히
+    무의미한 가중치를 물려받습니다.
+    """
+    model, optimizer, scheduler, context = _components()
+    checkpoint = tmp_path / "foundation"
+    save_checkpoint(
+        checkpoint,
+        model,
+        optimizer,
+        scheduler,
+        1,
+        context,
+        identity=_identity(model, tmp_path, dataset_name="foundation_dataset", stage="foundation"),
+    )
+
+    other = tmp_path / "other"
+    other.mkdir()
+    expected = _identity(model, tmp_path, dataset_name="dataset", stage="pretrain")
+    expected["tokenizer"]["model"]["sha256"] = "0" * 64
+
+    fresh, _, _, _ = _components()
+    with pytest.raises(ValueError, match="tokenizer/model identity"):
+        initialize_model_from_checkpoint(checkpoint, fresh, context, expected_identity=expected)
+
+
+def test_stage_transfer_refuses_a_different_model_config(tmp_path: Path) -> None:
+    model, optimizer, scheduler, context = _components()
+    checkpoint = tmp_path / "foundation"
+    save_checkpoint(
+        checkpoint,
+        model,
+        optimizer,
+        scheduler,
+        1,
+        context,
+        identity=_identity(model, tmp_path, dataset_name="foundation_dataset", stage="foundation"),
+    )
+
+    expected = _identity(model, tmp_path, dataset_name="dataset", stage="pretrain")
+    expected["model"]["config_sha256"] = "0" * 64
+
+    fresh, _, _, _ = _components()
+    with pytest.raises(ValueError, match="tokenizer/model identity"):
+        initialize_model_from_checkpoint(checkpoint, fresh, context, expected_identity=expected)
+
+
+def test_stage_transfer_refuses_a_checkpoint_without_an_identity(tmp_path: Path) -> None:
+    """검증할 수 없는 가중치를 물려받느니 멈추는 편이 낫다."""
+    model, optimizer, scheduler, context = _components()
+    checkpoint = tmp_path / "foundation"
+    save_checkpoint(checkpoint, model, optimizer, scheduler, 1, context)
+
+    fresh, _, _, _ = _components()
+    with pytest.raises(ValueError, match="no recorded identity"):
+        initialize_model_from_checkpoint(
+            checkpoint,
+            fresh,
+            context,
+            expected_identity=_identity(model, tmp_path, dataset_name="dataset", stage="pretrain"),
+        )
