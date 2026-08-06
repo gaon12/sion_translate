@@ -128,9 +128,12 @@ def test_short_and_long_lines_are_dropped_by_reason(tmp_path, tokenizer_model) -
         minimum_characters=8,
         maximum_characters=4000,
     )
-    assert stats.languages["ko"].accepted == 1
+    # 짧은 줄만 버립니다. 긴 문서는 버리지 않고 나눕니다 — e_gov 는 문자의
+    # 97.3%, aozora 는 92.8% 가 "상한 초과" 한 줄이라 통째로 폐기됐었습니다.
     assert stats.languages["ko"].too_short == 1
-    assert stats.languages["ko"].too_long == 1
+    assert stats.languages["ko"].too_long == 0
+    assert stats.languages["ko"].segmented_documents == 1
+    assert stats.languages["ko"].accepted == 1 + stats.languages["ko"].segments - 1
 
 
 def test_duplicates_are_removed_within_a_language(tmp_path, tokenizer_model) -> None:

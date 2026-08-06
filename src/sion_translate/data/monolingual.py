@@ -257,6 +257,66 @@ def iter_monolingual_lines(
             yield text
 
 
+# 문장 끝으로 볼 부호. 한국어·일본어·라틴 문장부호를 함께 봅니다.
+_SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?。．！？])\s*")
+
+
+def segment_text(
+    text: str,
+    *,
+    maximum_characters: int,
+    minimum_characters: int = 1,
+) -> list[str]:
+    """긴 문서를 ``maximum_characters`` 이하 조각으로 나눈다.
+
+    자르지도, 버리지도 않습니다. 둘 다 이 코퍼스에서는 큰 손실입니다 —
+    실측으로 ``e_gov`` 는 문자의 97.3%, ``aozora`` 는 92.8%, ``kowiki`` 는
+    68.0% 가 "4000자 초과" 한 줄이라 통째로 폐기됐고, 살아남은 것도 토큰
+    상한에서 23.9% 가 잘렸습니다. 전체로는 문자의 25.8% 입니다.
+
+    문장 경계에서 먼저 나누고, 한 문장이 상한보다 길면 그때만 강제로
+    자릅니다. 문장 경계를 우선하는 이유는 복원 과제의 정답이 조각 자체이기
+    때문입니다 — 문장 중간에서 끊으면 모델에게 미완성 문장을 완성된 정답으로
+    가르치게 됩니다.
+    """
+
+    if maximum_characters < 1:
+        raise ValueError("maximum_characters must be positive")
+    text = text.strip()
+    if not text:
+        return []
+    if len(text) <= maximum_characters:
+        # 짧은 경로에서도 최소 길이를 적용합니다. 여기서 건너뛰면 "나눌 필요가
+        # 없다"는 이유만으로 너무 짧은 줄이 통과합니다.
+        return [text] if len(text) >= minimum_characters else []
+
+    segments: list[str] = []
+    current = ""
+    for sentence in _SENTENCE_BOUNDARY.split(text):
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        while len(sentence) > maximum_characters:
+            # 문장 하나가 상한보다 길면 여기서만 강제로 자릅니다.
+            if current:
+                segments.append(current)
+                current = ""
+            segments.append(sentence[:maximum_characters])
+            sentence = sentence[maximum_characters:].strip()
+        if not sentence:
+            continue
+        candidate = f"{current} {sentence}".strip() if current else sentence
+        if len(candidate) > maximum_characters:
+            if current:
+                segments.append(current)
+            current = sentence
+        else:
+            current = candidate
+    if current:
+        segments.append(current)
+    return [segment for segment in segments if len(segment) >= minimum_characters]
+
+
 def language_sampling_weights(
     counts: dict[str, int],
     *,
@@ -467,5 +527,6 @@ __all__ = [
     "language_sampling_weights",
     "monolingual_budgets",
     "render_discovery_report",
+    "segment_text",
     "sample_monolingual_sentences",
 ]

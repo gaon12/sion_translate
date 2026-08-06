@@ -333,3 +333,66 @@ def test_a_zero_budget_yields_nothing(tmp_path) -> None:
     from sion_translate.data.monolingual import sample_monolingual_sentences
 
     assert list(sample_monolingual_sentences([path], 0)) == []
+
+
+# ── 긴 문서 분할: 버리지도 자르지도 않는다 ──────────────────────────────
+
+
+def test_a_short_text_is_returned_unchanged() -> None:
+    from sion_translate.data.monolingual import segment_text
+
+    assert segment_text("짧은 문장입니다.", maximum_characters=100) == ["짧은 문장입니다."]
+
+
+def test_a_long_document_is_split_at_sentence_boundaries() -> None:
+    """문장 중간에서 끊으면 미완성 문장을 완성된 정답으로 가르치게 된다."""
+    from sion_translate.data.monolingual import segment_text
+
+    document = " ".join(f"이것은 {index}번째 문장입니다." for index in range(20))
+    segments = segment_text(document, maximum_characters=60)
+
+    assert len(segments) > 1
+    assert all(len(segment) <= 60 for segment in segments)
+    # 문장 경계에서 나뉘었으므로 각 조각이 문장부호로 끝난다.
+    assert all(segment.endswith(".") for segment in segments)
+    # 내용이 사라지지 않는다.
+    assert "".join(segments).replace(" ", "") == document.replace(" ", "")
+
+
+def test_a_single_sentence_longer_than_the_cap_is_hard_split() -> None:
+    from sion_translate.data.monolingual import segment_text
+
+    segments = segment_text("가" * 250, maximum_characters=100)
+    assert [len(segment) for segment in segments] == [100, 100, 50]
+
+
+def test_segments_below_the_minimum_are_dropped() -> None:
+    from sion_translate.data.monolingual import segment_text
+
+    segments = segment_text(
+        "아. " + "긴 문장입니다. " * 20, maximum_characters=40, minimum_characters=5
+    )
+    assert all(len(segment) >= 5 for segment in segments)
+
+
+def test_an_empty_document_yields_nothing() -> None:
+    from sion_translate.data.monolingual import segment_text
+
+    assert segment_text("   ", maximum_characters=100) == []
+
+
+def test_a_non_positive_cap_is_rejected() -> None:
+    from sion_translate.data.monolingual import segment_text
+
+    with pytest.raises(ValueError, match="maximum_characters"):
+        segment_text("가나다", maximum_characters=0)
+
+
+def test_japanese_sentence_enders_are_boundaries() -> None:
+    """일본어 코퍼스가 가장 크게 손해 보던 쪽이다 (e_gov 97.3% 폐기)."""
+    from sion_translate.data.monolingual import segment_text
+
+    document = "".join(f"これは{index}番目の文です。" for index in range(20))
+    segments = segment_text(document, maximum_characters=60)
+    assert len(segments) > 1
+    assert all(segment.endswith("。") for segment in segments)

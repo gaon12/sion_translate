@@ -28,6 +28,7 @@ from sion_translate.data.monolingual import (
     ReadStats,
     assess_language_balance,
     iter_monolingual_lines,
+    segment_text,
 )
 from sion_translate.data.prepare import INDEX_DTYPE, ShardWriter, infer_register
 from sion_translate.fingerprint import file_sha256
@@ -43,7 +44,11 @@ class LanguageStats:
     lines_read: int = 0
     accepted: int = 0
     too_short: int = 0
+    # 상한을 넘어 폐기한 행. 이제 나누므로 0 이어야 정상입니다.
     too_long: int = 0
+    # 여러 조각으로 나뉜 문서 수와, 그 결과로 생긴 총 조각 수.
+    segmented_documents: int = 0
+    segments: int = 0
     duplicate: int = 0
     empty_after_tokenization: int = 0
     read_rejects: dict[str, int] = field(default_factory=dict)
@@ -136,58 +141,83 @@ def prepare_foundation_dataset(
     seen: set[bytes] = set()
     source_ids = {source.path: index for index, source in enumerate(discovery.sources)}
 
+    def record_segment(
+        text: str,
+        *,
+        language: str,
+        language_stats: LanguageStats,
+        source_id: int,
+    ) -> None:
+        """조각 하나를 shard 에 넣는다 (중복·빈 토큰은 여기서 걸러냄)."""
+
+        nonlocal seen
+        if deduplicate:
+            digest = _text_digest(language, text)
+            if digest in seen:
+                language_stats.duplicate += 1
+                return
+            seen.add(digest)
+        token_ids = tokenizer.encode(text)[:max_tokens]
+        if not token_ids:
+            language_stats.empty_after_tokenization += 1
+            return
+        # 복원 과제에는 test split 이 없습니다. 이 단계의 선택 지표는 복원
+        # 손실뿐이고, 최종 품질 판정은 번역 단계의 holdout 이 합니다.
+        split = choose_split_for_key(f"{language}\0{text}", validation_fraction, 0.0)
+        if split == "test":
+            split = "train"
+        register = infer_register(text, language)
+        writers[split].add(
+            src_ids=token_ids,
+            tgt_ids=token_ids,
+            src_register=register,
+            tgt_register=register,
+            src_language=language,
+            tgt_language=language,
+            source_id=source_id,
+            quality_score=100,
+            synthetic=False,
+            # 양방향 확장을 끕니다. 복원 과제는 두 방향이 같은 예제라
+            # 켜 두면 모든 문장이 정확히 두 번 학습됩니다.
+            forward_only=True,
+        )
+        language_stats.accepted += 1
+        if split == "train":
+            stats.train_records += 1
+        else:
+            stats.validation_records += 1
+
     for source in discovery.sources:
         language = source.language
         language_stats = stats.languages[language]
         read_stats = ReadStats()
         for raw_text in iter_monolingual_lines(source.path, stats=read_stats):
             language_stats.lines_read += 1
-            text = normalize_text(raw_text)
-            if len(text) < minimum_characters or not _is_usable(text):
+            document = normalize_text(raw_text)
+            if not _is_usable(document):
                 language_stats.too_short += 1
                 continue
-            if len(text) > maximum_characters:
-                language_stats.too_long += 1
-                continue
-            if deduplicate:
-                digest = _text_digest(language, text)
-                if digest in seen:
-                    language_stats.duplicate += 1
-                    continue
-                seen.add(digest)
-            token_ids = tokenizer.encode(text)[:max_tokens]
-            if not token_ids:
-                language_stats.empty_after_tokenization += 1
-                continue
-            # 복원 과제에는 test split 이 없습니다. 이 단계의 선택 지표는 복원
-            # 손실뿐이고, 최종 품질 판정은 번역 단계의 holdout 이 합니다.
-            split = choose_split_for_key(
-                f"{language}\0{text}",
-                validation_fraction,
-                0.0,
+            # 긴 문서는 버리지 않고 나눕니다. 자르지도 않습니다. 실측으로
+            # e_gov 는 문자의 97.3%, aozora 는 92.8%, kowiki 는 68.0% 가
+            # "상한 초과" 한 줄이라 통째로 폐기됐고, 전체로는 25.8% 였습니다.
+            segments = segment_text(
+                document,
+                maximum_characters=maximum_characters,
+                minimum_characters=minimum_characters,
             )
-            if split == "test":
-                split = "train"
-            register = infer_register(text, language)
-            writers[split].add(
-                src_ids=token_ids,
-                tgt_ids=token_ids,
-                src_register=register,
-                tgt_register=register,
-                src_language=language,
-                tgt_language=language,
-                source_id=source_ids[source.path],
-                quality_score=100,
-                synthetic=False,
-                # 양방향 확장을 끕니다. 복원 과제는 두 방향이 같은 예제라
-                # 켜 두면 모든 문장이 정확히 두 번 학습됩니다.
-                forward_only=True,
-            )
-            language_stats.accepted += 1
-            if split == "train":
-                stats.train_records += 1
-            else:
-                stats.validation_records += 1
+            if not segments:
+                language_stats.too_short += 1
+                continue
+            if len(segments) > 1:
+                language_stats.segmented_documents += 1
+            language_stats.segments += len(segments)
+            for text in segments:
+                record_segment(
+                    text,
+                    language=language,
+                    language_stats=language_stats,
+                    source_id=source_ids[source.path],
+                )
         language_stats.merge_read(read_stats)
 
     for writer in writers.values():
