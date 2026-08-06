@@ -243,6 +243,9 @@ def _selection_metric_label(key: str) -> str:
     labels = {
         "macro_direction_nll": "방향 균형 macro NLL",
         "worst_direction_nll": "최저 성능 방향 NLL",
+        "reward": "생성 복합 reward",
+        "macro_direction_reward": "방향 균형 macro reward",
+        "worst_direction_reward": "최저 성능 방향 reward",
         "nll": "전체 token NLL",
         "loss": "검증 loss",
     }
@@ -418,10 +421,32 @@ def evaluate(
         )
     if objective_sums:
         denominator = objective_count.clamp_min(1)
+        # 방향별 reward: 합계와 행 수가 같은 가중을 받았으므로 나누면 상쇄됩니다.
+        # 방향 하나가 후퇴해도 평균 reward 가 오르면 그 체크포인트가 best 가 되는
+        # 것을 막기 위한 값입니다 — 이 저장소는 이미 ko→ja 59.81 대 ja→ko 49.87
+        # 로 방향 격차가 있어서 평균만 보면 격차가 벌어지는 것을 놓칩니다.
+        direction_rewards: dict[str, float] = {}
+        for name in list(objective_sums):
+            if not name.endswith("_reward_sum"):
+                continue
+            direction = name.removesuffix("_reward_sum")
+            rows = objective_sums.get(f"{direction}_rows")
+            if rows is None or float(rows.item()) <= 0:
+                continue
+            direction_rewards[direction] = float((objective_sums[name] / rows).item())
+        if direction_rewards:
+            for direction, value in direction_rewards.items():
+                metrics[f"validation_{direction}_reward"] = value
+            metrics["validation_worst_direction_reward"] = min(direction_rewards.values())
+            metrics["validation_macro_direction_reward"] = sum(direction_rewards.values()) / len(
+                direction_rewards
+            )
+            metrics["validation_reward_direction_count"] = float(len(direction_rewards))
         metrics.update(
             {
                 f"validation_{name}": (value / denominator).item()
                 for name, value in objective_sums.items()
+                if not (name.endswith("_reward_sum") or name.endswith("_rows"))
             }
         )
     return metrics
@@ -575,6 +600,9 @@ def train(
         loaded_best_selection_metric if isinstance(loaded_best_selection_metric, str) else None
     )
     stopped_early = False
+    # 리스트로 두는 이유: 아래 중첩 함수에서 값을 바꾸는데 대입을 쓰면
+    # 그 이름이 지역 변수가 됩니다.
+    reward_fallback_reported: list[bool] = []
     last_eval_step = -1
     last_train_loss: float | None = None
     micro_step = 0
@@ -733,14 +761,30 @@ def train(
         # 사후학습은 실제 생성 reward를 최대화하고, SFT는 설정된 NLL 지표를 최소화합니다.
         # 기존 체크포인트 상태와 호환하기 위해 최대화 지표는 음수로 저장합니다.
         if objective is not None and "validation_reward" in metrics:
-            selection_key = (
-                "validation_ema_reward"
-                if "validation_ema_reward" in metrics
-                else "validation_reward"
-            )
+            # 방향별 지표를 먼저 찾고, 없으면 평균 reward 로 되돌아갑니다.
+            # 방향 메타데이터가 없는 custom caller 를 막지 않기 위해서입니다.
+            configured = config.posttraining.selection_metric
+            selection_key = None
+            if configured != "reward":
+                candidate_key = f"validation_{configured}"
+                if candidate_key in metrics:
+                    selection_key = candidate_key
+                elif not reward_fallback_reported:
+                    announce(
+                        f"posttraining.selection_metric={configured} 를 계산할 방향 "
+                        "메타데이터가 없어 평균 reward 로 선택합니다.",
+                        context,
+                    )
+                    reward_fallback_reported.append(True)
+            if selection_key is None:
+                selection_key = (
+                    "validation_ema_reward"
+                    if "validation_ema_reward" in metrics
+                    else "validation_reward"
+                )
             selection_value = float(metrics[selection_key])
             candidate = -selection_value
-            selection_name = "생성 복합 reward"
+            selection_name = _selection_metric_label(selection_key)
         else:
             candidate, selection_key, used_fallback = _select_sft_validation_metric(
                 metrics,

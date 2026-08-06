@@ -618,6 +618,44 @@ class MinimumRiskObjective:
         metrics.update(
             {f"reward_{name}": values.mean() for name, values in reward_output.components.items()}
         )
+        metrics.update(self._direction_reward_metrics(batch, reward_output.reward))
+        return metrics
+
+    def _direction_reward_metrics(
+        self,
+        batch: dict[str, torch.Tensor],
+        rewards: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """방향별 reward 합계와 행 수. 평균은 호출자가 나눠서 만듭니다.
+
+        평균을 여기서 내면 안 됩니다. 검증 aggregation 이 각 지표를 **배치
+        크기**로 가중하므로, 한 배치에 ko→ja 가 두 행뿐이어도 그 평균이 배치
+        전체 무게로 들어갑니다. 합계와 행 수를 따로 내보내면 두 값이 같은
+        가중을 받아 나눌 때 정확히 상쇄됩니다.
+        """
+
+        source_tags = batch.get("source_language_tag_ids")
+        if source_tags is None:
+            return {}
+        target_tags = batch["input_ids"][:, 0]
+        rows = float(target_tags.shape[0])
+        if rows <= 0:
+            return {}
+        per_row = rewards.reshape(rewards.shape[0], -1).mean(dim=-1).detach()
+        metrics: dict[str, torch.Tensor] = {}
+        identifier_to_language = {
+            int(token_id): language for language, token_id in self.tokenizer.language_tags.items()
+        }
+        for source_id, source_language in identifier_to_language.items():
+            for target_id, target_language in identifier_to_language.items():
+                if source_language == target_language:
+                    continue
+                selected = source_tags.eq(source_id) & target_tags.eq(target_id)
+                if not bool(selected.any()):
+                    continue
+                name = f"direction_{source_language}_to_{target_language}"
+                metrics[f"{name}_reward_sum"] = per_row[selected].sum() / rows
+                metrics[f"{name}_rows"] = selected.sum().to(per_row.dtype) / rows
         return metrics
 
     def __call__(self, model: nn.Module, batch: dict[str, torch.Tensor]) -> ObjectiveOutput:

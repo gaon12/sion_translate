@@ -557,6 +557,12 @@ class PostTrainingConfig:
     roundtrip_max_new_tokens: int = 256
     # best/early stopping은 이 beam 수로 생성한 번역의 복합 보상을 사용합니다.
     validation_num_beams: int = 4
+    # MRT best 선택 지표. 평균 reward 하나로 고르면 한 방향이 후퇴해도 다른
+    # 방향이 더 오르면 그 체크포인트가 best 가 됩니다. 이 저장소는 이미
+    # ko→ja 59.81 대 ja→ko 49.87 로 방향 격차가 있어서, 평균만 보면 격차가
+    # 벌어지는 것을 놓칩니다. 기본은 가장 낮은 방향을 올리는 쪽입니다.
+    # 방향 메타데이터가 없으면 trainer 가 평균 reward 로 되돌아갑니다.
+    selection_metric: str = "worst_direction_reward"
     eval_batch_size_per_gpu: int = 1
     eval_every: int = 250
     save_every: int = 1_000
@@ -783,6 +789,12 @@ class AppConfig:
             )
         if post.top_k < 0:
             raise ValueError("posttraining.top_k must be non-negative")
+        supported_post_selection = {"reward", "macro_direction_reward", "worst_direction_reward"}
+        if post.selection_metric not in supported_post_selection:
+            raise ValueError(
+                "posttraining.selection_metric must be one of: "
+                + ", ".join(sorted(supported_post_selection))
+            )
         if post.warmup_steps < 0 or post.warmup_steps > post.max_steps:
             raise ValueError("posttraining.warmup_steps must be between 0 and max_steps")
         if post.early_stopping_patience < 0:

@@ -621,3 +621,110 @@ def test_inference_prefers_posttrain_then_pretrain(tmp_path: Path) -> None:
     posttrain.parent.mkdir(parents=True)
     posttrain.touch()
     assert find_exported_model(tmp_path / "run") == posttrain
+
+
+# ── MRT 방향별 no-regression ────────────────────────────────────────────
+
+
+class _DirectionRewardObjective:
+    """ko→ja 는 낮은 reward, ja→ko 는 높은 reward 를 주는 가짜 목적함수."""
+
+    def __init__(self, tags: dict[str, int]):
+        self.tags = tags
+
+    def validation_metrics(self, model, batch):
+        del model
+        source = batch["source_language_tag_ids"]
+        target = batch["input_ids"][:, 0]
+        rows = float(target.shape[0])
+        rewards = torch.where(
+            target.eq(self.tags["ja"]),
+            torch.full((int(rows),), 0.2),
+            torch.full((int(rows),), 0.9),
+        )
+        metrics = {"reward": rewards.mean()}
+        for source_name, source_id in self.tags.items():
+            for target_name, target_id in self.tags.items():
+                if source_name == target_name:
+                    continue
+                selected = source.eq(source_id) & target.eq(target_id)
+                if not bool(selected.any()):
+                    continue
+                name = f"direction_{source_name}_to_{target_name}"
+                metrics[f"{name}_reward_sum"] = rewards[selected].sum() / rows
+                metrics[f"{name}_rows"] = selected.sum().float() / rows
+        return metrics
+
+
+def test_direction_rewards_are_weighted_by_rows_not_by_batch_size() -> None:
+    """평균 reward 하나로 best 를 고르면 한 방향의 후퇴가 가려진다.
+
+    방향 평균을 objective 안에서 내면 안 되는 이유도 여기 있습니다. 검증
+    aggregation 은 각 지표를 **배치 크기**로 가중하므로, 한 배치에 ko→ja 가 한
+    행뿐이어도 그 평균이 배치 전체 무게로 들어갑니다. 합계와 행 수를 따로
+    내보내면 두 값이 같은 가중을 받아 나눌 때 상쇄됩니다.
+    """
+    tags = {"ko": 4, "ja": 5}
+    model = SionForConditionalGeneration(tiny_model_config())
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+
+    batch = tiny_batch()
+    # ko→ja 한 행, ja→ko 한 행.
+    batch["input_ids"] = torch.tensor([[5, 10, 3], [4, 11, 3]])
+    batch["source_language_tag_ids"] = torch.tensor([4, 5])
+
+    metrics = evaluate(
+        model,
+        [batch],
+        context,
+        max_batches=1,
+        precision="fp32",
+        objective=_DirectionRewardObjective(tags),
+        language_tags=tags,
+    )
+
+    assert metrics["validation_direction_ko_to_ja_reward"] == pytest.approx(0.2)
+    assert metrics["validation_direction_ja_to_ko_reward"] == pytest.approx(0.9)
+    assert metrics["validation_worst_direction_reward"] == pytest.approx(0.2)
+    assert metrics["validation_macro_direction_reward"] == pytest.approx(0.55)
+    assert metrics["validation_reward_direction_count"] == 2.0
+    # 평균 reward 는 최저 방향보다 훨씬 높다 — 그것만 보면 후퇴를 놓친다.
+    assert metrics["validation_reward"] > metrics["validation_worst_direction_reward"]
+
+
+def test_the_intermediate_direction_sums_do_not_leak_into_the_report() -> None:
+    """합계와 행 수는 계산용이지 보고용 지표가 아니다."""
+    tags = {"ko": 4, "ja": 5}
+    model = SionForConditionalGeneration(tiny_model_config())
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+    batch = tiny_batch()
+    batch["input_ids"] = torch.tensor([[5, 10, 3], [4, 11, 3]])
+    batch["source_language_tag_ids"] = torch.tensor([4, 5])
+
+    metrics = evaluate(
+        model,
+        [batch],
+        context,
+        max_batches=1,
+        precision="fp32",
+        objective=_DirectionRewardObjective(tags),
+        language_tags=tags,
+    )
+
+    assert not [name for name in metrics if name.endswith("_reward_sum")]
+    assert not [name for name in metrics if name.endswith("_rows")]
+
+
+def test_the_default_posttraining_selection_metric_protects_the_worst_direction() -> None:
+    from sion_translate.config import AppConfig
+
+    assert AppConfig().posttraining.selection_metric == "worst_direction_reward"
+
+
+def test_an_unknown_posttraining_selection_metric_is_rejected() -> None:
+    from sion_translate.config import AppConfig
+
+    config = AppConfig()
+    config.posttraining.selection_metric = "average"
+    with pytest.raises(ValueError, match="posttraining.selection_metric"):
+        config.validate()
