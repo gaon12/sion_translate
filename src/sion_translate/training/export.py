@@ -39,6 +39,7 @@ import torch.distributed as dist
 from torch import nn
 
 from sion_translate.config import ExperimentalConfig, ModelConfig
+from sion_translate.fp8 import DEFAULT_BLOCK, FORWARD_DTYPE, Fp8Policy, scale_for
 from sion_translate.model import SionForConditionalGeneration
 from sion_translate.model.layers import RotaryEmbedding, SwiGLU
 
@@ -52,6 +53,7 @@ SUPPORTED_FORMATS = (
     "bf16",
     "int8",
     "int4",
+    "fp8",
     "gguf_q4_k_m",
     "transformers",
 )
@@ -64,6 +66,7 @@ _FORMAT_FILENAMES = {
     "bf16": "model_bf16.pt",
     "int8": "model_int8.pt",
     "int4": "model_int4.pt",
+    "fp8": "model_fp8.pt",
     "gguf_q4_k_m": "model-q4_k_m.gguf",
     "transformers": "transformers",
 }
@@ -820,6 +823,93 @@ def _pack_int4_state(
     return packed_state, quantization
 
 
+def _pack_fp8_state(
+    state_dict: Mapping[str, torch.Tensor],
+    policy: Fp8Policy,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    """가중치 전용 FP8. 정책이 허용한 projection 만 내리고 나머지는 그대로 둡니다.
+
+    활성값은 건드리지 않습니다. 이 모델의 디코딩은 가중치 대역폭 바운드라
+    (KV cache 는 옮기는 바이트의 1.5%) 가중치만 내려도 이득을 얻고, 실측에서
+    출력 오차도 더 작습니다 — 2.57% 대 3.63%.
+
+    무엇을 내리지 않는지가 더 중요합니다. ``Fp8Policy`` 의 기본 범위는 FFN
+    뿐이고, 어휘 projection 은 어떤 범위에서도 제외됩니다. 자세한 실측 근거는
+    ``sion_translate.fp8`` 모듈 문서에 있습니다.
+    """
+
+    policy.validate()
+    packed_state: dict[str, dict[str, Any]] = {}
+    quantized_parameters = 0
+    preserved_parameters = 0
+    for name, original in state_dict.items():
+        tensor = original.detach().to("cpu")
+        eligible = (
+            policy.allows(name)
+            and tensor.is_floating_point()
+            and tensor.ndim == 2
+            and tensor.shape[-1] % policy.block == 0
+        )
+        if not eligible:
+            preserved_parameters += tensor.numel()
+            packed_state[name] = {"kind": "tensor", "value": tensor}
+            continue
+        work = tensor.float()
+        scales = scale_for(work, dtype=FORWARD_DTYPE, block=policy.block)
+        grouped = work.reshape(*work.shape[:-1], -1, policy.block)
+        packed_state[name] = {
+            "kind": "block_fp8",
+            "shape": list(tensor.shape),
+            "block": policy.block,
+            "dtype": str(tensor.dtype).removeprefix("torch."),
+            # 스케일은 fp32 로 둡니다. 개수가 값의 1/block 이라 용량이 무의미하고,
+            # fp16 으로 낮추면 스케일 자체가 양자화 오차를 더합니다.
+            "scales": scales.squeeze(-1).contiguous(),
+            "values": (grouped / scales).to(FORWARD_DTYPE).reshape(tensor.shape).contiguous(),
+        }
+        quantized_parameters += tensor.numel()
+    total = quantized_parameters + preserved_parameters
+    quantization = {
+        "algorithm": "weight-only-fp8-e4m3-blockwise",
+        "format": "fp8",
+        "activation_dtype": "bfloat16",
+        "weight_dtype": "float8_e4m3fn",
+        "block": policy.block,
+        "scope": policy.scope,
+        "quantized_parameters": quantized_parameters,
+        "preserved_parameters": preserved_parameters,
+        "quantized_fraction": (quantized_parameters / total) if total else 0.0,
+        "runtime_device": "cuda",
+    }
+    return packed_state, quantization
+
+
+def _unpack_fp8_state(
+    packed_state: Mapping[str, Mapping[str, Any]],
+) -> dict[str, torch.Tensor]:
+    state: dict[str, torch.Tensor] = {}
+    for name, entry in packed_state.items():
+        kind = entry.get("kind")
+        if kind == "tensor":
+            value = entry.get("value")
+            if not isinstance(value, torch.Tensor):
+                raise ValueError(f"{name}: invalid packed tensor entry")
+            state[name] = value
+            continue
+        if kind != "block_fp8":
+            raise ValueError(f"{name}: unknown packed FP8 entry {kind!r}")
+        values = entry.get("values")
+        scales = entry.get("scales")
+        if not isinstance(values, torch.Tensor) or not isinstance(scales, torch.Tensor):
+            raise ValueError(f"{name}: invalid packed FP8 tensors")
+        block = int(entry.get("block", DEFAULT_BLOCK))
+        shape = tuple(map(int, entry["shape"]))
+        grouped = values.float().reshape(*shape[:-1], -1, block)
+        restored = (grouped * scales.float().unsqueeze(-1)).reshape(shape)
+        state[name] = restored.to(getattr(torch, str(entry.get("dtype", "float32"))))
+    return state
+
+
 def _unpack_int4_state(
     packed_state: Mapping[str, Mapping[str, Any]],
 ) -> dict[str, torch.Tensor]:
@@ -1198,6 +1288,7 @@ def export_state_dict_formats(
     token_features_path: str | Path | None = None,
     language_pairs: Sequence[Sequence[str]] | None = None,
     int4_backend: str = "auto",
+    fp8_policy: Fp8Policy | None = None,
     llama_quantize: str | Path | None = None,
     _filename_overrides: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
@@ -1212,6 +1303,10 @@ def export_state_dict_formats(
     requested = _normalize_formats(formats)
     if int4_backend not in {"auto", "torchao", "packed"}:
         raise ValueError("int4_backend must be one of: auto, torchao, packed")
+    # FP8 export 는 그 자체가 "FP8 로 내보내라"는 요청이므로 여기서는 켠 정책이
+    # 기본입니다. 무엇을 내릴지는 여전히 정책이 정합니다 (기본 범위 = FFN).
+    fp8_policy = fp8_policy or Fp8Policy(enabled=True)
+    fp8_policy.validate()
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     # Callers already hand us a stable snapshot. Avoid another full host copy:
@@ -1345,6 +1440,12 @@ def export_state_dict_formats(
                 payload["quantization"] = quantization
                 _atomic_torch_save(payload, path)
                 details = {"quantization": quantization}
+            elif format_name == "fp8":
+                quantized, quantization = _pack_fp8_state(cpu_state, fp8_policy)
+                payload["model"] = dict(quantized)
+                payload["quantization"] = quantization
+                _atomic_torch_save(payload, path)
+                details = {"quantization": quantization}
             elif format_name == "gguf_q4_k_m":
                 tensor_counts = _write_sion_gguf(
                     path,
@@ -1466,6 +1567,7 @@ def convert_export(
     bidirectional: bool | None = None,
     revision_trained: bool | None = None,
     int4_backend: str = "auto",
+    fp8_policy: Fp8Policy | None = None,
     llama_quantize: str | Path | None = None,
 ) -> dict[str, Any]:
     """Convert a stable state-dict export without mutating the source artifact."""
@@ -1551,6 +1653,7 @@ def convert_export(
         token_features_path=token_features_path,
         language_pairs=_metadata_language_pairs(metadata),
         int4_backend=int4_backend,
+        fp8_policy=fp8_policy,
         llama_quantize=llama_quantize,
     )
 
@@ -1604,7 +1707,15 @@ def load_exported_model(
         model: nn.Module = stored
         _hydrate_legacy_module_attributes(model, config)
     else:
-        if isinstance(quantization, Mapping) and quantization.get("backend") == "sion-packed":
+        if isinstance(quantization, Mapping) and quantization.get("format") == "fp8":
+            if not isinstance(stored, Mapping):
+                raise ValueError("FP8 export has no packed state dictionary")
+            # 여기서는 고정밀도로 되돌려 실어 줍니다. 대역폭 이득은 FP8 저장
+            # 그대로 GEMM 하는 런타임에서 나오고, 그 경로는 하드웨어가 있을 때만
+            # 켜집니다. 되돌려 실은 모델도 수치는 FP8 을 통과한 것과 같으므로,
+            # 품질 평가는 하드웨어 없이도 여기서 그대로 할 수 있습니다.
+            state = _unpack_fp8_state(stored)
+        elif isinstance(quantization, Mapping) and quantization.get("backend") == "sion-packed":
             if not isinstance(stored, Mapping):
                 raise ValueError("packed INT4 export has no packed state dictionary")
             state = _unpack_int4_state(stored)
@@ -1947,6 +2058,7 @@ def export_inference_models(
     bidirectional: bool = True,
     revision_trained: bool | None = None,
     int4_backend: str = "auto",
+    fp8_policy: Fp8Policy | None = None,
     strict: bool = False,
 ) -> dict[str, Any] | None:
     """Gather selected weights and export them without rank skew or blind barriers."""
@@ -2010,6 +2122,7 @@ def export_inference_models(
                 token_features_path=token_features_path,
                 language_pairs=_metadata_language_pairs(metadata),
                 int4_backend=int4_backend,
+                fp8_policy=fp8_policy,
                 _filename_overrides=filename_overrides,
             )
             if strict:

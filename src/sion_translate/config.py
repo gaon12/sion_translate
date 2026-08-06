@@ -367,6 +367,7 @@ SUPPORTED_EXPORT_FORMATS = frozenset(
         "bf16",
         "int8",
         "int4",
+        "fp8",
         "gguf_q4_k_m",
         "transformers",
     }
