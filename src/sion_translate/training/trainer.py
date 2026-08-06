@@ -924,6 +924,7 @@ def train(
                                 name: value
                                 for name in (
                                     "register_loss",
+                                    "register_unsupervised_rate",
                                     "alignment_loss",
                                     "coverage_loss",
                                     "uncertainty_loss",

@@ -104,6 +104,9 @@ class SionOutput:
     token_count: torch.Tensor | None = None
     auxiliary_loss: torch.Tensor | None = None
     register_loss: torch.Tensor | None = None
+    # register 규칙에 걸리지 않아 감독을 못 받은 행의 비율. 이 값이 크면
+    # CoRe 의 보조 loss 가 배치의 일부만 보고 있다는 뜻입니다.
+    register_unsupervised_rate: torch.Tensor | None = None
     alignment_loss: torch.Tensor | None = None
     coverage_loss: torch.Tensor | None = None
     uncertainty_loss: torch.Tensor | None = None
@@ -562,6 +565,7 @@ class SionForConditionalGeneration(nn.Module):
             z_loss = z_loss / valid_targets.sum().clamp_min(1.0)
             auxiliary_loss = auxiliary_loss + self.config.z_loss_weight * z_loss
         register_loss = logits.new_zeros(())
+        register_unsupervised_rate = logits.new_zeros(())
         if register_logits is not None and register_labels is not None:
             known = register_labels > 0
             safe_labels = torch.where(known, register_labels, torch.zeros_like(register_labels))
@@ -576,6 +580,10 @@ class SionForConditionalGeneration(nn.Module):
             auxiliary_loss = auxiliary_loss + (
                 self.config.experimental.register_loss_weight * register_loss
             )
+            # 감독을 못 받은 비율을 드러냅니다. 규칙에 안 걸린 문장(단편·감탄사·
+            # 욕설)은 loss 에서 빠지는데, 그 비율이 로그에 없으면 CoRe 가 배치의
+            # 절반만 보고 있어도 알 수 없습니다.
+            register_unsupervised_rate = 1.0 - (known_weights.sum() / known_weights.numel())
 
         alignment_loss = logits.new_zeros(())
         coverage_loss = logits.new_zeros(())
@@ -665,6 +673,7 @@ class SionForConditionalGeneration(nn.Module):
             token_count=token_count,
             auxiliary_loss=auxiliary_loss,
             register_loss=register_loss,
+            register_unsupervised_rate=register_unsupervised_rate,
             alignment_loss=alignment_loss,
             coverage_loss=coverage_loss,
             uncertainty_loss=uncertainty_loss,

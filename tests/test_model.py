@@ -1207,3 +1207,78 @@ def test_every_norm_uses_the_configured_epsilon() -> None:
         if isinstance(module, RMSNorm) and module.eps != config.rms_norm_eps
     ]
     assert not offenders, f"설정 eps 를 쓰지 않는 RMSNorm: {offenders}"
+
+
+# ── CoRe: 감독받지 않는 class 는 분류기 출력에서 빠져야 한다 ────────────
+
+
+def _register_model(register_classes: int = 4):
+    config = tiny_config()
+    config.experimental.bats_enabled = False
+    config.experimental.tetm_enabled = False
+    config.experimental.morphoscript_enabled = False
+    config.experimental.core_enabled = True
+    config.experimental.register_classes = register_classes
+    return SionForConditionalGeneration(config), config
+
+
+def test_the_unsupervised_register_class_cannot_win_the_softmax() -> None:
+    """class 0 은 "규칙에 안 걸림" 이지 학습 가능한 범주가 아니다.
+
+    register loss 는 labels > 0 만 학습하므로 class 0 은 한 번도 정답이 되지
+    않고 모든 예제에서 오답으로만 등장합니다. softmax 에 남겨 두면 실질적으로
+    3-way 인데 4-way 인 척하면서, class 0 의 embedding 은 context 혼합에 계속
+    섞이는데 register loss 로부터는 아무 신호도 못 받습니다.
+    """
+    model, _ = _register_model()
+    batch = make_batch()
+    with torch.no_grad():
+        output = model(**batch)
+
+    logits = output.register_loss  # 존재 확인용
+    assert logits is not None
+    encoder_states = model.encode(batch["input_ids"], batch["attention_mask"])
+    with torch.no_grad():
+        _, _, register_logits = model.register_state(encoder_states, batch["attention_mask"], None)
+    probabilities = register_logits.softmax(-1)
+    assert torch.isinf(register_logits[:, 0]).all() or register_logits[:, 0].min() < -1e30
+    assert probabilities[:, 0].max() < 1e-6
+    # 나머지 class 의 확률은 정상적으로 합이 1 이어야 한다.
+    assert probabilities.sum(-1).allclose(torch.ones(probabilities.shape[0]), atol=1e-5)
+
+
+def test_the_register_context_never_mixes_the_unsupervised_embedding() -> None:
+    model, _ = _register_model()
+    batch = make_batch()
+    encoder_states = model.encode(batch["input_ids"], batch["attention_mask"])
+    with torch.no_grad():
+        # class 0 의 embedding 을 크게 바꿔도 context 가 흔들리지 않아야 한다.
+        _, before, _ = model.register_state(encoder_states, batch["attention_mask"], None)
+        model.register_state.register_embeddings.weight[0].fill_(1000.0)
+        _, after, _ = model.register_state(encoder_states, batch["attention_mask"], None)
+    assert torch.allclose(before, after, atol=1e-4)
+
+
+def test_the_unsupervised_row_rate_is_reported() -> None:
+    """규칙에 안 걸린 문장이 loss 에서 빠지는 비율이 로그에 없으면,
+    CoRe 가 배치의 절반만 보고 있어도 알 수 없다."""
+    model, _ = _register_model()
+    batch = make_batch()
+    batch["register_labels"] = torch.tensor([0, 2])
+    output = model(**batch)
+    assert output.register_unsupervised_rate is not None
+    assert float(output.register_unsupervised_rate) == pytest.approx(0.5)
+
+    batch["register_labels"] = torch.tensor([1, 2])
+    assert float(model(**batch).register_unsupervised_rate) == pytest.approx(0.0)
+
+
+def test_register_loss_still_trains_the_supervised_classes() -> None:
+    model, _ = _register_model()
+    batch = make_batch()
+    batch["register_labels"] = torch.tensor([1, 3])
+    output = model(**batch)
+    output.loss.backward()
+    gradient = model.register_state.classifier.weight.grad
+    assert gradient is not None
+    assert float(gradient.abs().sum()) > 0
