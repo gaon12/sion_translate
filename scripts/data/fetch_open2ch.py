@@ -59,7 +59,14 @@ def main() -> None:
             table = pq.read_table(local)
             column = "dialogue" if "dialogue" in table.column_names else table.column_names[0]
             for value in table.column(column).to_pylist():
-                turns = value if isinstance(value, list) else [value]
+                # `dialogue` 는 {"speaker": [...], "content": [...]} 구조체입니다.
+                # 문자열 리스트로 가정하면 조용히 0행이 나옵니다 — 실제로 그랬습니다.
+                if isinstance(value, dict):
+                    turns = value.get("content") or []
+                elif isinstance(value, list):
+                    turns = value
+                else:
+                    turns = [value]
                 for turn in turns:
                     if not isinstance(turn, str):
                         continue
