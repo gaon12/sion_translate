@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -330,6 +331,93 @@ def assess_language_balance(
     return BalanceReport(counts=dict(counts), weights=weights, warnings=tuple(warnings))
 
 
+def _estimated_line_count(path: Path, *, probe_lines: int = 500) -> int:
+    """앞부분 표본으로 줄 수를 추정한다 (전량 스캔 없이).
+
+    5 GB 파일의 줄 수를 세자고 파일을 한 번 더 읽을 이유는 없습니다. 추정이
+    빗나가도 결과는 상한을 넘지 않습니다 — 아래 샘플러가 예산에서 하드 컷을
+    하기 때문입니다. 추정은 "얼마나 고르게 뽑을지"에만 씁니다.
+    """
+
+    size = path.stat().st_size
+    if size == 0:
+        return 0
+    consumed = 0
+    lines = 0
+    with path.open("rb") as handle:
+        for raw in handle:
+            consumed += len(raw)
+            lines += 1
+            if lines >= probe_lines:
+                break
+    if lines == 0:
+        return 0
+    return max(1, round(size / (consumed / lines)))
+
+
+def sample_monolingual_sentences(
+    paths: Sequence[Path],
+    budget: int,
+    *,
+    seed: int = 0,
+) -> Iterator[str]:
+    """파일 전체에 고르게 퍼진 최대 ``budget`` 문장을 낸다.
+
+    앞에서부터 자르지 않습니다. 단일어 코퍼스는 출처별로 파일이 나뉘어 있어
+    (위키 → 뉴스 → 커뮤니티) 앞에서 자르면 한 출처만 뽑히고, 그 편향이 그대로
+    어휘에 박힙니다. 대신 문장 내용을 해싱해 결정적으로 채택하므로, 같은
+    입력에서는 같은 표본이 나오고 파일 전체에 퍼집니다.
+    """
+
+    if budget <= 0:
+        return
+    estimated = sum(_estimated_line_count(path) for path in paths)
+    if estimated <= 0:
+        return
+    probability = min(1.0, budget / estimated)
+    threshold = int(probability * (1 << 64))
+    emitted = 0
+    for path in paths:
+        for text in iter_monolingual_lines(path):
+            if emitted >= budget:
+                return
+            if threshold < (1 << 64):
+                digest = hashlib.blake2b(f"{seed}\0{text}".encode("utf-8"), digest_size=8).digest()
+                if int.from_bytes(digest, "big") >= threshold:
+                    continue
+            emitted += 1
+            yield text
+
+
+def monolingual_budgets(
+    parallel_counts: dict[str, int],
+    languages: Sequence[str],
+    *,
+    ratio: float,
+) -> dict[str, int]:
+    """언어별 토크나이저 표본 상한.
+
+    상한은 "그 언어의 병렬 코퍼스 문장 수 × ratio" 입니다. 단일어 코퍼스를
+    전량 넣으면 분량이 큰 언어가 vocab 을 독식하고(현재 ko 5.3 GB 대 ja 0),
+    아예 빼면 foundation 단계가 자기 코퍼스에 없는 어휘로 학습합니다. 병렬
+    코퍼스 비율에 맞춰 넣으면 vocab 배분은 그대로 두고 어휘만 넓힙니다.
+
+    병렬 데이터가 없는 언어는 상한을 0 으로 두는 대신 병렬 데이터가 있는
+    언어들의 평균을 기준으로 잡습니다. 0 으로 두면 "번역쌍은 아직 없지만
+    단일어는 확보한" 언어가 토크나이저에서 통째로 빠지는데, 그것은 이
+    파이프라인에서 정상적인 중간 상태입니다.
+    """
+
+    if ratio < 0:
+        raise ValueError("monolingual sample ratio must be non-negative")
+    observed = [count for count in parallel_counts.values() if count > 0]
+    fallback = round(sum(observed) / len(observed)) if observed else 0
+    return {
+        language: int(round(ratio * (parallel_counts.get(language, 0) or fallback)))
+        for language in languages
+    }
+
+
 def render_discovery_report(
     discovery: MonolingualDiscovery,
     *,
@@ -377,5 +465,7 @@ __all__ = [
     "foundation_languages",
     "iter_monolingual_lines",
     "language_sampling_weights",
+    "monolingual_budgets",
     "render_discovery_report",
+    "sample_monolingual_sentences",
 ]

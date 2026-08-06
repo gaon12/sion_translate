@@ -280,3 +280,82 @@ def test_a_learned_piece_that_looks_like_a_tag_is_not_mistaken_for_one(monkeypat
     # '<2zz>' 는 예약 구간 밖의 학습된 조각이다.
     assert "zz" not in tokenizer.language_tags
     assert set(tokenizer.languages) == {"ko", "ja"}
+
+
+def _parallel_shard(path, count=1500):
+    with path.open("w", encoding="utf-8") as handle:
+        for index in range(count):
+            handle.write(
+                json.dumps(
+                    {
+                        "ko": f"한국어 병렬 문장 {index} 입니다",
+                        "ja": f"日本語の対訳文 {index} です",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+    return path
+
+
+def test_monolingual_vocabulary_reaches_the_tokenizer_under_a_per_language_cap(
+    tmp_path,
+) -> None:
+    """foundation 단계가 자기 코퍼스에 없는 어휘로 학습하면 안 된다.
+
+    단일어를 넣지 않으면 그 코퍼스에만 있는 낱말이 전부 byte fallback 이 되고,
+    foundation 은 자기 데이터를 바이트로 읽게 됩니다. 전량 넣으면 분량이 큰
+    언어가 vocab 을 독식하므로, 상한은 병렬 코퍼스의 해당 언어 문장 수를
+    기준으로 겁니다.
+    """
+    from sion_translate.data.monolingual import discover_monolingual_sources
+
+    shard = _parallel_shard(tmp_path / "pairs.jsonl")
+    corpus = tmp_path / "corpus"
+    (corpus / "ko").mkdir(parents=True)
+    # 병렬 코퍼스에는 없고 단일어에만 있는 어휘.
+    (corpus / "ko" / "mono.txt").write_text(
+        "\n".join(
+            f"광합성 엽록체 미토콘드리아 리보솜 {index} 세포소기관 연구" for index in range(2000)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    discovery = discover_monolingual_sources(corpus, ["ko", "ja"])
+
+    without = train_tokenizer(
+        [str(shard)],
+        tmp_path / "without",
+        vocab_size=800,
+        num_workers=1,
+        language_pair=["ko", "ja"],
+        monolingual=discovery,
+        monolingual_sample_ratio=0.0,
+    )
+    with_mono = train_tokenizer(
+        [str(shard)],
+        tmp_path / "with",
+        vocab_size=800,
+        num_workers=1,
+        language_pair=["ko", "ja"],
+        monolingual=discovery,
+        monolingual_sample_ratio=1.0,
+    )
+
+    def byte_pieces(model):
+        pieces = spm.SentencePieceProcessor(model_file=str(model)).encode(
+            "미토콘드리아", out_type=str
+        )
+        return sum(1 for piece in pieces if piece.startswith("<0x"))
+
+    assert byte_pieces(without) > 5
+    assert byte_pieces(with_mono) == 0
+
+    # 상한이 실제로 걸렸는지: 단일어 2,000줄 중 병렬 ko 문장 수 언저리만 들어간다.
+    metadata = load_tokenizer_metadata(with_mono)
+    sampled = metadata["monolingual_sentences"]["ko"]
+    assert 0 < sampled <= 1500
+    assert metadata["monolingual_sample_ratio"] == 1.0
+
+    # 넣지 않았을 때는 표본이 기록되지 않는다.
+    assert load_tokenizer_metadata(without)["monolingual_sentences"] == {}

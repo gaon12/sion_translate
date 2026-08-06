@@ -261,3 +261,75 @@ def test_the_report_names_every_skipped_path(tmp_path) -> None:
 
 def test_an_empty_discovery_is_falsy() -> None:
     assert not MonolingualDiscovery(root=__import__("pathlib").Path("x"))
+
+
+# ── 토크나이저 표본 상한 ────────────────────────────────────────────────
+
+
+def test_budget_follows_the_parallel_corpus_proportions() -> None:
+    """상한은 '그 언어의 병렬 문장 수 x ratio'."""
+    from sion_translate.data.monolingual import monolingual_budgets
+
+    budgets = monolingual_budgets({"ko": 1000, "ja": 1000}, ["ko", "ja"], ratio=1.0)
+    assert budgets == {"ko": 1000, "ja": 1000}
+
+    halved = monolingual_budgets({"ko": 1000, "ja": 1000}, ["ko", "ja"], ratio=0.5)
+    assert halved == {"ko": 500, "ja": 500}
+
+
+def test_a_language_without_parallel_data_still_gets_a_budget() -> None:
+    """번역쌍은 아직 없지만 단일어는 확보한 언어는 정상적인 중간 상태다.
+
+    0 으로 두면 그 언어가 토크나이저에서 통째로 빠지고, 나중에 번역쌍을
+    추가할 때 토크나이저를 다시 학습해야 합니다.
+    """
+    from sion_translate.data.monolingual import monolingual_budgets
+
+    budgets = monolingual_budgets({"ko": 1000, "ja": 500}, ["ko", "ja", "en"], ratio=1.0)
+    assert budgets["en"] == 750  # ko/ja 평균
+    assert budgets["ko"] == 1000
+
+
+def test_a_negative_ratio_is_rejected() -> None:
+    from sion_translate.data.monolingual import monolingual_budgets
+
+    with pytest.raises(ValueError, match="ratio"):
+        monolingual_budgets({"ko": 10}, ["ko"], ratio=-1.0)
+
+
+def test_sampling_respects_the_budget(tmp_path) -> None:
+    path = _write(tmp_path / "a.txt", [f"문장 번호 {index} 입니다" for index in range(1000)])
+    from sion_translate.data.monolingual import sample_monolingual_sentences
+
+    sampled = list(sample_monolingual_sentences([path], 100))
+    assert 0 < len(sampled) <= 100
+
+
+def test_sampling_spreads_across_the_file_instead_of_truncating(tmp_path) -> None:
+    """앞에서 자르면 한 출처만 뽑히고 그 편향이 어휘에 박힌다."""
+    path = _write(tmp_path / "a.txt", [f"문장 {index:05d} 번입니다" for index in range(2000)])
+    from sion_translate.data.monolingual import sample_monolingual_sentences
+
+    sampled = list(sample_monolingual_sentences([path], 200))
+    indices = [int(text.split()[1]) for text in sampled]
+
+    assert len(sampled) > 50
+    # 앞에서 자른 표본이라면 최댓값이 표본 크기 근처에 머문다.
+    assert max(indices) > 1500
+    assert min(indices) < 500
+
+
+def test_sampling_is_deterministic(tmp_path) -> None:
+    path = _write(tmp_path / "a.txt", [f"문장 {index} 입니다" for index in range(500)])
+    from sion_translate.data.monolingual import sample_monolingual_sentences
+
+    assert list(sample_monolingual_sentences([path], 50)) == list(
+        sample_monolingual_sentences([path], 50)
+    )
+
+
+def test_a_zero_budget_yields_nothing(tmp_path) -> None:
+    path = _write(tmp_path / "a.txt", ["문장 하나"])
+    from sion_translate.data.monolingual import sample_monolingual_sentences
+
+    assert list(sample_monolingual_sentences([path], 0)) == []

@@ -18,6 +18,11 @@ from sion_translate.data.records import (
     languages_from_pairs,
     normalize_language_pairs,
 )
+from sion_translate.data.monolingual import (
+    MonolingualDiscovery,
+    monolingual_budgets,
+    sample_monolingual_sentences,
+)
 from sion_translate.data.quality import QualityPolicy, assess_pair, canonical_text
 from sion_translate.fingerprint import file_sha256
 from sion_translate.performance import bounded_ordered_map, build_cpu_plan
@@ -140,6 +145,8 @@ def write_tokenizer_metadata(
     *,
     split_digits: bool,
     language_pairs: Sequence[Sequence[str]],
+    monolingual_sentences: dict[str, int] | None = None,
+    monolingual_sample_ratio: float = 0.0,
 ) -> Path:
     """Write the reproducibility and identity contract for a trained tokenizer."""
 
@@ -158,6 +165,10 @@ def write_tokenizer_metadata(
         "model_sha256": file_sha256(model_path),
         "vocab_file": vocab_path.name,
         "vocab_sha256": file_sha256(vocab_path),
+        # foundation 단계가 이 토크나이저와 같은 어휘를 보는지 확인할 수 있게
+        # 단일어 표본 규모를 남깁니다. 0 이면 병렬 코퍼스만으로 학습한 것입니다.
+        "monolingual_sample_ratio": float(monolingual_sample_ratio),
+        "monolingual_sentences": dict(monolingual_sentences or {}),
     }
     if features_path.is_file():
         metadata["token_features_file"] = features_path.name
@@ -231,7 +242,7 @@ def _filter_text_batch(
         frozenset[str],
         bool,
     ],
-) -> list[tuple[str, str, str, bytes, bytes]]:
+) -> list[tuple[str, str, str, str, str, bytes, bytes]]:
     (
         lines,
         language_pairs,
@@ -242,7 +253,7 @@ def _filter_text_batch(
         source_is_synthetic,
     ) = batch
     policy = QualityPolicy()
-    accepted: list[tuple[str, str, str, bytes, bytes]] = []
+    accepted: list[tuple[str, str, str, str, str, bytes, bytes]] = []
     for raw_line in lines:
         try:
             row = json.loads(raw_line.decode("utf-8-sig"))
@@ -289,7 +300,9 @@ def _filter_text_batch(
                 text_b,
                 approximate=approximate_split,
             )
-            accepted.append((text_a, text_b, split, source_digest, target_digest))
+            accepted.append(
+                (language_a, text_a, language_b, text_b, split, source_digest, target_digest)
+            )
     return accepted
 
 
@@ -319,6 +332,38 @@ def iter_parallel_text(
     num_workers: int | None = None,
 ) -> Iterator[str]:
     """Yield train-partition text without first materializing a temporary corpus."""
+
+    for _, text in iter_parallel_text_with_languages(
+        paths,
+        validation_fraction=validation_fraction,
+        test_fraction=test_fraction,
+        language_pair=language_pair,
+        language_pairs=language_pairs,
+        approximate_split=approximate_split,
+        source_only_languages=source_only_languages,
+        train_only_prefixes=train_only_prefixes,
+        num_workers=num_workers,
+    ):
+        yield text
+
+
+def iter_parallel_text_with_languages(
+    paths: Sequence[Path],
+    *,
+    validation_fraction: float = 0.005,
+    test_fraction: float = 0.005,
+    language_pair: Sequence[str] = DEFAULT_LANGUAGE_PAIR,
+    language_pairs: Sequence[Sequence[str]] | None = None,
+    approximate_split: bool = False,
+    source_only_languages: Sequence[str] = (),
+    train_only_prefixes: Sequence[str] = DEFAULT_SYNTHETIC_PREFIXES,
+    num_workers: int | None = None,
+) -> Iterator[tuple[str, str]]:
+    """``(language, text)`` 쌍을 낸다.
+
+    언어별 상한을 걸려면 어느 문장이 어느 언어인지 알아야 합니다. 라벨 없는
+    ``iter_parallel_text`` 는 이 함수를 감싼 것이라 두 경로가 갈라지지 않습니다.
+    """
 
     policy = QualityPolicy()
     policy.validate()
@@ -357,13 +402,21 @@ def iter_parallel_text(
         results = bounded_ordered_map(executor, _filter_text_batch, inputs, max_pending=workers * 2)
     try:
         for candidates in results:
-            for text_a, text_b, split, source_digest, target_digest in candidates:
+            for (
+                language_a,
+                text_a,
+                language_b,
+                text_b,
+                split,
+                source_digest,
+                target_digest,
+            ) in candidates:
                 if not target_split_guard.accept_many(split, (source_digest, target_digest)):
                     continue
                 if split != "train":
                     continue
-                yield text_a
-                yield text_b
+                yield language_a, text_a
+                yield language_b, text_b
     finally:
         if executor is not None:
             executor.shutdown()
@@ -489,10 +542,71 @@ class SionTokenizer:
         return self.processor.decode([int(token_id) for token_id in ids])
 
 
+def iter_tokenizer_sentences(
+    paths: Sequence[Path],
+    *,
+    monolingual: MonolingualDiscovery | None = None,
+    monolingual_sample_ratio: float = 0.0,
+    language_pairs: Sequence[Sequence[str]],
+    validation_fraction: float = 0.005,
+    test_fraction: float = 0.005,
+    approximate_split: bool = False,
+    source_only_languages: Sequence[str] = (),
+    train_only_prefixes: Sequence[str] = DEFAULT_SYNTHETIC_PREFIXES,
+    num_workers: int | None = None,
+    monolingual_counts: dict[str, int] | None = None,
+) -> Iterator[str]:
+    """토크나이저가 볼 문장 전부: 병렬 코퍼스 + 상한을 건 단일어 표본.
+
+    단일어를 넣는 이유는 foundation 단계가 자기 코퍼스에 없는 어휘로 학습하는
+    것을 막기 위해서이고, 상한을 거는 이유는 분량이 큰 언어가 vocab 을
+    독식하는 것을 막기 위해서입니다. 상한은 병렬 코퍼스를 흘려보내며 언어별로
+    센 문장 수에서 나오므로, 추가 pass 없이 결정됩니다 — 병렬을 먼저 전부
+    내보낸 뒤에 단일어를 내보내는 순서가 그래서 중요합니다.
+
+    ``monolingual_counts`` 를 주면 언어별로 실제 내보낸 단일어 문장 수가
+    기록됩니다(호출자 보고용).
+    """
+
+    parallel_counts: Counter[str] = Counter()
+    for language, text in iter_parallel_text_with_languages(
+        paths,
+        validation_fraction=validation_fraction,
+        test_fraction=test_fraction,
+        language_pairs=language_pairs,
+        approximate_split=approximate_split,
+        source_only_languages=source_only_languages,
+        train_only_prefixes=train_only_prefixes,
+        num_workers=num_workers,
+    ):
+        parallel_counts[language] += 1
+        yield text
+
+    if monolingual is None or not monolingual.sources or monolingual_sample_ratio <= 0:
+        return
+    budgets = monolingual_budgets(
+        dict(parallel_counts),
+        monolingual.languages,
+        ratio=monolingual_sample_ratio,
+    )
+    for language in monolingual.languages:
+        emitted = 0
+        for text in sample_monolingual_sentences(
+            monolingual.paths_for(language),
+            budgets.get(language, 0),
+        ):
+            emitted += 1
+            yield canonical_text(text)
+        if monolingual_counts is not None:
+            monolingual_counts[language] = emitted
+
+
 def corpus_character_counts(
     paths: Sequence[Path],
     *,
     language_pairs: Sequence[Sequence[str]],
+    monolingual: MonolingualDiscovery | None = None,
+    monolingual_sample_ratio: float = 0.0,
     validation_fraction: float = 0.005,
     test_fraction: float = 0.005,
     approximate_split: bool = False,
@@ -503,8 +617,10 @@ def corpus_character_counts(
     """Count every character in the training partition of ``paths``."""
 
     counts: Counter[str] = Counter()
-    for text in iter_parallel_text(
+    for text in iter_tokenizer_sentences(
         paths,
+        monolingual=monolingual,
+        monolingual_sample_ratio=monolingual_sample_ratio,
         validation_fraction=validation_fraction,
         test_fraction=test_fraction,
         language_pairs=language_pairs,
@@ -577,6 +693,11 @@ def train_tokenizer(
     num_workers: int | None = None,
     num_threads: int | None = None,
     split_digits: bool = True,
+    # foundation 사전학습용 단일어 코퍼스. 넣으면 그 어휘가 vocab 에 들어가고,
+    # 넣지 않으면 foundation 단계가 자기 코퍼스에 없는 어휘로 학습합니다.
+    # 언어별 상한은 `monolingual_sample_ratio` 가 정합니다.
+    monolingual: MonolingualDiscovery | None = None,
+    monolingual_sample_ratio: float = 0.0,
 ) -> Path:
     """병렬 코퍼스로 joint SentencePiece 토크나이저를 학습한다.
 
@@ -626,6 +747,8 @@ def train_tokenizer(
         counts = corpus_character_counts(
             paths,
             language_pairs=normalized_pairs,
+            monolingual=monolingual,
+            monolingual_sample_ratio=monolingual_sample_ratio,
             validation_fraction=validation_fraction,
             test_fraction=test_fraction,
             approximate_split=approximate_split,
@@ -650,9 +773,13 @@ def train_tokenizer(
                 f"{required_character_min_occurrences})."
             )
 
+    monolingual_counts: dict[str, int] = {}
     spm.SentencePieceTrainer.train(
-        sentence_iterator=iter_parallel_text(
+        sentence_iterator=iter_tokenizer_sentences(
             paths,
+            monolingual=monolingual,
+            monolingual_sample_ratio=monolingual_sample_ratio,
+            monolingual_counts=monolingual_counts,
             validation_fraction=validation_fraction,
             test_fraction=test_fraction,
             language_pairs=normalized_pairs,
@@ -687,6 +814,8 @@ def train_tokenizer(
         model_path,
         split_digits=split_digits,
         language_pairs=normalized_pairs,
+        monolingual_sentences=monolingual_counts or None,
+        monolingual_sample_ratio=monolingual_sample_ratio,
     )
     return model_path
 
