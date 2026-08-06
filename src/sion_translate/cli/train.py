@@ -27,7 +27,7 @@ import json
 import math
 import random
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 import torch
@@ -51,6 +51,10 @@ from sion_translate.data import (
     DistributedBucketBatchSampler,
     IndexedParallelDataset,
     SionBatchCollator,
+)
+from sion_translate.artifacts import (
+    FOUNDATION_STAGE_DIRECTORY,
+    TRANSLATION_RELEASE_NAME,
 )
 from sion_translate.data.collate import load_morphoscript_token_features
 from sion_translate.foundation import (
@@ -355,6 +359,9 @@ def export_final_model(
     *,
     stage: str,
     step: int,
+    formats: Sequence[str] | None = None,
+    release_name: str = TRANSLATION_RELEASE_NAME,
+    translation_capable: bool = True,
 ) -> Path:
     """Create the required final format set from the restored best weights."""
 
@@ -365,7 +372,9 @@ def export_final_model(
         config.model,
         context,
         step=step,
-        formats=tuple(config.training.final_export_formats),
+        formats=tuple(formats if formats is not None else config.training.final_export_formats),
+        release_name=release_name,
+        translation_capable=translation_capable,
         tokenizer_path=config.data.tokenizer_model,
         token_features_path=(
             config.data.tokenizer_features
@@ -855,6 +864,20 @@ def run_foundation_stage(
     del train_loader, validation_loader, train_sampler, validation_sampler
     del train_collator, validation_collator, train_dataset, validation_dataset
 
+    export_final_model(
+        model,
+        foundation_config,
+        context,
+        Path(config.training.output_dir),
+        stage=FOUNDATION_STAGE_DIRECTORY,
+        step=int(result["selected_step"]),
+        formats=config.foundation.final_export_formats,
+        # 번역 모델이 아니라 그 파운데이션입니다. 이름을 나누는 것만으로는
+        # 부족합니다 — 구조가 번역 모델과 같아서 그대로 실으면 방향 태그를
+        # 받아들이고 그럴듯한 쓰레기를 냅니다.
+        release_name=config.foundation.release_name,
+        translation_capable=False,
+    )
     if context.is_main:
         run_root.mkdir(parents=True, exist_ok=True)
         completion.write_text(

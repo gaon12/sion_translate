@@ -172,6 +172,16 @@ class Translator:
             if not isinstance(raw_metadata, Mapping):
                 raise ValueError("model export metadata must be an object")
             self.export_metadata = dict(raw_metadata)
+        # 번역할 수 없는 산출물을 번역기로 싣지 않습니다. foundation 모델은
+        # 번역쌍을 한 번도 보지 않았지만 구조가 같아서, 막지 않으면 방향
+        # 태그를 받아들이고 그럴듯한 쓰레기를 냅니다.
+        if self.export_metadata.get("translation_capable") is False:
+            release = self.export_metadata.get("release_name", "unknown")
+            raise ValueError(
+                f"이 export 는 번역 모델이 아닙니다 (release_name={release!r}). "
+                "단일어 복원만 학습한 foundation 산출물이므로 번역에 쓸 수 없습니다. "
+                "번역 단계(runs/*/pretrain 또는 posttrain)의 export 를 지정하세요."
+            )
         self.tokenizer_metadata = load_tokenizer_metadata(tokenizer_path)
         self.language_pairs = _language_pairs_from_metadata(self.export_metadata)
         if not self.language_pairs:

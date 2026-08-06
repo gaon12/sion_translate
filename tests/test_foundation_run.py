@@ -171,3 +171,33 @@ def test_a_disabled_plan_does_nothing_and_says_why(tmp_path, tokenizer_model) ->
     assert "foundation.enabled=false" in outcome.reason
     assert outcome.best_checkpoint is None
     assert not (foundation_run_directory(config) / FOUNDATION_COMPLETION_FILENAME).exists()
+
+
+def test_the_stage_publishes_under_the_foundation_release_name(tmp_path, tokenizer_model) -> None:
+    """foundation 산출물은 번역 모델이 아니라 그 파운데이션이다."""
+    config, plan, model, tokenizer, context = _prepared(tmp_path, tokenizer_model)
+    config.foundation.final_export_formats = ["fp32"]
+    run_foundation_stage(config, plan, model, tokenizer, context)
+
+    export = foundation_run_directory(config) / "exports" / "best"
+    assert export.is_dir()
+    payload = torch.load(export / "model.pt", map_location="cpu", weights_only=True)
+    metadata = payload["metadata"]
+    assert metadata["release_name"] == "sion"
+    assert metadata["translation_capable"] is False
+    # 번역 방향을 적지 않는다. 번역할 수 없는 가중치이기 때문이다.
+    assert "translation_directions" not in metadata
+    assert "language_pair" not in metadata
+
+
+def test_a_foundation_export_is_refused_by_the_translator(tmp_path, tokenizer_model) -> None:
+    """막지 않으면 방향 태그를 받아들이고 그럴듯한 쓰레기를 낸다."""
+    from sion_translate.inference import Translator
+
+    config, plan, model, tokenizer, context = _prepared(tmp_path, tokenizer_model)
+    config.foundation.final_export_formats = ["fp32"]
+    run_foundation_stage(config, plan, model, tokenizer, context)
+    export = foundation_run_directory(config) / "exports" / "best" / "model.pt"
+
+    with pytest.raises(ValueError, match="번역 모델이 아닙니다"):
+        Translator(str(export), str(tokenizer_model))
