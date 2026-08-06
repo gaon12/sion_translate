@@ -40,6 +40,42 @@ def test_disabled_by_default_so_existing_checkpoints_load() -> None:
     recurrent.load_state_dict(plain.state_dict())
 
 
+def test_repeats_the_block_as_a_unit_not_each_layer() -> None:
+    """마지막 N개 층은 **하나의 블록으로 묶여** 반복되어야 한다.
+
+    층별 반복(L2를 3번 → L3를 3번)과 블록 반복((L2,L3)을 3번)은 서로 다른
+    함수다. 설정 이름과 주석이 약속한 것은 후자이므로 그것을 직접 확인한다.
+    """
+    torch.manual_seed(4)
+    steps, block = 3, 2
+    model = SionForConditionalGeneration(
+        _config(recurrent_block_layers=block, recurrent_steps=steps)
+    ).eval()
+    input_ids, attention_mask = _inputs()
+    boundary = len(model.encoder_layers) - block
+
+    with torch.no_grad():
+        actual = model.encode(input_ids, attention_mask)
+
+        hidden = model._embed(input_ids)
+        for layer in model.encoder_layers[:boundary]:
+            hidden = layer(hidden, attention_mask)
+        for _ in range(steps):
+            for layer in model.encoder_layers[boundary:]:
+                hidden = layer(hidden, attention_mask)
+        per_block = model.encoder_norm(hidden)
+
+        hidden = model._embed(input_ids)
+        for index, layer in enumerate(model.encoder_layers):
+            for _ in range(steps if index >= boundary else 1):
+                hidden = layer(hidden, attention_mask)
+        per_layer = model.encoder_norm(hidden)
+
+    assert torch.allclose(actual, per_block, atol=1e-6)
+    # 두 해석이 실제로 다른 값을 내는 설정이어야 위 assert 가 의미를 가진다.
+    assert not torch.allclose(per_block, per_layer, atol=1e-5)
+
+
 def test_recurrence_changes_the_encoder_output() -> None:
     torch.manual_seed(0)
     config = _config()

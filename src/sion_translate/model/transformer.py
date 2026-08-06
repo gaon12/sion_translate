@@ -347,17 +347,26 @@ class SionForConditionalGeneration(nn.Module):
                 src_coda_ids if src_coda_ids is not None else zero,
             )
         interval = max(1, self.config.experimental.morphoscript_interval)
-        # 공유 블록 반복: 마지막 recurrent_block_layers 개 층을 recurrent_steps 번
-        # 통과시킵니다. 같은 가중치를 재사용하므로 파라미터는 늘지 않고 유효 깊이만
-        # 늘어납니다. 0 이면 아래 루프가 원래대로 각 층을 한 번씩만 돕니다.
-        block_size = min(self.recurrent_block_layers, len(self.encoder_layers))
-        boundary = len(self.encoder_layers) - block_size
-        for index, layer in enumerate(self.encoder_layers):
-            repeats = self.recurrent_steps if index >= boundary and block_size else 1
-            for _ in range(repeats):
-                hidden = self._checkpoint(layer, hidden, attention_mask)
+
+        def run_layer(index: int, hidden: torch.Tensor) -> torch.Tensor:
+            hidden = self._checkpoint(self.encoder_layers[index], hidden, attention_mask)
             if side_states is not None and (index + 1) % interval == 0:
                 hidden = hidden + torch.tanh(self.morph_gates[index]) * side_states
+            return hidden
+
+        # 공유 블록 반복: 마지막 recurrent_block_layers 개 층을 **하나의 블록으로
+        # 묶어** recurrent_steps 번 통과시킵니다. 층마다 따로 반복하는 것과는 다른
+        # 계산입니다 — (L2, L3) 를 3번 도는 것과 L2 를 3번 돈 뒤 L3 를 3번 도는 것은
+        # 서로 다른 함수이고, 여기서 의도한 것은 전자(블록 단위 재귀)입니다.
+        # 같은 가중치를 재사용하므로 파라미터는 늘지 않고 유효 깊이만 늘어납니다.
+        # 0 이면 블록이 비어 아래 루프가 원래대로 각 층을 한 번씩만 돕니다.
+        block_size = min(self.recurrent_block_layers, len(self.encoder_layers))
+        boundary = len(self.encoder_layers) - block_size
+        for index in range(boundary):
+            hidden = run_layer(index, hidden)
+        for _ in range(self.recurrent_steps if block_size else 1):
+            for index in range(boundary, len(self.encoder_layers)):
+                hidden = run_layer(index, hidden)
         return self.encoder_norm(hidden)
 
     def decode(
