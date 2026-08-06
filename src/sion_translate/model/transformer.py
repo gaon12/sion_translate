@@ -500,6 +500,9 @@ class SionForConditionalGeneration(nn.Module):
                     ignore_index=-100,
                     reduction="none",
                 )
+                # (batch, seq, vocab) 하나를 잡아 두는 것은 큰 vocab 에서 GB 단위
+                # 입니다. 두 요약값만 남기고 즉시 놓아 줍니다.
+                del pre_repair_logits
         decoder_states, uncertainty_logits, evidence_requests = self._apply_evidence_repair(
             decoder_states,
             encoder_states,
@@ -512,8 +515,14 @@ class SionForConditionalGeneration(nn.Module):
             return SionOutput(logits=logits, evidence_request_rate=request_rate)
         # label 이 -100 인 위치(패딩)는 loss 계산에서 제외합니다.
         token_count = labels.ne(-100).sum()
+        # BF16 autocast 아래에서 loss 는 FP32 로 계산해야 하는데, `logits.float()`
+        # 를 호출하는 곳마다 (batch, seq, vocab) 사본이 새로 생기고 그 사본은 전부
+        # backward 까지 살아 있습니다. batch 32 · seq 512 · vocab 48,000 이면 사본
+        # 하나가 3.1 GB 라, 예전처럼 cross-entropy 와 z-loss 가 따로 부르면 6.3 GB
+        # 가 상주했습니다. 한 번만 만들어 모든 FP32 소비자가 공유합니다.
+        float_logits = logits.float()
         lm_loss_sum = F.cross_entropy(
-            logits.float().reshape(-1, logits.shape[-1]),
+            float_logits.reshape(-1, float_logits.shape[-1]),
             labels.reshape(-1),
             ignore_index=-100,
             reduction="sum",
@@ -523,7 +532,7 @@ class SionForConditionalGeneration(nn.Module):
         # z-loss: logsumexp(logits)² 에 작은 벌점을 줘 logit 크기가
         # 무한정 커지는 것을 막습니다 (혼합 정밀도 학습 안정화).
         if self.config.z_loss_weight > 0:
-            log_normalizer = logits.float().logsumexp(-1)
+            log_normalizer = float_logits.logsumexp(-1)
             valid_targets = labels.ne(-100).to(dtype=log_normalizer.dtype)
             z_loss = (log_normalizer.square() * valid_targets).sum()
             z_loss = z_loss / valid_targets.sum().clamp_min(1.0)
@@ -592,7 +601,7 @@ class SionForConditionalGeneration(nn.Module):
                 F.relu(evidence_request_rate - exp.evidence_budget_target).square() * has_target
             )
             post_repair_token_nll = F.cross_entropy(
-                logits.float().transpose(1, 2),
+                float_logits.transpose(1, 2),
                 labels,
                 ignore_index=-100,
                 reduction="none",

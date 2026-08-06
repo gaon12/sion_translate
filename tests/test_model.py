@@ -1102,3 +1102,42 @@ def test_beam_search_is_reproducible_across_batch_and_beam_widths() -> None:
         for index, single in enumerate(singles):
             shared = min(batched.shape[1], single.shape[1])
             assert torch.equal(batched[index, :shared], single[0, :shared]), (num_beams, index)
+
+
+class _Float32VocabCopyCounter(torch.utils._python_dispatch.TorchDispatchMode):
+    """(batch, seq, vocab) 텐서를 FP32 로 복사하는 횟수를 셉니다."""
+
+    def __init__(self, vocab_size: int) -> None:
+        self.vocab_size = vocab_size
+        self.copies = 0
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        result = func(*args, **(kwargs or {}))
+        if func is torch.ops.aten._to_copy.default and isinstance(result, torch.Tensor):
+            if (
+                result.dtype is torch.float32
+                and result.dim() == 3
+                and result.shape[-1] == self.vocab_size
+            ):
+                self.copies += 1
+        return result
+
+
+def test_loss_materializes_the_fp32_logit_copy_only_once() -> None:
+    """혼합 정밀도에서 (batch, seq, vocab) FP32 사본은 하나만 만들어야 한다.
+
+    사본 하나가 batch 32 · seq 512 · vocab 48,000 에서 3.1 GB 이고 backward
+    까지 상주하므로, cross-entropy 와 z-loss 가 각자 ``logits.float()`` 를
+    부르면 그대로 두 배가 됩니다.
+    """
+    config = tiny_config()
+    config.z_loss_weight = 1e-4
+    model = SionForConditionalGeneration(config).eval()
+    batch = make_batch()
+
+    counter = _Float32VocabCopyCounter(config.vocab_size)
+    with torch.autocast("cpu", dtype=torch.bfloat16), counter:
+        output = model(**batch)
+
+    assert output.loss is not None
+    assert counter.copies == 1, f"FP32 logits 사본이 {counter.copies}개 생겼습니다"
