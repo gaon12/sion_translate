@@ -223,3 +223,36 @@ def test_a_threshold_outside_the_unit_interval_is_refused(threshold) -> None:
         audit_holdout_leakage(
             [HoldoutItem("x", "ko", "가나다")], [], similarity_threshold=threshold
         )
+
+
+def test_the_match_cap_keeps_the_worst_leaks_not_the_first_ones(tmp_path) -> None:
+    """스캔 순서대로 앞의 N 개를 남기면 더 심한 누출을 버린다.
+
+    실제로 `호랑이도 제 말 하면 온다더니.` 는 data12 에서 0.91, data9 에서
+    1.00 인데 문자열 정렬상 data12 가 먼저라 1.00 이 상한에 걸려 사라졌습니다.
+    안전 관문이 누출을 과소보고하는 방향이라 허용할 수 없습니다.
+    """
+    idiom = "호랑이도 제 말 하면 온다더니"
+    challenge = _challenge(
+        tmp_path / "cases.jsonl",
+        [{"id": "c1", "source": idiom, "source_language": "ko", "target_language": "ja"}],
+    )
+    # 먼저 스캔되는 파일에는 **부분** 일치만 둡니다. 관용구를 통째로 담으면
+    # 문장이 아무리 길어도 containment 는 1.0 입니다 — 비대칭이 설계 의도라
+    # 그것으로는 "앞의 N 개"와 "가장 나쁜 N 개"를 구분할 수 없습니다.
+    weak = _shard(
+        tmp_path / "data" / "a_first.jsonl",
+        [{"ko": f"호랑이도 제 말 하면 좋겠다는 생각 {index}", "ja": "x"} for index in range(6)],
+    )
+    strong = _shard(tmp_path / "data" / "z_last.jsonl", [{"ko": idiom, "ja": "x"}])
+
+    findings = audit_holdout_leakage(
+        load_holdout_items([challenge]), [weak, strong], maximum_matches_per_item=3
+    )
+    leaked = [finding for finding in findings if finding.leaked][0]
+
+    assert len(leaked.matches) == 3
+    assert leaked.worst.similarity == 1.0
+    assert "z_last" in leaked.worst.file
+    # 보고서가 심한 순으로 정렬되어 있어야 검수가 위에서부터 유효하다.
+    assert leaked.matches == sorted(leaked.matches, key=lambda m: -m.similarity)

@@ -200,10 +200,8 @@ def audit_holdout_leakage(
         for shingle in shingles(text):
             candidate_ids |= index.get((language, shingle), frozenset())
         for identifier in candidate_ids:
-            candidate = findings[identifier].item
-            finding = findings[candidate.identifier]
-            if len(finding.matches) >= maximum_matches_per_item:
-                continue
+            finding = findings[identifier]
+            candidate = finding.item
             similarity = containment(candidate.text, text)
             if similarity < similarity_threshold:
                 continue
@@ -216,6 +214,17 @@ def audit_holdout_leakage(
                     exact=normalized_split_key(text) == normalized_split_key(candidate.text),
                 )
             )
+            # 상한은 **가장 나쁜** N 개를 남깁니다. 스캔 순서대로 앞의 N 개를
+            # 남기면 더 심한 누출이 뒤 파일에 있을 때 그것을 버립니다 —
+            # 실제로 `호랑이도 제 말 하면 온다더니.` 는 data12 에서 0.91,
+            # data9 에서 1.00 인데 문자열 정렬상 data12 가 먼저라 1.00 이
+            # 상한에 걸려 사라졌습니다. 안전 관문이 누출을 과소보고하는
+            # 방향이라 허용할 수 없습니다.
+            if len(finding.matches) > maximum_matches_per_item:
+                finding.matches.sort(key=lambda match: -match.similarity)
+                del finding.matches[maximum_matches_per_item:]
+    for finding in findings.values():
+        finding.matches.sort(key=lambda match: -match.similarity)
     return list(findings.values())
 
 
