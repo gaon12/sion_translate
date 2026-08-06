@@ -4,6 +4,19 @@ sion_translate는 한국어↔일본어 번역 모델을 처음부터 학습하�
 joint SentencePiece, GQA, RoPE, pre-RMSNorm, QK-norm, SwiGLU, EMA, 양방향 번역,
 용어집 강제, SFT 뒤 최소위험 사후학습을 포함합니다.
 
+학습은 **세 단계**입니다.
+
+| 단계 | 목적 | 산출물 | 배포 이름 |
+|---|---|---|---|
+| foundation | 언어별 단일어 span-corruption 복원 | `runs/*/foundation/` | **`sion`** |
+| SFT | 번역 (foundation 가중치에서 시작) | `runs/*/pretrain/` | `sion_translate` |
+| MRT | 복합 보상 사후학습 | `runs/*/posttrain/` | `sion_translate` |
+
+foundation 단계는 `data/corpus/<언어코드>/`에 단일어 텍스트가 있으면 자동으로
+먼저 돌고, 없으면 이유를 출력하고 건너뜁니다. 그 산출물은 번역쌍을 한 번도
+보지 않았으므로 **번역 모델이 아니며**, `Translator`가 싣기를 거부합니다.
+자세한 내용은 [`docs/foundation-pretraining.md`](docs/foundation-pretraining.md).
+
 학습 데이터, 전처리 산출물, 체크포인트, 모델 가중치와 로컬 평가 결과는 Git 저장소에
 포함하지 않습니다. 사용자는 이용·가공·재배포 권한을 직접 확인한 JSONL만 준비해야
 합니다. 유지관리자가 별도로 만드는 `sion_translate.zip`은 권한 확인이 끝난 특정
@@ -328,6 +341,11 @@ sion-prepare-data --input "data/*.jsonl" \
 sion-train --config configs/sion_data_fit.yaml
 ```
 
+`sion-train`은 `data/corpus/`에 단일어 텍스트가 있으면 foundation 단계를 먼저
+실행합니다. 끝나면 `runs/*/foundation/stage_complete.json`이 남고, 이후 실행은
+학습을 건너뛰고 그 가중치만 물려받습니다 — 번역 학습이 실패해 다시 실행할 때마다
+며칠짜리 사전학습을 반복하지 않기 위한 것입니다.
+
 토크나이저를 다시 만들면 vocab이 달라지므로 `artifacts/dataset`과 기존
 체크포인트는 재사용할 수 없습니다. 위 세 단계를 순서대로 다시 실행해야 합니다.
 해당 경로에 호환되지 않는 과거 산출물이 있다면 먼저 별도 백업 경로로 옮기십시오.
@@ -426,6 +444,52 @@ sion-concat --input "data/*.jsonl" --output data/concat_multi.jsonl \
 ```bash
 torchrun --standalone --nproc-per-node=8 -m sion_translate.cli.train
 ```
+
+## 학습 전 감사 도구
+
+전부 GPU 시간을 쓰기 전에 도는 관문입니다. 이 프로젝트의 실패는 대부분
+"조용히 잘못된 데이터로 학습이 끝난 뒤에야 드러나는" 종류라 사전 검사를 둡니다.
+
+```bash
+# 1. 토큰 노출 — 어휘 조각이 디코더 타깃으로 몇 번 나오는가
+sion-audit-tokens --input "data/*.jsonl" --tokenizer artifacts/tokenizer/sion.model   --monolingual-corpus data/corpus
+
+# 2. holdout 누출 — challenge 문장이 학습 코퍼스에 이미 있는가 (누출 시 종료 코드 != 0)
+python scripts/data/audit_holdout_leakage.py   --holdout examples/expressive_cultural_cases.jsonl --corpus "data/*.jsonl"
+
+# 3. 오염된 정답쌍 — 사람 검수 queue 생성 (아무것도 지우지 않음)
+python scripts/data/build_review_queue.py --input "data/*.jsonl"   --output reports/review_queue.jsonl
+```
+
+측정된 결과와 그 해석은 [`docs/PROJECT_ROAST.md`](docs/PROJECT_ROAST.md)에 있습니다.
+`examples/expressive_cultural_cases.jsonl`은 실측으로 **48개 중 28개(58.3%)가
+학습 코퍼스와 겹치므로** 회귀 smoke set으로만 쓰고 품질 benchmark로 인용하지
+마십시오.
+
+### foundation 코퍼스 만들기
+
+```bash
+# 국립국어원 모두의 말뭉치 ZIP → 발화 단위 JSONL
+python scripts/data/extract_nikl_corpus.py --archive "kli_corpus/NIKL_*.zip"   --output data/corpus/ko/nikl_spoken_dialogue.jsonl
+
+# 일본어 구어 (Apache-2.0)
+python scripts/data/fetch_open2ch.py --output data/corpus/ja/open2ch_cleaned.jsonl
+```
+
+둘 다 **발화/문단 단위로 한 줄씩** 씁니다. 문서 단위로 넣으면 학습 준비에서
+문자의 25.9%가 상한 초과로 폐기됩니다(실측).
+
+## export 형식
+
+`training.final_export_formats`로 정합니다. `fp32`, `fp16`, `bf16`, `int8`,
+`int4`, `fp8`, `gguf_q4_k_m`, `transformers`.
+
+`fp8`은 가중치 전용 E4M3 + 블록 스케일입니다. 디코딩이 가중치 대역폭 바운드라
+(KV cache는 옮기는 바이트의 1.5%) 가중치만 내려도 이득을 얻고, 양쪽을 내리는
+것보다 정확합니다(출력 오차 2.57% 대 3.63%). 기본 범위는 FFN 뿐입니다 —
+attention까지 내리면 최종 logits 오차가 6.39%에서 13.11%로 두 배가 됩니다.
+어휘 projection은 어떤 설정에서도 제외됩니다(argmax 6.45% 변경).
+근거 수치는 `src/sion_translate/fp8.py` 문서에 있습니다.
 
 ## 저장소에 포함하지 않는 파일
 
