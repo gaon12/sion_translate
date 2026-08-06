@@ -188,9 +188,9 @@ class MorphoScriptFusion(nn.Module):
 
 
 class ContentRegisterState(nn.Module):
-    def __init__(self, d_model: int, register_classes: int):
+    def __init__(self, d_model: int, register_classes: int, *, norm_eps: float = 1e-6):
         super().__init__()
-        self.norm = RMSNorm(d_model)
+        self.norm = RMSNorm(d_model, norm_eps)
         self.classifier = nn.Linear(d_model, register_classes)
         self.register_embeddings = nn.Embedding(register_classes, d_model)
         # FSDP2 cannot shard scalar parameters. A one-element vector has the

@@ -223,7 +223,13 @@ class SionForConditionalGeneration(nn.Module):
             nn.Parameter(torch.zeros(config.encoder_layers)) if exp.morphoscript_enabled else None
         )
         self.register_state = (
-            ContentRegisterState(config.d_model, exp.register_classes) if exp.core_enabled else None
+            ContentRegisterState(
+                config.d_model,
+                exp.register_classes,
+                norm_eps=config.rms_norm_eps,
+            )
+            if exp.core_enabled
+            else None
         )
         self.typed_memory = (
             TypedEntityMemory(

@@ -1184,3 +1184,26 @@ def test_residual_projections_are_scaled_down_from_the_base_std() -> None:
     assert out_proj.std().item() == pytest.approx(expected, rel=0.25)
     assert q_proj.std().item() == pytest.approx(config.init_std, rel=0.25)
     assert out_proj.std().item() < q_proj.std().item()
+
+
+def test_every_norm_uses_the_configured_epsilon() -> None:
+    """RMSNorm eps 는 설정값 하나에서 와야 한다.
+
+    ``ContentRegisterState`` 만 ``RMSNorm(d_model)`` 로 기본값 1e-6 을 쓰고
+    있었습니다. 하필 루트 설정에서 유일하게 켜 두는 모듈이라, config 의
+    ``rms_norm_eps`` 를 바꿔도 그 하나만 따라오지 않았습니다.
+    """
+    from sion_translate.model.layers import RMSNorm
+
+    config = tiny_config()
+    config.rms_norm_eps = 3.5e-5
+    config.experimental.evidence_repair_enabled = True
+    config.experimental.semantic_parity_enabled = True
+    model = SionForConditionalGeneration(config)
+
+    offenders = [
+        name
+        for name, module in model.named_modules()
+        if isinstance(module, RMSNorm) and module.eps != config.rms_norm_eps
+    ]
+    assert not offenders, f"설정 eps 를 쓰지 않는 RMSNorm: {offenders}"
