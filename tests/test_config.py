@@ -435,3 +435,20 @@ def test_runnable_presets_do_not_outrun_the_corpus() -> None:
     runnable = sorted(path.name for path in config_root.glob("*.yaml"))
     assert runnable == ["debug.yaml", "sion_1_3b.yaml", "sion_data_fit.yaml"]
     assert (config_root / "aspirational" / "README.md").is_file()
+
+
+def test_runnable_presets_use_the_documented_deep_encoder_shape() -> None:
+    """깊은 encoder / 얕은 decoder.
+
+    ``SionForConditionalGeneration`` docstring 의 설계이자, 자기회귀 디코딩이
+    가중치 대역폭 바운드라는 측정의 직접적 함의입니다 — decoder 층 수가 곧
+    토큰당 지연입니다. debug.yaml 은 smoke 용이라 제외합니다.
+    """
+    config_root = Path(__file__).resolve().parents[1] / "configs"
+    for path in sorted(config_root.glob("sion_*.yaml")):
+        model = load_config(path).model
+        assert model.encoder_layers > model.decoder_layers, (
+            path.name,
+            model.encoder_layers,
+            model.decoder_layers,
+        )

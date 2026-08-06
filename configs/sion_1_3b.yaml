@@ -1,7 +1,11 @@
+# 인코더 중심 배분. 파라미터 수는 20/20 구성과 정확히 같은 1,206,346,752 이지만
+# decoder 층이 20 → 12 로 줄어듭니다. 자기회귀 디코딩은 이 모델에서 가중치 대역폭
+# 바운드이고(KV cache 는 전체 바이트의 1.5%) decoder 층 수가 곧 토큰당 지연이므로,
+# 같은 용량을 encoder 쪽에 두는 편이 품질·지연 양쪽에 유리합니다.
 model:
   d_model: 1536
-  encoder_layers: 20
-  decoder_layers: 20
+  encoder_layers: 30
+  decoder_layers: 12
   num_heads: 12
   num_kv_heads: 4
   d_ff: 4096
