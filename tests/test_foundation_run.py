@@ -1,0 +1,173 @@
+"""foundation 단계를 실제로 한 번 돌려 본다.
+
+계획·설정 유도는 `test_foundation_stage.py` 가 봅니다. 여기서는 그 설정으로
+정말 학습이 돌고, **두 번째 실행이 다시 학습하지 않는지** 를 봅니다. 이
+단계는 파이프라인에서 가장 오래 걸리는 구간이라, 번역 학습이 실패해 다시
+실행할 때마다 며칠짜리 사전학습을 반복하면 안 됩니다.
+"""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+import torch
+
+from sion_translate.cli.train import FOUNDATION_COMPLETION_FILENAME, run_foundation_stage
+from sion_translate.config import AppConfig, ExperimentalConfig, ModelConfig
+from sion_translate.data.prepare_foundation import prepare_foundation_dataset
+from sion_translate.foundation import foundation_run_directory, plan_foundation_stage
+from sion_translate.model import SionForConditionalGeneration
+from sion_translate.tokenizer import SionTokenizer, train_tokenizer
+from sion_translate.training.distributed import DistributedContext
+
+
+@pytest.fixture(scope="module")
+def tokenizer_model(tmp_path_factory):
+    directory = tmp_path_factory.mktemp("foundation_tokenizer")
+    shard = directory / "pairs.jsonl"
+    with shard.open("w", encoding="utf-8") as handle:
+        for index in range(400):
+            handle.write(
+                json.dumps(
+                    {
+                        "ko": f"한국어 문장 {index} 입니다 그리고 조금 더 깁니다",
+                        "ja": f"日本語の文 {index} です そしてもう少し長いです",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+    return train_tokenizer(
+        [str(shard)],
+        directory / "out",
+        vocab_size=700,
+        num_workers=1,
+        language_pair=["ko", "ja"],
+    )
+
+
+def _prepared(tmp_path, tokenizer_model):
+    """토크나이저·코퍼스·데이터셋이 준비된 설정과 모델을 만든다."""
+
+    corpus = tmp_path / "corpus"
+    for language, template in (
+        ("ko", "한국어 단일어 문장 {} 입니다 조금 더 깁니다"),
+        ("ja", "日本語の単言語文 {} です もう少し長いです"),
+    ):
+        (corpus / language).mkdir(parents=True)
+        (corpus / language / "a.txt").write_text(
+            "\n".join(template.format(index) for index in range(240)) + "\n",
+            encoding="utf-8",
+        )
+
+    config = AppConfig()
+    config.data.language_pairs = [["ko", "ja"]]
+    config.data.tokenizer_model = str(tokenizer_model)
+    config.data.tokenizer_features = str(tokenizer_model.parent / "token_features.npz")
+    config.data.dataset_dir = str(tmp_path / "dataset")
+    config.data.num_workers = 0
+    config.data.bucket_size = 16
+    config.data.max_source_length = 32
+    config.data.max_target_length = 32
+    config.foundation.corpus_dir = str(corpus)
+    config.foundation.dataset_dir = str(tmp_path / "foundation_dataset")
+    config.foundation.max_steps = 2
+    config.foundation.warmup_steps = 1
+    config.foundation.batch_size_per_gpu = 2
+    config.foundation.eval_every = 1
+    config.foundation.eval_batches = 1
+    config.foundation.save_every = 1
+    config.foundation.shard_size = 64
+    config.foundation.validation_fraction = 0.1
+    config.training.output_dir = str(tmp_path / "runs")
+    config.training.tensorboard = False
+    config.training.ema_decay = 0.0
+    config.training.precision = "fp32"
+
+    tokenizer = SionTokenizer(tokenizer_model)
+    config.model = ModelConfig(
+        vocab_size=len(tokenizer),
+        d_model=32,
+        encoder_layers=1,
+        decoder_layers=1,
+        num_heads=4,
+        num_kv_heads=2,
+        d_ff=64,
+        max_seq_len=64,
+        dropout=0.0,
+        experimental=ExperimentalConfig(),
+    )
+    config.validate()
+
+    plan = plan_foundation_stage(config)
+    prepare_foundation_dataset(
+        plan.discovery,
+        tokenizer_model,
+        config.foundation.dataset_dir,
+        shard_size=config.foundation.shard_size,
+        validation_fraction=config.foundation.validation_fraction,
+        minimum_characters=4,
+    )
+    model = SionForConditionalGeneration(config.model, pad_id=tokenizer.pad_id)
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+    return config, plan, model, tokenizer, context
+
+
+def test_the_stage_trains_and_marks_itself_complete(tmp_path, tokenizer_model) -> None:
+    config, plan, model, tokenizer, context = _prepared(tmp_path, tokenizer_model)
+    before = model.token_embedding.weight.detach().clone()
+
+    outcome = run_foundation_stage(config, plan, model, tokenizer, context)
+
+    assert outcome.ran
+    assert outcome.selected_step is not None
+    run_root = foundation_run_directory(config)
+    assert (run_root / FOUNDATION_COMPLETION_FILENAME).is_file()
+    assert (run_root / "checkpoints" / "best").exists()
+    # 실제로 학습이 일어났다면 가중치가 움직여야 한다.
+    assert not torch.allclose(model.token_embedding.weight, before)
+
+    marker = json.loads((run_root / FOUNDATION_COMPLETION_FILENAME).read_text(encoding="utf-8"))
+    assert marker["stage"] == "foundation"
+    assert marker["release_name"] == "sion"
+    assert sorted(marker["languages"]) == ["ja", "ko"]
+
+
+def test_a_second_run_reuses_the_weights_instead_of_retraining(
+    tmp_path,
+    tokenizer_model,
+    monkeypatch,
+) -> None:
+    """가장 비싼 단계를 반복하지 않는 것이 이 표시의 존재 이유다."""
+    config, plan, model, tokenizer, context = _prepared(tmp_path, tokenizer_model)
+    run_foundation_stage(config, plan, model, tokenizer, context)
+    trained = model.token_embedding.weight.detach().clone()
+
+    import sion_translate.cli.train as train_module
+
+    def _fail(*args, **kwargs):
+        raise AssertionError("완료된 foundation 단계를 다시 학습하려 했습니다")
+
+    monkeypatch.setattr(train_module, "train", _fail)
+
+    fresh = SionForConditionalGeneration(config.model, pad_id=tokenizer.pad_id)
+    outcome = run_foundation_stage(config, plan, fresh, tokenizer, context)
+
+    assert not outcome.ran
+    assert "재사용" in outcome.reason
+    assert outcome.best_checkpoint is not None
+    assert torch.allclose(fresh.token_embedding.weight, trained)
+
+
+def test_a_disabled_plan_does_nothing_and_says_why(tmp_path, tokenizer_model) -> None:
+    config, _, model, tokenizer, context = _prepared(tmp_path, tokenizer_model)
+    config.foundation.enabled = False
+    plan = plan_foundation_stage(config)
+
+    outcome = run_foundation_stage(config, plan, model, tokenizer, context)
+
+    assert not outcome.ran
+    assert "foundation.enabled=false" in outcome.reason
+    assert outcome.best_checkpoint is None
+    assert not (foundation_run_directory(config) / FOUNDATION_COMPLETION_FILENAME).exists()

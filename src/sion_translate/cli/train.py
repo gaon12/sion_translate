@@ -23,6 +23,7 @@ import argparse
 import copy
 import gc
 import importlib.util
+import json
 import math
 import random
 from pathlib import Path
@@ -52,6 +53,12 @@ from sion_translate.data import (
     SionBatchCollator,
 )
 from sion_translate.data.collate import load_morphoscript_token_features
+from sion_translate.foundation import (
+    FoundationOutcome,
+    build_foundation_config,
+    foundation_run_directory,
+    plan_foundation_stage,
+)
 from sion_translate.fingerprint import DatasetFingerprint, file_sha256
 from sion_translate.model import SionForConditionalGeneration
 from sion_translate.tokenizer import (
@@ -68,7 +75,11 @@ from sion_translate.training.distributed import (
     parallelize_model,
     resolve_parallel_strategy,
 )
-from sion_translate.training.checkpoint import checkpoint_path_exists
+from sion_translate.training.checkpoint import (
+    build_checkpoint_identity,
+    checkpoint_path_exists,
+    initialize_model_from_checkpoint,
+)
 from sion_translate.training.export import export_inference_models
 from sion_translate.training.objectives import MinimumRiskObjective
 from sion_translate.training.trainer import announce, train
@@ -377,7 +388,12 @@ def find_existing_checkpoint(config: AppConfig) -> Path | None:
         if explicit.exists():
             return explicit
     run_root = Path(config.training.output_dir)
-    for stage_root in (run_root, run_root / "pretrain", run_root / "posttrain"):
+    for stage_root in (
+        run_root,
+        run_root / "foundation",
+        run_root / "pretrain",
+        run_root / "posttrain",
+    ):
         checkpoint_root = stage_root / "checkpoints"
         if not checkpoint_root.is_dir():
             continue
@@ -499,7 +515,11 @@ def resolve_config(args: argparse.Namespace) -> tuple[AppConfig, dict, str]:
     return config_from_raw(raw), raw, source
 
 
-def ensure_artifacts(config: AppConfig, context: DistributedContext) -> None:
+def ensure_artifacts(
+    config: AppConfig,
+    context: DistributedContext,
+    foundation_plan: Any | None = None,
+) -> None:
     """토크나이저와 준비된 데이터셋이 없거나 낡았으면 자동으로 만듭니다.
 
     - 토크나이저: 없을 때만 학습합니다. 기존 vocabulary를 사용하는 다른 run을
@@ -512,6 +532,9 @@ def ensure_artifacts(config: AppConfig, context: DistributedContext) -> None:
     기다립니다. 다중 GPU 로 처음 실행하기 전에 단일 프로세스로 한 번
     실행해 준비를 끝내 두는 편이 통신 타임아웃 걱정이 없습니다.
     """
+
+    if foundation_plan is None:
+        foundation_plan = plan_foundation_stage(config)
     if context.is_main:
         data_dir = Path(config.data.raw_dir)
         tokenizer_path = Path(config.data.tokenizer_model)
@@ -567,6 +590,11 @@ def ensure_artifacts(config: AppConfig, context: DistributedContext) -> None:
                     tokenizer_path.parent,
                     vocab_size=vocab_size,
                     language_pairs=config.data.configured_language_pairs(),
+                    # foundation 단계가 자기 코퍼스에 없는 어휘로 학습하지 않도록
+                    # 단일어 코퍼스도 넣습니다. 언어별 상한이 없으면 분량이 큰
+                    # 언어가 vocab 을 독식합니다.
+                    monolingual=foundation_plan.discovery,
+                    monolingual_sample_ratio=config.foundation.tokenizer_sample_ratio,
                     approximate_split=config.data.approximate_split,
                     source_only_languages=config.data.configured_source_only_languages(),
                     train_only_prefixes=config.data.configured_synthetic_prefixes(),
@@ -645,8 +673,214 @@ def ensure_artifacts(config: AppConfig, context: DistributedContext) -> None:
                 announce("데이터셋 준비 완료.", context)
             else:
                 announce("데이터셋 최신 상태 확인 (원천 데이터 변경 없음).", context)
+
+            # ── foundation(단일어) 데이터셋 ──────────────────────────
+            for line in foundation_plan.report:
+                announce(f"  {line}", context)
+            if not foundation_plan.enabled:
+                announce(f"foundation 단계: {foundation_plan.reason}", context)
+            else:
+                for warning in foundation_plan.warnings:
+                    announce(f"[경고] foundation: {warning}", context)
+                foundation_dataset = Path(config.foundation.dataset_dir)
+                if (foundation_dataset / "manifest.json").is_file():
+                    announce("foundation 데이터셋 최신 상태 확인.", context)
+                else:
+                    from sion_translate.data.prepare_foundation import (
+                        prepare_foundation_dataset,
+                        render_prepare_report,
+                    )
+
+                    announce(
+                        "foundation 데이터셋 준비 시작 (단일어 토큰화) — 시간이 걸립니다.",
+                        context,
+                    )
+                    foundation_stats = prepare_foundation_dataset(
+                        foundation_plan.discovery,
+                        tokenizer_path,
+                        foundation_dataset,
+                        minimum_characters=config.foundation.minimum_characters,
+                        maximum_characters=config.foundation.maximum_characters,
+                        max_tokens=config.data.max_source_length - 2,
+                        deduplicate=config.foundation.deduplicate,
+                        shard_size=config.foundation.shard_size,
+                        validation_fraction=config.foundation.validation_fraction,
+                        language_sampling_alpha=config.foundation.language_sampling_alpha,
+                        minimum_language_share=config.foundation.minimum_language_share,
+                        release_name=config.foundation.release_name,
+                    )
+                    for line in render_prepare_report(foundation_stats):
+                        announce(f"  {line}", context)
     # 준비가 끝날 때까지 다른 rank 들이 기다립니다.
     barrier(context)
+
+
+FOUNDATION_COMPLETION_FILENAME = "stage_complete.json"
+
+
+def run_foundation_stage(
+    config: AppConfig,
+    foundation_plan: Any,
+    model: torch.nn.Module,
+    tokenizer: SionTokenizer,
+    context: DistributedContext,
+) -> FoundationOutcome:
+    """번역 학습 전에 단일어 복원으로 encoder-decoder 를 먼저 만든다.
+
+    끝난 단계를 다시 돌리지 않는 것이 중요합니다. 이 단계는 파이프라인에서
+    가장 오래 걸리는 구간이라, 번역 학습이 실패해 다시 실행할 때마다 며칠짜리
+    사전학습을 반복하면 안 됩니다. 완료 표시가 있으면 학습을 건너뛰고 best
+    가중치만 물려받습니다.
+    """
+
+    if not foundation_plan.enabled:
+        return FoundationOutcome(ran=False, reason=foundation_plan.reason)
+
+    foundation_config = build_foundation_config(config)
+    run_root = foundation_run_directory(config)
+    completion = run_root / FOUNDATION_COMPLETION_FILENAME
+    best_checkpoint = run_root / "checkpoints" / "best"
+
+    identity_for_transfer = build_checkpoint_identity(
+        model_config=config.model,
+        tokenizer_path=config.data.tokenizer_model,
+        token_features_path=config.data.tokenizer_features,
+        dataset_dir=config.data.dataset_dir,
+        stage_name="pretrain",
+    )
+
+    if completion.is_file() and checkpoint_path_exists(best_checkpoint):
+        provenance = initialize_model_from_checkpoint(
+            best_checkpoint,
+            model,
+            context,
+            expected_identity=identity_for_transfer,
+        )
+        announce(
+            f"foundation 단계는 이미 완료됐습니다 → {best_checkpoint} 의 가중치를 "
+            f"물려받습니다 (step {provenance['step']:,}).",
+            context,
+        )
+        return FoundationOutcome(
+            ran=False,
+            reason="이미 완료된 foundation 단계의 가중치를 재사용했습니다.",
+            best_checkpoint=str(best_checkpoint),
+            selected_step=provenance["step"],
+            languages=foundation_plan.languages,
+            warnings=foundation_plan.warnings,
+        )
+
+    resume = find_auto_resume(foundation_config)
+    if resume:
+        foundation_config.training.resume_from = resume
+        announce(f"foundation: 이전 실행 발견 → {resume} 에서 재개합니다.", context)
+
+    train_dataset = IndexedParallelDataset(
+        foundation_config.data.dataset_dir,
+        foundation_config.data.train_split,
+        bidirectional=foundation_config.data.bidirectional,
+    )
+    validation_dataset = IndexedParallelDataset(
+        foundation_config.data.dataset_dir,
+        foundation_config.data.validation_split,
+        bidirectional=foundation_config.data.bidirectional,
+    )
+    announce(
+        f"foundation 데이터 규모: 학습 {len(train_dataset):,}개 / "
+        f"검증 {len(validation_dataset):,}개 (언어: {', '.join(foundation_plan.languages)})",
+        context,
+    )
+
+    collator_args = build_collator_args(foundation_config, tokenizer)
+    train_collator = SionBatchCollator(
+        **collator_args,
+        denoise_probability=foundation_config.data.denoise_probability,
+        source_token_dropout=0.0,
+        decoder_input_noise=0.0,
+    )
+    validation_collator = SionBatchCollator(
+        **collator_args,
+        denoise_probability=foundation_config.data.validation_denoise_probability,
+        source_token_dropout=0.0,
+        decoder_input_noise=0.0,
+    )
+    train_sampler = DistributedBucketBatchSampler(
+        train_dataset,
+        foundation_config.training.batch_size_per_gpu,
+        rank=context.rank,
+        world_size=context.world_size,
+        bucket_size=foundation_config.data.bucket_size,
+        seed=foundation_config.training.seed,
+    )
+    validation_sampler = DistributedBucketBatchSampler(
+        validation_dataset,
+        foundation_config.training.batch_size_per_gpu,
+        rank=context.rank,
+        world_size=context.world_size,
+        bucket_size=foundation_config.data.bucket_size,
+        seed=foundation_config.training.seed + 1,
+    )
+    train_loader = DataLoader(
+        train_dataset,
+        batch_sampler=train_sampler,
+        collate_fn=train_collator,
+        **dataloader_runtime_kwargs(
+            foundation_config.data.num_workers,
+            context.device,
+            training=True,
+        ),
+    )
+    validation_loader = DataLoader(
+        validation_dataset,
+        batch_sampler=validation_sampler,
+        collate_fn=validation_collator,
+        **dataloader_runtime_kwargs(
+            0 if foundation_config.data.num_workers == 0 else 1,
+            context.device,
+            training=False,
+        ),
+    )
+
+    announce("0단계 foundation 사전학습(단일어 복원)을 시작합니다.", context)
+    result = train(
+        model,
+        train_loader,
+        validation_loader,
+        foundation_config,
+        context,
+        stage_name="foundation/denoising",
+    )
+    barrier(context)
+    release_stage_resources(context, train_loader, validation_loader)
+    del train_loader, validation_loader, train_sampler, validation_sampler
+    del train_collator, validation_collator, train_dataset, validation_dataset
+
+    if context.is_main:
+        run_root.mkdir(parents=True, exist_ok=True)
+        completion.write_text(
+            json.dumps(
+                {
+                    "stage": "foundation",
+                    "release_name": config.foundation.release_name,
+                    "languages": list(foundation_plan.languages),
+                    "selected_step": int(result["selected_step"]),
+                    "best_validation_loss": float(result["best_validation_loss"]),
+                },
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+    barrier(context)
+    return FoundationOutcome(
+        ran=True,
+        reason=foundation_plan.reason,
+        best_checkpoint=str(best_checkpoint),
+        selected_step=int(result["selected_step"]),
+        languages=foundation_plan.languages,
+        warnings=foundation_plan.warnings,
+    )
 
 
 def find_auto_resume(config: AppConfig) -> str | None:
@@ -680,7 +914,8 @@ def main() -> None:
         if not args.prepare_only:
             preflight_final_export_dependencies(config.training.final_export_formats)
         announce("준비 ③: 원천 데이터를 확인합니다.", context)
-        ensure_artifacts(config, context)
+        foundation_plan = plan_foundation_stage(config)
+        ensure_artifacts(config, context, foundation_plan)
         tokenizer = SionTokenizer(config.data.tokenizer_model)
         config.model.vocab_size = len(tokenizer)
         preflight_morphoscript_token_features(config, tokenizer)
@@ -854,6 +1089,24 @@ def main() -> None:
                 "영구 학습 상태 추정: "
                 f"rank당 {capacity['per_rank_state_gib']:.1f} GiB / "
                 f"안전 예산 {capacity['state_budget_gib']:.1f} GiB",
+                context,
+            )
+
+        # ── 단계 ⑤-b: foundation 사전학습 (단일어 복원) ────────────────
+        # 번역쌍을 보기 전에 encoder-decoder 를 먼저 만듭니다. 이 단계의
+        # 산출물은 번역 모델이 아니라 그 파운데이션이라 별도 이름으로 나갑니다.
+        foundation_outcome = run_foundation_stage(
+            config,
+            foundation_plan,
+            model,
+            tokenizer,
+            context,
+        )
+        if foundation_outcome.best_checkpoint:
+            announce(
+                f"번역 학습을 foundation 가중치에서 시작합니다 "
+                f"({config.foundation.release_name} step "
+                f"{foundation_outcome.selected_step:,}).",
                 context,
             )
 
