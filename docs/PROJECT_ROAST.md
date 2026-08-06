@@ -106,6 +106,31 @@ seed 내부 train/challenge exact 중복은 막지만 전체 원천 corpus와 �
 말뭉치에 동일·유사 대응이 있습니다. 양방향 24 case도 독립 의미쌍은 12개뿐이고
 category/direction당 4개입니다.
 
+**2026-08-06 실측으로 확인됨.** 전체 원천 코퍼스(8,978,338행)와 대조한 결과
+challenge 텍스트 48개 중 **28개(58.3%)** 에 근사 중복이 있습니다.
+
+| 범주 | 누출 |
+|---|---:|
+| idiom_culture | 14 |
+| interjection_moan | 10 |
+| profanity_slang | 4 |
+
+대표 사례:
+
+- `김칫국부터 마시지 마.` — `data29.jsonl:185527` 에 `김칫국부터 마시지 마…`
+  (마침표만 다름, containment 1.00)
+- `호랑이도 제 말 하면 온다더니.` — `data12.jsonl:50551` 행의 첫머리에 그대로
+- `세 살 버릇 여든까지 간다.` — `synthetic_llm_data47.jsonl:559` 안에 그대로
+
+**완전일치로 잡히는 것은 0개입니다.** 위 첫 사례가 `.` 대 `…` 하나로 갈리기
+때문입니다. 근사 중복 검사가 아니면 이 누출은 전부 보이지 않습니다.
+
+누출 항목은 전부 9~18자(평균 12.3자)입니다. 897만 행 코퍼스에서 10자짜리
+감탄사나 관용구는 독립 holdout 이 될 수 없습니다 — 길이 자체가 원인입니다.
+
+재현: `python scripts/data/audit_holdout_leakage.py --holdout
+examples/expressive_cultural_cases.jsonl --corpus "data/*.jsonl"`
+
 **판정:** 회귀 smoke set으로는 유용하지만 누출 없는 품질 benchmark라고 부르지 않기.
 
 ### 7. 방향 수량 50:50은 방향 품질 50:50이 아닙니다
