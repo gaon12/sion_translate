@@ -1,0 +1,225 @@
+"""challenge 문장의 학습 코퍼스 누출 감사.
+
+기존 누출 방지는 seed 30쌍 **내부**에서만 동작합니다. 그 12개 challenge
+문장이 897만 행짜리 원천 코퍼스에 이미 있는지는 아무도 확인하지 않았습니다.
+"""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from sion_translate.holdout_audit import (
+    HoldoutItem,
+    audit_holdout_leakage,
+    containment,
+    load_holdout_items,
+    summarize,
+)
+
+
+def _shard(path, rows):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _challenge(path, cases):
+    return _shard(path, cases)
+
+
+def test_both_sides_of_a_challenge_case_are_audited(tmp_path) -> None:
+    """정답 쪽이 코퍼스에 있어도 누출이다 — 모델이 그 문장을 생성해 본 것이다."""
+    path = _challenge(
+        tmp_path / "cases.jsonl",
+        [
+            {
+                "id": "c1",
+                "source": "김칫국부터 마시지 마.",
+                "reference": "取らぬ狸の皮算用をするな。",
+                "source_language": "ko",
+                "target_language": "ja",
+                "category": "idiom_culture",
+            }
+        ],
+    )
+    items = load_holdout_items([path])
+    assert {item.identifier for item in items} == {"c1#source", "c1#reference"}
+    assert {item.language for item in items} == {"ko", "ja"}
+
+
+def test_an_exact_duplicate_in_the_corpus_is_found(tmp_path) -> None:
+    challenge = _challenge(
+        tmp_path / "cases.jsonl",
+        [
+            {
+                "id": "c1",
+                "source": "세 살 버릇 여든까지 간다",
+                "reference": "三つ子の魂百まで",
+                "source_language": "ko",
+                "target_language": "ja",
+            }
+        ],
+    )
+    corpus = _shard(
+        tmp_path / "data" / "shard.jsonl",
+        [
+            {"ko": "전혀 다른 문장입니다", "ja": "全く違う文です"},
+            {"ko": "세 살 버릇 여든까지 간다", "ja": "三つ子の魂百まで"},
+        ],
+    )
+    findings = audit_holdout_leakage(load_holdout_items([challenge]), [corpus])
+    leaked = [finding for finding in findings if finding.leaked]
+
+    assert len(leaked) == 2  # 원문과 정답 양쪽
+    assert all(finding.worst.exact for finding in leaked)
+    assert all(finding.worst.line == 2 for finding in leaked)
+
+
+def test_a_near_duplicate_is_found_where_exact_matching_would_miss_it(tmp_path) -> None:
+    """조사 하나 다른 행은 완전일치로 잡히지 않는다. 그래서 MinHash 를 쓴다."""
+    challenge = _challenge(
+        tmp_path / "cases.jsonl",
+        [
+            {
+                "id": "c1",
+                "source": "세 살 버릇 여든까지 간다",
+                "source_language": "ko",
+                "target_language": "ja",
+            }
+        ],
+    )
+    corpus = _shard(
+        tmp_path / "data" / "shard.jsonl",
+        [{"ko": "세 살 버릇이 여든까지 간다고 하죠", "ja": "三つ子の魂百までと言いますね"}],
+    )
+    findings = audit_holdout_leakage(load_holdout_items([challenge]), [corpus])
+    leaked = [finding for finding in findings if finding.leaked]
+
+    assert len(leaked) == 1
+    assert not leaked[0].worst.exact
+    assert leaked[0].worst.similarity >= 0.7
+
+
+def test_an_unrelated_corpus_reports_no_leak(tmp_path) -> None:
+    """오탐이 많으면 이 관문은 무시당한다."""
+    challenge = _challenge(
+        tmp_path / "cases.jsonl",
+        [
+            {
+                "id": "c1",
+                "source": "김칫국부터 마시지 마.",
+                "source_language": "ko",
+                "target_language": "ja",
+            }
+        ],
+    )
+    corpus = _shard(
+        tmp_path / "data" / "shard.jsonl",
+        [
+            {"ko": "오늘 날씨가 정말 좋습니다", "ja": "今日は本当にいい天気です"},
+            {"ko": "회의는 세 시에 시작합니다", "ja": "会議は三時に始まります"},
+        ],
+    )
+    findings = audit_holdout_leakage(load_holdout_items([challenge]), [corpus])
+    assert not any(finding.leaked for finding in findings)
+
+
+def test_a_different_language_field_is_never_compared(tmp_path) -> None:
+    """한국어 challenge 를 일본어 행과 비교하면 안 된다."""
+    challenge = _challenge(
+        tmp_path / "cases.jsonl",
+        [
+            {
+                "id": "c1",
+                "source": "가나다라마바사",
+                "source_language": "ko",
+                "target_language": "ja",
+            }
+        ],
+    )
+    corpus = _shard(tmp_path / "data" / "shard.jsonl", [{"ja": "가나다라마바사"}])
+    findings = audit_holdout_leakage(load_holdout_items([challenge]), [corpus])
+    assert not any(finding.leaked for finding in findings)
+
+
+def test_matches_are_capped_per_item(tmp_path) -> None:
+    challenge = _challenge(
+        tmp_path / "cases.jsonl",
+        [
+            {
+                "id": "c1",
+                "source": "같은 문장이 여러 번 나옵니다",
+                "source_language": "ko",
+                "target_language": "ja",
+            }
+        ],
+    )
+    corpus = _shard(
+        tmp_path / "data" / "shard.jsonl",
+        [{"ko": "같은 문장이 여러 번 나옵니다", "ja": "同じ"} for _ in range(20)],
+    )
+    findings = audit_holdout_leakage(
+        load_holdout_items([challenge]), [corpus], maximum_matches_per_item=3
+    )
+    assert max(len(finding.matches) for finding in findings) == 3
+
+
+def test_the_summary_reports_the_leak_rate_and_a_warning(tmp_path) -> None:
+    challenge = _challenge(
+        tmp_path / "cases.jsonl",
+        [
+            {
+                "id": "c1",
+                "source": "누출되는 문장입니다",
+                "source_language": "ko",
+                "target_language": "ja",
+                "category": "idiom_culture",
+            },
+            {
+                "id": "c2",
+                "source": "완전히 무관한 다른 표현",
+                "source_language": "ko",
+                "target_language": "ja",
+                "category": "profanity",
+            },
+        ],
+    )
+    corpus = _shard(tmp_path / "data" / "shard.jsonl", [{"ko": "누출되는 문장입니다", "ja": "x"}])
+    summary = summarize(audit_holdout_leakage(load_holdout_items([challenge]), [corpus]))
+
+    assert summary["leaked_items"] == 1
+    assert summary["exact_leaked_items"] == 1
+    assert summary["by_category"] == {"idiom_culture": 1}
+    # 누출된 집합을 품질 benchmark 로 쓰면 안 된다는 사실이 보고서에 남아야 한다.
+    assert "benchmark" in summary["note"]
+
+
+def test_containment_answers_is_the_holdout_inside_the_corpus_line() -> None:
+    """Jaccard 가 아닌 이유: 누출의 전형은 긴 문장 안에 관용구가 들어 있는 것.
+
+    상대 문장이 길다는 이유로 점수가 떨어지면 그 누출을 놓칩니다.
+    """
+    idiom = "김칫국부터 마시지 마"
+    assert containment(idiom, idiom) == 1.0
+    assert containment(idiom, "야 그러니까 김칫국부터 마시지 마 진짜") > 0.8
+    assert containment(idiom, "오늘 날씨가 정말 좋습니다") == 0.0
+    # 비대칭이어야 한다 — 짧은 쪽이 긴 쪽에 들어 있는지를 묻는 것이다.
+    assert containment("야 그러니까 김칫국부터 마시지 마 진짜", idiom) < 0.8
+
+
+def test_an_empty_holdout_is_refused(tmp_path) -> None:
+    with pytest.raises(ValueError, match="challenge 문장이 없습니다"):
+        audit_holdout_leakage([], [])
+
+
+@pytest.mark.parametrize("threshold", [0.0, -0.1, 1.5])
+def test_a_threshold_outside_the_unit_interval_is_refused(threshold) -> None:
+    with pytest.raises(ValueError, match="similarity_threshold"):
+        audit_holdout_leakage(
+            [HoldoutItem("x", "ko", "가나다")], [], similarity_threshold=threshold
+        )
