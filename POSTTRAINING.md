@@ -19,6 +19,24 @@ L = L_reference_CE + risk_weight * L_composite_MRT
 - 사후학습의 `best`와 early stopping은 CE가 아니라 validation 문장의 beam
   번역에 계산한 복합 reward를 사용합니다. CE도 모델 drift 진단용으로 계속
   기록합니다.
+- 선택 지표는 `posttraining.selection_metric` 이며 기본값은
+  **`worst_direction_reward`**(가장 낮은 방향)입니다. 평균 reward 하나로 고르면
+  한 방향이 후퇴해도 다른 방향이 더 오르면 그 체크포인트가 best 가 됩니다 —
+  이 저장소는 이미 ko→ja 59.81 대 ja→ko 49.87 로 방향 격차가 있어서, 평균만
+  보면 격차가 벌어지는 것을 놓칩니다. `macro_direction_reward`(방향 균형)와
+  `reward`(예전 동작)도 고를 수 있습니다. 방향 메타데이터가 없는 custom caller
+  에서는 평균 reward 로 되돌아가며 그 사실을 한 번 출력합니다.
+- 방향별 reward 는 `validation_direction_<src>_to_<tgt>_reward` 로 로그에
+  남습니다.
+- 선택 지표는 `posttraining.selection_metric`이며 기본값은
+  **`worst_direction_reward`**(가장 낮은 방향)입니다. 평균 reward 하나로 고르면
+  한 방향이 후퇴해도 다른 방향이 더 오르면 그 체크포인트가 best 가 됩니다 —
+  이 저장소는 이미 ko→ja 59.81 대 ja→ko 49.87 로 방향 격차가 있어서, 평균만
+  보면 격차가 벌어지는 것을 놓칩니다. `macro_direction_reward`(방향 균형)와
+  `reward`(예전 동작)도 고를 수 있습니다. 방향 메타데이터가 없는 custom caller
+  에서는 평균 reward로 되돌아가며 그 사실을 한 번 출력합니다.
+- 방향별 reward는 `validation_direction_<src>_to_<tgt>_reward` 로 로그에
+  남습니다.
 
 기본 보상 가중치는 일반 문장 품질을 위한 시작점입니다. 숫자/코드가 중요한
 업무 데이터라면 `reward_number_weight`, `reward_structured_weight`,

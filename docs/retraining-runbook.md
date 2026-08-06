@@ -195,6 +195,24 @@ sion-prepare-data \
 `sion-train`을 인자 없이 돌리면 이 단계가 자동으로 실행되므로 건너뛰어도
 됩니다. 수동으로 돌리면 중간 산출물을 확인할 수 있습니다.
 
+## 5-b. foundation 사전학습 (선택, 자동)
+
+`data/corpus/<언어코드>/` 에 단일어 텍스트(`.txt` 한 줄에 하나, 또는 `text` 키의
+`.jsonl`)가 있으면 번역 학습 **전에** 단일어 복원 사전학습이 자동으로 먼저
+돕니다. 없으면 이유를 출력하고 건너뜁니다. `easy_run.py` 가 시작 전에 언어별
+분량·건너뛴 파일·언어 불균형 경고를 출력하므로 그것부터 확인하십시오.
+
+끝나면 `runs/auto/foundation/stage_complete.json` 이 남고, 이후 실행은 학습을
+건너뛰고 그 가중치만 물려받습니다. **중단된** 실행은 표시가 없으므로 정상적으로
+재개됩니다.
+
+가중치 인계는 재개가 아닙니다 — optimizer moment·scheduler·step 을 물려받지
+않고, 대신 토크나이저와 model config 가 같은지 검증합니다. 토크나이저가 다르면
+텐서 모양은 맞아서 로드는 성공하고 모든 임베딩 행이 조용히 다른 것을 가리키기
+때문입니다.
+
+자세한 내용: `docs/foundation-pretraining.md`
+
 ## 6. 학습
 
 ```bash
@@ -254,16 +272,26 @@ greedy). MRT 생성 시간이 늘어납니다.
 
 ```
 runs/auto/
-├── pretrain/
+├── foundation/           단일어 복원 (data/corpus/ 가 있을 때만)
+│   ├── checkpoints/
+│   ├── exports/best/     파운데이션 모델 `sion` — 번역 불가
+│   └── stage_complete.json
+├── pretrain/             번역 SFT (foundation 가중치에서 시작)
 │   ├── checkpoints/      best / latest / final
-│   └── exports/best/     fp32 fp16 bf16 int8 int4 gguf_q4_k_m transformers
+│   └── exports/best/     fp32 fp16 bf16 int8 int4 fp8 gguf_q4_k_m transformers
 └── posttrain/            MRT 사후학습
     ├── checkpoints/
     └── exports/best/
 artifacts/
 ├── tokenizer/            sion.model, token_features.npz
-└── dataset/              전처리된 indexed 데이터
+├── dataset/              전처리된 번역 indexed 데이터
+└── foundation_dataset/   단일어 복원 shard (data/corpus/ 가 있을 때만)
 ```
+
+`runs/auto/foundation/exports/best/` 는 **번역 모델이 아닙니다.** 번역쌍을 한 번도
+보지 않았지만 구조가 같아서, 막지 않으면 방향 태그를 받고 그럴듯한 헛소리를
+냅니다. metadata 의 `translation_capable: false` 를 보고 `Translator` 가
+거부합니다.
 
 `posttraining.enabled`가 true이므로 **최종 산출물은
 `runs/auto/posttrain/exports/best/`** 입니다. `pretrain/` 쪽은 MRT 이전
