@@ -43,7 +43,7 @@ def test_shipped_configs_keep_canonical_paths_without_release_namespaces() -> No
         "sion_32b.yaml": "runs/sion-32b",
         "sion_data_fit.yaml": "runs/sion-data-fit",
     }
-    for config_path in sorted(config_root.glob("*.yaml")):
+    for config_path in sorted(config_root.rglob("*.yaml")):
         config = load_config(config_path)
         data = config.data
         assert data.tokenizer_model == "artifacts/tokenizer/sion.model", config_path
@@ -203,7 +203,13 @@ def test_root_config_keeps_the_experimental_surface_small() -> None:
 
 def test_capacity_presets_are_clean_architecture_baselines() -> None:
     config_root = Path(__file__).resolve().parents[1] / "configs"
-    for name in ("sion_1_3b.yaml", "sion_8b.yaml", "sion_32b.yaml", "sion_data_fit.yaml"):
+    names = (
+        "sion_1_3b.yaml",
+        "sion_data_fit.yaml",
+        "aspirational/sion_8b.yaml",
+        "aspirational/sion_32b.yaml",
+    )
+    for name in names:
         experimental = load_config(config_root / name).model.experimental
         enabled = {
             "situglu": experimental.situglu_enabled,
@@ -415,3 +421,17 @@ def test_final_export_formats_are_validated(
     config.training.final_export_formats = formats
     with pytest.raises(ValueError, match=message):
         config.validate()
+
+
+def test_runnable_presets_do_not_outrun_the_corpus() -> None:
+    """`configs/` 최상위는 현재 데이터로 실제 학습할 수 있는 것만 둔다.
+
+    측정: data/*.jsonl 8,978,338 레코드 = 한 번 통과에 약 0.357B 토큰.
+    32B preset 은 Chinchilla 기준의 1,790배가 부족했고, 그런 설정이 실행
+    가능한 목록에 섞여 있으면 다음 사람이 그것을 고릅니다. 용량이 데이터를
+    앞지르는 preset 은 `configs/aspirational/` 로 격리합니다.
+    """
+    config_root = Path(__file__).resolve().parents[1] / "configs"
+    runnable = sorted(path.name for path in config_root.glob("*.yaml"))
+    assert runnable == ["debug.yaml", "sion_1_3b.yaml", "sion_data_fit.yaml"]
+    assert (config_root / "aspirational" / "README.md").is_file()

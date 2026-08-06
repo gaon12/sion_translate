@@ -170,7 +170,10 @@ NCCL, 저장 장치, 처리량을 검증한 뒤 전체 작업을 시작한다. �
 |---|---|---|---|
 | 단일 GPU | 런타임 `single` | 모든 설정 | 분산 wrapper가 필요 없음 |
 | 각 GPU에 전체 모델이 들어감 | `ddp` | `sion_data_fit`, `sion_1_3b` | parameter all-gather가 없어 보통 더 빠름 |
-| 전체 모델/optimizer가 한 GPU에 안 들어감 | `fsdp2` | `sion_8b`, `sion_32b` | layer 단위 parameter·gradient·optimizer state sharding |
+| 전체 모델/optimizer가 한 GPU에 안 들어감 | `fsdp2` | `configs/aspirational/sion_8b`, `sion_32b` | layer 단위 parameter·gradient·optimizer state sharding |
+
+`configs/aspirational/` 의 두 설정은 현재 코퍼스(0.357B 토큰/epoch)로 학습해서는
+안 됩니다. 이유와 필요한 데이터 규모는 `configs/aspirational/README.md` 를 보십시오.
 
 모든 CUDA 전략은 먼저 meta device에 저장 공간 없는 모델을 만들고 FP32 master
 parameter, gradient, AdamW 1·2차 moment, 선택적 FP32 EMA를 합산한다. 따라서

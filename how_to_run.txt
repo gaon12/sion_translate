@@ -75,9 +75,13 @@ SION_NO_TMUX=1 python3 easy_run.py
 - 사후학습의 후보 생성은 micro-batch 1로 시작합니다.
 - torch.compile은 사용자가 설정에서 명시하지 않는 한 자동으로 켜지 않습니다.
 
-configs/sion_1_3b.yaml, sion_8b.yaml, sion_32b.yaml은 파일 주석에 적힌 80GB급
-GPU 수를 전제로 한 수동 용량 기준입니다. easy_run.py는 이 파일을 자동으로
-선택하지 않고 sion_translate.yaml의 보수적인 자동 경로를 사용합니다.
+configs/sion_1_3b.yaml은 파일 주석에 적힌 80GB급 GPU 수를 전제로 한 수동 용량
+기준입니다. easy_run.py는 이 파일을 자동으로 선택하지 않고 sion_translate.yaml의
+보수적인 자동 경로를 사용합니다.
+
+configs/aspirational/의 sion_8b.yaml과 sion_32b.yaml은 실행 대상이 아닙니다.
+현재 코퍼스는 한 번 통과에 약 0.357B 토큰인데 32B 설정은 Chinchilla 기준의
+1,790배가 부족합니다. 자세한 수치는 configs/aspirational/README.md를 보십시오.
 
 
 5. 상태, 결과와 재개
