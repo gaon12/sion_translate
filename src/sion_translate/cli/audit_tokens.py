@@ -5,7 +5,17 @@ import json
 from pathlib import Path
 
 from sion_translate.console import configure_stdio
-from sion_translate.token_audit import audit_indexed_token_exposure, audit_token_exposure
+from sion_translate.data.monolingual import discover_monolingual_sources
+from sion_translate.token_audit import (
+    audit_indexed_token_exposure,
+    audit_monolingual_token_exposure,
+    audit_token_exposure,
+    combine_target_exposure,
+)
+
+
+def configured_pairs(args) -> list[list[str]]:
+    return args.language_pairs or [args.language_pair]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -37,6 +47,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rare-threshold", type=int, default=25)
     parser.add_argument("--max-piece-examples", type=int, default=50)
     parser.add_argument("--filter-quality", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--monolingual-corpus",
+        help=(
+            "foundation 단일어 코퍼스 루트 (예: data/corpus). 지정하면 그 단계가 "
+            "주는 디코더 타깃 노출을 함께 세고 두 단계를 합친 판정을 냅니다"
+        ),
+    )
+    parser.add_argument(
+        "--monolingual-max-lines",
+        type=int,
+        default=0,
+        help="0 이면 전량 스캔, 양수는 언어별 prefix 표본 (빠른 preflight 용)",
+    )
     parser.add_argument("--output", help="JSON report path (default: stdout)")
     parser.add_argument(
         "--fail-byte-rate",
@@ -83,7 +106,35 @@ def main() -> None:
             rare_threshold=args.rare_threshold,
             max_piece_examples=args.max_piece_examples,
             filter_quality=args.filter_quality,
+            return_counts=bool(args.monolingual_corpus),
         )
+
+    if args.monolingual_corpus:
+        if args.dataset:
+            raise SystemExit(
+                "--monolingual-corpus 는 --input 스캔과 함께 씁니다 "
+                "(--dataset 은 이미 색인된 번역 데이터셋입니다)"
+            )
+        languages = sorted({language for pair in configured_pairs(args) for language in pair})
+        monolingual = audit_monolingual_token_exposure(
+            discover_monolingual_sources(args.monolingual_corpus, languages),
+            args.tokenizer,
+            rare_threshold=args.rare_threshold,
+            max_piece_examples=args.max_piece_examples,
+            max_lines_per_language=args.monolingual_max_lines,
+        )
+        report["combined_stages"] = combine_target_exposure(
+            report["global_target_counts"],
+            monolingual["counts"],
+            args.tokenizer,
+            rare_threshold=args.rare_threshold,
+            max_piece_examples=args.max_piece_examples,
+        )
+        # 원시 count 벡터는 어휘 크기의 정수 배열이라 보고서에 싣지 않습니다.
+        monolingual.pop("counts", None)
+        report["monolingual"] = monolingual
+    report.pop("global_target_counts", None)
+
     rendered = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
     if args.output:
         output = Path(args.output)

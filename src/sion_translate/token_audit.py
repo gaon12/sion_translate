@@ -16,6 +16,7 @@ from typing import Any, Iterator, Sequence
 
 import numpy as np
 
+from sion_translate.data.monolingual import MonolingualDiscovery, iter_monolingual_lines
 from sion_translate.data.quality import QualityPolicy, assess_pair, canonical_text
 from sion_translate.data.records import (
     expand_parallel_record,
@@ -265,6 +266,154 @@ def _rare_piece_examples(
     ]
 
 
+def audit_monolingual_token_exposure(
+    discovery: MonolingualDiscovery,
+    tokenizer_model: str | Path,
+    *,
+    minimum_characters: int = 8,
+    maximum_characters: int = 4000,
+    rare_threshold: int = 25,
+    max_piece_examples: int = 50,
+    max_lines_per_language: int = 0,
+) -> dict[str, Any]:
+    """foundation 코퍼스가 각 조각을 디코더 타깃으로 몇 번 보여 주는지 센다.
+
+    복원 과제의 정답은 손상되지 않은 원문 전체입니다. 즉 단일어 코퍼스의
+    **모든 토큰이 디코더 타깃**이고, 그래서 이 단계는 병렬 코퍼스가 한 번도
+    출력으로 만들어 본 적 없는 조각에도 출력 임베딩 학습 신호를 줍니다.
+
+    병렬 감사만 보고 어휘를 판단하면 두 방향으로 틀립니다. foundation 이
+    충분히 노출시키는 조각을 위험하다고 하거나, 반대로 단일어 코퍼스가 어휘에
+    밀어 넣은 조각이 번역 학습에서 전혀 나오지 않는 것을 놓칩니다.
+
+    ``max_lines_per_language=0`` 이 전량 스캔이고, 양수는 결정적 prefix 표본
+    이라 보고서에 그렇게 표시됩니다 — 빠른 preflight 용이지 어휘가 안전하다고
+    선언할 근거는 아닙니다.
+    """
+
+    if minimum_characters < 1:
+        raise ValueError("minimum_characters must be positive")
+    if maximum_characters <= minimum_characters:
+        raise ValueError("maximum_characters must be greater than minimum_characters")
+    if rare_threshold < 1:
+        raise ValueError("rare_threshold must be positive")
+    if max_lines_per_language < 0:
+        raise ValueError("max_lines_per_language must be non-negative")
+    if not discovery.sources:
+        raise ValueError(f"단일어 코퍼스에 읽을 수 있는 파일이 없습니다: {discovery.root}")
+
+    tokenizer = SionTokenizer(tokenizer_model)
+    vocab_size = len(tokenizer)
+    counts = {language: np.zeros(vocab_size, dtype=np.uint64) for language in discovery.languages}
+    accepted = Counter()
+    dropped = Counter()
+
+    for language in discovery.languages:
+        target = counts[language]
+        for path in discovery.paths_for(language):
+            if max_lines_per_language and accepted[language] >= max_lines_per_language:
+                break
+            for text in iter_monolingual_lines(path):
+                if max_lines_per_language and accepted[language] >= max_lines_per_language:
+                    break
+                normalized = canonical_text(text)
+                if len(normalized) < minimum_characters:
+                    dropped[f"{language}:too_short"] += 1
+                    continue
+                if len(normalized) > maximum_characters:
+                    dropped[f"{language}:too_long"] += 1
+                    continue
+                token_ids = tokenizer.encode(normalized)
+                if token_ids:
+                    target += np.bincount(token_ids, minlength=vocab_size).astype(
+                        np.uint64, copy=False
+                    )
+                accepted[language] += 1
+
+    combined = np.zeros(vocab_size, dtype=np.uint64)
+    for value in counts.values():
+        combined += value
+    eligible = np.array(
+        [
+            not _piece_is_special(tokenizer.processor.id_to_piece(index))
+            for index in range(vocab_size)
+        ]
+    )
+    return {
+        "scan": "monolingual-corpus",
+        "root": str(discovery.root),
+        "complete_scan": max_lines_per_language == 0,
+        "max_lines_per_language": max_lines_per_language,
+        "rare_threshold": rare_threshold,
+        "vocab_size": vocab_size,
+        "languages": list(discovery.languages),
+        "accepted_lines": dict(accepted),
+        "dropped_lines": dict(dropped),
+        "decoder_target_totals": _frequency_summary(combined, eligible),
+        "per_language": {
+            language: _frequency_summary(counts[language], eligible) for language in counts
+        },
+        "lowest_target_exposure": _rare_piece_examples(
+            tokenizer,
+            combined,
+            eligible,
+            maximum=max_piece_examples,
+            include_unused=True,
+        ),
+        "counts": combined,
+    }
+
+
+def combine_target_exposure(
+    parallel_counts: np.ndarray,
+    monolingual_counts: np.ndarray,
+    tokenizer_model: str | Path,
+    *,
+    rare_threshold: int = 25,
+    max_piece_examples: int = 50,
+) -> dict[str, Any]:
+    """두 단계를 합쳐야 비로소 "이 조각이 학습되는가"에 답할 수 있다.
+
+    foundation 이 먼저 돌면 출력 임베딩은 두 단계 모두에서 신호를 받습니다.
+    한쪽만 보고 판정하면 조각을 잘못 살리거나 잘못 죽입니다.
+    """
+
+    if parallel_counts.shape != monolingual_counts.shape:
+        raise ValueError("count vectors must describe the same vocabulary")
+    tokenizer = SionTokenizer(tokenizer_model)
+    vocab_size = len(tokenizer)
+    if parallel_counts.shape[0] != vocab_size:
+        raise ValueError("count vectors do not match the tokenizer vocabulary size")
+    eligible = np.array(
+        [
+            not _piece_is_special(tokenizer.processor.id_to_piece(index))
+            for index in range(vocab_size)
+        ]
+    )
+    combined = parallel_counts.astype(np.uint64) + monolingual_counts.astype(np.uint64)
+    rescued = int(
+        np.count_nonzero(
+            eligible & (parallel_counts < rare_threshold) & (combined >= rare_threshold)
+        )
+    )
+    still_rare = int(np.count_nonzero(eligible & (combined < rare_threshold)))
+    return {
+        "scan": "combined-stages",
+        "rare_threshold": rare_threshold,
+        "totals": _frequency_summary(combined, eligible),
+        # foundation 이 병렬 코퍼스만으로는 부족했던 조각을 몇 개 구제했는가.
+        "rescued_by_foundation": rescued,
+        "still_below_threshold": still_rare,
+        "lowest_target_exposure": _rare_piece_examples(
+            tokenizer,
+            combined,
+            eligible,
+            maximum=max_piece_examples,
+            include_unused=True,
+        ),
+    }
+
+
 def audit_token_exposure(
     input_patterns: Sequence[str],
     tokenizer_model: str | Path,
@@ -277,8 +426,14 @@ def audit_token_exposure(
     rare_threshold: int = 25,
     max_piece_examples: int = 50,
     filter_quality: bool = True,
+    return_counts: bool = False,
 ) -> dict[str, Any]:
     """Audit target-token exposure without materializing an indexed dataset.
+
+    ``return_counts`` attaches the raw decoder-target count vector under
+    ``global_target_counts`` so a caller can combine it with another stage's
+    exposure. It is off by default because the value is a vocabulary-sized
+    NumPy array and the report is otherwise JSON-serializable.
 
     ``max_physical_pairs=0`` performs an exact full scan. A positive value is a
     deterministic prefix sample and is labelled as such in the report; it is
@@ -472,7 +627,9 @@ def audit_token_exposure(
     global_summary["rare_observed_pieces"] = int(
         np.count_nonzero(eligible & (global_target > 0) & (global_target < rare_threshold))
     )
+    report_counts = {"global_target_counts": global_target} if return_counts else {}
     return {
+        **report_counts,
         "schema": "sion-token-exposure-audit-v1",
         "complete_scan": max_physical_pairs == 0 or not stop,
         "parameters": {
