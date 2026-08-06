@@ -553,3 +553,133 @@ def test_stage_transfer_refuses_a_checkpoint_without_an_identity(tmp_path: Path)
             context,
             expected_identity=_identity(model, tmp_path, dataset_name="dataset", stage="pretrain"),
         )
+
+
+# ── 목적함수 identity: 무엇을 최적화하는지도 정체성이다 ─────────────────
+
+
+def _objective_config():
+    from sion_translate.config import AppConfig
+
+    return AppConfig()
+
+
+def test_the_objective_identity_covers_the_optimizer_schedule() -> None:
+    """학습률·Adam 계수를 바꾸고 optimizer state 를 이어받으면 momentum 이
+    다른 곡률을 가리킨다."""
+    from sion_translate.training.checkpoint import build_objective_identity
+
+    config = _objective_config()
+    baseline = build_objective_identity(config.training)
+    for field, value in (
+        ("learning_rate", 1e-5),
+        ("adam_beta2", 0.98),
+        ("weight_decay", 0.0),
+        ("precision", "fp32"),
+        ("ema_decay", 0.0),
+        ("sft_selection_metric", "global_nll"),
+    ):
+        changed = _objective_config()
+        setattr(changed.training, field, value)
+        assert build_objective_identity(changed.training) != baseline, field
+
+
+def test_reward_weights_are_part_of_the_posttraining_identity() -> None:
+    """MRT 는 reward 정의가 곧 선택 지표다.
+
+    가중치 하나만 바꿔도 validation_reward 는 다른 축의 수치가 되는데
+    early stopping 은 과거 best 와 비교합니다.
+    """
+    from sion_translate.training.checkpoint import build_objective_identity
+
+    config = _objective_config()
+    baseline = build_objective_identity(
+        config.training, config.posttraining, include_posttraining=True
+    )
+    for field, value in (
+        ("reward_chrf_weight", 0.1),
+        ("roundtrip_enabled", True),
+        ("samples_per_source", 8),
+        ("validation_num_beams", 1),
+    ):
+        changed = _objective_config()
+        setattr(changed.posttraining, field, value)
+        assert (
+            build_objective_identity(
+                changed.training, changed.posttraining, include_posttraining=True
+            )
+            != baseline
+        ), field
+
+
+def test_posttraining_settings_do_not_affect_a_supervised_identity() -> None:
+    """SFT 재개를 MRT 설정 변경만으로 거부하면 안 된다."""
+    from sion_translate.training.checkpoint import build_objective_identity
+
+    config = _objective_config()
+    baseline = build_objective_identity(config.training)
+    changed = _objective_config()
+    changed.posttraining.reward_chrf_weight = 0.1
+    assert build_objective_identity(changed.training) == baseline
+
+
+def test_resuming_with_a_changed_objective_is_refused(tmp_path: Path) -> None:
+    from sion_translate.training.checkpoint import build_objective_identity
+
+    model, optimizer, scheduler, context = _components()
+    config = _objective_config()
+    checkpoint = tmp_path / "checkpoint"
+
+    def identity(app_config):
+        return build_checkpoint_identity(
+            model_config=model.config,
+            tokenizer_path=tmp_path / "sion.model",
+            token_features_path=None,
+            dataset_dir=tmp_path,
+            objective_identity=build_objective_identity(app_config.training),
+        )
+
+    save_checkpoint(checkpoint, model, optimizer, scheduler, 1, context, identity=identity(config))
+
+    changed = _objective_config()
+    changed.training.learning_rate = 1e-6
+    with pytest.raises(ValueError, match="identity does not match"):
+        load_checkpoint(
+            checkpoint,
+            model,
+            optimizer,
+            scheduler,
+            context,
+            expected_identity=identity(changed),
+        )
+
+
+def test_a_legacy_checkpoint_without_an_objective_warns_instead_of_failing(
+    tmp_path: Path,
+) -> None:
+    """구버전 체크포인트의 재개를 막지는 않되, 검사하지 못한 것을 밝힌다."""
+    import warnings as warnings_module
+
+    from sion_translate.training.checkpoint import build_objective_identity
+
+    model, optimizer, scheduler, context = _components()
+    legacy = build_checkpoint_identity(
+        model_config=model.config,
+        tokenizer_path=tmp_path / "sion.model",
+        token_features_path=None,
+        dataset_dir=tmp_path,
+    )
+    checkpoint = tmp_path / "checkpoint"
+    save_checkpoint(checkpoint, model, optimizer, scheduler, 1, context, identity=legacy)
+
+    modern = build_checkpoint_identity(
+        model_config=model.config,
+        tokenizer_path=tmp_path / "sion.model",
+        token_features_path=None,
+        dataset_dir=tmp_path,
+        objective_identity=build_objective_identity(_objective_config().training),
+    )
+    with warnings_module.catch_warnings(record=True) as caught:
+        warnings_module.simplefilter("always")
+        load_checkpoint(checkpoint, model, optimizer, scheduler, context, expected_identity=modern)
+    assert any("목적함수" in str(entry.message) for entry in caught)

@@ -126,6 +126,85 @@ def _portable_data_config(data_config: Any) -> Any:
     }
 
 
+# 재개 시 같아야 하는 최적화·목적함수 설정. 여기 빠진 값을 바꾸고 재개하면
+# optimizer state 를 그대로 이어받으면서 다른 목적을 최적화하게 되고, 과거
+# best 지표와 새 지표를 같은 축에 놓고 비교하게 됩니다.
+_SUPERVISED_OBJECTIVE_FIELDS = (
+    "learning_rate",
+    "min_learning_rate_ratio",
+    "warmup_steps",
+    "weight_decay",
+    "adam_beta1",
+    "adam_beta2",
+    "adam_eps",
+    "grad_clip",
+    "precision",
+    "ema_decay",
+    "sft_selection_metric",
+)
+
+# MRT 는 reward 정의 자체가 선택 지표입니다. 가중치 하나만 바꿔도
+# validation_reward 는 다른 축의 수치가 되므로 반드시 identity 에 들어갑니다.
+_POSTTRAINING_OBJECTIVE_FIELDS = (
+    "method",
+    "learning_rate",
+    "warmup_steps",
+    "samples_per_source",
+    "sampling_temperature",
+    "top_k",
+    "max_new_tokens",
+    "risk_weight",
+    "mrt_alpha",
+    "preference_weight",
+    "preference_min_gap",
+    "preference_temperature",
+    "reward_chrf_weight",
+    "reward_token_f1_weight",
+    "reward_number_weight",
+    "reward_structured_weight",
+    "reward_slot_weight",
+    "reward_language_weight",
+    "reward_length_weight",
+    "reward_repetition_penalty",
+    "reward_copy_penalty",
+    "roundtrip_enabled",
+    "roundtrip_reward_weight",
+    "roundtrip_failure_penalty",
+    "roundtrip_min_score",
+    "roundtrip_num_beams",
+    "validation_num_beams",
+)
+
+
+def build_objective_identity(
+    training_config: Any,
+    posttraining_config: Any = None,
+    *,
+    include_posttraining: bool = False,
+) -> dict[str, Any]:
+    """무엇을 최적화하고 무엇으로 best 를 고르는지의 정체성.
+
+    모델·토크나이저·데이터가 같아도 목적이 다르면 재개는 안전하지 않습니다.
+    학습률 스케줄이나 Adam 계수를 바꾸고 optimizer state 를 이어받으면 momentum
+    이 다른 곡률을 가리키고, MRT 의 reward 가중치를 바꾸면 ``validation_reward``
+    가 다른 축의 수치가 되는데 early stopping 은 과거 best 와 비교합니다.
+    """
+
+    payload: dict[str, Any] = {
+        "supervised": {
+            field: _json_compatible(getattr(training_config, field))
+            for field in _SUPERVISED_OBJECTIVE_FIELDS
+        }
+    }
+    if include_posttraining and posttraining_config is not None:
+        payload["posttraining"] = {
+            field: _json_compatible(getattr(posttraining_config, field))
+            for field in _POSTTRAINING_OBJECTIVE_FIELDS
+        }
+    payload["sha256"] = hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+    return payload
+
+
 def build_checkpoint_identity(
     *,
     model_config: Any,
@@ -136,6 +215,7 @@ def build_checkpoint_identity(
     sampling_seed: int | None = None,
     stage_name: str | None = None,
     loader_config: Mapping[str, Any] | None = None,
+    objective_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a portable identity for the model, tokenizer, and prepared data.
 
@@ -163,7 +243,7 @@ def build_checkpoint_identity(
         data_identity["sampling_seed"] = int(sampling_seed)
     if loader_config is not None:
         data_identity["loader"] = _json_compatible(loader_config)
-    return {
+    identity: dict[str, Any] = {
         "schema": CHECKPOINT_IDENTITY_SCHEMA,
         "stage": stage_name,
         "model": {
@@ -183,6 +263,9 @@ def build_checkpoint_identity(
         },
         "data": data_identity,
     }
+    if objective_identity is not None:
+        identity["objective"] = _json_compatible(objective_identity)
+    return identity
 
 
 def _normalize_identity_for_comparison(identity: Mapping[str, Any]) -> dict[str, Any]:
@@ -253,6 +336,19 @@ def _validate_identity(
         raise ValueError("checkpoint identity must be an object")
     expected = _normalize_identity_for_comparison(expected_identity)
     actual = _normalize_identity_for_comparison(stored_identity)
+    if "objective" in expected and "objective" not in actual:
+        # 목적함수 identity 가 없던 시절의 체크포인트입니다. 재개 자체를 막지는
+        # 않되, 무엇을 검사하지 못했는지 밝힙니다 — 그 사이에 학습률이나 reward
+        # 가중치가 바뀌었다면 이 재개는 과거 best 와 비교 불가능한 숫자를
+        # 이어받습니다.
+        warnings.warn(
+            "이 체크포인트에는 목적함수/최적화 identity 가 없습니다(구버전). "
+            "학습률·Adam 계수·EMA·MRT reward 가중치가 그대로인지 확인할 수 없으므로 "
+            "그 부분의 동일성 검사는 건너뜁니다.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+        expected = {key: value for key, value in expected.items() if key != "objective"}
     if expected != actual:
         differences = _identity_differences(expected, actual)
         detail = ", ".join(differences) if differences else "unknown fields"

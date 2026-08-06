@@ -31,7 +31,12 @@ from tqdm.auto import tqdm
 
 from sion_translate.config import AppConfig, TrainingConfig
 
-from .checkpoint import build_checkpoint_identity, load_checkpoint, save_checkpoint
+from .checkpoint import (
+    build_checkpoint_identity,
+    build_objective_identity,
+    load_checkpoint,
+    save_checkpoint,
+)
 from .distributed import (
     DistributedContext,
     broadcast_bool,
@@ -454,6 +459,14 @@ def train(
             config.training.seed,
         ),
         stage_name=stage_name,
+        # 목적함수/최적화 설정도 identity 입니다. `objective` 가 주어졌다는 것은
+        # 이 stage 가 MRT 라는 뜻이므로, 그때만 reward 정의까지 포함합니다 —
+        # SFT 재개를 MRT 설정 변경만으로 거부하면 안 되기 때문입니다.
+        objective_identity=build_objective_identity(
+            config.training,
+            config.posttraining,
+            include_posttraining=objective is not None,
+        ),
         loader_config={
             "batch_size_per_rank": getattr(
                 batch_sampler,
