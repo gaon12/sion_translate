@@ -1,0 +1,204 @@
+"""FP8 수치와 정책.
+
+여기 테스트의 상당수는 "FP8 이 정확하다"가 아니라 **얼마나 부정확한지를
+고정**합니다. FP8 학습이 실패하는 방식은 대부분 느려짐이 아니라 내리면 안
+되는 것을 내리는 것이고, 그 경계는 숫자로 남겨 두지 않으면 잊힙니다.
+"""
+
+from __future__ import annotations
+
+import pytest
+import torch
+
+from sion_translate.fp8 import (
+    DEFAULT_BLOCK,
+    FORWARD_DTYPE,
+    GRADIENT_DTYPE,
+    Fp8Policy,
+    fp8_gemm_supported,
+    gemm_error,
+    quantize_dequantize,
+    relative_error,
+    scale_for,
+)
+
+
+def test_round_trip_preserves_the_scale_of_the_tensor() -> None:
+    torch.manual_seed(0)
+    tensor = torch.randn(64, 256) * 3.0
+    restored = quantize_dequantize(tensor)
+    assert restored.shape == tensor.shape
+    assert relative_error(restored, tensor) < 0.05
+    assert restored.abs().max() == pytest.approx(tensor.abs().max(), rel=0.05)
+
+
+def test_round_trip_keeps_the_input_dtype() -> None:
+    tensor = torch.randn(8, 128, dtype=torch.bfloat16)
+    assert quantize_dequantize(tensor).dtype is torch.bfloat16
+
+
+def test_an_all_zero_block_does_not_divide_by_zero() -> None:
+    tensor = torch.zeros(4, 256)
+    restored = quantize_dequantize(tensor)
+    assert torch.isfinite(restored).all()
+    assert float(restored.abs().sum()) == 0.0
+
+
+def test_a_ragged_last_dimension_is_refused_rather_than_silently_padded() -> None:
+    with pytest.raises(ValueError, match="multiple of the FP8 block size"):
+        quantize_dequantize(torch.randn(4, 130), block=128)
+
+
+def test_per_tensor_scaling_is_available_for_comparison() -> None:
+    tensor = torch.randn(4, 130)
+    assert quantize_dequantize(tensor, block=None).shape == tensor.shape
+    assert scale_for(tensor, block=None).ndim == 0
+
+
+# ── 측정한 사실을 고정한다 ──────────────────────────────────────────────
+
+
+def test_fp8_gemm_error_is_an_order_of_magnitude_worse_than_bf16() -> None:
+    """FP8 은 bf16 과 "거의 같다"가 아니다.
+
+    실측 (M=2048, K=768, N=2048, 정규분포): FP8 block128 3.64% 대 bf16 0.23%.
+    이 배율을 잊으면 정확도 하락을 다른 원인에서 찾게 됩니다.
+    """
+    torch.manual_seed(0)
+    activations = torch.randn(512, 768)
+    weights = torch.randn(1024, 768) * 0.02
+
+    fp8 = gemm_error(activations, weights)
+    exact = activations.float() @ weights.float().T
+    bf16 = relative_error(
+        activations.bfloat16().float() @ weights.bfloat16().float().T,
+        exact,
+    )
+
+    assert 0.02 < fp8 < 0.06
+    assert bf16 < 0.005
+    assert fp8 > bf16 * 5
+
+
+def test_block_scaling_earns_its_cost_only_when_there_are_outliers() -> None:
+    """블록 스케일링은 이상치 대책이지 일반적인 정확도 개선이 아니다.
+
+    실측: 정규분포 3.74%→3.64% (거의 없음), 이상치 3.75%→3.19%.
+    """
+    torch.manual_seed(0)
+    weights = torch.randn(1024, 768) * 0.02
+
+    plain = torch.randn(512, 768)
+    spiked = plain.clone()
+    index = torch.randperm(spiked.numel())[: spiked.numel() // 1000]
+    spiked.view(-1)[index] *= 30.0
+
+    plain_gain = gemm_error(plain, weights, block=None) - gemm_error(plain, weights)
+    spiked_gain = gemm_error(spiked, weights, block=None) - gemm_error(spiked, weights)
+
+    assert spiked_gain > plain_gain
+    assert spiked_gain > 0.002
+
+
+def test_e5m2_trades_precision_for_range() -> None:
+    """기울기에 E5M2 를 쓰는 이유는 정밀도가 아니라 동적 범위다."""
+    torch.manual_seed(0)
+    tensor = torch.randn(256, 768)
+
+    precise = relative_error(quantize_dequantize(tensor, dtype=FORWARD_DTYPE), tensor)
+    wide = relative_error(quantize_dequantize(tensor, dtype=GRADIENT_DTYPE), tensor)
+
+    assert wide > precise
+    assert torch.finfo(GRADIENT_DTYPE).max > torch.finfo(FORWARD_DTYPE).max * 100
+
+
+def test_the_vocabulary_projection_changes_the_predicted_token(monkeypatch) -> None:
+    """이 저장소에서 FP8 을 어휘 projection 에 쓰면 안 되는 이유.
+
+    48,000 어휘에서 hidden 과 가중치를 모두 E4M3 로 내리면 argmax 가 실측
+    6.45% 바뀝니다. greedy 디코딩에서 그것은 그대로 다른 단어입니다.
+    """
+    torch.manual_seed(0)
+    hidden = torch.randn(256, 768)
+    projection = torch.randn(8192, 768) * 0.02
+
+    exact = (hidden.float() @ projection.float().T).argmax(-1)
+    quantized = (
+        quantize_dequantize(hidden).float() @ quantize_dequantize(projection).float().T
+    ).argmax(-1)
+
+    mismatch = float((quantized != exact).float().mean())
+    assert mismatch > 0.01, "이 경고가 무의미해졌다면 측정을 다시 하십시오"
+
+
+# ── 정책 ────────────────────────────────────────────────────────────────
+
+
+def test_the_policy_is_off_by_default() -> None:
+    policy = Fp8Policy()
+    assert not policy.enabled
+    assert not policy.allows("encoder_layers.0.self_attn.q_proj.weight")
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "encoder_layers.0.self_attn.q_proj.weight",
+        "encoder_layers.3.self_attn.k_proj.weight",
+        "decoder_layers.1.cross_attn.v_proj.weight",
+        "decoder_layers.2.self_attn.out_proj.weight",
+        "encoder_layers.0.ffn.gate_proj.weight",
+        "encoder_layers.0.ffn.up_proj.weight",
+        "decoder_layers.0.ffn.down_proj.weight",
+    ],
+)
+def test_the_big_projections_are_quantizable(name: str) -> None:
+    assert Fp8Policy(enabled=True).allows(name)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "token_embedding.weight",
+        "lm_head.weight",
+        "encoder_norm.weight",
+        "encoder_layers.0.attn_norm.weight",
+        "register_state.register_embeddings.weight",
+        "typed_memory.type_embedding.weight",
+        "evidence_repair.uncertainty_head.weight",
+    ],
+)
+def test_the_protected_tensors_are_never_quantized(name: str) -> None:
+    assert not Fp8Policy(enabled=True).allows(name)
+
+
+def test_the_tied_embedding_is_protected_because_it_is_also_the_output_head() -> None:
+    """``tie_embeddings=True`` 면 출력 projection 이 곧 임베딩 행렬이다.
+
+    가중치를 FP8 로 저장하면 출력만이 아니라 입력 임베딩 조회까지 같이
+    망가집니다.
+    """
+    assert not Fp8Policy(enabled=True).allows("token_embedding.weight")
+    assert (
+        Fp8Policy(enabled=True, quantize_vocabulary_projection=True).allows(
+            "token_embedding.weight"
+        )
+        is False
+    )  # QUANTIZABLE_PROJECTIONS 에 없으므로 그래도 대상이 아니다
+
+
+def test_the_policy_rejects_a_non_power_of_two_block() -> None:
+    with pytest.raises(ValueError, match="power of two"):
+        Fp8Policy(enabled=True, block=100).validate()
+    with pytest.raises(ValueError, match="positive"):
+        Fp8Policy(enabled=True, block=0).validate()
+    Fp8Policy(enabled=True, block=DEFAULT_BLOCK).validate()
+
+
+def test_hardware_support_is_reported_separately_from_dtype_availability() -> None:
+    """dtype 이 있는 것과 커널이 있는 것은 다르다.
+
+    CPU 에서도 FP8 캐스팅은 됩니다. ``_scaled_mm`` 은 안 됩니다.
+    """
+    assert torch.zeros(1).to(FORWARD_DTYPE).dtype is FORWARD_DTYPE
+    assert not fp8_gemm_supported(torch.device("cpu"))
