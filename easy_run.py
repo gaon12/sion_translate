@@ -265,6 +265,38 @@ def _validate_gpu_runtime(torch_module) -> tuple[int, tuple[str, ...]]:
     return gpu_count, names
 
 
+def _report_foundation_corpus(config_path: Path) -> None:
+    """단일어 코퍼스에서 무엇이 학습에 들어가고 무엇이 빠지는지 먼저 보여 준다.
+
+    foundation 단계는 "폴더가 있으면 자동 실행"이라 **건너뛰는 것이 정상
+    경로**입니다. 그래서 조용히 건너뛰면 사용자는 5 GB 코퍼스가 학습에
+    들어갔다고 믿은 채로 며칠을 씁니다. 여기서 이유와 제외 목록을 먼저
+    출력합니다.
+
+    학습을 막지는 않습니다 — 언어를 나중에 채우는 것이 정상적인 작업
+    흐름이기 때문입니다. 막고 싶으면 foundation.require_all_languages 를
+    켜십시오.
+    """
+
+    from sion_translate.config import load_config
+    from sion_translate.foundation import plan_foundation_stage
+
+    plan = plan_foundation_stage(load_config(config_path))
+    print("[easy_run] foundation(단일어 사전학습) 코퍼스를 확인합니다.", flush=True)
+    for line in plan.report:
+        print(f"[easy_run]   {line}", flush=True)
+    if not plan.enabled:
+        print(f"[easy_run] foundation 단계를 건너뜁니다: {plan.reason}", flush=True)
+        return
+    for warning in plan.warnings:
+        print(f"[easy_run] [경고] {warning}", flush=True)
+    print(
+        f"[easy_run] foundation 단계를 실행합니다 (언어: {', '.join(plan.languages)}). "
+        "산출물은 번역 모델과 별도로 runs/*/foundation/ 에 저장됩니다.",
+        flush=True,
+    )
+
+
 def _check_shard_keys(env: dict[str, str]) -> None:
     """Refuse to start when a shard's keys match no configured language pair.
 
@@ -430,6 +462,7 @@ def main() -> None:
     # Before anything expensive: a shard the pipeline cannot read is worth
     # catching now rather than after hours of training.
     _check_shard_keys(env)
+    _report_foundation_corpus(generated_config)
     try:
         # 전처리를 단일 rank에서 끝내야 torchrun worker가 장시간 barrier에서
         # 기다리거나 통신 timeout에 걸리지 않습니다.

@@ -169,3 +169,63 @@ def test_a_missing_checker_does_not_block_the_run(monkeypatch, tmp_path: Path) -
     # A trimmed deployment without scripts/ should still be able to train.
     monkeypatch.setattr(EASY, "ROOT", tmp_path)
     EASY._check_shard_keys({})  # must not raise
+
+
+def test_the_foundation_corpus_is_reported_before_training(tmp_path, capsys) -> None:
+    """건너뛰는 것이 정상 경로이므로, 조용히 건너뛰면 안 된다."""
+    import easy_run
+
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        f"foundation:\n  corpus_dir: {(tmp_path / 'corpus').as_posix()}\n",
+        encoding="utf-8",
+    )
+
+    easy_run._report_foundation_corpus(config)
+
+    output = capsys.readouterr().out
+    assert "foundation 단계를 건너뜁니다" in output
+    # 무엇을 어디에 두면 되는지가 출력에 있어야 한다.
+    assert ".txt" in output and ".jsonl" in output
+
+
+def test_a_usable_corpus_is_announced_with_its_languages(tmp_path, capsys) -> None:
+    import easy_run
+
+    corpus = tmp_path / "corpus"
+    for language in ("ko", "ja"):
+        (corpus / language).mkdir(parents=True)
+        (corpus / language / "a.txt").write_text(
+            "\n".join(f"{language} 문장 {index} 입니다" for index in range(10)) + "\n",
+            encoding="utf-8",
+        )
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        f"foundation:\n  corpus_dir: {corpus.as_posix()}\n",
+        encoding="utf-8",
+    )
+
+    easy_run._report_foundation_corpus(config)
+
+    output = capsys.readouterr().out
+    assert "foundation 단계를 실행합니다" in output
+    assert "ko" in output and "ja" in output
+    # 산출물이 번역 모델과 분리된다는 사실을 미리 알린다.
+    assert "runs/*/foundation/" in output
+
+
+def test_a_skipped_directory_is_named_in_the_preflight(tmp_path, capsys) -> None:
+    """`data/corpus/korean_tech_corpus_130m/` 같은 실제 사례."""
+    import easy_run
+
+    corpus = tmp_path / "corpus"
+    (corpus / "ko").mkdir(parents=True)
+    (corpus / "ko" / "a.txt").write_text("한국어 문장입니다\n", encoding="utf-8")
+    (corpus / "korean_tech_corpus_130m").mkdir()
+    (corpus / "korean_tech_corpus_130m" / "ui.txt").write_text("기술 문장\n", encoding="utf-8")
+    config = tmp_path / "config.yaml"
+    config.write_text(f"foundation:\n  corpus_dir: {corpus.as_posix()}\n", encoding="utf-8")
+
+    easy_run._report_foundation_corpus(config)
+
+    assert "korean_tech_corpus_130m" in capsys.readouterr().out
