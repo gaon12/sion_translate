@@ -12,6 +12,8 @@ import torch
 
 from sion_translate.fp8 import (
     DEFAULT_BLOCK,
+    SCOPE_ALL,
+    SCOPE_FFN,
     FORWARD_DTYPE,
     GRADIENT_DTYPE,
     Fp8Policy,
@@ -153,7 +155,7 @@ def test_the_policy_is_off_by_default() -> None:
     ],
 )
 def test_the_big_projections_are_quantizable(name: str) -> None:
-    assert Fp8Policy(enabled=True).allows(name)
+    assert Fp8Policy(enabled=True, scope=SCOPE_ALL).allows(name)
 
 
 @pytest.mark.parametrize(
@@ -169,7 +171,7 @@ def test_the_big_projections_are_quantizable(name: str) -> None:
     ],
 )
 def test_the_protected_tensors_are_never_quantized(name: str) -> None:
-    assert not Fp8Policy(enabled=True).allows(name)
+    assert not Fp8Policy(enabled=True, scope=SCOPE_ALL).allows(name)
 
 
 def test_the_tied_embedding_is_protected_because_it_is_also_the_output_head() -> None:
@@ -178,9 +180,9 @@ def test_the_tied_embedding_is_protected_because_it_is_also_the_output_head() ->
     가중치를 FP8 로 저장하면 출력만이 아니라 입력 임베딩 조회까지 같이
     망가집니다.
     """
-    assert not Fp8Policy(enabled=True).allows("token_embedding.weight")
+    assert not Fp8Policy(enabled=True, scope=SCOPE_ALL).allows("token_embedding.weight")
     assert (
-        Fp8Policy(enabled=True, quantize_vocabulary_projection=True).allows(
+        Fp8Policy(enabled=True, scope=SCOPE_ALL, quantize_vocabulary_projection=True).allows(
             "token_embedding.weight"
         )
         is False
@@ -202,3 +204,105 @@ def test_hardware_support_is_reported_separately_from_dtype_availability() -> No
     """
     assert torch.zeros(1).to(FORWARD_DTYPE).dtype is FORWARD_DTYPE
     assert not fp8_gemm_supported(torch.device("cpu"))
+
+
+# ── 범위(scope): 측정에서 나온 기본값 ────────────────────────────────────
+
+
+def test_the_default_scope_is_ffn_only() -> None:
+    """실측: FFN 만 내리면 logits 오차 6.39%, 전 층이면 13.11%.
+
+    attention projection 은 softmax 를 거치며 오차가 증폭되고, FFN 의 오차는
+    잔차에 더해질 뿐입니다.
+    """
+    policy = Fp8Policy(enabled=True)
+    assert policy.scope == SCOPE_FFN
+    assert policy.allows("encoder_layers.0.ffn.gate_proj.weight")
+    assert not policy.allows("encoder_layers.0.self_attn.q_proj.weight")
+    assert not policy.allows("decoder_layers.0.cross_attn.out_proj.weight")
+
+
+def test_the_all_scope_adds_the_attention_projections() -> None:
+    policy = Fp8Policy(enabled=True, scope=SCOPE_ALL)
+    assert policy.allows("encoder_layers.0.ffn.gate_proj.weight")
+    assert policy.allows("encoder_layers.0.self_attn.q_proj.weight")
+    assert not policy.allows("token_embedding.weight")
+
+
+def test_an_unknown_scope_is_rejected() -> None:
+    with pytest.raises(ValueError, match="fp8 scope"):
+        Fp8Policy(enabled=True, scope="everything").validate()
+    with pytest.raises(ValueError, match="fp8 scope"):
+        Fp8Policy(enabled=True, scope="everything").allows("x.ffn.gate_proj.weight")
+
+
+def test_weight_only_quantization_beats_quantizing_both_operands() -> None:
+    """디코딩은 대역폭 바운드라 가중치만 내려도 이득을 얻는다.
+
+    실측: 가중치만 2.57%, 양쪽 다 3.63%. 그리고 가중치만 내리면 활성값
+    이상치에 영향받지 않습니다.
+    """
+    torch.manual_seed(0)
+    activations = torch.randn(256, 768)
+    weights = torch.randn(1024, 768) * 0.02
+    exact = activations.float() @ weights.float().T
+
+    weight_only = relative_error(
+        activations.bfloat16().float() @ quantize_dequantize(weights).float().T,
+        exact,
+    )
+    both = relative_error(
+        quantize_dequantize(activations).float() @ quantize_dequantize(weights).float().T,
+        exact,
+    )
+    assert weight_only < both
+
+
+def test_quantization_error_compounds_with_depth() -> None:
+    """단일 GEMM 오차로 모델 전체를 판단하면 안 된다.
+
+    실측: GEMM 1회 2.57% → encoder 16층 11.7% → 최종 logits 13.1%.
+    독립적인 양자화 잡음이 잔차 스트림에 쌓입니다.
+    """
+    import copy
+
+    from sion_translate.config import ExperimentalConfig, ModelConfig
+    from sion_translate.model import SionForConditionalGeneration
+
+    config = ModelConfig(
+        vocab_size=512,
+        d_model=128,
+        encoder_layers=8,
+        decoder_layers=2,
+        num_heads=4,
+        num_kv_heads=2,
+        d_ff=256,
+        max_seq_len=64,
+        dropout=0.0,
+        experimental=ExperimentalConfig(),
+    )
+    torch.manual_seed(0)
+    reference = SionForConditionalGeneration(config).eval()
+    quantized = copy.deepcopy(reference)
+    policy = Fp8Policy(enabled=True, scope=SCOPE_ALL)
+    with torch.no_grad():
+        for name, parameter in quantized.named_parameters():
+            if policy.allows(name):
+                parameter.copy_(quantize_dequantize(parameter))
+
+    ids = torch.randint(4, 500, (2, 32))
+    mask = torch.ones(2, 32, dtype=torch.bool)
+    with torch.no_grad():
+        deep = relative_error(quantized.encode(ids, mask), reference.encode(ids, mask))
+
+    # 같은 기준으로 비교한다: 모델 경로는 가중치만 양자화하므로, 기준도
+    # 개별 가중치 텐서 하나의 양자화 오차여야 한다.
+    with torch.no_grad():
+        per_tensor = [
+            relative_error(quantize_dequantize(parameter), parameter)
+            for name, parameter in reference.named_parameters()
+            if policy.allows(name)
+        ]
+    single = sum(per_tensor) / len(per_tensor)
+
+    assert deep > single, (deep, single)

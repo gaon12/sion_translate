@@ -36,6 +36,56 @@ mantissa 가 한 비트 적으니 당연하고, 그럼에도 기울기에 E5M2 �
 이 모델에서는 그 금지가 임베딩까지 번집니다. ``tie_embeddings=True`` 라
 출력 projection 이 곧 ``token_embedding.weight`` 이기 때문입니다. 가중치를
 FP8 로 **저장**해 버리면 입력 임베딩 조회까지 같이 망가집니다.
+
+## 가중치만 FP8 (활성값은 bf16)
+
+디코딩은 이 모델에서 가중치 대역폭 바운드입니다(KV cache 는 전체 바이트의
+1.5%). 그래서 대역폭을 줄이는 데는 가중치만 내려도 충분하고, 그편이 더
+정확합니다:
+
+    가중치 FP8 + 활성값 bf16    출력오차 2.57%   (활성값 이상치와 무관)
+    가중치·활성값 모두 FP8       출력오차 3.63%
+    bf16                       출력오차 0.23%
+
+## 오차는 깊이를 따라 누적된다
+
+이것이 이 파일에서 가장 중요한 수치입니다. GEMM 하나의 2.57% 는 그대로
+남지 않습니다. sion_data_fit(encoder 16 / decoder 8) 전체를 통과시키면:
+
+    GEMM 1회        2.57%
+    encoder 16층    11.7%      (약 sqrt(층수) 배)
+    최종 logits     13.1%
+
+층을 지날수록 독립적인 양자화 잡음이 잔차 스트림에 쌓입니다. 단일 GEMM
+수치만 보고 "3% 정도"라고 판단하면 안 됩니다.
+
+## 무엇이 누적을 끊는가 (실측)
+
+    구성                          logits오차  argmax불일치   KL      FP8비율
+    전 층 FP8                       13.11%      18.75%   0.0628    100%
+    앞뒤 1층씩 bf16                   11.37%      18.75%   0.0471     83%
+    앞뒤 2층씩 bf16                    9.42%      13.54%   0.0325     65%
+    앞뒤 3층씩 bf16                    7.61%      13.54%   0.0213     48%
+    FFN 만 FP8 (attention bf16)      6.39%       8.33%   0.0150     69%
+
+**FFN 만 내리는 것이 가장 좋은 거래입니다.** 오차는 절반인데 양자화 대상의
+69% 를 덮습니다. attention projection 은 softmax 를 거치며 오차가 증폭되고,
+FFN 의 오차는 잔차에 더해질 뿐이라 그렇습니다. "가장자리 층을 빼는" 흔한
+처방보다 이 모델에서는 이쪽이 낫습니다.
+
+## 시도했으나 효과가 없던 보정 (다시 하지 마십시오)
+
+- **양자화 잔차의 저계수 보정** (LQER 계열): rank-32 가 대역폭을 11.5% 더
+  쓰면서 가중치 오차를 2.57% → 2.44% 로 줄일 뿐입니다. 반올림 잔차는
+  백색잡음에 가까워 저계수 구조가 없습니다.
+- **활성값 인지 스케일링** (AWQ 계열): 2.571% → 2.544%. 채널 크기가 100 배
+  차이 나는 활성값에서도 그렇습니다.
+
+둘 다 실패하는 이유는 같습니다. 여기서 남은 오차는 **범위**가 아니라 E4M3
+의 mantissa 3 비트, 즉 **해상도** 문제입니다. 블록 스케일링으로 범위를 이미
+맞춘 뒤에는 스케일을 아무리 영리하게 골라도 mantissa 를 늘릴 수 없습니다.
+블록 폭을 128→32 로 좁히면 2.571% → 2.400% 로 조금 더 가지만, 스케일 계수가
+4 배가 됩니다.
 """
 
 from __future__ import annotations
@@ -54,16 +104,21 @@ GRADIENT_DTYPE = torch.float8_e5m2
 # 지점입니다(3.75% → 3.19%; block32 로 더 좁혀도 2.97% 로 조금 더 갈 뿐).
 DEFAULT_BLOCK = 128
 
-# FP8 로 내려도 되는 projection. 모델 전체 파라미터의 81.6% 입니다.
-QUANTIZABLE_PROJECTIONS = (
-    "q_proj",
-    "k_proj",
-    "v_proj",
-    "out_proj",
-    "gate_proj",
-    "up_proj",
-    "down_proj",
-)
+# FFN projection. 실측에서 가장 좋은 거래를 주는 범위입니다 — 오차는 전 층
+# FP8 의 절반인데 양자화 대상의 69% 를 덮습니다.
+FFN_PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
+
+# attention projection. 여기까지 내리면 대역폭은 더 줄지만 softmax 를 거치며
+# 오차가 증폭됩니다 (logits 오차 6.39% → 13.11%).
+ATTENTION_PROJECTIONS = ("q_proj", "k_proj", "v_proj", "out_proj")
+
+# 두 범위를 합친 것. 모델 전체 파라미터의 81.6%.
+QUANTIZABLE_PROJECTIONS = FFN_PROJECTIONS + ATTENTION_PROJECTIONS
+
+# 기본 범위. 이름이 아니라 측정에서 나온 값입니다.
+SCOPE_FFN = "ffn"
+SCOPE_ALL = "all"
+SCOPES = (SCOPE_FFN, SCOPE_ALL)
 
 # 이름에 이것이 들어가면 어떤 설정에서도 FP8 로 내리지 않습니다.
 PROTECTED_SUBSTRINGS = (
@@ -83,6 +138,9 @@ class Fp8Policy:
 
     enabled: bool = False
     block: int = DEFAULT_BLOCK
+    # 기본은 FFN 만. attention 까지 내리면 대역폭은 더 줄지만 최종 logits
+    # 오차가 두 배가 됩니다 (6.39% → 13.11%).
+    scope: str = SCOPE_FFN
     # 어휘 projection 을 내리는 것은 실측에서 argmax 6.45% 변경이라
     # 기본은 False 입니다. 연구 목적으로 켜려면 명시해야 합니다.
     quantize_vocabulary_projection: bool = False
@@ -92,17 +150,24 @@ class Fp8Policy:
             raise ValueError("fp8 block size must be positive")
         if self.block & (self.block - 1):
             raise ValueError("fp8 block size must be a power of two")
+        if self.scope not in SCOPES:
+            raise ValueError(f"fp8 scope must be one of {SCOPES}, got {self.scope!r}")
+
+    def targets(self) -> tuple[str, ...]:
+        return FFN_PROJECTIONS if self.scope == SCOPE_FFN else QUANTIZABLE_PROJECTIONS
 
     def allows(self, parameter_name: str) -> bool:
         """``named_parameters()`` 이름 하나가 FP8 대상인지."""
 
         if not self.enabled:
             return False
+        if self.scope not in SCOPES:
+            raise ValueError(f"fp8 scope must be one of {SCOPES}, got {self.scope!r}")
         if not self.quantize_vocabulary_projection and any(
             token in parameter_name for token in PROTECTED_SUBSTRINGS
         ):
             return False
-        return any(token in parameter_name for token in QUANTIZABLE_PROJECTIONS)
+        return any(token in parameter_name for token in self.targets())
 
 
 def scale_for(
@@ -200,11 +265,16 @@ def fp8_gemm_supported(device: torch.device | None = None) -> bool:
 
 
 __all__ = [
+    "ATTENTION_PROJECTIONS",
     "DEFAULT_BLOCK",
+    "FFN_PROJECTIONS",
     "FORWARD_DTYPE",
     "GRADIENT_DTYPE",
     "PROTECTED_SUBSTRINGS",
     "QUANTIZABLE_PROJECTIONS",
+    "SCOPES",
+    "SCOPE_ALL",
+    "SCOPE_FFN",
     "Fp8Policy",
     "fp8_gemm_supported",
     "gemm_error",
