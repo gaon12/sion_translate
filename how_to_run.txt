@@ -75,6 +75,12 @@ SION_NO_TMUX=1 python3 easy_run.py
 - 사후학습의 후보 생성은 micro-batch 1로 시작합니다.
 - torch.compile은 사용자가 설정에서 명시하지 않는 한 자동으로 켜지 않습니다.
 
+data/corpus/<언어코드>/ 에 단일어 텍스트가 있으면 번역 학습 전에 단일어 복원
+사전학습(foundation)이 자동으로 먼저 돕니다. 허용 형식은 .txt(한 줄에 하나)와
+.jsonl(text 키)뿐이며, 없으면 이유를 출력하고 건너뜁니다. 산출물은 번역 모델과
+분리되어 runs/*/foundation/ 에 sion 이라는 이름으로 저장됩니다.
+자세한 내용: docs/foundation-pretraining.md
+
 configs/sion_1_3b.yaml은 파일 주석에 적힌 80GB급 GPU 수를 전제로 한 수동 용량
 기준입니다. easy_run.py는 이 파일을 자동으로 선택하지 않고 sion_translate.yaml의
 보수적인 자동 경로를 사용합니다.
@@ -93,6 +99,8 @@ watch -n 2 nvidia-smi
 
 주요 결과:
 
+- foundation best: runs/auto/foundation/exports/best  (파운데이션 모델 sion,
+  번역 불가 — Translator가 거부합니다. 단일어 코퍼스가 있을 때만 생성)
 - SFT best: runs/auto/pretrain/exports/best
 - 최종 MRT best: runs/auto/posttrain/exports/best
 - 재개 checkpoint: 각 단계의 checkpoints/latest

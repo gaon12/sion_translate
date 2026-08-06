@@ -70,8 +70,10 @@ python3 easy_run.py
 5. 현재 split 정책으로 SentencePiece와 MorphoScript sidecar를 생성·검증합니다.
 6. 품질 필터, 중복 제거와 누수 방지 split으로 indexed dataset을 만듭니다.
 7. GPU 중 가장 작은 VRAM과 가장 낮은 BF16 능력에 맞춰 공통 설정을 선택합니다.
-8. SFT 사전학습을 실행하고 체크포인트를 저장합니다.
-9. best SFT 모델에서 MRT 사후학습을 실행하고 별도로 저장합니다.
+8. `data/corpus/`에 단일어 텍스트가 있으면 foundation 사전학습(단일어 복원)을
+   먼저 실행합니다. 없으면 이유를 출력하고 건너뜁니다.
+9. foundation 가중치에서 SFT 사전학습을 실행하고 체크포인트를 저장합니다.
+10. best SFT 모델에서 MRT 사후학습을 실행하고 별도로 저장합니다.
 
 대화형 터미널이고 `tmux`가 이미 설치돼 있으면 체크아웃별 세션을 만듭니다.
 Slurm, `nohup`, 컨테이너 또는 비대화형 SSH에서는 현재 프로세스로 그대로 실행합니다.
@@ -90,6 +92,15 @@ SION_NO_TMUX=1 python3 easy_run.py
 - 다중 GPU는 DDP 또는 필요 시 FSDP2를 사용합니다.
 - `torch.compile`은 드라이버·컨테이너 조합별 검증 없이 자동으로 켜지 않습니다.
 
+## foundation 사전학습 (선택, 자동 감지)
+
+`data/corpus/<언어코드>/` 에 단일어 텍스트(`.txt` 또는 `text` 키의 `.jsonl`)가
+있으면, 번역 학습 **전에** 단일어 복원 사전학습이 자동으로 먼저 돕니다. 없으면
+이유를 출력하고 건너뜁니다. 이 단계의 산출물은 번역 모델이 아니라 파운데이션
+모델이라 `sion` 이라는 별도 이름으로 `runs/*/foundation/` 에 저장됩니다.
+
+자세한 내용은 `docs/foundation-pretraining.md` 를 보십시오.
+
 `configs/sion_1_3b.yaml`은 일반 자동 설정이 아니라 주석에 적힌 80GB급 GPU 수를
 전제로 한 용량 기준 설정입니다. `easy_run.py`는 기본 `sion_translate.yaml`과 자동
 설정을 사용하므로 이 파일을 자동 선택하지 않습니다.
@@ -102,16 +113,24 @@ SION_NO_TMUX=1 python3 easy_run.py
 
 ```text
 runs/auto/
+├── foundation/            # 단일어 코퍼스가 있을 때만
+│   ├── checkpoints/
+│   ├── exports/best/      # 파운데이션 모델 (sion) — 번역 불가
+│   └── stage_complete.json
 ├── pretrain/
 │   ├── checkpoints/
 │   └── exports/best/
 └── posttrain/
     ├── checkpoints/
-    └── exports/best/
+    └── exports/best/      # 최종 번역 모델 (sion_translate)
 artifacts/
 ├── tokenizer/
-└── dataset/
+├── dataset/
+└── foundation_dataset/    # 단일어 코퍼스가 있을 때만
 ```
+
+`runs/auto/foundation/exports/best`는 **번역 모델이 아닙니다.** 번역쌍을 한 번도
+보지 않았으므로 `Translator`가 거부합니다.
 
 사후학습이 활성화돼 있으므로 최종 추론 모델은
 `runs/auto/posttrain/exports/best/`입니다. 중단 뒤 같은 명령을 다시 실행하면 각
