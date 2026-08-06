@@ -452,3 +452,103 @@ def test_runnable_presets_use_the_documented_deep_encoder_shape() -> None:
             model.encoder_layers,
             model.decoder_layers,
         )
+
+
+def test_foundation_stage_is_a_top_level_config_section(tmp_path: Path) -> None:
+    config_path = tmp_path / "with_foundation.yaml"
+    config_path.write_text(
+        "foundation:\n  enabled: false\n  max_steps: 25\n  warmup_steps: 5\n",
+        encoding="utf-8",
+    )
+    config = load_config(config_path)
+    assert config.foundation.enabled is False
+    assert config.foundation.max_steps == 25
+
+
+def test_foundation_defaults_point_at_the_documented_layout() -> None:
+    foundation = AppConfig().foundation
+    assert foundation.enabled is True
+    assert foundation.corpus_dir == "data/corpus"
+    assert foundation.dataset_dir == "artifacts/foundation_dataset"
+    # 병렬 데이터셋과 절대 같은 경로여서는 안 된다: record 규격도 split 규칙도 다르다.
+    assert foundation.dataset_dir != AppConfig().data.dataset_dir
+
+
+def test_the_two_stages_publish_under_different_names() -> None:
+    """foundation 산출물은 번역 모델이 아니라 그 파운데이션이다."""
+    from sion_translate.artifacts import FOUNDATION_RELEASE_NAME, TRANSLATION_RELEASE_NAME
+
+    assert FOUNDATION_RELEASE_NAME == "sion"
+    assert TRANSLATION_RELEASE_NAME == "sion_translate"
+    assert AppConfig().foundation.release_name == FOUNDATION_RELEASE_NAME
+
+
+def test_reusing_the_translation_release_name_is_rejected() -> None:
+    config = AppConfig()
+    config.foundation.release_name = "sion_translate"
+    with pytest.raises(ValueError, match="published separately"):
+        config.validate()
+
+
+def test_foundation_languages_drop_the_source_only_varieties() -> None:
+    """단일어 복원은 그 언어를 디코더 출력으로 만드는 학습이다."""
+    config = AppConfig()
+    config.data.language_pairs = [
+        ["kj", "ko"],
+        ["kj", "ja"],
+        ["kd", "ko"],
+        ["jd", "ja"],
+        ["ko", "ja"],
+    ]
+    config.data.source_only_languages = ["kj", "kd", "jd"]
+    config.validate()
+    assert config.foundation_languages() == ("ko", "ja")
+
+
+@pytest.mark.parametrize(
+    "field_name, value, message",
+    [
+        ("corpus_dir", "", "corpus_dir"),
+        ("dataset_dir", "", "dataset_dir"),
+        ("language_sampling_alpha", 0.0, "language_sampling_alpha"),
+        ("language_sampling_alpha", 1.5, "language_sampling_alpha"),
+        ("minimum_language_share", 1.0, "minimum_language_share"),
+        ("minimum_characters", 0, "minimum_characters"),
+        ("noise_density", 0.0, "noise_density"),
+        ("noise_density", 1.0, "noise_density"),
+        ("mean_span", 0.0, "mean_span"),
+        ("tokenizer_sample_ratio", -0.5, "tokenizer_sample_ratio"),
+        ("max_steps", 0, "max_steps"),
+        ("learning_rate", 0.0, "learning_rate"),
+        ("validation_fraction", 0.0, "validation_fraction"),
+        ("validation_fraction", 0.9, "validation_fraction"),
+    ],
+)
+def test_foundation_values_are_validated(field_name: str, value: object, message: str) -> None:
+    config = AppConfig()
+    setattr(config.foundation, field_name, value)
+    with pytest.raises(ValueError, match=message):
+        config.validate()
+
+
+def test_foundation_maximum_characters_must_exceed_the_minimum() -> None:
+    config = AppConfig()
+    config.foundation.minimum_characters = 100
+    config.foundation.maximum_characters = 50
+    with pytest.raises(ValueError, match="maximum_characters"):
+        config.validate()
+
+
+def test_foundation_warmup_cannot_exceed_its_own_step_budget() -> None:
+    config = AppConfig()
+    config.foundation.max_steps = 100
+    config.foundation.warmup_steps = 500
+    with pytest.raises(ValueError, match="foundation.warmup_steps"):
+        config.validate()
+
+
+def test_foundation_export_formats_share_the_training_validator() -> None:
+    config = AppConfig()
+    config.foundation.final_export_formats = ["onnx"]
+    with pytest.raises(ValueError, match="unsupported foundation.final_export_formats"):
+        config.validate()

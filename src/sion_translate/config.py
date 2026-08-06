@@ -3,7 +3,7 @@ from __future__ import annotations
 import warnings
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import yaml
 from yaml.constructor import ConstructorError
@@ -11,9 +11,17 @@ from yaml.nodes import MappingNode
 
 from sion_translate.artifacts import (
     DEFAULT_DATASET_DIRECTORY,
+    DEFAULT_FOUNDATION_DATASET_DIRECTORY,
+    DEFAULT_MONOLINGUAL_CORPUS_DIRECTORY,
     DEFAULT_RUN_DIRECTORY,
     DEFAULT_TOKENIZER_FEATURES,
     DEFAULT_TOKENIZER_MODEL,
+    FOUNDATION_RELEASE_NAME,
+    TRANSLATION_RELEASE_NAME,
+)
+from sion_translate.data.monolingual import (
+    DEFAULT_LANGUAGE_SAMPLING_ALPHA,
+    foundation_languages,
 )
 from sion_translate.synthetic import (
     DEFAULT_SYNTHETIC_PREFIXES,
@@ -352,6 +360,156 @@ class TrainingConfig:
     )
 
 
+SUPPORTED_EXPORT_FORMATS = frozenset(
+    {
+        "fp32",
+        "fp16",
+        "bf16",
+        "int8",
+        "int4",
+        "gguf_q4_k_m",
+        "transformers",
+    }
+)
+
+
+def _validate_export_formats(formats: Sequence[str], *, field_name: str) -> None:
+    """Both training stages publish their own artifacts, so both need this."""
+
+    if not formats:
+        raise ValueError(f"{field_name}.final_export_formats must contain at least one format")
+    if len(set(formats)) != len(formats):
+        raise ValueError(f"{field_name}.final_export_formats must not contain duplicates")
+    unknown = sorted(set(formats) - SUPPORTED_EXPORT_FORMATS)
+    if unknown:
+        raise ValueError(
+            f"unsupported {field_name}.final_export_formats: "
+            f"{unknown}; supported={sorted(SUPPORTED_EXPORT_FORMATS)}"
+        )
+
+
+@dataclass
+class FoundationConfig:
+    """번역 학습 **이전**의 단일어 사전학습(pre-pre-train) 설정.
+
+    이 단계는 언어별 단일어 텍스트로 span-corruption 복원만 학습합니다
+    (``<denoise_xx>`` 과제). 번역쌍을 전혀 쓰지 않으므로 결과물은 번역
+    모델이 아니라 encoder-decoder **파운데이션 모델**이며, 그래서 이후
+    번역 단계와 다른 이름(``sion``)으로 따로 저장·배포됩니다.
+
+    단계 순서: foundation → SFT(번역) → MRT(사후학습).
+    """
+
+    # 코퍼스 폴더에 유효한 데이터가 있으면 자동 실행합니다. 폴더가 없거나
+    # 비어 있으면 이유를 출력하고 건너뜁니다 — 토크나이저·데이터셋 자동
+    # 감지와 같은 방식입니다. false 로 두면 데이터가 있어도 건너뜁니다.
+    enabled: bool = True
+    corpus_dir: str = DEFAULT_MONOLINGUAL_CORPUS_DIRECTORY
+    dataset_dir: str = DEFAULT_FOUNDATION_DATASET_DIRECTORY
+    # 배포 이름. 이 단계의 산출물은 번역 모델이 아니라 그 파운데이션입니다.
+    release_name: str = FOUNDATION_RELEASE_NAME
+
+    # ── 코퍼스 구성 ──────────────────────────────────────────────────
+    # 언어 간 온도 샘플링. 1.0 은 분량 정비례, 낮출수록 균등에 가깝습니다.
+    language_sampling_alpha: float = DEFAULT_LANGUAGE_SAMPLING_ALPHA
+    # 이 비중 미만인 언어가 있으면 경고합니다(0 이면 경고 안 함).
+    minimum_language_share: float = 0.05
+    # 학습 대상 언어 중 단일어 데이터가 아예 없는 언어가 있을 때 중단할지.
+    # 기본은 false: 경고하고 있는 언어로 진행합니다. 언어를 나중에 채우는
+    # 것이 정상적인 작업 흐름이기 때문입니다.
+    require_all_languages: bool = False
+    minimum_characters: int = 8
+    maximum_characters: int = 4000
+    deduplicate: bool = True
+
+    # ── 복원 과제 ────────────────────────────────────────────────────
+    # 이 단계는 100% denoising 입니다. 번역 SFT 의 denoise_probability 와
+    # 달리 확률이 아니라 과제 자체이므로 별도 값을 두지 않습니다.
+    noise_density: float = 0.15
+    mean_span: float = 3.0
+
+    # ── 토크나이저 ───────────────────────────────────────────────────
+    # 토크나이저 학습에 단일어 코퍼스를 넣되, 언어별로 "병렬 코퍼스의 해당
+    # 언어 문장 수 × 이 배수" 까지만 샘플링합니다. 넣지 않으면 foundation
+    # 단계가 자기 코퍼스에 없는 어휘로 학습하고, 전량 넣으면 분량이 큰
+    # 언어가 vocab 을 독식해 다른 언어 토큰화가 나빠집니다. 0 이면 단일어
+    # 코퍼스를 토크나이저 학습에서 제외합니다.
+    tokenizer_sample_ratio: float = 1.0
+
+    # ── 학습 ─────────────────────────────────────────────────────────
+    max_steps: int = 100_000
+    batch_size_per_gpu: int = 16
+    gradient_accumulation_steps: int = 1
+    learning_rate: float = 3e-4
+    min_learning_rate_ratio: float = 0.1
+    warmup_steps: int = 2_000
+    eval_every: int = 1_000
+    eval_batches: int = 50
+    save_every: int = 2_000
+    early_stopping_patience: int = 8
+    early_stopping_min_delta: float = 0.0
+    shard_size: int = 200_000
+    validation_fraction: float = 0.002
+    # 이 단계 산출물의 export 형식. 파운데이션 모델은 이어서 미세조정하는
+    # 것이 용도이므로 기본은 학습을 이어갈 수 있는 형식만 냅니다.
+    final_export_formats: list[str] = field(
+        default_factory=lambda: ["fp32", "bf16", "transformers"]
+    )
+
+    def validate(self) -> None:
+        if not self.corpus_dir:
+            raise ValueError("foundation.corpus_dir must be non-empty")
+        if not self.dataset_dir:
+            raise ValueError("foundation.dataset_dir must be non-empty")
+        if not self.release_name or not self.release_name.isascii():
+            raise ValueError("foundation.release_name must be a non-empty ASCII name")
+        if self.release_name == TRANSLATION_RELEASE_NAME:
+            raise ValueError(
+                "foundation.release_name must differ from the translation release name "
+                f"({TRANSLATION_RELEASE_NAME!r}); the two stages are published separately"
+            )
+        if not 0.0 < self.language_sampling_alpha <= 1.0:
+            raise ValueError("foundation.language_sampling_alpha must be in (0, 1]")
+        if not 0.0 <= self.minimum_language_share < 1.0:
+            raise ValueError("foundation.minimum_language_share must be in [0, 1)")
+        if self.minimum_characters < 1:
+            raise ValueError("foundation.minimum_characters must be positive")
+        if self.maximum_characters <= self.minimum_characters:
+            raise ValueError(
+                "foundation.maximum_characters must be greater than minimum_characters"
+            )
+        if not 0.0 < self.noise_density < 1.0:
+            raise ValueError("foundation.noise_density must be in (0, 1)")
+        if self.mean_span <= 0:
+            raise ValueError("foundation.mean_span must be positive")
+        if self.tokenizer_sample_ratio < 0:
+            raise ValueError("foundation.tokenizer_sample_ratio must be non-negative")
+        for name, value in (
+            ("max_steps", self.max_steps),
+            ("batch_size_per_gpu", self.batch_size_per_gpu),
+            ("gradient_accumulation_steps", self.gradient_accumulation_steps),
+            ("eval_every", self.eval_every),
+            ("eval_batches", self.eval_batches),
+            ("save_every", self.save_every),
+            ("shard_size", self.shard_size),
+        ):
+            if value <= 0:
+                raise ValueError(f"foundation.{name} must be positive")
+        if self.learning_rate <= 0:
+            raise ValueError("foundation.learning_rate must be positive")
+        if not 0.0 <= self.min_learning_rate_ratio <= 1.0:
+            raise ValueError("foundation.min_learning_rate_ratio must be in [0, 1]")
+        if self.warmup_steps < 0 or self.warmup_steps > self.max_steps:
+            raise ValueError("foundation.warmup_steps must be between 0 and max_steps")
+        if self.early_stopping_patience < 0:
+            raise ValueError("foundation.early_stopping_patience must be non-negative")
+        if self.early_stopping_min_delta < 0:
+            raise ValueError("foundation.early_stopping_min_delta must be non-negative")
+        if not 0.0 < self.validation_fraction < 0.5:
+            raise ValueError("foundation.validation_fraction must be in (0, 0.5)")
+        _validate_export_formats(self.final_export_formats, field_name="foundation")
+
+
 @dataclass
 class PostTrainingConfig:
     """SFT 뒤 실행하는 복합 최소위험 + 다중 후보 선호학습 설정."""
@@ -408,8 +566,18 @@ class PostTrainingConfig:
 class AppConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     data: DataConfig = field(default_factory=DataConfig)
+    # 단계 순서대로: foundation(단일어) → training(번역 SFT) → posttraining(MRT).
+    foundation: FoundationConfig = field(default_factory=FoundationConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     posttraining: PostTrainingConfig = field(default_factory=PostTrainingConfig)
+
+    def foundation_languages(self) -> tuple[str, ...]:
+        """foundation 단계가 실제로 학습할 언어 (source-only 제외)."""
+
+        return foundation_languages(
+            self.data.languages,
+            self.data.configured_source_only_languages(),
+        )
 
     def validate(self) -> None:
         self.model.validate()
@@ -547,27 +715,8 @@ class AppConfig:
             )
         if not 0.0 <= self.training.ema_decay < 1.0:
             raise ValueError("ema_decay must be in [0, 1)")
-        supported_export_formats = {
-            "fp32",
-            "fp16",
-            "bf16",
-            "int8",
-            "int4",
-            "gguf_q4_k_m",
-            "transformers",
-        }
-        if not self.training.final_export_formats:
-            raise ValueError("final_export_formats must contain at least one format")
-        if len(set(self.training.final_export_formats)) != len(self.training.final_export_formats):
-            raise ValueError("final_export_formats must not contain duplicates")
-        unknown_export_formats = sorted(
-            set(self.training.final_export_formats) - supported_export_formats
-        )
-        if unknown_export_formats:
-            raise ValueError(
-                "unsupported final_export_formats: "
-                f"{unknown_export_formats}; supported={sorted(supported_export_formats)}"
-            )
+        _validate_export_formats(self.training.final_export_formats, field_name="training")
+        self.foundation.validate()
         post = self.posttraining
         if post.method != "mrt":
             raise ValueError("posttraining.method must be 'mrt'")
@@ -674,7 +823,7 @@ def _construct_dataclass(cls: type, values: dict[str, Any] | None):
     return cls(**values)
 
 
-_CONFIG_TOP_LEVEL_KEYS = frozenset({"model", "data", "training", "posttraining"})
+_CONFIG_TOP_LEVEL_KEYS = frozenset({"model", "data", "foundation", "training", "posttraining"})
 
 
 class _UniqueKeySafeLoader(yaml.SafeLoader):
@@ -738,6 +887,7 @@ def config_from_raw(raw: dict[str, Any]) -> AppConfig:
     return AppConfig(
         model=model,
         data=_construct_dataclass(DataConfig, data_values),
+        foundation=_construct_dataclass(FoundationConfig, raw.get("foundation")),
         training=_construct_dataclass(TrainingConfig, training_values),
         posttraining=_construct_dataclass(PostTrainingConfig, raw.get("posttraining")),
     )
