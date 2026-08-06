@@ -27,6 +27,7 @@ import json
 import math
 import random
 from pathlib import Path
+from contextlib import ExitStack
 from typing import Any, Sequence
 
 import numpy as np
@@ -57,6 +58,7 @@ from sion_translate.artifacts import (
     TRANSLATION_RELEASE_NAME,
 )
 from sion_translate.data.collate import load_morphoscript_token_features
+from sion_translate.locking import artifact_lock
 from sion_translate.foundation import (
     FoundationOutcome,
     build_foundation_config,
@@ -544,182 +546,190 @@ def ensure_artifacts(
 
     if foundation_plan is None:
         foundation_plan = plan_foundation_stage(config)
-    if context.is_main:
-        data_dir = Path(config.data.raw_dir)
-        tokenizer_path = Path(config.data.tokenizer_model)
-        dataset_dir = Path(config.data.dataset_dir)
-        files = scan_configured_raw_data(config, data_dir, tokenizer_path)
-        dataset_ready = (dataset_dir / "manifest.json").exists()
-        existing_checkpoint = find_existing_checkpoint(config)
+    # 같은 artifacts/ 를 쓰는 작업 두 개가 동시에 "없으니 만들자"고 판단하면
+    # 서로 다른 세대의 토크나이저와 데이터셋이 같은 경로에 섞입니다. 실패가
+    # 아니라 **섞인 상태**라 지문 검사는 그 조합을 처음 보는 것으로만 인식합니다.
+    with ExitStack() as artifact_scope:
+        if context.is_main:
+            artifact_scope.enter_context(artifact_lock(Path(config.data.dataset_dir).parent))
+        if context.is_main:
+            data_dir = Path(config.data.raw_dir)
+            tokenizer_path = Path(config.data.tokenizer_model)
+            dataset_dir = Path(config.data.dataset_dir)
+            files = scan_configured_raw_data(config, data_dir, tokenizer_path)
+            dataset_ready = (dataset_dir / "manifest.json").exists()
+            existing_checkpoint = find_existing_checkpoint(config)
 
-        if not files and not dataset_ready:
-            raise FileNotFoundError(
-                f"원천 데이터({data_dir}/*.jsonl)도 준비된 데이터셋({dataset_dir})도 없습니다."
-            )
-        if not tokenizer_path.is_file() and dataset_ready and not files:
-            raise FileNotFoundError(
-                f"준비된 데이터셋은 있지만 대응하는 토크나이저가 없습니다: {tokenizer_path}. "
-                "원천 데이터와 새 출력 경로를 지정해 새 run을 시작하세요."
-            )
+            if not files and not dataset_ready:
+                raise FileNotFoundError(
+                    f"원천 데이터({data_dir}/*.jsonl)도 준비된 데이터셋({dataset_dir})도 없습니다."
+                )
+            if not tokenizer_path.is_file() and dataset_ready and not files:
+                raise FileNotFoundError(
+                    f"준비된 데이터셋은 있지만 대응하는 토크나이저가 없습니다: {tokenizer_path}. "
+                    "원천 데이터와 새 출력 경로를 지정해 새 run을 시작하세요."
+                )
 
-        if files:
-            cpu_plan = build_cpu_plan(input_files=len(files))
-            announce(
-                f"원천 데이터 인식: {len(files)}개 파일, "
-                f"총 {sum(files.values()) / 2**30:.2f} GiB ({data_dir}/)",
-                context,
-            )
-            announce(
-                f"CPU 자동 배분: 할당 {cpu_plan.available}개 → "
-                f"입력 정제 {cpu_plan.preprocess_workers}개 + "
-                f"SentencePiece {cpu_plan.sentencepiece_threads}개; "
-                f"dataset 준비 {cpu_plan.dataset_workers}개",
-                context,
-            )
-            # ── 토크나이저 ────────────────────────────────────────────
-            if not tokenizer_path.exists():
-                if existing_checkpoint is not None:
-                    raise RuntimeError(
-                        "기존 체크포인트가 있지만 대응하는 토크나이저가 없습니다. "
-                        f"checkpoint={existing_checkpoint}. 기존 vocabulary를 추측해 "
-                        "새 토크나이저로 덮어쓸 수 없습니다. tokenizer_model, dataset_dir, "
-                        "training.output_dir을 새 경로로 지정해 새 run을 시작하세요."
-                    )
-                from sion_translate.tokenizer import train_tokenizer
-
-                pair_estimate = estimate_pair_count(files, data_dir)
-                vocab_size = pick_vocab_size(pair_estimate)
+            if files:
+                cpu_plan = build_cpu_plan(input_files=len(files))
                 announce(
-                    f"토크나이저가 없어 새로 학습합니다 "
-                    f"(약 {pair_estimate:,}행 → vocab {vocab_size:,}) — 시간이 걸립니다.",
+                    f"원천 데이터 인식: {len(files)}개 파일, "
+                    f"총 {sum(files.values()) / 2**30:.2f} GiB ({data_dir}/)",
                     context,
                 )
-                train_tokenizer(
-                    [str(data_dir / "*.jsonl")],
-                    tokenizer_path.parent,
-                    vocab_size=vocab_size,
-                    language_pairs=config.data.configured_language_pairs(),
-                    # foundation 단계가 자기 코퍼스에 없는 어휘로 학습하지 않도록
-                    # 단일어 코퍼스도 넣습니다. 언어별 상한이 없으면 분량이 큰
-                    # 언어가 vocab 을 독식합니다.
-                    monolingual=foundation_plan.discovery,
-                    monolingual_sample_ratio=config.foundation.tokenizer_sample_ratio,
-                    approximate_split=config.data.approximate_split,
-                    source_only_languages=config.data.configured_source_only_languages(),
-                    train_only_prefixes=config.data.configured_synthetic_prefixes(),
-                    num_workers=cpu_plan.preprocess_workers,
-                    num_threads=cpu_plan.sentencepiece_threads,
+                announce(
+                    f"CPU 자동 배분: 할당 {cpu_plan.available}개 → "
+                    f"입력 정제 {cpu_plan.preprocess_workers}개 + "
+                    f"SentencePiece {cpu_plan.sentencepiece_threads}개; "
+                    f"dataset 준비 {cpu_plan.dataset_workers}개",
+                    context,
                 )
-                announce("토크나이저 학습 완료.", context)
-                # 토크나이저 파일의 SHA-256도 데이터셋 지문에 포함됩니다.
-                files = scan_configured_raw_data(config, data_dir, tokenizer_path)
+                # ── 토크나이저 ────────────────────────────────────────────
+                if not tokenizer_path.exists():
+                    if existing_checkpoint is not None:
+                        raise RuntimeError(
+                            "기존 체크포인트가 있지만 대응하는 토크나이저가 없습니다. "
+                            f"checkpoint={existing_checkpoint}. 기존 vocabulary를 추측해 "
+                            "새 토크나이저로 덮어쓸 수 없습니다. tokenizer_model, dataset_dir, "
+                            "training.output_dir을 새 경로로 지정해 새 run을 시작하세요."
+                        )
+                    from sion_translate.tokenizer import train_tokenizer
 
-            # ── 데이터셋 (지문 기반 변경 감지) ─────────────────────────
-            policy_problem = tokenizer_policy_problem(
-                tokenizer_path,
-                config.data.configured_language_pairs(),
-            )
-            if policy_problem is not None:
-                existing_tokenizer = SionTokenizer(tokenizer_path)
-                if (
-                    existing_checkpoint is None
-                    and existing_tokenizer.splits_digits
-                    and load_tokenizer_metadata(tokenizer_path) is None
-                ):
-                    write_tokenizer_metadata(
-                        tokenizer_path,
-                        split_digits=True,
+                    pair_estimate = estimate_pair_count(files, data_dir)
+                    vocab_size = pick_vocab_size(pair_estimate)
+                    announce(
+                        f"토크나이저가 없어 새로 학습합니다 "
+                        f"(약 {pair_estimate:,}행 → vocab {vocab_size:,}) — 시간이 걸립니다.",
+                        context,
+                    )
+                    train_tokenizer(
+                        [str(data_dir / "*.jsonl")],
+                        tokenizer_path.parent,
+                        vocab_size=vocab_size,
                         language_pairs=config.data.configured_language_pairs(),
+                        # foundation 단계가 자기 코퍼스에 없는 어휘로 학습하지 않도록
+                        # 단일어 코퍼스도 넣습니다. 언어별 상한이 없으면 분량이 큰
+                        # 언어가 vocab 을 독식합니다.
+                        monolingual=foundation_plan.discovery,
+                        monolingual_sample_ratio=config.foundation.tokenizer_sample_ratio,
+                        approximate_split=config.data.approximate_split,
+                        source_only_languages=config.data.configured_source_only_languages(),
+                        train_only_prefixes=config.data.configured_synthetic_prefixes(),
+                        num_workers=cpu_plan.preprocess_workers,
+                        num_threads=cpu_plan.sentencepiece_threads,
+                    )
+                    announce("토크나이저 학습 완료.", context)
+                    # 토크나이저 파일의 SHA-256도 데이터셋 지문에 포함됩니다.
+                    files = scan_configured_raw_data(config, data_dir, tokenizer_path)
+
+                # ── 데이터셋 (지문 기반 변경 감지) ─────────────────────────
+                policy_problem = tokenizer_policy_problem(
+                    tokenizer_path,
+                    config.data.configured_language_pairs(),
+                )
+                if policy_problem is not None:
+                    existing_tokenizer = SionTokenizer(tokenizer_path)
+                    if (
+                        existing_checkpoint is None
+                        and existing_tokenizer.splits_digits
+                        and load_tokenizer_metadata(tokenizer_path) is None
+                    ):
+                        write_tokenizer_metadata(
+                            tokenizer_path,
+                            split_digits=True,
+                            language_pairs=config.data.configured_language_pairs(),
+                        )
+                        files = scan_configured_raw_data(config, data_dir, tokenizer_path)
+                        policy_problem = tokenizer_policy_problem(
+                            tokenizer_path,
+                            config.data.configured_language_pairs(),
+                        )
+                    if policy_problem is not None:
+                        checkpoint_detail = (
+                            f" 기존 checkpoint={existing_checkpoint}와 vocabulary 호환성을 "
+                            "깨뜨리는 자동 재학습은 수행하지 않습니다."
+                            if existing_checkpoint is not None
+                            else ""
+                        )
+                        raise RuntimeError(
+                            f"{policy_problem}.{checkpoint_detail} tokenizer_model, dataset_dir, "
+                            "training.output_dir을 함께 검토하세요. 새 학습이라면 관련 run이 "
+                            "이 vocabulary를 쓰지 않는지 확인한 뒤 기존 tokenizer/dataset을 "
+                            "별도 백업으로 옮기고 split_digits=True로 다시 준비하십시오."
+                        )
+                stored = stored_fingerprint(dataset_dir) if dataset_ready else None
+                if not dataset_ready or stored != files:
+                    from sion_translate.data.prepare import prepare_dataset
+
+                    if dataset_ready:
+                        backup = backup_stale_dataset(dataset_dir)
+                        reason = (
+                            "호환 가능한 지문 없음"
+                            if stored is None
+                            else "원천/토크나이저/전처리 변경"
+                        )
+                        announce(
+                            f"{reason} 감지 → 기존 데이터셋을 {backup.name}/ 으로 보관합니다.",
+                            context,
+                        )
+                    announce(
+                        "데이터셋 준비 시작 (품질 필터 + 중복 제거 + 토큰화) — 시간이 걸립니다.",
+                        context,
+                    )
+                    prepare_dataset(
+                        [str(data_dir / "*.jsonl")],
+                        tokenizer_path,
+                        dataset_dir,
+                        language_pairs=config.data.configured_language_pairs(),
+                        source_only_languages=config.data.configured_source_only_languages(),
+                        approximate_split=config.data.approximate_split,
+                        train_only_prefixes=config.data.configured_synthetic_prefixes(),
+                        synthetic_sampling_weight=config.data.synthetic_sampling_weight,
+                        num_workers=cpu_plan.dataset_workers,
                     )
                     files = scan_configured_raw_data(config, data_dir, tokenizer_path)
-                    policy_problem = tokenizer_policy_problem(
-                        tokenizer_path,
-                        config.data.configured_language_pairs(),
-                    )
-                if policy_problem is not None:
-                    checkpoint_detail = (
-                        f" 기존 checkpoint={existing_checkpoint}와 vocabulary 호환성을 "
-                        "깨뜨리는 자동 재학습은 수행하지 않습니다."
-                        if existing_checkpoint is not None
-                        else ""
-                    )
-                    raise RuntimeError(
-                        f"{policy_problem}.{checkpoint_detail} tokenizer_model, dataset_dir, "
-                        "training.output_dir을 함께 검토하세요. 새 학습이라면 관련 run이 "
-                        "이 vocabulary를 쓰지 않는지 확인한 뒤 기존 tokenizer/dataset을 "
-                        "별도 백업으로 옮기고 split_digits=True로 다시 준비하십시오."
-                    )
-            stored = stored_fingerprint(dataset_dir) if dataset_ready else None
-            if not dataset_ready or stored != files:
-                from sion_translate.data.prepare import prepare_dataset
-
-                if dataset_ready:
-                    backup = backup_stale_dataset(dataset_dir)
-                    reason = (
-                        "호환 가능한 지문 없음" if stored is None else "원천/토크나이저/전처리 변경"
-                    )
-                    announce(
-                        f"{reason} 감지 → 기존 데이터셋을 {backup.name}/ 으로 보관합니다.",
-                        context,
-                    )
-                announce(
-                    "데이터셋 준비 시작 (품질 필터 + 중복 제거 + 토큰화) — 시간이 걸립니다.",
-                    context,
-                )
-                prepare_dataset(
-                    [str(data_dir / "*.jsonl")],
-                    tokenizer_path,
-                    dataset_dir,
-                    language_pairs=config.data.configured_language_pairs(),
-                    source_only_languages=config.data.configured_source_only_languages(),
-                    approximate_split=config.data.approximate_split,
-                    train_only_prefixes=config.data.configured_synthetic_prefixes(),
-                    synthetic_sampling_weight=config.data.synthetic_sampling_weight,
-                    num_workers=cpu_plan.dataset_workers,
-                )
-                files = scan_configured_raw_data(config, data_dir, tokenizer_path)
-                write_fingerprint(dataset_dir, files)
-                announce("데이터셋 준비 완료.", context)
-            else:
-                announce("데이터셋 최신 상태 확인 (원천 데이터 변경 없음).", context)
-
-            # ── foundation(단일어) 데이터셋 ──────────────────────────
-            for line in foundation_plan.report:
-                announce(f"  {line}", context)
-            if not foundation_plan.enabled:
-                announce(f"foundation 단계: {foundation_plan.reason}", context)
-            else:
-                for warning in foundation_plan.warnings:
-                    announce(f"[경고] foundation: {warning}", context)
-                foundation_dataset = Path(config.foundation.dataset_dir)
-                if (foundation_dataset / "manifest.json").is_file():
-                    announce("foundation 데이터셋 최신 상태 확인.", context)
+                    write_fingerprint(dataset_dir, files)
+                    announce("데이터셋 준비 완료.", context)
                 else:
-                    from sion_translate.data.prepare_foundation import (
-                        prepare_foundation_dataset,
-                        render_prepare_report,
-                    )
+                    announce("데이터셋 최신 상태 확인 (원천 데이터 변경 없음).", context)
 
-                    announce(
-                        "foundation 데이터셋 준비 시작 (단일어 토큰화) — 시간이 걸립니다.",
-                        context,
-                    )
-                    foundation_stats = prepare_foundation_dataset(
-                        foundation_plan.discovery,
-                        tokenizer_path,
-                        foundation_dataset,
-                        minimum_characters=config.foundation.minimum_characters,
-                        maximum_characters=config.foundation.maximum_characters,
-                        max_tokens=config.data.max_source_length - 2,
-                        deduplicate=config.foundation.deduplicate,
-                        shard_size=config.foundation.shard_size,
-                        validation_fraction=config.foundation.validation_fraction,
-                        language_sampling_alpha=config.foundation.language_sampling_alpha,
-                        minimum_language_share=config.foundation.minimum_language_share,
-                        release_name=config.foundation.release_name,
-                    )
-                    for line in render_prepare_report(foundation_stats):
-                        announce(f"  {line}", context)
+                # ── foundation(단일어) 데이터셋 ──────────────────────────
+                for line in foundation_plan.report:
+                    announce(f"  {line}", context)
+                if not foundation_plan.enabled:
+                    announce(f"foundation 단계: {foundation_plan.reason}", context)
+                else:
+                    for warning in foundation_plan.warnings:
+                        announce(f"[경고] foundation: {warning}", context)
+                    foundation_dataset = Path(config.foundation.dataset_dir)
+                    if (foundation_dataset / "manifest.json").is_file():
+                        announce("foundation 데이터셋 최신 상태 확인.", context)
+                    else:
+                        from sion_translate.data.prepare_foundation import (
+                            prepare_foundation_dataset,
+                            render_prepare_report,
+                        )
+
+                        announce(
+                            "foundation 데이터셋 준비 시작 (단일어 토큰화) — 시간이 걸립니다.",
+                            context,
+                        )
+                        foundation_stats = prepare_foundation_dataset(
+                            foundation_plan.discovery,
+                            tokenizer_path,
+                            foundation_dataset,
+                            minimum_characters=config.foundation.minimum_characters,
+                            maximum_characters=config.foundation.maximum_characters,
+                            max_tokens=config.data.max_source_length - 2,
+                            deduplicate=config.foundation.deduplicate,
+                            shard_size=config.foundation.shard_size,
+                            validation_fraction=config.foundation.validation_fraction,
+                            language_sampling_alpha=config.foundation.language_sampling_alpha,
+                            minimum_language_share=config.foundation.minimum_language_share,
+                            release_name=config.foundation.release_name,
+                        )
+                        for line in render_prepare_report(foundation_stats):
+                            announce(f"  {line}", context)
     # 준비가 끝날 때까지 다른 rank 들이 기다립니다.
     barrier(context)
 
