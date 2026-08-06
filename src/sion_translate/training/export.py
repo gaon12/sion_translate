@@ -38,6 +38,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+from sion_translate.artifacts import TRANSLATION_RELEASE_NAME
 from sion_translate.config import ExperimentalConfig, ModelConfig
 from sion_translate.fp8 import DEFAULT_BLOCK, FORWARD_DTYPE, Fp8Policy, scale_for
 from sion_translate.fp8_runtime import apply_fp8_weights
@@ -424,11 +425,22 @@ def build_export_metadata(
     revision_trained: bool | None = None,
     step: int | None = None,
     source: str | Path | None = None,
+    release_name: str = TRANSLATION_RELEASE_NAME,
+    translation_capable: bool = True,
 ) -> dict[str, Any]:
-    """Build provenance and compatibility metadata shared by every format."""
+    """Build provenance and compatibility metadata shared by every format.
+
+    ``translation_capable`` 은 이름표가 아니라 계약입니다. foundation 단계의
+    산출물은 번역쌍을 한 번도 보지 않았지만 구조가 번역 모델과 완전히 같아서,
+    그대로 실으면 방향 태그를 받아들이고 그럴듯한 쓰레기를 냅니다.
+    """
 
     experimental = model_config.experimental
-    metadata: dict[str, Any] = {"created_unix": time.time()}
+    metadata: dict[str, Any] = {
+        "created_unix": time.time(),
+        "release_name": str(release_name),
+        "translation_capable": bool(translation_capable),
+    }
     if source is not None:
         metadata["source"] = str(Path(source))
     if step is not None:
@@ -441,7 +453,12 @@ def build_export_metadata(
         language_pair=language_pair,
         language_pairs=language_pairs,
     )
-    if pairs:
+    if pairs and not translation_capable:
+        # 파운데이션 모델에는 언어쌍이 없습니다. 단일어 복원만 학습했으므로
+        # 다룰 줄 아는 것은 **언어**이고, 쌍도 방향도 존재하지 않습니다.
+        # 쌍을 적어 두면 아래 검증이 방향을 요구하고, 그 방향은 거짓입니다.
+        metadata["languages"] = _languages_from_pairs(pairs)
+    elif pairs:
         metadata["language_pairs"] = pairs
         metadata["languages"] = _languages_from_pairs(pairs)
         metadata["translation_directions"] = _normalize_translation_directions(
@@ -485,6 +502,44 @@ def _remove_artifact(path: Path) -> None:
         path.unlink(missing_ok=True)
 
 
+def _install_directory(temporary: Path, destination: Path) -> None:
+    """staging 디렉터리를 목적지 자리에 설치한다.
+
+    보통은 rename 한 번이면 끝나고, 그것이 원자적이라 선호합니다.
+
+    Windows 에서는 그 rename 이 실패할 수 있습니다. Transformers export 를
+    검증할 때 원격 코드를 ``transformers_modules.*`` 로 import 하는데, 그
+    과정에서 staging 디렉터리 **자체**에 핸들이 남습니다. 실측으로 확인한
+    상태는 이렇습니다.
+
+    - staging 디렉터리를 어떤 이름으로도 rename 할 수 없다
+    - 그 안의 **모든 자식**(파일과 하위 디렉터리)은 개별적으로 rename 된다
+    - 목적지 자리에는 새로 mkdir 할 수 있다
+    - ``gc.collect()`` 로는 풀리지 않는다 (import 시스템이 잡고 있으므로)
+
+    그래서 자식을 하나씩 옮기는 것으로 물러섭니다. Windows 에는 애초에
+    디렉터리의 원자적 교체가 없으므로 이것이 잃는 보장은 없습니다. 호출자가
+    이전 판을 backup 으로 들고 있어 실패 시 되돌릴 수 있다는 점도 그대로입니다.
+    """
+
+    try:
+        os.replace(temporary, destination)
+        return
+    except OSError:
+        if not temporary.is_dir():
+            raise
+
+    destination.mkdir(parents=True, exist_ok=True)
+    for child in list(temporary.iterdir()):
+        os.replace(child, destination / child.name)
+    try:
+        temporary.rmdir()
+    except OSError:
+        # 내용은 전부 옮겼습니다. 잠긴 빈 껍데기 때문에 성공한 export 를
+        # 실패로 만들지 않습니다.
+        pass
+
+
 def _atomic_replace_directory(temporary: Path, destination: Path) -> None:
     """Install a fully written directory while retaining the prior one on failure."""
 
@@ -495,7 +550,7 @@ def _atomic_replace_directory(temporary: Path, destination: Path) -> None:
             os.replace(destination, backup)
             moved_existing = True
         try:
-            os.replace(temporary, destination)
+            _install_directory(temporary, destination)
         except Exception:
             if moved_existing and backup.exists() and not destination.exists():
                 os.replace(backup, destination)
@@ -1290,6 +1345,8 @@ def export_state_dict_formats(
     language_pairs: Sequence[Sequence[str]] | None = None,
     int4_backend: str = "auto",
     fp8_policy: Fp8Policy | None = None,
+    release_name: str = TRANSLATION_RELEASE_NAME,
+    translation_capable: bool = True,
     llama_quantize: str | Path | None = None,
     _filename_overrides: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
@@ -1371,9 +1428,14 @@ def export_state_dict_formats(
             export_metadata.pop("language_pairs", None)
             export_metadata.pop("languages", None)
             export_metadata.pop("translation_directions", None)
-    resolved_translation_directions = _metadata_translation_directions(export_metadata)
-    if resolved_translation_directions:
-        export_metadata["translation_directions"] = resolved_translation_directions
+    # 번역 불가 산출물(foundation)에는 방향을 유도해 넣지 않습니다. 이 함수는
+    # 방향이 비어 있으면 language_pairs 에서 만들어 채우는데, 그 가중치는
+    # 어떤 방향으로도 번역할 수 없습니다.
+    resolved_translation_directions: list[list[str]] = []
+    if export_metadata.get("translation_capable") is not False:
+        resolved_translation_directions = _metadata_translation_directions(export_metadata)
+        if resolved_translation_directions:
+            export_metadata["translation_directions"] = resolved_translation_directions
     metadata_compatibility_id = _metadata_compatibility_id(export_metadata)
     previous_metadata_compatibility_id = None
     if same_weights and previous_manifest is not None:
@@ -1569,6 +1631,8 @@ def convert_export(
     revision_trained: bool | None = None,
     int4_backend: str = "auto",
     fp8_policy: Fp8Policy | None = None,
+    release_name: str = TRANSLATION_RELEASE_NAME,
+    translation_capable: bool = True,
     llama_quantize: str | Path | None = None,
 ) -> dict[str, Any]:
     """Convert a stable state-dict export without mutating the source artifact."""
@@ -1655,6 +1719,8 @@ def convert_export(
         language_pairs=_metadata_language_pairs(metadata),
         int4_backend=int4_backend,
         fp8_policy=fp8_policy,
+        release_name=release_name,
+        translation_capable=translation_capable,
         llama_quantize=llama_quantize,
     )
 
@@ -2070,6 +2136,8 @@ def export_inference_models(
     revision_trained: bool | None = None,
     int4_backend: str = "auto",
     fp8_policy: Fp8Policy | None = None,
+    release_name: str = TRANSLATION_RELEASE_NAME,
+    translation_capable: bool = True,
     strict: bool = False,
 ) -> dict[str, Any] | None:
     """Gather selected weights and export them without rank skew or blind barriers."""
@@ -2093,6 +2161,8 @@ def export_inference_models(
                 bidirectional=bidirectional,
                 revision_trained=revision_trained,
                 step=step,
+                release_name=release_name,
+                translation_capable=translation_capable,
             )
         except Exception as error:
             setup_error = error
@@ -2134,6 +2204,8 @@ def export_inference_models(
                 language_pairs=_metadata_language_pairs(metadata),
                 int4_backend=int4_backend,
                 fp8_policy=fp8_policy,
+                release_name=release_name,
+                translation_capable=translation_capable,
                 _filename_overrides=filename_overrides,
             )
             if strict:
@@ -2160,6 +2232,12 @@ def export_inference_models(
                         "final export validation failed: "
                         + json.dumps(validation["errors"], ensure_ascii=False)
                     )
+                # 검증은 방금 쓴 산출물을 mmap 으로 다시 읽습니다. 그 핸들이
+                # 살아 있으면 Windows 는 그 파일을 품은 staging 디렉터리의
+                # rename 을 거부합니다(POSIX 는 허용하므로 지금까지 드러나지
+                # 않았습니다). 위쪽 gc.collect() 는 검증 *이전* 것이라 검증이
+                # 새로 만든 핸들은 잡지 못합니다.
+                gc.collect()
                 _atomic_replace_directory(working_directory, directory)
         except Exception as error:
             export_error = error
