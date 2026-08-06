@@ -29,6 +29,16 @@ def build_parser() -> argparse.ArgumentParser:
             "이 횟수 이상 나오는 문자는 반드시 어휘에 넣습니다(byte fallback 방지). 0 이면 끕니다"
         ),
     )
+    parser.add_argument(
+        "--character-coverage",
+        type=float,
+        default=0.9999,
+        help=(
+            "SentencePiece 가 어휘에 담을 문자 빈도 비율. 1.0 은 코퍼스의 모든 문자를 "
+            "넣어 byte fallback 과 required-chars 를 동시에 무의미하게 만들므로 "
+            "거부합니다"
+        ),
+    )
     parser.add_argument("--seed-sentencepiece-size", type=int, default=1_000_000)
     parser.add_argument("--workers", type=int, default=None, help="전처리 프로세스 수 (기본: 자동)")
     parser.add_argument(
@@ -96,6 +106,7 @@ def main() -> None:
         args.output_dir,
         vocab_size=args.vocab_size,
         input_sentence_size=args.input_sentence_size,
+        character_coverage=args.character_coverage,
         required_character_min_occurrences=args.required_character_min_occurrences,
         seed_sentencepiece_size=args.seed_sentencepiece_size,
         validation_fraction=args.validation_fraction,

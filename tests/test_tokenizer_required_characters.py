@@ -105,3 +105,114 @@ def test_the_vocab_floor_is_reported_before_the_corpus_scan(tmp_path, monkeypatc
             required_character_min_occurrences=1,
         )
     assert not trained, "training must not start once the floor is known to fail"
+
+
+def _tiny_shard(tmp_path):
+    import json
+
+    shard = tmp_path / "shard.jsonl"
+    with shard.open("w", encoding="utf-8") as handle:
+        for index in range(50):
+            handle.write(
+                json.dumps(
+                    {"ko": f"문장 {index} 입니다", "ja": f"文 {index} です"}, ensure_ascii=False
+                )
+                + "\n"
+            )
+    return shard
+
+
+def test_full_coverage_is_rejected_because_it_disables_the_other_two_mechanisms(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """``character_coverage=1.0`` 은 required_chars 와 byte fallback 을 동시에 무력화한다.
+
+    코퍼스의 모든 문자를 어휘에 넣으므로 (a) required_chars 가 이미 포함된
+    부분집합이 되고, (b) byte fallback 256 조각이 발화할 대상을 잃고,
+    (c) GPU 시간 앞의 byte fallback 비율 관문이 정의상 통과합니다.
+    실측: 8,978,338 레코드 코퍼스에서 distinct 문자 10,760개 중 4,275개가
+    25회 미만입니다.
+    """
+    import sion_translate.tokenizer as tokenizer_module
+
+    trained: list[object] = []
+    monkeypatch.setattr(
+        tokenizer_module.spm.SentencePieceTrainer,
+        "train",
+        lambda **kwargs: trained.append(kwargs),
+    )
+
+    with pytest.raises(ValueError, match="byte fallback unreachable"):
+        tokenizer_module.train_tokenizer(
+            [str(_tiny_shard(tmp_path))],
+            tmp_path / "out",
+            vocab_size=300,
+            character_coverage=1.0,
+        )
+    assert not trained, "training must not start on a self-defeating coverage setting"
+
+
+def test_full_coverage_is_allowed_when_the_frequency_floor_is_opted_out(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """두 장치 중 하나만 쓰겠다는 명시적 선택은 막지 않는다."""
+    import sion_translate.tokenizer as tokenizer_module
+
+    trained: list[dict] = []
+    monkeypatch.setattr(
+        tokenizer_module.spm.SentencePieceTrainer,
+        "train",
+        lambda **kwargs: trained.append(kwargs),
+    )
+    monkeypatch.setattr(tokenizer_module, "write_token_features", lambda *a, **k: None)
+    monkeypatch.setattr(tokenizer_module, "write_tokenizer_metadata", lambda *a, **k: None)
+
+    tokenizer_module.train_tokenizer(
+        [str(_tiny_shard(tmp_path))],
+        tmp_path / "out",
+        vocab_size=300,
+        character_coverage=1.0,
+        required_character_min_occurrences=0,
+    )
+    assert trained and trained[0]["character_coverage"] == 1.0
+    assert trained[0]["required_chars"] == ""
+
+
+def test_the_default_coverage_leaves_a_tail_for_byte_fallback(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import sion_translate.tokenizer as tokenizer_module
+
+    trained: list[dict] = []
+    monkeypatch.setattr(
+        tokenizer_module.spm.SentencePieceTrainer,
+        "train",
+        lambda **kwargs: trained.append(kwargs),
+    )
+    monkeypatch.setattr(tokenizer_module, "write_token_features", lambda *a, **k: None)
+    monkeypatch.setattr(tokenizer_module, "write_tokenizer_metadata", lambda *a, **k: None)
+
+    tokenizer_module.train_tokenizer(
+        [str(_tiny_shard(tmp_path))],
+        tmp_path / "out",
+        vocab_size=600,
+    )
+    assert trained
+    assert trained[0]["character_coverage"] < 1.0
+    assert trained[0]["byte_fallback"] is True
+
+
+@pytest.mark.parametrize("coverage", [0.0, -0.1, 1.5])
+def test_coverage_outside_the_unit_interval_is_rejected(tmp_path, coverage) -> None:
+    import sion_translate.tokenizer as tokenizer_module
+
+    with pytest.raises(ValueError, match="character_coverage"):
+        tokenizer_module.train_tokenizer(
+            [str(_tiny_shard(tmp_path))],
+            tmp_path / "out",
+            vocab_size=300,
+            character_coverage=coverage,
+        )

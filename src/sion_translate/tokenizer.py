@@ -549,6 +549,15 @@ def train_tokenizer(
     # could be pruned out of the vocabulary by chance.
     input_sentence_size: int = 0,
     seed_sentencepiece_size: int = 1_000_000,
+    # Not 1.0. Full coverage puts *every* character observed in the corpus into
+    # the vocabulary, which makes three separate mechanisms fight over the same
+    # job: `required_chars` becomes a subset of what coverage already admits,
+    # byte fallback's 256 pieces can never fire, and the preflight that gates GPU
+    # time on a byte-fallback rate becomes impossible to fail. Measured on the
+    # 8.98M-record corpus: 10,760 distinct characters at coverage 1.0, of which
+    # 4,275 occur fewer than 25 times in 18M sentences. See the module tests for
+    # the division of labour this value restores.
+    character_coverage: float = 0.9999,
     required_character_min_occurrences: int = 25,
     validation_fraction: float = 0.005,
     test_fraction: float = 0.005,
@@ -563,6 +572,11 @@ def train_tokenizer(
 ) -> Path:
     """병렬 코퍼스로 joint SentencePiece 토크나이저를 학습한다.
 
+    ``character_coverage`` 와 ``required_character_min_occurrences`` 는 역할이
+    다릅니다. 전자는 "빈도 꼬리를 어디서 자를지"를 정하고, 후자는 "그 아래라도
+    이건 반드시 넣어라"를 정합니다. 전자가 1.0 이면 자를 꼬리가 없어서 후자도,
+    byte fallback 도, byte fallback 비율 관문도 전부 무의미해집니다.
+
     ``split_digits`` 는 기본으로 켭니다. 끄면 SentencePiece 가 자주 등장하는
     숫자열을 하나의 토큰으로 병합하므로 (예: ``62.5kg`` → ``▁6`` + ``2.5`` + ``kg``,
     ``1,286,400`` → ``▁1,2`` + ``86`` + ``,`` + ``400``) 모델이 숫자를 자릿수로
@@ -573,6 +587,15 @@ def train_tokenizer(
     paths = expand_inputs(input_patterns)
     if not paths:
         raise FileNotFoundError(f"No JSONL files matched: {input_patterns}")
+    if not 0.0 < character_coverage <= 1.0:
+        raise ValueError("character_coverage must be in (0, 1]")
+    if character_coverage >= 1.0 and required_character_min_occurrences > 0:
+        raise ValueError(
+            "character_coverage=1.0 admits every character in the corpus, which makes "
+            "required_chars redundant and byte fallback unreachable. Lower "
+            "character_coverage (0.9999 is the default) or set "
+            "required_character_min_occurrences=0 to opt out of the frequency floor."
+        )
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -586,9 +609,10 @@ def train_tokenizer(
     threads = num_threads or plan.sentencepiece_threads
 
     # Reserve the characters that carry content. This costs one pass over the
-    # corpus and is worth it: `character_coverage` alone decides coverage from a
-    # sample, so a character can be dropped for being rare in the sample even
-    # when it is common in a shard that matters.
+    # corpus and is worth it precisely because `character_coverage` is below 1.0:
+    # coverage cuts the frequency tail globally, so a character that is rare
+    # overall but common in a shard that matters (the 한본어 fused syllables are
+    # 0.11% of all sentences) would land in the tail. This floor pulls it back.
     required_characters: list[str] = []
     if required_character_min_occurrences > 0:
         counts = corpus_character_counts(
@@ -632,7 +656,7 @@ def train_tokenizer(
         model_prefix=str(model_prefix),
         vocab_size=vocab_size,
         model_type="unigram",
-        character_coverage=1.0,
+        character_coverage=character_coverage,
         byte_fallback=True,
         split_digits=split_digits,
         normalization_rule_name="identity",
