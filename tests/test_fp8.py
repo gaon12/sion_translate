@@ -12,17 +12,70 @@ import torch
 
 from sion_translate.fp8 import (
     DEFAULT_BLOCK,
-    SCOPE_ALL,
-    SCOPE_FFN,
     FORWARD_DTYPE,
     GRADIENT_DTYPE,
+    SCOPE_ALL,
+    SCOPE_FFN,
     Fp8Policy,
     fp8_gemm_supported,
-    gemm_error,
-    quantize_dequantize,
-    relative_error,
     scale_for,
 )
+
+# 아래 세 함수는 **측정 장비**입니다. 프로덕션 경로가 쓰지 않으므로
+# 프로덕션 코드에 두지 않습니다. FP8 이 얼마나 부정확한지를 여기서 재고,
+# 그 수치를 위 테스트들이 고정합니다.
+
+
+def quantize_dequantize(
+    tensor: torch.Tensor,
+    *,
+    dtype: torch.dtype = FORWARD_DTYPE,
+    block: int | None = DEFAULT_BLOCK,
+) -> torch.Tensor:
+    """FP8 왕복. 실제 FP8 GEMM 이 보는 값을 고정밀도로 재현합니다.
+
+    학습 경로에서 쓰는 것이 아니라, 하드웨어 없이 **오차를 측정**하고
+    회귀를 잡기 위한 것입니다. 실제 커널은 ``torch._scaled_mm`` 입니다.
+    """
+
+    original = tensor.dtype
+    work = tensor.float()
+    scale = scale_for(work, dtype=dtype, block=block)
+    if block is None:
+        return ((work / scale).to(dtype).float() * scale).to(original)
+    grouped = work.reshape(*work.shape[:-1], -1, block)
+    restored = (grouped / scale).to(dtype).float() * scale
+    return restored.reshape(work.shape).to(original)
+
+
+def relative_error(approximate: torch.Tensor, exact: torch.Tensor) -> float:
+    """Frobenius 상대 오차. 0 텐서에서도 정의됩니다."""
+
+    denominator = exact.float().norm()
+    if denominator == 0:
+        return float(approximate.float().norm())
+    return float((approximate.float() - exact.float()).norm() / denominator)
+
+
+def gemm_error(
+    activations: torch.Tensor,
+    weights: torch.Tensor,
+    *,
+    block: int | None = DEFAULT_BLOCK,
+) -> float:
+    """``activations @ weights.T`` 을 FP8 로 했을 때의 출력 상대 오차.
+
+    개별 텐서의 양자화 오차가 아니라 **출력** 오차를 봅니다. 실제로 학습에
+    영향을 주는 것은 이쪽이고, 축소 차원을 따라 오차가 일부 상쇄되므로 두
+    수치는 같지 않습니다.
+    """
+
+    exact = activations.float() @ weights.float().T
+    approximate = (
+        quantize_dequantize(activations, block=block).float()
+        @ quantize_dequantize(weights, block=block).float().T
+    )
+    return relative_error(approximate, exact)
 
 
 def test_round_trip_preserves_the_scale_of_the_tensor() -> None:

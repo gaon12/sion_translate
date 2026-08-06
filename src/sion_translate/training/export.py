@@ -40,6 +40,7 @@ from torch import nn
 
 from sion_translate.config import ExperimentalConfig, ModelConfig
 from sion_translate.fp8 import DEFAULT_BLOCK, FORWARD_DTYPE, Fp8Policy, scale_for
+from sion_translate.fp8_runtime import apply_fp8_weights
 from sion_translate.model import SionForConditionalGeneration
 from sion_translate.model.layers import RotaryEmbedding, SwiGLU
 
@@ -1707,14 +1708,18 @@ def load_exported_model(
         model: nn.Module = stored
         _hydrate_legacy_module_attributes(model, config)
     else:
-        if isinstance(quantization, Mapping) and quantization.get("format") == "fp8":
-            if not isinstance(stored, Mapping):
-                raise ValueError("FP8 export has no packed state dictionary")
-            # 여기서는 고정밀도로 되돌려 실어 줍니다. 대역폭 이득은 FP8 저장
-            # 그대로 GEMM 하는 런타임에서 나오고, 그 경로는 하드웨어가 있을 때만
-            # 켜집니다. 되돌려 실은 모델도 수치는 FP8 을 통과한 것과 같으므로,
-            # 품질 평가는 하드웨어 없이도 여기서 그대로 할 수 있습니다.
+        fp8_packed = (
+            isinstance(quantization, Mapping)
+            and quantization.get("format") == "fp8"
+            and isinstance(stored, Mapping)
+        )
+        if fp8_packed:
+            # 먼저 고정밀도로 실은 뒤 아래에서 FP8 모듈로 바꿔 끼웁니다. 이렇게
+            # 하는 이유는 모듈 구조와 키를 그대로 검증받기 위해서이고, 교체가
+            # 끝나면 상주 가중치는 FP8 입니다.
             state = _unpack_fp8_state(stored)
+        elif isinstance(quantization, Mapping) and quantization.get("format") == "fp8":
+            raise ValueError("FP8 export has no packed state dictionary")
         elif isinstance(quantization, Mapping) and quantization.get("backend") == "sion-packed":
             if not isinstance(stored, Mapping):
                 raise ValueError("packed INT4 export has no packed state dictionary")
@@ -1732,6 +1737,12 @@ def load_exported_model(
         # another full model before copying.  This keeps strict validation of a
         # 32B FP32 artifact near one model's host-memory footprint rather than two.
         model.load_state_dict(state, assign=True)
+        if fp8_packed:
+            # 되돌린 가중치를 버리고 FP8 을 상주시킵니다. 되돌린 채 두면 디스크만
+            # 줄고 정작 노리던 디코딩 대역폭은 그대로입니다.
+            replaced = apply_fp8_weights(model, dict(stored))
+            if not replaced:
+                raise ValueError("FP8 export contains no quantized weights")
     model.eval()
     metadata = copy.deepcopy(payload.get("metadata") or {})
     if isinstance(quantization, Mapping):

@@ -10,13 +10,20 @@ from __future__ import annotations
 import torch
 
 from sion_translate.config import ExperimentalConfig, ModelConfig
-from sion_translate.fp8 import Fp8Policy, relative_error
+from sion_translate.fp8 import Fp8Policy
 from sion_translate.model import SionForConditionalGeneration
 from sion_translate.training.export import (
     SUPPORTED_FORMATS,
     _pack_fp8_state,
     _unpack_fp8_state,
 )
+
+
+def relative_error(approximate: torch.Tensor, exact: torch.Tensor) -> float:
+    denominator = exact.float().norm()
+    if denominator == 0:
+        return float(approximate.float().norm())
+    return float((approximate.float() - exact.float()).norm() / denominator)
 
 
 def _config() -> ModelConfig:
