@@ -269,14 +269,32 @@ class SionForConditionalGeneration(nn.Module):
             torch.cuda.set_rng_state_all(initialization_cuda_rng_states)
         self.init_weights()
 
+    def residual_write_count(self) -> int:
+        """잔차 스트림에 한 번의 forward 동안 값이 더해지는 총 횟수.
+
+        초기화 스케일의 분모입니다. 층 수가 아니라 **쓰기 횟수**가 기준인
+        이유는, 잔차 스트림의 분산이 그 스트림에 더해지는 항의 개수만큼
+        누적되기 때문입니다.
+
+        - encoder layer 는 2번 씁니다 (self-attention, FFN).
+        - decoder layer 는 3번 씁니다 (self-attention, cross-attention, FFN).
+          층 수만 세면 decoder 쪽을 1.5배 과소평가합니다.
+        - 공유 블록을 반복하면 그 블록의 층이 추가로 반복 횟수만큼 더 씁니다.
+        """
+
+        encoder_writes = 2 * self.config.encoder_layers
+        block_size = min(self.recurrent_block_layers, self.config.encoder_layers)
+        encoder_writes += 2 * block_size * (self.recurrent_steps - 1)
+        decoder_writes = 3 * self.config.decoder_layers
+        return max(encoder_writes, decoder_writes)
+
     def init_weights(self) -> None:
         """가중치 초기화. 기본은 N(0, init_std²) 정규분포이고,
         잔차 경로로 합쳐지는 출력 projection(out_proj/down_proj)은
-        층 수에 비례해 더 작게 초기화해 깊은 모델의 초기 발산을 막습니다."""
+        잔차 쓰기 횟수에 비례해 더 작게 초기화해 깊은 모델의 초기 발산을
+        막습니다 (``residual_write_count`` 참고)."""
         std = self.config.init_std
-        residual_std = (
-            std / (2 * max(self.config.encoder_layers, self.config.decoder_layers)) ** 0.5
-        )
+        residual_std = std / self.residual_write_count() ** 0.5
 
         def initialize(module: nn.Module) -> None:
             if isinstance(module, nn.Linear):

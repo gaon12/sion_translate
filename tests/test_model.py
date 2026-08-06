@@ -1141,3 +1141,46 @@ def test_loss_materializes_the_fp32_logit_copy_only_once() -> None:
 
     assert output.loss is not None
     assert counter.copies == 1, f"FP32 logits 사본이 {counter.copies}개 생겼습니다"
+
+
+def test_residual_init_scale_counts_writes_not_layers() -> None:
+    """잔차 초기화 분모는 층 수가 아니라 잔차에 더해지는 항의 개수여야 한다."""
+    config = tiny_config()
+    config.encoder_layers = 6
+    config.decoder_layers = 4
+    model = SionForConditionalGeneration(config)
+    # encoder 6층 x 2회 = 12, decoder 4층 x 3회(self/cross/ffn) = 12
+    assert model.residual_write_count() == 12
+
+    config = tiny_config()
+    config.encoder_layers = 4
+    config.decoder_layers = 6
+    model = SionForConditionalGeneration(config)
+    # decoder 가 지배: 6 x 3 = 18. 층 수만 세면 12 로 과소평가된다.
+    assert model.residual_write_count() == 18
+
+
+def test_residual_init_scale_accounts_for_repeated_blocks() -> None:
+    """반복되는 블록은 반복 횟수만큼 잔차에 더 쓴다."""
+    config = tiny_config()
+    config.encoder_layers = 8
+    config.decoder_layers = 1
+    config.experimental.recurrent_block_layers = 2
+    config.experimental.recurrent_steps = 4
+    model = SionForConditionalGeneration(config)
+    # 8층 x 2회 + 반복 블록 2층 x 2회 x 추가 3회 = 16 + 12 = 28
+    assert model.residual_write_count() == 28
+
+
+def test_residual_projections_are_scaled_down_from_the_base_std() -> None:
+    config = tiny_config()
+    config.encoder_layers = 6
+    config.decoder_layers = 6
+    model = SionForConditionalGeneration(config)
+    expected = config.init_std / model.residual_write_count() ** 0.5
+    out_proj = model.encoder_layers[0].self_attn.out_proj.weight
+    q_proj = model.encoder_layers[0].self_attn.q_proj.weight
+    # 표준편차 추정은 표본 오차가 있으므로 넉넉한 상대 허용오차를 씁니다.
+    assert out_proj.std().item() == pytest.approx(expected, rel=0.25)
+    assert q_proj.std().item() == pytest.approx(config.init_std, rel=0.25)
+    assert out_proj.std().item() < q_proj.std().item()
