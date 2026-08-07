@@ -3,11 +3,12 @@
 
 한본어 works because Korean and Japanese are both agglutinative with SOV order,
 so a stem from one language takes an ending from the other and the result still
-parses. Four registers occur, and they differ in what can be asserted about
-their script, so every frame declares which one it produces:
+parses.
 
-    blend        morphology mixed inside one word
-                 체고카요 = 최고 + かよ, やばいンデ = やばい + ~ㄴ데
+Rows are classified by **which scripts the mixture uses**, and there are three
+such registers. A code-point check can verify each one, which is what
+``validate`` does:
+
     hangul_only  a Japanese clause transliterated into Hangul
                  닝겐노 유리와 튼튼데스네 = 人間の百合は丈夫ですね
     script       Hangul beside kana or kanji
@@ -15,10 +16,13 @@ their script, so every frame declares which one it produces:
     kana_only    Korean vocabulary in katakana inside Japanese
                  チンチャそれな
 
-The last three are uniform or mixed in ways a code-point check can verify;
-``blend`` rows are where the interesting morphology lives and are drawn from a
-hand-written lexicon rather than composed blindly, because the Japanese side is
-often lexical: 대박 + い is やばい, not 大当たりい.
+**Blending is a separate axis, not a fourth register.** A blend mixes morphology
+inside a single word — 체고카요 = 최고 + かよ, やばいンデ = やばい + ~ㄴ데 — and
+the result can land in any of the three registers depending on how it is
+spelled, so :func:`register_of` derives the register rather than assuming one.
+Blends come from a hand-written lexicon rather than being composed blindly,
+because the Japanese side is frequently lexical: 대박 + い is やばい, not
+大当たりい.
 
 Every row is a triple, because the model has to read the mixture and answer in
 exactly one language:

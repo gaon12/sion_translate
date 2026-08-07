@@ -222,6 +222,61 @@ NOUNS: tuple[Noun, ...] = (
     Noun("테", "手", "손", BODY),
     Noun("메", "目", "눈", BODY),
     Noun("코코로", "心", "심장", BODY),
+    # --- 2차 확장 -------------------------------------------------------
+    # 어휘가 생성량의 상한입니다. 40,000행을 요청했을 때 6,719행에서 멈췄고,
+    # 중복 16,787건이 버려졌으며, 쓰인 항목이 234개뿐이라 상위 항목은 전부
+    # per-item 상한 200 에 걸려 있었습니다. 프레임 수가 아니라 조합할 것이
+    # 모자란 것이므로 어휘를 늘립니다.
+    Noun("오토코노코", "男の子", "남자아이", PERSON),
+    Noun("온나노코", "女の子", "여자아이", PERSON),
+    Noun("세이토", "生徒", "학생", PERSON),
+    Noun("오캬쿠", "お客", "손님", PERSON),
+    Noun("이모토", "妹", "여동생", PERSON),
+    Noun("우사기", "兎", "토끼", ANIMAL),
+    Noun("쿠마", "熊", "곰", ANIMAL),
+    Noun("사카나", "魚", "물고기", ANIMAL),
+    Noun("무시", "虫", "벌레", ANIMAL),
+    Noun("키", "木", "나무", PLANT),
+    Noun("쿠사", "草", "풀", PLANT),
+    Noun("소라", "空", "하늘", CELESTIAL),
+    Noun("미즈우미", "湖", "호수", LANDSCAPE),
+    Noun("시마", "島", "섬", LANDSCAPE),
+    Noun("미치", "道", "길", LANDSCAPE),
+    Noun("코엔", "公園", "공원", PLACE),
+    Noun("뵤인", "病院", "병원", PLACE),
+    Noun("토쇼칸", "図書館", "도서관", PLACE),
+    Noun("쿠코", "空港", "공항", PLACE),
+    Noun("이에", "家", "집", PLACE),
+    Noun("마도", "窓", "창문", ARTIFACT),
+    Noun("츠쿠에", "机", "책상", ARTIFACT),
+    Noun("이스", "椅子", "의자", ARTIFACT),
+    Noun("카방", "鞄", "가방", ARTIFACT),
+    Noun("토케이", "時計", "시계", ARTIFACT),
+    Noun("덴와", "電話", "전화", ARTIFACT),
+    Noun("도라마", "ドラマ", "드라마", MEDIA),
+    Noun("망가", "漫画", "만화", MEDIA),
+    Noun("고항", "ご飯", "밥", FOOD),
+    Noun("니쿠", "肉", "고기", FOOD),
+    Noun("야사이", "野菜", "채소", FOOD),
+    Noun("쿠다모노", "果物", "과일", FOOD),
+    Noun("미즈", "水", "물", FOOD),
+    Noun("오차", "お茶", "차", FOOD),
+    Noun("벤쿄", "勉強", "공부", TASK),
+    Noun("렌슈", "練習", "연습", TASK),
+    Noun("카이기", "会議", "회의", TASK),
+    Noun("히카리", "光", "빛", PERCEPT),
+    Noun("카타치", "形", "모양", PERCEPT),
+    Noun("히루", "昼", "낮", TIME),
+    Noun("하루", "春", "봄", TIME),
+    Noun("아키", "秋", "가을", TIME),
+    Noun("쿠모", "雲", "구름", WEATHER),
+    Noun("키오쿠", "記憶", "기억", MIND),
+    Noun("유우키", "勇気", "용기", MIND),
+    Noun("아시", "足", "다리", BODY),
+    Noun("아타마", "頭", "머리", BODY),
+    Noun("쿠치", "口", "입", BODY),
+    Noun("미미", "耳", "귀", BODY),
+    Noun("카오", "顔", "얼굴", BODY),
 )
 
 PREDICATES: tuple[Predicate, ...] = (
@@ -541,6 +596,14 @@ INTERJECTIONS: tuple[Interjection, ...] = (
     Interjection("마지", "マジ", "진짜"),
     Interjection("호라", "ほら", "봐"),
     Interjection("야메로", "やめろ", "그만해"),
+    Interjection("나니", "なに", "뭐"),
+    Interjection("소카", "そっか", "그렇구나"),
+    Interjection("훙", "ふーん", "흠"),
+    Interjection("아레", "あれ", "어라"),
+    Interjection("우웅", "うーん", "음"),
+    Interjection("이야", "いや", "아니"),
+    Interjection("사아", "さあ", "자"),
+    Interjection("웃소", "うそ", "거짓말"),
 )
 
 LOANWORDS: tuple[Loanword, ...] = (
@@ -572,6 +635,26 @@ LOANWORDS: tuple[Loanword, ...] = (
     Loanword("だいすき", "다이스키", "정말 좋아한다는 말", "phrase"),
     Loanword("だめ", "다메", "안 된다는 말", "phrase"),
     Loanword("むり", "무리", "무리라는 말", "phrase"),
+    Loanword("コスプレ", "코스프레", "코스프레", "noun"),
+    Loanword("デビュー", "데뷔", "데뷔", "noun"),
+    Loanword("ライブ", "라이브", "공연", "noun"),
+    Loanword("サイン", "사인", "사인", "noun"),
+    Loanword("メンバー", "멘바", "멤버", "noun"),
+    Loanword("ファン", "환", "팬", "noun"),
+    Loanword("レベル", "레베루", "수준", "noun"),
+    Loanword("センス", "센스", "센스", "noun"),
+    Loanword("テスト", "테스토", "시험", "noun"),
+    Loanword("サークル", "사쿠루", "동아리", "noun"),
+    Loanword("うまい", "우마이", "맛있는 거", "adjective"),
+    Loanword("さむい", "사무이", "추운 거", "adjective"),
+    Loanword("あつい", "아츠이", "더운 거", "adjective"),
+    Loanword("ひどい", "히도이", "심한 거", "adjective"),
+    Loanword("ありがとう", "아리가토", "고맙다는 말", "phrase"),
+    Loanword("ごめん", "고멘", "미안하다는 말", "phrase"),
+    Loanword("おはよう", "오하요", "좋은 아침이라는 인사", "phrase"),
+    Loanword("じゃあね", "쟈네", "잘 가라는 말", "phrase"),
+    Loanword("まってて", "맛테테", "기다리라는 말", "phrase"),
+    Loanword("たのむ", "타노무", "부탁한다는 말", "phrase"),
 )
 
 KOREAN_INTENSIFIERS_IN_KATAKANA: tuple[KoreanInKatakana, ...] = (
@@ -581,6 +664,10 @@ KOREAN_INTENSIFIERS_IN_KATAKANA: tuple[KoreanInKatakana, ...] = (
     KoreanInKatakana("ケンチャナ", "괜찮아", "大丈夫、"),
     KoreanInKatakana("ワンジョン", "완전", "めっちゃ"),
     KoreanInKatakana("ノム", "너무", "すごく"),
+    KoreanInKatakana("チンチャロ", "진짜로", "本当に"),
+    KoreanInKatakana("オモ", "어머", "あら"),
+    KoreanInKatakana("チョア", "좋아", "いいね、"),
+    KoreanInKatakana("パルリ", "빨리", "早く"),
 )
 
 KOREAN_NOUNS_IN_KATAKANA: tuple[KoreanInKatakana, ...] = (
@@ -592,6 +679,11 @@ KOREAN_NOUNS_IN_KATAKANA: tuple[KoreanInKatakana, ...] = (
     KoreanInKatakana("ソンベ", "선배", "先輩"),
     KoreanInKatakana("フベ", "후배", "後輩"),
     KoreanInKatakana("サジャン", "사장님", "社長"),
+    KoreanInKatakana("ドンセン", "동생", "弟"),
+    KoreanInKatakana("アジュンマ", "아줌마", "おばさん"),
+    KoreanInKatakana("ハラボジ", "할아버지", "おじいさん"),
+    KoreanInKatakana("ハルモニ", "할머니", "おばあさん"),
+    KoreanInKatakana("ヒョン", "형", "お兄さん"),
 )
 
 KOREAN_FOOD_IN_KATAKANA: tuple[KoreanInKatakana, ...] = (
@@ -603,6 +695,12 @@ KOREAN_FOOD_IN_KATAKANA: tuple[KoreanInKatakana, ...] = (
     KoreanInKatakana("チゲ", "찌개", "チゲ"),
     KoreanInKatakana("ソジュ", "소주", "ソジュ"),
     KoreanInKatakana("チャプチェ", "잡채", "チャプチェ"),
+    KoreanInKatakana("プルコギ", "불고기", "プルコギ"),
+    KoreanInKatakana("ネンミョン", "냉면", "冷麺"),
+    KoreanInKatakana("キンパ", "김밥", "キンパ"),
+    KoreanInKatakana("ホットク", "호떡", "ホットク"),
+    KoreanInKatakana("スンドゥブ", "순두부", "スンドゥブ"),
+    KoreanInKatakana("カンジャン", "간장", "醤油"),
 )
 
 REACTIONS: tuple[Reaction, ...] = (
@@ -620,6 +718,18 @@ REACTIONS: tuple[Reaction, ...] = (
     Reaction("さすが", "역시"),
     Reaction("ずるい", "치사해"),
     Reaction("いいね", "좋네"),
+    Reaction("ほんと", "진짜"),
+    Reaction("やばい", "대박"),
+    Reaction("たしかに", "확실히"),
+    Reaction("わかった", "알겠어"),
+    Reaction("おいしい", "맛있어"),
+    Reaction("こわい", "무서워"),
+    Reaction("はずかしい", "부끄러워"),
+    Reaction("さびしい", "외로워"),
+    Reaction("うらやましい", "부러워"),
+    Reaction("めんどくさい", "귀찮아"),
+    Reaction("しんどい", "힘들어"),
+    Reaction("ありがと", "고마워"),
 )
 
 # Korean content nouns that keep their Hangul spelling inside a Japanese frame.
@@ -645,6 +755,20 @@ KOREAN_CONTENT_NOUNS: tuple[KoreanContentNoun, ...] = (
     KoreanContentNoun("날씨", "天気", WEATHER),
     KoreanContentNoun("학교", "学校", PLACE),
     KoreanContentNoun("가게", "店", PLACE),
+    KoreanContentNoun("얼굴", "顔", BODY),
+    KoreanContentNoun("목소리", "声", PERCEPT),
+    KoreanContentNoun("노래", "歌", MEDIA),
+    KoreanContentNoun("영화", "映画", MEDIA),
+    KoreanContentNoun("고양이", "猫", ANIMAL),
+    KoreanContentNoun("친구", "友達", PERSON),
+    KoreanContentNoun("선생님", "先生", PERSON),
+    KoreanContentNoun("가족", "家族", PERSON),
+    KoreanContentNoun("바다", "海", LANDSCAPE),
+    KoreanContentNoun("하늘", "空", CELESTIAL),
+    KoreanContentNoun("공부", "勉強", TASK),
+    KoreanContentNoun("기억", "記憶", MIND),
+    KoreanContentNoun("밤", "夜", TIME),
+    KoreanContentNoun("봄", "春", TIME),
 )
 
 # Korean endings that attach to a transliterated Japanese predicate stem. Only
