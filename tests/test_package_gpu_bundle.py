@@ -108,6 +108,106 @@ def test_build_is_deterministic_allowlisted_and_verifiable(tmp_path: Path) -> No
     assert tree_result == archive_result
 
 
+def _with_monolingual_corpus(root: Path) -> None:
+    corpus = root / "data" / "corpus"
+    for language, text in (("ko", "단일어 문장\n"), ("ja", "単言語の文\n")):
+        directory = corpus / language
+        directory.mkdir(parents=True)
+        (directory / "wiki.txt").write_text(text, encoding="utf-8")
+        # Not a readable monolingual format; must not be shipped.
+        (directory / "notes.md").write_text("stray download\n", encoding="utf-8")
+
+
+def _with_tokenizer(root: Path, *, complete: bool = True) -> None:
+    tokenizer = root / "artifacts" / "tokenizer"
+    tokenizer.mkdir(parents=True, exist_ok=True)
+    (tokenizer / "sion.model").write_bytes(b"model")
+    (tokenizer / "tokenizer_metadata.json").write_text('{"split_digits":true}\n', encoding="utf-8")
+    if complete:
+        (tokenizer / "sion.vocab").write_text("piece\t0\n", encoding="utf-8")
+
+
+def test_the_monolingual_corpus_ships_only_when_asked_for(tmp_path: Path) -> None:
+    """foundation 입력이라 없으면 그 단계가 통째로 건너뛰어진다.
+
+    기본에 넣지 않는 이유는 분량입니다. 실제 코퍼스는 13.86 GiB 이고, 그것을
+    모르고 배포물에 넣는 것은 실수로 치르기에 비싼 비용입니다.
+    """
+
+    root = _repository(tmp_path)
+    _with_monolingual_corpus(root)
+
+    default_archive = tmp_path / "default.zip"
+    package_gpu_bundle.build_bundle(root, default_archive)
+    with zipfile.ZipFile(default_archive) as archive:
+        # `data/corpus.jsonl` 은 병렬 shard 라 들어가야 한다. 빠져야 하는 것은
+        # `data/corpus/` **폴더** 이므로 구분자까지 보고 판정한다.
+        assert not any("data/corpus/" in name for name in archive.namelist())
+
+    included = tmp_path / "with-corpus.zip"
+    package_gpu_bundle.build_bundle(root, included, include_monolingual_corpus=True)
+    with zipfile.ZipFile(included) as archive:
+        names = set(archive.namelist())
+    assert "sion_translate/data/corpus/ko/wiki.txt" in names
+    assert "sion_translate/data/corpus/ja/wiki.txt" in names
+    # 읽을 수 없는 형식은 빼야 한다. 넣으면 기가바이트를 조용히 낭비한다.
+    assert not any(name.endswith("notes.md") for name in names)
+
+    origins = {entry["path"]: entry["origin"] for entry in _manifest(included)["files"]}
+    assert origins["data/corpus/ko/wiki.txt"] == "monolingual-corpus"
+    package_gpu_bundle.verify_archive(included)
+
+
+def test_the_tokenizer_ships_only_when_asked_for_and_only_if_complete(tmp_path: Path) -> None:
+    """반쪽 토크나이저를 실으면 실패가 업로드 뒤 GPU 서버로 미뤄진다."""
+
+    root = _repository(tmp_path)
+    _with_tokenizer(root, complete=False)
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="sion.vocab"):
+        package_gpu_bundle.build_bundle(root, tmp_path / "partial.zip", include_tokenizer=True)
+
+    _with_tokenizer(root, complete=True)
+    included = tmp_path / "with-tokenizer.zip"
+    package_gpu_bundle.build_bundle(root, included, include_tokenizer=True)
+    with zipfile.ZipFile(included) as archive:
+        names = set(archive.namelist())
+    assert "sion_translate/artifacts/tokenizer/sion.model" in names
+    assert "sion_translate/artifacts/tokenizer/tokenizer_metadata.json" in names
+
+    origins = {entry["path"]: entry["origin"] for entry in _manifest(included)["files"]}
+    assert origins["artifacts/tokenizer/sion.model"] == "tokenizer"
+    package_gpu_bundle.verify_archive(included)
+
+
+def test_the_default_bundle_still_refuses_stale_artifacts(tmp_path: Path) -> None:
+    """opt-in 이 artifacts/ 전체를 여는 것이 아니어야 한다."""
+
+    root = _repository(tmp_path)
+    _with_tokenizer(root, complete=True)
+    (root / "artifacts" / "dataset").mkdir(parents=True)
+    (root / "artifacts" / "dataset" / "train.bin").write_bytes(b"stale")
+
+    included = tmp_path / "tokenizer-only.zip"
+    package_gpu_bundle.build_bundle(root, included, include_tokenizer=True)
+    with zipfile.ZipFile(included) as archive:
+        names = set(archive.namelist())
+
+    assert "sion_translate/artifacts/tokenizer/sion.model" in names
+    assert not any("artifacts/dataset" in name for name in names)
+    assert not any("do-not-package" in name for name in names)
+
+
+def test_requesting_an_absent_optional_tree_is_an_error(tmp_path: Path) -> None:
+    """조용히 빠지면 서버에서야 foundation 이 없다는 것을 알게 된다."""
+
+    root = _repository(tmp_path)
+    with pytest.raises(package_gpu_bundle.BundleError, match="data/corpus"):
+        package_gpu_bundle.build_bundle(
+            root, tmp_path / "no-corpus.zip", include_monolingual_corpus=True
+        )
+
+
 def test_build_refuses_a_dirty_tracked_tree(tmp_path: Path) -> None:
     root = _repository(tmp_path)
     (root / "README.md").write_text("dirty\n", encoding="utf-8")

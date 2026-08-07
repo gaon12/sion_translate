@@ -9,6 +9,27 @@ The bundle is intentionally assembled from a narrow set of sources:
 Nothing else in the working tree is eligible.  In particular, stale artifacts,
 checkpoints, virtual environments, caches, and ``data/excluded`` cannot enter
 the archive just because they happen to exist beside the source tree.
+
+Two further trees can be added, but only when asked for by name:
+
+``--with-monolingual-corpus``
+    ``data/corpus`` -- the foundation stage's input.  Without it that stage
+    finds no monolingual text and is skipped, so a bundle built for a
+    three-stage run needs it.  It is tens of gigabytes, which is exactly why
+    it is not a default.
+
+``--with-tokenizer``
+    ``artifacts/tokenizer``.  Training a tokenizer is CPU and RAM work that
+    does not touch the GPU, so doing it beforehand and shipping the result
+    keeps a rented GPU from idling through it.  ``cli.train`` reuses whatever
+    tokenizer already exists, so a complete directory here means the server
+    skips that step entirely.  The set is checked for completeness before it
+    ships: a partial tokenizer would fail on the server, after the upload.
+
+Both are recorded in the manifest with their own origin, so ``verify-archive``
+and ``verify-tree`` cover them like everything else.  Shipping fourteen
+gigabytes of corpus outside the manifest would leave the largest part of the
+payload with no integrity check at all.
 """
 
 from __future__ import annotations
@@ -66,7 +87,25 @@ EXCLUDED_PATH_PARTS = {
     "caches",
 }
 EXCLUDED_SUFFIXES = {".pyc", ".pyo"}
-ALLOWED_ORIGINS = {"git-index", "data-jsonl", "evaluation-only"}
+ALLOWED_ORIGINS = {
+    "git-index",
+    "data-jsonl",
+    "evaluation-only",
+    # Opt-in only. Both live under a directory the default allowlist refuses,
+    # and both are large enough that shipping them by accident is a real cost.
+    "monolingual-corpus",
+    "tokenizer",
+}
+
+# Monolingual corpus files the foundation stage can actually read. Mirrors
+# ``sion_translate.data.monolingual.ALLOWED_SUFFIXES``: anything else in that
+# tree is a stray download, and silently shipping it wastes gigabytes.
+MONOLINGUAL_SUFFIXES = {".txt", ".jsonl"}
+
+# A tokenizer is only useful to the training pipeline as a complete set. The
+# model alone loads, but ``tokenizer_policy_problem`` then cannot read the
+# digit policy or the language tags and the run stops after the upload.
+REQUIRED_TOKENIZER_FILES = {"sion.model", "sion.vocab", "tokenizer_metadata.json"}
 REGULAR_GIT_MODES = {"100644", "100755"}
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 GIT_OBJECT_PATTERN = re.compile(r"[0-9a-f]{40,64}")
@@ -242,7 +281,50 @@ def _assert_regular_source(path: Path, relative_path: PurePosixPath) -> None:
         raise BundleError(f"selected source is not a regular file: {relative_path}")
 
 
-def _collect_sources(root: Path) -> list[SourceEntry]:
+def _collect_tree(
+    root: Path,
+    tree_root: Path,
+    origin: str,
+    *,
+    suffixes: set[str] | None = None,
+) -> list[SourceEntry]:
+    """Regular files below ``tree_root``, refusing symlinks.
+
+    Symlinks are refused rather than followed because these trees are not in
+    Git and nothing else has checked them: a link pointing outside the
+    repository would silently pull an arbitrary file into a bundle whose whole
+    promise is that its contents are accounted for.
+    """
+
+    entries: list[SourceEntry] = []
+    if not tree_root.is_dir():
+        return entries
+    for source_path in sorted(tree_root.rglob("*"), key=lambda path: path.as_posix()):
+        if source_path.is_symlink():
+            relative = source_path.relative_to(root).as_posix()
+            raise BundleError(f"{origin} source may not be a symlink: {relative}")
+        if source_path.is_dir():
+            continue
+        if suffixes is not None and source_path.suffix.lower() not in suffixes:
+            continue
+        relative_path = _validated_relative_path(source_path.relative_to(root).as_posix())
+        entries.append(
+            SourceEntry(
+                relative_path=relative_path,
+                source_path=source_path,
+                origin=origin,
+                mode="100644",
+            )
+        )
+    return entries
+
+
+def _collect_sources(
+    root: Path,
+    *,
+    include_monolingual_corpus: bool = False,
+    include_tokenizer: bool = False,
+) -> list[SourceEntry]:
     selected: dict[PurePosixPath, SourceEntry] = {}
     portable_paths = {
         _portable_path_key(PurePosixPath(MANIFEST_NAME)): MANIFEST_NAME,
@@ -305,6 +387,41 @@ def _collect_sources(root: Path) -> list[SourceEntry]:
                     mode="100644",
                 )
             )
+
+    if include_monolingual_corpus:
+        corpus_entries = _collect_tree(
+            root,
+            data_root / "corpus",
+            "monolingual-corpus",
+            suffixes=MONOLINGUAL_SUFFIXES,
+        )
+        if not corpus_entries:
+            raise BundleError(
+                "--with-monolingual-corpus was requested but data/corpus holds no "
+                f"readable {'/'.join(sorted(MONOLINGUAL_SUFFIXES))} files"
+            )
+        for entry in corpus_entries:
+            add(entry)
+
+    if include_tokenizer:
+        tokenizer_root = root / "artifacts" / "tokenizer"
+        tokenizer_entries = _collect_tree(root, tokenizer_root, "tokenizer")
+        if not tokenizer_entries:
+            raise BundleError(
+                f"--with-tokenizer was requested but {tokenizer_root} does not exist "
+                "or holds no files"
+            )
+        present = {entry.relative_path.name for entry in tokenizer_entries}
+        missing = sorted(REQUIRED_TOKENIZER_FILES - present)
+        if missing:
+            # Shipping a partial tokenizer moves the failure to the GPU server,
+            # after the upload and after the environment is paid for.
+            raise BundleError(
+                "the tokenizer directory is incomplete; refusing to ship it. "
+                f"missing: {', '.join(missing)}"
+            )
+        for entry in tokenizer_entries:
+            add(entry)
 
     entries = [selected[path] for path in sorted(selected, key=lambda item: item.as_posix())]
     if not any(
@@ -796,6 +913,8 @@ def build_bundle(
     output_path: Path | str | None = None,
     *,
     overwrite: bool = False,
+    include_monolingual_corpus: bool = False,
+    include_tokenizer: bool = False,
 ) -> BuildResult:
     """Build, verify, and atomically publish a deterministic GPU bundle."""
 
@@ -815,7 +934,11 @@ def build_bundle(
 
     _ensure_clean_tracked_tree(root)
     commit, tree = _git_identity(root)
-    sources = _collect_sources(root)
+    sources = _collect_sources(
+        root,
+        include_monolingual_corpus=include_monolingual_corpus,
+        include_tokenizer=include_tokenizer,
+    )
     if not sources:
         raise BundleError("the bundle source allowlist selected no files")
     if any(source.source_path.resolve() == output for source in sources):
@@ -879,6 +1002,22 @@ def _argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="atomically replace an existing output ZIP",
     )
+    build_parser.add_argument(
+        "--with-monolingual-corpus",
+        action="store_true",
+        help=(
+            "also ship data/corpus (foundation pretraining input). Without it the "
+            "foundation stage finds no monolingual text and is skipped."
+        ),
+    )
+    build_parser.add_argument(
+        "--with-tokenizer",
+        action="store_true",
+        help=(
+            "also ship artifacts/tokenizer so the server reuses it instead of "
+            "spending hours training one. The directory must be complete."
+        ),
+    )
 
     archive_parser = subparsers.add_parser(
         "verify-archive",
@@ -903,6 +1042,8 @@ def main(arguments: list[str] | None = None) -> int:
                 parsed.root,
                 parsed.output,
                 overwrite=parsed.overwrite,
+                include_monolingual_corpus=parsed.with_monolingual_corpus,
+                include_tokenizer=parsed.with_tokenizer,
             )
             print(f"bundle: {result.output_path}")
             print(f"sha256: {result.archive_sha256}")
