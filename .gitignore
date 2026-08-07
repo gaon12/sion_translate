@@ -53,6 +53,12 @@ glossary_mined.json
 # starts from user-supplied JSONL and does not redistribute acquisition code.
 tools/
 
+# The internal audit. It cites source rows by file and line number, and those
+# shards are not redistributed, so the findings only mean anything to someone
+# who already has the corpus. Kept local and maintained; see docs/README.md
+# for the parts of it that belong in public documentation.
+docs/PROJECT_ROAST.md
+
 # Locally generated translation queues contain source and translated text.
 # Ignore the complete tree: results and accepted shards live below nested
 # directories and must not be staged by a broad `git add .`.
