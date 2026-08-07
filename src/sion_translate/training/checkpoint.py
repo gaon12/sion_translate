@@ -169,6 +169,7 @@ _POSTTRAINING_OBJECTIVE_FIELDS = (
     "reward_length_weight",
     "reward_repetition_penalty",
     "reward_copy_penalty",
+    "reward_number_corruption_penalty",
     "roundtrip_enabled",
     "roundtrip_reward_weight",
     "roundtrip_failure_penalty",

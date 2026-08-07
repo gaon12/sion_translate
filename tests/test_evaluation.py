@@ -14,6 +14,7 @@ from sion_translate.evaluation import (
     load_split_pairs,
     number_preservation,
     number_preservation_details,
+    numeric_corruption,
     numeric_tokens,
     results_as_markdown,
     save_results,
@@ -132,6 +133,25 @@ def test_numeric_tokens_sees_counters_but_not_identifiers() -> None:
     # 식별자 안의 숫자는 값이 아니므로 세지 않는다.
     assert numeric_tokens("config.json의 retry_limit") == []
     assert numeric_tokens("utf8 인코딩") == []
+
+
+def test_numeric_corruption_counts_values_nothing_licenses() -> None:
+    # 실측 결함: 원래 값을 남긴 채 새 값을 덧붙이는 발명.
+    assert numeric_corruption("1개 주세요", "1つください", "1, 999つください") == (1, 0)
+    # 값 자체가 바뀌면 발명 하나와 누락 하나다.
+    assert numeric_corruption("가격 100", "価格 100円", "価格 200円") == (1, 1)
+    # 원문과 정답이 합의한 값을 빠뜨린 경우.
+    assert numeric_corruption("250mg씩 48시간", "250mgずつ48時間", "250mgずつ") == (0, 1)
+    # 값을 지킨 번역은 변조가 없다.
+    assert numeric_corruption("가격 100", "価格 100円", "価格 100円") == (0, 0)
+
+
+def test_a_number_only_the_reference_spells_out_is_not_an_invention() -> None:
+    """한국어는 수를 한글로 자주 적는다. 원문만으로 판정하면 정상 번역이 걸린다."""
+
+    assert numeric_corruption("하루 두 번", "1日2回", "1日2回") == (0, 0)
+    # 정답에도 원문에도 없는 값은 여전히 발명이다.
+    assert numeric_corruption("하루 두 번", "1日2回", "1日5回") == (1, 0)
 
 
 def test_structured_tokens_share_the_reversible_protection_parser() -> None:

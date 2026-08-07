@@ -188,6 +188,9 @@ posttraining:
   reward_length_weight: 0.05
   reward_repetition_penalty: 0.15
   reward_copy_penalty: 0.10
+  # 값 변조 하나당 빼는 고정액. reward_number_weight 는 비율이라 숫자를 틀린
+  # 후보도 chrF 가 조금 높으면 이깁니다. 0 으로 두면 그 예전 동작이 됩니다.
+  reward_number_corruption_penalty: 0.35
   # 정방향 후보를 다시 원문 언어로 번역해 원문 복원에 실패하면 감점
   roundtrip_enabled: true
   roundtrip_reward_weight: 0.20

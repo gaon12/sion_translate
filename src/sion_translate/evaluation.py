@@ -92,6 +92,38 @@ def numeric_tokens(text: str) -> list[str]:
     return [token.replace(",", "") for token in normalized_matches(NUMBER_PATTERN, text)]
 
 
+def numeric_corruption(source: str, reference: str, hypothesis: str) -> tuple[int, int]:
+    """``(발명, 누락)`` — 어떤 근거로도 설명되지 않는 숫자 변조의 개수.
+
+    ``multiset_f1`` 은 변조를 **비율**로 바꿔 놓습니다. 값 하나를 지어낸
+    후보와 숫자가 많은 문장에서 하나를 빠뜨린 후보가 비슷한 점수를 받고,
+    가중치가 0.10 이면 chrF 가 조금 높은 쪽이 이깁니다. 배포 홀드아웃에서
+    10문장 중 8문장의 값이 바뀐 것이 그 결과입니다. 그래서 비율이 아니라
+    **개수**를 세고, 호출자가 이것을 하드 페널티로 씁니다.
+
+    판정 기준은 원문과 정답의 **합집합**입니다.
+
+    * **발명**: 원문에도 정답에도 없는 값이 번역문에 있는 경우. 어느 쪽으로도
+      정당화되지 않으므로 오류입니다.
+    * **누락**: 원문과 정답에 **둘 다** 있는 값이 번역문에 없는 경우. 양쪽이
+      합의한 값이므로 빠뜨릴 이유가 없습니다.
+
+    원문만으로 판정하지 않는 이유는 한국어가 수를 한글로 자주 적기 때문입니다.
+    ``하루 두 번`` → ``1日2回`` 에서 ``2`` 는 원문에 숫자로 없지만 정답에는
+    있으므로 발명이 아닙니다. 정답만으로 판정하지 않는 이유는 정답 자체가
+    오염될 수 있기 때문이고, 그때 원문이 값을 뒷받침해 줍니다.
+    """
+
+    source_values = Counter(numeric_tokens(source))
+    reference_values = Counter(numeric_tokens(reference))
+    hypothesis_values = Counter(numeric_tokens(hypothesis))
+    licensed = source_values | reference_values  # 합집합 (원소별 최댓값)
+    required = source_values & reference_values  # 교집합 (원소별 최솟값)
+    invented = sum((hypothesis_values - licensed).values())
+    dropped = sum((required - hypothesis_values).values())
+    return invented, dropped
+
+
 @dataclass(frozen=True, slots=True)
 class NumberPreservationResult:
     """숫자가 실제로 등장한 문장에 한정한 보존 지표."""

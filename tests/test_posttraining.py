@@ -49,14 +49,66 @@ def test_composite_reward_penalizes_number_corruption_and_slot_omission() -> Non
     assert result.components["slot"][0].tolist() == [1.0, 0.0]
 
 
+def test_a_value_changing_candidate_cannot_win_on_chrf() -> None:
+    """가중 성분만으로는 숫자를 틀린 후보가 이긴다. 그래서 하드 페널티를 쓴다.
+
+    `reward_number_weight` 는 0.10 이라 값 변조 하나의 손실이 chrF 우위로
+    덮입니다. 배포 홀드아웃 10문장 중 8문장의 숫자가 바뀐 것이 그 결과입니다.
+    """
+
+    weighted_only = PostTrainingConfig(reward_number_corruption_penalty=0.0)
+    gated = PostTrainingConfig()  # 기본값 0.35
+
+    source = torch.tensor([[4, 10, 11, 3]])  # "가격 100"
+    reference = torch.tensor([[20, 21, 3]])  # "価格 100円"
+    # 값을 지킨 후보와 100 을 200 으로 바꾼 후보.
+    candidates = torch.tensor([[[2, 20, 21, 3], [2, 20, 22, 3]]])
+
+    weighted = CompositeTranslationReward(TextTokenizer(), weighted_only)(
+        candidates, source, reference
+    ).reward[0]
+    gated_score = CompositeTranslationReward(TextTokenizer(), gated)(
+        candidates, source, reference
+    ).reward[0]
+
+    # 값을 지킨 후보는 두 설정에서 똑같이 온전하다.
+    assert weighted[0] == pytest.approx(gated_score[0])
+    # 값을 바꾼 후보만 더 낮아지고, 격차가 벌어진다.
+    assert gated_score[1] < weighted[1]
+    assert (gated_score[0] - gated_score[1]) > (weighted[0] - weighted[1])
+
+
+def test_a_number_the_reference_licenses_is_not_a_corruption() -> None:
+    """한국어는 수를 한글로 자주 적는다. 정답이 뒷받침하는 값은 발명이 아니다."""
+
+    gated = PostTrainingConfig()
+    source = torch.tensor([[4, 10, 3]])  # "가격 " — 숫자가 없다
+    reference = torch.tensor([[20, 21, 3]])  # "価格 100円"
+    candidates = torch.tensor([[[2, 20, 21, 3]]])  # 정답과 같은 값
+
+    score = CompositeTranslationReward(TextTokenizer(), gated)(
+        candidates, source, reference
+    ).reward.item()
+    unpenalized = CompositeTranslationReward(
+        TextTokenizer(), PostTrainingConfig(reward_number_corruption_penalty=0.0)
+    )(candidates, source, reference).reward.item()
+
+    assert score == pytest.approx(unpenalized)
+
+
 def test_composite_reward_applies_repetition_and_source_copy_penalties() -> None:
+    # 이 테스트는 반복·복사 페널티만 격리합니다. 값 변조 페널티는 양쪽에서 끕니다 —
+    # 켜 두면 반복 후보가 원문의 100 을 빠뜨린 것으로 함께 감점되어, 두 설정
+    # 모두에서 0 으로 눌리고 비교가 성립하지 않습니다.
     base = PostTrainingConfig(
         reward_repetition_penalty=0.0,
         reward_copy_penalty=0.0,
+        reward_number_corruption_penalty=0.0,
     )
     penalized = PostTrainingConfig(
         reward_repetition_penalty=0.4,
         reward_copy_penalty=0.4,
+        reward_number_corruption_penalty=0.0,
     )
     source = torch.tensor([[4, 10, 11, 3]])
     reference = torch.tensor([[20, 21, 3]])

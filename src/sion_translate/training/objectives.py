@@ -18,6 +18,7 @@ from sion_translate.data.quality import canonical_text, language_fraction
 from sion_translate.evaluation import (
     has_excessive_repetition,
     multiset_f1,
+    numeric_corruption,
     numeric_tokens,
     structured_tokens,
 )
@@ -189,6 +190,14 @@ class CompositeTranslationReward:
         # not the very phenomenon the model is being taught to preserve.
         if has_excessive_repetition(hypothesis) and not has_excessive_repetition(reference_text):
             reward -= self.config.reward_repetition_penalty
+        # 값 변조는 개수로 셉니다. `number` 성분은 비율이라 값 하나를 지어낸
+        # 후보도 chrF 가 조금 높으면 이기고, 그것이 배포 홀드아웃에서 10문장 중
+        # 8문장의 숫자가 바뀐 이유입니다. 여기서는 변조 하나당 고정액을 빼서
+        # 숫자를 틀린 후보가 이기지 못하게 합니다.
+        if self.config.reward_number_corruption_penalty > 0:
+            invented, dropped = numeric_corruption(source_text, reference_text, hypothesis)
+            if invented or dropped:
+                reward -= self.config.reward_number_corruption_penalty * (invented + dropped)
         source_key = canonical_text(source_text).casefold()
         hypothesis_key = canonical_text(hypothesis).casefold()
         reference_key = canonical_text(reference_text).casefold()

@@ -550,6 +550,13 @@ class PostTrainingConfig:
     reward_length_weight: float = 0.05
     reward_repetition_penalty: float = 0.15
     reward_copy_penalty: float = 0.10
+    # 값 변조는 가중 성분이 아니라 하드 페널티입니다. `reward_number_weight`
+    # 는 비율이라, 값 하나를 지어낸 후보도 chrF 가 조금 높으면 이깁니다.
+    # 배포 홀드아웃 10문장 중 8문장의 숫자가 바뀐 것이 그 결과입니다.
+    # 변조 하나당 이 값을 빼며, 기본값은 chrF 가중치(0.55)로 만회할 수 있는
+    # 현실적인 chrF 차이보다 크게 잡았습니다 — 숫자를 틀리고 이기는 후보가
+    # 없어야 한다는 뜻입니다. 0 으로 두면 이전의 가중치 전용 동작이 됩니다.
+    reward_number_corruption_penalty: float = 0.35
     # 후보를 원문 언어로 다시 번역해 원문 복원 여부를 확인합니다. 정답과
     # 우연히 비슷한 후보가 보상을 독식하지 못하게 하는 순환 일관성 검증입니다.
     roundtrip_enabled: bool = False
@@ -774,6 +781,8 @@ class AppConfig:
         }
         if any(value < 0 for value in reward_weights.values()):
             raise ValueError("posttraining reward weights must be non-negative")
+        if post.reward_number_corruption_penalty < 0:
+            raise ValueError("posttraining.reward_number_corruption_penalty must be non-negative")
         if sum(reward_weights.values()) <= 0:
             raise ValueError("at least one posttraining reward weight must be positive")
         if not 0.0 <= post.reward_repetition_penalty <= 1.0:
