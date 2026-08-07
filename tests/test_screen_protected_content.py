@@ -11,6 +11,11 @@ import json
 from pathlib import Path
 import sys
 
+import pytest
+
+
+pytestmark = pytest.mark.usefixtures("configured_content_screen")
+
 
 SCRIPT_PATH = (
     Path(__file__).resolve().parents[1] / "scripts" / "data" / "screen_protected_content.py"

@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import pytest
 
+import sion_translate.content_screen as content_screen
 from sion_translate.content_screen import (
-    CHILD_MARKERS,
     MAX_CHILD_AGE,
     child_ages,
     known_languages,
@@ -17,6 +17,9 @@ from sion_translate.content_screen import (
     screen_pair,
     screen_text,
 )
+
+
+pytestmark = pytest.mark.usefixtures("configured_content_screen")
 
 
 def test_a_child_marker_alone_is_not_flagged() -> None:
@@ -74,9 +77,9 @@ def test_high_school_is_deliberately_not_a_child_marker() -> None:
     # Written as adults in this genre; flagging it would flag a large share of the
     # corpus and say nothing useful.
     for term in ("고등학생", "고교생", "중학생"):
-        assert term not in CHILD_MARKERS["ko"], term
+        assert term not in content_screen.CHILD_MARKERS["ko"], term
     for term in ("高校生", "中学生", "JK"):
-        assert term not in CHILD_MARKERS["ja"], term
+        assert term not in content_screen.CHILD_MARKERS["ja"], term
     assert not screen_text("고등학생 커플이 섹스를 했다", "ko").flagged
 
 
@@ -149,6 +152,20 @@ def test_language_tags_are_case_and_space_insensitive() -> None:
 def test_empty_input_is_safe() -> None:
     assert not screen_text("", "ko").flagged
     assert not screen_pair("", "", source_language="ko", target_language="ja").flagged
+
+
+def test_empty_policy_tables_disable_screening(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(content_screen, "CHILD_MARKERS", {"ko": (), "ja": ()})
+    monkeypatch.setattr(content_screen, "SEXUAL_MARKERS", {"ko": (), "ja": ()})
+
+    assert not screen_text("초등학생과 성관계", "ko").flagged
+    assert not screen_pair(
+        "초등학생과 성관계",
+        "小学生と性交した",
+        source_language="ko",
+        target_language="ja",
+    ).flagged
+    assert markers_for("ko") == ((), ())
 
 
 def test_both_marker_tables_cover_the_configured_pair() -> None:
