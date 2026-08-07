@@ -23,6 +23,9 @@
   이것이 없으면 수정 모델이 멀쩡한 문장을 헛되게 고칩니다.
 """
 
+# Revision rows are loaded from JSON and normalized immediately.
+# pyright: reportMissingTypeArgument=false, reportUnknownParameterType=false, reportUnknownVariableType=false
+
 from __future__ import annotations
 
 import json

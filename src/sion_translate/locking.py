@@ -19,7 +19,7 @@ import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import IO, Iterator
 
 LOCK_FILENAME = ".sion_artifacts.lock"
 
@@ -33,7 +33,7 @@ _HOLDER_WIDTH = 128
 if sys.platform == "win32":  # pragma: no cover - 플랫폼별 분기
     import msvcrt
 
-    def _try_acquire(handle) -> bool:
+    def _try_acquire(handle: IO[str]) -> bool:
         try:
             handle.seek(_LOCK_OFFSET)
             msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
@@ -41,7 +41,7 @@ if sys.platform == "win32":  # pragma: no cover - 플랫폼별 분기
             return False
         return True
 
-    def _release(handle) -> None:
+    def _release(handle: IO[str]) -> None:
         try:
             handle.seek(_LOCK_OFFSET)
             msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
@@ -50,14 +50,14 @@ if sys.platform == "win32":  # pragma: no cover - 플랫폼별 분기
 else:  # pragma: no cover - 플랫폼별 분기
     import fcntl
 
-    def _try_acquire(handle) -> bool:
+    def _try_acquire(handle: IO[str]) -> bool:
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             return False
         return True
 
-    def _release(handle) -> None:
+    def _release(handle: IO[str]) -> None:
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         except OSError:
@@ -72,7 +72,7 @@ def _describe_holder(path: Path) -> str:
     return recorded or "알 수 없는 프로세스"
 
 
-@contextmanager
+@contextmanager  # pyright: ignore[reportDeprecated]
 def artifact_lock(
     root: str | Path,
     *,

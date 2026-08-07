@@ -13,6 +13,9 @@
   과제 태그를 고릅니다.
 """
 
+# Foundation preparation aggregates dynamic worker result payloads.
+# pyright: reportUnknownVariableType=false
+
 from __future__ import annotations
 
 import hashlib

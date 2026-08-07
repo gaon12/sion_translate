@@ -1,3 +1,6 @@
+# SentencePiece metadata is returned as an untyped JSON mapping.
+# pyright: reportUnknownVariableType=false
+
 from __future__ import annotations
 
 import glob

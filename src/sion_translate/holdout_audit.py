@@ -31,6 +31,9 @@ MinHash 버킷도 버렸습니다. ``num_perm=1`` 의 충돌 확률은 Jaccard �
 행마다 자기 3-gram 을 조회하기만 하면 겹치는 항목이 **빠짐없이** 나옵니다.
 """
 
+# Holdout reports consume heterogeneous JSON findings.
+# pyright: reportUnknownArgumentType=false, reportUnknownMemberType=false, reportUnknownVariableType=false
+
 from __future__ import annotations
 
 import json

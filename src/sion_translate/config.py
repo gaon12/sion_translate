@@ -1,3 +1,6 @@
+# YAML constructors and raw configuration objects are dynamically typed.
+# pyright: reportUnknownArgumentType=false, reportUnknownMemberType=false, reportUnknownVariableType=false
+
 from __future__ import annotations
 
 import warnings

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
-from typing import Mapping
+from typing import Mapping, cast
 
 import numpy as np
 
@@ -47,9 +47,10 @@ def inherit_record_metadata(
     }
     envelope = record.get("metadata")
     if isinstance(envelope, Mapping):
+        typed_envelope = cast(Mapping[object, object], envelope)
         for field in RECORD_METADATA_FIELDS:
-            if field in envelope:
-                result[field] = deepcopy(envelope[field])
+            if field in typed_envelope:
+                result[field] = deepcopy(typed_envelope[field])
     for field in RECORD_METADATA_FIELDS:
         if field in record:
             result[field] = deepcopy(record[field])
@@ -82,7 +83,8 @@ def decode_record_metadata(payload: bytes) -> dict[str, object]:
     value = json.loads(payload)
     if not isinstance(value, dict):
         raise ValueError("record metadata payload must decode to an object")
-    unknown = set(value) - set(RECORD_METADATA_FIELDS)
+    metadata = cast(dict[str, object], value)
+    unknown = set(metadata) - set(RECORD_METADATA_FIELDS)
     if unknown:
         raise ValueError(f"record metadata contains unsupported fields: {sorted(unknown)}")
-    return value
+    return metadata

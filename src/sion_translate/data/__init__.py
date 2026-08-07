@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+# Public attributes are materialized lazily by module-level __getattr__.
+# pyright: reportUnsupportedDunderAll=false
+
 from importlib import import_module
 from typing import Any
 
@@ -17,7 +20,15 @@ _EXPORTS = {
     "prepare_dataset": ("sion_translate.data.prepare", "prepare_dataset"),
 }
 
-__all__ = list(_EXPORTS)
+__all__ = [
+    "DistributedBucketBatchSampler",
+    "IndexedParallelDataset",
+    "QualityPolicy",
+    "SionBatchCollator",
+    "assess_pair",
+    "audit_dataset",
+    "prepare_dataset",
+]
 
 
 def __getattr__(name: str) -> Any:

@@ -1,3 +1,6 @@
+# Audit rows are heterogeneous JSON objects validated during traversal.
+# pyright: reportUnknownMemberType=false
+
 from __future__ import annotations
 
 import glob
@@ -353,6 +356,7 @@ def audit_dataset(
 
         with path.open("rb") as handle:
             for row_number, raw_line in enumerate(handle, start=1):
+                line = ""
                 base_example = {"source": str(path), "row": row_number}
                 try:
                     encoding = "utf-8-sig" if row_number == 1 else "utf-8"

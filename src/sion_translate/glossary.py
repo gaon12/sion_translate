@@ -22,6 +22,9 @@ DeepL/Google 의 glossary 기능과 같은 목적이며, 이 프로젝트에 이
 언어 키가 언어쌍과 일치하면 방향에 상관없이(ko→ja, ja→ko) 모두 강제됩니다.
 """
 
+# Glossary files accept multiple JSON layouts validated at load time.
+# pyright: reportUnknownArgumentType=false, reportUnknownVariableType=false
+
 from __future__ import annotations
 
 import json

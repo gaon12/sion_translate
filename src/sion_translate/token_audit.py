@@ -7,12 +7,15 @@ This module scans the same parallel JSONL schema as the training pipeline and
 reports both failure modes by language and translation direction.
 """
 
+# Audit reports consume heterogeneous JSON records validated at runtime.
+# pyright: reportUnknownArgumentType=false, reportUnknownMemberType=false, reportUnknownVariableType=false
+
 from __future__ import annotations
 
 import json
 from collections import Counter
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import Any, Iterator, Sequence, cast
 
 import numpy as np
 
@@ -744,7 +747,7 @@ def audit_indexed_token_exposure(
 
     for index_path in index_paths:
         index = np.load(index_path, mmap_mode="r", allow_pickle=False)
-        fields = frozenset(index.dtype.names or ())
+        fields = frozenset(cast(tuple[str, ...], index.dtype.names or ()))
         shard_modern = {"src_offset", "src_length", "tgt_offset", "tgt_length"}.issubset(fields)
         shard_legacy = {"ko_offset", "ko_length", "ja_offset", "ja_length"}.issubset(fields)
         if shard_modern != modern or shard_legacy != legacy:

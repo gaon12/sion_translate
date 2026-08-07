@@ -1,3 +1,6 @@
+# Synthetic markers are read from arbitrary JSON record mappings.
+# pyright: reportUnknownMemberType=false, reportUnknownVariableType=false
+
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping

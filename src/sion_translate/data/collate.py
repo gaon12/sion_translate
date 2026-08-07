@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import random
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Sequence
+from typing import NotRequired, Sequence, TypedDict, cast
 
 import numpy as np
 import torch
@@ -17,6 +18,28 @@ _TOKEN_FEATURE_CLASS_COUNTS = {
     "vowel": 22,
     "coda": 29,
 }
+
+
+class _CollatorItem(TypedDict):
+    src: Sequence[int]
+    tgt: Sequence[int]
+    src_language: str
+    target_language: str
+    src_register: int
+    target_register: int
+    pair_index: NotRequired[int]
+    augmentation_key: NotRequired[int]
+    reverse_direction_trained: NotRequired[bool]
+
+
+class _CollatedExample(TypedDict):
+    input_ids: list[int]
+    decoder_input_ids: list[int]
+    labels: list[int]
+    register_label: int
+    memory_tokens: list[int]
+    source_language_tag_id: int
+    reverse_direction_trained: bool
 
 
 def load_morphoscript_token_features(
@@ -57,7 +80,9 @@ def load_morphoscript_token_features(
             maximum_id = maximum_ids[name]
             if values.size and (int(values.min()) < 0 or int(values.max()) >= maximum_id):
                 raise ValueError(f"token feature {name} contains IDs outside [0, {maximum_id})")
-            features[name] = torch.from_numpy(values)
+            features[name] = torch.from_numpy(  # pyright: ignore[reportUnknownMemberType]
+                values
+            )
     return features
 
 
@@ -155,11 +180,11 @@ class SionBatchCollator:
         self.augmentation_seed = int(augmentation_seed)
         # shared-memory scalar라 persistent DataLoader worker에도 epoch 변경이
         # 전달됩니다. 각 샘플은 이 값과 pair identity로 독립 RNG를 만듭니다.
-        self._augmentation_key = torch.tensor(
+        self._augmentation_key: torch.Tensor = torch.tensor(
             int(augmentation_key), dtype=torch.int64
         ).share_memory_()
-        self.slot_ids = set(tokenizer.slot_ids)
-        self.features = None
+        self.slot_ids: set[int] = set(tokenizer.slot_ids)
+        self.features: dict[str, torch.Tensor] | None = None
         if token_features is not None:
             self.features = load_morphoscript_token_features(
                 token_features,
@@ -179,7 +204,7 @@ class SionBatchCollator:
 
         self.set_augmentation_key(epoch)
 
-    def _sample_rng(self, item: dict) -> random.Random:
+    def _sample_rng(self, item: _CollatorItem) -> random.Random:
         pair_index = int(item.get("pair_index", 0))
         augmentation_key = item.get("augmentation_key", self.augmentation_key)
         identity = "|".join(
@@ -194,7 +219,7 @@ class SionBatchCollator:
         digest = hashlib.blake2b(identity.encode("utf-8"), digest_size=16).digest()
         return random.Random(int.from_bytes(digest, byteorder="big"))
 
-    def _make_example(self, item: dict) -> dict:
+    def _make_example(self, item: _CollatorItem) -> _CollatedExample:
         src = list(map(int, item["src"]))
         tgt = list(map(int, item["tgt"]))
         target_register = int(item["target_register"])
@@ -220,7 +245,8 @@ class SionBatchCollator:
             )
             tgt = original
             # <denoise_xx>: 원문 언어에 맞는 복원 과제 태그
-            task_id = self.tokenizer.denoise_tags[item["src_language"]]
+            source_language = item["src_language"]
+            task_id = self.tokenizer.denoise_tags[source_language]
             target_register = int(item["src_register"])
             # 단일언어 복원 과제에는 번역 방향이 없으므로 순환 번역 보상을
             # 적용하지 않습니다.
@@ -228,8 +254,10 @@ class SionBatchCollator:
             reverse_direction_trained = False
         else:
             # <2xx>: 목표 언어를 지정하는 방향 태그 (양방향 학습의 핵심)
-            task_id = self.tokenizer.language_tags[item["target_language"]]
-            source_language_tag_id = self.tokenizer.language_tags[item["src_language"]]
+            target_language = item["target_language"]
+            source_language = item["src_language"]
+            task_id = self.tokenizer.language_tags[target_language]
+            source_language_tag_id = self.tokenizer.language_tags[source_language]
             # Missing graph metadata is treated conservatively: an unknown
             # reverse edge must not receive a roundtrip reward.
             reverse_direction_trained = bool(item.get("reverse_direction_trained", False))
@@ -270,7 +298,8 @@ class SionBatchCollator:
 
         if self.decoder_input_noise <= 0:
             return list(target)
-        vocab_size = self.tokenizer.vocab_size
+        vocab_size_value = cast(object, getattr(self.tokenizer, "vocab_size", None))
+        vocab_size = vocab_size_value if isinstance(vocab_size_value, int) else len(self.tokenizer)
         noised: list[int] = []
         for token_id in target:
             if token_id in self.slot_ids or rng.random() >= self.decoder_input_noise:
@@ -286,8 +315,8 @@ class SionBatchCollator:
                 noised.append(rng.randrange(vocab_size))
         return noised
 
-    def __call__(self, items: Sequence[dict]) -> dict[str, torch.Tensor]:
-        examples = [self._make_example(item) for item in items]
+    def __call__(self, items: Sequence[Mapping[str, object]]) -> dict[str, torch.Tensor]:
+        examples = [self._make_example(cast(_CollatorItem, item)) for item in items]
         batch_size = len(examples)
         src_len = max(len(example["input_ids"]) for example in examples)
         tgt_len = max(len(example["decoder_input_ids"]) for example in examples)

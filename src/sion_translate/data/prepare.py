@@ -6,10 +6,11 @@ import re
 import shutil
 import sqlite3
 import uuid
+from collections.abc import Iterator
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Any, BinaryIO, Sequence, TypeAlias
 
 import numpy as np
 
@@ -165,8 +166,8 @@ class ShardWriter:
         self.src_offset = 0
         self.tgt_offset = 0
         self.total_records = 0
-        self._src_handle = None
-        self._tgt_handle = None
+        self._src_handle: BinaryIO | None = None
+        self._tgt_handle: BinaryIO | None = None
         self._open_shard()
 
     def _prefix(self) -> str:
@@ -271,22 +272,33 @@ _QUALITY_REASON_FIELDS = {
 }
 
 
+_PrepareBatchInput: TypeAlias = tuple[
+    int,
+    list[bytes],
+    QualityPolicy,
+    bool,
+    tuple[tuple[str, str], ...],
+]
+_PrepareEvent: TypeAlias = tuple[str, tuple[Any, ...]]
+
 _PREPARE_WORKER_TOKENIZER: SionTokenizer | None = None
 
 
 def _initialize_prepare_worker(tokenizer_model: str) -> None:
     global _PREPARE_WORKER_TOKENIZER
-    _PREPARE_WORKER_TOKENIZER = SionTokenizer(tokenizer_model)
+    _PREPARE_WORKER_TOKENIZER = SionTokenizer(  # pyright: ignore[reportConstantRedefinition]
+        tokenizer_model
+    )
 
 
-def _process_prepare_batch(args):
+def _process_prepare_batch(args: _PrepareBatchInput) -> list[_PrepareEvent]:
     """CPU-heavy, order-preserving row work executed in worker processes."""
 
     source_id, rows, quality_policy, filter_quality, language_pairs = args
     tokenizer = _PREPARE_WORKER_TOKENIZER
     if tokenizer is None:
         raise RuntimeError("prepare worker tokenizer was not initialized")
-    output = []
+    output: list[_PrepareEvent] = []
     for raw_line in rows:
         output.append(("physical_line", (source_id,)))
         record_group_key = hashlib.sha256(raw_line.strip()).hexdigest()
@@ -362,7 +374,7 @@ def _prepare_input_batches(
     filter_quality: bool,
     language_pairs: tuple[tuple[str, str], ...],
     batch_size: int = 512,
-):
+) -> Iterator[_PrepareBatchInput]:
     for source_id, path in enumerate(paths):
         with path.open("rb") as handle:
             rows: list[bytes] = []
@@ -407,15 +419,19 @@ class _SqliteDigestSet:
 
     def __init__(self, path: Path):
         self.path = path
-        self.connection = sqlite3.connect(path)
-        self.connection.execute("PRAGMA journal_mode=OFF")
-        self.connection.execute("PRAGMA synchronous=OFF")
-        self.connection.execute("PRAGMA temp_store=MEMORY")
-        self.connection.execute("PRAGMA locking_mode=EXCLUSIVE")
-        self.connection.execute("CREATE TABLE digests (digest BLOB PRIMARY KEY) WITHOUT ROWID")
-        self.connection.execute("BEGIN IMMEDIATE")
+        self.connection: sqlite3.Connection | None = sqlite3.connect(path)
+        connection = self.connection
+        assert connection is not None
+        connection.execute("PRAGMA journal_mode=OFF")
+        connection.execute("PRAGMA synchronous=OFF")
+        connection.execute("PRAGMA temp_store=MEMORY")
+        connection.execute("PRAGMA locking_mode=EXCLUSIVE")
+        connection.execute("CREATE TABLE digests (digest BLOB PRIMARY KEY) WITHOUT ROWID")
+        connection.execute("BEGIN IMMEDIATE")
 
     def add_if_new(self, digest: bytes) -> bool:
+        if self.connection is None:
+            raise RuntimeError("digest store is closed")
         cursor = self.connection.execute(
             "INSERT OR IGNORE INTO digests(digest) VALUES (?)",
             (sqlite3.Binary(digest),),
@@ -426,7 +442,7 @@ class _SqliteDigestSet:
         if self.connection is not None:
             self.connection.commit()
             self.connection.close()
-            self.connection = None  # type: ignore[assignment]
+            self.connection = None
 
 
 # 합성 데이터가 든 입력 파일의 접두어. 이런 파일은 train split 에만 넣습니다 —
@@ -477,6 +493,9 @@ def prepare_dataset(
     quality_policy = quality_policy or QualityPolicy()
     quality_policy.validate()
     normalized_pairs = normalize_language_pairs(language_pair, language_pairs)
+    if not normalized_pairs:
+        raise ValueError("at least one language pair is required")
+    primary_pair = next(iter(normalized_pairs))
     endpoint_key_schema = (
         "language-prefixed-minhash-char5-v1" if approximate_split else "language-prefixed-exact-v1"
     )
@@ -589,7 +608,7 @@ def prepare_dataset(
     try:
         for batch in processed_batches:
             for status, payload in batch:
-                source_id = payload[0]
+                source_id = int(payload[0])
                 source_stats = per_source_stats[source_id]
                 targets = (stats, source_stats)
                 if status == "physical_line":
@@ -782,7 +801,7 @@ def prepare_dataset(
 
     manifest = {
         "format": INDEX_FORMAT,
-        "language_pair": list(normalized_pairs[0]),
+        "language_pair": list(primary_pair),
         "language_pairs": [list(pair) for pair in normalized_pairs],
         "languages": list(languages),
         "language_to_id": language_to_id,

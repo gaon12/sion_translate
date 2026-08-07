@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from collections import deque
-from concurrent.futures import Executor
+from concurrent.futures import Executor, Future
 from dataclasses import dataclass
 from typing import Callable, Iterable, Iterator, TypeVar
 
@@ -84,7 +84,7 @@ def bounded_ordered_map(
     """Ordered executor map that does not enqueue a multi-GiB input eagerly."""
 
     iterator = iter(inputs)
-    pending = deque()
+    pending: deque[Future[_Output]] = deque()
     for _ in range(max(1, max_pending)):
         try:
             pending.append(executor.submit(function, next(iterator)))

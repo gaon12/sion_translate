@@ -236,10 +236,10 @@ class CorpusScreenReport:
     rows: int = 0
     flagged: int = 0
     unscreened_language: int = 0
-    child_marker_counts: dict[str, int] = field(default_factory=dict)
-    sexual_marker_counts: dict[str, int] = field(default_factory=dict)
-    age_counts: dict[int, int] = field(default_factory=dict)
-    flagged_row_ids: list[str] = field(default_factory=list)
+    child_marker_counts: dict[str, int] = field(default_factory=lambda: {})
+    sexual_marker_counts: dict[str, int] = field(default_factory=lambda: {})
+    age_counts: dict[int, int] = field(default_factory=lambda: {})
+    flagged_row_ids: list[str] = field(default_factory=lambda: [])
 
     @property
     def flagged_rate(self) -> float:

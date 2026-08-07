@@ -37,6 +37,9 @@ on machine-translated data. Every check is a multiset comparison so repeated
 units are counted rather than deduplicated.
 """
 
+# Preservation reports aggregate heterogeneous JSON values.
+# pyright: reportArgumentType=false, reportUnknownVariableType=false
+
 from __future__ import annotations
 
 from collections import Counter

@@ -4,7 +4,7 @@ import bisect
 import json
 import math
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator, cast
 
 import numpy as np
 from torch.utils.data import Dataset, Sampler
@@ -19,7 +19,7 @@ from .record_metadata import (
 )
 
 
-class IndexedParallelDataset(Dataset):
+class IndexedParallelDataset(Dataset[dict[str, object]]):
     def __init__(
         self,
         root: str | Path,
@@ -78,9 +78,9 @@ class IndexedParallelDataset(Dataset):
                 self.has_forward_only_metadata = False
                 forward_only_flags.append(np.zeros(len(index), dtype=np.bool_))
         self.pair_count = total
-        self.pair_lengths = np.concatenate(lengths)
-        self.pair_source_ids = np.concatenate(source_ids)
-        self.pair_synthetic_flags = np.concatenate(synthetic_flags)
+        self.pair_lengths: np.ndarray | None = np.concatenate(lengths)
+        self.pair_source_ids: np.ndarray | None = np.concatenate(source_ids)
+        self.pair_synthetic_flags: np.ndarray | None = np.concatenate(synthetic_flags)
         self.forward_only_count = int(np.count_nonzero(np.concatenate(forward_only_flags)))
         self.source_names = self._load_source_names()
         self.synthetic_sampling_weight = self._load_synthetic_sampling_weight()
@@ -154,7 +154,7 @@ class IndexedParallelDataset(Dataset):
         self._bidirectional_pairs = np.flatnonzero(~flags).astype(np.int32)
         self._forward_only_pairs = np.flatnonzero(flags).astype(np.int32)
 
-    def __getstate__(self) -> dict:
+    def __getstate__(self) -> dict[str, Any]:
         """Keep Windows spawn workers from serializing hundreds of MB of memmaps."""
 
         state = self.__dict__.copy()
@@ -169,7 +169,7 @@ class IndexedParallelDataset(Dataset):
         state["_record_metadata_cache"] = {}
         return state
 
-    def __setstate__(self, state: dict) -> None:
+    def __setstate__(self, state: dict[str, Any]) -> None:
         self.__dict__.update(state)
         # Pickles created before row sidecars predate the opt-in flag.
         self.include_metadata = bool(getattr(self, "include_metadata", False))
@@ -187,43 +187,54 @@ class IndexedParallelDataset(Dataset):
         manifest_path = self.dataset_root / "manifest.json"
         if manifest_path.exists():
             with manifest_path.open("r", encoding="utf-8") as handle:
-                manifest = json.load(handle)
-            raw_pairs = manifest.get("language_pairs")
+                manifest = cast(dict[str, Any], json.load(handle))
+            raw_pairs: object = manifest.get("language_pairs")
             if isinstance(raw_pairs, list) and raw_pairs:
+                pair_values = cast(list[object], raw_pairs)
                 pairs = tuple(
-                    (str(pair[0]), str(pair[1]))
-                    for pair in raw_pairs
-                    if isinstance(pair, list) and len(pair) == 2
+                    (str(pair_values[0]), str(pair_values[1]))
+                    for raw_pair in pair_values
+                    if isinstance(raw_pair, list)
+                    and len(pair_values := cast(list[object], raw_pair)) == 2
                 )
-                raw_languages = manifest.get("languages")
+                raw_languages: object = manifest.get("languages")
                 languages = (
-                    tuple(map(str, raw_languages))
+                    tuple(map(str, cast(list[object], raw_languages)))
                     if isinstance(raw_languages, list)
                     else tuple(dict.fromkeys(language for pair in pairs for language in pair))
                 )
                 if pairs and languages:
                     return pairs, languages
-            pair = manifest.get("language_pair")
-            if isinstance(pair, list) and len(pair) == 2:
-                normalized = (str(pair[0]), str(pair[1]))
-                return (normalized,), normalized
+            pair: object = manifest.get("language_pair")
+            if isinstance(pair, list):
+                pair_items = cast(list[object], pair)
+                if len(pair_items) == 2:
+                    normalized = (str(pair_items[0]), str(pair_items[1]))
+                    return (normalized,), normalized
         return (("ko", "ja"),), ("ko", "ja")
 
     def _load_source_names(self) -> list[str]:
         manifest_path = self.dataset_root / "manifest.json"
         if not manifest_path.exists():
+            if self.pair_source_ids is None:
+                return ["source-0"]
             maximum = int(self.pair_source_ids.max(initial=0))
             return [f"source-{source_id}" for source_id in range(maximum + 1)]
         with manifest_path.open("r", encoding="utf-8") as handle:
-            manifest = json.load(handle)
-        sources = manifest.get("sources") or []
+            manifest = cast(dict[str, Any], json.load(handle))
+        raw_sources: object = manifest.get("sources")
+        sources = cast(list[object], raw_sources) if isinstance(raw_sources, list) else []
         if not sources:
-            inputs = manifest.get("inputs") or []
-            return [Path(path).name for path in inputs] or ["source-0"]
-        maximum = max(int(source["id"]) for source in sources)
+            raw_inputs: object = manifest.get("inputs")
+            inputs = cast(list[object], raw_inputs) if isinstance(raw_inputs, list) else []
+            return [Path(str(path)).name for path in inputs] or ["source-0"]
+        source_mappings = [
+            cast(dict[object, object], source) for source in sources if isinstance(source, dict)
+        ]
+        maximum = max(int(str(source["id"])) for source in source_mappings)
         names = [f"source-{source_id}" for source_id in range(maximum + 1)]
-        for source in sources:
-            names[int(source["id"])] = str(source["name"])
+        for source in source_mappings:
+            names[int(str(source["id"]))] = str(source["name"])
         return names
 
     def _load_source_only_languages(self) -> tuple[str, ...]:
@@ -231,20 +242,21 @@ class IndexedParallelDataset(Dataset):
         if not manifest_path.exists():
             return ()
         with manifest_path.open("r", encoding="utf-8") as handle:
-            manifest = json.load(handle)
-        raw = manifest.get("source_only_languages")
+            manifest = cast(dict[str, Any], json.load(handle))
+        raw: object = manifest.get("source_only_languages")
         if not isinstance(raw, list):
             return ()
-        return tuple(str(language) for language in raw)
+        return tuple(str(language) for language in cast(list[object], raw))
 
     def _load_synthetic_sampling_weight(self) -> float:
         manifest_path = self.dataset_root / "manifest.json"
         if not manifest_path.exists():
             return DEFAULT_SYNTHETIC_SAMPLING_WEIGHT
         with manifest_path.open("r", encoding="utf-8") as handle:
-            manifest = json.load(handle)
-        policy = manifest.get("synthetic_policy") or {}
-        return float(policy.get("sampling_weight", DEFAULT_SYNTHETIC_SAMPLING_WEIGHT))
+            manifest = cast(dict[str, Any], json.load(handle))
+        raw_policy: object = manifest.get("synthetic_policy")
+        policy = cast(dict[object, object], raw_policy) if isinstance(raw_policy, dict) else {}
+        return float(str(policy.get("sampling_weight", DEFAULT_SYNTHETIC_SAMPLING_WEIGHT)))
 
     def __len__(self) -> int:
         if not self.bidirectional:
@@ -431,7 +443,7 @@ class IndexedParallelDataset(Dataset):
             else False
         )
 
-    def __getitem__(self, index: int) -> dict:
+    def __getitem__(self, index: int) -> dict[str, object]:
         if index < 0:
             index += len(self)
         if index < 0 or index >= len(self):
@@ -487,7 +499,7 @@ class IndexedParallelDataset(Dataset):
             if row.dtype.names is not None and "forward_only" in row.dtype.names
             else False
         )
-        item = {
+        item: dict[str, object] = {
             "src": src,
             "tgt": tgt,
             "src_language": src_language,
@@ -699,7 +711,9 @@ class DistributedBucketBatchSampler(Sampler[list[int]]):
         if not self.dataset.bidirectional:
             return sampled_pairs
         directions = rng.integers(0, 2, size=sample_count, dtype=np.uint32)
-        return self.dataset._virtual_indices_for_pairs(sampled_pairs, directions)
+        return self.dataset._virtual_indices_for_pairs(  # pyright: ignore[reportPrivateUsage]
+            sampled_pairs, directions
+        )
 
     def __iter__(self) -> Iterator[list[int]]:
         if self._balance_sources:

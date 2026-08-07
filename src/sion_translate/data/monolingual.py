@@ -17,6 +17,9 @@
 호출자가 학습 시작 전에 보고합니다.
 """
 
+# Monolingual manifests contain heterogeneous JSON statistics.
+# pyright: reportUnknownVariableType=false
+
 from __future__ import annotations
 
 import hashlib

@@ -1,3 +1,6 @@
+# Fingerprint manifests contain recursively heterogeneous JSON values.
+# pyright: reportUnknownArgumentType=false, reportUnknownVariableType=false
+
 from __future__ import annotations
 
 import hashlib

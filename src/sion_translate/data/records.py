@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 import re
-from typing import Sequence
+from typing import cast
 
 from .record_metadata import inherit_record_metadata
 
@@ -21,7 +22,7 @@ class ParallelText:
     text_a: str
     language_b: str
     text_b: str
-    metadata: dict[str, object] = field(default_factory=dict, hash=False)
+    metadata: dict[str, object] = field(default_factory=lambda: {}, hash=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,7 +85,7 @@ def _pair_labels(language_a: str, language_b: str) -> tuple[str, ...]:
     )
 
 
-def _first_value(mapping: dict, names: Sequence[str]) -> object | None:
+def _first_value(mapping: Mapping[object, object], names: Sequence[str]) -> object | None:
     for name in names:
         if name in mapping:
             return mapping[name]
@@ -115,9 +116,14 @@ def expand_parallel_record(
     def values(value: object) -> list[str] | None:
         if isinstance(value, str):
             return [value]
-        if isinstance(value, (list, tuple)) and all(isinstance(item, str) for item in value):
-            return list(value)
+        if isinstance(value, (list, tuple)):
+            items = cast(Sequence[object], value)
+            if all(isinstance(item, str) for item in items):
+                return [item for item in items if isinstance(item, str)]
         return None
+
+    def is_container(value: object) -> bool:
+        return isinstance(value, (dict, list, tuple))
 
     def emit(
         language_a: str,
@@ -151,7 +157,7 @@ def expand_parallel_record(
             output.append(ParallelText(*key, metadata=inherit_record_metadata({}, metadata)))
 
     def emit_explicit(
-        mapping: dict,
+        mapping: Mapping[object, object],
         context: tuple[str, str] | None,
         metadata: dict[str, object],
     ) -> bool:
@@ -188,33 +194,35 @@ def expand_parallel_record(
         inherited_metadata: dict[str, object] | None = None,
     ) -> None:
         if isinstance(node, (list, tuple)):
-            for item in node:
+            for item in cast(Sequence[object], node):
                 walk(item, context, inherited_metadata)
             return
         if not isinstance(node, dict):
             issue("invalid_record")
             return
 
-        metadata = inherit_record_metadata(node, inherited_metadata)
-        explicit = emit_explicit(node, context, metadata)
+        mapping = cast(dict[object, object], node)
+
+        metadata = inherit_record_metadata(mapping, inherited_metadata)
+        explicit = emit_explicit(mapping, context, metadata)
         if not explicit:
             for language_a, language_b in configured:
-                if language_a in node or language_b in node:
-                    if language_a not in node or language_b not in node:
+                if language_a in mapping or language_b in mapping:
+                    if language_a not in mapping or language_b not in mapping:
                         issue("missing_text")
                     else:
                         emit(
                             language_a,
-                            node[language_a],
+                            mapping[language_a],
                             language_b,
-                            node[language_b],
+                            mapping[language_b],
                             metadata,
                         )
 
         nested: dict[str, tuple[str, str]] = {}
         for language_a, language_b in configured:
             for label in _pair_labels(language_a, language_b):
-                if label not in node:
+                if label not in mapping:
                     continue
                 nested[label] = (
                     (language_a, language_b)
@@ -222,12 +230,14 @@ def expand_parallel_record(
                     else (language_b, language_a)
                 )
 
-        for key, value in node.items():
+        for key, value in mapping.items():
+            if not isinstance(key, str):
+                continue
             if key in nested:
                 walk(value, nested[key], metadata)
             elif key in _CONTAINER_KEYS:
                 walk(value, context, metadata)
-            elif key == "translation" and not explicit and isinstance(value, (dict, list, tuple)):
+            elif key == "translation" and not explicit and is_container(value):
                 # Hugging Face translation datasets conventionally wrap their
                 # language map in a singular ``translation`` field.  Keep the
                 # scalar field reserved for explicit source/target records.

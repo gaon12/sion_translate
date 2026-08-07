@@ -1,3 +1,6 @@
+# NumPy min-hash operations lose element types in current stubs.
+# pyright: reportUnknownArgumentType=false, reportUnknownMemberType=false, reportUnknownParameterType=false, reportUnknownVariableType=false
+
 from __future__ import annotations
 
 import hashlib
