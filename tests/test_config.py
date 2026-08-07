@@ -40,7 +40,6 @@ def test_shipped_configs_keep_canonical_paths_without_release_namespaces() -> No
         "debug.yaml": "runs/debug",
         "sion_1_3b.yaml": "runs/sion-1.3b",
         "sion_8b.yaml": "runs/sion-8b",
-        "sion_32b.yaml": "runs/sion-32b",
         "sion_data_fit.yaml": "runs/sion-data-fit",
     }
     for config_path in sorted(config_root.rglob("*.yaml")):
@@ -207,7 +206,6 @@ def test_capacity_presets_are_clean_architecture_baselines() -> None:
         "sion_1_3b.yaml",
         "sion_data_fit.yaml",
         "aspirational/sion_8b.yaml",
-        "aspirational/sion_32b.yaml",
     )
     for name in names:
         experimental = load_config(config_root / name).model.experimental

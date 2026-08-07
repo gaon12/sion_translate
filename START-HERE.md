@@ -105,9 +105,9 @@ SION_NO_TMUX=1 python3 easy_run.py
 전제로 한 용량 기준 설정입니다. `easy_run.py`는 기본 `sion_translate.yaml`과 자동
 설정을 사용하므로 이 파일을 자동 선택하지 않습니다.
 
-`configs/aspirational/`의 `sion_8b.yaml`과 `sion_32b.yaml`은 **실행 대상이 아닙니다.**
-현재 코퍼스는 한 번 통과에 약 0.357B 토큰이고, 32B 설정은 Chinchilla 기준의 1,790배가
-부족합니다. 수치와 필요한 데이터 규모는 `configs/aspirational/README.md`를 보십시오.
+`configs/aspirational/sion_8b.yaml`은 **실행 대상이 아닙니다.** 현재 코퍼스는 한 번
+통과에 약 0.357B 토큰이고, 8B 설정은 Chinchilla 기준의 460배가 부족합니다. 수치와
+필요한 데이터 규모는 `configs/aspirational/README.md`를 보십시오.
 
 ## 5. 결과와 재개
 
