@@ -78,7 +78,7 @@ class EMAWeights:
         parameter.copy_(shadow)
         shadow.copy_(current)
 
-    @contextmanager
+    @contextmanager  # pyright: ignore[reportDeprecated]
     def swap(self, model: nn.Module) -> Iterator[None]:
         """블록 안에서만 모델 가중치를 EMA 값으로 바꿉니다 (나가면 원상복구).
 

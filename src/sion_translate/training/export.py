@@ -12,6 +12,11 @@ implement the Sion encoder-decoder architecture; it is therefore an honest
 storage/interchange artifact rather than a falsely advertised llama.cpp model.
 """
 
+# Optional TorchAO/GGUF/remote-code APIs do not publish complete typing metadata.
+# Keep strict checking for known types while containing Unknown values at this
+# integration boundary.
+# pyright: reportMissingImports=false, reportUnknownArgumentType=false, reportUnknownMemberType=false, reportUnknownVariableType=false
+
 from __future__ import annotations
 
 import copy
@@ -31,7 +36,7 @@ import zipfile
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -96,7 +101,7 @@ def _legacy_kjx_pickle_aliases():
     import sion_translate.model.layers as layers_module
 
     legacy_model_module = types.ModuleType("kjx.model.kjx")
-    legacy_model_module.KJXForConditionalGeneration = SionForConditionalGeneration
+    legacy_model_module.__dict__["KJXForConditionalGeneration"] = SionForConditionalGeneration
     aliases = {
         "kjx": sion_translate,
         "kjx.config": config_module,
@@ -121,7 +126,7 @@ def _hydrate_legacy_module_attributes(model: nn.Module, config: ModelConfig) -> 
     """Restore non-parameter runtime attributes absent from early pickles."""
 
     if isinstance(model, SionForConditionalGeneration):
-        model._synchronize_generation_across_ranks = getattr(
+        model._synchronize_generation_across_ranks = getattr(  # pyright: ignore[reportPrivateUsage]
             model,
             "_synchronize_generation_across_ranks",
             False,
@@ -144,7 +149,9 @@ def _hydrate_legacy_module_attributes(model: nn.Module, config: ModelConfig) -> 
             module.head_dim = getattr(module, "head_dim", config.d_model // config.num_heads)
             module.max_seq_len = getattr(module, "max_seq_len", config.max_seq_len)
             module.base = getattr(module, "base", 10000.0)
-            module._cache_device = getattr(module, "_cache_device", str(module.cos.device))
+            module._cache_device = getattr(  # pyright: ignore[reportPrivateUsage]
+                module, "_cache_device", str(module.cos.device)
+            )
 
 
 def _model_config_from_dict(raw: Mapping[str, Any]) -> ModelConfig:
@@ -228,7 +235,7 @@ def _directory_entry(path: Path) -> dict[str, Any]:
 
 def _tensor_bytes(tensor: torch.Tensor) -> memoryview:
     cpu = tensor.detach().to("cpu").contiguous()
-    return memoryview(cpu.view(torch.uint8).numpy())
+    return memoryview(cpu.view(torch.uint8).numpy().tobytes())
 
 
 def _state_sha256(state_dict: Mapping[str, torch.Tensor]) -> str:
@@ -316,8 +323,6 @@ def _normalize_translation_directions(
     bidirectional: bool = True,
 ) -> list[list[str]]:
     pairs = _normalize_language_pairs(language_pairs=language_pairs)
-    if not isinstance(bidirectional, bool):
-        raise ValueError("bidirectional must be a boolean")
     if translation_directions is None:
         directions: list[list[str]] = []
         for source, target in pairs:
@@ -1377,7 +1382,7 @@ def export_state_dict_formats(
     same_weights = (
         previous_manifest is not None and previous_manifest.get("artifact_set_id") == artifact_id
     )
-    if metadata is None and same_weights:
+    if metadata is None and previous_manifest is not None and same_weights:
         export_metadata = copy.deepcopy(previous_manifest.get("metadata") or {})
     else:
         export_metadata = copy.deepcopy(
@@ -1966,9 +1971,12 @@ def validate_export_directory(directory: str | Path) -> dict[str, Any]:
                     )
 
             if format_name in {*_PRECISION_DTYPES, "int8", "int4"}:
-                model, config, pad_id, artifact_metadata = load_exported_model(
-                    artifact,
-                    return_metadata=True,
+                model, config, pad_id, artifact_metadata = cast(
+                    tuple[nn.Module, ModelConfig, int, dict[str, Any]],
+                    load_exported_model(
+                        artifact,
+                        return_metadata=True,
+                    ),
                 )
                 expected_artifact_set_id = _artifact_set_id(
                     str(manifest["state_sha256"]),
@@ -2054,8 +2062,9 @@ def unwrap_model(model: nn.Module) -> nn.Module:
 
     unwrapped = model
     while True:
-        if hasattr(unwrapped, "_orig_mod"):
-            unwrapped = unwrapped._orig_mod
+        original = getattr(unwrapped, "_orig_mod", None)
+        if isinstance(original, nn.Module):
+            unwrapped = original
             continue
         module = getattr(unwrapped, "module", None)
         if isinstance(module, nn.Module):
@@ -2076,9 +2085,12 @@ def gather_full_state_dict(
             get_model_state_dict,
         )
 
-        return get_model_state_dict(
-            model,
-            options=StateDictOptions(full_state_dict=True, cpu_offload=True),
+        return cast(
+            dict[str, torch.Tensor],
+            get_model_state_dict(
+                model,
+                options=StateDictOptions(full_state_dict=True, cpu_offload=True),
+            ),
         )
     return {
         # ``copy=True`` is required when the source already lives on CPU.

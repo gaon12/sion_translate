@@ -19,6 +19,9 @@ export 는 가중치를 FP8 로 저장합니다. 그것을 불러올 때 고정�
 수치는 ``sion_translate.fp8`` 문서에 있습니다.
 """
 
+# Torch FP8 primitives and optional packed-module hooks are incompletely typed.
+# pyright: reportArgumentType=false, reportCallIssue=false, reportUnknownMemberType=false, reportUnknownVariableType=false
+
 from __future__ import annotations
 
 import torch
@@ -115,7 +118,7 @@ def apply_fp8_weights(
                 f"{module_name} is a {type(target).__name__}, not nn.Linear; "
                 "the FP8 export and this model do not agree"
             )
-        if target.bias is not None:
+        if target.bias is not None:  # pyright: ignore[reportUnnecessaryComparison]
             raise ValueError(f"{module_name} has a bias, which Fp8Linear does not carry")
         _replace_child(
             model,

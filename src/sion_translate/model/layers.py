@@ -1,3 +1,6 @@
+# PyTorch attention and RoPE overloads do not retain cache tuple shapes.
+# pyright: reportCallIssue=false, reportUnknownArgumentType=false, reportUnknownMemberType=false, reportUnknownParameterType=false, reportUnknownVariableType=false
+
 from __future__ import annotations
 
 
@@ -125,6 +128,8 @@ class GQAAttention(nn.Module):
       (decoder→encoder)에는 위치 회전을 적용하지 않습니다.
     """
 
+    rope: RotaryEmbedding | None
+
     def __init__(
         self,
         d_model: int,
@@ -197,7 +202,7 @@ class GQAAttention(nn.Module):
             # cross-attention 캐시 적중: encoder 쪽 k/v 재계산 생략
             k, v = past_key_value
         else:
-            source = key_value_states if is_cross_attention else hidden_states
+            source = key_value_states if key_value_states is not None else hidden_states
             k, v = self.project_key_value(source)
             if self.rope is not None and not is_cross_attention:
                 q, k = self.rope(q, k, offset=position_offset)
@@ -451,4 +456,6 @@ class DecoderLayer(nn.Module):
         )
         x = x + cross_out
         x = x + self.ffn(self.ffn_norm(x))
+        if self_kv is None or cross_kv is None:
+            raise RuntimeError("decoder attention cache was not initialized")
         return x, self_kv, cross_kv

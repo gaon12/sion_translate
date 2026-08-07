@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Callable, TypedDict, cast
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
-from torch.utils.checkpoint import checkpoint
+from torch.utils.checkpoint import checkpoint  # pyright: ignore[reportUnknownVariableType]
 
 from sion_translate.config import ModelConfig
 
@@ -22,13 +22,22 @@ from .experimental import (
 from .layers import DecoderLayer, EncoderLayer, GQAAttention, RMSNorm, RotaryEmbedding, SwiGLU
 
 
+_activation_checkpoint = cast(Callable[..., torch.Tensor], checkpoint)
+_KeyValue = tuple[torch.Tensor, torch.Tensor]
+
+
+class _LayerCache(TypedDict):
+    self: _KeyValue | None
+    cross: _KeyValue | None
+
+
 def _all_ranks_finished(local_finished: bool, device: torch.device) -> bool:
     """Return true only when every distributed rank can leave its decode loop."""
 
     if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() == 1:
         return local_finished
     flag = torch.tensor(1 if local_finished else 0, dtype=torch.int32, device=device)
-    dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN)  # pyright: ignore[reportUnknownMemberType]
     return bool(flag.item())
 
 
@@ -38,7 +47,7 @@ def _all_ranks_max_new_tokens(local_max_new_tokens: int, device: torch.device) -
     if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() == 1:
         return local_max_new_tokens
     limit = torch.tensor(local_max_new_tokens, dtype=torch.int32, device=device)
-    dist.all_reduce(limit, op=dist.ReduceOp.MAX)
+    dist.all_reduce(limit, op=dist.ReduceOp.MAX)  # pyright: ignore[reportUnknownMemberType]
     return int(limit.item())
 
 
@@ -52,8 +61,6 @@ def _validate_row_generation_limits(
 ) -> torch.Tensor | None:
     if limits is None:
         return None
-    if not isinstance(limits, torch.Tensor):
-        raise TypeError("max_new_tokens_per_row must be a tensor or None")
     if limits.ndim != 1 or limits.shape[0] != batch_size:
         raise ValueError(
             f"max_new_tokens_per_row must have shape ({batch_size},), got {tuple(limits.shape)}"
@@ -161,32 +168,43 @@ class SionForConditionalGeneration(nn.Module):
         head_dim = config.d_model // config.num_heads
         self.encoder_rope = RotaryEmbedding(head_dim, config.max_seq_len, config.rope_base)
         self.decoder_rope = RotaryEmbedding(head_dim, config.max_seq_len, config.rope_base)
-        layer_args = dict(
-            d_model=config.d_model,
-            num_heads=config.num_heads,
-            num_kv_heads=config.num_kv_heads,
-            d_ff=config.d_ff,
-            dropout=config.dropout,
-            qk_norm=config.qk_norm,
-            norm_eps=config.rms_norm_eps,
-            ffn_gate_beta=(
-                config.experimental.situglu_gate_beta
-                if config.experimental.situglu_enabled
-                else None
-            ),
-            ffn_up_beta=(
-                config.experimental.situglu_up_beta if config.experimental.situglu_enabled else None
-            ),
+        ffn_gate_beta = (
+            config.experimental.situglu_gate_beta if config.experimental.situglu_enabled else None
+        )
+        ffn_up_beta = (
+            config.experimental.situglu_up_beta if config.experimental.situglu_enabled else None
         )
         self.encoder_layers = nn.ModuleList(
             [
-                EncoderLayer(**layer_args, rope=self.encoder_rope)
+                EncoderLayer(
+                    config.d_model,
+                    config.num_heads,
+                    config.num_kv_heads,
+                    config.d_ff,
+                    dropout=config.dropout,
+                    rope=self.encoder_rope,
+                    qk_norm=config.qk_norm,
+                    norm_eps=config.rms_norm_eps,
+                    ffn_gate_beta=ffn_gate_beta,
+                    ffn_up_beta=ffn_up_beta,
+                )
                 for _ in range(config.encoder_layers)
             ]
         )
         self.decoder_layers = nn.ModuleList(
             [
-                DecoderLayer(**layer_args, rope=self.decoder_rope)
+                DecoderLayer(
+                    config.d_model,
+                    config.num_heads,
+                    config.num_kv_heads,
+                    config.d_ff,
+                    dropout=config.dropout,
+                    rope=self.decoder_rope,
+                    qk_norm=config.qk_norm,
+                    norm_eps=config.rms_norm_eps,
+                    ffn_gate_beta=ffn_gate_beta,
+                    ffn_up_beta=ffn_up_beta,
+                )
                 for _ in range(config.decoder_layers)
             ]
         )
@@ -198,7 +216,7 @@ class SionForConditionalGeneration(nn.Module):
         self.recurrent_steps = max(1, config.experimental.recurrent_steps)
         self.encoder_norm = RMSNorm(config.d_model, config.rms_norm_eps)
         self.decoder_norm = RMSNorm(config.d_model, config.rms_norm_eps)
-        self.lm_head = (
+        self.lm_head: nn.Linear | None = (
             None
             if config.tie_embeddings
             else nn.Linear(config.d_model, config.vocab_size, bias=False)
@@ -214,7 +232,7 @@ class SionForConditionalGeneration(nn.Module):
             torch.cuda.get_rng_state_all() if torch.cuda.is_initialized() else None
         )
         exp = config.experimental
-        self.morphoscript = (
+        self.morphoscript: MorphoScriptFusion | None = (
             MorphoScriptFusion(config.d_model, exp.script_classes)
             if exp.morphoscript_enabled
             else None
@@ -222,10 +240,10 @@ class SionForConditionalGeneration(nn.Module):
         # MorphoScript 를 켰을 때만 게이트 파라미터를 만듭니다. 꺼져 있는데
         # 파라미터로 등록해 두면 DDP 가 find_unused_parameters=True 를
         # 요구하게 되어 매 step 불필요한 통신 비용이 생깁니다.
-        self.morph_gates = (
+        self.morph_gates: nn.Parameter | None = (
             nn.Parameter(torch.zeros(config.encoder_layers)) if exp.morphoscript_enabled else None
         )
-        self.register_state = (
+        self.register_state: ContentRegisterState | None = (
             ContentRegisterState(
                 config.d_model,
                 exp.register_classes,
@@ -234,7 +252,7 @@ class SionForConditionalGeneration(nn.Module):
             if exp.core_enabled
             else None
         )
-        self.typed_memory = (
+        self.typed_memory: TypedEntityMemory | None = (
             TypedEntityMemory(
                 config.d_model,
                 config.num_heads,
@@ -248,10 +266,10 @@ class SionForConditionalGeneration(nn.Module):
             if exp.tetm_enabled
             else None
         )
-        self.alignment_head = (
+        self.alignment_head: BilingualAlignmentTransport | None = (
             BilingualAlignmentTransport(config.d_model, exp.bats_dim) if exp.bats_enabled else None
         )
-        self.evidence_repair = (
+        self.evidence_repair: ActiveEvidenceRepair | None = (
             ActiveEvidenceRepair(
                 config.d_model,
                 config.num_heads,
@@ -263,7 +281,7 @@ class SionForConditionalGeneration(nn.Module):
             if exp.evidence_repair_enabled
             else None
         )
-        self.semantic_parity = (
+        self.semantic_parity: SemanticParityHead | None = (
             SemanticParityHead(
                 config.d_model,
                 exp.semantic_parity_dim,
@@ -308,7 +326,7 @@ class SionForConditionalGeneration(nn.Module):
         def initialize(module: nn.Module) -> None:
             if isinstance(module, nn.Linear):
                 nn.init.normal_(module.weight, mean=0.0, std=std)
-                if module.bias is not None:
+                if module.bias is not None:  # pyright: ignore[reportUnnecessaryComparison]
                     nn.init.zeros_(module.bias)
             elif isinstance(module, nn.Embedding):
                 nn.init.normal_(module.weight, mean=0.0, std=std)
@@ -350,8 +368,8 @@ class SionForConditionalGeneration(nn.Module):
 
     def _checkpoint(self, layer: nn.Module, *args: torch.Tensor) -> torch.Tensor:
         if self.config.gradient_checkpointing and self.training and torch.is_grad_enabled():
-            return checkpoint(layer, *args, use_reentrant=False)
-        return layer(*args)
+            return _activation_checkpoint(layer, *args, use_reentrant=False)
+        return cast(torch.Tensor, layer(*args))
 
     def encode(
         self,
@@ -376,8 +394,11 @@ class SionForConditionalGeneration(nn.Module):
         interval = max(1, self.config.experimental.morphoscript_interval)
 
         def run_layer(index: int, hidden: torch.Tensor) -> torch.Tensor:
-            hidden = self._checkpoint(self.encoder_layers[index], hidden, attention_mask)
+            layer = cast(EncoderLayer, self.encoder_layers[index])
+            hidden = self._checkpoint(layer, hidden, attention_mask)
             if side_states is not None and (index + 1) % interval == 0:
+                if self.morph_gates is None:
+                    raise RuntimeError("MorphoScript gates are unavailable")
                 hidden = hidden + torch.tanh(self.morph_gates[index]) * side_states
             return hidden
 
@@ -690,7 +711,7 @@ class SionForConditionalGeneration(nn.Module):
         tokens: torch.Tensor,
         encoder_states: torch.Tensor,
         source_mask: torch.Tensor,
-        caches: list[dict[str, tuple[torch.Tensor, torch.Tensor] | None]],
+        caches: list[_LayerCache],
         position: int,
         register_context: torch.Tensor | None,
         *,
@@ -708,7 +729,8 @@ class SionForConditionalGeneration(nn.Module):
         hidden = self._embed(tokens)
         if register_context is not None:
             hidden = hidden + register_context[:, None, :].to(dtype=hidden.dtype)
-        for layer, cache in zip(self.decoder_layers, caches, strict=True):
+        for raw_layer, cache in zip(self.decoder_layers, caches, strict=True):
+            layer = cast(DecoderLayer, raw_layer)
             hidden, cache["self"], cache["cross"] = layer.forward_step(
                 hidden,
                 encoder_states,
@@ -739,22 +761,26 @@ class SionForConditionalGeneration(nn.Module):
         cross_key_values: tuple[tuple[torch.Tensor, torch.Tensor], ...] | None = None,
         *,
         repeats: int = 1,
-    ) -> list[dict[str, Any]]:
+    ) -> list[_LayerCache]:
         if cross_key_values is None:
             return [{"self": None, "cross": None} for _ in range(layer_count)]
         if len(cross_key_values) != layer_count:
             raise ValueError("cross_key_values must have one entry per decoder layer")
-        return [
+        caches: list[_LayerCache] = [
             {
                 "self": None,
                 "cross": (
-                    tuple(value.repeat_interleave(repeats, dim=0) for value in key_value)
+                    (
+                        key_value[0].repeat_interleave(repeats, dim=0),
+                        key_value[1].repeat_interleave(repeats, dim=0),
+                    )
                     if repeats > 1
                     else key_value
                 ),
             }
             for key_value in cross_key_values
         ]
+        return caches
 
     @torch.no_grad()
     def prepare_generation(
@@ -781,7 +807,8 @@ class SionForConditionalGeneration(nn.Module):
                     register_labels=None,
                 )
             cross_key_values = tuple(
-                layer.project_cross_key_value(encoder_states) for layer in self.decoder_layers
+                cast(DecoderLayer, layer).project_cross_key_value(encoder_states)
+                for layer in self.decoder_layers
             )
             evidence_key_value = (
                 self.evidence_repair.project_key_value(encoder_states)
@@ -887,7 +914,7 @@ class SionForConditionalGeneration(nn.Module):
         두 경로 모두 KV cache 를 사용해 토큰당 비용이 문장 길이에 선형입니다
         (이전 구현은 매 토큰마다 prefix 전체를 다시 계산했습니다).
         """
-        if not isinstance(max_new_tokens, int) or isinstance(max_new_tokens, bool):
+        if isinstance(max_new_tokens, bool):
             raise TypeError("max_new_tokens must be an integer")
         if not 1 <= max_new_tokens <= self.config.max_seq_len:
             raise ValueError(
@@ -997,7 +1024,7 @@ class SionForConditionalGeneration(nn.Module):
         **encoder_features: torch.Tensor,
     ) -> torch.Tensor:
         """MRT용 확률적 후보를 ``(batch, samples, length)``로 생성합니다."""
-        if not isinstance(max_new_tokens, int) or isinstance(max_new_tokens, bool):
+        if isinstance(max_new_tokens, bool):
             raise TypeError("max_new_tokens must be an integer")
         if not 1 <= max_new_tokens <= self.config.max_seq_len:
             raise ValueError(
@@ -1056,8 +1083,9 @@ class SionForConditionalGeneration(nn.Module):
             if register_context is not None:
                 register_context = register_context.repeat_interleave(num_samples, dim=0)
             if evidence_key_value is not None:
-                evidence_key_value = tuple(
-                    value.repeat_interleave(num_samples, dim=0) for value in evidence_key_value
+                evidence_key_value = (
+                    evidence_key_value[0].repeat_interleave(num_samples, dim=0),
+                    evidence_key_value[1].repeat_interleave(num_samples, dim=0),
                 )
             if memory_token_ids is not None:
                 memory_token_ids = memory_token_ids.repeat_interleave(num_samples, dim=0)
@@ -1247,8 +1275,9 @@ class SionForConditionalGeneration(nn.Module):
         if register_context is not None:
             register_context = register_context.repeat_interleave(num_beams, dim=0)
         if evidence_key_value is not None:
-            evidence_key_value = tuple(
-                value.repeat_interleave(num_beams, dim=0) for value in evidence_key_value
+            evidence_key_value = (
+                evidence_key_value[0].repeat_interleave(num_beams, dim=0),
+                evidence_key_value[1].repeat_interleave(num_beams, dim=0),
             )
         if memory_token_ids is not None:
             memory_token_ids = memory_token_ids.repeat_interleave(num_beams, dim=0)
@@ -1276,8 +1305,11 @@ class SionForConditionalGeneration(nn.Module):
         beam_scores[:, 0] = 0.0
         # 완성된 가설: batch 별 (length-penalty 적용 점수, 토큰 텐서) 목록
         done: list[list[tuple[float, torch.Tensor]]] = [[] for _ in range(batch)]
-        maximum_completion_lengths = (
-            max_new_tokens_per_row.tolist()
+        maximum_completion_lengths: list[int] = (
+            cast(
+                list[int],
+                max_new_tokens_per_row.tolist(),  # pyright: ignore[reportUnknownMemberType]
+            )
             if max_new_tokens_per_row is not None
             else [max_new_tokens] * batch
         )
@@ -1363,11 +1395,21 @@ class SionForConditionalGeneration(nn.Module):
             finished = (finite & ends_here).nonzero(as_tuple=False)
             if finished.numel():
                 finished_rows = finished[:, 0]
-                finished_scores = top_scores[finished_rows, finished[:, 1]].tolist()
-                finished_sources = flat_sources[finished_rows, finished[:, 1]].tolist()
+                finished_scores = cast(
+                    list[float],
+                    top_scores[finished_rows, finished[:, 1]].tolist(),  # pyright: ignore[reportUnknownMemberType]
+                )
+                finished_sources = cast(
+                    list[int],
+                    flat_sources[finished_rows, finished[:, 1]].tolist(),  # pyright: ignore[reportUnknownMemberType]
+                )
+                finished_row_numbers = cast(
+                    list[int],
+                    finished_rows.tolist(),  # pyright: ignore[reportUnknownMemberType]
+                )
                 eos_column = torch.tensor([eos_id], device=device)
                 for row, score, source in zip(
-                    finished_rows.tolist(),
+                    finished_row_numbers,
                     finished_scores,
                     finished_sources,
                     strict=True,
@@ -1389,7 +1431,13 @@ class SionForConditionalGeneration(nn.Module):
                 (sequences.index_select(0, flat_index), step_tokens.reshape(-1, 1)), dim=1
             )
             for cache in caches:
-                cache["self"] = tuple(t.index_select(0, flat_index) for t in cache["self"])
+                self_key_value = cache["self"]
+                if self_key_value is None:
+                    raise RuntimeError("decoder cache was not initialized")
+                cache["self"] = (
+                    self_key_value[0].index_select(0, flat_index),
+                    self_key_value[1].index_select(0, flat_index),
+                )
             beam_scores = next_scores
 
             # 모든 문장이 '완성 가설이 충분하고, 살아있는 beam 이 더 나은 점수를
@@ -1397,7 +1445,10 @@ class SionForConditionalGeneration(nn.Module):
             all_done = all(len(hypotheses) >= num_beams for hypotheses in done)
             if all_done:
                 # One reduction and one host transfer instead of one per row.
-                best_alive = beam_scores.amax(dim=1).tolist()
+                best_alive = cast(
+                    list[float],
+                    beam_scores.amax(dim=1).tolist(),  # pyright: ignore[reportUnknownMemberType]
+                )
                 for row, hypotheses in enumerate(done):
                     # Log-probability can never increase. With a positive
                     # length penalty, however, dividing that negative score by

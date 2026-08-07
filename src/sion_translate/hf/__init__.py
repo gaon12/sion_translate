@@ -1,5 +1,8 @@
 """Hugging Face Transformers integration for Sion."""
 
+# Transformers Auto registries intentionally accept runtime class objects.
+# pyright: reportUnknownMemberType=false
+
 from __future__ import annotations
 
 from transformers import AutoConfig, AutoModelForSeq2SeqLM, AutoTokenizer

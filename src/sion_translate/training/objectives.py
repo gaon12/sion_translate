@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Iterable
 from dataclasses import dataclass
 import math
 import time
+from typing import Any, Callable, cast
 
 import torch
 import torch.nn.functional as F
-from sacrebleu.metrics import CHRF
+from sacrebleu.metrics.chrf import CHRF
 from torch import nn
-from torch.utils.checkpoint import checkpoint
+from torch.utils.checkpoint import checkpoint  # pyright: ignore[reportUnknownVariableType]
 
 from sion_translate.config import PostTrainingConfig
 from sion_translate.data.quality import canonical_text, language_fraction
@@ -19,9 +21,13 @@ from sion_translate.evaluation import (
     numeric_tokens,
     structured_tokens,
 )
+from sion_translate.model import SionForConditionalGeneration
 from sion_translate.tokenizer import SionTokenizer
 
 from .export import unwrap_model
+
+
+_activation_checkpoint = cast(Callable[..., torch.Tensor], checkpoint)
 
 
 @dataclass
@@ -58,8 +64,8 @@ class CompositeTranslationReward:
         self.language_by_tag = {
             token_id: language for language, token_id in tokenizer.language_tags.items()
         }
-        self.slot_ids = set(getattr(tokenizer, "slot_ids", ()))
-        self.special_ids = {
+        self.slot_ids: set[int] = set(cast(Iterable[int], getattr(tokenizer, "slot_ids", ())))
+        self.special_ids: set[int] = {
             tokenizer.pad_id,
             tokenizer.bos_id,
             tokenizer.eos_id,
@@ -251,13 +257,22 @@ class CompositeTranslationReward:
         for row_index, (source, candidate_row, reference) in enumerate(
             zip(inputs_cpu, candidates_cpu, references_cpu, strict=True)
         ):
-            source_ids = source.tolist()
-            reference_ids = reference.tolist()
+            source_ids = cast(
+                list[int],
+                source.tolist(),  # pyright: ignore[reportUnknownMemberType]
+            )
+            reference_ids = cast(
+                list[int],
+                reference.tolist(),  # pyright: ignore[reportUnknownMemberType]
+            )
             target_language = self.language_by_tag.get(source_ids[0]) if source_ids else None
             row_rewards: list[float] = []
-            row_components = {name: [] for name in self.weights}
+            row_components: dict[str, list[float]] = {name: [] for name in self.weights}
             for candidate_index, candidate in enumerate(candidate_row):
-                candidate_ids = candidate.tolist()
+                candidate_ids = cast(
+                    list[int],
+                    candidate.tolist(),  # pyright: ignore[reportUnknownMemberType]
+                )
                 if candidates_include_bos:
                     candidate_ids = candidate_ids[1:]
                 roundtrip_ids = None
@@ -265,7 +280,10 @@ class CompositeTranslationReward:
                     roundtrip_mask_cpu is None
                     or bool(roundtrip_mask_cpu[row_index, candidate_index])
                 ):
-                    roundtrip_ids = roundtrips_cpu[row_index, candidate_index].tolist()
+                    roundtrip_ids = cast(
+                        list[int],
+                        roundtrips_cpu[row_index, candidate_index].tolist(),  # pyright: ignore[reportUnknownMemberType]
+                    )
                     if candidates_include_bos:
                         roundtrip_ids = roundtrip_ids[1:]
                 reward, components = self._score_one(
@@ -306,7 +324,9 @@ class MinimumRiskObjective:
         labels.masked_fill_(labels.eq(eos_id).cumsum(dim=-1) > 1, -100)
         return labels
 
-    def _max_new_tokens(self, base: nn.Module, reference_labels: torch.Tensor) -> int:
+    def _max_new_tokens(
+        self, base: SionForConditionalGeneration, reference_labels: torch.Tensor
+    ) -> int:
         return min(
             self.config.max_new_tokens,
             base.config.max_seq_len - 1,
@@ -314,7 +334,7 @@ class MinimumRiskObjective:
         )
 
     @staticmethod
-    def _generation_features(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    def _generation_features(batch: dict[str, torch.Tensor]) -> dict[str, Any]:
         # Candidate scoring receives every non-target batch tensor through
         # ``_repeated_model_inputs``. Candidate generation must use the same
         # source-side context, otherwise a TETM-enabled model samples without
@@ -334,7 +354,7 @@ class MinimumRiskObjective:
     @torch.no_grad()
     def _backtranslate_candidates(
         self,
-        base: nn.Module,
+        base: SionForConditionalGeneration,
         batch: dict[str, torch.Tensor],
         candidates: torch.Tensor,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
@@ -519,7 +539,7 @@ class MinimumRiskObjective:
             return sequence_log_probs.view(batch_size, candidates)
 
         if self.config.candidate_gradient_checkpointing and torch.is_grad_enabled():
-            return checkpoint(
+            return _activation_checkpoint(
                 score_chunk,
                 decoder_input_ids,
                 labels,
@@ -592,7 +612,7 @@ class MinimumRiskObjective:
         self, model: nn.Module, batch: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
         """실제 추론과 가까운 beam 출력으로 사후학습 품질을 검증합니다."""
-        base = unwrap_model(model)
+        base = cast(SionForConditionalGeneration, unwrap_model(model))
         generated = base.generate(
             batch["input_ids"],
             batch["attention_mask"],
@@ -659,7 +679,7 @@ class MinimumRiskObjective:
         return metrics
 
     def __call__(self, model: nn.Module, batch: dict[str, torch.Tensor]) -> ObjectiveOutput:
-        base = unwrap_model(model)
+        base = cast(SionForConditionalGeneration, unwrap_model(model))
         reference_labels = batch["labels"]
         batch_size = reference_labels.shape[0]
         generation_features = self._generation_features(batch)

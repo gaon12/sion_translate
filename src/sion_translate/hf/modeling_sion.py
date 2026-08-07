@@ -1,5 +1,9 @@
 """Transformers model wrapper around the native Sion implementation."""
 
+# Transformers' generic model hooks and remote-code registration are only
+# partially typed. Keep known-type diagnostics strict at this adapter boundary.
+# pyright: reportArgumentType=false, reportAttributeAccessIssue=false, reportCallIssue=false, reportGeneralTypeIssues=false, reportIncompatibleMethodOverride=false, reportPrivateImportUsage=false, reportPrivateUsage=false, reportUnknownArgumentType=false, reportUnknownMemberType=false, reportUnknownVariableType=false
+
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -312,11 +316,15 @@ class SionForConditionalGeneration(PreTrainedModel, GenerationMixin):
                     dim=1,
                 )
                 for cache in caches:
+                    self_key_value = cache["self"]
+                    cross_key_value = cache["cross"]
+                    if self_key_value is None or cross_key_value is None:
+                        raise RuntimeError("generation cache was not initialized")
                     cache["self"] = tuple(
-                        tensor.index_select(0, flat_index) for tensor in cache["self"]
+                        tensor.index_select(0, flat_index) for tensor in self_key_value
                     )
                     cache["cross"] = tuple(
-                        tensor.index_select(0, flat_index) for tensor in cache["cross"]
+                        tensor.index_select(0, flat_index) for tensor in cross_key_value
                     )
                 beam_scores = next_scores
 

@@ -1,3 +1,6 @@
+# Distributed collectives and composable FSDP hooks are dynamically registered.
+# pyright: reportArgumentType=false, reportCallIssue=false, reportUnknownMemberType=false
+
 from __future__ import annotations
 
 import os
@@ -270,7 +273,7 @@ def parallelize_model(
     return model
 
 
-@contextmanager
+@contextmanager  # pyright: ignore[reportDeprecated]
 def maybe_no_sync(model: nn.Module, enabled: bool) -> Iterator[None]:
     if not enabled:
         yield

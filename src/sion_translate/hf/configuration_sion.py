@@ -1,5 +1,8 @@
 """Transformers configuration for the Sion encoder-decoder architecture."""
 
+# Transformers configuration dictionaries intentionally carry arbitrary JSON.
+# pyright: reportArgumentType=false, reportCallIssue=false, reportInvalidTypeForm=false, reportUnknownArgumentType=false, reportUnknownMemberType=false, reportUnknownParameterType=false, reportUnknownVariableType=false
+
 from __future__ import annotations
 
 from dataclasses import asdict
@@ -115,7 +118,9 @@ class SionConfig(PretrainedConfig):
                 for direction in (pair, list(reversed(pair)))
             ]
         )
-        if revision_trained is not None and not isinstance(revision_trained, bool):
+        if revision_trained is not None and not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
+            revision_trained, bool
+        ):
             raise ValueError("revision_trained must be a boolean or null")
         self.revision_trained = revision_trained
         self.slot_token_ids = [int(token_id) for token_id in (slot_token_ids or [])]

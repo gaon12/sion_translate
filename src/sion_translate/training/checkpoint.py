@@ -24,7 +24,7 @@ import warnings
 from collections.abc import Mapping
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -51,12 +51,13 @@ def _json_compatible(value: Any) -> Any:
     if is_dataclass(value) and not isinstance(value, type):
         value = asdict(value)
     if isinstance(value, Mapping):
+        mapping = cast(Mapping[object, object], value)
         return {
             str(key): _json_compatible(item)
-            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            for key, item in sorted(mapping.items(), key=lambda pair: str(pair[0]))
         }
     if isinstance(value, (list, tuple)):
-        return [_json_compatible(item) for item in value]
+        return [_json_compatible(item) for item in cast(list[Any] | tuple[Any, ...], value)]
     if isinstance(value, Path):
         return str(value)
     if value is None or isinstance(value, (bool, int, float, str)):
@@ -121,8 +122,9 @@ def _portable_data_config(data_config: Any) -> Any:
     payload = _json_compatible(data_config)
     if not isinstance(payload, Mapping):
         return payload
+    mapping = cast(Mapping[object, object], payload)
     return {
-        key: value for key, value in payload.items() if str(key) not in RUNTIME_DATA_PATH_FIELDS
+        key: value for key, value in mapping.items() if str(key) not in RUNTIME_DATA_PATH_FIELDS
     }
 
 
@@ -272,15 +274,17 @@ def _normalize_identity_for_comparison(identity: Mapping[str, Any]) -> dict[str,
     """Normalize legacy path-bearing identities to the portable representation."""
 
     payload = _json_compatible(identity)
+    payload = cast(dict[str, Any], payload)
     data_identity = payload.get("data")
     if not isinstance(data_identity, dict):
         return payload
-    data_config = data_identity.get("config")
+    typed_data_identity = cast(dict[str, Any], data_identity)
+    data_config = typed_data_identity.get("config")
     if data_config is None:
         return payload
     portable_config = _portable_data_config(data_config)
-    data_identity["config"] = portable_config
-    data_identity["config_sha256"] = hashlib.sha256(
+    typed_data_identity["config"] = portable_config
+    typed_data_identity["config_sha256"] = hashlib.sha256(
         _canonical_json(portable_config).encode("utf-8")
     ).hexdigest()
     return payload
@@ -292,22 +296,30 @@ def _identity_differences(expected: Any, actual: Any, path: str = "identity") ->
     if len(path) > 512:
         return [path]
     if isinstance(expected, Mapping) and isinstance(actual, Mapping):
+        expected_mapping = cast(Mapping[object, Any], expected)
+        actual_mapping = cast(Mapping[object, Any], actual)
         differences: list[str] = []
-        keys = sorted(set(expected) | set(actual), key=str)
+        keys = sorted(set(expected_mapping) | set(actual_mapping), key=str)
         for key in keys:
             child = f"{path}.{key}"
-            if key not in expected or key not in actual:
+            if key not in expected_mapping or key not in actual_mapping:
                 differences.append(child)
             else:
-                differences.extend(_identity_differences(expected[key], actual[key], child))
+                differences.extend(
+                    _identity_differences(expected_mapping[key], actual_mapping[key], child)
+                )
             if len(differences) >= 8:
                 return differences[:8]
         return differences
     if isinstance(expected, (list, tuple)) and isinstance(actual, (list, tuple)):
+        expected_sequence = cast(list[Any] | tuple[Any, ...], expected)
+        actual_sequence = cast(list[Any] | tuple[Any, ...], actual)
         differences = []
-        if len(expected) != len(actual):
+        if len(expected_sequence) != len(actual_sequence):
             differences.append(f"{path}.length")
-        for index, (expected_item, actual_item) in enumerate(zip(expected, actual, strict=False)):
+        for index, (expected_item, actual_item) in enumerate(
+            zip(expected_sequence, actual_sequence, strict=False)
+        ):
             differences.extend(
                 _identity_differences(expected_item, actual_item, f"{path}[{index}]")
             )
@@ -335,7 +347,7 @@ def _validate_identity(
     if not isinstance(stored_identity, Mapping):
         raise ValueError("checkpoint identity must be an object")
     expected = _normalize_identity_for_comparison(expected_identity)
-    actual = _normalize_identity_for_comparison(stored_identity)
+    actual = _normalize_identity_for_comparison(cast(Mapping[str, Any], stored_identity))
     if "objective" in expected and "objective" not in actual:
         # 목적함수 identity 가 없던 시절의 체크포인트입니다. 재개 자체를 막지는
         # 않되, 무엇을 검사하지 못했는지 밝힙니다 — 그 사이에 학습률이나 reward
@@ -359,12 +371,14 @@ def _validate_identity(
 
 
 def _capture_rng_state() -> dict[str, Any]:
-    numpy_state = np.random.get_state()
+    numpy_state = cast(tuple[str, np.ndarray, int, int, float], np.random.get_state())
     state: dict[str, Any] = {
         "python": random.getstate(),
         "numpy": {
             "algorithm": str(numpy_state[0]),
-            "keys": torch.from_numpy(numpy_state[1].copy()),
+            "keys": torch.from_numpy(  # pyright: ignore[reportUnknownMemberType]
+                numpy_state[1].copy()
+            ),
             "position": int(numpy_state[2]),
             "has_gauss": int(numpy_state[3]),
             "cached_gaussian": float(numpy_state[4]),
@@ -385,21 +399,23 @@ def _restore_rng_state(state: Mapping[str, Any]) -> None:
     torch_cpu_state = state.get("torch_cpu")
     if not isinstance(python_state, tuple):
         raise ValueError("checkpoint Python RNG state is invalid")
-    if not isinstance(numpy_state, Mapping) or not isinstance(
-        numpy_state.get("keys"), torch.Tensor
-    ):
+    if not isinstance(numpy_state, Mapping):
+        raise ValueError("checkpoint NumPy RNG state is invalid")
+    typed_numpy_state = cast(Mapping[str, Any], numpy_state)
+    if not isinstance(typed_numpy_state.get("keys"), torch.Tensor):
         raise ValueError("checkpoint NumPy RNG state is invalid")
     if not isinstance(torch_cpu_state, torch.Tensor):
         raise ValueError("checkpoint torch RNG state is invalid")
 
-    random.setstate(python_state)
+    random.setstate(cast(Any, python_state))
+    numpy_keys = cast(torch.Tensor, typed_numpy_state["keys"])
     np.random.set_state(
         (
-            str(numpy_state["algorithm"]),
-            numpy_state["keys"].detach().cpu().numpy().astype(np.uint32, copy=False),
-            int(numpy_state["position"]),
-            int(numpy_state["has_gauss"]),
-            float(numpy_state["cached_gaussian"]),
+            str(typed_numpy_state["algorithm"]),
+            numpy_keys.detach().cpu().numpy().astype(np.uint32, copy=False),
+            int(typed_numpy_state["position"]),
+            int(typed_numpy_state["has_gauss"]),
+            float(typed_numpy_state["cached_gaussian"]),
         )
     )
     torch.set_rng_state(torch_cpu_state.detach().cpu())
@@ -408,17 +424,18 @@ def _restore_rng_state(state: Mapping[str, Any]) -> None:
         if isinstance(cuda_state, torch.Tensor):
             selected_cuda_state = cuda_state
         elif isinstance(cuda_state, list) and all(
-            isinstance(item, torch.Tensor) for item in cuda_state
+            isinstance(item, torch.Tensor) for item in cast(list[object], cuda_state)
         ):
             # Backward compatibility for checkpoints that stored every visible
             # device. Restore only this rank's current device instead of
             # initializing or overwriting RNG streams owned by other ranks.
             current_device = torch.cuda.current_device()
-            if current_device >= len(cuda_state):
+            typed_cuda_state = cast(list[torch.Tensor], cuda_state)
+            if current_device >= len(typed_cuda_state):
                 raise ValueError(
                     "legacy checkpoint CUDA RNG state has no entry for the current device"
                 )
-            selected_cuda_state = cuda_state[current_device]
+            selected_cuda_state = typed_cuda_state[current_device]
         else:
             raise ValueError("checkpoint CUDA RNG state is invalid")
         torch.cuda.set_rng_state(selected_cuda_state.detach().cpu())
@@ -518,11 +535,13 @@ def _valid_dcp_completion(path: Path, *, world_size: int) -> bool:
         payload = json.loads(marker.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return False
+    if not isinstance(payload, Mapping):
+        return False
+    marker_payload = cast(Mapping[object, object], payload)
     return (
-        isinstance(payload, Mapping)
-        and payload.get("schema") == CHECKPOINT_SCHEMA
-        and isinstance(payload.get("step"), int)
-        and payload.get("world_size") == world_size
+        marker_payload.get("schema") == CHECKPOINT_SCHEMA
+        and isinstance(marker_payload.get("step"), int)
+        and marker_payload.get("world_size") == world_size
         and (path / ".metadata").is_file()
     )
 
@@ -570,21 +589,22 @@ def checkpoint_path_exists(path: str | Path) -> bool:
 def _validate_loaded_state(state: Any) -> Mapping[str, Any]:
     if not isinstance(state, Mapping):
         raise ValueError("checkpoint payload must be an object")
-    schema = state.get("schema")
+    typed_state = cast(Mapping[str, Any], state)
+    schema = typed_state.get("schema")
     if schema is not None and schema != CHECKPOINT_SCHEMA:
         raise ValueError(f"unsupported checkpoint schema: {schema!r}")
     missing = [
         key
         for key in ("model", "optimizer", "scheduler", "step", "training_state")
-        if key not in state
+        if key not in typed_state
     ]
     if missing:
         raise ValueError(f"checkpoint is missing required fields: {', '.join(missing)}")
-    if isinstance(state["step"], bool) or not isinstance(state["step"], int):
+    if isinstance(typed_state["step"], bool) or not isinstance(typed_state["step"], int):
         raise ValueError("checkpoint step must be an integer")
-    if not isinstance(state["training_state"], Mapping):
+    if not isinstance(typed_state["training_state"], Mapping):
         raise ValueError("checkpoint training_state must be an object")
-    return state
+    return typed_state
 
 
 def save_checkpoint(
@@ -637,7 +657,9 @@ def save_checkpoint(
         model_state, optimizer_state = get_state_dict(checkpoint_model, optimizer)
         state["model"] = model_state
         state["optimizer"] = optimizer_state
-        dcp.save(state, checkpoint_id=staging)
+        dcp.save(  # pyright: ignore[reportUnknownMemberType, reportPrivateImportUsage]
+            state, checkpoint_id=staging
+        )
         _atomic_torch_save(
             {"schema": CHECKPOINT_SCHEMA, "rng_state": _capture_rng_state()},
             staging / f"rng-rank-{context.rank:05d}.pt",
@@ -698,13 +720,19 @@ def initialize_model_from_checkpoint(
         state: dict[str, Any] = {"model": get_model_state_dict(checkpoint_model), "step": 0}
         if expected_identity is not None:
             state["identity"] = _json_compatible(expected_identity)
-        dcp.load(state, checkpoint_id=resolved)
+        dcp.load(  # pyright: ignore[reportUnknownMemberType, reportPrivateImportUsage]
+            state, checkpoint_id=resolved
+        )
         _validate_stage_transfer(state, expected_identity, source=resolved)
         set_model_state_dict(checkpoint_model, state["model"])
+        identity = state.get("identity")
+        identity_mapping: Mapping[object, object] = (
+            cast(Mapping[object, object], identity) if isinstance(identity, Mapping) else {}
+        )
         return {
             "source": str(resolved),
             "step": int(state.get("step") or 0),
-            "stage": (state.get("identity") or {}).get("stage"),
+            "stage": identity_mapping.get("stage"),
         }
 
     try:
@@ -719,13 +747,17 @@ def initialize_model_from_checkpoint(
             "stage-transfer checkpoint could not be loaded with PyTorch's safe "
             "weights-only loader; refusing to fall back to executable pickle"
         ) from error
-    state = _validate_loaded_state(loaded)
-    _validate_stage_transfer(state, expected_identity, source=path)
-    _unwrap_compiled_model(model).load_state_dict(state["model"])
+    loaded_state = _validate_loaded_state(loaded)
+    _validate_stage_transfer(loaded_state, expected_identity, source=path)
+    _unwrap_compiled_model(model).load_state_dict(loaded_state["model"])
+    identity = loaded_state.get("identity")
+    identity_mapping: Mapping[object, object] = (
+        cast(Mapping[object, object], identity) if isinstance(identity, Mapping) else {}
+    )
     return {
         "source": str(path),
-        "step": int(state.get("step") or 0),
-        "stage": (state.get("identity") or {}).get("stage"),
+        "step": int(loaded_state.get("step") or 0),
+        "stage": identity_mapping.get("stage"),
     }
 
 
@@ -749,7 +781,7 @@ def _validate_stage_transfer(
             f"stage-transfer checkpoint has no recorded identity: {source}. "
             "Refusing to inherit weights whose tokenizer cannot be verified."
         )
-    recorded = _normalize_identity_for_comparison(recorded)
+    recorded = _normalize_identity_for_comparison(cast(Mapping[str, Any], recorded))
     expected = _normalize_identity_for_comparison(expected_identity)
     differences: list[str] = []
     for section in ("tokenizer", "model"):
@@ -813,7 +845,9 @@ def load_checkpoint(
         state["schema"] = CHECKPOINT_SCHEMA
         # 체크포인트가 불완전하거나 구조가 맞지 않으면 여기서 바로 실패합니다.
         # 일부 파라미터가 초기값인 채로 조용히 재개되는 것이 훨씬 위험하기 때문입니다.
-        dcp.load(state, checkpoint_id=path)
+        dcp.load(  # pyright: ignore[reportUnknownMemberType, reportPrivateImportUsage]
+            state, checkpoint_id=path
+        )
         _validate_loaded_state(state)
         _validate_identity(state, expected_identity)
         set_state_dict(
@@ -837,11 +871,12 @@ def load_checkpoint(
                 weights_only=True,
                 mmap=True,
             )
-            if not isinstance(rng_payload, Mapping) or not isinstance(
-                rng_payload.get("rng_state"), Mapping
-            ):
+            if not isinstance(rng_payload, Mapping):
                 raise ValueError("distributed checkpoint RNG payload is invalid")
-            _restore_rng_state(rng_payload["rng_state"])
+            typed_rng_payload = cast(Mapping[str, Any], rng_payload)
+            if not isinstance(typed_rng_payload.get("rng_state"), Mapping):
+                raise ValueError("distributed checkpoint RNG payload is invalid")
+            _restore_rng_state(cast(Mapping[str, Any], typed_rng_payload["rng_state"]))
         return int(state["step"])
 
     # 단일 프로세스: 임의 코드 실행이 가능한 일반 pickle 로드는 사용하지 않습니다.
@@ -857,21 +892,21 @@ def load_checkpoint(
             "checkpoint could not be loaded with PyTorch's safe weights-only loader; "
             "refusing to fall back to executable pickle"
         ) from error
-    state = _validate_loaded_state(loaded)
+    loaded_state = _validate_loaded_state(loaded)
     # 모델/optimizer를 변경하기 전에 현재 실행과 체크포인트의 정체성을 비교합니다.
-    _validate_identity(state, expected_identity)
-    _unwrap_compiled_model(model).load_state_dict(state["model"])
-    optimizer.load_state_dict(state["optimizer"])
-    scheduler.load_state_dict(state["scheduler"])
-    if scaler is not None and state.get("scaler"):
-        scaler.load_state_dict(state["scaler"])
-    if ema is not None and state.get("ema"):
-        ema.load_state_dict(state["ema"])
+    _validate_identity(loaded_state, expected_identity)
+    _unwrap_compiled_model(model).load_state_dict(loaded_state["model"])
+    optimizer.load_state_dict(loaded_state["optimizer"])
+    scheduler.load_state_dict(loaded_state["scheduler"])
+    if scaler is not None and loaded_state.get("scaler"):
+        scaler.load_state_dict(loaded_state["scaler"])
+    if ema is not None and loaded_state.get("ema"):
+        ema.load_state_dict(loaded_state["ema"])
     if training_state is not None:
-        training_state.update(state.get("training_state", {}))
-    rng_state = state.get("rng_state")
+        training_state.update(loaded_state.get("training_state", {}))
+    rng_state = loaded_state.get("rng_state")
     if rng_state is not None:
         if not isinstance(rng_state, Mapping):
             raise ValueError("checkpoint RNG state must be an object")
-        _restore_rng_state(rng_state)
-    return int(state["step"])
+        _restore_rng_state(cast(Mapping[str, Any], rng_state))
+    return int(loaded_state["step"])

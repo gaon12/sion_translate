@@ -1,5 +1,8 @@
 """SentencePiece tokenizer exposed through the Transformers tokenizer API."""
 
+# PreTrainedTokenizer exposes dynamically typed compatibility hooks.
+# pyright: reportArgumentType=false, reportMissingImports=false, reportMissingModuleSource=false, reportUnknownArgumentType=false, reportUnknownMemberType=false, reportUnknownVariableType=false
+
 from __future__ import annotations
 
 import hashlib

@@ -15,6 +15,9 @@
      : 추론용. 일반(FP32) ``model.pt`` 와 INT8 양자화 ``model_int8.pt`` 둘 다 저장
 """
 
+# DataLoader samplers, AMP scalers, tqdm, and SummaryWriter expose dynamic hooks.
+# pyright: reportAttributeAccessIssue=false, reportUnknownArgumentType=false, reportUnknownMemberType=false
+
 from __future__ import annotations
 
 import json

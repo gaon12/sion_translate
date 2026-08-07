@@ -1,5 +1,8 @@
 """Conversion helpers for standard Transformers checkpoints."""
 
+# Safetensors and Transformers remote-code APIs have incomplete type metadata.
+# pyright: reportArgumentType=false, reportUnknownArgumentType=false, reportUnknownMemberType=false, reportUnknownVariableType=false
+
 from __future__ import annotations
 
 import hashlib
