@@ -26,6 +26,38 @@ def normalized_split_key(text: str) -> str:
     return _WHITESPACE.sub(" ", unicodedata.normalize("NFKC", text).strip())
 
 
+# General categories dropped by :func:`comparison_key`: punctuation, symbols,
+# separators, and control/format characters. Letters, combining marks and
+# digits survive.
+_DISCARDED_CATEGORIES = frozenset("PSZC")
+
+
+def comparison_key(text: str) -> str:
+    """NFKC text with punctuation, symbols and whitespace removed.
+
+    :func:`normalized_split_key` keeps punctuation, which is correct for a
+    dedup key -- two rows differing by a question mark are two rows. It is the
+    wrong question for "is this holdout sentence already in the training
+    corpus", because the copies that matter there differ by exactly that much:
+    ``김칫국부터 마시지 마.`` in the holdout against ``김칫국부터 마시지 마…``
+    in the corpus. Under the split key those are unequal, so a verbatim leak
+    gets reported as merely approximate and an exact-match count of zero reads
+    as "nothing leaked". Under this key they are one sentence, which is what a
+    human reviewer would say about them.
+
+    Characters are dropped by Unicode general category rather than from a
+    hand-written list, so a form nobody thought to list -- a full-width
+    bracket, a wave dash, an emoji -- cannot quietly defeat the comparison.
+    """
+
+    folded = unicodedata.normalize("NFKC", text)
+    return "".join(
+        character
+        for character in folded
+        if unicodedata.category(character)[0] not in _DISCARDED_CATEGORIES
+    )
+
+
 def character_shingles(text: str, size: int = SHINGLE_SIZE) -> list[str]:
     """Character n-grams of the normalized text, whitespace removed.
 

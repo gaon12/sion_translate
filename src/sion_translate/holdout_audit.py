@@ -29,6 +29,21 @@ MinHash 버킷도 버렸습니다. ``num_perm=1`` 의 충돌 확률은 Jaccard �
 위 사례의 J5 가 0.32 라 셋 중 둘은 후보에도 못 듭니다. 대신 challenge 쪽
 3-gram 역색인을 만듭니다 — challenge 는 수십 개뿐이라 색인이 작고, 코퍼스
 행마다 자기 3-gram 을 조회하기만 하면 겹치는 항목이 **빠짐없이** 나옵니다.
+
+## 구두점은 비교에서 제외한다
+
+포함도와 완전일치 판정 모두 :func:`~sion_translate.splitting.comparison_key`
+위에서 계산합니다. 구두점·기호·공백을 지운 형태입니다.
+
+이유는 실측입니다. 이전에는 완전일치를 dedup 용 키로 판정했고, 그 키는
+구두점을 남깁니다. 그래서 `김칫국부터 마시지 마.` 와 코퍼스의
+`김칫국부터 마시지 마…` 가 **다른 문장**으로 집계됐고, 완전일치 누출이
+0개로 보고됐습니다. 문장이 통째로 들어 있는데도 0개입니다. 마침표 하나가
+안전 관문을 통과시킨 셈입니다.
+
+dedup 키는 그대로 둡니다 — 물음표 하나가 다른 두 행은 학습 데이터로서는
+서로 다른 두 행이 맞습니다. 하지만 "이 문장이 이미 코퍼스에 있는가" 라는
+질문에서는 아닙니다. 두 질문에 같은 키를 쓴 것이 결함이었습니다.
 """
 
 # Holdout reports consume heterogeneous JSON findings.
@@ -42,7 +57,7 @@ from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
 from sion_translate.data.quality import canonical_text
-from sion_translate.splitting import character_shingles, normalized_split_key
+from sion_translate.splitting import character_shingles, comparison_key
 
 # challenge 문장의 3-gram 중 코퍼스 행에 들어 있는 비율의 하한. 위 표에서
 # 누출은 0.83 이상, 무관·주제유사는 0.00 이라 그 사이 어디든 되지만, 부분
@@ -133,7 +148,7 @@ def load_holdout_items(
 
 
 def shingles(text: str) -> set[str]:
-    return set(character_shingles(text, size=SHINGLE_SIZE))
+    return set(character_shingles(comparison_key(text), size=SHINGLE_SIZE))
 
 
 def containment(holdout_text: str, corpus_text: str) -> float:
@@ -214,7 +229,7 @@ def audit_holdout_leakage(
                     line=line_number,
                     text=text,
                     similarity=similarity,
-                    exact=normalized_split_key(text) == normalized_split_key(candidate.text),
+                    exact=comparison_key(text) == comparison_key(candidate.text),
                 )
             )
             # 상한은 **가장 나쁜** N 개를 남깁니다. 스캔 순서대로 앞의 N 개를

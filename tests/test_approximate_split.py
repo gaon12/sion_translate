@@ -17,9 +17,43 @@ from sion_translate.splitting import (
     approximate_split_key,
     character_shingles,
     choose_split_for_key,
+    comparison_key,
     minhash_signature,
     normalized_split_key,
 )
+
+
+def test_comparison_key_drops_punctuation_where_the_split_key_keeps_it() -> None:
+    """두 키는 서로 다른 질문에 답한다.
+
+    dedup 은 "이 두 행이 같은 행인가" 이고 구두점은 유효한 차이입니다.
+    누출 감사는 "이 문장이 이미 코퍼스에 있는가" 이고 거기서는 아닙니다.
+    """
+
+    assert normalized_split_key("김칫국부터 마시지 마.") != normalized_split_key(
+        "김칫국부터 마시지 마…"
+    )
+    assert comparison_key("김칫국부터 마시지 마.") == comparison_key("김칫국부터 마시지 마…")
+
+
+def test_comparison_key_drops_by_category_not_by_a_listed_alphabet() -> None:
+    """목록에 없는 기호가 비교를 조용히 무력화하면 안 된다."""
+
+    plain = comparison_key("최고")
+    for decorated in ("최고!", "「최고」", "최고～", "최고 ✨", "최고\u200b"):
+        assert comparison_key(decorated) == plain, decorated
+
+    # 글자·숫자는 살아남는다. 지우면 서로 다른 문장이 같아진다.
+    assert comparison_key("가격은 1,000원") == "가격은1000원"
+    assert comparison_key("ＡＢＣ") == "ABC"
+
+    # 자모 웃음은 기호가 아니라 글자다. 이것이 지워지면 `ㅋㅋㅋ` 하나로
+    # 이루어진 감탄사 challenge 가 빈 문자열이 되어 아무 행에나 일치한다.
+    # NFKC 가 호환 자모를 결합 자모로 접으므로 표기는 바뀌지만, 코퍼스와
+    # holdout 이 같은 변환을 거치므로 비교는 성립한다.
+    assert len(comparison_key("ㅋㅋㅋ")) == 3
+    assert comparison_key("ㅋㅋㅋ!") == comparison_key("ㅋㅋㅋ")
+    assert comparison_key("ㅠㅠ") == comparison_key("ㅠㅠ…")
 
 
 def test_shingles_ignore_whitespace_and_normalize() -> None:

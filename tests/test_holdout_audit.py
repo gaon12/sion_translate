@@ -80,6 +80,36 @@ def test_an_exact_duplicate_in_the_corpus_is_found(tmp_path) -> None:
     assert all(finding.worst.line == 2 for finding in leaked)
 
 
+def test_trailing_punctuation_does_not_hide_a_verbatim_leak(tmp_path) -> None:
+    """실측 사례. 마침표 하나가 완전일치 집계를 0 으로 만들고 있었다.
+
+    `김칫국부터 마시지 마.` 는 `data29.jsonl:185527` 에 `김칫국부터 마시지 마…`
+    로 통째로 들어 있습니다. dedup 키는 구두점을 남기므로 둘이 다른 문장으로
+    집계됐고, 관문은 "완전일치 누출 0개" 라고 보고했습니다.
+    """
+
+    challenge = _challenge(
+        tmp_path / "cases.jsonl",
+        [
+            {
+                "id": "c1",
+                "source": "김칫국부터 마시지 마.",
+                "source_language": "ko",
+                "target_language": "ja",
+            }
+        ],
+    )
+    corpus = _shard(
+        tmp_path / "data" / "shard.jsonl",
+        [{"ko": "김칫국부터 마시지 마…", "ja": "取らぬ狸の皮算用をするな。"}],
+    )
+    findings = audit_holdout_leakage(load_holdout_items([challenge]), [corpus])
+    leaked = [finding for finding in findings if finding.leaked]
+
+    assert len(leaked) == 1
+    assert leaked[0].worst.exact, "구두점만 다른 행은 완전일치로 잡혀야 한다"
+
+
 def test_a_near_duplicate_is_found_where_exact_matching_would_miss_it(tmp_path) -> None:
     """조사 하나 다른 행은 완전일치로 잡히지 않는다. 그래서 MinHash 를 쓴다."""
     challenge = _challenge(
