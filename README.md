@@ -1,5 +1,8 @@
 # sion_translate
 
+> 어느 문서를 읽어야 할지 모르겠다면 [`docs/README.md`](docs/README.md)가
+> 질문별 색인입니다.
+
 sion_translate는 한국어↔일본어 번역 모델을 처음부터 학습하고 평가하는 PyTorch 프로젝트입니다.
 joint SentencePiece, GQA, RoPE, pre-RMSNorm, QK-norm, SwiGLU, EMA, 양방향 번역,
 용어집 강제, SFT 뒤 최소위험 사후학습을 포함합니다.
@@ -70,8 +73,8 @@ python -m venv .venv
 선택, SFT와 사후학습, 체크포인트 재개를 순서대로 처리합니다. tokenizer와 dataset은
 안정된 공개 경로인 `artifacts/`에 만들며, 재사용 전 메타데이터·SHA-256·언어 태그·
 숫자 분리 정책·dataset 지문을 검사합니다. 이 자동 실행기는 Linux CUDA GPU 서버용이며 CPU나 Windows에서는
-수동 CLI 경로를 사용해야 합니다. 세부 GPU 서버 실행법은 [`START-HERE.md`](START-HERE.md)와
-[`how_to_run.txt`](how_to_run.txt), 사후학습 설계는
+수동 CLI 경로를 사용해야 합니다. 세부 GPU 서버 실행법은 [`START-HERE.md`](START-HERE.md)
+(평문판은 [`how_to_run.txt`](how_to_run.txt), 같은 절차의 두 표기입니다), 사후학습 설계는
 [`POSTTRAINING.md`](POSTTRAINING.md)를 참고하세요. 80GB급 GPU의 수동 용량 점검과
 7종 내보내기는
 [`docs/H100_TRAINING.md`](docs/H100_TRAINING.md), 데이터 정비 현황과 1억 쌍

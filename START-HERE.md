@@ -23,8 +23,11 @@ python3 scripts/package_gpu_bundle.py verify-tree .
 ZIP에는 다음이 포함됩니다.
 
 - Git이 추적하는 소스·설정·테스트·문서
-- `data/` 바로 아래의 학습 JSONL 51개
+- `data/` 바로 아래의 학습 JSONL 전량
 - 학습에서 격리된 `data/evaluation_only/`
+
+정확한 파일 목록과 개수는 `PACKAGE_MANIFEST.json`에 있습니다. 여기에 숫자를
+적어 두면 shard 를 늘릴 때마다 이 문서가 틀리므로 적지 않습니다.
 
 품질 문제로 제외한 `data/excluded/`, 과거 `artifacts/`, `runs/`, 체크포인트,
 가상환경과 캐시는 포함되지 않습니다. 서버에서 현재 코드와 데이터로 새로 만듭니다.
