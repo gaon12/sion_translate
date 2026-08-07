@@ -608,11 +608,11 @@ def iter_tokenizer_sentences(
 
 @dataclass(frozen=True)
 class CorpusCounts:
-    """한 번의 스캔에서 나오는 두 값.
+    """한 번의 스캔에서 나오는 값들.
 
-    문자 빈도는 ``required_chars`` 를 뽑는 데 쓰고, 문장 수는
-    :func:`seed_array_elements` 가 SentencePiece 의 상한을 계산하는 데 씁니다.
-    두 값이 같은 pass 에서 나와야 서로 어긋나지 않습니다.
+    문자 빈도는 ``required_chars`` 를 뽑는 데 쓰고, 가장 긴 낱말은
+    SentencePiece 의 16비트 낱말 한계를 넘는지 보는 데 씁니다. 같은 pass 에서
+    나와야 서로 어긋나지 않습니다.
     """
 
     characters: Counter[str]
@@ -623,41 +623,31 @@ class CorpusCounts:
         return sum(self.characters.values())
 
 
-def seed_array_elements(characters: int, sentences: int) -> int:
-    """SentencePiece 가 seed piece 추출에 쓰는 배열의 원소 수.
-
-    ``MakeSeedSentencePieces`` 는 모든 문장을 ``vector<char32>`` 하나로 이어
-    붙이고 문장마다 경계 문자를 하나씩 넣습니다. 그래서 원소 수는 문자 수와
-    문장 수의 **합** 이고, 접미사 배열이 그 위에 올라갑니다.
-    """
-
-    return characters + sentences
-
-
-# 이 크기를 넘으면 SentencePiece 가 seed piece 추출 중 SIGSEGV 로 죽습니다.
-# 메모리가 아닙니다 — 통과한 실행의 peak RSS 는 49.75 GiB 였고, 실패한 실행은
-# 256 GiB 를 주고도 더 일찍 죽었습니다. `train_extremely_large_corpus=True` 도
-# 막지 못합니다.
+# ─────────────────────────────────────────────────────────────────────────
+# SentencePiece 가 seed piece 추출에서 SIGSEGV 로 죽는 경우가 있습니다.
+# **원인을 모릅니다.** 여기에 크기 상한을 두지 않는 이유가 그것입니다.
 #
-# 실측 (원소 = 문자 + 문장):
+# 2026-08-07 실측. 원소 = 문자 + 문장 (`MakeSeedSentencePieces` 가 문장마다
+# 경계 문자를 하나 넣고 이어 붙입니다):
 #
-#     0.123 G  ->  통과
-#     0.304 G  ->  통과
-#     1.110 G  ->  통과
-#     1.967 G  ->  통과      <- 최대 성공
-#     1.975 G  ->  SIGSEGV   <- 최소 실패
-#     2.779 G  ->  SIGSEGV
-#     3.971 G  ->  SIGSEGV
+#     문장        문자     원소    최장낱말   결과
+#     20,459,141  0.93 G  0.95 G   16,886   통과
+#     20,923,746  1.95 G  1.97 G        ?   통과
+#     20,355,467  1.06 G  1.08 G    1,401   SIGSEGV
+#     24,954,792  1.95 G  1.98 G        ?   SIGSEGV
+#     41,438,233  3.93 G  3.97 G        ?   SIGSEGV
 #
-# 경계는 1.967~1.975 G 사이, 즉 2^31 의 91.6% 지점입니다. 정확히 2^31 이 아닌
-# 이유는 알 수 없습니다 — SentencePiece 가 바이너리라 내부를 볼 수 없고, 접미사
-# 배열 경로의 32비트 인덱스에 센티널·중간 계산 여유분이 붙는다는 것이 가장
-# 그럴듯한 설명입니다. 원인을 단정하지 않고 **관측된 경계 아래**로 막습니다.
+# 세 번째 줄이 핵심입니다. 첫 줄보다 **모든 축에서 작은데** 죽습니다.
+# 배제된 가설: 메모리(통과 실행 peak 40~50 GiB, 실패는 256 GiB 를 주고도
+# 죽음), 문자 수, 문장 수, 원소 수, 스레드 경합(4·16 둘 다 죽음), 4 KiB 초과
+# 긴 줄(미리 걸러도 죽음), google/sentencepiece#954 의 32,768 자 낱말 한계
+# (최장 1,401 자 코퍼스가 죽으므로 해당 없음), required_chars 의 블록 문자.
 #
-# 문장 수만 세지 않고 원소로 세는 이유는 두 차원을 동시에 막기 때문입니다
-# (문장 수는 항상 원소 수 이하). 관측만으로는 "문장 수 한계"와 "원소 수 한계"를
-# 구별할 수 없는데, 원소 쪽이 실제 자료구조에 대응하고 더 보수적입니다.
-SEED_ARRAY_ELEMENT_LIMIT = 1_900_000_000
+# 크기로 예측할 수 없으므로 크기 상한은 거짓 안심만 줍니다. 실패는 코퍼스를
+# 전부 읽은 뒤에 오고, 파이썬 예외가 아니라 프로세스가 사라지므로 로그에
+# 원인이 남지 않습니다. 새 코퍼스로 큰 학습을 걸기 전에 **같은 코퍼스의
+# 표본으로 작게 한 번 돌려 보는 것** 외에 알려진 방어가 없습니다.
+# ─────────────────────────────────────────────────────────────────────────
 
 
 def corpus_character_counts(
@@ -705,7 +695,17 @@ def corpus_character_counts(
 # :func:`acceptable_required_characters`: this list is what we happen to know,
 # not what SentencePiece happens to enforce, so the set is verified rather than
 # trusted.
-SENTENCEPIECE_RESERVED_CHARACTERS = frozenset("⁇▅")
+SENTENCEPIECE_RESERVED_CHARACTERS = frozenset(
+    # U+2047 is kUNKChar itself.
+    "⁇"
+    # U+2580-U+259F, the Block Elements. SentencePiece treats these as reserved
+    # and drops any *sentence* containing one, which it announces as
+    # "Reserved chars are found. Skipped: ...". Requiring a character while
+    # discarding every sentence that carries it is a contradiction: the
+    # vocabulary must hold it, and nothing in the corpus can teach it. They are
+    # ASCII-art residue in scraped text, never content worth a reserved slot.
+    + "".join(chr(codepoint) for codepoint in range(0x2580, 0x25A0))
+)
 
 
 def required_characters_from_counts(
@@ -920,20 +920,10 @@ def train_tokenizer(
         # 코퍼스가 SentencePiece 가 감당하는 크기인지 먼저 봅니다. 넘으면
         # seed piece 추출 중 SIGSEGV 로 죽는데, 그 지점까지 가는 데만 몇 시간이
         # 걸리고 실패 원인이 로그에 남지 않습니다.
-        elements = seed_array_elements(counts.character_total, counts.sentences)
-        if elements > SEED_ARRAY_ELEMENT_LIMIT:
-            over = elements / SEED_ARRAY_ELEMENT_LIMIT
-            raise ValueError(
-                f"코퍼스가 SentencePiece 한계를 넘습니다: 문자 "
-                f"{counts.character_total:,} + 문장 {counts.sentences:,} = "
-                f"{elements:,} 원소, 상한 {SEED_ARRAY_ELEMENT_LIMIT:,} 의 {over:.2f}배. "
-                "이대로 학습하면 코퍼스를 다 읽은 뒤 seed piece 추출에서 SIGSEGV 로 "
-                "죽습니다. 줄이는 방법은 두 가지입니다: "
-                "foundation.tokenizer_sample_ratio 를 낮춰 단일어 표본을 줄이거나, "
-                "input_sentence_size 로 문장 수에 상한을 두십시오. "
-                "required_chars 는 전량 코퍼스에서 나오므로 어느 쪽을 택해도 "
-                "내용 문자는 어휘에 그대로 남습니다."
-            )
+        print(
+            f"[tokenizer] 코퍼스 규모: 문장 {counts.sentences:,}, 문자 {counts.character_total:,}",
+            flush=True,
+        )
 
         required_characters = required_characters_from_counts(
             counts.characters,

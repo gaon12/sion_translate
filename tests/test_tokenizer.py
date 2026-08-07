@@ -10,13 +10,12 @@ import sentencepiece as spm
 from sion_translate.fingerprint import file_sha256
 from sion_translate.splitting import choose_split_for_key, endpoint_split_key
 from sion_translate.tokenizer import (
-    SEED_ARRAY_ELEMENT_LIMIT,
+    SENTENCEPIECE_RESERVED_CHARACTERS,
     TOKENIZER_METADATA_VERSION,
     CorpusCounts,
     SionTokenizer,
     iter_parallel_text,
     load_tokenizer_metadata,
-    seed_array_elements,
     tokenizer_split_digits_policy,
     train_tokenizer,
 )
@@ -116,67 +115,26 @@ def _numeric_corpus(tmp_path: Path) -> Path:
     return source
 
 
-def test_seed_array_counts_the_sentence_boundaries_too() -> None:
-    """SentencePiece 는 문장마다 경계 문자를 하나씩 넣는다.
-
-    그래서 배열 크기는 문자 수만으로 결정되지 않습니다. 짧은 문장이 아주 많은
-    코퍼스는 문자 수가 같아도 배열이 더 큽니다 — 실측에서 문자가 **더 적은**
-    코퍼스가 문장이 많다는 이유로 먼저 죽었습니다.
-    """
-
-    assert seed_array_elements(1_000, 10) == 1_010
+def test_corpus_counts_report_both_dimensions_from_one_pass() -> None:
     counts = CorpusCounts(characters=Counter("가나다"), sentences=1)
     assert counts.character_total == 3
+    assert counts.sentences == 1
 
 
-def test_a_corpus_over_the_sentencepiece_ceiling_is_refused_before_training(
-    tmp_path: Path, monkeypatch
-) -> None:
-    """넘으면 코퍼스를 다 읽은 뒤 SIGSEGV 로 죽는다. 그 전에 멈춰야 한다.
+def test_the_block_elements_are_reserved_and_never_required() -> None:
+    """SentencePiece 는 블록 문자가 든 **문장을 통째로 버립니다.**
 
-    실측 경계는 1.967 G(통과) 와 1.975 G(실패) 사이입니다. 그 지점까지 가는 데만
-    수십 분이고, 죽을 때 파이썬 예외가 아니라 프로세스가 사라지므로 로그에
-    원인이 남지 않습니다.
+    로그에 ``Reserved chars are found. Skipped: ...`` 로 나옵니다. 그런 문자를
+    `required_chars` 로 넘기는 것은 모순입니다 — 어휘에는 반드시 넣으라면서
+    그것을 가르칠 문장은 하나도 남기지 않는 셈입니다. 웹에서 긁은 문서의
+    아스키 아트 잔재이지 어휘 한 칸을 줄 내용 문자가 아닙니다.
     """
 
-    shard = tmp_path / "data" / "corpus.jsonl"
-    shard.parent.mkdir(parents=True, exist_ok=True)
-    shard.write_text(
-        "\n".join(
-            json.dumps({"ko": f"문장 {index}", "ja": f"文 {index}"}, ensure_ascii=False)
-            for index in range(200)
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
-    # 실제로 20억 원소짜리 코퍼스를 만들 수는 없으므로 상한을 낮춰 검사합니다.
-    monkeypatch.setattr("sion_translate.tokenizer.SEED_ARRAY_ELEMENT_LIMIT", 10)
-
-    trained: list[object] = []
-    monkeypatch.setattr(
-        spm.SentencePieceTrainer,
-        "train",
-        lambda **kwargs: trained.append(kwargs),
-    )
-
-    with pytest.raises(ValueError, match="SentencePiece 한계"):
-        train_tokenizer([str(shard)], tmp_path / "out", vocab_size=300)
-
-    assert not trained, "한계를 넘은 코퍼스로 학습을 시작하면 안 된다"
-
-
-def test_the_ceiling_leaves_headroom_under_the_smallest_observed_failure() -> None:
-    """상한은 최대 성공값이 아니라 그 아래여야 한다.
-
-    성공 1.967 G 와 실패 1.975 G 는 0.4% 차이입니다. 경계가 그만큼 가파르면
-    최대 성공값에 맞추는 것은 다음 코퍼스에서 실패하겠다는 뜻입니다.
-    """
-
-    largest_success = 1_966_923_746
-    smallest_failure = 1_974_954_792
-
-    assert SEED_ARRAY_ELEMENT_LIMIT < largest_success < smallest_failure
+    for codepoint in (0x2580, 0x2585, 0x2592, 0x259F):
+        assert chr(codepoint) in SENTENCEPIECE_RESERVED_CHARACTERS
+    assert "⁇" in SENTENCEPIECE_RESERVED_CHARACTERS
+    # 이웃한 기하 도형(U+25A0~)은 예약 대상이 아니므로 남아야 한다.
+    assert chr(0x25A0) not in SENTENCEPIECE_RESERVED_CHARACTERS
 
 
 def test_train_tokenizer_splits_digits_by_default(tmp_path: Path) -> None:
