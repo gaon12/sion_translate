@@ -10,7 +10,7 @@ Nothing else in the working tree is eligible.  In particular, stale artifacts,
 checkpoints, virtual environments, caches, and ``data/excluded`` cannot enter
 the archive just because they happen to exist beside the source tree.
 
-Two further trees can be added, but only when asked for by name:
+Three further trees can be added, but only when asked for by name:
 
 ``--with-monolingual-corpus``
     ``data/corpus`` -- the foundation stage's input.  Without it that stage
@@ -26,10 +26,16 @@ Two further trees can be added, but only when asked for by name:
     skips that step entirely.  The set is checked for completeness before it
     ships: a partial tokenizer would fail on the server, after the upload.
 
-Both are recorded in the manifest with their own origin, so ``verify-archive``
-and ``verify-tree`` cover them like everything else.  Shipping fourteen
-gigabytes of corpus outside the manifest would leave the largest part of the
-payload with no integrity check at all.
+``--with-dataset``
+    ``artifacts/dataset``, the tokenized training shards.  Preparing them is
+    more CPU work the GPU cannot help with.  It requires ``--with-tokenizer``,
+    because the shards are token ids and mean nothing without the tokenizer
+    that produced them -- shipping them alone only wastes the upload.
+
+All three are recorded in the manifest with their own origin, so
+``verify-archive`` and ``verify-tree`` cover them like everything else.
+Shipping fourteen gigabytes of corpus outside the manifest would leave the
+largest part of the payload with no integrity check at all.
 """
 
 from __future__ import annotations
@@ -91,10 +97,11 @@ ALLOWED_ORIGINS = {
     "git-index",
     "data-jsonl",
     "evaluation-only",
-    # Opt-in only. Both live under a directory the default allowlist refuses,
-    # and both are large enough that shipping them by accident is a real cost.
+    # Opt-in only. These live under directories the default allowlist refuses,
+    # and each is large enough that shipping one by accident is a real cost.
     "monolingual-corpus",
     "tokenizer",
+    "dataset",
 }
 
 # Monolingual corpus files the foundation stage can actually read. Mirrors
@@ -324,6 +331,7 @@ def _collect_sources(
     *,
     include_monolingual_corpus: bool = False,
     include_tokenizer: bool = False,
+    include_dataset: bool = False,
 ) -> list[SourceEntry]:
     selected: dict[PurePosixPath, SourceEntry] = {}
     portable_paths = {
@@ -421,6 +429,24 @@ def _collect_sources(
                 f"missing: {', '.join(missing)}"
             )
         for entry in tokenizer_entries:
+            add(entry)
+
+    if include_dataset:
+        dataset_root = root / "artifacts" / "dataset"
+        dataset_entries = _collect_tree(root, dataset_root, "dataset")
+        if not dataset_entries:
+            raise BundleError(
+                f"--with-dataset was requested but {dataset_root} does not exist or holds no files"
+            )
+        if not include_tokenizer:
+            # The dataset is token ids. Without the tokenizer that produced them
+            # the server rebuilds it anyway, so shipping gigabytes of it alone is
+            # wasted upload.
+            raise BundleError(
+                "--with-dataset requires --with-tokenizer: a prepared dataset is "
+                "only reusable together with the tokenizer whose ids it holds"
+            )
+        for entry in dataset_entries:
             add(entry)
 
     entries = [selected[path] for path in sorted(selected, key=lambda item: item.as_posix())]
@@ -915,6 +941,7 @@ def build_bundle(
     overwrite: bool = False,
     include_monolingual_corpus: bool = False,
     include_tokenizer: bool = False,
+    include_dataset: bool = False,
 ) -> BuildResult:
     """Build, verify, and atomically publish a deterministic GPU bundle."""
 
@@ -938,6 +965,7 @@ def build_bundle(
         root,
         include_monolingual_corpus=include_monolingual_corpus,
         include_tokenizer=include_tokenizer,
+        include_dataset=include_dataset,
     )
     if not sources:
         raise BundleError("the bundle source allowlist selected no files")
@@ -1018,6 +1046,15 @@ def _argument_parser() -> argparse.ArgumentParser:
             "spending hours training one. The directory must be complete."
         ),
     )
+    build_parser.add_argument(
+        "--with-dataset",
+        action="store_true",
+        help=(
+            "also ship artifacts/dataset, the tokenized training shards. "
+            "Requires --with-tokenizer, because the ids only mean anything "
+            "alongside the tokenizer that produced them."
+        ),
+    )
 
     archive_parser = subparsers.add_parser(
         "verify-archive",
@@ -1044,6 +1081,7 @@ def main(arguments: list[str] | None = None) -> int:
                 overwrite=parsed.overwrite,
                 include_monolingual_corpus=parsed.with_monolingual_corpus,
                 include_tokenizer=parsed.with_tokenizer,
+                include_dataset=parsed.with_dataset,
             )
             print(f"bundle: {result.output_path}")
             print(f"sha256: {result.archive_sha256}")

@@ -180,6 +180,31 @@ def test_the_tokenizer_ships_only_when_asked_for_and_only_if_complete(tmp_path: 
     package_gpu_bundle.verify_archive(included)
 
 
+def test_the_dataset_needs_the_tokenizer_that_produced_its_ids(tmp_path: Path) -> None:
+    """데이터셋은 토큰 id 다. 그 id 를 만든 토크나이저가 없으면 서버가 어차피
+    다시 만들고, 기가바이트짜리 업로드만 버려진다."""
+
+    root = _repository(tmp_path)
+    _with_tokenizer(root, complete=True)
+    dataset = root / "artifacts" / "dataset"
+    dataset.mkdir(parents=True)
+    (dataset / "train.00000.idx.npy").write_bytes(b"ids")
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="--with-tokenizer"):
+        package_gpu_bundle.build_bundle(root, tmp_path / "dataset-only.zip", include_dataset=True)
+
+    both = tmp_path / "both.zip"
+    package_gpu_bundle.build_bundle(root, both, include_tokenizer=True, include_dataset=True)
+    with zipfile.ZipFile(both) as archive:
+        names = set(archive.namelist())
+    assert "sion_translate/artifacts/dataset/train.00000.idx.npy" in names
+    assert "sion_translate/artifacts/tokenizer/sion.model" in names
+
+    origins = {entry["path"]: entry["origin"] for entry in _manifest(both)["files"]}
+    assert origins["artifacts/dataset/train.00000.idx.npy"] == "dataset"
+    package_gpu_bundle.verify_archive(both)
+
+
 def test_the_default_bundle_still_refuses_stale_artifacts(tmp_path: Path) -> None:
     """opt-in 이 artifacts/ 전체를 여는 것이 아니어야 한다."""
 
