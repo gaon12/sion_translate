@@ -11,6 +11,7 @@ import tempfile
 import unicodedata
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
@@ -605,6 +606,60 @@ def iter_tokenizer_sentences(
             monolingual_counts[language] = emitted
 
 
+@dataclass(frozen=True)
+class CorpusCounts:
+    """한 번의 스캔에서 나오는 두 값.
+
+    문자 빈도는 ``required_chars`` 를 뽑는 데 쓰고, 문장 수는
+    :func:`seed_array_elements` 가 SentencePiece 의 상한을 계산하는 데 씁니다.
+    두 값이 같은 pass 에서 나와야 서로 어긋나지 않습니다.
+    """
+
+    characters: Counter[str]
+    sentences: int
+
+    @property
+    def character_total(self) -> int:
+        return sum(self.characters.values())
+
+
+def seed_array_elements(characters: int, sentences: int) -> int:
+    """SentencePiece 가 seed piece 추출에 쓰는 배열의 원소 수.
+
+    ``MakeSeedSentencePieces`` 는 모든 문장을 ``vector<char32>`` 하나로 이어
+    붙이고 문장마다 경계 문자를 하나씩 넣습니다. 그래서 원소 수는 문자 수와
+    문장 수의 **합** 이고, 접미사 배열이 그 위에 올라갑니다.
+    """
+
+    return characters + sentences
+
+
+# 이 크기를 넘으면 SentencePiece 가 seed piece 추출 중 SIGSEGV 로 죽습니다.
+# 메모리가 아닙니다 — 통과한 실행의 peak RSS 는 49.75 GiB 였고, 실패한 실행은
+# 256 GiB 를 주고도 더 일찍 죽었습니다. `train_extremely_large_corpus=True` 도
+# 막지 못합니다.
+#
+# 실측 (원소 = 문자 + 문장):
+#
+#     0.123 G  ->  통과
+#     0.304 G  ->  통과
+#     1.110 G  ->  통과
+#     1.967 G  ->  통과      <- 최대 성공
+#     1.975 G  ->  SIGSEGV   <- 최소 실패
+#     2.779 G  ->  SIGSEGV
+#     3.971 G  ->  SIGSEGV
+#
+# 경계는 1.967~1.975 G 사이, 즉 2^31 의 91.6% 지점입니다. 정확히 2^31 이 아닌
+# 이유는 알 수 없습니다 — SentencePiece 가 바이너리라 내부를 볼 수 없고, 접미사
+# 배열 경로의 32비트 인덱스에 센티널·중간 계산 여유분이 붙는다는 것이 가장
+# 그럴듯한 설명입니다. 원인을 단정하지 않고 **관측된 경계 아래**로 막습니다.
+#
+# 문장 수만 세지 않고 원소로 세는 이유는 두 차원을 동시에 막기 때문입니다
+# (문장 수는 항상 원소 수 이하). 관측만으로는 "문장 수 한계"와 "원소 수 한계"를
+# 구별할 수 없는데, 원소 쪽이 실제 자료구조에 대응하고 더 보수적입니다.
+SEED_ARRAY_ELEMENT_LIMIT = 1_900_000_000
+
+
 def corpus_character_counts(
     paths: Sequence[Path],
     *,
@@ -617,10 +672,11 @@ def corpus_character_counts(
     source_only_languages: Sequence[str] = (),
     train_only_prefixes: Sequence[str] = DEFAULT_SYNTHETIC_PREFIXES,
     num_workers: int | None = None,
-) -> Counter[str]:
-    """Count every character in the training partition of ``paths``."""
+) -> CorpusCounts:
+    """Count every character, and every sentence, in the training partition."""
 
     counts: Counter[str] = Counter()
+    sentences = 0
     for text in iter_tokenizer_sentences(
         paths,
         monolingual=monolingual,
@@ -634,7 +690,8 @@ def corpus_character_counts(
         num_workers=num_workers,
     ):
         counts.update(text)
-    return counts
+        sentences += 1
+    return CorpusCounts(characters=counts, sentences=sentences)
 
 
 # Characters SentencePiece refuses to accept as required characters. Passing one
@@ -860,8 +917,26 @@ def train_tokenizer(
             train_only_prefixes=train_only_prefixes,
             num_workers=workers,
         )
+        # 코퍼스가 SentencePiece 가 감당하는 크기인지 먼저 봅니다. 넘으면
+        # seed piece 추출 중 SIGSEGV 로 죽는데, 그 지점까지 가는 데만 몇 시간이
+        # 걸리고 실패 원인이 로그에 남지 않습니다.
+        elements = seed_array_elements(counts.character_total, counts.sentences)
+        if elements > SEED_ARRAY_ELEMENT_LIMIT:
+            over = elements / SEED_ARRAY_ELEMENT_LIMIT
+            raise ValueError(
+                f"코퍼스가 SentencePiece 한계를 넘습니다: 문자 "
+                f"{counts.character_total:,} + 문장 {counts.sentences:,} = "
+                f"{elements:,} 원소, 상한 {SEED_ARRAY_ELEMENT_LIMIT:,} 의 {over:.2f}배. "
+                "이대로 학습하면 코퍼스를 다 읽은 뒤 seed piece 추출에서 SIGSEGV 로 "
+                "죽습니다. 줄이는 방법은 두 가지입니다: "
+                "foundation.tokenizer_sample_ratio 를 낮춰 단일어 표본을 줄이거나, "
+                "input_sentence_size 로 문장 수에 상한을 두십시오. "
+                "required_chars 는 전량 코퍼스에서 나오므로 어느 쪽을 택해도 "
+                "내용 문자는 어휘에 그대로 남습니다."
+            )
+
         required_characters = required_characters_from_counts(
-            counts,
+            counts.characters,
             min_occurrences=required_character_min_occurrences,
         )
         # SentencePiece refuses when required_chars plus its meta pieces exceed
