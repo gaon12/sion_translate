@@ -8,6 +8,10 @@ Accepted shards are consumable only when their manifest part has
 ``published: true``; a two-phase pending publish prevents partial training data.
 """
 
+# Queue manifests are persisted JSON objects and SacreBLEU exposes incomplete
+# annotations. Validate their shape at runtime and contain Unknown types here.
+# pyright: reportUnknownArgumentType=false, reportUnknownMemberType=false, reportUnknownVariableType=false
+
 from __future__ import annotations
 
 from collections import Counter
@@ -20,9 +24,9 @@ import json
 import math
 import os
 from pathlib import Path
-from typing import Any, BinaryIO, Protocol
+from typing import Any, BinaryIO, Protocol, cast
 
-from sacrebleu.metrics import CHRF
+from sacrebleu.metrics.chrf import CHRF
 
 from sion_translate.data.quality import (
     assess_pair,
@@ -196,7 +200,7 @@ def _release_file_lock(handle: BinaryIO) -> None:
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-@contextmanager
+@contextmanager  # pyright: ignore[reportDeprecated]
 def _directory_run_lock(
     directory: Path,
     *,
@@ -218,7 +222,7 @@ def _directory_run_lock(
             _release_file_lock(handle)
 
 
-@contextmanager
+@contextmanager  # pyright: ignore[reportDeprecated]
 def _queue_run_lock(output_dir: Path) -> Iterator[None]:
     """Hold an OS-released single-writer lock for one queue output directory."""
 
@@ -230,7 +234,7 @@ def _queue_run_lock(output_dir: Path) -> Iterator[None]:
         yield
 
 
-@contextmanager
+@contextmanager  # pyright: ignore[reportDeprecated]
 def _accepted_run_lock(accepted_dir: Path) -> Iterator[None]:
     """Serialize publishers sharing an accepted-shard namespace."""
 
@@ -398,8 +402,6 @@ def _validate_artifact(
     expected_path: Path,
     label: str,
 ) -> dict[str, Any]:
-    if not isinstance(artifact, Mapping):
-        raise ValueError(f"{label} has no valid artifact metadata")
     recorded_path = Path(str(artifact.get("path", "")))
     if recorded_path.resolve() != expected_path.resolve():
         raise ValueError(f"{label} path does not match its queue manifest")
@@ -541,7 +543,8 @@ def _content_tokens(translator: TranslatorLike, text: str) -> list[object]:
     tokenizer = getattr(translator, "tokenizer", None)
     encode = getattr(tokenizer, "encode", None)
     if callable(encode):
-        return list(encode(text))
+        typed_encode = cast(Callable[[str], Sequence[object]], encode)
+        return list(typed_encode(text))
     return [character for character in canonical_text(text) if not character.isspace()]
 
 
@@ -859,7 +862,7 @@ def _validate_or_register_parts(
 
     if total_result_rows != int(progress["completed_rows"]):
         raise ValueError("committed result rows do not match progress.completed_rows")
-    stats = manifest["stats"]
+    stats = cast(dict[str, Any], manifest["stats"])
     if total_result_rows != int(stats["processed"]):
         raise ValueError("committed result rows do not match stats.processed")
     if total_accepted_rows != int(stats["accepted"]):
@@ -918,11 +921,12 @@ def _configure_teacher_review(
         isinstance(review, dict)
         and not review.get("approved")
         and (
-            int(stats["generated"]) >= int(review["pilot_rows"])
+            int(stats["generated"]) >= int(str(review["pilot_rows"]))
             or (manifest["progress"].get("complete") and int(stats["generated"]) > 0)
         )
         and not review.get("review_required")
     ):
+        review = cast(dict[str, Any], review)
         review["review_required"] = True
         changed = True
 
@@ -932,6 +936,7 @@ def _configure_teacher_review(
         if not review.get("review_required"):
             raise ValueError("the teacher pilot is not complete or has no reviewable output")
         if not review.get("approved"):
+            review = cast(dict[str, Any], review)
             actor = canonical_text(approval_actor or "")
             if not actor:
                 raise ValueError("approval_actor is required to approve a teacher")

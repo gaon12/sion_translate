@@ -17,6 +17,10 @@
 진행됐는지 터미널에서 바로 확인할 수 있습니다.
 """
 
+# CLI configuration, CUDA properties, DataLoader internals, and torch.compile
+# are runtime-selected integration points with incomplete annotations.
+# pyright: reportUnknownArgumentType=false, reportUnknownMemberType=false, reportUnknownParameterType=false, reportUnknownVariableType=false
+
 from __future__ import annotations
 
 import argparse
@@ -28,7 +32,7 @@ import math
 import random
 from pathlib import Path
 from contextlib import ExitStack
-from typing import Any, Sequence
+from typing import Any, Sequence, cast
 
 import numpy as np
 import torch
@@ -214,22 +218,22 @@ def dataloader_runtime_kwargs(
     return options
 
 
-def shutdown_dataloader(loader: DataLoader | None) -> None:
+def shutdown_dataloader(loader: DataLoader[Any] | None) -> None:
     """Stop a persistent DataLoader pool before constructing the next stage."""
 
     if loader is None:
         return
-    iterator = getattr(loader, "_iterator", None)
+    iterator = getattr(loader, "_iterator", None)  # pyright: ignore[reportPrivateUsage]
     shutdown = getattr(iterator, "_shutdown_workers", None)
     if callable(shutdown):
         shutdown()
     if iterator is not None:
-        loader._iterator = None
+        loader._iterator = None  # pyright: ignore[reportPrivateUsage]
 
 
 def release_stage_resources(
     context: DistributedContext,
-    *loaders: DataLoader | None,
+    *loaders: DataLoader[Any] | None,
 ) -> dict[str, float]:
     """Release CPU workers and CUDA cache at a pretrain/posttrain boundary."""
 
@@ -285,6 +289,7 @@ def validate_training_capacity(
         if context.device.type != "cuda":
             return None
         per_gpu_vram_gib = torch.cuda.get_device_properties(context.device).total_memory / 2**30
+    assert per_gpu_vram_gib is not None
     if per_gpu_vram_gib <= 0:
         raise ValueError("per_gpu_vram_gib must be positive")
 
@@ -496,7 +501,7 @@ def seed_everything(seed: int, rank: int) -> None:
         torch.cuda.manual_seed_all(seed + rank)
 
 
-def resolve_config(args: argparse.Namespace) -> tuple[AppConfig, dict, str]:
+def resolve_config(args: argparse.Namespace) -> tuple[AppConfig, dict[str, Any], str]:
     """설정 파일을 찾아 (config, raw dict, 출처 설명) 을 돌려줍니다.
 
     raw dict 는 '사용자가 어떤 키를 직접 적었는지'를 기억하는 용도입니다.
@@ -1110,7 +1115,7 @@ def main() -> None:
             find_unused_parameters=detect_unused_parameters,
         )
         if config.training.compile:
-            model = torch.compile(model)
+            model = cast(torch.nn.Module, torch.compile(model))
         # 여기서부터의 난수(dropout, denoising 등)는 rank 별로 달라야 합니다.
         seed_everything(config.training.seed, context.rank)
         announce(

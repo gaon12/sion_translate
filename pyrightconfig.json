@@ -1,0 +1,20 @@
+{
+  "include": [
+    "src"
+  ],
+  "exclude": [
+    "**/__pycache__"
+  ],
+  "typeCheckingMode": "strict",
+  "pythonVersion": "3.11",
+  "venvPath": ".",
+  "venv": ".venv",
+  "executionEnvironments": [
+    {
+      "root": ".",
+      "extraPaths": [
+        "src"
+      ]
+    }
+  ]
+}

@@ -42,6 +42,9 @@ MBR 의 합의 조건이 그 이상치를 눌러 주기 때문에 합쳐야 쓸 
 않습니다. 그쪽은 토크나이저 재학습으로만 해결됩니다.
 """
 
+# Metric component dictionaries are assembled dynamically.
+# pyright: reportUnknownVariableType=false
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -145,7 +148,7 @@ def mbr_scores(candidates: Sequence[str]) -> list[float]:
     """
     if len(candidates) <= 1:
         return [1.0] * len(candidates)
-    from sacrebleu.metrics import CHRF
+    from sacrebleu.metrics.chrf import CHRF
 
     chrf = CHRF(word_order=0)
     scores: list[float] = []

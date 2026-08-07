@@ -11,6 +11,9 @@
 모델이 먼저 있어야 합니다.
 """
 
+# CLI result serializers are attached dynamically.
+# pyright: reportUnknownMemberType=false
+
 from __future__ import annotations
 
 import argparse

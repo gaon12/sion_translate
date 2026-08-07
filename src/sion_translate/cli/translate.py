@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 
 from sion_translate.config import config_from_raw, load_raw_config
@@ -184,7 +185,7 @@ def main() -> None:
                 "sion-revise-data 로 만든 데이터를 학습에 포함하십시오."
             )
 
-        def revise_batch(sources: list[str], drafts: list[str]) -> list[str]:
+        def revise_batch(sources: Sequence[str], drafts: Sequence[str]) -> list[str]:
             return translator.revise(
                 sources,
                 drafts,

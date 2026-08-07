@@ -187,7 +187,8 @@ def score_translations(
     """(chrF, BLEU, BLEU 토큰화 방식) 을 반환합니다."""
     if len(hypotheses) != len(references):
         raise ValueError(f"번역문 {len(hypotheses)}개와 정답 {len(references)}개의 수가 다릅니다")
-    from sacrebleu.metrics import BLEU, CHRF
+    from sacrebleu.metrics.bleu import BLEU
+    from sacrebleu.metrics.chrf import CHRF
 
     tokenize = "char" if target_language in CHARACTER_LEVEL_LANGUAGES else "13a"
     chrf = CHRF().corpus_score(list(hypotheses), [list(references)]).score
@@ -292,12 +293,15 @@ def save_results(
     results: Sequence[DirectionResult],
     output_path: str | Path,
     *,
-    metadata: dict,
+    metadata: dict[str, object],
 ) -> None:
     """결과를 JSON(기계용)과 Markdown(사람용)으로 저장합니다."""
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"metadata": metadata, "results": [asdict(result) for result in results]}
+    payload: dict[str, object] = {
+        "metadata": metadata,
+        "results": [asdict(result) for result in results],
+    }
     output_path.with_suffix(".json").write_text(
         json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
     )

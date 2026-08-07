@@ -17,6 +17,9 @@
 결과는 터미널 표 + reports/evaluation-*.json/.md 로 저장됩니다.
 """
 
+# CLI registry callables are discovered dynamically.
+# pyright: reportUnknownVariableType=false
+
 from __future__ import annotations
 
 import argparse

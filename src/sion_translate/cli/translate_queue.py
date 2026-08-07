@@ -1,5 +1,8 @@
 """Translate immutable JSONL queues into audited synthetic training shards."""
 
+# Existing queue manifests are heterogeneous JSON mappings.
+# pyright: reportUnknownMemberType=false
+
 from __future__ import annotations
 
 import argparse

@@ -4,6 +4,9 @@
 로컬 모델, 사람이 복사한 결과를 모두 같은 형식으로 채점할 수 있다.
 """
 
+# Comparison inputs are heterogeneous JSON rows validated by this module.
+# pyright: reportUnknownArgumentType=false, reportUnknownMemberType=false, reportUnknownParameterType=false, reportUnknownVariableType=false
+
 from __future__ import annotations
 
 import json
@@ -61,7 +64,7 @@ def _required_text(row: object, key: str, *, location: str) -> str:
     return value.strip()
 
 
-def _optional_text(row: dict, key: str, *, location: str) -> str:
+def _optional_text(row: dict[str, object], key: str, *, location: str) -> str:
     value = row.get(key, "")
     if value is None:
         return ""
@@ -70,7 +73,7 @@ def _optional_text(row: dict, key: str, *, location: str) -> str:
     return value.strip()
 
 
-def _optional_intensity(row: dict, *, location: str) -> int | None:
+def _optional_intensity(row: dict[str, object], *, location: str) -> int | None:
     value = row.get("intensity")
     if value is None:
         return None

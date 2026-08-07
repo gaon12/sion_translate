@@ -7,9 +7,13 @@
 holdout 점수를 올리는 일을 막기 위한 것입니다.
 """
 
+# CLI registries and argparse namespaces expose dynamic callables.
+# pyright: reportUnknownMemberType=false, reportUnknownVariableType=false
+
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 import json
 from pathlib import Path
 
@@ -72,14 +76,16 @@ def main() -> None:
     if args.max_tokens is not None and not args.tokenizer:
         raise SystemExit("--max-tokens 를 쓰려면 --tokenizer 도 지정해야 합니다")
 
-    count_tokens = None
+    count_tokens: Callable[[str], int] | None = None
     if args.tokenizer:
         from sion_translate.tokenizer import SionTokenizer
 
         tokenizer = SionTokenizer(args.tokenizer)
 
-        def count_tokens(text: str) -> int:
+        def _count_tokens(text: str) -> int:
             return len(tokenizer.encode(text))
+
+        count_tokens = _count_tokens
 
     paths = expand_inputs(args.input)
     if not paths:

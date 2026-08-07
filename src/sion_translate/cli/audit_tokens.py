@@ -1,3 +1,6 @@
+# argparse namespaces and report serializers are runtime-shaped.
+# pyright: reportMissingParameterType=false, reportUnknownMemberType=false, reportUnknownParameterType=false, reportUnknownVariableType=false
+
 from __future__ import annotations
 
 import argparse

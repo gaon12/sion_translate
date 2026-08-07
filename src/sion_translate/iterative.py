@@ -27,6 +27,9 @@
 대조해 숫자·식별자 보존, 목표 언어, 길이, 반복 붕괴를 봅니다.
 """
 
+# Iterative-run state is loaded from a JSON manifest.
+# pyright: reportUnknownVariableType=false
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

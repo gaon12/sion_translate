@@ -24,6 +24,9 @@ is a single file::
 Exit codes: 0 within thresholds, 1 a threshold was exceeded, 2 bad input.
 """
 
+# argparse values and subprocess output are validated by the CLI.
+# pyright: reportUnknownArgumentType=false
+
 from __future__ import annotations
 
 import argparse
@@ -118,7 +121,7 @@ def pick(row: dict[str, object], keys: tuple[str, ...], *, line: int, role: str)
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("paths", nargs="+", help="JSONL files to check")
     parser.add_argument(
         "--source-key",

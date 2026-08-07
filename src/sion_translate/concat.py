@@ -26,7 +26,7 @@ import json
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Iterator, Sequence
+from typing import Callable, Iterable, Iterator, Sequence, cast
 
 DEFAULT_LANGUAGE_PAIR = ("ko", "ja")
 
@@ -45,7 +45,7 @@ class ConcatStats:
     skipped_too_long: int
     sentences_per_example: dict[int, int]
 
-    def as_dict(self) -> dict:
+    def as_dict(self) -> dict[str, object]:
         return {
             "source_pairs": self.source_pairs,
             "written": self.written,
@@ -72,7 +72,10 @@ def read_pairs(
                     row = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                text_a, text_b = row.get(key_a), row.get(key_b)
+                if not isinstance(row, dict):
+                    continue
+                mapping = cast(dict[object, object], row)
+                text_a, text_b = mapping.get(key_a), mapping.get(key_b)
                 if isinstance(text_a, str) and isinstance(text_b, str):
                     text_a, text_b = text_a.strip(), text_b.strip()
                     if text_a and text_b:
@@ -85,7 +88,7 @@ def _too_long(
     *,
     max_tokens: int | None,
     max_chars: int,
-    count_tokens,
+    count_tokens: Callable[[str], int] | None,
 ) -> bool:
     if len(joined_a) > max_chars or len(joined_b) > max_chars:
         return True
@@ -104,7 +107,7 @@ def build_concatenations(
     separator: str = "space",
     max_chars: int = 480,
     max_tokens: int | None = None,
-    count_tokens=None,
+    count_tokens: Callable[[str], int] | None = None,
     seed: int = 20260726,
 ) -> tuple[list[tuple[str, str]], ConcatStats]:
     """무관한 쌍을 묶어 다문장 예제를 만듭니다.

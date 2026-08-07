@@ -1,5 +1,8 @@
 """선택 설치형 공개 번역 모델 baseline 실행기."""
 
+# AutoModel/AutoTokenizer return model-specific dynamic objects.
+# pyright: reportArgumentType=false, reportAttributeAccessIssue=false, reportUnknownArgumentType=false, reportUnknownMemberType=false, reportUnknownVariableType=false
+
 from __future__ import annotations
 
 from collections import defaultdict

@@ -11,6 +11,9 @@
 우선합니다. 즉 sion_translate.yaml 은 '바꾸고 싶은 것만 적는 얇은 override 파일'입니다.
 """
 
+# CUDA device properties and YAML payloads are dynamically typed boundaries.
+# pyright: reportUnknownArgumentType=false, reportUnknownMemberType=false, reportUnknownParameterType=false, reportUnknownVariableType=false
+
 from __future__ import annotations
 
 import json
@@ -382,7 +385,7 @@ def _clamp(value: int, low: int, high: int) -> int:
 
 def apply_auto_settings(
     config: AppConfig,
-    raw: dict,
+    raw: dict[str, Any],
     env: EnvironmentInfo,
     *,
     train_examples: int,
@@ -400,7 +403,7 @@ def apply_auto_settings(
     raw_data = dict(raw.get("data") or {})
     decisions: list[str] = []
 
-    def auto(section: dict, key: str) -> bool:
+    def auto(section: dict[str, Any], key: str) -> bool:
         """해당 키를 사용자가 적지 않았으면 True (= 자동 결정 대상)."""
         return key not in section
 

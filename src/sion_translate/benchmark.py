@@ -16,6 +16,9 @@ FLORES-200 은 200개 언어에 대해 같은 3,001개 문장을 번역해 둔 �
 출력은 학습/평가 데이터와 같은 형식입니다: 한 줄에 {"ko": ..., "ja": ...}.
 """
 
+# Hugging Face datasets is an optional plugin with a dynamic row schema.
+# pyright: reportMissingImports=false, reportUnknownMemberType=false, reportUnknownVariableType=false
+
 from __future__ import annotations
 
 import json

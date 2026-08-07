@@ -11,12 +11,13 @@ import math
 import warnings
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Sequence, cast
 
 import numpy as np
 import torch
 
 from sion_translate.glossary import Glossary, apply_source_placeholders, restore_targets
+from sion_translate.model import SionForConditionalGeneration
 from sion_translate.rerank import select as rerank_select
 from sion_translate.revision import DRAFT_SEPARATOR, serialize_revision_input
 from sion_translate.structured import mask_structured_spans
@@ -33,23 +34,22 @@ from sion_translate.training.export import load_exported_model, resolve_manifest
 def _language_pairs_from_metadata(
     metadata: Mapping[str, Any] | None,
 ) -> tuple[tuple[str, str], ...]:
-    if not isinstance(metadata, Mapping):
+    if metadata is None:
         return ()
-    raw_pairs = metadata.get("language_pairs")
+    raw_pairs: object = metadata.get("language_pairs")
     if raw_pairs is None and metadata.get("language_pair") is not None:
         raw_pairs = [metadata["language_pair"]]
     if not isinstance(raw_pairs, Sequence) or isinstance(raw_pairs, (str, bytes)):
         return ()
     pairs: list[tuple[str, str]] = []
     seen: set[frozenset[str]] = set()
-    for raw_pair in raw_pairs:
-        if (
-            not isinstance(raw_pair, Sequence)
-            or isinstance(raw_pair, (str, bytes))
-            or len(raw_pair) != 2
-        ):
+    for raw_pair in cast(Sequence[object], raw_pairs):
+        if not isinstance(raw_pair, Sequence) or isinstance(raw_pair, (str, bytes)):
             continue
-        pair = (str(raw_pair[0]), str(raw_pair[1]))
+        pair_items = cast(Sequence[object], raw_pair)
+        if len(pair_items) != 2:
+            continue
+        pair = (str(pair_items[0]), str(pair_items[1]))
         edge = frozenset(pair)
         if len(edge) == 2 and edge not in seen:
             seen.add(edge)
@@ -60,10 +60,10 @@ def _language_pairs_from_metadata(
 def _translation_directions_from_metadata(
     metadata: Mapping[str, Any] | None,
 ) -> tuple[tuple[str, str], ...]:
-    if not isinstance(metadata, Mapping):
+    if metadata is None:
         return ()
     pairs = _language_pairs_from_metadata(metadata)
-    raw_directions = metadata.get("translation_directions")
+    raw_directions: object = metadata.get("translation_directions")
     if raw_directions is None:
         return tuple(direction for pair in pairs for direction in (pair, (pair[1], pair[0])))
     if not isinstance(raw_directions, Sequence) or isinstance(
@@ -78,14 +78,13 @@ def _translation_directions_from_metadata(
     allowed_edges = {frozenset(pair) for pair in pairs}
     directions: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
-    for raw_direction in raw_directions:
-        if (
-            not isinstance(raw_direction, Sequence)
-            or isinstance(raw_direction, (str, bytes))
-            or len(raw_direction) != 2
-        ):
+    for raw_direction in cast(Sequence[object], raw_directions):
+        if not isinstance(raw_direction, Sequence) or isinstance(raw_direction, (str, bytes)):
             raise ValueError(f"invalid translation direction metadata: {raw_direction!r}")
-        direction = (str(raw_direction[0]), str(raw_direction[1]))
+        direction_items = cast(Sequence[object], raw_direction)
+        if len(direction_items) != 2:
+            raise ValueError(f"invalid translation direction metadata: {raw_direction!r}")
+        direction = (str(direction_items[0]), str(direction_items[1]))
         if direction[0] == direction[1] or frozenset(direction) not in allowed_edges:
             raise ValueError(f"invalid translation direction metadata: {raw_direction!r}")
         if direction not in seen:
@@ -165,13 +164,19 @@ class Translator:
             )
         loaded = load_exported_model(model_path, return_metadata=True)
         if len(loaded) == 3:
-            self.model, self.model_config, self.pad_id = loaded
+            self.model, self.model_config, self.pad_id = cast(
+                tuple[SionForConditionalGeneration, Any, int], loaded
+            )
             self.export_metadata: dict[str, Any] = {}
         else:
-            self.model, self.model_config, self.pad_id, raw_metadata = loaded
+            self.model, self.model_config, self.pad_id, raw_metadata = cast(
+                tuple[SionForConditionalGeneration, Any, int, object], loaded
+            )
             if not isinstance(raw_metadata, Mapping):
                 raise ValueError("model export metadata must be an object")
-            self.export_metadata = dict(raw_metadata)
+            self.export_metadata = cast(
+                dict[str, Any], dict(cast(Mapping[object, object], raw_metadata))
+            )
         # 번역할 수 없는 산출물을 번역기로 싣지 않습니다. foundation 모델은
         # 번역쌍을 한 번도 보지 않았지만 구조가 같아서, 막지 않으면 방향
         # 태그를 받아들이고 그럴듯한 쓰레기를 냅니다.
@@ -182,7 +187,9 @@ class Translator:
                 "단일어 복원만 학습한 foundation 산출물이므로 번역에 쓸 수 없습니다. "
                 "번역 단계(runs/*/pretrain 또는 posttrain)의 export 를 지정하세요."
             )
-        self.tokenizer_metadata = load_tokenizer_metadata(tokenizer_path)
+        self.tokenizer_metadata = cast(
+            dict[str, Any] | None, load_tokenizer_metadata(tokenizer_path)
+        )
         self.language_pairs = _language_pairs_from_metadata(self.export_metadata)
         if not self.language_pairs:
             self.language_pairs = _language_pairs_from_metadata(self.tokenizer_metadata)
@@ -199,15 +206,20 @@ class Translator:
                 for pair in self.language_pairs
                 for direction in (pair, (pair[1], pair[0]))
             )
-        self._translation_direction_edges = set(self.translation_directions)
+        self._translation_direction_edges: set[tuple[str, str]] = set(self.translation_directions)
         self._validate_compatibility(tokenizer_path)
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
         # 양자화 모델은 CPU 전용 커널을 쓰므로 CPU 에 남깁니다.
         quantization = self.export_metadata.get("quantization")
+        quantization_mapping = (
+            cast(Mapping[object, object], quantization)
+            if isinstance(quantization, Mapping)
+            else None
+        )
         runtime_device = (
-            quantization.get("runtime_device") if isinstance(quantization, Mapping) else None
+            quantization_mapping.get("runtime_device") if quantization_mapping is not None else None
         )
         self.quantized = runtime_device == "cpu" or any(
             "quantized" in type(module).__module__ for module in self.model.modules()
@@ -217,7 +229,7 @@ class Translator:
         # 대역폭만) 구분해서 남깁니다.
         self.fp8_runtime: str | None = (
             describe_runtime(self.device)
-            if isinstance(quantization, Mapping) and quantization.get("format") == "fp8"
+            if quantization_mapping is not None and quantization_mapping.get("format") == "fp8"
             else None
         )
         if not self.quantized:
@@ -257,10 +269,10 @@ class Translator:
         filenames: list[str] = []
         export_identity = self.export_metadata.get("token_features")
         if isinstance(export_identity, Mapping):
-            filename = export_identity.get("filename")
+            filename = cast(Mapping[object, object], export_identity).get("filename")
             if isinstance(filename, str) and filename and Path(filename).name == filename:
                 filenames.append(filename)
-        if isinstance(self.tokenizer_metadata, Mapping):
+        if self.tokenizer_metadata is not None:
             filename = self.tokenizer_metadata.get("token_features_file")
             if (
                 isinstance(filename, str)
@@ -294,10 +306,11 @@ class Translator:
 
         tokenizer_identity = self.export_metadata.get("tokenizer")
         if isinstance(tokenizer_identity, Mapping):
-            expected_size = tokenizer_identity.get("size")
+            identity = cast(Mapping[object, object], tokenizer_identity)
+            expected_size = identity.get("size")
             if isinstance(expected_size, int) and tokenizer_path.stat().st_size != expected_size:
                 raise ValueError("tokenizer metadata size does not match the selected tokenizer")
-            expected_sha256 = tokenizer_identity.get("sha256")
+            expected_sha256 = identity.get("sha256")
             if isinstance(expected_sha256, str):
                 digest = hashlib.sha256(tokenizer_path.read_bytes()).hexdigest()
                 if digest != expected_sha256:
@@ -305,15 +318,15 @@ class Translator:
                         "tokenizer metadata SHA256 does not match the selected tokenizer"
                     )
 
-        raw_pairs = self.export_metadata.get("language_pairs")
+        raw_pairs: object = self.export_metadata.get("language_pairs")
         if raw_pairs is None and self.export_metadata.get("language_pair") is not None:
             raw_pairs = [self.export_metadata["language_pair"]]
         if isinstance(raw_pairs, Sequence) and not isinstance(raw_pairs, (str, bytes)):
             expected_languages = {
                 str(language)
-                for pair in raw_pairs
+                for pair in cast(Sequence[object], raw_pairs)
                 if isinstance(pair, Sequence) and not isinstance(pair, (str, bytes))
-                for language in pair
+                for language in cast(Sequence[object], pair)
             }
             if expected_languages and expected_languages != set(self.tokenizer.languages):
                 raise ValueError(
@@ -323,6 +336,7 @@ class Translator:
 
         feature_flags = self.export_metadata.get("feature_flags")
         if isinstance(feature_flags, Mapping):
+            typed_feature_flags = cast(Mapping[object, object], feature_flags)
             experimental = self.model_config.experimental
             expected_flags = {
                 "bats": bool(experimental.bats_enabled),
@@ -335,9 +349,9 @@ class Translator:
                 "recurrent_block": bool(experimental.recurrent_block_layers),
             }
             mismatches = {
-                name: (bool(feature_flags[name]), enabled)
+                name: (bool(typed_feature_flags[name]), enabled)
                 for name, enabled in expected_flags.items()
-                if name in feature_flags and bool(feature_flags[name]) != enabled
+                if name in typed_feature_flags and bool(typed_feature_flags[name]) != enabled
             }
             if mismatches:
                 raise ValueError(
@@ -369,13 +383,13 @@ class Translator:
             digest = hashlib.sha256(tokenizer_path.read_bytes()).hexdigest()
             if digest != metadata_sha256:
                 raise ValueError("tokenizer sidecar model identity does not match tokenizer.model")
-        metadata_pairs = tokenizer_metadata.get("language_pairs")
+        metadata_pairs: object = tokenizer_metadata.get("language_pairs")
         if isinstance(metadata_pairs, Sequence) and not isinstance(metadata_pairs, (str, bytes)):
             metadata_languages = {
                 str(language)
-                for pair in metadata_pairs
+                for pair in cast(Sequence[object], metadata_pairs)
                 if isinstance(pair, Sequence) and not isinstance(pair, (str, bytes))
-                for language in pair
+                for language in cast(Sequence[object], pair)
             }
             if metadata_languages and metadata_languages != set(self.tokenizer.languages):
                 raise ValueError(
@@ -411,8 +425,12 @@ class Translator:
                     f"MorphoScript token feature file does not exist: {path}" if required else path
                 )
             return None
-        identity = expected_identity if isinstance(expected_identity, Mapping) else None
-        if identity is None and isinstance(self.tokenizer_metadata, Mapping):
+        identity = (
+            cast(Mapping[object, object], expected_identity)
+            if isinstance(expected_identity, Mapping)
+            else None
+        )
+        if identity is None and self.tokenizer_metadata is not None:
             expected_sha = self.tokenizer_metadata.get("token_features_sha256")
             if isinstance(expected_sha, str):
                 identity = {
@@ -466,7 +484,9 @@ class Translator:
                     raise ValueError(
                         f"token feature {name} contains IDs outside [0, {maximum_ids[name]})"
                     )
-                features[name] = torch.from_numpy(values)
+                features[name] = torch.from_numpy(  # pyright: ignore[reportUnknownMemberType]
+                    values
+                )
         return features
 
     def _generation_features(self, input_ids: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -550,7 +570,11 @@ class Translator:
             )
         if source_language == target_language:
             raise ValueError("source_language와 target_language는 달라야 합니다")
-        direction_edges = getattr(self, "_translation_direction_edges", set())
+        empty_directions: set[tuple[str, str]] = set()
+        direction_edges = cast(
+            set[tuple[str, str]],
+            getattr(self, "_translation_direction_edges", empty_directions),
+        )
         if direction_edges and (source_language, target_language) not in direction_edges:
             translation_directions = getattr(self, "translation_directions", ())
             supported = ", ".join(f"{source}→{target}" for source, target in translation_directions)
@@ -659,7 +683,7 @@ class Translator:
             target_language,
         )
         eos = self.tokenizer.eos_id
-        results: list[str] = []
+        results: list[Any] = []
         special_ids = {
             self.tokenizer.pad_id,
             self.tokenizer.bos_id,
@@ -783,9 +807,13 @@ class Translator:
                 max_new_tokens_per_row=row_max_new_tokens,
                 **({} if generation_context is not None else generation_features),
             )
+            generated_rows = cast(
+                list[list[int]],
+                generated.tolist(),  # pyright: ignore[reportUnknownMemberType]
+            )
             beam_texts = [
                 restore(row, structured_maps[index], glossary_maps[index])
-                for index, row in enumerate(generated.tolist())
+                for index, row in enumerate(generated_rows)
             ]
 
             if num_candidates < 1:
@@ -810,9 +838,13 @@ class Translator:
                 generation_context=generation_context,
                 max_new_tokens_per_row=row_max_new_tokens,
             )
+            sampled_rows = cast(
+                list[list[list[int]]],
+                sampled.tolist(),  # pyright: ignore[reportUnknownMemberType]
+            )
             for row_index, source_text in enumerate(sources):
                 candidates = [beam_texts[row_index]]
-                for sample_row in sampled[row_index].tolist():
+                for sample_row in sampled_rows[row_index]:
                     candidate = restore(
                         sample_row,
                         structured_maps[row_index],
@@ -853,8 +885,15 @@ class Translator:
         구분자가 여러 토큰으로 쪼개져 학습 때와 다른 입력이 되기 때문입니다.
         """
         capabilities = self.export_metadata.get("capabilities")
+        capabilities_mapping = (
+            cast(Mapping[object, object], capabilities)
+            if isinstance(capabilities, Mapping)
+            else None
+        )
         revision_trained = (
-            capabilities.get("revision_trained") if isinstance(capabilities, Mapping) else None
+            capabilities_mapping.get("revision_trained")
+            if capabilities_mapping is not None
+            else None
         )
         if revision_trained is False:
             raise ValueError(
