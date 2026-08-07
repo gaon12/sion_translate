@@ -13,6 +13,8 @@ from sion_translate.contamination import (
     assess_contamination,
     normalize,
     rank_findings,
+    repair_pair,
+    spaced_normalize,
     supported_direction,
 )
 from sion_translate.data.quality import QualityPolicy, assess_pair
@@ -63,10 +65,45 @@ def test_the_lookalike_idiom_is_flagged() -> None:
     findings = assess_contamination("아빠랑 붕어빵이네", "パパとたい焼きだね")
     assert any(finding.rule == "literal_idiom" for finding in findings)
 
+    findings = assess_contamination(
+        "남동생과 붕어빵처럼 똑 닮았다", "弟とたい焼きのようにそっくりだ"
+    )
+    assert any(finding.rule == "literal_idiom" for finding in findings)
+
+
+def test_the_food_sense_of_the_lookalike_word_is_not_flagged() -> None:
+    """실측 오탐. queue 155행의 `literal_idiom` 은 대부분 진짜 음식이었다.
+
+    `붕어빵을 입에 물고`, `펭수네 붕어빵` 에서 `たい焼き` 는 맞는 번역입니다.
+    닮음을 뜻하는 표지가 없으면 관용구로 보지 않습니다.
+    """
+
+    for source, target in (
+        ("붕어빵 두 개 주세요", "たい焼きを二つください"),
+        ("김명수가 붕어빵을 입에 물고 있다", "キム・ミョンスがたい焼きをくわえている"),
+        ("펭수네 붕어빵 가게", "ペンスネたい焼き店"),
+    ):
+        assert assess_contamination(source, target) == [], source
+
 
 def test_a_dog_prefix_insult_translated_as_the_animal_is_flagged() -> None:
     findings = assess_contamination("이 개새끼야", "この犬野郎")
     assert any(finding.rule == "dog_prefix_literal" for finding in findings)
+
+    findings = assess_contamination("개소리 하지 마", "犬のこと言わないで")
+    assert any(finding.rule == "dog_prefix_literal" for finding in findings)
+
+
+def test_a_spaced_animal_reference_is_not_a_dog_prefix_insult() -> None:
+    """실측 오탐. 공백을 지우면 `개 소리`(짖는 소리)가 `개소리`(헛소리)가 된다."""
+
+    assert (
+        assess_contamination(
+            "길마다 개 소리가 들려 웃음을 자아냈다", "犬の声が聞こえて笑いを誘った"
+        )
+        == []
+    )
+    assert assess_contamination("어미 개에 딸린 새끼 개의 형국", "母犬にくっつく子犬の形") == []
 
 
 def test_profanity_losing_its_intensity_is_flagged_without_a_lookup_table() -> None:
@@ -83,7 +120,6 @@ def test_a_correctly_localized_insult_is_not_flagged() -> None:
 
 def test_ordinary_pairs_are_not_flagged() -> None:
     assert assess_contamination("오늘 날씨가 좋네요", "今日は天気がいいですね") == []
-    assert assess_contamination("붕어빵 두 개 주세요", "たい焼きを二つください") != []  # 동음이의
 
 
 def test_an_unsupported_direction_returns_nothing_and_says_so() -> None:
@@ -98,6 +134,46 @@ def test_an_unsupported_direction_returns_nothing_and_says_so() -> None:
 def test_normalize_strips_spacing_and_repetition() -> None:
     assert normalize("씨 발!!!") == "씨발"
     assert normalize("아아아 진짜") == "아진짜"
+
+
+def test_spaced_normalize_keeps_the_boundary_that_carries_meaning() -> None:
+    assert spaced_normalize("개 소리!!!") == "개 소리"
+    assert spaced_normalize("개소리") == "개소리"
+    assert spaced_normalize("개  소리") != spaced_normalize("개소리")
+
+
+def test_the_known_literal_artifact_is_repaired_and_verified() -> None:
+    """축자 산물은 그 자리에 있다는 것 자체가 오류이므로 규칙으로 고칠 수 있다."""
+
+    repair = repair_pair("씨발 진짜 짜증나네", "種まき 本当にうざい")
+    assert repair is not None
+    assert repair.changed
+    assert repair.target == "くそ 本当にうざい"
+    assert repair.original_target == "種まき 本当にうざい"
+    assert ("種まき", "くそ") in repair.replacements
+    # 고친 결과는 더 이상 걸리지 않아야 한다. 이 검증이 repair_pair 안에 있다.
+    assert assess_contamination("씨발 진짜 짜증나네", repair.target) == []
+
+
+def test_every_literal_artifact_occurrence_is_repaired() -> None:
+    repair = repair_pair("이 씨발, 어떤 씨발년이", "この種まき、ある種まきは")
+    assert repair is not None
+    assert "種まき" not in repair.target
+
+
+def test_a_pair_needing_a_new_translation_is_not_repaired() -> None:
+    """관용구 직역과 강도 소실은 대체어를 사람이 써야 한다. 규칙이 지어내면 안 된다."""
+
+    assert repair_pair("아빠랑 붕어빵이네", "パパとたい焼きだね") is None
+    assert repair_pair("존나 짜증나", "とても嫌です") is None
+    assert repair_pair("개소리 하지 마", "犬のこと言わないで") is None
+
+
+def test_a_clean_pair_is_not_repaired() -> None:
+    """``None`` 은 '못 고친다'는 뜻이지 '깨끗하다'는 뜻이 아니다."""
+
+    assert repair_pair("오늘 날씨가 좋네요", "今日は天気がいいですね") is None
+    assert repair_pair("씨발 진짜 짜증나네", "くそ、本当にむかつく") is None
 
 
 def test_ranking_picks_the_most_confident_reason() -> None:
