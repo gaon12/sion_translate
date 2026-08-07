@@ -12,7 +12,11 @@ from collections import Counter
 
 import pytest
 
-from sion_translate.tokenizer import required_characters_from_counts
+from sion_translate.tokenizer import (
+    SENTENCEPIECE_RESERVED_CHARACTERS,
+    acceptable_required_characters,
+    required_characters_from_counts,
+)
 
 
 def test_a_frequent_character_is_required() -> None:
@@ -33,6 +37,51 @@ def test_whitespace_is_never_required() -> None:
     # SentencePiece handles whitespace through its own meta symbol; reserving it
     # as a required character would waste a slot and confuse the segmenter.
     counts = Counter({" ": 10**6, "\n": 10**6, "　": 10**6, "가": 100})
+    assert required_characters_from_counts(counts, min_occurrences=25) == ["가"]
+
+
+def test_the_sentencepiece_unknown_character_is_never_required() -> None:
+    """실측 실패. ⁇ 하나가 코퍼스 전체를 읽은 뒤에 학습을 죽인다.
+
+    U+2047 은 SentencePiece 가 unknown 조각을 찍을 때 쓰는 문자라
+    ``required_chars`` 로 넘기면 트레이너가 assert 로 죽습니다
+    (``[!port::ContainsKey(required_chars_, kUNKChar)]``). 단일어 웹 코퍼스에
+    이 문자가 임계값을 넘겨 들어 있었고, 실패는 코퍼스 스캔이 끝난 뒤에야
+    났습니다 — 빌린 CPU 시간을 다 쓰고 난 다음입니다.
+    """
+
+    counts = Counter({"⁇": 10**6, "가": 100})
+    assert required_characters_from_counts(counts, min_occurrences=25) == ["가"]
+
+
+def test_the_verifier_finds_a_character_sentencepiece_will_not_take() -> None:
+    """규칙을 추측하지 않고 SentencePiece 에게 직접 묻는다.
+
+    U+2585 는 실제 실패를 이분 탐색해서 찾은 문자입니다. ``kUNKChar`` 도 아니고
+    공백 기호 U+2581 도 아니며, 이웃한 블록 문자는 전부 통과합니다. 설명되지
+    않는 거부가 존재하는 이상 목록을 손으로 관리하는 것은 다음 코퍼스에서 또
+    무너집니다.
+    """
+
+    accepted, refused = acceptable_required_characters(list("가나▅다"))
+
+    assert refused == ["▅"]
+    assert accepted == list("가나다")
+
+
+def test_the_verifier_leaves_a_clean_set_alone() -> None:
+    characters = list("가나다あいう漢")
+    accepted, refused = acceptable_required_characters(characters)
+
+    assert refused == []
+    assert accepted == characters
+
+
+def test_the_known_rejects_are_filtered_before_the_probe_runs() -> None:
+    """확인된 것은 목록으로 빠르게 걸러 탐색 횟수를 줄인다."""
+
+    counts = Counter({character: 10**6 for character in SENTENCEPIECE_RESERVED_CHARACTERS})
+    counts["가"] = 100
     assert required_characters_from_counts(counts, min_occurrences=25) == ["가"]
 
 

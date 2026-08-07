@@ -7,6 +7,7 @@ import glob
 import hashlib
 import json
 import re
+import tempfile
 import unicodedata
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
@@ -636,6 +637,20 @@ def corpus_character_counts(
     return counts
 
 
+# Characters SentencePiece refuses to accept as required characters. Passing one
+# asserts inside the trainer (``trainer_interface.cc``:
+# ``[!port::ContainsKey(required_chars_, kUNKChar)]``) *after* it has read the
+# whole corpus, which is the expensive half of the run.
+#
+# U+2047 is ``kUNKChar`` itself. U+2585 was found by bisecting a real failure and
+# has no documented reason to be here -- neighbouring block characters are
+# accepted, and it is not the U+2581 space symbol. That is the point of
+# :func:`acceptable_required_characters`: this list is what we happen to know,
+# not what SentencePiece happens to enforce, so the set is verified rather than
+# trusted.
+SENTENCEPIECE_RESERVED_CHARACTERS = frozenset("⁇▅")
+
+
 def required_characters_from_counts(
     counts: Counter[str],
     *,
@@ -653,6 +668,11 @@ def required_characters_from_counts(
     below it a character is genuinely incidental and byte fallback is the right
     answer, which is what byte fallback is for. Nothing here names a script, so a
     new language pair gets the same protection without a code change.
+
+    :data:`SENTENCEPIECE_RESERVED_CHARACTERS` is removed regardless of how often
+    it occurs. Those characters are not ours to reserve, and leaving them in
+    fails the training run rather than the vocabulary: SentencePiece asserts on
+    them, and only after it has read the whole corpus.
     """
 
     if min_occurrences < 1:
@@ -660,8 +680,89 @@ def required_characters_from_counts(
     return sorted(
         character
         for character, count in counts.items()
-        if count >= min_occurrences and not character.isspace()
+        if count >= min_occurrences
+        and not character.isspace()
+        and character not in SENTENCEPIECE_RESERVED_CHARACTERS
     )
+
+
+def _required_characters_rejected(characters: Sequence[str], probe_corpus: Path) -> bool:
+    """Does SentencePiece assert on this set? One throwaway training run."""
+
+    if not characters:
+        return False
+    with tempfile.TemporaryDirectory() as workspace:
+        try:
+            spm.SentencePieceTrainer.train(
+                input=str(probe_corpus),
+                model_prefix=str(Path(workspace) / "probe"),
+                vocab_size=len(characters) + 512,
+                model_type="unigram",
+                character_coverage=0.9999,
+                byte_fallback=True,
+                normalization_rule_name="identity",
+                required_chars="".join(characters),
+                hard_vocab_limit=False,
+                minloglevel=3,
+            )
+        except RuntimeError as error:
+            if "kUNKChar" in str(error):
+                return True
+            raise
+    return False
+
+
+def acceptable_required_characters(
+    required: Sequence[str],
+) -> tuple[list[str], list[str]]:
+    """``(수용된 문자, 거부된 문자)`` — SentencePiece 에게 직접 물어서 가른다.
+
+    ``required_chars`` 에 SentencePiece 가 받지 않는 문자가 하나라도 있으면
+    학습은 **코퍼스를 다 읽은 뒤에** assert 로 죽습니다. 3,500만 문장에서는 그
+    지점까지 가는 데만 몇 시간이 걸리고, 빌린 CPU 라면 그 시간이 곧 비용입니다.
+
+    어떤 문자가 거부되는지 규칙으로 예측하지 않습니다. U+2047 은 ``kUNKChar``
+    라 설명이 되지만 U+2585 는 되지 않습니다 — 이웃한 블록 문자는 통과하고,
+    공백 기호 U+2581 도 아닙니다. 규칙을 추측해 목록을 손으로 관리하면 다음
+    코퍼스에서 또 같은 방식으로 무너집니다. 그래서 작은 합성 코퍼스로 실제
+    학습을 시켜 보고, 실패하면 이분 탐색으로 범인을 찾아 빼기를 반복합니다.
+
+    비용은 몇 초짜리 학습 수십 번이고, 막는 것은 코퍼스 전량 스캔입니다.
+    """
+
+    candidate = list(required)
+    rejected: list[str] = []
+    with tempfile.TemporaryDirectory() as workspace:
+        probe_corpus = Path(workspace) / "probe.txt"
+        # 어떤 언어에도 치우치지 않게, 그리고 required 문자를 담지 않게 씁니다.
+        # 여기서 재는 것은 코퍼스가 아니라 required 집합의 수용 여부입니다.
+        probe_corpus.write_text(
+            "".join(f"probe line {index}\n" for index in range(500)),
+            encoding="utf-8",
+        )
+
+        while _required_characters_rejected(candidate, probe_corpus):
+            low = candidate
+            while len(low) > 1:
+                middle = len(low) // 2
+                left, right = low[:middle], low[middle:]
+                if _required_characters_rejected(left, probe_corpus):
+                    low = left
+                elif _required_characters_rejected(right, probe_corpus):
+                    low = right
+                else:
+                    # 어느 절반도 단독으로는 실패하지 않으면 조합 문제입니다.
+                    # 그런 사례는 아직 관측되지 않았고, 조용히 추측해서 지우는
+                    # 것보다 멈추고 말하는 편이 낫습니다.
+                    raise RuntimeError(
+                        "SentencePiece rejects this required-character set, but no "
+                        f"single character explains it ({len(low)} remain). Inspect "
+                        "them by hand rather than trusting an automatic drop."
+                    )
+            offender = low[0]
+            rejected.append(offender)
+            candidate = [character for character in candidate if character != offender]
+    return candidate, rejected
 
 
 def train_tokenizer(
@@ -765,7 +866,8 @@ def train_tokenizer(
         )
         # SentencePiece refuses when required_chars plus its meta pieces exceed
         # vocab_size, and it only says so after the corpus scan. Say it here, with
-        # the number to change, rather than after a long wait.
+        # the number to change, rather than after a long wait. This costs nothing,
+        # so it runs before the probe below, which costs seconds.
         reserved = len(required_characters) + len(symbols) + 256
         if reserved >= vocab_size:
             raise ValueError(
@@ -774,6 +876,16 @@ def train_tokenizer(
                 f"vocab_size is {vocab_size:,}. Raise vocab_size or raise "
                 f"required_character_min_occurrences (currently "
                 f"{required_character_min_occurrences})."
+            )
+        # Ask SentencePiece whether it will take this set before handing it the
+        # corpus. It asserts on a character it dislikes only after reading every
+        # sentence, so without this the failure arrives at the end of the run.
+        required_characters, refused = acceptable_required_characters(required_characters)
+        if refused:
+            print(
+                "[tokenizer] SentencePiece 가 받지 않는 문자를 required_chars 에서 "
+                f"제외했습니다: {' '.join(f'U+{ord(c):04X}' for c in refused)}",
+                flush=True,
             )
 
     monolingual_counts: dict[str, int] = {}
