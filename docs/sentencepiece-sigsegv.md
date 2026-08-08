@@ -101,10 +101,33 @@ foundation 입력도 따로 확인했습니다. 언어별 결정적 표본에서
 | ja | 19,166 | 기존 0.13 | 0.0038% | 0.539918 |
 | ja | 19,166 | 고단일어 후보 | 0.0039% | **0.526961** |
 
-fallback은 사실상 같고, 조각 수는 ko에서 4.79%, ja에서 2.40% 줄었습니다. 후보
-모델은 재현 작업 폴더에만 보존했고 저장소의 배포 artifact는 교체하지 않았습니다.
-그 모델을 교체하면 이미 준비한 token-id dataset도 함께 다시 만들어야 하기
-때문입니다.
+fallback은 사실상 같고, 조각 수는 ko에서 4.79%, ja에서 2.40% 줄었습니다. 이
+절의 스트레스 후보는 당시 재현 작업 폴더에만 보존했고 배포 artifact는 교체하지
+않았습니다. 다음 절의 production artifact를 만들 때 tokenizer와 token-id dataset을
+함께 교체했습니다.
+
+### 2026-08-08 production 0.40 검증
+
+실제 production 경로인 `scripts/modal_train_tokenizer.py`로 SentencePiece 0.2.1,
+preprocess workers 16개, SentencePiece threads 16개, unigram 48,000 모델을
+학습했습니다. run ID는
+`ratio-040-fe9a4799de05-6b2fd43b3111-20260808t081122z-d0d1ac`입니다.
+
+- 병렬 18,177,344문장
+- 단일어 ja 3,445,471문장 + ko 3,308,940문장
+- 총 24,931,755문장; 문자 계획 pass와 최종 trainer pass 모두 정확히
+  24,931,755문장
+- required characters 9,751개, SHA-256
+  `bc1e656d90cd109cb8631583c588aeb9b51125dafa31744c9016eba392ed1e86`
+- 모델 SHA-256
+  `082695f2d42314061fe3c5431816ef501cb2257d6af6c334f726816aea1bdc98`
+
+`easy_run._verify_tokenizer()`는 1,304,691개 표본 토큰 중 byte fallback 736개,
+**0.0564%**로 0.2% 상한을 통과했습니다. `넼`은 dummy prefix를 제외하면 한
+조각이고, `38,720`은 `3 8 , 7 2 0`으로 나뉩니다. 같은 모델로 병렬 dataset도
+다시 만들었고, dataset manifest와 freshness fingerprint가 위 모델 SHA를
+기록하는지 확인했습니다. 정확한 source/artifact hash와 두 pass count는 tokenizer
+옆의 `training_manifest.json`에 보존합니다.
 
 ## 다시 실행하는 법
 

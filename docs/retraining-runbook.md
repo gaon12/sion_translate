@@ -1,7 +1,7 @@
 # 처음부터 재학습 실행 안내
 
 GPU 서버에서 토크나이저부터 사후학습까지 순서대로 돌리는 절차입니다.
-2026-07-31 기준이며, 이 문서의 수치는 전부 실측입니다.
+2026-08-08 기준이며, 이 문서의 수치는 전부 실측입니다.
 
 ## 0. 전제
 
@@ -19,9 +19,10 @@ GPU 서버에서 토크나이저부터 사후학습까지 순서대로 돌리는
 GPU ZIP을 서버에 올린 경우 먼저 압축과 내부 checksum을 검증합니다.
 
 ```bash
-sha256sum sion_translate.zip  # 배포자가 전달한 값과 비교
-python -m zipfile -t sion_translate.zip
-unzip sion_translate.zip
+TRAINING_ZIP="sion-training-input-COMMIT-082695f2.zip"
+sha256sum "$TRAINING_ZIP"  # 배포자가 전달한 값과 비교
+python -m zipfile -t "$TRAINING_ZIP"
+unzip "$TRAINING_ZIP"
 cd sion_translate
 python scripts/package_gpu_bundle.py verify-tree .
 
@@ -80,7 +81,7 @@ print(f"{'TOTAL':44} {total:>10,}")
 PY
 ```
 
-2026-07-31 기준 **8,978,338행 / 51 shard**입니다. 숫자가 크게 다르면 코퍼스
+2026-08-08 기준 **9,042,554개 물리 행 / 54 files**입니다. 숫자가 크게 다르면 코퍼스
 업로드가 덜 끝난 것입니다.
 
 ### 키 이름 확인 — 반드시 하십시오
@@ -125,6 +126,30 @@ PY
 
 ## 4. 토크나이저
 
+이 runbook이 대상으로 삼는 완전한 GPU 학습 ZIP은
+`--with-tokenizer --with-dataset --with-monolingual-corpus`로 만든 variant입니다.
+여기에는 검증된 `artifacts/tokenizer/`와 그 tokenizer로 만든
+`artifacts/dataset/`이 함께 들어 있습니다. 서버에서 둘 중 하나만 다시 만들지
+마십시오. tokenizer가 바뀌면 모든 token ID의 의미가 바뀌므로 dataset도 함께
+재생성해야 합니다. package CLI의 기본 ZIP은 이 opt-in artifact들을 포함하지
+않습니다.
+
+production tokenizer 자체를 다시 학습할 때는 병렬 JSONL과 `data/corpus/{ja,ko}`를
+모두 올린 `sion-dataset` Modal volume에서 다음 명령을 실행합니다.
+
+```bash
+python -m modal run scripts/modal_train_tokenizer.py
+```
+
+이 경로는 `foundation.tokenizer_sample_ratio: 0.40`, SentencePiece 0.2.1, 원문
+90파일의 size/SHA, 두 번의 전체 iterator pass를 검증하고 기존 candidate를
+덮어쓰지 않습니다. 성공 candidate의 model/vocab/features/metadata/training manifest
+5파일을 함께 설치한 뒤 번역 dataset과 GPU ZIP을 다시 만드십시오. SIGSEGV 원인과
+버전 정책은 [`sentencepiece-sigsegv.md`](sentencepiece-sigsegv.md)에 있습니다.
+
+아래 명령은 **병렬 JSONL만 보는 진단용**입니다. 단일어 corpus와 production 0.40
+표본을 쓰지 않으므로 release tokenizer를 만드는 명령으로 사용하면 안 됩니다.
+
 ```bash
 sion-train-tokenizer \
   --input "data/*.jsonl" \
@@ -141,15 +166,17 @@ sion-train-tokenizer \
   --train-only-prefix bt_ concat_ revise_ synthetic_
 ```
 
-`--input-sentence-size 0`이 핵심입니다. 기본 상한을 두면 SentencePiece가
-코퍼스의 22.2%만 보고, 균등 무작위 추출이라 작은 shard가 비중만큼만
-보입니다 — 한본어(`kj`)는 10,731행으로 전체의 0.12%입니다. 작지만 고유
-문자를 담고 있는 shard라, 비중대로 표본을 뽑으면 그 문자가 사라집니다.
+`--input-sentence-size 0`은 제공된 iterator stream 전체를 쓰고 SentencePiece가
+다시 내부 표본을 뽑지 않게 합니다. production Modal 경로에서는 애플리케이션이
+먼저 0.40 정책으로 단일어를 고른 뒤 이 옵션을 적용합니다. 위 parallel-only 진단
+명령에는 0.40 단일어 표본이 없습니다. 내부 상한을 두면 작은 shard가 비중만큼만
+보이므로, 한본어(`kj`)처럼 작지만 고유 문자가 있는 shard는 그 문자가 사라질 수
+있습니다.
 
-`--required-character-min-occurrences 25`는 25회 이상 나오는 문자를 어휘에
-못 박습니다. 코퍼스에 고유 문자가 10,761개 있고 이 임계값에서 6,492개가
-남습니다(48k 어휘의 13.5%). 5~49회 구간 2,231자는 대부분 희귀 한자·한글
-음절이라 byte fallback이 맞는 대상입니다.
+`--required-character-min-occurrences 25`는 표본에서 25회 이상 나오는 문자를
+어휘에 못 박습니다. 2026-08-08 production 0.40 실행에서는 9,751개가 남았고,
+그 집합의 SHA-256까지 `training_manifest.json`에 기록했습니다. 표본 밖 또는 더
+희귀한 문자는 byte fallback 대상입니다.
 
 ### 끝나면 반드시 확인할 것
 
