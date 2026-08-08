@@ -29,10 +29,12 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import secrets
+import signal
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any, cast
 
 
@@ -43,6 +45,9 @@ OUTPUT_MOUNT = "/output"
 INPUT_VOLUME_NAME = "sion-dataset"
 OUTPUT_VOLUME_NAME = "sion-tokenizer-production"
 APP_NAME = "sion-tokenizer-production"
+REMOTE_SCRIPT_PATH = f"{REMOTE_REPOSITORY_ROOT}/scripts/modal_train_tokenizer.py"
+CHILD_MODE_FLAG = "--modal-tokenizer-child"
+CHILD_HEARTBEAT_SECONDS = 45.0
 
 SOURCE_MANIFEST_VERSION = 1
 TRAINING_MANIFEST_VERSION = 1
@@ -58,6 +63,7 @@ REQUIRED_ARTIFACTS = frozenset(
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40,64}$")
 RUN_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,95}$")
+_CHILD_MODE = CHILD_MODE_FLAG in sys.argv
 
 
 @dataclass(frozen=True)
@@ -421,12 +427,196 @@ def _new_run_id(commit: str, source_manifest: Mapping[str, object]) -> str:
     )
 
 
+def _cpu_plan_payload(cpu_plan: Any) -> dict[str, int]:
+    payload = {
+        "available": int(cpu_plan.available),
+        "preprocess_workers": int(cpu_plan.preprocess_workers),
+        "sentencepiece_threads": int(cpu_plan.sentencepiece_threads),
+    }
+    if (
+        payload["preprocess_workers"] < 1
+        or payload["sentencepiece_threads"] < 1
+        or payload["preprocess_workers"] + payload["sentencepiece_threads"] != payload["available"]
+    ):
+        raise RuntimeError(f"invalid production CPU plan: {payload}")
+    return payload
+
+
+def _write_json_atomic(path: Path, value: Mapping[str, object]) -> None:
+    temporary = path.with_name(f".{path.name}.{secrets.token_hex(4)}.tmp")
+    if path.exists():
+        raise FileExistsError(f"refusing to replace an existing result file: {path}")
+    temporary.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+
+
+def _train_child(build_directory: Path, result_path: Path) -> None:
+    """Run production training in a process whose GIL cannot starve Modal."""
+
+    remote_repository_root = Path(REMOTE_REPOSITORY_ROOT)
+    input_mount = Path(INPUT_MOUNT)
+    config_path = remote_repository_root / "sion_translate.yaml"
+    _, monolingual_module, tokenizer_module = _load_production_modules(remote_repository_root)
+    sentencepiece = importlib.import_module("sentencepiece")
+    sentencepiece_version = str(getattr(sentencepiece, "__version__", "unknown"))
+    if sentencepiece_version != EXPECTED_SENTENCEPIECE_VERSION:
+        raise RuntimeError(
+            f"expected SentencePiece {EXPECTED_SENTENCEPIECE_VERSION}, got {sentencepiece_version}"
+        )
+    if build_directory.exists() or result_path.exists():
+        raise FileExistsError("child output paths must not exist before training")
+
+    paths, config = _source_paths(
+        input_mount,
+        config_path,
+        source_root=remote_repository_root,
+    )
+    ratio = float(config.foundation.tokenizer_sample_ratio)
+    if ratio != EXPECTED_TOKENIZER_SAMPLE_RATIO:
+        raise RuntimeError(f"child tokenizer ratio differs from production: {ratio}")
+    pairs = config.data.configured_language_pairs()
+    foundation_languages = monolingual_module.foundation_languages(
+        tokenizer_module.languages_from_pairs(pairs),
+        config.data.configured_source_only_languages(),
+    )
+    discovery = monolingual_module.discover_monolingual_sources(
+        input_mount / config.foundation.corpus_dir,
+        foundation_languages,
+    )
+    cpu_plan = tokenizer_module.build_cpu_plan(input_files=len(paths))
+    cpu_plan_payload = _cpu_plan_payload(cpu_plan)
+
+    with _observe_tokenizer_sentence_counts(tokenizer_module) as observed_counts:
+        tokenizer_module.train_tokenizer(
+            [str(input_mount / config.data.raw_dir / "*.jsonl")],
+            build_directory,
+            vocab_size=EXPECTED_VOCAB_SIZE,
+            language_pairs=pairs,
+            monolingual=discovery,
+            monolingual_sample_ratio=ratio,
+            approximate_split=config.data.approximate_split,
+            source_only_languages=config.data.configured_source_only_languages(),
+            train_only_prefixes=config.data.configured_synthetic_prefixes(),
+            num_workers=cpu_plan.preprocess_workers,
+            num_threads=cpu_plan.sentencepiece_threads,
+        )
+    artifacts = _artifact_records(build_directory)
+    metadata = _validate_training_metadata(build_directory, observed_counts, artifacts)
+    _write_json_atomic(
+        result_path,
+        {
+            "sentencepiece_version": sentencepiece_version,
+            "tokenizer_sample_ratio": ratio,
+            "observed_sentence_counts": list(observed_counts),
+            "monolingual_sentences": metadata.get("monolingual_sentences"),
+            "cpu_plan": cpu_plan_payload,
+        },
+    )
+
+
+def _child_failure_message(returncode: int) -> str:
+    signal_number: int | None = None
+    if returncode < 0:
+        signal_number = -returncode
+    elif returncode >= 128:
+        signal_number = returncode - 128
+    if signal_number is not None:
+        try:
+            signal_name = signal.Signals(signal_number).name
+        except ValueError:
+            signal_name = f"signal {signal_number}"
+        return f"tokenizer child terminated by {signal_name} (return code {returncode})"
+    return f"tokenizer child exited with return code {returncode}"
+
+
+def _stop_child(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=10)
+
+
+def _run_training_subprocess(
+    command: Sequence[str],
+    *,
+    heartbeat_seconds: float = CHILD_HEARTBEAT_SECONDS,
+) -> None:
+    """Wait without capturing child logs, periodically yielding the parent GIL."""
+
+    if heartbeat_seconds <= 0:
+        raise ValueError("heartbeat_seconds must be positive")
+    started = time.monotonic()
+    process = subprocess.Popen(list(command))
+    print(f"[modal-parent] tokenizer child started: pid={process.pid}", flush=True)
+    try:
+        while True:
+            try:
+                returncode = process.wait(timeout=heartbeat_seconds)
+                break
+            except subprocess.TimeoutExpired:
+                elapsed = time.monotonic() - started
+                print(
+                    f"[modal-parent] tokenizer child alive: pid={process.pid}, "
+                    f"elapsed={elapsed:.1f}s",
+                    flush=True,
+                )
+    except BaseException:
+        _stop_child(process)
+        raise
+    if returncode != 0:
+        raise RuntimeError(_child_failure_message(returncode))
+    print(
+        f"[modal-parent] tokenizer child completed: pid={process.pid}, "
+        f"elapsed={time.monotonic() - started:.1f}s",
+        flush=True,
+    )
+
+
+def _load_child_result(path: Path) -> dict[str, object]:
+    if not path.is_file():
+        raise RuntimeError(f"tokenizer child succeeded without a result JSON: {path}")
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise RuntimeError("tokenizer child result must be a JSON object")
+    result = cast(dict[str, object], value)
+    if result.get("sentencepiece_version") != EXPECTED_SENTENCEPIECE_VERSION:
+        raise RuntimeError("tokenizer child reported the wrong SentencePiece version")
+    if result.get("tokenizer_sample_ratio") != EXPECTED_TOKENIZER_SAMPLE_RATIO:
+        raise RuntimeError("tokenizer child reported the wrong sample ratio")
+    if result.get("observed_sentence_counts") != [
+        EXPECTED_TOTAL_SENTENCES,
+        EXPECTED_TOTAL_SENTENCES,
+    ]:
+        raise RuntimeError(
+            "tokenizer child reported unexpected iterator counts: "
+            f"{result.get('observed_sentence_counts')}"
+        )
+    if result.get("monolingual_sentences") != EXPECTED_MONOLINGUAL_SENTENCES:
+        raise RuntimeError(
+            "tokenizer child reported unexpected monolingual counts: "
+            f"{result.get('monolingual_sentences')}"
+        )
+    cpu_plan = result.get("cpu_plan")
+    if not isinstance(cpu_plan, dict):
+        raise RuntimeError("tokenizer child result has no CPU plan")
+    return result
+
+
 def _train_remote(source_manifest: Mapping[str, object], run_id: str) -> dict[str, object]:
+    """Verify in the Modal parent, train in a child, and publish in the parent."""
+
     remote_repository_root = Path(REMOTE_REPOSITORY_ROOT)
     input_mount = Path(INPUT_MOUNT)
     output_mount = Path(OUTPUT_MOUNT)
     config_path = remote_repository_root / "sion_translate.yaml"
-    _, monolingual_module, tokenizer_module = _load_production_modules(remote_repository_root)
+    _, _, tokenizer_module = _load_production_modules(remote_repository_root)
     sentencepiece = importlib.import_module("sentencepiece")
     sentencepiece_version = str(getattr(sentencepiece, "__version__", "unknown"))
     if sentencepiece_version != EXPECTED_SENTENCEPIECE_VERSION:
@@ -443,39 +633,29 @@ def _train_remote(source_manifest: Mapping[str, object], run_id: str) -> dict[st
     ratio = float(config.foundation.tokenizer_sample_ratio)
     if ratio != EXPECTED_TOKENIZER_SAMPLE_RATIO:
         raise RuntimeError(f"remote tokenizer ratio changed after verification: {ratio}")
-    pairs = config.data.configured_language_pairs()
-    foundation_languages = monolingual_module.foundation_languages(
-        tokenizer_module.languages_from_pairs(pairs),
-        config.data.configured_source_only_languages(),
-    )
-    discovery = monolingual_module.discover_monolingual_sources(
-        input_mount / config.foundation.corpus_dir,
-        foundation_languages,
-    )
-    cpu_plan = tokenizer_module.build_cpu_plan(input_files=len(paths))
-    if (
-        cpu_plan.preprocess_workers < 1
-        or cpu_plan.sentencepiece_threads < 1
-        or cpu_plan.preprocess_workers + cpu_plan.sentencepiece_threads != cpu_plan.available
-    ):
-        raise RuntimeError(f"invalid production CPU plan: {cpu_plan}")
+    parent_cpu_plan = _cpu_plan_payload(tokenizer_module.build_cpu_plan(input_files=len(paths)))
 
     with tempfile.TemporaryDirectory(prefix="sion-tokenizer-") as workspace:
-        build_directory = Path(workspace) / "tokenizer"
-        with _observe_tokenizer_sentence_counts(tokenizer_module) as observed_counts:
-            tokenizer_module.train_tokenizer(
-                [str(input_mount / config.data.raw_dir / "*.jsonl")],
-                build_directory,
-                vocab_size=EXPECTED_VOCAB_SIZE,
-                language_pairs=pairs,
-                monolingual=discovery,
-                monolingual_sample_ratio=ratio,
-                approximate_split=config.data.approximate_split,
-                source_only_languages=config.data.configured_source_only_languages(),
-                train_only_prefixes=config.data.configured_synthetic_prefixes(),
-                num_workers=cpu_plan.preprocess_workers,
-                num_threads=cpu_plan.sentencepiece_threads,
+        workspace_path = Path(workspace)
+        build_directory = workspace_path / "tokenizer"
+        child_result_path = workspace_path / "child-result.json"
+        command = [
+            sys.executable,
+            REMOTE_SCRIPT_PATH,
+            CHILD_MODE_FLAG,
+            "--build-directory",
+            str(build_directory),
+            "--result",
+            str(child_result_path),
+        ]
+        _run_training_subprocess(command)
+        child_result = _load_child_result(child_result_path)
+        if child_result["cpu_plan"] != parent_cpu_plan:
+            raise RuntimeError(
+                "tokenizer child CPU plan differs from its verified parent: "
+                f"parent={parent_cpu_plan}, child={child_result['cpu_plan']}"
             )
+        observed_counts = cast(list[int], child_result["observed_sentence_counts"])
         artifacts = _artifact_records(build_directory)
         metadata = _validate_training_metadata(build_directory, observed_counts, artifacts)
         training_manifest: dict[str, object] = {
@@ -494,22 +674,15 @@ def _train_remote(source_manifest: Mapping[str, object], run_id: str) -> dict[st
                 "parallel": EXPECTED_PARALLEL_SENTENCES,
                 "monolingual": EXPECTED_MONOLINGUAL_SENTENCES,
                 "total": EXPECTED_TOTAL_SENTENCES,
-                "observed_passes": list(observed_counts),
+                "observed_passes": observed_counts,
             },
-            "cpu_plan": {
-                "available": cpu_plan.available,
-                "preprocess_workers": cpu_plan.preprocess_workers,
-                "sentencepiece_threads": cpu_plan.sentencepiece_threads,
-            },
+            "cpu_plan": parent_cpu_plan,
             "required_character_count": metadata.get("required_character_count"),
             "required_characters_sha256": metadata.get("required_characters_sha256"),
             "artifacts": artifacts,
         }
         manifest_path = build_directory / "training_manifest.json"
-        manifest_path.write_text(
-            json.dumps(training_manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        _write_json_atomic(manifest_path, training_manifest)
         final_directory = _publish_candidate(
             build_directory,
             output_mount / "tokenizer_candidates",
@@ -524,9 +697,25 @@ def _train_remote(source_manifest: Mapping[str, object], run_id: str) -> dict[st
     return result
 
 
-try:
-    import modal as _modal
-except ModuleNotFoundError:  # Unit tests do not require the optional Modal client.
+def _child_main(arguments: Sequence[str]) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="SentencePiece child process")
+    parser.add_argument(CHILD_MODE_FLAG, action="store_true", required=True)
+    parser.add_argument("--build-directory", type=Path, required=True)
+    parser.add_argument("--result", type=Path, required=True)
+    parsed = parser.parse_args(arguments)
+    _train_child(parsed.build_directory, parsed.result)
+    return 0
+
+
+if not _CHILD_MODE:
+    try:
+        import modal as _modal
+    except ModuleNotFoundError:  # Unit tests do not require the optional Modal client.
+        _modal = None
+else:
+    # A child must not construct Modal Images or Apps while re-importing this file.
     _modal = None
 
 
@@ -542,6 +731,11 @@ if _modal is not None:
         .add_local_file(
             str(REPOSITORY_ROOT / "sion_translate.yaml"),
             remote_path=f"{REMOTE_REPOSITORY_ROOT}/sion_translate.yaml",
+            copy=True,
+        )
+        .add_local_file(
+            str(REPOSITORY_ROOT / "scripts" / "modal_train_tokenizer.py"),
+            remote_path=REMOTE_SCRIPT_PATH,
             copy=True,
         )
     )
@@ -597,4 +791,6 @@ else:
 
 
 if __name__ == "__main__":
+    if _CHILD_MODE:
+        raise SystemExit(_child_main(sys.argv[1:]))
     main()

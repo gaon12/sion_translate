@@ -7,10 +7,14 @@ import hashlib
 import json
 from collections.abc import Iterator
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
+import scripts.modal_train_tokenizer as modal_tokenizer_script
 
 from scripts.modal_train_tokenizer import (
+    CHILD_MODE_FLAG,
     EXPECTED_MONOLINGUAL_SENTENCES,
     EXPECTED_SENTENCEPIECE_VERSION,
     EXPECTED_TOKENIZER_SAMPLE_RATIO,
@@ -18,13 +22,16 @@ from scripts.modal_train_tokenizer import (
     REQUIRED_ARTIFACTS,
     SourceRecord,
     _artifact_records,
+    _child_failure_message,
     _file_sha256,
+    _load_child_result,
     _manifest_digest,
     _new_run_id,
     _observe_tokenizer_sentence_counts,
     _parse_source_manifest,
     _publish_candidate,
     _records_digest,
+    _run_training_subprocess,
     _validate_training_metadata,
 )
 
@@ -125,3 +132,120 @@ def test_file_hash_uses_file_bytes(tmp_path: Path) -> None:
     path = tmp_path / "artifact"
     path.write_bytes(b"tokenizer")
     assert _file_sha256(path) == hashlib.sha256(b"tokenizer").hexdigest()
+
+
+def test_parent_heartbeats_while_mock_child_holds_the_gil(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class FakeProcess:
+        pid = 4242
+
+        def __init__(self) -> None:
+            self.returncode: int | None = None
+            self.waits = 0
+
+        def wait(self, timeout: float) -> int:
+            self.waits += 1
+            if self.waits == 1:
+                raise subprocess.TimeoutExpired(["child"], timeout)
+            self.returncode = 0
+            return 0
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def terminate(self) -> None:
+            raise AssertionError("successful child must not be terminated")
+
+        def kill(self) -> None:
+            raise AssertionError("successful child must not be killed")
+
+    process = FakeProcess()
+
+    def fake_popen(command: object) -> FakeProcess:
+        del command
+        return process
+
+    monkeypatch.setattr(
+        modal_tokenizer_script.subprocess,
+        "Popen",
+        fake_popen,
+    )
+
+    _run_training_subprocess(["python", "child.py"], heartbeat_seconds=45)
+
+    output = capsys.readouterr().out
+    assert "tokenizer child alive" in output
+    assert "tokenizer child completed" in output
+
+
+def test_parent_reports_native_child_signal(monkeypatch: pytest.MonkeyPatch) -> None:
+    class CrashedProcess:
+        pid = 5252
+
+        @staticmethod
+        def wait(timeout: float) -> int:
+            del timeout
+            return -11
+
+        @staticmethod
+        def poll() -> int:
+            return -11
+
+        @staticmethod
+        def terminate() -> None:
+            raise AssertionError("exited child must not be terminated")
+
+        @staticmethod
+        def kill() -> None:
+            raise AssertionError("exited child must not be killed")
+
+    def fake_popen(command: object) -> CrashedProcess:
+        del command
+        return CrashedProcess()
+
+    monkeypatch.setattr(
+        modal_tokenizer_script.subprocess,
+        "Popen",
+        fake_popen,
+    )
+
+    with pytest.raises(RuntimeError, match="SIGSEGV"):
+        _run_training_subprocess(["python", "child.py"])
+    assert "SIGSEGV" in _child_failure_message(139)
+
+
+def test_parent_validates_child_result_json(tmp_path: Path) -> None:
+    result_path = tmp_path / "child-result.json"
+    result = {
+        "sentencepiece_version": EXPECTED_SENTENCEPIECE_VERSION,
+        "tokenizer_sample_ratio": EXPECTED_TOKENIZER_SAMPLE_RATIO,
+        "observed_sentence_counts": [EXPECTED_TOTAL_SENTENCES, EXPECTED_TOTAL_SENTENCES],
+        "monolingual_sentences": EXPECTED_MONOLINGUAL_SENTENCES,
+        "cpu_plan": {
+            "available": 16,
+            "preprocess_workers": 8,
+            "sentencepiece_threads": 8,
+        },
+    }
+    result_path.write_text(json.dumps(result), encoding="utf-8")
+    assert _load_child_result(result_path) == result
+
+    result["observed_sentence_counts"] = [EXPECTED_TOTAL_SENTENCES]
+    result_path.write_text(json.dumps(result), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="iterator counts"):
+        _load_child_result(result_path)
+
+
+def test_child_mode_help_does_not_construct_modal_app() -> None:
+    script = Path(modal_tokenizer_script.__file__)
+    completed = subprocess.run(
+        [sys.executable, str(script), CHILD_MODE_FLAG, "--help"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "SentencePiece child process" in completed.stdout
