@@ -174,6 +174,31 @@ def test_a_disabled_plan_does_nothing_and_says_why(tmp_path, tokenizer_model) ->
     assert not (foundation_run_directory(config) / FOUNDATION_COMPLETION_FILENAME).exists()
 
 
+def test_a_missing_corpus_never_trains_or_exports_a_foundation_model(
+    tmp_path,
+    tokenizer_model,
+    monkeypatch,
+) -> None:
+    config, _, model, tokenizer, context = _prepared(tmp_path, tokenizer_model)
+    config.foundation.corpus_dir = str(tmp_path / "missing-corpus")
+    plan = plan_foundation_stage(config)
+    run_root = foundation_run_directory(config)
+
+    import sion_translate.cli.train as train_module
+
+    def _fail(*_args, **_kwargs):
+        raise AssertionError("missing corpus must not train or export sion")
+
+    monkeypatch.setattr(train_module, "train", _fail)
+    monkeypatch.setattr(train_module, "export_final_model", _fail)
+
+    outcome = run_foundation_stage(config, plan, model, tokenizer, context)
+
+    assert not outcome.ran
+    assert outcome.best_checkpoint is None
+    assert not run_root.exists()
+
+
 def test_the_stage_publishes_under_the_foundation_release_name(tmp_path, tokenizer_model) -> None:
     """foundation 산출물은 번역 모델이 아니라 그 파운데이션이다."""
     config, plan, model, tokenizer, context = _prepared(tmp_path, tokenizer_model)

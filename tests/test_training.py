@@ -150,7 +150,18 @@ def test_single_step_training_loop(tmp_path: Path) -> None:
     config = tiny_app_config(tmp_path)
     model = SionForConditionalGeneration(config.model)
     context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
-    result = train(model, [tiny_batch()], [tiny_batch()], config, context)
+    pipeline_identity = {
+        "schema": "sion-translation-pipeline-v1",
+        "branch": "translation-only",
+    }
+    result = train(
+        model,
+        [tiny_batch()],
+        [tiny_batch()],
+        config,
+        context,
+        pipeline_identity=pipeline_identity,
+    )
     assert result["step"] == 1
     assert (tmp_path / "run" / "checkpoints" / "best" / "checkpoint.pt").exists()
     assert (tmp_path / "run" / "checkpoints" / "latest" / "checkpoint.pt").exists()
@@ -159,6 +170,12 @@ def test_single_step_training_loop(tmp_path: Path) -> None:
     for name in ("best", "latest"):
         assert (tmp_path / "run" / "exports" / name / "model_ema.pt").exists()
         assert not (tmp_path / "run" / "exports" / name / "model.pt").exists()
+    checkpoint = torch.load(
+        tmp_path / "run" / "checkpoints" / "final" / "checkpoint.pt",
+        map_location="cpu",
+        weights_only=True,
+    )
+    assert checkpoint["identity"]["pipeline"] == pipeline_identity
 
 
 def test_intermediate_exports_advertise_only_trained_directions(

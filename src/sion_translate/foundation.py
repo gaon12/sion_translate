@@ -22,6 +22,9 @@ from sion_translate.data.monolingual import (
 )
 
 
+PIPELINE_IDENTITY_SCHEMA = "sion-translation-pipeline-v1"
+
+
 @dataclass(frozen=True)
 class FoundationPlan:
     """이 실행에서 foundation 단계를 돌릴지, 그리고 그 이유."""
@@ -35,6 +38,21 @@ class FoundationPlan:
 
     def __bool__(self) -> bool:
         return self.enabled
+
+
+def build_translation_pipeline_identity(plan: FoundationPlan) -> dict[str, str]:
+    """Return the stable ancestry branch required for translation-stage resume.
+
+    ``ran`` is deliberately not part of this identity: a completed foundation
+    stage that is reused and one that was trained in the current process have
+    the same translation-model ancestry. Paths and human-readable skip reasons
+    are likewise runtime details rather than compatibility inputs.
+    """
+
+    return {
+        "schema": PIPELINE_IDENTITY_SCHEMA,
+        "branch": "foundation-then-translation" if plan.enabled else "translation-only",
+    }
 
 
 def plan_foundation_stage(config: AppConfig) -> FoundationPlan:
@@ -185,7 +203,9 @@ class FoundationOutcome:
 __all__ = [
     "FoundationOutcome",
     "FoundationPlan",
+    "PIPELINE_IDENTITY_SCHEMA",
     "build_foundation_config",
+    "build_translation_pipeline_identity",
     "foundation_run_directory",
     "plan_foundation_stage",
 ]

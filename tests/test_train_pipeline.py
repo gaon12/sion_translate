@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 import torch
@@ -675,6 +676,44 @@ def test_existing_checkpoint_search_covers_stage_directories(tmp_path: Path) -> 
     checkpoint.mkdir(parents=True)
     (checkpoint / "checkpoint.pt").write_bytes(b"weights")
     assert find_existing_checkpoint(config) == checkpoint
+
+
+def test_translation_initialization_log_states_the_no_corpus_release_contract() -> None:
+    from sion_translate.foundation import FoundationOutcome
+
+    message = train_module.translation_initialization_message(
+        FoundationOutcome(ran=False, reason="missing corpus"),
+        resume_from=None,
+    )
+
+    assert "fresh initialization" in message
+    assert "sion)은 학습·내보내지 않습니다" in message
+    assert "SFT/MRT" in message
+    assert "sion_translate만" in message
+
+
+def test_validated_sft_resume_takes_priority_without_touching_foundation(monkeypatch) -> None:
+    def _fail(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("validated SFT resume must skip foundation")
+
+    monkeypatch.setattr(train_module, "run_foundation_stage", _fail)
+    outcome = train_module.run_foundation_before_translation(
+        AppConfig(),
+        cast(Any, None),
+        torch.nn.Linear(1, 1),
+        cast(Any, None),
+        DistributedContext(0, 0, 1, torch.device("cpu"), False),
+        validated_pretrain_resume="runs/auto/pretrain/checkpoints/latest",
+    )
+    message = train_module.translation_initialization_message(
+        outcome,
+        resume_from="runs/auto/pretrain/checkpoints/latest",
+        pipeline_branch="foundation-then-translation",
+    )
+
+    assert not outcome.ran
+    assert "우선 재개" in message
+    assert "foundation 단계" in message and "로드하지 않으며" in message
 
 
 def test_tokenizer_policy_requires_digit_splitting_and_matching_identity(

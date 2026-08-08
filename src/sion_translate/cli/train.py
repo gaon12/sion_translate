@@ -66,6 +66,7 @@ from sion_translate.locking import artifact_lock
 from sion_translate.foundation import (
     FoundationOutcome,
     build_foundation_config,
+    build_translation_pipeline_identity,
     foundation_run_directory,
     plan_foundation_stage,
 )
@@ -89,10 +90,15 @@ from sion_translate.training.checkpoint import (
     build_checkpoint_identity,
     checkpoint_path_exists,
     initialize_model_from_checkpoint,
+    preflight_checkpoint_identity,
 )
 from sion_translate.training.export import export_inference_models
 from sion_translate.training.objectives import MinimumRiskObjective
-from sion_translate.training.trainer import announce, train
+from sion_translate.training.trainer import (
+    announce,
+    build_training_checkpoint_identity,
+    train,
+)
 from sion_translate.performance import build_cpu_plan
 
 DEFAULT_CONFIG_FILE = "sion_translate.yaml"
@@ -541,6 +547,8 @@ def ensure_artifacts(
     config: AppConfig,
     context: DistributedContext,
     foundation_plan: Any | None = None,
+    *,
+    prepare_foundation: bool = True,
 ) -> None:
     """토크나이저와 준비된 데이터셋이 없거나 낡았으면 자동으로 만듭니다.
 
@@ -709,6 +717,11 @@ def ensure_artifacts(
                     announce(f"  {line}", context)
                 if not foundation_plan.enabled:
                     announce(f"foundation 단계: {foundation_plan.reason}", context)
+                elif not prepare_foundation:
+                    announce(
+                        "SFT resume 후보를 먼저 검증하므로 foundation 데이터셋 준비를 보류합니다.",
+                        context,
+                    )
                 else:
                     for warning in foundation_plan.warnings:
                         announce(f"[경고] foundation: {warning}", context)
@@ -939,6 +952,51 @@ def find_auto_resume(config: AppConfig) -> str | None:
     return None
 
 
+def run_foundation_before_translation(
+    config: AppConfig,
+    foundation_plan: Any,
+    model: torch.nn.Module,
+    tokenizer: SionTokenizer,
+    context: DistributedContext,
+    *,
+    validated_pretrain_resume: str | None,
+) -> FoundationOutcome:
+    """Run foundation only when no validated SFT state will supersede it."""
+
+    if validated_pretrain_resume:
+        return FoundationOutcome(
+            ran=False,
+            reason="검증된 SFT resume가 foundation 실행/로드보다 우선합니다.",
+        )
+    return run_foundation_stage(config, foundation_plan, model, tokenizer, context)
+
+
+def translation_initialization_message(
+    foundation_outcome: FoundationOutcome,
+    *,
+    resume_from: str | None,
+    foundation_release_name: str = "sion",
+    pipeline_branch: str | None = None,
+) -> str:
+    """Describe the ancestry that the translation stages will actually use."""
+
+    if resume_from:
+        branch = pipeline_branch or "검증된"
+        return (
+            f"{branch} SFT 체크포인트 {resume_from} 를 우선 재개합니다. foundation 단계는 "
+            "이번 실행에서 학습하거나 로드하지 않으며 최종 release는 sion_translate입니다."
+        )
+    if foundation_outcome.best_checkpoint:
+        return (
+            "번역 학습을 foundation 가중치에서 시작합니다 "
+            f"({foundation_release_name} step {foundation_outcome.selected_step:,})."
+        )
+    return (
+        "foundation 모델(sion)은 학습·내보내지 않습니다. fresh initialization에서 "
+        "번역 SFT/MRT로 바로 진행해 sion_translate만 만듭니다."
+    )
+
+
 def main() -> None:
     configure_stdio()
     args = build_parser().parse_args()
@@ -963,7 +1021,19 @@ def main() -> None:
             preflight_final_export_dependencies(config.training.final_export_formats)
         announce("준비 ③: 원천 데이터를 확인합니다.", context)
         foundation_plan = plan_foundation_stage(config)
-        ensure_artifacts(config, context, foundation_plan)
+        pipeline_identity = build_translation_pipeline_identity(foundation_plan)
+        initial_run_root = Path(config.training.output_dir)
+        pretrain_resume_candidate = config.training.resume_from
+        if not pretrain_resume_candidate:
+            latest_pretrain = initial_run_root / "pretrain" / "checkpoints" / "latest"
+            if checkpoint_path_exists(latest_pretrain):
+                pretrain_resume_candidate = str(latest_pretrain)
+        ensure_artifacts(
+            config,
+            context,
+            foundation_plan,
+            prepare_foundation=args.prepare_only or not bool(pretrain_resume_candidate),
+        )
         tokenizer = SionTokenizer(config.data.tokenizer_model)
         config.model.vocab_size = len(tokenizer)
         preflight_morphoscript_token_features(config, tokenizer)
@@ -1025,11 +1095,13 @@ def main() -> None:
         pretrain_config.training.output_dir = str(run_root / "pretrain")
 
         # ── 단계 ⑤: 이전 사전학습 자동 재개 ────────────────────────────
-        if not pretrain_config.training.resume_from:
-            resume = find_auto_resume(pretrain_config)
-            if resume:
-                pretrain_config.training.resume_from = resume
-                announce(f"준비 ⑤: 이전 사전학습 발견 → {resume} 에서 자동 재개합니다.", context)
+        if not pretrain_config.training.resume_from and pretrain_resume_candidate:
+            pretrain_config.training.resume_from = pretrain_resume_candidate
+        if pretrain_config.training.resume_from:
+            announce(
+                f"준비 ⑤: 이전 SFT 체크포인트 후보 발견 → {pretrain_config.training.resume_from}",
+                context,
+            )
 
         # ── DataLoader 구성 ──────────────────────────────────────────────
         # collator: 원문/번역문을 토큰화하고 패딩해 텐서 배치로 만듭니다.
@@ -1060,6 +1132,29 @@ def main() -> None:
             source_sampling_weights=config.data.source_sampling_weights,
             max_source_upsampling=config.data.max_source_upsampling,
         )
+        if pretrain_config.training.resume_from:
+            announce(
+                "준비 ⑤: SFT resume identity를 foundation 단계보다 먼저 검증합니다.",
+                context,
+            )
+            expected_pretrain_identity = build_training_checkpoint_identity(
+                pretrain_config,
+                batch_sampler=train_sampler,
+                context=context,
+                stage_name="pretrain/SFT",
+                include_posttraining=False,
+                pipeline_identity=pipeline_identity,
+            )
+            preflight_checkpoint_identity(
+                pretrain_config.training.resume_from,
+                context,
+                expected_pretrain_identity,
+            )
+            announce(
+                "준비 ⑤: SFT resume identity 검증 완료 — 이 체크포인트가 foundation "
+                "실행/로드보다 우선합니다.",
+                context,
+            )
         validation_sampler = DistributedBucketBatchSampler(
             validation_dataset,
             config.training.batch_size_per_gpu,
@@ -1143,20 +1238,23 @@ def main() -> None:
         # ── 단계 ⑤-b: foundation 사전학습 (단일어 복원) ────────────────
         # 번역쌍을 보기 전에 encoder-decoder 를 먼저 만듭니다. 이 단계의
         # 산출물은 번역 모델이 아니라 그 파운데이션이라 별도 이름으로 나갑니다.
-        foundation_outcome = run_foundation_stage(
+        foundation_outcome = run_foundation_before_translation(
             config,
             foundation_plan,
             model,
             tokenizer,
             context,
+            validated_pretrain_resume=pretrain_config.training.resume_from,
         )
-        if foundation_outcome.best_checkpoint:
-            announce(
-                f"번역 학습을 foundation 가중치에서 시작합니다 "
-                f"({config.foundation.release_name} step "
-                f"{foundation_outcome.selected_step:,}).",
-                context,
-            )
+        announce(
+            translation_initialization_message(
+                foundation_outcome,
+                resume_from=pretrain_config.training.resume_from,
+                foundation_release_name=config.foundation.release_name,
+                pipeline_branch=pipeline_identity["branch"],
+            ),
+            context,
+        )
 
         # ── 단계 ⑥: SFT 사전학습 ───────────────────────────────────────
         announce("1단계 SFT 사전학습을 시작합니다.", context)
@@ -1168,6 +1266,7 @@ def main() -> None:
             context,
             stage_name="pretrain/SFT",
             language_tags=tokenizer.language_tags,
+            pipeline_identity=pipeline_identity,
         )
         barrier(context)
         memory = release_stage_resources(context, train_loader, validation_loader)
@@ -1259,6 +1358,7 @@ def main() -> None:
                 objective=objective,
                 stage_name="posttrain/composite-MRT+preference",
                 language_tags=tokenizer.language_tags,
+                pipeline_identity=pipeline_identity,
             )
             barrier(context)
             memory = release_stage_resources(

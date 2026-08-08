@@ -10,6 +10,13 @@ foundation (단일어 복원)  →  SFT (번역)  →  MRT (사후학습)
 runs/*/foundation/           runs/*/pretrain/   runs/*/posttrain/
 ```
 
+유효한 foundation 코퍼스가 없으면 첫 단계를 이름만 남겨 두고 실행하지 않습니다.
+새 `training.output_dir`에서는 fresh initialization으로 번역 SFT와 MRT를 바로
+진행하며, `runs/*/foundation/`을 만들거나 foundation release인 `sion`을 학습·export
+하지 않습니다. 이 경로의 모델 산출물은 번역 release인 **`sion_translate`만**입니다.
+같은 translation-only 분기의 호환 체크포인트가 있으면 fresh initialization 대신
+그 SFT/MRT를 안전하게 재개합니다.
+
 ## 코퍼스 배치
 
 `data/corpus/` 아래에 **언어 코드 폴더**를 만들고 그 안에 파일을 둡니다.
@@ -113,6 +120,12 @@ export 를 거부하고 `runs/*/pretrain` 이나 `posttrain` 을 가리킵니다
 
 foundation 이 끝나면 `runs/*/foundation/stage_complete.json` 이 남습니다. 이후
 실행은 학습을 건너뛰고 best 가중치만 물려받습니다.
+
+이미 SFT `checkpoints/latest`가 있으면 우선순위는 더 뒤 단계인 **SFT resume**입니다.
+체크포인트의 pipeline identity가 현재 `translation-only` 또는
+`foundation-then-translation` 분기와 같은지 foundation 비용 전에 검증하고, 맞으면
+foundation을 다시 학습하거나 로드하지 않습니다. 분기가 다르거나 이 provenance가
+없는 구버전 체크포인트는 자동으로 추측하지 않고 새 `training.output_dir`을 요구합니다.
 
 이 표시가 필요한 이유는 번역 학습이 실패해 재실행되기 때문입니다 — 코퍼스
 지문 변경, export 의존성 누락, 용량 검사 실패. 표시가 없으면 그때마다 며칠짜리

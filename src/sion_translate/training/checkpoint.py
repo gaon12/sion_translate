@@ -219,6 +219,7 @@ def build_checkpoint_identity(
     stage_name: str | None = None,
     loader_config: Mapping[str, Any] | None = None,
     objective_identity: Mapping[str, Any] | None = None,
+    pipeline_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a portable identity for the model, tokenizer, and prepared data.
 
@@ -268,6 +269,8 @@ def build_checkpoint_identity(
     }
     if objective_identity is not None:
         identity["objective"] = _json_compatible(objective_identity)
+    if pipeline_identity is not None:
+        identity["pipeline"] = _json_compatible(pipeline_identity)
     return identity
 
 
@@ -338,6 +341,12 @@ def _validate_identity(
         return
     stored_identity = state.get("identity")
     if stored_identity is None:
+        if "pipeline" in expected_identity:
+            raise ValueError(
+                "checkpoint has no recorded pipeline identity. Refusing to resume because "
+                "its foundation-vs-translation-only ancestry cannot be verified. Start a "
+                "new training.output_dir or resume from a checkpoint created by this pipeline."
+            )
         warnings.warn(
             "이전 버전 체크포인트에는 model/tokenizer/data identity가 없습니다. "
             "이번 재개에서는 안전한 동일성 검사를 건너뜁니다. 다음 저장부터는 identity가 기록됩니다.",
@@ -349,6 +358,12 @@ def _validate_identity(
         raise ValueError("checkpoint identity must be an object")
     expected = _normalize_identity_for_comparison(expected_identity)
     actual = _normalize_identity_for_comparison(cast(Mapping[str, Any], stored_identity))
+    if "pipeline" in expected and "pipeline" not in actual:
+        raise ValueError(
+            "checkpoint has no recorded pipeline identity. Refusing to resume because "
+            "its foundation-vs-translation-only ancestry cannot be verified. Start a new "
+            "training.output_dir or resume from a checkpoint created by this pipeline."
+        )
     if "objective" in expected and "objective" not in actual:
         # 목적함수 identity 가 없던 시절의 체크포인트입니다. 재개 자체를 막지는
         # 않되, 무엇을 검사하지 못했는지 밝힙니다 — 그 사이에 학습률이나 reward
@@ -369,6 +384,172 @@ def _validate_identity(
             "checkpoint identity does not match the current model/tokenizer/data "
             f"({detail}). Refusing to resume with incompatible artifacts."
         )
+
+
+def _dcp_identity_probe(metadata: Any) -> dict[str, Any]:
+    """Build an identity-only DCP target from keys actually in the checkpoint."""
+
+    from torch.distributed.checkpoint._nested_dict import (  # pyright: ignore[reportPrivateImportUsage, reportUnknownVariableType]
+        unflatten_state_dict,  # pyright: ignore[reportUnknownVariableType]
+    )
+
+    planner_data_raw = getattr(metadata, "planner_data", None)
+    planner_data: Mapping[object, object] = (
+        cast(Mapping[object, object], planner_data_raw)
+        if isinstance(planner_data_raw, Mapping)
+        else cast(Mapping[object, object], {})
+    )
+    flattened: dict[str, Any] = {}
+    paths: dict[str, tuple[str | int, ...]] = {}
+    for raw_key in metadata.state_dict_metadata:
+        flat_key = str(raw_key)
+        if flat_key != "identity" and not flat_key.startswith("identity."):
+            continue
+        raw_path = planner_data.get(raw_key)
+        if raw_path is None:
+            raw_path = planner_data.get(flat_key)
+        if isinstance(raw_path, list):
+            raw_parts = tuple(cast(list[object], raw_path))
+        elif isinstance(raw_path, tuple):
+            raw_parts = cast(tuple[object, ...], raw_path)
+        else:
+            raw_parts = ()
+        if raw_path is not None:
+            if not raw_parts or not all(type(part) in (str, int) for part in raw_parts):
+                raise ValueError(
+                    f"distributed checkpoint has an invalid identity metadata path: {flat_key}"
+                )
+            path = tuple(cast(str | int, part) for part in raw_parts)
+        else:
+            path = tuple(flat_key.split("."))
+        if not path or path[0] != "identity":
+            raise ValueError(
+                f"distributed checkpoint has an invalid identity metadata path: {flat_key}"
+            )
+        flattened[flat_key] = None
+        paths[flat_key] = path
+    try:
+        return cast(dict[str, Any], unflatten_state_dict(flattened, paths))
+    except (IndexError, KeyError, TypeError, ValueError) as error:
+        raise ValueError("distributed checkpoint identity metadata is malformed") from error
+
+
+def _restore_expected_empty_mappings(
+    actual: dict[str, Any],
+    expected: Mapping[str, Any],
+) -> None:
+    """Restore empty mappings, which DCP intentionally omits from metadata."""
+
+    for key, expected_value in expected.items():
+        if key not in actual:
+            if isinstance(expected_value, Mapping) and not expected_value:
+                actual[key] = {}
+            continue
+        actual_value = actual[key]
+        if isinstance(actual_value, dict) and isinstance(expected_value, Mapping):
+            _restore_expected_empty_mappings(
+                cast(dict[str, Any], actual_value),
+                cast(Mapping[str, Any], expected_value),
+            )
+
+
+def _preflight_dcp_identity(
+    path: Path,
+    expected_identity: Mapping[str, Any] | None,
+) -> None:
+    """Validate DCP identity without binding checkpoint data to live tensors."""
+
+    if expected_identity is None:
+        return
+    import torch.distributed.checkpoint as dcp
+
+    metadata = dcp.FileSystemReader(  # pyright: ignore[reportPrivateImportUsage]
+        path
+    ).read_metadata()
+    probe = _dcp_identity_probe(metadata)
+    if "identity" not in probe:
+        _validate_identity(probe, expected_identity)
+        return
+    try:
+        dcp.load(  # pyright: ignore[reportUnknownMemberType, reportPrivateImportUsage]
+            probe,
+            checkpoint_id=path,
+        )
+    except dcp.CheckpointException as error:  # pyright: ignore[reportPrivateImportUsage]
+        raise ValueError(
+            f"distributed checkpoint identity could not be preflighted: {path}"
+        ) from error
+    stored_identity = probe.get("identity")
+    if isinstance(stored_identity, dict):
+        _restore_expected_empty_mappings(
+            cast(dict[str, Any], stored_identity),
+            cast(Mapping[str, Any], _json_compatible(expected_identity)),
+        )
+    _validate_identity(probe, expected_identity)
+
+
+def _preflight_dcp_stage_transfer(
+    path: Path,
+    expected_identity: Mapping[str, Any] | None,
+) -> None:
+    """Validate model/tokenizer ancestry before DCP touches the live model."""
+
+    if expected_identity is None:
+        return
+    import torch.distributed.checkpoint as dcp
+
+    metadata = dcp.FileSystemReader(  # pyright: ignore[reportPrivateImportUsage]
+        path
+    ).read_metadata()
+    probe = _dcp_identity_probe(metadata)
+    if "identity" not in probe:
+        _validate_stage_transfer(probe, expected_identity, source=path)
+        return
+    try:
+        dcp.load(  # pyright: ignore[reportUnknownMemberType, reportPrivateImportUsage]
+            probe,
+            checkpoint_id=path,
+        )
+    except dcp.CheckpointException as error:  # pyright: ignore[reportPrivateImportUsage]
+        raise ValueError(
+            f"distributed stage-transfer identity could not be preflighted: {path}"
+        ) from error
+    stored_identity = probe.get("identity")
+    if isinstance(stored_identity, dict):
+        _restore_expected_empty_mappings(
+            cast(dict[str, Any], stored_identity),
+            cast(Mapping[str, Any], _json_compatible(expected_identity)),
+        )
+    _validate_stage_transfer(probe, expected_identity, source=path)
+
+
+def preflight_checkpoint_identity(
+    path: str | Path,
+    context: DistributedContext,
+    expected_identity: Mapping[str, Any] | None,
+) -> None:
+    """Fail on incompatible resume provenance before mutating training state."""
+
+    if expected_identity is None:
+        return
+    path = Path(path)
+    if context.distributed:
+        resolved = _resolve_dcp_checkpoint(path, world_size=context.world_size)
+        _preflight_dcp_identity(resolved, expected_identity)
+        return
+    try:
+        loaded = torch.load(
+            path / "checkpoint.pt",
+            map_location="cpu",
+            weights_only=True,
+            mmap=True,
+        )
+    except Exception as error:
+        raise RuntimeError(
+            "checkpoint identity could not be loaded with PyTorch's safe weights-only loader"
+        ) from error
+    loaded_state = _validate_loaded_state(loaded)
+    _validate_identity(loaded_state, expected_identity)
 
 
 def _capture_rng_state() -> dict[str, Any]:
@@ -715,6 +896,7 @@ def initialize_model_from_checkpoint(
         )
 
         resolved = _resolve_dcp_checkpoint(path, world_size=context.world_size)
+        _preflight_dcp_stage_transfer(resolved, expected_identity)
         checkpoint_model = _unwrap_compiled_model(model)
         # DCP 는 여기 넣어 둔 값 '안으로' 읽어들이므로, 가져올 것만 등록합니다.
         # optimizer/scheduler/EMA 를 등록하지 않는 것이 곧 "가중치만" 입니다.
@@ -826,6 +1008,7 @@ def load_checkpoint(
         from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
 
         path = _resolve_dcp_checkpoint(path, world_size=context.world_size)
+        _preflight_dcp_identity(path, expected_identity)
         checkpoint_model = _unwrap_compiled_model(model)
         model_state, optimizer_state = get_state_dict(checkpoint_model, optimizer)
         state: dict[str, Any] = {

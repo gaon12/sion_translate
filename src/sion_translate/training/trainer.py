@@ -456,6 +456,51 @@ def evaluate(
     return metrics
 
 
+def build_training_checkpoint_identity(
+    config: AppConfig,
+    *,
+    batch_sampler: Any,
+    context: DistributedContext,
+    stage_name: str,
+    include_posttraining: bool,
+    pipeline_identity: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the exact identity shared by resume preflight and ``train``."""
+
+    return build_checkpoint_identity(
+        model_config=config.model,
+        tokenizer_path=config.data.tokenizer_model,
+        token_features_path=config.data.tokenizer_features,
+        dataset_dir=config.data.dataset_dir,
+        data_config=config.data,
+        sampling_seed=getattr(
+            batch_sampler,
+            "seed",
+            config.training.seed,
+        ),
+        stage_name=stage_name,
+        # 목적함수/최적화 설정도 identity 입니다. MRT stage 일 때만 reward
+        # 정의까지 포함해 SFT resume가 MRT 설정 변경에 좌우되지 않게 합니다.
+        objective_identity=build_objective_identity(
+            config.training,
+            config.posttraining,
+            include_posttraining=include_posttraining,
+        ),
+        pipeline_identity=pipeline_identity,
+        loader_config={
+            "batch_size_per_rank": getattr(
+                batch_sampler,
+                "batch_size",
+                config.training.batch_size_per_gpu,
+            ),
+            "world_size": context.world_size,
+            "gradient_accumulation_steps": config.training.gradient_accumulation_steps,
+            "drop_last": getattr(batch_sampler, "drop_last", None),
+            "bucket_size": getattr(batch_sampler, "bucket_size", None),
+        },
+    )
+
+
 def train(
     model: nn.Module,
     train_loader: Iterable[dict[str, torch.Tensor]],
@@ -470,6 +515,7 @@ def train(
     export_release_name: str = TRANSLATION_RELEASE_NAME,
     export_translation_capable: bool = True,
     export_languages: Sequence[str] | None = None,
+    pipeline_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, float | int | bool | str]:
     """sion_translate 학습의 본체. 반환값은 진행 상태와 best 선택 지표 요약입니다."""
     config.validate()
@@ -479,37 +525,13 @@ def train(
     training = config.training
     output_dir = Path(training.output_dir)
     batch_sampler = getattr(train_loader, "batch_sampler", None)
-    checkpoint_identity = build_checkpoint_identity(
-        model_config=config.model,
-        tokenizer_path=config.data.tokenizer_model,
-        token_features_path=config.data.tokenizer_features,
-        dataset_dir=config.data.dataset_dir,
-        data_config=config.data,
-        sampling_seed=getattr(
-            batch_sampler,
-            "seed",
-            config.training.seed,
-        ),
+    checkpoint_identity = build_training_checkpoint_identity(
+        config,
+        batch_sampler=batch_sampler,
+        context=context,
         stage_name=stage_name,
-        # 목적함수/최적화 설정도 identity 입니다. `objective` 가 주어졌다는 것은
-        # 이 stage 가 MRT 라는 뜻이므로, 그때만 reward 정의까지 포함합니다 —
-        # SFT 재개를 MRT 설정 변경만으로 거부하면 안 되기 때문입니다.
-        objective_identity=build_objective_identity(
-            config.training,
-            config.posttraining,
-            include_posttraining=objective is not None,
-        ),
-        loader_config={
-            "batch_size_per_rank": getattr(
-                batch_sampler,
-                "batch_size",
-                config.training.batch_size_per_gpu,
-            ),
-            "world_size": context.world_size,
-            "gradient_accumulation_steps": config.training.gradient_accumulation_steps,
-            "drop_last": getattr(batch_sampler, "drop_last", None),
-            "bucket_size": getattr(batch_sampler, "bucket_size", None),
-        },
+        include_posttraining=objective is not None,
+        pipeline_identity=pipeline_identity,
     )
     if context.is_main:
         output_dir.mkdir(parents=True, exist_ok=True)

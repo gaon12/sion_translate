@@ -13,6 +13,7 @@ import pytest
 from sion_translate.config import AppConfig
 from sion_translate.foundation import (
     build_foundation_config,
+    build_translation_pipeline_identity,
     foundation_run_directory,
     plan_foundation_stage,
 )
@@ -62,6 +63,22 @@ def test_disabling_the_stage_says_so_explicitly(tmp_path) -> None:
     plan = plan_foundation_stage(_config(tmp_path, enabled=False))
     assert not plan.enabled
     assert "foundation.enabled=false" in plan.reason
+
+
+def test_pipeline_identity_tracks_model_ancestry_not_the_skip_reason(tmp_path) -> None:
+    missing = plan_foundation_stage(_config(tmp_path))
+    _corpus(tmp_path)
+    disabled = plan_foundation_stage(_config(tmp_path, enabled=False))
+    enabled = plan_foundation_stage(_config(tmp_path))
+
+    assert build_translation_pipeline_identity(missing) == {
+        "schema": "sion-translation-pipeline-v1",
+        "branch": "translation-only",
+    }
+    assert build_translation_pipeline_identity(disabled) == build_translation_pipeline_identity(
+        missing
+    )
+    assert build_translation_pipeline_identity(enabled)["branch"] == "foundation-then-translation"
 
 
 def test_source_only_languages_never_reach_the_plan(tmp_path) -> None:

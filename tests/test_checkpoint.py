@@ -3,13 +3,14 @@ from __future__ import annotations
 from copy import deepcopy
 import random
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 
 import sion_translate.training.checkpoint as checkpoint_module
-from sion_translate.config import DataConfig, ExperimentalConfig, ModelConfig
+from sion_translate.config import AppConfig, DataConfig, ExperimentalConfig, ModelConfig
 from sion_translate.model import SionForConditionalGeneration
 from sion_translate.training.checkpoint import (
     build_checkpoint_identity,
@@ -20,7 +21,10 @@ from sion_translate.training.checkpoint import (
 )
 from sion_translate.training.distributed import DistributedContext
 from sion_translate.training.ema import EMAWeights
-from sion_translate.training.trainer import cosine_scheduler
+from sion_translate.training.trainer import (
+    build_training_checkpoint_identity,
+    cosine_scheduler,
+)
 
 
 class FakeScaler:
@@ -218,6 +222,109 @@ def test_checkpoint_identity_still_rejects_semantic_data_changes(tmp_path: Path)
         checkpoint_module._validate_identity({"identity": incompatible}, expected)
 
 
+def test_dcp_preflight_round_trips_the_full_training_identity(tmp_path: Path) -> None:
+    import torch.distributed.checkpoint as dcp
+
+    tokenizer = tmp_path / "artifacts" / "tokenizer" / "sion.model"
+    dataset = tmp_path / "artifacts" / "dataset"
+    tokenizer.parent.mkdir(parents=True)
+    dataset.mkdir(parents=True)
+    tokenizer.write_bytes(b"production identity tokenizer")
+    (dataset / "manifest.json").write_text('{"format":"test"}\n', encoding="utf-8")
+    (dataset / "raw_fingerprint.json").write_text(
+        '{"schema":"test","sha256":"abc"}\n',
+        encoding="utf-8",
+    )
+    config = AppConfig(
+        model=ModelConfig(vocab_size=64),
+        data=DataConfig(
+            tokenizer_model=str(tokenizer),
+            tokenizer_features=str(tokenizer.parent / "token_features.npz"),
+            dataset_dir=str(dataset),
+            language_pairs=[["kj", "ko"], ["kj", "ja"]],
+            source_only_languages=["kj"],
+        ),
+    )
+    context = DistributedContext(0, 0, 2, torch.device("cpu"), True, "gloo")
+    identity = build_training_checkpoint_identity(
+        config,
+        batch_sampler=SimpleNamespace(
+            seed=17,
+            batch_size=3,
+            drop_last=True,
+            bucket_size=19,
+        ),
+        context=context,
+        stage_name="pretrain/SFT",
+        include_posttraining=False,
+        pipeline_identity={
+            "schema": "sion-translation-pipeline-v1",
+            "branch": "translation-only",
+        },
+    )
+    checkpoint = tmp_path / "dcp-full-identity"
+    dcp.save({"identity": identity}, checkpoint_id=checkpoint)
+
+    checkpoint_module._preflight_dcp_identity(checkpoint, identity)
+    checkpoint_module._preflight_dcp_stage_transfer(checkpoint, identity)
+    metadata = dcp.FileSystemReader(checkpoint).read_metadata()
+    probe = checkpoint_module._dcp_identity_probe(metadata)
+    dcp.load(probe, checkpoint_id=checkpoint)
+    checkpoint_module._restore_expected_empty_mappings(probe["identity"], identity)
+
+    assert probe == {"identity": identity}
+
+
+def test_dcp_identity_probe_preserves_integer_list_paths(tmp_path: Path) -> None:
+    import torch.distributed.checkpoint as dcp
+
+    state = {
+        "identity": {
+            "schema": "test",
+            "languages": [
+                {"code": "ko", "weight": 1.0},
+                {"code": "ja", "weight": 0.5},
+            ],
+        }
+    }
+    checkpoint = tmp_path / "dcp-list-identity"
+    dcp.save(state, checkpoint_id=checkpoint)
+    metadata = dcp.FileSystemReader(checkpoint).read_metadata()
+
+    probe = checkpoint_module._dcp_identity_probe(metadata)
+    assert isinstance(probe["identity"]["languages"], list)
+    dcp.load(probe, checkpoint_id=checkpoint)
+
+    assert probe == state
+
+
+def test_checkpoint_identity_rejects_a_different_pipeline_branch(tmp_path: Path) -> None:
+    expected = _identity_fixture(tmp_path / "expected")
+    expected["pipeline"] = {
+        "schema": "sion-translation-pipeline-v1",
+        "branch": "translation-only",
+    }
+    incompatible = deepcopy(expected)
+    incompatible["pipeline"]["branch"] = "foundation-then-translation"
+
+    with pytest.raises(ValueError, match=r"identity\.pipeline\.branch"):
+        checkpoint_module._validate_identity({"identity": incompatible}, expected)
+
+
+@pytest.mark.parametrize("state", [{}, {"identity": {"schema": "legacy"}}])
+def test_required_pipeline_identity_rejects_unverifiable_legacy_resume(state: dict) -> None:
+    expected = {
+        "schema": "test",
+        "pipeline": {
+            "schema": "sion-translation-pipeline-v1",
+            "branch": "translation-only",
+        },
+    }
+
+    with pytest.raises(ValueError, match="no recorded pipeline identity"):
+        checkpoint_module._validate_identity(state, expected)
+
+
 @pytest.mark.parametrize(
     ("compiled_at_save", "compiled_at_load"),
     [(False, False), (True, False), (False, True), (True, True)],
@@ -361,6 +468,12 @@ def test_distributed_checkpoint_publishes_complete_directory_and_falls_back(
         checkpoint = tmp_path / "latest"
         identity = {"schema": "test", "tokenizer": {"sha256": "a" * 64}}
 
+        # Materialize Adam moments so a failed identity check can prove that
+        # neither model nor optimizer state was populated by DCP first.
+        sum(parameter.sum() for parameter in model.parameters()).backward()
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+
         save_checkpoint(
             checkpoint,
             model,
@@ -373,6 +486,7 @@ def test_distributed_checkpoint_publishes_complete_directory_and_falls_back(
         first_weight = model.token_embedding.weight.detach().clone()
         with torch.no_grad():
             model.token_embedding.weight.add_(1.0)
+            optimizer.state[model.token_embedding.weight]["exp_avg"].add_(1.0)
         save_checkpoint(
             checkpoint,
             model,
@@ -388,6 +502,11 @@ def test_distributed_checkpoint_publishes_complete_directory_and_falls_back(
         assert marker.is_file()
         assert (previous / checkpoint_module.DCP_COMPLETION_FILENAME).is_file()
         assert not checkpoint.with_name(".latest.staging").exists()
+        with torch.no_grad():
+            model.token_embedding.weight.add_(2.0)
+            optimizer.state[model.token_embedding.weight]["exp_avg"].add_(2.0)
+        live_weight = model.token_embedding.weight.detach().clone()
+        live_exp_avg = optimizer.state[model.token_embedding.weight]["exp_avg"].detach().clone()
         with pytest.raises(ValueError, match="identity does not match"):
             load_checkpoint(
                 checkpoint,
@@ -397,6 +516,66 @@ def test_distributed_checkpoint_publishes_complete_directory_and_falls_back(
                 context,
                 expected_identity={"schema": "test", "tokenizer": {"sha256": "b" * 64}},
             )
+        torch.testing.assert_close(model.token_embedding.weight, live_weight)
+        torch.testing.assert_close(
+            optimizer.state[model.token_embedding.weight]["exp_avg"],
+            live_exp_avg,
+        )
+        with pytest.raises(ValueError, match="no recorded pipeline identity"):
+            load_checkpoint(
+                checkpoint,
+                model,
+                optimizer,
+                scheduler,
+                context,
+                expected_identity={
+                    "schema": "test",
+                    "tokenizer": {"sha256": "a" * 64},
+                    "pipeline": {
+                        "schema": "sion-translation-pipeline-v1",
+                        "branch": "translation-only",
+                    },
+                },
+            )
+        torch.testing.assert_close(model.token_embedding.weight, live_weight)
+        torch.testing.assert_close(
+            optimizer.state[model.token_embedding.weight]["exp_avg"],
+            live_exp_avg,
+        )
+        with pytest.raises(ValueError, match=r"identity\.tokenizer\.metadata"):
+            load_checkpoint(
+                checkpoint,
+                model,
+                optimizer,
+                scheduler,
+                context,
+                expected_identity={
+                    "schema": "test",
+                    "tokenizer": {
+                        "sha256": "a" * 64,
+                        "metadata": {"sha256": "c" * 64},
+                    },
+                },
+            )
+        torch.testing.assert_close(model.token_embedding.weight, live_weight)
+        torch.testing.assert_close(
+            optimizer.state[model.token_embedding.weight]["exp_avg"],
+            live_exp_avg,
+        )
+
+        fresh, _, _, _ = _components()
+        fresh_weight = fresh.token_embedding.weight.detach().clone()
+        with pytest.raises(ValueError, match="tokenizer/model identity"):
+            initialize_model_from_checkpoint(
+                checkpoint,
+                fresh,
+                context,
+                expected_identity={
+                    "schema": "test",
+                    "tokenizer": {"sha256": "b" * 64},
+                },
+            )
+        torch.testing.assert_close(fresh.token_embedding.weight, fresh_weight)
 
         # An incomplete current publication must not destroy the retained
         # checkpoint. Removing its marker simulates interruption around publish.
