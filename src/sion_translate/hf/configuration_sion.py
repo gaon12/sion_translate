@@ -59,6 +59,7 @@ class SionConfig(PretrainedConfig):
         languages: list[str] | tuple[str, ...] | None = None,
         language_pairs: list[list[str]] | tuple[tuple[str, str], ...] | None = None,
         translation_directions: list[list[str]] | tuple[tuple[str, str], ...] | None = None,
+        translation_capable: bool = True,
         revision_trained: bool | None = None,
         slot_token_ids: list[int] | tuple[int, ...] | None = None,
         tokenizer_sha256: str | None = None,
@@ -118,6 +119,9 @@ class SionConfig(PretrainedConfig):
                 for direction in (pair, list(reversed(pair)))
             ]
         )
+        if not isinstance(translation_capable, bool):  # pyright: ignore[reportUnnecessaryIsInstance]
+            raise ValueError("translation_capable must be a boolean")
+        self.translation_capable = translation_capable
         if revision_trained is not None and not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
             revision_trained, bool
         ):
@@ -179,6 +183,10 @@ class SionConfig(PretrainedConfig):
             raise ValueError(
                 "translation_directions cannot be empty when language pairs are configured"
             )
+        if not self.translation_capable and (self.language_pairs or self.translation_directions):
+            raise ValueError(
+                "translation-incapable configs cannot advertise language pairs or directions"
+            )
         for direction in self.translation_directions:
             key = tuple(direction)
             if (
@@ -224,6 +232,7 @@ class SionConfig(PretrainedConfig):
         languages: list[str] | tuple[str, ...] | None = None,
         language_pairs: list[list[str]] | tuple[tuple[str, str], ...] | None = None,
         translation_directions: list[list[str]] | tuple[tuple[str, str], ...] | None = None,
+        translation_capable: bool = True,
         revision_trained: bool | None = None,
         slot_token_ids: list[int] | tuple[int, ...] | None = None,
         tokenizer_sha256: str | None = None,
@@ -240,6 +249,7 @@ class SionConfig(PretrainedConfig):
             languages=languages,
             language_pairs=language_pairs,
             translation_directions=translation_directions,
+            translation_capable=translation_capable,
             revision_trained=revision_trained,
             slot_token_ids=slot_token_ids,
             tokenizer_sha256=tokenizer_sha256,

@@ -32,6 +32,8 @@ from sion_translate.model import (
 from sion_translate.tokenizer import SionTokenizer as NativeSionTokenizer
 from sion_translate.tokenizer import train_tokenizer
 from sion_translate.training.export import (
+    build_export_metadata,
+    convert_export,
     export_state_dict_formats,
     validate_export_directory,
 )
@@ -559,6 +561,14 @@ def test_transformers_export_rejects_incompatible_tokenizer_and_features(
             tokenizer_path=tokenizer_path,
             languages=["ko", "en"],
         )
+    with pytest.raises(ValueError, match="language tags"):
+        save_transformers_checkpoint(
+            tmp_path / "incomplete-languages",
+            native.state_dict(),
+            config,
+            tokenizer_path=tokenizer_path,
+            languages=["ko"],
+        )
 
     wrong_features = tmp_path / "wrong-token-features.npz"
     np.savez_compressed(
@@ -686,3 +696,75 @@ def test_export_pipeline_writes_and_validates_hf_tokenizer(tmp_path: Path) -> No
     assert validate_export_directory(output_dir)["valid"]
     restored = AutoTokenizer.from_pretrained(checkpoint, trust_remote_code=True)
     assert restored.vocab_size == len(tokenizer)
+
+
+def test_legacy_export_without_language_metadata_keeps_tokenizer_discovery(
+    tmp_path: Path,
+) -> None:
+    tokenizer_path = train_tiny_tokenizer(tmp_path)
+    tokenizer = NativeSionTokenizer(tokenizer_path)
+    config = tiny_model_config(len(tokenizer))
+    model = NativeSionForConditionalGeneration(config, pad_id=tokenizer.pad_id)
+    output_dir = tmp_path / "legacy-export"
+
+    manifest = export_state_dict_formats(
+        output_dir,
+        model.state_dict(),
+        config,
+        tokenizer.pad_id,
+        formats=("transformers",),
+        tokenizer_path=tokenizer_path,
+    )
+
+    assert "languages" not in manifest["metadata"]
+    checkpoint = output_dir / manifest["formats"]["transformers"]["file"]
+    config_payload = json.loads((checkpoint / "config.json").read_text(encoding="utf-8"))
+    assert set(config_payload["languages"]) == set(tokenizer.languages)
+    assert validate_export_directory(output_dir)["valid"]
+
+
+def test_foundation_conversion_preserves_release_and_rejects_translation(
+    tmp_path: Path,
+) -> None:
+    tokenizer_path = train_tiny_tokenizer(tmp_path)
+    tokenizer = NativeSionTokenizer(tokenizer_path)
+    config = tiny_model_config(len(tokenizer))
+    model = NativeSionForConditionalGeneration(config, pad_id=tokenizer.pad_id)
+    source_dir = tmp_path / "foundation-native"
+    metadata = build_export_metadata(
+        config,
+        tokenizer_path=tokenizer_path,
+        languages=["ko", "ja"],
+        release_name="sion",
+        translation_capable=False,
+    )
+    export_state_dict_formats(
+        source_dir,
+        model.state_dict(),
+        config,
+        tokenizer.pad_id,
+        formats=("fp32",),
+        metadata=metadata,
+        tokenizer_path=tokenizer_path,
+    )
+
+    converted = convert_export(
+        source_dir / "model.pt",
+        tmp_path / "foundation-transformers",
+        formats=("transformers",),
+    )
+
+    assert converted["metadata"]["release_name"] == "sion"
+    assert converted["metadata"]["translation_capable"] is False
+    assert converted["metadata"]["languages"] == ["ko", "ja"]
+    checkpoint = tmp_path / "foundation-transformers" / converted["formats"]["transformers"]["file"]
+    restored = AutoTokenizer.from_pretrained(checkpoint, trust_remote_code=True)
+    assert restored.translation_capable is False
+    with pytest.raises(ValueError, match="foundation model.*not translation-capable"):
+        restored._build_translation_inputs(
+            "번역 불가",
+            return_tensors="pt",
+            src_lang="ko",
+            tgt_lang="ja",
+        )
+    assert validate_export_directory(tmp_path / "foundation-transformers")["valid"]

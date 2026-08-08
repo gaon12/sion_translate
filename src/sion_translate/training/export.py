@@ -316,6 +316,19 @@ def _metadata_language_pairs(metadata: Mapping[str, Any]) -> list[list[str]]:
     return []
 
 
+def _metadata_languages(metadata: Mapping[str, Any]) -> list[str] | None:
+    raw_languages = metadata.get("languages")
+    if raw_languages is None:
+        pairs = _metadata_language_pairs(metadata)
+        return _languages_from_pairs(pairs) if pairs else None
+    if not isinstance(raw_languages, Sequence) or isinstance(raw_languages, (str, bytes)):
+        raise ValueError("metadata.languages must be a sequence")
+    languages = list(dict.fromkeys(str(language).strip() for language in raw_languages))
+    if any(not language for language in languages):
+        raise ValueError("metadata.languages must contain only non-empty languages")
+    return languages
+
+
 def _normalize_translation_directions(
     language_pairs: Sequence[Sequence[str]],
     *,
@@ -362,6 +375,13 @@ def _metadata_translation_directions(metadata: Mapping[str, Any]) -> list[list[s
         pairs,
         translation_directions=raw_directions,
     )
+
+
+def _metadata_translation_capable(metadata: Mapping[str, Any]) -> bool:
+    value = metadata.get("translation_capable", True)
+    if not isinstance(value, bool):
+        raise ValueError("metadata.translation_capable must be a boolean")
+    return value
 
 
 def _metadata_revision_capability(metadata: Mapping[str, Any]) -> bool | None:
@@ -425,6 +445,7 @@ def build_export_metadata(
     token_features_path: str | Path | None = None,
     language_pair: Sequence[str] | None = None,
     language_pairs: Sequence[Sequence[str]] | None = None,
+    languages: Sequence[str] | None = None,
     translation_directions: Sequence[Sequence[str]] | None = None,
     bidirectional: bool = True,
     revision_trained: bool | None = None,
@@ -458,11 +479,20 @@ def build_export_metadata(
         language_pair=language_pair,
         language_pairs=language_pairs,
     )
+    explicit_languages = (
+        list(dict.fromkeys(str(language).strip() for language in languages))
+        if languages is not None
+        else None
+    )
+    if explicit_languages is not None and (
+        not explicit_languages or any(not language for language in explicit_languages)
+    ):
+        raise ValueError("languages must contain at least one non-empty language")
     if pairs and not translation_capable:
         # 파운데이션 모델에는 언어쌍이 없습니다. 단일어 복원만 학습했으므로
         # 다룰 줄 아는 것은 **언어**이고, 쌍도 방향도 존재하지 않습니다.
         # 쌍을 적어 두면 아래 검증이 방향을 요구하고, 그 방향은 거짓입니다.
-        metadata["languages"] = _languages_from_pairs(pairs)
+        metadata["languages"] = explicit_languages or _languages_from_pairs(pairs)
     elif pairs:
         metadata["language_pairs"] = pairs
         metadata["languages"] = _languages_from_pairs(pairs)
@@ -473,6 +503,8 @@ def build_export_metadata(
         )
         if len(pairs) == 1:
             metadata["language_pair"] = pairs[0]
+    elif explicit_languages is not None:
+        metadata["languages"] = explicit_languages
     elif translation_directions is not None:
         raise ValueError("translation_directions require at least one language pair")
     metadata["feature_flags"] = {
@@ -651,6 +683,9 @@ def _inspect_transformers_checkpoint(path: Path) -> dict[str, Any]:
 
     remote_config_class = load_remote_class("AutoConfig", auto_map)
     config = remote_config_class.from_pretrained(path)
+    config_translation_capable = getattr(config, "translation_capable", True)
+    if not isinstance(config_translation_capable, bool):
+        raise RuntimeError("Transformers config translation_capable must be a boolean")
     weight_files = sorted(path.glob("model*.safetensors"))
     if not weight_files:
         raise RuntimeError("Transformers checkpoint has no model*.safetensors weights")
@@ -686,6 +721,19 @@ def _inspect_transformers_checkpoint(path: Path) -> dict[str, Any]:
         if not remote_tokenizer.__class__.__module__.startswith("transformers_modules."):
             raise RuntimeError(
                 "Transformers checkpoint imported an installed tokenizer instead of bundled code"
+            )
+        tokenizer_translation_capable = getattr(
+            remote_tokenizer,
+            "translation_capable",
+            True,
+        )
+        if not isinstance(tokenizer_translation_capable, bool):
+            raise RuntimeError("Transformers tokenizer translation_capable must be a boolean")
+        if tokenizer_translation_capable is not config_translation_capable:
+            raise RuntimeError(
+                "Transformers config/tokenizer disagree about translation capability: "
+                f"config={config_translation_capable!r}, "
+                f"tokenizer={tokenizer_translation_capable!r}"
             )
         del remote_tokenizer
 
@@ -732,6 +780,7 @@ def _inspect_transformers_checkpoint(path: Path) -> dict[str, Any]:
         "languages": list(config.languages),
         "language_pairs": [list(pair) for pair in config.language_pairs],
         "translation_directions": [list(direction) for direction in config.translation_directions],
+        "translation_capable": config_translation_capable,
         "revision_trained": config.revision_trained,
     }
 
@@ -744,8 +793,10 @@ def _write_transformers_checkpoint(
     *,
     tokenizer_path: str | Path | None,
     token_features_path: str | Path | None,
+    languages: Sequence[str] | None,
     language_pairs: Sequence[Sequence[str]],
     translation_directions: Sequence[Sequence[str]],
+    translation_capable: bool,
     revision_trained: bool | None,
 ) -> dict[str, Any]:
     from sion_translate.hf.conversion import save_transformers_checkpoint
@@ -759,10 +810,12 @@ def _write_transformers_checkpoint(
             pad_id=pad_id,
             tokenizer_path=tokenizer_path,
             token_features_path=token_features_path,
-            languages=_languages_from_pairs(language_pairs) or None,
+            languages=languages,
             language_pairs=language_pairs,
             translation_directions=translation_directions,
+            translation_capable=translation_capable,
             revision_trained=revision_trained,
+            allow_language_subset=not bool(language_pairs),
         )
         inspection = _inspect_transformers_checkpoint(temporary)
         _atomic_replace_directory(temporary, path)
@@ -1394,6 +1447,8 @@ def export_state_dict_formats(
                 token_features_path=token_features_path,
                 language_pairs=language_pairs,
                 step=step,
+                release_name=release_name,
+                translation_capable=translation_capable,
             )
         )
     export_metadata.setdefault("step", int(step))
@@ -1431,16 +1486,22 @@ def export_state_dict_formats(
         else:
             export_metadata.pop("language_pair", None)
             export_metadata.pop("language_pairs", None)
-            export_metadata.pop("languages", None)
+            # A foundation export has languages but deliberately has no
+            # translation pairs. Dropping both would erase the only truthful
+            # statement of what its denoising weights were trained on.
+            if export_metadata.get("translation_capable") is not False:
+                export_metadata.pop("languages", None)
             export_metadata.pop("translation_directions", None)
     # 번역 불가 산출물(foundation)에는 방향을 유도해 넣지 않습니다. 이 함수는
     # 방향이 비어 있으면 language_pairs 에서 만들어 채우는데, 그 가중치는
     # 어떤 방향으로도 번역할 수 없습니다.
+    resolved_translation_capable = _metadata_translation_capable(export_metadata)
     resolved_translation_directions: list[list[str]] = []
-    if export_metadata.get("translation_capable") is not False:
+    if resolved_translation_capable:
         resolved_translation_directions = _metadata_translation_directions(export_metadata)
         if resolved_translation_directions:
             export_metadata["translation_directions"] = resolved_translation_directions
+    resolved_languages = _metadata_languages(export_metadata)
     metadata_compatibility_id = _metadata_compatibility_id(export_metadata)
     previous_metadata_compatibility_id = None
     if same_weights and previous_manifest is not None:
@@ -1558,8 +1619,10 @@ def export_state_dict_formats(
                     pad_id,
                     tokenizer_path=tokenizer_path,
                     token_features_path=token_features_path,
+                    languages=resolved_languages,
                     language_pairs=resolved_language_pairs,
                     translation_directions=resolved_translation_directions,
+                    translation_capable=resolved_translation_capable,
                     revision_trained=_metadata_revision_capability(export_metadata),
                 )
                 details = {
@@ -1636,8 +1699,8 @@ def convert_export(
     revision_trained: bool | None = None,
     int4_backend: str = "auto",
     fp8_policy: Fp8Policy | None = None,
-    release_name: str = TRANSLATION_RELEASE_NAME,
-    translation_capable: bool = True,
+    release_name: str | None = None,
+    translation_capable: bool | None = None,
     llama_quantize: str | Path | None = None,
 ) -> dict[str, Any]:
     """Convert a stable state-dict export without mutating the source artifact."""
@@ -1662,6 +1725,16 @@ def convert_export(
     step = int(payload.get("step", 0))
     pad_id = int(payload.get("pad_id", 0))
     inherited = copy.deepcopy(payload.get("metadata") or {})
+    resolved_release_name = (
+        str(release_name)
+        if release_name is not None
+        else str(inherited.get("release_name", TRANSLATION_RELEASE_NAME))
+    )
+    resolved_translation_capable = (
+        translation_capable
+        if translation_capable is not None
+        else _metadata_translation_capable(inherited)
+    )
 
     def resolve_inherited_sidecar(
         explicit: str | Path | None,
@@ -1696,6 +1769,8 @@ def convert_export(
         revision_trained=revision_trained,
         step=step,
         source=source,
+        release_name=resolved_release_name,
+        translation_capable=resolved_translation_capable,
     )
     if tokenizer_path is None and inherited.get("tokenizer"):
         metadata["tokenizer"] = inherited["tokenizer"]
@@ -1709,6 +1784,8 @@ def convert_export(
             if len(inherited_pairs) == 1:
                 metadata["language_pair"] = inherited_pairs[0]
             metadata["translation_directions"] = _metadata_translation_directions(inherited)
+        elif inherited.get("languages"):
+            metadata["languages"] = _metadata_languages(inherited)
     if revision_trained is None and inherited.get("capabilities"):
         metadata["capabilities"] = inherited["capabilities"]
     return export_state_dict_formats(
@@ -1724,8 +1801,8 @@ def convert_export(
         language_pairs=_metadata_language_pairs(metadata),
         int4_backend=int4_backend,
         fp8_policy=fp8_policy,
-        release_name=release_name,
-        translation_capable=translation_capable,
+        release_name=resolved_release_name,
+        translation_capable=resolved_translation_capable,
         llama_quantize=llama_quantize,
     )
 
@@ -2026,6 +2103,9 @@ def validate_export_directory(directory: str | Path) -> dict[str, Any]:
                             f"Transformers {metadata_name} does not match manifest metadata"
                         )
                 inspection = _inspect_transformers_checkpoint(artifact)
+                expected_languages = _metadata_languages(manifest_metadata)
+                if expected_languages is not None and inspection["languages"] != expected_languages:
+                    raise RuntimeError("Transformers languages do not match the manifest")
                 expected_pairs = _metadata_language_pairs(manifest_metadata)
                 if expected_pairs and inspection["language_pairs"] != expected_pairs:
                     raise RuntimeError("Transformers language pairs do not match the manifest")
@@ -2033,6 +2113,11 @@ def validate_export_directory(directory: str | Path) -> dict[str, Any]:
                 if inspection["translation_directions"] != expected_directions:
                     raise RuntimeError(
                         "Transformers translation directions do not match the manifest"
+                    )
+                expected_translation_capable = _metadata_translation_capable(manifest_metadata)
+                if inspection["translation_capable"] is not expected_translation_capable:
+                    raise RuntimeError(
+                        "Transformers translation capability does not match the manifest"
                     )
                 expected_revision = _metadata_revision_capability(manifest_metadata)
                 if inspection["revision_trained"] is not expected_revision:
@@ -2144,6 +2229,8 @@ def export_inference_models(
     token_features_path: str | Path | None = None,
     language_pair: Sequence[str] | None = None,
     language_pairs: Sequence[Sequence[str]] | None = None,
+    languages: Sequence[str] | None = None,
+    translation_directions: Sequence[Sequence[str]] | None = None,
     bidirectional: bool = True,
     revision_trained: bool | None = None,
     int4_backend: str = "auto",
@@ -2170,6 +2257,8 @@ def export_inference_models(
                 token_features_path=token_features_path,
                 language_pair=language_pair,
                 language_pairs=language_pairs,
+                languages=languages,
+                translation_directions=translation_directions,
                 bidirectional=bidirectional,
                 revision_trained=revision_trained,
                 step=step,

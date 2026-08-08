@@ -25,13 +25,14 @@ import math
 import time
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 from tqdm.auto import tqdm
 
+from sion_translate.artifacts import TRANSLATION_RELEASE_NAME
 from sion_translate.config import AppConfig, TrainingConfig
 
 from .checkpoint import (
@@ -466,6 +467,9 @@ def train(
     objective: Callable[[nn.Module, dict[str, torch.Tensor]], ObjectiveOutput] | None = None,
     stage_name: str = "pretrain",
     language_tags: Mapping[str, int] | None = None,
+    export_release_name: str = TRANSLATION_RELEASE_NAME,
+    export_translation_capable: bool = True,
+    export_languages: Sequence[str] | None = None,
 ) -> dict[str, float | int | bool | str]:
     """sion_translate 학습의 본체. 반환값은 진행 상태와 best 선택 지표 요약입니다."""
     config.validate()
@@ -669,8 +673,16 @@ def train(
             tokenizer_path=config.data.tokenizer_model,
             token_features_path=token_features_path,
             language_pairs=config.data.configured_language_pairs(),
+            languages=export_languages,
+            translation_directions=(
+                config.data.configured_translation_directions()
+                if export_translation_capable
+                else None
+            ),
             bidirectional=config.data.bidirectional,
             revision_trained=config.data.revision_examples,
+            release_name=export_release_name,
+            translation_capable=export_translation_capable,
         )
         if context.is_main and manifest is not None:
             successful = [

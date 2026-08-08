@@ -181,6 +181,51 @@ def test_final_export_wires_all_formats_and_model_sidecars(
     assert kwargs["strict"] is True
 
 
+def test_final_export_advertises_only_the_eight_trained_directions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = AppConfig()
+    config.data.language_pairs = [
+        ["kj", "ko"],
+        ["kj", "ja"],
+        ["kd", "ko"],
+        ["kd", "ja"],
+        ["jd", "ko"],
+        ["jd", "ja"],
+        ["ko", "ja"],
+    ]
+    config.data.source_only_languages = ["kj", "kd", "jd"]
+    config.data.bidirectional = True
+    captured: dict[str, object] = {}
+
+    def capture(*_args: object, **kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr(train_module, "export_inference_models", capture)
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+
+    export_final_model(
+        torch.nn.Linear(1, 1),
+        config,
+        context,
+        tmp_path / "run",
+        stage="posttrain",
+        step=23,
+    )
+
+    assert captured["translation_directions"] == (
+        ("kj", "ko"),
+        ("kj", "ja"),
+        ("kd", "ko"),
+        ("kd", "ja"),
+        ("jd", "ko"),
+        ("jd", "ja"),
+        ("ko", "ja"),
+        ("ja", "ko"),
+    )
+
+
 def test_parallel_strategy_prefers_ddp_and_supports_legacy_fsdp() -> None:
     distributed = DistributedContext(
         rank=0,

@@ -43,7 +43,8 @@ def tokenizer_model(tmp_path_factory):
         directory / "out",
         vocab_size=700,
         num_workers=1,
-        language_pair=["ko", "ja"],
+        language_pairs=[["kj", "ko"], ["kj", "ja"], ["ko", "ja"]],
+        source_only_languages=["kj"],
     )
 
 
@@ -176,18 +177,71 @@ def test_a_disabled_plan_does_nothing_and_says_why(tmp_path, tokenizer_model) ->
 def test_the_stage_publishes_under_the_foundation_release_name(tmp_path, tokenizer_model) -> None:
     """foundation 산출물은 번역 모델이 아니라 그 파운데이션이다."""
     config, plan, model, tokenizer, context = _prepared(tmp_path, tokenizer_model)
-    config.foundation.final_export_formats = ["fp32"]
+    # The translation graph also contains a source-only variety, but the
+    # foundation plan deliberately targets only ko/ja.
+    config.data.language_pairs = [["kj", "ko"], ["kj", "ja"], ["ko", "ja"]]
+    config.data.source_only_languages = ["kj"]
+    config.foundation.final_export_formats = ["fp32", "transformers"]
     run_foundation_stage(config, plan, model, tokenizer, context)
 
     export = foundation_run_directory(config) / "exports" / "best"
     assert export.is_dir()
+    # `best` is replaced by the final multi-format export. `latest` is the
+    # training-loop export that would remain if the run were interrupted after
+    # a save, so it must carry the same non-translation contract too.
+    latest = foundation_run_directory(config) / "exports" / "latest" / "model.pt"
+    latest_payload = torch.load(latest, map_location="cpu", weights_only=True)
+    latest_metadata = latest_payload["metadata"]
+    assert latest_metadata["release_name"] == "sion"
+    assert latest_metadata["translation_capable"] is False
+    assert latest_metadata["languages"] == ["ko", "ja"]
+    assert "translation_directions" not in latest_metadata
+    assert "language_pair" not in latest_metadata
+    assert "language_pairs" not in latest_metadata
+
     payload = torch.load(export / "model.pt", map_location="cpu", weights_only=True)
     metadata = payload["metadata"]
     assert metadata["release_name"] == "sion"
     assert metadata["translation_capable"] is False
+    assert metadata["languages"] == ["ko", "ja"]
     # 번역 방향을 적지 않는다. 번역할 수 없는 가중치이기 때문이다.
     assert "translation_directions" not in metadata
     assert "language_pair" not in metadata
+    assert "language_pairs" not in metadata
+
+    transformers_config = json.loads(
+        (export / "transformers" / "config.json").read_text(encoding="utf-8")
+    )
+    assert transformers_config["languages"] == ["ko", "ja"]
+    assert transformers_config["language_pairs"] == []
+    assert transformers_config["translation_directions"] == []
+    assert transformers_config["translation_capable"] is False
+
+    tokenizer_config = json.loads(
+        (export / "transformers" / "tokenizer_config.json").read_text(encoding="utf-8")
+    )
+    assert tokenizer_config["translation_capable"] is False
+
+    manifest = json.loads((export / "export_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["formats"]["transformers"]["languages"] == metadata["languages"]
+    assert manifest["formats"]["transformers"]["translation_capable"] is False
+
+    from transformers import AutoConfig, AutoTokenizer
+
+    hf_config = AutoConfig.from_pretrained(export / "transformers", trust_remote_code=True)
+    hf_tokenizer = AutoTokenizer.from_pretrained(
+        export / "transformers",
+        trust_remote_code=True,
+    )
+    assert hf_config.translation_capable is False
+    assert hf_tokenizer.translation_capable is False
+    with pytest.raises(ValueError, match="foundation model.*not translation-capable"):
+        hf_tokenizer._build_translation_inputs(
+            "번역을 시도하면 안 됩니다.",
+            return_tensors="pt",
+            src_lang="ko",
+            tgt_lang="ja",
+        )
 
 
 def test_a_foundation_export_is_refused_by_the_translator(tmp_path, tokenizer_model) -> None:

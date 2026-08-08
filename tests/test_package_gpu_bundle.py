@@ -127,6 +127,50 @@ def _with_tokenizer(root: Path, *, complete: bool = True) -> None:
         (tokenizer / "sion.vocab").write_text("piece\t0\n", encoding="utf-8")
 
 
+def _with_dataset(
+    root: Path,
+    *,
+    tokenizer_sha256: str | None = None,
+    manifest_tokenizer_sha256: str | None = None,
+    include_raw_fingerprint: bool = True,
+    include_manifest: bool = True,
+) -> None:
+    dataset = root / "artifacts" / "dataset"
+    dataset.mkdir(parents=True)
+    (dataset / "train.00000.idx.npy").write_bytes(b"ids")
+    digest = (
+        tokenizer_sha256
+        or hashlib.sha256(
+            (root / "artifacts" / "tokenizer" / "sion.model").read_bytes()
+        ).hexdigest()
+    )
+    if include_raw_fingerprint:
+        (dataset / "raw_fingerprint.json").write_text(
+            json.dumps(
+                {
+                    "schema": "sion-dataset-fingerprint-v2",
+                    "tokenizer_sha256": digest,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    if include_manifest:
+        (dataset / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "format": "sion-indexed-parallel-v5",
+                    "fingerprint": {
+                        "schema": "sion-dataset-fingerprint-v2",
+                        "tokenizer_sha256": manifest_tokenizer_sha256 or digest,
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+
 def test_the_monolingual_corpus_ships_only_when_asked_for(tmp_path: Path) -> None:
     """foundation 입력이라 없으면 그 단계가 통째로 건너뛰어진다.
 
@@ -186,9 +230,7 @@ def test_the_dataset_needs_the_tokenizer_that_produced_its_ids(tmp_path: Path) -
 
     root = _repository(tmp_path)
     _with_tokenizer(root, complete=True)
-    dataset = root / "artifacts" / "dataset"
-    dataset.mkdir(parents=True)
-    (dataset / "train.00000.idx.npy").write_bytes(b"ids")
+    _with_dataset(root)
 
     with pytest.raises(package_gpu_bundle.BundleError, match="--with-tokenizer"):
         package_gpu_bundle.build_bundle(root, tmp_path / "dataset-only.zip", include_dataset=True)
@@ -202,7 +244,98 @@ def test_the_dataset_needs_the_tokenizer_that_produced_its_ids(tmp_path: Path) -
 
     origins = {entry["path"]: entry["origin"] for entry in _manifest(both)["files"]}
     assert origins["artifacts/dataset/train.00000.idx.npy"] == "dataset"
-    package_gpu_bundle.verify_archive(both)
+    archive_result = package_gpu_bundle.verify_archive(both)
+    extracted = tmp_path / "both-extracted"
+    with zipfile.ZipFile(both) as archive:
+        archive.extractall(extracted)
+    assert package_gpu_bundle.verify_tree(extracted) == archive_result
+
+
+def test_the_dataset_refuses_a_different_tokenizer_fingerprint(tmp_path: Path) -> None:
+    root = _repository(tmp_path)
+    _with_tokenizer(root, complete=True)
+    _with_dataset(root, tokenizer_sha256="0" * 64)
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="dataset tokenizer mismatch"):
+        package_gpu_bundle.build_bundle(
+            root,
+            tmp_path / "mismatch.zip",
+            include_tokenizer=True,
+            include_dataset=True,
+        )
+
+
+def test_the_dataset_requires_a_tokenizer_fingerprint(tmp_path: Path) -> None:
+    root = _repository(tmp_path)
+    _with_tokenizer(root, complete=True)
+    _with_dataset(root, include_raw_fingerprint=False, include_manifest=False)
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="neither raw_fingerprint.json"):
+        package_gpu_bundle.build_bundle(
+            root,
+            tmp_path / "missing-fingerprint.zip",
+            include_tokenizer=True,
+            include_dataset=True,
+        )
+
+
+def test_the_dataset_manifest_is_a_safe_fingerprint_fallback(tmp_path: Path) -> None:
+    root = _repository(tmp_path)
+    _with_tokenizer(root, complete=True)
+    _with_dataset(root, include_raw_fingerprint=False)
+
+    archive = tmp_path / "manifest-fallback.zip"
+    package_gpu_bundle.build_bundle(
+        root,
+        archive,
+        include_tokenizer=True,
+        include_dataset=True,
+    )
+    package_gpu_bundle.verify_archive(archive)
+
+
+def test_the_dataset_identity_sources_must_agree(tmp_path: Path) -> None:
+    root = _repository(tmp_path)
+    _with_tokenizer(root, complete=True)
+    _with_dataset(root, manifest_tokenizer_sha256="0" * 64)
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="fingerprints disagree"):
+        package_gpu_bundle.build_bundle(
+            root,
+            tmp_path / "disagree.zip",
+            include_tokenizer=True,
+            include_dataset=True,
+        )
+
+
+def test_archive_and_tree_verification_recheck_dataset_tokenizer_semantics(
+    tmp_path: Path,
+) -> None:
+    root = _repository(tmp_path)
+    _with_tokenizer(root, complete=True)
+    _with_dataset(root)
+    sources = package_gpu_bundle._collect_sources(
+        root,
+        include_tokenizer=True,
+        include_dataset=True,
+    )
+
+    # Emulate a tokenizer replacement after the build preflight. _write_archive
+    # creates internally consistent manifest/checksum metadata for the changed
+    # payload, so only the semantic verifier can detect the stale token ids.
+    (root / "artifacts" / "tokenizer" / "sion.model").write_bytes(b"replacement model")
+    archive = tmp_path / "semantic-mismatch.zip"
+    commit, tree = package_gpu_bundle._git_identity(root)
+    package_gpu_bundle._write_archive(archive, sources, commit, tree)
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="dataset tokenizer mismatch"):
+        package_gpu_bundle.verify_archive(archive)
+
+    extracted = tmp_path / "semantic-mismatch"
+    with zipfile.ZipFile(archive) as source:
+        source.extractall(extracted)
+    with pytest.raises(package_gpu_bundle.BundleError, match="dataset tokenizer mismatch"):
+        package_gpu_bundle.verify_tree(extracted)
 
 
 def test_the_default_bundle_still_refuses_stale_artifacts(tmp_path: Path) -> None:

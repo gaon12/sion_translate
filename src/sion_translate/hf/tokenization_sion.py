@@ -66,6 +66,7 @@ class SionTokenizer(PreTrainedTokenizer):
         slot_token_ids: list[int] | tuple[int, ...] | None = None,
         language_pairs: list[list[str]] | tuple[tuple[str, str], ...] | None = None,
         translation_directions: list[list[str]] | tuple[tuple[str, str], ...] | None = None,
+        translation_capable: bool = True,
         script_classes: int = 9,
         tetm_type_id: int = 8,
         tetm_mode_id: int = 4,
@@ -151,6 +152,13 @@ class SionTokenizer(PreTrainedTokenizer):
                 seen_directions.add(key)
                 self.translation_directions.append(direction)
         self._translation_direction_edges = seen_directions
+        if not isinstance(translation_capable, bool):  # pyright: ignore[reportUnnecessaryIsInstance]
+            raise ValueError("translation_capable must be a boolean")
+        self.translation_capable = translation_capable
+        if not self.translation_capable and (self.language_pairs or self.translation_directions):
+            raise ValueError(
+                "translation-incapable tokenizers cannot advertise language pairs or directions"
+            )
         self.script_classes = int(script_classes)
         if self.script_classes < 1:
             raise ValueError("script_classes must be positive")
@@ -216,6 +224,7 @@ class SionTokenizer(PreTrainedTokenizer):
         kwargs.setdefault("slot_token_ids", self.slot_token_ids)
         kwargs.setdefault("language_pairs", self.language_pairs)
         kwargs.setdefault("translation_directions", self.translation_directions)
+        kwargs.setdefault("translation_capable", self.translation_capable)
         kwargs.setdefault("script_classes", self.script_classes)
         kwargs.setdefault("tetm_type_id", self.tetm_type_id)
         kwargs.setdefault("tetm_mode_id", self.tetm_mode_id)
@@ -481,6 +490,10 @@ class SionTokenizer(PreTrainedTokenizer):
         tgt_lang: str | None,
         **kwargs: Any,
     ):
+        if not self.translation_capable:
+            raise ValueError(
+                "this tokenizer belongs to a foundation model and is not translation-capable"
+            )
         if src_lang is None or tgt_lang is None:
             raise ValueError("src_lang and tgt_lang are required for translation")
         if src_lang not in self.language_tags or tgt_lang not in self.language_tags:

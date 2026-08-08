@@ -295,6 +295,24 @@ class DataConfig:
     def configured_source_only_languages(self) -> tuple[str, ...]:
         return tuple(dict.fromkeys(str(language) for language in self.source_only_languages))
 
+    def configured_translation_directions(self) -> tuple[tuple[str, str], ...]:
+        """Return the directed edges the indexed dataset can actually train."""
+
+        source_only = set(self.configured_source_only_languages())
+        directions: list[tuple[str, str]] = []
+        for source, target in self.configured_language_pairs():
+            if source in source_only:
+                # Source-only varieties are always normalized onto the source
+                # side, even when the configured pair lists them second.
+                directions.append((source, target))
+            elif target in source_only:
+                directions.append((target, source))
+            else:
+                directions.append((source, target))
+                if self.bidirectional:
+                    directions.append((target, source))
+        return tuple(dict.fromkeys(directions))
+
     @property
     def languages(self) -> tuple[str, ...]:
         return tuple(

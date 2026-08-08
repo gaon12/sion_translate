@@ -369,10 +369,14 @@ def export_final_model(
     formats: Sequence[str] | None = None,
     release_name: str = TRANSLATION_RELEASE_NAME,
     translation_capable: bool = True,
+    languages: Sequence[str] | None = None,
+    translation_directions: Sequence[Sequence[str]] | None = None,
 ) -> Path:
     """Create the required final format set from the restored best weights."""
 
     export_dir = run_root / stage / "exports" / "best"
+    if translation_capable and translation_directions is None:
+        translation_directions = config.data.configured_translation_directions()
     export_inference_models(
         export_dir,
         model,
@@ -389,6 +393,8 @@ def export_final_model(
             else None
         ),
         language_pairs=config.data.configured_language_pairs(),
+        languages=languages,
+        translation_directions=translation_directions,
         bidirectional=config.data.bidirectional,
         revision_trained=config.data.revision_examples,
         strict=True,
@@ -873,6 +879,9 @@ def run_foundation_stage(
         foundation_config,
         context,
         stage_name="foundation/denoising",
+        export_release_name=config.foundation.release_name,
+        export_translation_capable=False,
+        export_languages=foundation_plan.languages,
     )
     barrier(context)
     release_stage_resources(context, train_loader, validation_loader)
@@ -892,6 +901,7 @@ def run_foundation_stage(
         # 받아들이고 그럴듯한 쓰레기를 냅니다.
         release_name=config.foundation.release_name,
         translation_capable=False,
+        languages=foundation_plan.languages,
     )
     if context.is_main:
         run_root.mkdir(parents=True, exist_ok=True)

@@ -124,6 +124,7 @@ def _validate_language_contract(
     pad_id: int,
     languages: Sequence[str] | None,
     language_pairs: Sequence[Sequence[str]] | None,
+    allow_language_subset: bool = False,
 ) -> tuple[list[str], list[list[str]]]:
     if len(tokenizer) != model_config.vocab_size:
         raise ValueError(
@@ -138,7 +139,14 @@ def _validate_language_contract(
     exported_languages = (
         tokenizer_languages if languages is None else list(dict.fromkeys(map(str, languages)))
     )
-    if set(exported_languages) != set(tokenizer_languages):
+    if allow_language_subset:
+        unknown_languages = sorted(set(exported_languages) - set(tokenizer_languages))
+        if unknown_languages:
+            raise ValueError(
+                "configured languages are not represented by tokenizer language tags: "
+                f"{unknown_languages} not in {sorted(tokenizer_languages)}"
+            )
+    elif set(exported_languages) != set(tokenizer_languages):
         raise ValueError(
             "configured languages do not match tokenizer language tags: "
             f"{sorted(exported_languages)} != {sorted(tokenizer_languages)}"
@@ -240,7 +248,9 @@ def save_transformers_checkpoint(
     languages: Sequence[str] | None = None,
     language_pairs: Sequence[Sequence[str]] | None = None,
     translation_directions: Sequence[Sequence[str]] | None = None,
+    translation_capable: bool = True,
     revision_trained: bool | None = None,
+    allow_language_subset: bool = False,
     max_shard_size: str = "5GB",
 ) -> Path:
     """Save native Sion weights as a safe, AutoClass-compatible directory."""
@@ -262,6 +272,7 @@ def save_transformers_checkpoint(
             pad_id=pad_id,
             languages=languages,
             language_pairs=language_pairs,
+            allow_language_subset=allow_language_subset,
         )
         bos_id = tokenizer.bos_id
         eos_id = tokenizer.eos_id
@@ -303,6 +314,7 @@ def save_transformers_checkpoint(
         languages=list(languages or []),
         language_pairs=pairs,
         translation_directions=directions,
+        translation_capable=translation_capable,
         revision_trained=revision_trained,
         slot_token_ids=slot_token_ids,
         tokenizer_sha256=tokenizer_sha256,
@@ -357,6 +369,7 @@ def save_transformers_checkpoint(
             slot_token_ids=slot_token_ids,
             language_pairs=pairs,
             translation_directions=directions,
+            translation_capable=translation_capable,
             script_classes=model_config.experimental.script_classes,
             tetm_type_id=min(8, model_config.experimental.tetm_types - 1),
             tetm_mode_id=min(4, model_config.experimental.tetm_modes - 1),
@@ -424,6 +437,7 @@ def save_transformers_checkpoint(
         "languages": list(languages or []),
         "language_pairs": pairs,
         "translation_directions": directions,
+        "translation_capable": translation_capable,
         "capabilities": (
             {"revision_trained": revision_trained} if revision_trained is not None else {}
         ),

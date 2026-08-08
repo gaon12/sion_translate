@@ -161,6 +161,48 @@ def test_single_step_training_loop(tmp_path: Path) -> None:
         assert not (tmp_path / "run" / "exports" / name / "model.pt").exists()
 
 
+def test_intermediate_exports_advertise_only_trained_directions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tiny_app_config(tmp_path, ema_decay=0.0)
+    config.data.language_pairs = [
+        ["kj", "ko"],
+        ["kj", "ja"],
+        ["kd", "ko"],
+        ["kd", "ja"],
+        ["jd", "ko"],
+        ["jd", "ja"],
+        ["ko", "ja"],
+    ]
+    config.data.source_only_languages = ["kj", "kd", "jd"]
+    captured: list[dict[str, object]] = []
+
+    def capture(*_args: object, **kwargs: object) -> None:
+        captured.append(kwargs)
+
+    monkeypatch.setattr(trainer_module, "export_inference_models", capture)
+    model = SionForConditionalGeneration(config.model)
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+
+    train(model, [tiny_batch()], [tiny_batch()], config, context)
+
+    expected = (
+        ("kj", "ko"),
+        ("kj", "ja"),
+        ("kd", "ko"),
+        ("kd", "ja"),
+        ("jd", "ko"),
+        ("jd", "ja"),
+        ("ko", "ja"),
+        ("ja", "ko"),
+    )
+    assert captured
+    assert all(item["translation_directions"] == expected for item in captured)
+    assert all(item["release_name"] == "sion_translate" for item in captured)
+    assert all(item["translation_capable"] is True for item in captured)
+
+
 def test_posttraining_validation_metrics_share_the_autocast_context(monkeypatch) -> None:
     active = False
 

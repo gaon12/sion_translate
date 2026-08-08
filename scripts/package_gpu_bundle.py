@@ -51,7 +51,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-from typing import BinaryIO, Iterable
+from typing import BinaryIO, Callable, Iterable, cast
 import unicodedata
 import zipfile
 
@@ -61,6 +61,10 @@ ARCHIVE_ROOT = "sion_translate"
 MANIFEST_NAME = "PACKAGE_MANIFEST.json"
 CHECKSUMS_NAME = "SHA256SUMS"
 FORMAT_VERSION = 1
+DATASET_FINGERPRINT_SCHEMA = "sion-dataset-fingerprint-v2"
+TOKENIZER_MODEL_PATH = "artifacts/tokenizer/sion.model"
+DATASET_RAW_FINGERPRINT_PATH = "artifacts/dataset/raw_fingerprint.json"
+DATASET_MANIFEST_PATH = "artifacts/dataset/manifest.json"
 COPY_BUFFER_SIZE = 8 * 1024 * 1024
 ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 MAX_METADATA_SIZE = 64 * 1024 * 1024
@@ -326,6 +330,120 @@ def _collect_tree(
     return entries
 
 
+def _parse_json_object(content: bytes, name: str) -> dict[str, object]:
+    try:
+        decoded = cast(object, json.loads(content.decode("utf-8")))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise BundleError(f"{name} is not valid UTF-8 JSON") from error
+    if not isinstance(decoded, dict):
+        raise BundleError(f"{name} must contain a JSON object")
+    return cast(dict[str, object], decoded)
+
+
+def _fingerprint_tokenizer_hash(fingerprint: dict[str, object], name: str) -> str:
+    if fingerprint.get("schema") != DATASET_FINGERPRINT_SCHEMA:
+        raise BundleError(f"{name} does not use the current {DATASET_FINGERPRINT_SCHEMA} schema")
+    recorded_hash = fingerprint.get("tokenizer_sha256")
+    if not isinstance(recorded_hash, str) or not SHA256_PATTERN.fullmatch(recorded_hash):
+        raise BundleError(f"{name} has no valid tokenizer_sha256")
+    return recorded_hash
+
+
+def _dataset_tokenizer_hash(
+    payload_paths: set[str],
+    read_payload: Callable[[str], bytes],
+) -> str:
+    """Read and cross-check every packaged dataset identity source."""
+
+    identities: dict[str, str] = {}
+    if DATASET_RAW_FINGERPRINT_PATH in payload_paths:
+        raw_fingerprint = _parse_json_object(
+            read_payload(DATASET_RAW_FINGERPRINT_PATH),
+            DATASET_RAW_FINGERPRINT_PATH,
+        )
+        identities[DATASET_RAW_FINGERPRINT_PATH] = _fingerprint_tokenizer_hash(
+            raw_fingerprint,
+            DATASET_RAW_FINGERPRINT_PATH,
+        )
+
+    if DATASET_MANIFEST_PATH in payload_paths:
+        manifest = _parse_json_object(
+            read_payload(DATASET_MANIFEST_PATH),
+            DATASET_MANIFEST_PATH,
+        )
+        raw_manifest_fingerprint = manifest.get("fingerprint")
+        if not isinstance(raw_manifest_fingerprint, dict):
+            raise BundleError(f"{DATASET_MANIFEST_PATH} has no valid fingerprint object")
+        manifest_fingerprint = cast(dict[str, object], raw_manifest_fingerprint)
+        identities[DATASET_MANIFEST_PATH] = _fingerprint_tokenizer_hash(
+            manifest_fingerprint,
+            f"{DATASET_MANIFEST_PATH}.fingerprint",
+        )
+
+    if not identities:
+        raise BundleError(
+            "the prepared dataset has neither raw_fingerprint.json nor a manifest.json "
+            "fingerprint; refusing to ship token ids whose tokenizer identity cannot be verified"
+        )
+    if len(set(identities.values())) != 1:
+        rendered = ", ".join(f"{name}={digest}" for name, digest in identities.items())
+        raise BundleError(f"prepared dataset tokenizer fingerprints disagree: {rendered}")
+    return next(iter(identities.values()))
+
+
+def _validate_payload_dataset_tokenizer_identity(
+    payload_paths: set[str],
+    tokenizer_sha256: str | None,
+    read_payload: Callable[[str], bytes],
+    *,
+    dataset_included: bool | None = None,
+) -> None:
+    """Verify the semantic tokenizer/dataset relation inside one payload."""
+
+    has_dataset = (
+        any(path.startswith("artifacts/dataset/") for path in payload_paths)
+        if dataset_included is None
+        else dataset_included
+    )
+    if not has_dataset:
+        return
+    if TOKENIZER_MODEL_PATH not in payload_paths or tokenizer_sha256 is None:
+        raise BundleError(
+            "a prepared dataset requires artifacts/tokenizer/sion.model in the same payload"
+        )
+    recorded_hash = _dataset_tokenizer_hash(payload_paths, read_payload)
+    if recorded_hash != tokenizer_sha256:
+        raise BundleError(
+            "prepared dataset tokenizer mismatch: dataset fingerprint records "
+            f"{recorded_hash}, but {TOKENIZER_MODEL_PATH} is {tokenizer_sha256}. "
+            "Rebuild artifacts/dataset with this tokenizer before packaging."
+        )
+
+
+def _validate_dataset_tokenizer_identity(root: Path) -> None:
+    """Require prepared token ids to name the tokenizer that produced them."""
+
+    tokenizer_path = root.joinpath(*PurePosixPath(TOKENIZER_MODEL_PATH).parts)
+    payload_paths = {TOKENIZER_MODEL_PATH}
+    for relative_path in (DATASET_RAW_FINGERPRINT_PATH, DATASET_MANIFEST_PATH):
+        candidate = root.joinpath(*PurePosixPath(relative_path).parts)
+        if candidate.is_file():
+            payload_paths.add(relative_path)
+
+    def read_payload(relative_path: str) -> bytes:
+        path = root.joinpath(*PurePosixPath(relative_path).parts)
+        with path.open("rb") as source:
+            return _read_limited(source, path.stat().st_size, relative_path)
+
+    _model_size, actual_hash = _hash_file(tokenizer_path)
+    _validate_payload_dataset_tokenizer_identity(
+        payload_paths,
+        actual_hash,
+        read_payload,
+        dataset_included=True,
+    )
+
+
 def _collect_sources(
     root: Path,
     *,
@@ -446,6 +564,7 @@ def _collect_sources(
                 "--with-dataset requires --with-tokenizer: a prepared dataset is "
                 "only reusable together with the tokenizer whose ids it holds"
             )
+        _validate_dataset_tokenizer_identity(root)
         for entry in dataset_entries:
             add(entry)
 
@@ -844,6 +963,24 @@ def verify_archive(archive_path: Path | str) -> VerificationResult:
                     size, digest = _hash_stream(source)
                 if size != record.size or digest != record.sha256:
                     raise BundleError(f"ZIP payload hash mismatch for {record.path}")
+
+            records_by_path = {record.path: record for record in records}
+
+            def read_payload(relative_path: str) -> bytes:
+                info = by_relative_path[relative_path]
+                with archive.open(info, mode="r") as source:
+                    return _read_limited(
+                        cast(BinaryIO, source),
+                        info.file_size,
+                        relative_path,
+                    )
+
+            tokenizer_record = records_by_path.get(TOKENIZER_MODEL_PATH)
+            _validate_payload_dataset_tokenizer_identity(
+                set(records_by_path),
+                tokenizer_record.sha256 if tokenizer_record is not None else None,
+                read_payload,
+            )
             if _zip_mode(manifest_info) != "100644":
                 raise BundleError(f"ZIP mode mismatch for {MANIFEST_NAME}")
             if _zip_mode(checksums_info) != "100644":
@@ -923,6 +1060,19 @@ def verify_tree(tree_path: Path | str) -> VerificationResult:
         size, digest = _hash_file(source_path)
         if size != record.size or digest != record.sha256:
             raise BundleError(f"package tree payload hash mismatch for {record.path}")
+
+    records_by_path = {record.path: record for record in records}
+
+    def read_payload(relative_path: str) -> bytes:
+        source_path = root.joinpath(*PurePosixPath(relative_path).parts)
+        return _read_tree_metadata(source_path, relative_path)
+
+    tokenizer_record = records_by_path.get(TOKENIZER_MODEL_PATH)
+    _validate_payload_dataset_tokenizer_identity(
+        set(records_by_path),
+        tokenizer_record.sha256 if tokenizer_record is not None else None,
+        read_payload,
+    )
 
     git_identity = raw_manifest["git"]
     assert isinstance(git_identity, dict)
