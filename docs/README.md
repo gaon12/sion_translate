@@ -22,6 +22,7 @@
 |---|---|
 | [`retraining-runbook.md`](retraining-runbook.md) | `easy_run.py` 없이 단계별로 직접 돌리려면 어떤 명령을 어떤 순서로 치는가 |
 | [`foundation-pretraining.md`](foundation-pretraining.md) | 단일어 span-corruption 단계는 무엇이고 언제 도는가 |
+| [`sentencepiece-sigsegv.md`](sentencepiece-sigsegv.md) | 토크나이저 학습 SIGSEGV의 원인·재현·운영 방어는 무엇인가 |
 | [`H100_TRAINING.md`](H100_TRAINING.md) | 다중 GPU 에서 어떤 병렬 전략을 고르는가 |
 | [`QUALITY_OVERHAUL.md`](QUALITY_OVERHAUL.md) | 방향 격차와 토큰 노출은 어떻게 진단했는가 |
 | [`corpus-gaps.md`](corpus-gaps.md) | 어떤 분야 데이터가 비어 있는가 |

@@ -438,7 +438,7 @@ class FoundationConfig:
     # 단계가 자기 코퍼스에 없는 어휘로 학습하고, 전량 넣으면 분량이 큰
     # 언어가 vocab 을 독식해 다른 언어 토큰화가 나빠집니다. 0 이면 단일어
     # 코퍼스를 토크나이저 학습에서 제외합니다.
-    tokenizer_sample_ratio: float = 1.0
+    tokenizer_sample_ratio: float = 0.4
 
     # ── 학습 ─────────────────────────────────────────────────────────
     max_steps: int = 100_000

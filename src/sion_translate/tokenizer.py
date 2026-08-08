@@ -48,6 +48,7 @@ from sion_translate.synthetic import (
 DEFAULT_LANGUAGE_PAIR = ("ko", "ja")
 TOKENIZER_METADATA_FILENAME = "tokenizer_metadata.json"
 TOKENIZER_METADATA_VERSION = 2
+SENTENCEPIECE_MULTITHREADED_TRAINING_REGRESSION = "0.2.2"
 
 # 언어쌍에 따라 달라지는 제어 토큰: <2xx> = "xx 언어로 번역하라",
 # <denoise_xx> = "xx 언어 원문을 복원하라(denoising)".
@@ -152,6 +153,7 @@ def write_tokenizer_metadata(
     language_pairs: Sequence[Sequence[str]],
     monolingual_sentences: dict[str, int] | None = None,
     monolingual_sample_ratio: float = 0.0,
+    required_characters: Sequence[str] = (),
 ) -> Path:
     """Write the reproducibility and identity contract for a trained tokenizer."""
 
@@ -174,7 +176,16 @@ def write_tokenizer_metadata(
         # 단일어 표본 규모를 남깁니다. 0 이면 병렬 코퍼스만으로 학습한 것입니다.
         "monolingual_sample_ratio": float(monolingual_sample_ratio),
         "monolingual_sentences": dict(monolingual_sentences or {}),
+        # The model format does not identify the trainer build. Keep it in the
+        # v2 sidecar as an optional field so v1/v2 loading semantics stay intact.
+        "sentencepiece_version": str(getattr(spm, "__version__", "unknown")),
     }
+    if required_characters:
+        rendered_required = "".join(required_characters)
+        metadata["required_character_count"] = len(required_characters)
+        metadata["required_characters_sha256"] = hashlib.sha256(
+            rendered_required.encode("utf-8")
+        ).hexdigest()
     if features_path.is_file():
         metadata["token_features_file"] = features_path.name
         metadata["token_features_size"] = features_path.stat().st_size
@@ -624,8 +635,8 @@ class CorpusCounts:
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# SentencePiece 가 seed piece 추출에서 SIGSEGV 로 죽는 경우가 있습니다.
-# **원인을 모릅니다.** 여기에 크기 상한을 두지 않는 이유가 그것입니다.
+# SentencePiece 0.2.2 는 큰 코퍼스의 다중 스레드 정규화에서 SIGSEGV 로 죽습니다.
+# 크기 상한을 두지 않는 이유는 크기가 원인이 아니기 때문입니다.
 #
 # 2026-08-07 실측. 원소 = 문자 + 문장 (`MakeSeedSentencePieces` 가 문장마다
 # 경계 문자를 하나 넣고 이어 붙입니다):
@@ -643,11 +654,32 @@ class CorpusCounts:
 # 긴 줄(미리 걸러도 죽음), google/sentencepiece#954 의 32,768 자 낱말 한계
 # (최장 1,401 자 코퍼스가 죽으므로 해당 없음), required_chars 의 블록 문자.
 #
-# 크기로 예측할 수 없으므로 크기 상한은 거짓 안심만 줍니다. 실패는 코퍼스를
-# 전부 읽은 뒤에 오고, 파이썬 예외가 아니라 프로세스가 사라지므로 로그에
-# 원인이 남지 않습니다. 새 코퍼스로 큰 학습을 걸기 전에 **같은 코퍼스의
-# 표본으로 작게 한 번 돌려 보는 것** 외에 알려진 방어가 없습니다.
+# v0.2.2 소스 빌드의 native stack 은 ``PrefixMatcher::GlobalReplace`` 안의
+# ``std::string::_M_append``/glibc malloc 을 가리켰습니다. Python iterator 를
+# 거치지 않는 C++ CLI 에서도 같습니다. 정확 A/B 결과:
+#
+# * 0.2.2, 4 threads: SIGSEGV; 1 thread: 통과
+# * 0.2.1, 4 threads: 통과
+# * 0.2.2 에서 새 thread pool 만 우회: SIGSEGV
+# * 0.2.2 에서 ``de32a1e`` 가 없앤 normalization offset 만 복원: 통과
+#
+# 따라서 0.2.2 의 offset 생략 회귀가 원인입니다. 실패는 모든 문장을 읽은 뒤에
+# 오므로 아래 runtime 검사는 문자 스캔보다 먼저 실행해야 합니다.
 # ─────────────────────────────────────────────────────────────────────────
+
+
+def validate_sentencepiece_training_runtime(num_threads: int) -> str:
+    """Return the trainer version, rejecting the measured 0.2.2 crash path."""
+
+    version = str(getattr(spm, "__version__", "unknown"))
+    if version == SENTENCEPIECE_MULTITHREADED_TRAINING_REGRESSION and num_threads > 1:
+        raise RuntimeError(
+            "sentencepiece 0.2.2의 다중 스레드 trainer에는 확인된 SIGSEGV 회귀가 "
+            "있습니다(normalization offset을 생략한 upstream de32a1e). 코퍼스를 "
+            "스캔하기 전에 중단합니다. 프로젝트가 고정한 sentencepiece==0.2.1을 "
+            "설치하거나, 느린 우회가 필요하면 num_threads=1을 명시하십시오."
+        )
+    return version
 
 
 def corpus_character_counts(
@@ -897,6 +929,7 @@ def train_tokenizer(
     plan = build_cpu_plan(input_files=len(paths))
     workers = num_workers or plan.preprocess_workers
     threads = num_threads or plan.sentencepiece_threads
+    validate_sentencepiece_training_runtime(threads)
 
     # Reserve the characters that carry content. This costs one pass over the
     # corpus and is worth it precisely because `character_coverage` is below 1.0:
@@ -917,9 +950,9 @@ def train_tokenizer(
             train_only_prefixes=train_only_prefixes,
             num_workers=workers,
         )
-        # 코퍼스가 SentencePiece 가 감당하는 크기인지 먼저 봅니다. 넘으면
-        # seed piece 추출 중 SIGSEGV 로 죽는데, 그 지점까지 가는 데만 몇 시간이
-        # 걸리고 실패 원인이 로그에 남지 않습니다.
+        # 이 값들은 required_chars 계획과 실행 기록을 위한 통계입니다. SIGSEGV
+        # 생존 여부를 크기로 예측하지 않습니다. 더 작은 코퍼스가 더 큰 코퍼스보다
+        # 먼저 죽은 실측이 있고, 원인은 위에서 이미 차단한 0.2.2 회귀였습니다.
         print(
             f"[tokenizer] 코퍼스 규모: 문장 {counts.sentences:,}, 문자 {counts.character_total:,}",
             flush=True,
@@ -996,6 +1029,7 @@ def train_tokenizer(
         language_pairs=normalized_pairs,
         monolingual_sentences=monolingual_counts or None,
         monolingual_sample_ratio=monolingual_sample_ratio,
+        required_characters=required_characters,
     )
     return model_path
 

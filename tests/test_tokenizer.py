@@ -171,6 +171,9 @@ def test_train_tokenizer_splits_digits_by_default(tmp_path: Path) -> None:
     assert metadata["token_features_file"] == features_path.name
     assert metadata["token_features_size"] == features_path.stat().st_size
     assert metadata["token_features_sha256"] == file_sha256(features_path)
+    assert metadata["sentencepiece_version"] == spm.__version__
+    assert metadata["required_character_count"] > 0
+    assert len(metadata["required_characters_sha256"]) == 64
     assert tokenizer_split_digits_policy(model_path) is True
 
 

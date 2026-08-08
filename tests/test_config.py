@@ -470,6 +470,9 @@ def test_foundation_defaults_point_at_the_documented_layout() -> None:
     assert foundation.dataset_dir == "artifacts/foundation_dataset"
     # 병렬 데이터셋과 절대 같은 경로여서는 안 된다: record 규격도 split 규칙도 다르다.
     assert foundation.dataset_dir != AppConfig().data.dataset_dir
+    assert foundation.tokenizer_sample_ratio == 0.4
+    root_config = Path(__file__).resolve().parents[1] / "sion_translate.yaml"
+    assert load_config(root_config).foundation.tokenizer_sample_ratio == 0.4
 
 
 def test_the_two_stages_publish_under_different_names() -> None:

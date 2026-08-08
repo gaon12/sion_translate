@@ -171,6 +171,41 @@ def _tiny_shard(tmp_path):
     return shard
 
 
+def test_sentencepiece_022_multithreaded_regression_is_refused_before_scanning(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """0.2.2 dies after loading 20M rows, so version rejection must precede that pass."""
+    import sion_translate.tokenizer as tokenizer_module
+
+    scanned = False
+
+    def fail_if_scanned(*args, **kwargs):
+        nonlocal scanned
+        scanned = True
+        raise AssertionError("the corpus scan must not start")
+
+    monkeypatch.setattr(tokenizer_module.spm, "__version__", "0.2.2")
+    monkeypatch.setattr(tokenizer_module, "corpus_character_counts", fail_if_scanned)
+
+    with pytest.raises(RuntimeError, match=r"0\.2\.2.*SIGSEGV"):
+        tokenizer_module.train_tokenizer(
+            [str(_tiny_shard(tmp_path))],
+            tmp_path / "out",
+            vocab_size=600,
+            num_threads=4,
+        )
+    assert not scanned
+
+
+def test_sentencepiece_022_single_thread_measured_workaround_is_allowed(monkeypatch) -> None:
+    """The same 20,355,455-row corpus completed with 0.2.2 when threads=1."""
+    import sion_translate.tokenizer as tokenizer_module
+
+    monkeypatch.setattr(tokenizer_module.spm, "__version__", "0.2.2")
+    assert tokenizer_module.validate_sentencepiece_training_runtime(1) == "0.2.2"
+
+
 def test_full_coverage_is_rejected_because_it_disables_the_other_two_mechanisms(
     tmp_path,
     monkeypatch,

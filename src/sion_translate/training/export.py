@@ -15,7 +15,7 @@ storage/interchange artifact rather than a falsely advertised llama.cpp model.
 # Optional TorchAO/GGUF/remote-code APIs do not publish complete typing metadata.
 # Keep strict checking for known types while containing Unknown values at this
 # integration boundary.
-# pyright: reportMissingImports=false, reportUnknownArgumentType=false, reportUnknownMemberType=false, reportUnknownVariableType=false
+# pyright: reportMissingImports=false, reportMissingTypeStubs=false, reportUnknownArgumentType=false, reportUnknownMemberType=false, reportUnknownVariableType=false
 
 from __future__ import annotations
 

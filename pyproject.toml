@@ -14,7 +14,9 @@ dependencies = [
   "numpy>=2.0",
   "PyYAML>=6.0",
   "sacrebleu>=2.5",
-  "sentencepiece>=0.2",
+  # 0.2.2 drops the normalization offset buffer used by the trainer and
+  # deterministically SIGSEGVs on the production corpus with multiple threads.
+  "sentencepiece==0.2.1",
   "safetensors>=0.5",
   "tensorboard>=2.18",
   "torch>=2.8",

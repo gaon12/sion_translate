@@ -76,13 +76,19 @@ foundation:
 19 조각(byte fallback 18 개)이 됐다가 넣으면 1 조각이 됩니다.
 
 전량 넣지도 않습니다. 언어별로 **"그 언어의 병렬 코퍼스 문장 수 ×
-`foundation.tokenizer_sample_ratio`"**(기본 1.0)까지만 뽑습니다. 전량 넣으면
+`foundation.tokenizer_sample_ratio`"**(기본 0.4)까지만 뽑습니다. 전량 넣으면
 분량이 큰 언어가 vocab 을 독식합니다 — 지금 ko 는 5.31 GB, ja 는 0 이라
 사실상 한국어 전용 토크나이저가 됩니다.
 
 표본은 파일 앞에서 자르지 않고 해시로 고르게 뽑습니다. 단일어 파일은 출처별로
 나뉘어 있어(위키 → 뉴스 → 커뮤니티) 앞을 자르면 한 출처만 뽑히고 그 편향이
 그대로 어휘에 박힙니다.
+
+0.4는 어휘 균형을 위한 값입니다. 예전 0.13은 SentencePiece 0.2.2의 native
+crash를 우연히 피하려고 낮춘 값이었고 안전 경계가 아니었습니다. 원인을 고친
+버전 정책과 실측은 [`sentencepiece-sigsegv.md`](sentencepiece-sigsegv.md)에
+남겼습니다. 이 비율은 토크나이저 학습 문장뿐 아니라 `required_chars` 문자 빈도
+스캔에도 동일하게 적용됩니다.
 
 ## 산출물은 번역 모델이 아닙니다
 
@@ -136,7 +142,7 @@ foundation:
 
   noise_density: 0.15            # 복원 과제의 손상 비율
   mean_span: 3.0
-  tokenizer_sample_ratio: 1.0    # 0 이면 토크나이저 학습에서 단일어 제외
+  tokenizer_sample_ratio: 0.4    # 0 이면 토크나이저 학습에서 단일어 제외
 
   max_steps: 100000
   batch_size_per_gpu: 16
