@@ -132,16 +132,21 @@ preprocess workers 16개, SentencePiece threads 16개, unigram 48,000 모델을
 ## 다시 실행하는 법
 
 진단은 프로젝트의 고정 버전을 바꾸지 않도록 별도 가상환경에서 합니다.
-`tokenizer_plan.json`과 코퍼스는 크기 때문에 저장소 밖에 둡니다.
+`tokenizer_plan.json`과 코퍼스는 크기 때문에 Git에는 넣지 않고, 프로젝트의
+ignored 로컬 산출물 경로인 `artifacts/sentencepiece_repro/`에 둡니다.
 
 ```powershell
 py -3.11 -m venv C:\tmp\spm-022
 C:\tmp\spm-022\Scripts\python.exe -m pip install sentencepiece==0.2.2
 C:\tmp\spm-022\Scripts\python.exe scripts\diagnose_sentencepiece_crash.py `
-  --corpus C:\Users\solso\sion_tokenizer_work\corpus_balanced_short.txt `
-  --plan C:\Users\solso\sion_tokenizer_work\tokenizer_plan.json `
+  --corpus artifacts\sentencepiece_repro\corpus_balanced_short.txt `
+  --plan artifacts\sentencepiece_repro\tokenizer_plan.json `
   --model-type char --threads 4
 ```
+
+보존한 입력의 SHA-256은 corpus
+`855cdc67378272490691279deb2ce5d4160dc56d4d4e4373e889d683f98ad12a`, plan
+`ef286833960dd6ac5cac22852b8a9fdcc0a0762fd14a97edd71fb1785a7858f6`입니다.
 
 부모 프로세스가 trainer를 자식으로 실행하므로 native crash 뒤에도 return code와
 시간을 JSON으로 남깁니다. `--maximum-sentences N`은 같은 파일의 ordered prefix를
