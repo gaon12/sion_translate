@@ -9,11 +9,17 @@
 from __future__ import annotations
 
 import json
+import math
+from types import SimpleNamespace
 
 import pytest
 import torch
 
-from sion_translate.cli.train import FOUNDATION_COMPLETION_FILENAME, run_foundation_stage
+from sion_translate.cli.train import (
+    FOUNDATION_COMPLETION_FILENAME,
+    _foundation_source_sampling_weights,
+    run_foundation_stage,
+)
 from sion_translate.config import AppConfig, ExperimentalConfig, ModelConfig
 from sion_translate.data.prepare_foundation import prepare_foundation_dataset
 from sion_translate.foundation import foundation_run_directory, plan_foundation_stage
@@ -149,7 +155,27 @@ def test_the_stage_trains_and_marks_itself_complete(
     assert marker["release_name"] == "sion"
     assert sorted(marker["languages"]) == ["ja", "ko"]
     assert sampler_arguments[0]["source_sampling_weights_by_id"]
+    assert math.isinf(sampler_arguments[0]["max_source_upsampling"])
     assert "source_sampling_weights_by_id" not in sampler_arguments[1]
+
+
+def test_empty_prepared_language_has_zero_sampling_mass(tmp_path) -> None:
+    manifest = {
+        "language_sampling": {
+            "counts": {"ko": 100, "ja": 0},
+            "weights": {"ko": 1.0, "ja": 0.0},
+        },
+        "sources": [
+            {"id": 0, "language": "ko", "name": "ko.txt"},
+            {"id": 1, "language": "ja", "name": "ja.txt"},
+        ],
+    }
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    dataset = SimpleNamespace(dataset_root=tmp_path, source_names=["ko.txt", "ja.txt"])
+
+    weights = _foundation_source_sampling_weights(dataset)
+
+    assert weights == {0: 1.0, 1: 0.0}
 
 
 def test_a_second_run_reuses_the_weights_instead_of_retraining(

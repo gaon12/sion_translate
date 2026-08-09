@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import pickle
 from pathlib import Path
 
@@ -265,6 +266,42 @@ def test_source_id_weights_do_not_depend_on_unique_file_names() -> None:
     sampled = [index for batch in sampler for index in batch]
     small_share = sum(index >= 9_000 for index in sampled) / len(sampled)
     assert 0.48 < small_share < 0.52
+
+
+def test_source_id_weights_can_apply_an_uncapped_prepared_distribution() -> None:
+    class DummyDataset:
+        bidirectional = False
+        pair_count = 100_000
+        pair_source_ids = np.asarray([0] * 99_000 + [1] * 1_000, dtype=np.uint16)
+        source_names = ["major.txt", "minor.txt"]
+
+        def __len__(self) -> int:
+            return self.pair_count
+
+        def lengths_for_indices(self, indices: np.ndarray) -> np.ndarray:
+            return np.ones_like(indices)
+
+    alpha = 0.7
+    major_target = 99_000**alpha
+    minor_target = 1_000**alpha
+    minor_share = minor_target / (major_target + minor_target)
+    sampler = DistributedBucketBatchSampler(
+        DummyDataset(),
+        batch_size=1_000,
+        bucket_size=100_000,
+        seed=17,
+        source_sampling_weights_by_id={
+            0: (1.0 - minor_share) / 99_000,
+            1: minor_share / 1_000,
+        },
+        max_source_upsampling=math.inf,
+    )
+
+    sampled = [index for batch in sampler for index in batch]
+    sampled_minor_share = sum(index >= 99_000 for index in sampled) / len(sampled)
+
+    assert minor_share > 0.03  # The generic 3x cap would stop exactly here.
+    assert sampled_minor_share == pytest.approx(minor_share, abs=0.003)
 
 
 def test_record_level_synthetic_samples_are_downweighted() -> None:

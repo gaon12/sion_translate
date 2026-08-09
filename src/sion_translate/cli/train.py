@@ -803,12 +803,23 @@ def _foundation_source_sampling_weights(
             raise ValueError(
                 f"foundation source {name!r} has no language sampling weight for {language!r}"
             ) from error
-        if not name or count <= 0.0 or target_share < 0.0:
+        if not name or count < 0.0 or target_share < 0.0:
             raise ValueError(
                 f"foundation source {name!r} has invalid language sampling values: "
                 f"count={count}, weight={target_share}"
             )
-        multiplier = target_share / count
+        if count == 0.0:
+            if not math.isclose(target_share, 0.0, abs_tol=1e-12):
+                raise ValueError(
+                    f"foundation source {name!r} has a positive sampling weight "
+                    f"for empty language {language!r}"
+                )
+            # ``require_all_languages=false`` permits a discovered language to
+            # yield no usable records. Keep its source id in the policy with
+            # zero mass so the prepared warning remains non-fatal.
+            multiplier = 0.0
+        else:
+            multiplier = target_share / count
         previous = multipliers.get(source_id)
         if previous is not None and not math.isclose(previous, multiplier):
             raise ValueError(f"foundation source id {source_id} has conflicting language weights")
@@ -917,6 +928,10 @@ def run_foundation_stage(
         bucket_size=foundation_config.data.bucket_size,
         seed=foundation_config.training.seed,
         source_sampling_weights_by_id=_foundation_source_sampling_weights(train_dataset),
+        # The prepared manifest already defines the intended alpha-tempered
+        # language distribution. The generic sampler's 3x safety cap would
+        # silently alter that policy for sufficiently imbalanced corpora.
+        max_source_upsampling=math.inf,
     )
     validation_sampler = DistributedBucketBatchSampler(
         validation_dataset,
