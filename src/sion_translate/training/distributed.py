@@ -262,12 +262,16 @@ def parallelize_model(
         # find_unused_parameters 는 forward 에서 안 쓰인 파라미터를 매 step
         # 탐색하는 비용이 있으므로, 실험 모듈처럼 조건부로만 쓰이는 파라미터가
         # 있을 때만 켭니다 (호출부에서 설정 기준으로 결정).
+        # SionOutput is a plain dataclass, so PyTorch 2.8's static-graph DDP
+        # cannot traverse it to attach the first-backward synchronization sink.
+        # Keep static-graph mode disabled to prevent ranks from diverging on the
+        # first optimizer step.
         model = DistributedDataParallel(
             model,
             device_ids=[context.local_rank] if context.device.type == "cuda" else None,
             find_unused_parameters=find_unused_parameters,
             gradient_as_bucket_view=True,
-            static_graph=not find_unused_parameters,
+            static_graph=False,
             broadcast_buffers=False,
         )
     return model

@@ -557,6 +557,57 @@ def test_fsdp2_reports_missing_custom_forward_registration_api(
         )
 
 
+@pytest.mark.parametrize("find_unused_parameters", [False, True])
+def test_ddp_disables_static_graph_for_sion_outputs(
+    monkeypatch,
+    find_unused_parameters: bool,
+) -> None:
+    ddp_options: dict[str, object] = {}
+
+    def capture_ddp(model: torch.nn.Module, **kwargs: object) -> torch.nn.Module:
+        ddp_options.update(kwargs)
+        return model
+
+    monkeypatch.setattr(
+        torch.nn.parallel,
+        "DistributedDataParallel",
+        capture_ddp,
+    )
+    context = DistributedContext(
+        rank=0,
+        local_rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        distributed=True,
+        backend="gloo",
+    )
+
+    parallelize_model(
+        SionForConditionalGeneration(
+            ModelConfig(
+                vocab_size=32,
+                d_model=16,
+                encoder_layers=1,
+                decoder_layers=1,
+                num_heads=4,
+                num_kv_heads=2,
+                d_ff=32,
+                max_seq_len=16,
+                dropout=0.0,
+            )
+        ),
+        context,
+        strategy="ddp",
+        precision="fp32",
+        reshard_after_forward=True,
+        materialize_meta=False,
+        find_unused_parameters=find_unused_parameters,
+    )
+
+    assert ddp_options["static_graph"] is False
+    assert ddp_options["find_unused_parameters"] is find_unused_parameters
+
+
 def test_ddp_unused_parameter_detection_covers_supervised_only_heads() -> None:
     config = AppConfig()
     config.model.experimental.bats_enabled = True
