@@ -323,6 +323,74 @@ def test_direction_statistics_have_a_fixed_ddp_reduction_layout(monkeypatch) -> 
     assert metrics["validation_worst_direction_nll"] == pytest.approx(remote_nll)
 
 
+def test_sparse_objective_metrics_use_one_rank_stable_ddp_layout(monkeypatch) -> None:
+    """Rank-local direction/custom keys must not alter collective order or meaning."""
+
+    class SparseObjective:
+        @staticmethod
+        def validation_metrics(model, batch):
+            del model, batch
+            return {
+                "reward": torch.tensor(0.2),
+                "direction_ja_to_ko_reward_sum": torch.tensor(0.2),
+                "direction_ja_to_ko_rows": torch.tensor(1.0),
+                "local_metric": torch.tensor(2.0),
+            }
+
+    model = FixedValidationModel(torch.tensor([[0.8, 0.8]]), smoothed_loss_sum=2.0)
+    local_batch = {name: value[:1].clone() for name, value in direction_validation_batch().items()}
+    context = DistributedContext(0, 0, 2, torch.device("cpu"), True, "gloo")
+    scalar_reductions = 0
+    packed_reductions = 0
+
+    def simulate_name_gather(
+        gathered: list[tuple[str, ...] | None], local_names: tuple[str, ...]
+    ) -> None:
+        # Direction accumulator names come from language_tags and do not need
+        # object exchange. Arbitrary objective metrics still participate in the
+        # sorted union even when only one rank emits them.
+        assert local_names == ("local_metric", "reward")
+        gathered[0] = local_names
+        gathered[1] = ("remote_metric", "reward")
+
+    def simulate_all_reduce(tensor: torch.Tensor, _context: DistributedContext) -> torch.Tensor:
+        nonlocal scalar_reductions, packed_reductions
+        if tensor.ndim == 0:
+            scalar_reductions += 1
+            if scalar_reductions == 6:  # objective_count
+                tensor += 1.0
+        elif tensor.shape == (7,):
+            packed_reductions += 1
+            # Sorted layout: two accumulators for each of ja->ko and ko->ja,
+            # followed by local_metric, remote_metric, and reward.
+            torch.testing.assert_close(
+                tensor,
+                tensor.new_tensor([0.2, 1.0, 0.0, 0.0, 2.0, 0.0, 0.2]),
+            )
+            tensor += tensor.new_tensor([0.0, 0.0, 0.9, 1.0, 0.0, 6.0, 0.9])
+        return tensor
+
+    monkeypatch.setattr(trainer_module.dist, "all_gather_object", simulate_name_gather)
+    monkeypatch.setattr(trainer_module, "reduce_sum", simulate_all_reduce)
+    metrics = evaluate(
+        model,
+        [local_batch],
+        context,
+        max_batches=1,
+        objective=SparseObjective(),
+        language_tags=FakeTokenizer.language_tags,
+    )
+
+    assert packed_reductions == 1
+    assert metrics["validation_reward"] == pytest.approx(0.55)
+    assert metrics["validation_local_metric"] == pytest.approx(1.0)
+    assert metrics["validation_remote_metric"] == pytest.approx(3.0)
+    assert metrics["validation_direction_ja_to_ko_reward"] == pytest.approx(0.2)
+    assert metrics["validation_direction_ko_to_ja_reward"] == pytest.approx(0.9)
+    assert metrics["validation_worst_direction_reward"] == pytest.approx(0.2)
+    assert metrics["validation_macro_direction_reward"] == pytest.approx(0.55)
+
+
 def test_sft_direction_selection_falls_back_to_a_finite_global_nll() -> None:
     metrics = {
         "validation_ema_macro_direction_nll": float("nan"),

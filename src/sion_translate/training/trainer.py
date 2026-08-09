@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch.nn import functional as F
 from tqdm.auto import tqdm
@@ -189,6 +190,41 @@ def _language_metric_layout(
     if len(tag_ids) != len(set(tag_ids)):
         raise ValueError("language_tags must assign a unique token id to every language")
     return layout
+
+
+def _objective_metric_layout(
+    local_names: Iterable[str],
+    context: DistributedContext,
+    language_layout: Sequence[tuple[str, int]],
+) -> tuple[str, ...]:
+    """Build one rank-stable layout for optional validation objective metrics.
+
+    Direction reward accumulators have a layout known from ``language_tags``.
+    Other objectives may expose arbitrary metric names, so distributed ranks
+    exchange only those small string tuples and reduce the numeric values later
+    in one packed tensor. A metric absent locally is consequently represented by
+    zero instead of changing the collective count or order.
+    """
+
+    direction_names: set[str] = set()
+    for source_language, _ in language_layout:
+        for target_language, _ in language_layout:
+            if source_language == target_language:
+                continue
+            prefix = f"direction_{source_language}_to_{target_language}"
+            direction_names.update((f"{prefix}_reward_sum", f"{prefix}_rows"))
+
+    custom_names = tuple(sorted(set(local_names) - direction_names))
+    if not context.distributed:
+        return tuple(sorted(direction_names.union(custom_names)))
+
+    gathered_names: list[tuple[str, ...] | None] = [None] * context.world_size
+    dist.all_gather_object(gathered_names, custom_names)
+    for rank_names in gathered_names:
+        if rank_names is None:
+            raise RuntimeError("distributed objective metric name gathering was incomplete")
+        direction_names.update(rank_names)
+    return tuple(sorted(direction_names))
 
 
 def _perplexity(nll: float) -> float:
@@ -377,8 +413,25 @@ def evaluate(
     # that are locally zero but observed on another DDP rank.
     if language_layout:
         reduce_sum(language_stats, context)
-    for value in objective_sums.values():
-        reduce_sum(value, context)
+    objective_layout = (
+        _objective_metric_layout(objective_sums, context, language_layout)
+        if objective is not None
+        else ()
+    )
+    if objective_layout:
+        packed_objective_sums = torch.zeros(
+            len(objective_layout),
+            device=context.device,
+            dtype=torch.float64,
+        )
+        for index, name in enumerate(objective_layout):
+            local_value = objective_sums.get(name)
+            if local_value is not None:
+                packed_objective_sums[index] = local_value
+        reduce_sum(packed_objective_sums, context)
+        objective_sums = {
+            name: packed_objective_sums[index] for index, name in enumerate(objective_layout)
+        }
     batch_tensor = torch.tensor(float(batches), device=context.device, dtype=torch.float64)
     reduce_sum(batch_tensor, context)
     model.train(was_training)
