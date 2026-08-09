@@ -40,9 +40,11 @@ FP8 로 **저장**해 버리면 입력 임베딩 조회까지 같이 망가집�
 
 ## 가중치만 FP8 (활성값은 bf16)
 
-디코딩은 이 모델에서 가중치 대역폭 바운드입니다(KV cache 는 전체 바이트의
-1.5%). 그래서 대역폭을 줄이는 데는 가중치만 내려도 충분하고, 그편이 더
-정확합니다:
+현재 export/runtime 형식은 활성값을 bf16 으로 유지하고 가중치만 FP8 로
+상주시킵니다. 이 선택은 저장·상주 가중치 바이트를 줄이면서 활성값 양자화
+오차를 피합니다. 다만 기본 runtime 은 매 forward 에서 가중치를 bf16 으로
+역양자화한 뒤 dense GEMM 을 사용하므로 실행 대역폭·연산량 이득을 보장하지
+않습니다:
 
     가중치 FP8 + 활성값 bf16    출력오차 2.57%   (활성값 이상치와 무관)
     가중치·활성값 모두 FP8       출력오차 3.63%
@@ -109,8 +111,8 @@ DEFAULT_BLOCK = 128
 # FP8 의 절반인데 양자화 대상의 69% 를 덮습니다.
 FFN_PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
 
-# attention projection. 여기까지 내리면 대역폭은 더 줄지만 softmax 를 거치며
-# 오차가 증폭됩니다 (logits 오차 6.39% → 13.11%).
+# attention projection. 여기까지 내리면 FP8 로 상주하는 가중치 비중은 늘지만
+# softmax 를 거치며 오차가 증폭됩니다 (logits 오차 6.39% → 13.11%).
 ATTENTION_PROJECTIONS = ("q_proj", "k_proj", "v_proj", "out_proj")
 
 # 두 범위를 합친 것. 모델 전체 파라미터의 81.6%.
@@ -139,8 +141,8 @@ class Fp8Policy:
 
     enabled: bool = False
     block: int = DEFAULT_BLOCK
-    # 기본은 FFN 만. attention 까지 내리면 대역폭은 더 줄지만 최종 logits
-    # 오차가 두 배가 됩니다 (6.39% → 13.11%).
+    # 기본은 FFN 만. attention 까지 내리면 FP8 상주 가중치는 늘지만 최종
+    # logits 오차가 두 배가 됩니다 (6.39% → 13.11%).
     scope: str = SCOPE_FFN
     # 어휘 projection 을 내리는 것은 실측에서 argmax 6.45% 변경이라
     # 기본은 False 입니다. 연구 목적으로 켜려면 명시해야 합니다.

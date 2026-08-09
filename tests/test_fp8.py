@@ -291,10 +291,10 @@ def test_an_unknown_scope_is_rejected() -> None:
 
 
 def test_weight_only_quantization_beats_quantizing_both_operands() -> None:
-    """디코딩은 대역폭 바운드라 가중치만 내려도 이득을 얻는다.
+    """가중치만 양자화하면 두 operand 를 양자화할 때보다 오차가 작다.
 
     실측: 가중치만 2.57%, 양쪽 다 3.63%. 그리고 가중치만 내리면 활성값
-    이상치에 영향받지 않습니다.
+    이상치에 영향받지 않습니다. 이 검사는 실행 성능 이득을 주장하지 않습니다.
     """
     torch.manual_seed(0)
     activations = torch.randn(256, 768)
