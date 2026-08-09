@@ -12,8 +12,7 @@ import os
 import subprocess
 import sys
 import textwrap
-
-import pytest
+import time
 
 from sion_translate.locking import LOCK_FILENAME, artifact_lock
 
@@ -111,21 +110,26 @@ def test_the_lock_is_released_when_the_holder_dies(tmp_path) -> None:
 
 
 def test_a_timeout_waits_before_giving_up(tmp_path) -> None:
+    started = time.monotonic()
     with artifact_lock(tmp_path):
-        with pytest.raises(RuntimeError, match="잠겨 있습니다"):
-            script = textwrap.dedent(
-                f"""
-                from sion_translate.locking import artifact_lock
-                with artifact_lock({str(tmp_path)!r}, timeout=0.2, poll_interval=0.05):
-                    pass
-                """
-            )
-            result = subprocess.run(
-                [sys.executable, "-c", script],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                cwd=os.getcwd(),
-            )
-            if result.returncode != 0:
-                raise RuntimeError("artifact 루트가 다른 프로세스에 잠겨 있습니다")
+        script = textwrap.dedent(
+            f"""
+            from sion_translate.locking import artifact_lock
+            with artifact_lock({str(tmp_path)!r}, timeout=0.2, poll_interval=0.05):
+                pass
+            """
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+            cwd=os.getcwd(),
+        )
+    elapsed = time.monotonic() - started
+
+    assert result.returncode != 0
+    assert "artifact 루트가 다른 프로세스에 잠겨 있습니다" in result.stderr
+    assert elapsed >= 0.15
