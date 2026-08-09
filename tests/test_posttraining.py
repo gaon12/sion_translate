@@ -438,6 +438,43 @@ class ConcurrentCandidateScorer(TinyCandidateScorer):
         )
 
 
+class AutocastCacheRecordingScorer(TinyCandidateScorer):
+    """Record cache state across no-grad generation and checkpoint replay."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.config = SimpleNamespace(label_smoothing=0.1, max_seq_len=16, vocab_size=64)
+        self.sample_cache_states: list[bool] = []
+        self.forward_cache_states: list[tuple[bool, bool]] = []
+
+    @torch.no_grad()
+    def sample(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        *,
+        num_samples: int,
+        **kwargs,
+    ) -> torch.Tensor:
+        del attention_mask, kwargs
+        self.sample_cache_states.append(torch.is_autocast_cache_enabled())
+        candidates = torch.tensor(
+            [[2, 20, 21, 3], [2, 20, 22, 3]],
+            device=input_ids.device,
+        )
+        return candidates[:num_samples].unsqueeze(0).expand(input_ids.shape[0], -1, -1)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        decoder_input_ids: torch.Tensor,
+        labels: torch.Tensor | None = None,
+    ):
+        self.forward_cache_states.append((labels is None, torch.is_autocast_cache_enabled()))
+        return super().forward(input_ids, attention_mask, decoder_input_ids, labels)
+
+
 class MemoryAwareCandidateScorer(TinyCandidateScorer):
     """Small objective double that records source-side generation context."""
 
@@ -595,6 +632,48 @@ def test_reward_cpu_work_overlaps_candidate_scoring_and_reports_wait_telemetry()
     )
     output.loss_sum.backward()
     assert model.embedding.weight.grad is not None
+
+
+def test_mrt_autocast_cache_is_disabled_for_generation_and_checkpoint_replay() -> None:
+    """No-grad casts and cross-chunk casts must not leak into MRT scoring.
+
+    CUDA autocast in PyTorch 2.8 otherwise gives later candidate chunks a
+    different saved-tensor graph from their fresh-cache backward replay.  CPU
+    autocast exposes the cache state directly, so this regression test does not
+    need CUDA to protect the required context boundaries.
+    """
+
+    config = PostTrainingConfig(
+        samples_per_source=2,
+        candidate_micro_batch=1,
+        candidate_gradient_checkpointing=True,
+        max_new_tokens=4,
+    )
+    objective = MinimumRiskObjective(TextTokenizer(), config)
+    model = AutocastCacheRecordingScorer()
+
+    with torch.autocast("cpu", dtype=torch.bfloat16, cache_enabled=True):
+        output = objective(model, posttraining_batch())
+    output.loss_sum.backward()
+
+    assert model.sample_cache_states == [False]
+    candidate_cache_states = [
+        cache_enabled
+        for labels_are_absent, cache_enabled in model.forward_cache_states
+        if labels_are_absent
+    ]
+    # Two original chunks and their two backward recomputations all use the
+    # same cache-disabled mixed-precision context.
+    assert candidate_cache_states == [False, False, False, False]
+    reference_cache_states = [
+        cache_enabled
+        for labels_are_absent, cache_enabled in model.forward_cache_states
+        if not labels_are_absent
+    ]
+    # The ordinary reference pass may keep the outer cache: unlike no-grad
+    # generation and checkpoint replay, it owns all of its parameter edges.
+    assert reference_cache_states == [True]
+    assert model.projection.weight.grad is not None
 
 
 def test_reward_worker_exception_propagates_without_leaking_executor_thread() -> None:

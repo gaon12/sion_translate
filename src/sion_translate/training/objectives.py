@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Iterable
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 import math
 import time
@@ -29,6 +30,32 @@ from .export import unwrap_model
 
 
 _activation_checkpoint = cast(Callable[..., torch.Tensor], checkpoint)
+
+
+def _autocast_without_weight_cache(device_type: str) -> AbstractContextManager[Any]:
+    """Preserve mixed precision without reusing casts across grad modes.
+
+    MRT generates candidates under ``no_grad`` before scoring them with
+    gradients.  PyTorch's autocast weight cache is shared by nested contexts,
+    so a cast first created by generation can be reused by the training pass
+    without its parameter edge.  Checkpointed candidate chunks have a second
+    problem: each backward recomputation starts with a fresh autocast cache,
+    while later original chunks can reuse casts from an earlier chunk.  On
+    PyTorch 2.8/CUDA that difference raises ``CheckpointError`` because the
+    saved-tensor sequence no longer matches.
+
+    A nested cache-disabled context keeps the selected BF16/FP16 dtype while
+    making both sides build the same autograd graph.  Outside autocast it is a
+    no-op.
+    """
+
+    if not torch.is_autocast_enabled(device_type):
+        return nullcontext()
+    return torch.autocast(
+        device_type=device_type,
+        dtype=torch.get_autocast_dtype(device_type),
+        cache_enabled=False,
+    )
 
 
 @dataclass
@@ -526,26 +553,30 @@ class MinimumRiskObjective:
             chunk_decoder_input_ids: torch.Tensor,
             chunk_labels: torch.Tensor,
         ) -> torch.Tensor:
-            batch_size, candidates, target_length = chunk_decoder_input_ids.shape
-            output = model(
-                **self._repeated_model_inputs(batch, candidates),
-                decoder_input_ids=chunk_decoder_input_ids.reshape(
-                    batch_size * candidates, target_length
-                ),
-                labels=None,
-            )
-            flat_labels = chunk_labels.reshape(batch_size * candidates, target_length)
-            token_nll = F.cross_entropy(
-                output.logits.float().transpose(1, 2),
-                flat_labels,
-                ignore_index=-100,
-                reduction="none",
-            )
-            valid = flat_labels.ne(-100)
-            sequence_log_probs = -token_nll.masked_fill(~valid, 0.0).sum(-1) / valid.sum(
-                -1
-            ).clamp_min(1)
-            return sequence_log_probs.view(batch_size, candidates)
+            # Original chunks share the trainer's outer autocast context, but
+            # checkpoint recomputation creates a fresh one.  Do not let cached
+            # parameter casts make those two graphs differ on PyTorch 2.8.
+            with _autocast_without_weight_cache(chunk_decoder_input_ids.device.type):
+                batch_size, candidates, target_length = chunk_decoder_input_ids.shape
+                output = model(
+                    **self._repeated_model_inputs(batch, candidates),
+                    decoder_input_ids=chunk_decoder_input_ids.reshape(
+                        batch_size * candidates, target_length
+                    ),
+                    labels=None,
+                )
+                flat_labels = chunk_labels.reshape(batch_size * candidates, target_length)
+                token_nll = F.cross_entropy(
+                    output.logits.float().transpose(1, 2),
+                    flat_labels,
+                    ignore_index=-100,
+                    reduction="none",
+                )
+                valid = flat_labels.ne(-100)
+                sequence_log_probs = -token_nll.masked_fill(~valid, 0.0).sum(-1) / valid.sum(
+                    -1
+                ).clamp_min(1)
+                return sequence_log_probs.view(batch_size, candidates)
 
         if self.config.candidate_gradient_checkpointing and torch.is_grad_enabled():
             return _activation_checkpoint(
@@ -699,24 +730,28 @@ class MinimumRiskObjective:
                 if 0 <= token_id < base.config.vocab_size
             )
         )
-        sampled = base.sample(
-            batch["input_ids"],
-            batch["attention_mask"],
-            bos_id=self.tokenizer.bos_id,
-            eos_id=self.tokenizer.eos_id,
-            num_samples=self.config.samples_per_source,
-            max_new_tokens=self._max_new_tokens(base, reference_labels),
-            temperature=self.config.sampling_temperature,
-            top_k=self.config.top_k,
-            forbidden_token_ids=forbidden,
-            **generation_features,
-        )
-        roundtrip_started = time.perf_counter()
-        roundtrip_candidates, roundtrip_mask = self._backtranslate_candidates(
-            base,
-            batch,
-            sampled,
-        )
+        # Sampling and round-trip generation are no-grad operations inside the
+        # trainer's autocast scope.  Prevent their detached parameter casts from
+        # being reused by the subsequent gradient-bearing scoring passes.
+        with _autocast_without_weight_cache(batch["input_ids"].device.type):
+            sampled = base.sample(
+                batch["input_ids"],
+                batch["attention_mask"],
+                bos_id=self.tokenizer.bos_id,
+                eos_id=self.tokenizer.eos_id,
+                num_samples=self.config.samples_per_source,
+                max_new_tokens=self._max_new_tokens(base, reference_labels),
+                temperature=self.config.sampling_temperature,
+                top_k=self.config.top_k,
+                forbidden_token_ids=forbidden,
+                **generation_features,
+            )
+            roundtrip_started = time.perf_counter()
+            roundtrip_candidates, roundtrip_mask = self._backtranslate_candidates(
+                base,
+                batch,
+                sampled,
+            )
         roundtrip_generation_seconds = time.perf_counter() - roundtrip_started
         reward_transfer_started = time.perf_counter()
         reward_candidates_cpu = sampled.detach().to("cpu")
