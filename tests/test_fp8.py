@@ -35,7 +35,8 @@ def quantize_dequantize(
     """FP8 왕복. 실제 FP8 GEMM 이 보는 값을 고정밀도로 재현합니다.
 
     학습 경로에서 쓰는 것이 아니라, 하드웨어 없이 **오차를 측정**하고
-    회귀를 잡기 위한 것입니다. 실제 커널은 ``torch._scaled_mm`` 입니다.
+    회귀를 잡기 위한 것입니다. 네이티브 FP8 GEMM에서 관측할 양자화 값의
+    기준이며, 현재 프로덕션 런타임은 ``torch._scaled_mm`` 을 쓰지 않습니다.
     """
 
     original = tensor.dtype

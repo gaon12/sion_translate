@@ -1,7 +1,8 @@
 """FP8 가중치를 FP8 인 채로 들고 추론하는 경로.
 
-불러올 때 고정밀도로 되돌려 버리면 디스크만 줄고 정작 노리던 디코딩 대역폭은
-그대로입니다. 여기서 확인하는 것은 **상주 가중치가 FP8 인가** 입니다.
+불러올 때 고정밀도로 되돌려 상주시켜 버리면 디스크만 줄어듭니다. 여기서
+확인하는 것은 **상주 가중치가 FP8 인가** 와 실제 계산 경로를 정확히 보고하는가
+입니다.
 """
 
 from __future__ import annotations
@@ -137,8 +138,18 @@ def test_replacing_a_module_that_is_not_linear_is_refused() -> None:
         apply_fp8_weights(model, renamed)
 
 
-def test_the_runtime_description_distinguishes_where_the_gain_comes_from() -> None:
-    """텐서코어가 있으면 대역폭+연산량, 없으면 대역폭만."""
-    description = describe_runtime(torch.device("cpu"))
-    assert "대역폭" in description
-    assert "FP8 텐서코어 없음" in description
+@pytest.mark.parametrize("device", [torch.device("cpu"), torch.device("cuda")])
+def test_the_runtime_description_reports_the_actual_path_on_every_device(
+    device: torch.device,
+) -> None:
+    description = describe_runtime(device)
+
+    assert "BF16 즉시 역양자화" in description
+    assert "dense GEMM" in description
+    assert "상주 메모리 절감" in description
+    assert "네이티브 FP8 텐서코어 미사용" in description
+    assert "대역폭" not in description
+
+
+def test_the_runtime_description_does_not_change_with_cuda_capability() -> None:
+    assert describe_runtime(torch.device("cpu")) == describe_runtime(torch.device("cuda", 7))

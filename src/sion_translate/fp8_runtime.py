@@ -1,22 +1,18 @@
-"""FP8 가중치를 **FP8 인 채로** 들고 추론하는 경로.
+"""FP8 가중치를 FP8 인 채로 상주시켜 추론하는 경로.
 
-export 는 가중치를 FP8 로 저장합니다. 그것을 불러올 때 고정밀도로 되돌리면
-디스크만 줄고 정작 노리던 것 — 디코딩 대역폭 — 은 그대로입니다. 이 모듈은
-가중치를 FP8 로 둔 채 GEMM 마다 필요한 만큼만 쓰게 합니다.
+export 가 저장한 FP8 가중치와 블록 스케일은 모델 버퍼에서도 FP8 로 유지되므로
+상주 메모리는 줄어듭니다. 현재 ``Fp8Linear`` 의 계산 경로는 하나뿐입니다.
+매 ``forward`` 에서 전체 가중치를 ``compute_dtype`` (기본값 bf16)으로
+역양자화한 뒤 평범한 ``torch.nn.functional.linear`` 를 호출합니다.
 
-두 가지 경로가 있고, 이득의 출처가 다릅니다.
+따라서 이 구현은 ``torch._scaled_mm`` 을 호출하지 않고 네이티브 FP8
+텐서코어 GEMM 을 사용하지 않습니다. 역양자화된 임시 dense 가중치를 만들기
+때문에 실행 중 메모리 대역폭이나 연산량이 줄어든다고도 보장할 수 없습니다.
+장치 성능 이득은 별도 벤치마크로 확인해야 합니다.
 
-- **``_scaled_mm`` (Hopper 이상)**: 가중치도 활성값도 FP8 로 텐서코어에
-  들어갑니다. 대역폭과 연산량을 모두 줄입니다.
-- **on-the-fly 역양자화 (그 외 전부)**: 가중치를 FP8 로 읽어 와 bf16 으로
-  풀어서 평범한 GEMM 을 합니다. 연산량은 그대로지만 **HBM 에서 읽는 바이트가
-  절반**이고, 이 모델의 디코딩은 가중치 대역폭 바운드이므로(KV cache 는 옮기는
-  바이트의 1.5%) 이득의 대부분이 여기서 나옵니다. FP8 텐서코어가 없는 GPU
-  에서도 동작합니다.
-
-활성값은 어느 경로에서도 FP8 로 내리지 않습니다. 가중치만 내리는 편이 더
-정확하고(출력 오차 2.57% 대 3.63%) 활성값 이상치에 영향받지 않습니다. 근거
-수치는 ``sion_translate.fp8`` 문서에 있습니다.
+활성값은 FP8 로 내리지 않습니다. 가중치만 내리는 편이 더 정확하고(출력 오차
+2.57% 대 3.63%) 활성값 이상치에 영향받지 않습니다. 근거 수치는
+``sion_translate.fp8`` 문서에 있습니다.
 """
 
 # Torch FP8 primitives and optional packed-module hooks are incompletely typed.
@@ -27,7 +23,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from sion_translate.fp8 import DEFAULT_BLOCK, FORWARD_DTYPE, fp8_gemm_supported
+from sion_translate.fp8 import DEFAULT_BLOCK, FORWARD_DTYPE
 
 
 class Fp8Linear(nn.Module):
@@ -135,11 +131,17 @@ def apply_fp8_weights(
 
 
 def describe_runtime(device: torch.device) -> str:
-    """어느 경로로 도는지 한 줄로. 배포 로그에 남길 용도입니다."""
+    """실제로 사용하는 계산 경로를 배포 로그용 한 줄로 설명합니다.
 
-    if fp8_gemm_supported(device):
-        return "FP8 텐서코어 GEMM (대역폭 + 연산량 절감)"
-    return "FP8 가중치 + 즉시 역양자화 (대역폭만 절감; FP8 텐서코어 없음)"
+    ``device`` 는 호출 API 호환성을 위해 받습니다. 현재 구현은 장치 capability와
+    무관하게 같은 역양자화 경로를 사용합니다.
+    """
+
+    del device
+    return (
+        "FP8 상주 가중치 + BF16 즉시 역양자화 후 dense GEMM "
+        "(상주 메모리 절감; 네이티브 FP8 텐서코어 미사용)"
+    )
 
 
 __all__ = ["Fp8Linear", "apply_fp8_weights", "describe_runtime"]

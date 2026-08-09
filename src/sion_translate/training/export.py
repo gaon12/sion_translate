@@ -1886,8 +1886,8 @@ def load_exported_model(
         # 32B FP32 artifact near one model's host-memory footprint rather than two.
         model.load_state_dict(state, assign=True)
         if fp8_packed:
-            # 되돌린 가중치를 버리고 FP8 을 상주시킵니다. 되돌린 채 두면 디스크만
-            # 줄고 정작 노리던 디코딩 대역폭은 그대로입니다.
+            # 되돌린 가중치를 버리고 FP8 을 상주시킵니다. 현재 계산은 forward
+            # 마다 bf16 으로 역양자화하지만, 모델의 상주 메모리는 FP8 로 줄입니다.
             replaced = apply_fp8_weights(model, dict(stored))
             if not replaced:
                 raise ValueError("FP8 export contains no quantized weights")

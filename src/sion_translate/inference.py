@@ -224,9 +224,9 @@ class Translator:
         self.quantized = runtime_device == "cpu" or any(
             "quantized" in type(module).__module__ for module in self.model.modules()
         )
-        # FP8 export 는 CPU 전용이 아닙니다. 어느 경로로 도는지는 장치에 따라
-        # 갈리고 이득의 성격도 다르므로(텐서코어면 대역폭+연산량, 아니면
-        # 대역폭만) 구분해서 남깁니다.
+        # FP8 export 는 CPU 전용이 아닙니다. 현재는 모든 장치에서 가중치를
+        # bf16 으로 즉시 역양자화한 뒤 dense GEMM 을 하므로 그 실제 경로를
+        # 로그에 남깁니다.
         self.fp8_runtime: str | None = (
             describe_runtime(self.device)
             if quantization_mapping is not None and quantization_mapping.get("format") == "fp8"

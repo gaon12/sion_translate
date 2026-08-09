@@ -487,12 +487,14 @@ python scripts/data/fetch_open2ch.py --output data/corpus/ja/open2ch_cleaned.jso
 `training.final_export_formats`로 정합니다. `fp32`, `fp16`, `bf16`, `int8`,
 `int4`, `fp8`, `gguf_q4_k_m`, `transformers`.
 
-`fp8`은 가중치 전용 E4M3 + 블록 스케일입니다. 디코딩이 가중치 대역폭 바운드라
-(KV cache는 옮기는 바이트의 1.5%) 가중치만 내려도 이득을 얻고, 양쪽을 내리는
-것보다 정확합니다(출력 오차 2.57% 대 3.63%). 기본 범위는 FFN 뿐입니다 —
+`fp8`은 가중치 전용 E4M3 + 블록 스케일입니다. export 파일과 모델의 상주
+가중치 메모리를 줄이면서, 활성값까지 내리는 것보다 정확합니다(출력 오차
+2.57% 대 3.63%). 현재 런타임은 매 forward에서 가중치를 bf16으로 역양자화한
+뒤 dense GEMM을 하며 네이티브 FP8 텐서코어를 사용하지 않습니다. 따라서 실행
+대역폭이나 연산량 절감은 보장하지 않습니다. 기본 범위는 FFN 뿐입니다 —
 attention까지 내리면 최종 logits 오차가 6.39%에서 13.11%로 두 배가 됩니다.
-어휘 projection은 어떤 설정에서도 제외됩니다(argmax 6.45% 변경).
-근거 수치는 `src/sion_translate/fp8.py` 문서에 있습니다.
+어휘 projection은 어떤 설정에서도 제외됩니다(argmax 6.45% 변경). 근거 수치는
+`src/sion_translate/fp8.py` 문서에 있습니다.
 
 ## 저장소에 포함하지 않는 파일
 
