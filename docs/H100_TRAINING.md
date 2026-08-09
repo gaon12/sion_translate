@@ -198,8 +198,10 @@ rank별 batch padding 길이에서 계산된 생성 한도 역시 시작 시 `MA
 DDP는 `gradient_as_bucket_view`를 사용한다. BATS는 SFT의 label 기반 보조
 손실에서는 사용되지만 MRT candidate scoring의 label-free forward에서는
 사용되지 않는다. 따라서 BATS+사후학습 구성은
-`find_unused_parameters=true`, `static_graph=false`로 시작한다. 사후학습이
-없고 parameter 사용 집합이 고정된 구성만 static graph를 유지한다.
+`find_unused_parameters=true`로 시작하고, parameter 사용 집합이 고정된
+구성은 `false`를 사용한다. 현재 모든 DDP 구성은 `static_graph=false`다.
+`SionOutput` dataclass가 PyTorch pytree로 등록되어 있지 않아 PyTorch 2.8의
+static-graph 첫 backward에서 delayed all-reduce가 누락될 수 있기 때문이다.
 
 `torch.compile`은 현재 `sion_data_fit`과 `sion_1_3b`에서 켜져 있다. 첫 step들의
 컴파일 시간은 steady-state 처리량에서 제외한다. graph break나 컴파일 실패가

@@ -1206,7 +1206,7 @@ def main() -> None:
             parallel_strategy=parallel_strategy,
         )
         # SFT와 MRT가 같은 DDP wrapper를 공유하므로 단계 전환 뒤의 파라미터
-        # 사용 집합까지 고려해 static_graph 사용 여부를 정합니다.
+        # 사용 집합까지 고려해 unused-parameter 탐지 여부를 정합니다.
         detect_unused_parameters = requires_ddp_unused_parameter_detection(config)
         model = parallelize_model(
             model,
