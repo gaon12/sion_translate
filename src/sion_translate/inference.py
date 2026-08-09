@@ -27,7 +27,7 @@ from sion_translate.tokenizer import (
     load_tokenizer_metadata,
     tokenizer_split_digits_policy,
 )
-from sion_translate.fp8_runtime import describe_runtime
+from sion_translate.fp8_runtime import describe_runtime, prepare_fp8_model_for_device
 from sion_translate.training.export import load_exported_model, resolve_manifest_artifact
 
 
@@ -224,16 +224,18 @@ class Translator:
         self.quantized = runtime_device == "cpu" or any(
             "quantized" in type(module).__module__ for module in self.model.modules()
         )
-        # FP8 export 는 CPU 전용이 아닙니다. 현재는 모든 장치에서 가중치를
-        # bf16 으로 즉시 역양자화한 뒤 dense GEMM 을 하므로 그 실제 경로를
-        # 로그에 남깁니다.
-        self.fp8_runtime: str | None = (
-            describe_runtime(self.device)
-            if quantization_mapping is not None and quantization_mapping.get("format") == "fp8"
-            else None
+        # FP8 export 는 CPU 전용이 아닙니다. 현재는 가중치를 BF16(미지원 CUDA는
+        # FP16)으로 즉시 역양자화한 뒤 dense GEMM 을 하므로 실제 선택을 로그에
+        # 남깁니다. 상주 FP8 형식과 계산 dtype은 서로 독립입니다.
+        fp8_export = (
+            quantization_mapping is not None and quantization_mapping.get("format") == "fp8"
         )
+        self.fp8_runtime: str | None = describe_runtime(self.device) if fp8_export else None
         if not self.quantized:
-            self.model.to(self.device)
+            if fp8_export:
+                prepare_fp8_model_for_device(self.model, self.device)
+            else:
+                self.model.to(self.device)
         else:
             if self.device.type != "cpu":
                 warnings.warn(

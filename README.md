@@ -489,11 +489,13 @@ python scripts/data/fetch_open2ch.py --output data/corpus/ja/open2ch_cleaned.jso
 
 `fp8`은 가중치 전용 E4M3 + 블록 스케일입니다. export 파일과 모델의 상주
 가중치 메모리를 줄이면서, 활성값까지 내리는 것보다 정확합니다(출력 오차
-2.57% 대 3.63%). 현재 런타임은 매 forward에서 가중치를 bf16으로 역양자화한
-뒤 dense GEMM을 하며 네이티브 FP8 텐서코어를 사용하지 않습니다. 따라서 실행
-대역폭이나 연산량 절감은 보장하지 않습니다. 기본 범위는 FFN 뿐입니다 —
-attention까지 내리면 최종 logits 오차가 6.39%에서 13.11%로 두 배가 됩니다.
-어휘 projection은 어떤 설정에서도 제외됩니다(argmax 6.45% 변경). 근거 수치는
+2.57% 대 3.63%). 현재 런타임은 매 forward에서 가중치를 BF16으로 역양자화하되,
+BF16을 지원하지 않는 CUDA 장치에서는 FP16으로 자동 fallback한 뒤 dense GEMM을
+합니다. A100처럼 네이티브 FP8 텐서코어가 없는 장치에서도 실행할 수 있습니다.
+현재 경로는 네이티브 FP8 텐서코어를 사용하지 않으므로 실행 대역폭이나 연산량
+절감은 보장하지 않습니다. 기본 범위는 FFN 뿐입니다 — attention까지 내리면
+최종 logits 오차가 6.39%에서 13.11%로 두 배가 됩니다. 어휘 projection은 어떤
+설정에서도 제외됩니다(argmax 6.45% 변경). 근거 수치는
 `src/sion_translate/fp8.py` 문서에 있습니다.
 
 ## 저장소에 포함하지 않는 파일

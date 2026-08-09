@@ -945,8 +945,9 @@ def _pack_fp8_state(
 
     활성값은 건드리지 않습니다. 가중치만 내리면 저장·상주 바이트를 줄이면서
     실측 출력 오차도 더 작습니다 — 2.57% 대 3.63%. 기본 runtime 은 FP8
-    가중치를 매 forward 에서 bf16 으로 역양자화한 뒤 dense GEMM 을 사용하므로
-    실행 대역폭·연산량 이득을 보장하지 않습니다.
+    가중치를 매 forward 에서 BF16(BF16 미지원 CUDA에서는 FP16)으로
+    역양자화한 뒤 dense GEMM 을 사용하므로 실행 대역폭·연산량 이득을
+    보장하지 않습니다.
 
     무엇을 내리지 않는지가 더 중요합니다. ``Fp8Policy`` 의 기본 범위는 FFN
     뿐이고, 어휘 projection 은 어떤 범위에서도 제외됩니다. 자세한 실측 근거는
@@ -988,6 +989,8 @@ def _pack_fp8_state(
         "algorithm": "weight-only-fp8-e4m3-blockwise",
         "format": "fp8",
         "activation_dtype": "bfloat16",
+        "activation_fallback_dtype": "float16",
+        "activation_dtype_policy": "bf16-if-supported-else-fp16",
         "weight_dtype": "float8_e4m3fn",
         "block": policy.block,
         "scope": policy.scope,
@@ -1888,7 +1891,8 @@ def load_exported_model(
         model.load_state_dict(state, assign=True)
         if fp8_packed:
             # 되돌린 가중치를 버리고 FP8 을 상주시킵니다. 현재 계산은 forward
-            # 마다 bf16 으로 역양자화하지만, 모델의 상주 메모리는 FP8 로 줄입니다.
+            # 마다 BF16(미지원 CUDA는 FP16)으로 역양자화하지만, 모델의 상주
+            # 메모리는 FP8 로 줄입니다.
             replaced = apply_fp8_weights(model, dict(stored))
             if not replaced:
                 raise ValueError("FP8 export contains no quantized weights")

@@ -8,9 +8,13 @@ import numpy as np
 import pytest
 import torch
 
+import sion_translate.fp8_runtime as fp8_runtime
 import sion_translate.inference as inference
 from sion_translate.config import ExperimentalConfig, ModelConfig
+from sion_translate.fp8 import FORWARD_DTYPE, Fp8Policy
+from sion_translate.fp8_runtime import Fp8Linear, apply_fp8_weights
 from sion_translate.model import SionForConditionalGeneration
+from sion_translate.training.export import _pack_fp8_state
 
 
 _UNSET = object()
@@ -82,11 +86,12 @@ def make_translator(
     device: str = "cpu",
     raw_revision_capability: object = _UNSET,
     feature_arrays: dict[str, np.ndarray] | None = None,
+    loaded_model: SionForConditionalGeneration | None = None,
 ) -> inference.Translator:
     tokenizer_path = tmp_path / "tokenizer.model"
     tokenizer_path.write_bytes(b"fake tokenizer")
     digest = hashlib.sha256(tokenizer_path.read_bytes()).hexdigest()
-    model = SionForConditionalGeneration(config)
+    model = loaded_model if loaded_model is not None else SionForConditionalGeneration(config)
     features = tmp_path / feature_filename
     zeros = np.zeros(64, dtype=np.uint8)
     np.savez_compressed(
@@ -529,6 +534,47 @@ def test_cpu_only_quantization_metadata_overrides_requested_cuda(
         )
     assert translator.device == torch.device("cpu")
     assert translator.quantized
+
+
+def test_fp8_translator_prepares_a_bf16_model_for_fp16_fallback(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    config = runtime_config()
+    model = SionForConditionalGeneration(config).eval().to(torch.bfloat16)
+    packed, _quantization = _pack_fp8_state(
+        model.state_dict(),
+        Fp8Policy(enabled=True, block=32),
+    )
+    assert apply_fp8_weights(model, packed) > 0
+    monkeypatch.setattr(
+        fp8_runtime,
+        "resolve_fp8_compute_dtype",
+        lambda _device: torch.float16,
+    )
+
+    translator = make_translator(
+        monkeypatch,
+        tmp_path,
+        config,
+        quantization={"format": "fp8", "runtime_device": "cuda"},
+        loaded_model=model,
+    )
+
+    assert translator.fp8_runtime is not None
+    assert "FP16 즉시 역양자화" in translator.fp8_runtime
+    assert {parameter.dtype for parameter in translator.model.parameters()} == {torch.float16}
+    fp8_modules = [module for module in translator.model.modules() if isinstance(module, Fp8Linear)]
+    assert fp8_modules
+    assert all(module.weight.dtype is FORWARD_DTYPE for module in fp8_modules)
+    assert all(module.scales.dtype is torch.float32 for module in fp8_modules)
+
+    input_ids = torch.randint(4, 60, (2, 8))
+    attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+    decoder_ids = torch.randint(4, 60, (2, 4))
+    with torch.no_grad():
+        logits = translator.model(input_ids, attention_mask, decoder_ids).logits
+    assert torch.isfinite(logits).all()
 
 
 def test_typed_memory_matches_training_slot_cap(monkeypatch, tmp_path: Path) -> None:

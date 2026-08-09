@@ -117,6 +117,8 @@ def test_the_manifest_records_what_was_done() -> None:
     _, quantization = _pack_fp8_state(_state(), Fp8Policy(enabled=True))
     assert quantization["algorithm"] == "weight-only-fp8-e4m3-blockwise"
     assert quantization["activation_dtype"] == "bfloat16"
+    assert quantization["activation_fallback_dtype"] == "float16"
+    assert quantization["activation_dtype_policy"] == "bf16-if-supported-else-fp16"
     assert quantization["weight_dtype"] == "float8_e4m3fn"
     assert quantization["block"] == 128
 
