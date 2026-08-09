@@ -997,7 +997,7 @@ def _pack_fp8_state(
         "quantized_parameters": quantized_parameters,
         "preserved_parameters": preserved_parameters,
         "quantized_fraction": (quantized_parameters / total) if total else 0.0,
-        "runtime_device": "cuda",
+        "runtime_device": "any",
     }
     return packed_state, quantization
 

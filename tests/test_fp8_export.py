@@ -120,6 +120,7 @@ def test_the_manifest_records_what_was_done() -> None:
     assert quantization["activation_fallback_dtype"] == "float16"
     assert quantization["activation_dtype_policy"] == "bf16-if-supported-else-fp16"
     assert quantization["weight_dtype"] == "float8_e4m3fn"
+    assert quantization["runtime_device"] == "any"
     assert quantization["block"] == 128
 
 
