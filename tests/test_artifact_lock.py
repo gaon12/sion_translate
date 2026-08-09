@@ -12,7 +12,6 @@ import os
 import subprocess
 import sys
 import textwrap
-import time
 
 from sion_translate.locking import LOCK_FILENAME, artifact_lock
 
@@ -110,13 +109,21 @@ def test_the_lock_is_released_when_the_holder_dies(tmp_path) -> None:
 
 
 def test_a_timeout_waits_before_giving_up(tmp_path) -> None:
-    started = time.monotonic()
     with artifact_lock(tmp_path):
         script = textwrap.dedent(
             f"""
+            import sys
+            import time
             from sion_translate.locking import artifact_lock
-            with artifact_lock({str(tmp_path)!r}, timeout=0.2, poll_interval=0.05):
-                pass
+
+            started = time.monotonic()
+            try:
+                with artifact_lock({str(tmp_path)!r}, timeout=0.2, poll_interval=0.05):
+                    pass
+            except RuntimeError as error:
+                print(f"{{time.monotonic() - started:.9f}}")
+                print(error, file=sys.stderr)
+                sys.exit(3)
             """
         )
         result = subprocess.run(
@@ -127,9 +134,10 @@ def test_a_timeout_waits_before_giving_up(tmp_path) -> None:
             errors="replace",
             env={**os.environ, "PYTHONIOENCODING": "utf-8"},
             cwd=os.getcwd(),
+            timeout=5.0,
         )
-    elapsed = time.monotonic() - started
 
-    assert result.returncode != 0
+    assert result.returncode == 3
     assert "artifact 루트가 다른 프로세스에 잠겨 있습니다" in result.stderr
-    assert elapsed >= 0.15
+    # 자식의 import/startup 시간이 아니라 artifact_lock 안에서 보낸 시간만 잽니다.
+    assert float(result.stdout.strip()) >= 0.15
