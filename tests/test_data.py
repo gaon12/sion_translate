@@ -241,6 +241,32 @@ def test_source_temperature_sampling_is_deterministic_and_balanced() -> None:
     assert 10 < sampled_small <= 30
 
 
+def test_source_id_weights_do_not_depend_on_unique_file_names() -> None:
+    class DummyDataset:
+        bidirectional = False
+        pair_count = 10_000
+        pair_source_ids = np.asarray([0] * 9_000 + [1] * 1_000, dtype=np.uint16)
+        source_names = ["shared.txt", "shared.txt"]
+
+        def __len__(self) -> int:
+            return self.pair_count
+
+        def lengths_for_indices(self, indices: np.ndarray) -> np.ndarray:
+            return np.ones_like(indices)
+
+    sampler = DistributedBucketBatchSampler(
+        DummyDataset(),
+        batch_size=100,
+        bucket_size=10_000,
+        seed=13,
+        source_sampling_weights_by_id={0: 1.0 / 9.0, 1: 1.0},
+        max_source_upsampling=10.0,
+    )
+    sampled = [index for batch in sampler for index in batch]
+    small_share = sum(index >= 9_000 for index in sampled) / len(sampled)
+    assert 0.48 < small_share < 0.52
+
+
 def test_record_level_synthetic_samples_are_downweighted() -> None:
     class DummyDataset:
         bidirectional = False

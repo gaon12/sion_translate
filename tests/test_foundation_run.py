@@ -115,9 +115,24 @@ def _prepared(tmp_path, tokenizer_model):
     return config, plan, model, tokenizer, context
 
 
-def test_the_stage_trains_and_marks_itself_complete(tmp_path, tokenizer_model) -> None:
+def test_the_stage_trains_and_marks_itself_complete(
+    tmp_path,
+    tokenizer_model,
+    monkeypatch,
+) -> None:
     config, plan, model, tokenizer, context = _prepared(tmp_path, tokenizer_model)
     before = model.token_embedding.weight.detach().clone()
+
+    import sion_translate.cli.train as train_module
+
+    sampler_arguments: list[dict[str, object]] = []
+    original_sampler = train_module.DistributedBucketBatchSampler
+
+    def recording_sampler(*args, **kwargs):
+        sampler_arguments.append(dict(kwargs))
+        return original_sampler(*args, **kwargs)
+
+    monkeypatch.setattr(train_module, "DistributedBucketBatchSampler", recording_sampler)
 
     outcome = run_foundation_stage(config, plan, model, tokenizer, context)
 
@@ -133,6 +148,8 @@ def test_the_stage_trains_and_marks_itself_complete(tmp_path, tokenizer_model) -
     assert marker["stage"] == "foundation"
     assert marker["release_name"] == "sion"
     assert sorted(marker["languages"]) == ["ja", "ko"]
+    assert sampler_arguments[0]["source_sampling_weights_by_id"]
+    assert "source_sampling_weights_by_id" not in sampler_arguments[1]
 
 
 def test_a_second_run_reuses_the_weights_instead_of_retraining(

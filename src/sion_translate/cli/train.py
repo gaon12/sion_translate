@@ -761,6 +761,68 @@ def ensure_artifacts(
 FOUNDATION_COMPLETION_FILENAME = "stage_complete.json"
 
 
+def _foundation_source_sampling_weights(
+    dataset: IndexedParallelDataset,
+) -> dict[int, float]:
+    """Convert the prepared language distribution into per-source multipliers.
+
+    ``DistributedBucketBatchSampler`` balances source ids, while foundation
+    preparation records the desired distribution by language.  Giving every
+    source in a language ``target_share / language_count`` makes the summed
+    source mass equal that language's target share without treating a language
+    with more shard files as intrinsically more important.
+    """
+
+    manifest_path = dataset.dataset_root / "manifest.json"
+    try:
+        manifest = cast(dict[str, Any], json.loads(manifest_path.read_text(encoding="utf-8")))
+        language_sampling = cast(dict[str, Any], manifest["language_sampling"])
+        language_counts = cast(dict[str, Any], language_sampling["counts"])
+        language_weights = cast(dict[str, Any], language_sampling["weights"])
+        raw_sources = cast(list[Any], manifest["sources"])
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ValueError(
+            f"foundation manifest has no usable language sampling policy: {manifest_path}"
+        ) from error
+
+    multipliers: dict[int, float] = {}
+    for raw_source in raw_sources:
+        if not isinstance(raw_source, dict):
+            raise ValueError(f"foundation manifest has an invalid source entry: {raw_source!r}")
+        source = cast(dict[str, Any], raw_source)
+        try:
+            source_id = int(source["id"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(f"foundation manifest has an invalid source id: {source!r}") from error
+        name = str(source.get("name", ""))
+        language = str(source.get("language", ""))
+        try:
+            count = float(language_counts[language])
+            target_share = float(language_weights[language])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(
+                f"foundation source {name!r} has no language sampling weight for {language!r}"
+            ) from error
+        if not name or count <= 0.0 or target_share < 0.0:
+            raise ValueError(
+                f"foundation source {name!r} has invalid language sampling values: "
+                f"count={count}, weight={target_share}"
+            )
+        multiplier = target_share / count
+        previous = multipliers.get(source_id)
+        if previous is not None and not math.isclose(previous, multiplier):
+            raise ValueError(f"foundation source id {source_id} has conflicting language weights")
+        multipliers[source_id] = multiplier
+
+    missing = sorted(set(range(len(dataset.source_names))) - set(multipliers))
+    if missing:
+        raise ValueError(f"foundation manifest has no language for source ids: {missing}")
+    maximum = max(multipliers.values(), default=0.0)
+    if maximum <= 0.0:
+        raise ValueError("foundation language sampling excludes every source")
+    return {source_id: value / maximum for source_id, value in multipliers.items()}
+
+
 def run_foundation_stage(
     config: AppConfig,
     foundation_plan: Any,
@@ -854,6 +916,7 @@ def run_foundation_stage(
         world_size=context.world_size,
         bucket_size=foundation_config.data.bucket_size,
         seed=foundation_config.training.seed,
+        source_sampling_weights_by_id=_foundation_source_sampling_weights(train_dataset),
     )
     validation_sampler = DistributedBucketBatchSampler(
         validation_dataset,

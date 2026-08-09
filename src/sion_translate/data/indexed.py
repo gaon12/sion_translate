@@ -542,6 +542,7 @@ class DistributedBucketBatchSampler(Sampler[list[int]]):
         drop_last: bool = True,
         source_sampling_alpha: float = 1.0,
         source_sampling_weights: dict[str, float] | None = None,
+        source_sampling_weights_by_id: dict[int, float] | None = None,
         max_source_upsampling: float = 3.0,
         synthetic_sampling_weight: float | None = None,
     ):
@@ -564,6 +565,7 @@ class DistributedBucketBatchSampler(Sampler[list[int]]):
             raise ValueError("max_source_upsampling must be at least 1")
         self.source_sampling_alpha = source_sampling_alpha
         self.source_sampling_weights = dict(source_sampling_weights or {})
+        self.source_sampling_weights_by_id = dict(source_sampling_weights_by_id or {})
         self.max_source_upsampling = max_source_upsampling
         self.synthetic_sampling_weight = (
             float(synthetic_sampling_weight)
@@ -584,12 +586,25 @@ class DistributedBucketBatchSampler(Sampler[list[int]]):
             raise ValueError(f"Unknown source_sampling_weights keys: {sorted(unknown_sources)}")
         if any(weight < 0 for weight in self.source_sampling_weights.values()):
             raise ValueError("source sampling weights must be non-negative")
+        unknown_source_ids = sorted(
+            source_id
+            for source_id in self.source_sampling_weights_by_id
+            if source_id < 0 or source_id >= len(dataset.source_names)
+        )
+        if unknown_source_ids:
+            raise ValueError(f"Unknown source_sampling_weights_by_id keys: {unknown_source_ids}")
+        if any(weight < 0 for weight in self.source_sampling_weights_by_id.values()):
+            raise ValueError("source sampling weights by id must be non-negative")
         synthetic_flags = getattr(dataset, "pair_synthetic_flags", None)
         has_synthetic = synthetic_flags is not None and bool(np.asarray(synthetic_flags).any())
         self._balance_sources = (
             not math.isclose(source_sampling_alpha, 1.0)
             or any(
                 not math.isclose(weight, 1.0) for weight in self.source_sampling_weights.values()
+            )
+            or any(
+                not math.isclose(weight, 1.0)
+                for weight in self.source_sampling_weights_by_id.values()
             )
             or (has_synthetic and not math.isclose(self.synthetic_sampling_weight, 1.0))
         )
@@ -677,11 +692,15 @@ class DistributedBucketBatchSampler(Sampler[list[int]]):
                     else f"source-{source_id}"
                 )
                 raw[position] *= self.source_sampling_weights.get(name, 1.0)
+                raw[position] *= self.source_sampling_weights_by_id.get(source_id, 1.0)
                 if group_is_synthetic:
                     source_is_all_synthetic = (
                         synthetic_counts_by_source[source_id] == source_counts[source_id]
                     )
-                    has_explicit_source_weight = name in self.source_sampling_weights
+                    has_explicit_source_weight = (
+                        name in self.source_sampling_weights
+                        or source_id in self.source_sampling_weights_by_id
+                    )
                     if not (source_is_all_synthetic and has_explicit_source_weight):
                         raw[position] *= self.synthetic_sampling_weight
             self._group_codes = group_codes
