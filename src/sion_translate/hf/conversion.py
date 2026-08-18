@@ -227,6 +227,8 @@ def _generation_suppress_tokens(
         suppressed.add(int(tokenizer.unk_id))
         suppressed.update(map(int, tokenizer.language_tags.values()))
         suppressed.update(map(int, tokenizer.denoise_tags.values()))
+        suppressed.update(map(int, tokenizer.reasoning_tags.values()))
+        suppressed.update(map(int, tokenizer.reasoning_trace_ids.values()))
         for symbol in (*SHARED_CONTROL_SYMBOLS, *OPTIONAL_CONTROL_SYMBOLS):
             token_id = tokenizer.piece_id(symbol)
             if token_id >= 0 and tokenizer.processor.id_to_piece(token_id) == symbol:

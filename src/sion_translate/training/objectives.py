@@ -100,6 +100,8 @@ class CompositeTranslationReward:
             tokenizer.mask_id,
             *tokenizer.language_tags.values(),
             *tokenizer.denoise_tags.values(),
+            *getattr(tokenizer, "reasoning_tags", {}).values(),
+            *getattr(tokenizer, "reasoning_trace_ids", {}).values(),
         }
         self.weights = {
             "chrf": config.reward_chrf_weight,

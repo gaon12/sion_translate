@@ -28,6 +28,13 @@ class FakeTokenizer:
     mask_id = 6
     language_tags = {"ja": 4, "ko": 5}
     denoise_tags = {"ja": 7, "ko": 8}
+    reasoning_tags = {"ja": 16}
+    reasoning_trace_ids = {
+        "<think>": 17,
+        "</think>": 18,
+        "<answer>": 19,
+        "</answer>": 21,
+    }
     slot_ids = [20]
     draft_id = 9
     splits_digits = True
@@ -447,7 +454,7 @@ def test_translator_applies_safe_decode_limits_and_control_token_mask(
     assert captured["min_new_tokens"] == 1
     assert captured["reasoning_level"] == 0
     forbidden = set(captured["forbidden_token_ids"])
-    assert {0, 2, 4, 5, 6, 7, 8, 9} <= forbidden
+    assert {0, 2, 4, 5, 6, 7, 8, 9, 16, 17, 18, 19, 21} <= forbidden
     assert 3 not in forbidden
 
 

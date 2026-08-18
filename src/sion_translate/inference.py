@@ -703,6 +703,8 @@ class Translator:
             self.tokenizer.mask_id,
             *self.tokenizer.language_tags.values(),
             *self.tokenizer.denoise_tags.values(),
+            *getattr(self.tokenizer, "reasoning_tags", {}).values(),
+            *getattr(self.tokenizer, "reasoning_trace_ids", {}).values(),
         }
         if self.tokenizer.draft_id is not None:
             special_ids.add(self.tokenizer.draft_id)
