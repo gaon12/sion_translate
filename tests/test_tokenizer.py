@@ -32,6 +32,22 @@ def test_foundation_only_language_reserves_only_a_denoise_tag() -> None:
     assert "<2en>" not in symbols
 
 
+def test_reasoning_controls_are_reserved_only_for_structured_corpus_languages() -> None:
+    without_reasoning = control_symbols(["ko", "ja"], denoise_languages=["ko", "ja", "en"])
+    with_reasoning = control_symbols(
+        ["ko", "ja"],
+        denoise_languages=["ko", "ja", "en"],
+        reasoning_languages=["ja", "en"],
+    )
+
+    assert "<reason_ja>" not in without_reasoning
+    assert "<think>" not in without_reasoning
+    assert "<reason_ja>" in with_reasoning
+    assert "<reason_en>" in with_reasoning
+    assert "<reason_ko>" not in with_reasoning
+    assert {"<think>", "</think>", "<answer>", "</answer>"} <= set(with_reasoning)
+
+
 def _pair_for_split(split: str) -> tuple[str, str]:
     for index in range(100_000):
         ko = f"분할 검증을 위한 한국어 문장 {index}입니다."

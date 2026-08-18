@@ -72,12 +72,19 @@ SLOT_SYMBOLS = [f"<slot_{index}>" for index in range(64)]
 OPTIONAL_CONTROL_SYMBOLS = [
     "<draft>",
 ]
+REASONING_TRACE_SYMBOLS = [
+    "<think>",
+    "</think>",
+    "<answer>",
+    "</answer>",
+]
 
 
 def control_symbols(
     languages: Sequence[str] = DEFAULT_LANGUAGE_PAIR,
     *,
     denoise_languages: Sequence[str] | None = None,
+    reasoning_languages: Sequence[str] = (),
 ) -> list[str]:
     """언어 목록에 맞는 전체 제어 토큰 목록 (토크나이저 학습 시 예약)."""
 
@@ -85,9 +92,12 @@ def control_symbols(
     unique_denoise_languages = tuple(
         dict.fromkeys(unique_languages if denoise_languages is None else denoise_languages)
     )
+    unique_reasoning_languages = tuple(dict.fromkeys(reasoning_languages))
     return (
         [f"<2{language}>" for language in unique_languages]
         + [f"<denoise_{language}>" for language in unique_denoise_languages]
+        + [f"<reason_{language}>" for language in unique_reasoning_languages]
+        + (REASONING_TRACE_SYMBOLS if unique_reasoning_languages else [])
         + SHARED_CONTROL_SYMBOLS
         + OPTIONAL_CONTROL_SYMBOLS
     )
@@ -159,6 +169,7 @@ def write_tokenizer_metadata(
     split_digits: bool,
     language_pairs: Sequence[Sequence[str]],
     denoise_languages: Sequence[str] | None = None,
+    reasoning_languages: Sequence[str] = (),
     monolingual_sentences: dict[str, int] | None = None,
     monolingual_sample_ratio: float = 0.0,
     required_characters: Sequence[str] = (),
@@ -173,6 +184,7 @@ def write_tokenizer_metadata(
     normalized_denoise_languages = list(
         dict.fromkeys(translation_languages if denoise_languages is None else denoise_languages)
     )
+    normalized_reasoning_languages = list(dict.fromkeys(reasoning_languages))
     processor = spm.SentencePieceProcessor(model_file=str(model_path))
     metadata = {
         "version": TOKENIZER_METADATA_VERSION,
@@ -180,6 +192,7 @@ def write_tokenizer_metadata(
         "language_pair": list(normalized_pairs[0]),
         "language_pairs": [list(pair) for pair in normalized_pairs],
         "denoise_languages": normalized_denoise_languages,
+        "reasoning_languages": normalized_reasoning_languages,
         "vocab_size": int(processor.vocab_size()),
         "model_file": model_path.name,
         "model_sha256": file_sha256(model_path),
@@ -475,8 +488,10 @@ class SionTokenizer:
         # ko-ja 든 en-de 든 같은 코드로 동작합니다.
         self.language_tags: dict[str, int] = {}  # {"ja": <2ja> 토큰 id, ...}
         self.denoise_tags: dict[str, int] = {}  # {"ko": <denoise_ko> 토큰 id, ...}
+        self.reasoning_tags: dict[str, int] = {}  # {"en": <reason_en> 토큰 id, ...}
         lang_pattern = re.compile(r"^<2([A-Za-z0-9]+)>$")
         denoise_pattern = re.compile(r"^<denoise_([A-Za-z0-9]+)>$")
+        reasoning_pattern = re.compile(r"^<reason_([A-Za-z0-9]+)>$")
         byte_pattern = re.compile(r"^<0x[0-9A-Fa-f]{2}>$")
         # 예약 구간의 끝은 첫 byte fallback 조각입니다. SentencePiece 는
         # pad/unk/bos/eos → user_defined_symbols → byte 조각 → 학습된 조각
@@ -493,6 +508,8 @@ class SionTokenizer:
                 self.language_tags[match.group(1)] = token_id
             elif match := denoise_pattern.match(piece):
                 self.denoise_tags[match.group(1)] = token_id
+            elif match := reasoning_pattern.match(piece):
+                self.reasoning_tags[match.group(1)] = token_id
         if len(self.language_tags) < 2 or not set(self.language_tags).issubset(self.denoise_tags):
             raise ValueError(
                 "Tokenizer must reserve at least two <2xx> tags and a matching "
@@ -501,6 +518,13 @@ class SionTokenizer:
             )
         self.languages = tuple(sorted(self.language_tags))
         self.denoise_languages = tuple(sorted(self.denoise_tags))
+        self.reasoning_languages = tuple(sorted(self.reasoning_tags))
+        unknown_reasoning_languages = sorted(set(self.reasoning_tags) - set(self.denoise_tags))
+        if unknown_reasoning_languages:
+            raise ValueError(
+                "Tokenizer reasoning tags require matching denoise languages; found "
+                f"reasoning-only languages {unknown_reasoning_languages}"
+            )
 
         required_symbols = SHARED_CONTROL_SYMBOLS + SLOT_SYMBOLS
         symbol_ids = {
@@ -524,6 +548,16 @@ class SionTokenizer:
             if token_id >= 0 and self.processor.id_to_piece(token_id) == symbol:
                 self.optional_ids[symbol] = token_id
         self.draft_id: int | None = self.optional_ids.get("<draft>")
+        self.reasoning_trace_ids: dict[str, int] = {}
+        for symbol in REASONING_TRACE_SYMBOLS:
+            token_id = int(self.processor.piece_to_id(symbol))
+            if token_id >= 0 and self.processor.id_to_piece(token_id) == symbol:
+                self.reasoning_trace_ids[symbol] = token_id
+        if self.reasoning_tags and len(self.reasoning_trace_ids) != len(REASONING_TRACE_SYMBOLS):
+            missing = sorted(set(REASONING_TRACE_SYMBOLS) - set(self.reasoning_trace_ids))
+            raise ValueError(
+                f"Tokenizer reasoning task tags require every trace marker; missing {missing}"
+            )
         # 하위 호환 별칭 (ko-ja 토크나이저일 때만 존재)
         if {"ko", "ja"} == set(self.language_tags):
             self.ko_to_ja_id = self.language_tags["ja"]
@@ -907,6 +941,7 @@ def train_tokenizer(
     monolingual: MonolingualDiscovery | None = None,
     monolingual_sample_ratio: float = 0.0,
     foundation_languages: Sequence[str] = (),
+    reasoning_languages: Sequence[str] = (),
 ) -> Path:
     """병렬 코퍼스로 joint SentencePiece 토크나이저를 학습한다.
 
@@ -941,7 +976,21 @@ def train_tokenizer(
     normalized_pairs = normalize_language_pairs(language_pair, language_pairs)
     languages = languages_from_pairs(normalized_pairs)
     denoise_languages = tuple(dict.fromkeys((*languages, *map(str, foundation_languages))))
-    symbols = control_symbols(languages, denoise_languages=denoise_languages) + SLOT_SYMBOLS
+    reasoning_languages = tuple(dict.fromkeys(map(str, reasoning_languages)))
+    unknown_reasoning_languages = sorted(set(reasoning_languages) - set(denoise_languages))
+    if unknown_reasoning_languages:
+        raise ValueError(
+            "reasoning_languages must also be foundation/translation languages; "
+            f"unknown {unknown_reasoning_languages}"
+        )
+    symbols = (
+        control_symbols(
+            languages,
+            denoise_languages=denoise_languages,
+            reasoning_languages=reasoning_languages,
+        )
+        + SLOT_SYMBOLS
+    )
 
     plan = build_cpu_plan(input_files=len(paths))
     workers = num_workers or plan.preprocess_workers
@@ -1045,6 +1094,7 @@ def train_tokenizer(
         split_digits=split_digits,
         language_pairs=normalized_pairs,
         denoise_languages=denoise_languages,
+        reasoning_languages=reasoning_languages,
         monolingual_sentences=monolingual_counts or None,
         monolingual_sample_ratio=monolingual_sample_ratio,
         required_characters=required_characters,

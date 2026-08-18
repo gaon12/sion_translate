@@ -479,6 +479,18 @@ def _train_child(build_directory: Path, result_path: Path) -> None:
         input_mount / config.foundation.corpus_dir,
         foundation_languages,
     )
+    reasoning_languages = (
+        tuple(
+            dict.fromkeys(
+                source.language
+                for source in discovery.sources
+                if source.path.suffix.lower() == ".jsonl"
+                and source.path.name.lower().startswith("reasoning_")
+            )
+        )
+        if config.foundation.enabled
+        else ()
+    )
     cpu_plan = tokenizer_module.build_cpu_plan(input_files=len(paths))
     cpu_plan_payload = _cpu_plan_payload(cpu_plan)
 
@@ -491,6 +503,7 @@ def _train_child(build_directory: Path, result_path: Path) -> None:
             monolingual=discovery,
             monolingual_sample_ratio=ratio,
             foundation_languages=foundation_languages,
+            reasoning_languages=reasoning_languages,
             approximate_split=config.data.approximate_split,
             source_only_languages=config.data.configured_source_only_languages(),
             train_only_prefixes=config.data.configured_synthetic_prefixes(),
