@@ -434,6 +434,7 @@ def find_existing_checkpoint(config: AppConfig) -> Path | None:
 def tokenizer_policy_problem(
     tokenizer_path: str | Path,
     language_pairs: tuple[tuple[str, str], ...],
+    foundation_languages: tuple[str, ...] | None = None,
 ) -> str | None:
     """Return a concrete compatibility problem for a tokenizer, if any."""
 
@@ -475,6 +476,13 @@ def tokenizer_policy_problem(
         return (
             "토크나이저 제어 토큰의 언어 집합이 현재 설정과 다릅니다 "
             f"(tokenizer={sorted(tokenizer.languages)}, config={sorted(expected_languages)})"
+        )
+    expected_denoise_languages = set(foundation_languages or expected_languages)
+    if set(tokenizer.denoise_tags) != expected_denoise_languages:
+        return (
+            "토크나이저 복원 태그의 언어 집합이 foundation 설정과 다릅니다 "
+            f"(tokenizer={sorted(tokenizer.denoise_tags)}, "
+            f"config={sorted(expected_denoise_languages)})"
         )
     return None
 
@@ -631,6 +639,7 @@ def ensure_artifacts(
                         # 언어가 vocab 을 독식합니다.
                         monolingual=foundation_plan.discovery,
                         monolingual_sample_ratio=config.foundation.tokenizer_sample_ratio,
+                        foundation_languages=foundation_plan.languages,
                         approximate_split=config.data.approximate_split,
                         source_only_languages=config.data.configured_source_only_languages(),
                         train_only_prefixes=config.data.configured_synthetic_prefixes(),
@@ -645,6 +654,7 @@ def ensure_artifacts(
                 policy_problem = tokenizer_policy_problem(
                     tokenizer_path,
                     config.data.configured_language_pairs(),
+                    config.foundation_languages(),
                 )
                 if policy_problem is not None:
                     existing_tokenizer = SionTokenizer(tokenizer_path)
@@ -662,6 +672,7 @@ def ensure_artifacts(
                         policy_problem = tokenizer_policy_problem(
                             tokenizer_path,
                             config.data.configured_language_pairs(),
+                            config.foundation_languages(),
                         )
                     if policy_problem is not None:
                         checkpoint_detail = (

@@ -57,6 +57,7 @@ def train_tiny_tokenizer(
     tmp_path: Path,
     *,
     language_pairs: list[tuple[str, str]] | None = None,
+    foundation_languages: tuple[str, ...] = (),
 ) -> Path:
     source = tmp_path / "parallel.jsonl"
     rows = [
@@ -81,6 +82,7 @@ def train_tiny_tokenizer(
         validation_fraction=0.0,
         test_fraction=0.0,
         language_pairs=language_pairs,
+        foundation_languages=foundation_languages,
         num_workers=1,
         num_threads=1,
     )
@@ -480,7 +482,9 @@ def test_transformers_checkpoint_auto_classes_and_safe_weights(
         ).eval()
         tokenizer.src_lang = "ko"
         tokenizer.tgt_lang = "ja"
-        encoded = tokenizer("독립 실행 <slot_0>", return_tensors="pt")
+        # Keep the ``python -c`` payload ASCII-only so Windows does not corrupt
+        # the Korean sample while transferring it through the command line.
+        encoded = tokenizer("\\ub3c5\\ub9bd \\uc2e4\\ud589 <slot_0>", return_tensors="pt")
         generated = model.generate(**encoded, max_length=3)
         assert generated.shape[0] == 1
         assert generated.shape[1] <= 3
@@ -726,15 +730,20 @@ def test_legacy_export_without_language_metadata_keeps_tokenizer_discovery(
 def test_foundation_conversion_preserves_release_and_rejects_translation(
     tmp_path: Path,
 ) -> None:
-    tokenizer_path = train_tiny_tokenizer(tmp_path)
+    tokenizer_path = train_tiny_tokenizer(
+        tmp_path,
+        foundation_languages=("ko", "ja", "en"),
+    )
     tokenizer = NativeSionTokenizer(tokenizer_path)
+    assert set(tokenizer.languages) == {"ko", "ja"}
+    assert set(tokenizer.denoise_languages) == {"ko", "ja", "en"}
     config = tiny_model_config(len(tokenizer))
     model = NativeSionForConditionalGeneration(config, pad_id=tokenizer.pad_id)
     source_dir = tmp_path / "foundation-native"
     metadata = build_export_metadata(
         config,
         tokenizer_path=tokenizer_path,
-        languages=["ko", "ja"],
+        languages=["ko", "ja", "en"],
         release_name="sion",
         translation_capable=False,
     )
@@ -756,7 +765,7 @@ def test_foundation_conversion_preserves_release_and_rejects_translation(
 
     assert converted["metadata"]["release_name"] == "sion"
     assert converted["metadata"]["translation_capable"] is False
-    assert converted["metadata"]["languages"] == ["ko", "ja"]
+    assert converted["metadata"]["languages"] == ["ko", "ja", "en"]
     checkpoint = tmp_path / "foundation-transformers" / converted["formats"]["transformers"]["file"]
     restored = AutoTokenizer.from_pretrained(checkpoint, trust_remote_code=True)
     assert restored.translation_capable is False

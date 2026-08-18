@@ -430,6 +430,10 @@ class FoundationConfig:
     dataset_dir: str = DEFAULT_FOUNDATION_DATASET_DIRECTORY
     # 배포 이름. 이 단계의 산출물은 번역 모델이 아니라 그 파운데이션입니다.
     release_name: str = FOUNDATION_RELEASE_NAME
+    # 비어 언어를 번역 edge에 추가하지 않고 foundation에만 넣을 때
+    # 명시합니다. 비워 두면 번역 언어에서 source-only variety를 뺀
+    # 기존 목록을 사용합니다. 예: [ko, ja, en].
+    languages: list[str] = field(default_factory=list)
 
     # ── 코퍼스 구성 ──────────────────────────────────────────────────
     # 언어 간 온도 샘플링. 1.0 은 분량 정비례, 낮출수록 균등에 가깝습니다.
@@ -490,6 +494,17 @@ class FoundationConfig:
                 "foundation.release_name must differ from the translation release name "
                 f"({TRANSLATION_RELEASE_NAME!r}); the two stages are published separately"
             )
+        if len(set(self.languages)) != len(self.languages):
+            raise ValueError("foundation.languages must not contain duplicates")
+        if any(
+            not language
+            or not language.isascii()
+            or not language.isalnum()
+            or not language[0].isalpha()
+            or len(language) > 16
+            for language in self.languages
+        ):
+            raise ValueError("foundation.languages must contain 1-16 character ASCII language keys")
         if not 0.0 < self.language_sampling_alpha <= 1.0:
             raise ValueError("foundation.language_sampling_alpha must be in (0, 1]")
         if not 0.0 <= self.minimum_language_share < 1.0:
@@ -610,7 +625,7 @@ class AppConfig:
         """foundation 단계가 실제로 학습할 언어 (source-only 제외)."""
 
         return foundation_languages(
-            self.data.languages,
+            self.foundation.languages or self.data.languages,
             self.data.configured_source_only_languages(),
         )
 

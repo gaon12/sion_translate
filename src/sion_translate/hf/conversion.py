@@ -135,7 +135,9 @@ def _validate_language_contract(
         raise ValueError(
             f"tokenizer pad ID does not match export pad_id: {tokenizer.pad_id} != {pad_id}"
         )
-    tokenizer_languages = list(tokenizer.languages)
+    tokenizer_languages = list(
+        tokenizer.languages if language_pairs else tokenizer.denoise_languages
+    )
     exported_languages = (
         tokenizer_languages if languages is None else list(dict.fromkeys(map(str, languages)))
     )

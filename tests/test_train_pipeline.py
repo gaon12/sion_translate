@@ -780,6 +780,7 @@ def test_tokenizer_policy_requires_digit_splitting_and_matching_identity(
     class DigitTokenizer:
         splits_digits = True
         languages = ("ko", "ja")
+        denoise_tags = {"ko": 10, "ja": 11}
 
     metadata = {
         "version": 2,
@@ -798,6 +799,7 @@ def test_tokenizer_policy_requires_digit_splitting_and_matching_identity(
         lambda _: True,
     )
     assert tokenizer_policy_problem(model_path, pairs) is None
+    assert "복원 태그" in str(tokenizer_policy_problem(model_path, pairs, ("ko", "ja", "en")))
 
     class MergedDigitTokenizer:
         splits_digits = False

@@ -74,13 +74,20 @@ OPTIONAL_CONTROL_SYMBOLS = [
 ]
 
 
-def control_symbols(languages: Sequence[str] = DEFAULT_LANGUAGE_PAIR) -> list[str]:
+def control_symbols(
+    languages: Sequence[str] = DEFAULT_LANGUAGE_PAIR,
+    *,
+    denoise_languages: Sequence[str] | None = None,
+) -> list[str]:
     """언어 목록에 맞는 전체 제어 토큰 목록 (토크나이저 학습 시 예약)."""
 
     unique_languages = tuple(dict.fromkeys(languages))
+    unique_denoise_languages = tuple(
+        dict.fromkeys(unique_languages if denoise_languages is None else denoise_languages)
+    )
     return (
         [f"<2{language}>" for language in unique_languages]
-        + [f"<denoise_{language}>" for language in unique_languages]
+        + [f"<denoise_{language}>" for language in unique_denoise_languages]
         + SHARED_CONTROL_SYMBOLS
         + OPTIONAL_CONTROL_SYMBOLS
     )
@@ -151,6 +158,7 @@ def write_tokenizer_metadata(
     *,
     split_digits: bool,
     language_pairs: Sequence[Sequence[str]],
+    denoise_languages: Sequence[str] | None = None,
     monolingual_sentences: dict[str, int] | None = None,
     monolingual_sample_ratio: float = 0.0,
     required_characters: Sequence[str] = (),
@@ -161,12 +169,17 @@ def write_tokenizer_metadata(
     vocab_path = model_path.with_suffix(".vocab")
     features_path = model_path.parent / "token_features.npz"
     normalized_pairs = normalize_language_pairs(language_pairs=language_pairs)
+    translation_languages = languages_from_pairs(normalized_pairs)
+    normalized_denoise_languages = list(
+        dict.fromkeys(translation_languages if denoise_languages is None else denoise_languages)
+    )
     processor = spm.SentencePieceProcessor(model_file=str(model_path))
     metadata = {
         "version": TOKENIZER_METADATA_VERSION,
         "split_digits": bool(split_digits),
         "language_pair": list(normalized_pairs[0]),
         "language_pairs": [list(pair) for pair in normalized_pairs],
+        "denoise_languages": normalized_denoise_languages,
         "vocab_size": int(processor.vocab_size()),
         "model_file": model_path.name,
         "model_sha256": file_sha256(model_path),
@@ -480,12 +493,14 @@ class SionTokenizer:
                 self.language_tags[match.group(1)] = token_id
             elif match := denoise_pattern.match(piece):
                 self.denoise_tags[match.group(1)] = token_id
-        if len(self.language_tags) < 2 or set(self.language_tags) != set(self.denoise_tags):
+        if len(self.language_tags) < 2 or not set(self.language_tags).issubset(self.denoise_tags):
             raise ValueError(
-                "Tokenizer must reserve at least two <2xx> tags with matching "
-                f"<denoise_xx> tags; found {sorted(self.language_tags)} / {sorted(self.denoise_tags)}"
+                "Tokenizer must reserve at least two <2xx> tags and a matching "
+                "<denoise_xx> tag for every translation language; found "
+                f"{sorted(self.language_tags)} / {sorted(self.denoise_tags)}"
             )
         self.languages = tuple(sorted(self.language_tags))
+        self.denoise_languages = tuple(sorted(self.denoise_tags))
 
         required_symbols = SHARED_CONTROL_SYMBOLS + SLOT_SYMBOLS
         symbol_ids = {
@@ -891,6 +906,7 @@ def train_tokenizer(
     # 언어별 상한은 `monolingual_sample_ratio` 가 정합니다.
     monolingual: MonolingualDiscovery | None = None,
     monolingual_sample_ratio: float = 0.0,
+    foundation_languages: Sequence[str] = (),
 ) -> Path:
     """병렬 코퍼스로 joint SentencePiece 토크나이저를 학습한다.
 
@@ -924,7 +940,8 @@ def train_tokenizer(
     model_prefix = output_dir / "sion"
     normalized_pairs = normalize_language_pairs(language_pair, language_pairs)
     languages = languages_from_pairs(normalized_pairs)
-    symbols = control_symbols(languages) + SLOT_SYMBOLS
+    denoise_languages = tuple(dict.fromkeys((*languages, *map(str, foundation_languages))))
+    symbols = control_symbols(languages, denoise_languages=denoise_languages) + SLOT_SYMBOLS
 
     plan = build_cpu_plan(input_files=len(paths))
     workers = num_workers or plan.preprocess_workers
@@ -1027,6 +1044,7 @@ def train_tokenizer(
         model_path,
         split_digits=split_digits,
         language_pairs=normalized_pairs,
+        denoise_languages=denoise_languages,
         monolingual_sentences=monolingual_counts or None,
         monolingual_sample_ratio=monolingual_sample_ratio,
         required_characters=required_characters,

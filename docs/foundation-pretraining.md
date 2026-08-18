@@ -29,6 +29,8 @@ data/corpus/
     2026/news.jsonl            # {"text": "..."} 한 줄에 하나
   ja/
     wiki.txt
+  en/
+    science.jsonl
 ```
 
 허용 형식은 **`.txt` 와 `.jsonl` 둘뿐**이고, `.jsonl` 은 **`text` 키**를 씁니다.
@@ -36,6 +38,18 @@ data/corpus/
 **건너뛰고 그 사실을 출력**합니다. 조용히 무시하지 않는 이유는 이 단계가
 가장 오래 걸리는데 입력 오류는 티가 나지 않기 때문입니다 — 키 이름 하나가
 틀리면 그 파일만 0문장이 되고, 학습이 끝난 뒤에야 드러납니다.
+
+번역 대상이 아닌 언어를 foundation에만 추가하려면 번역
+`data.language_pairs`를 늘리지 말고 다음처럼 설정합니다.
+
+```yaml
+foundation:
+  languages: [ko, ja, en]
+```
+
+빈 목록이면 기존처럼 번역 설정에 등장하는 target 가능 언어를
+자동으로 사용합니다. 이 목록을 바꾸면 해당 `<denoise_xx>` 태그가
+필요하므로 토크나이저와 foundation dataset은 새로 만들어야 합니다.
 
 `python easy_run.py` 를 실행하면 학습 전에 보고가 나옵니다. 예를 들어 corpus를
 잘못 배치해 일본어가 누락된 경우에는 다음처럼 경고합니다.
@@ -53,8 +67,9 @@ data/corpus/
 
 ## 어떤 언어가 대상인가
 
-설정된 언어에서 **source-only 언어를 뺀 것**입니다. 현재 설정에서는
-`kj`/`kd`/`jd` 가 빠지고 `ko`, `ja` 만 남습니다.
+`foundation.languages`가 있으면 그 목록에서 source-only 언어를 뺀 것입니다.
+비어 있으면 번역 설정의 언어에서 source-only 언어를 뺁니다. 현재
+설정은 `kj`/`kd`/`jd`를 빼고 `ko`, `ja`, `en`을 학습합니다.
 
 이유는 데이터 계약입니다. 복원 과제는 그 언어를 **디코더 출력**으로 만드는
 학습인데, source-only 는 "번역 결과로 나오면 안 되는 언어" 라는 뜻입니다.

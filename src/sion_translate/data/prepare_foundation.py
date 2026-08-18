@@ -128,7 +128,7 @@ def prepare_foundation_dataset(
 
     tokenizer = SionTokenizer(tokenizer_model)
     languages = discovery.languages
-    missing_tags = sorted(set(languages) - set(tokenizer.languages))
+    missing_tags = sorted(set(languages) - set(tokenizer.denoise_tags))
     if missing_tags:
         raise ValueError(
             "Tokenizer is missing denoise tags for the monolingual languages: "

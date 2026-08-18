@@ -114,13 +114,9 @@ def _source_paths(
 ) -> tuple[list[Path], Any]:
     """Select exactly the files consumed by the configured tokenizer path."""
 
-    config_module, monolingual_module, tokenizer_module = _load_production_modules(source_root)
+    config_module, monolingual_module, _ = _load_production_modules(source_root)
     config = config_module.load_config(config_path)
-    pairs = config.data.configured_language_pairs()
-    languages = monolingual_module.foundation_languages(
-        tokenizer_module.languages_from_pairs(pairs),
-        config.data.configured_source_only_languages(),
-    )
+    languages = config.foundation_languages()
     data_directory = input_root / config.data.raw_dir
     corpus_directory = input_root / config.foundation.corpus_dir
     parallel_paths = sorted(path for path in data_directory.glob("*.jsonl") if path.is_file())
@@ -478,10 +474,7 @@ def _train_child(build_directory: Path, result_path: Path) -> None:
     if ratio != EXPECTED_TOKENIZER_SAMPLE_RATIO:
         raise RuntimeError(f"child tokenizer ratio differs from production: {ratio}")
     pairs = config.data.configured_language_pairs()
-    foundation_languages = monolingual_module.foundation_languages(
-        tokenizer_module.languages_from_pairs(pairs),
-        config.data.configured_source_only_languages(),
-    )
+    foundation_languages = config.foundation_languages()
     discovery = monolingual_module.discover_monolingual_sources(
         input_mount / config.foundation.corpus_dir,
         foundation_languages,
@@ -497,6 +490,7 @@ def _train_child(build_directory: Path, result_path: Path) -> None:
             language_pairs=pairs,
             monolingual=discovery,
             monolingual_sample_ratio=ratio,
+            foundation_languages=foundation_languages,
             approximate_split=config.data.approximate_split,
             source_only_languages=config.data.configured_source_only_languages(),
             train_only_prefixes=config.data.configured_synthetic_prefixes(),

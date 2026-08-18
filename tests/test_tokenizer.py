@@ -14,11 +14,22 @@ from sion_translate.tokenizer import (
     TOKENIZER_METADATA_VERSION,
     CorpusCounts,
     SionTokenizer,
+    control_symbols,
     iter_parallel_text,
     load_tokenizer_metadata,
     tokenizer_split_digits_policy,
     train_tokenizer,
 )
+
+
+def test_foundation_only_language_reserves_only_a_denoise_tag() -> None:
+    symbols = control_symbols(
+        ["ko", "ja"],
+        denoise_languages=["ko", "ja", "en"],
+    )
+
+    assert "<denoise_en>" in symbols
+    assert "<2en>" not in symbols
 
 
 def _pair_for_split(split: str) -> tuple[str, str]:

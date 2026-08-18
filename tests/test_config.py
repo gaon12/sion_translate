@@ -506,6 +506,23 @@ def test_foundation_languages_drop_the_source_only_varieties() -> None:
     assert config.foundation_languages() == ("ko", "ja")
 
 
+def test_foundation_can_add_a_non_translation_language() -> None:
+    config = AppConfig()
+    config.foundation.languages = ["ko", "ja", "en"]
+    config.validate()
+
+    assert config.foundation_languages() == ("ko", "ja", "en")
+    assert config.data.languages == ("ko", "ja")
+
+
+def test_foundation_language_keys_are_validated() -> None:
+    config = AppConfig()
+    config.foundation.languages = ["ko", "not-a-language-key"]
+
+    with pytest.raises(ValueError, match="foundation.languages"):
+        config.validate()
+
+
 @pytest.mark.parametrize(
     "field_name, value, message",
     [
