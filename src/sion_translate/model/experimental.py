@@ -65,10 +65,21 @@ class ActiveEvidenceRepair(nn.Module):
         source_mask: torch.Tensor,
         *,
         evidence_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
+        reasoning_budget: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Audit target states and apply a budgeted local evidence repair.
+
+        ``reasoning_budget`` is deliberately a scalar rather than a learned
+        embedding. This lets SSRT levels control how much repair can be
+        requested without adding parameters, so checkpoints produced before
+        reasoning-level control remain strictly loadable.
+        """
+
+        if not 0.0 < reasoning_budget <= 1.0:
+            raise ValueError("reasoning_budget must be in (0, 1]")
         query = self.query_norm(decoder_states)
         uncertainty_logits = self.uncertainty_head(query).squeeze(-1)
-        request_probabilities = uncertainty_logits.sigmoid()
+        request_probabilities = uncertainty_logits.sigmoid() * reasoning_budget
         # ``key_value_states`` keeps this on the cross-attention path. Its
         # contents are ignored when the projected cache is supplied, so avoid
         # normalizing the full encoder sequence on every generated token.

@@ -24,6 +24,7 @@ from .layers import DecoderLayer, EncoderLayer, GQAAttention, RMSNorm, RotaryEmb
 
 _activation_checkpoint = cast(Callable[..., torch.Tensor], checkpoint)
 _KeyValue = tuple[torch.Tensor, torch.Tensor]
+_MAX_REASONING_LEVEL = 9
 
 
 class _LayerCache(TypedDict):
@@ -91,6 +92,33 @@ def _force_eos_at_row_limits(
     return logits
 
 
+def _validate_reasoning_level(reasoning_level: object) -> int | None:
+    """Validate the public SSRT compute-control contract.
+
+    ``None`` retains the pre-SSRT behavior for checkpoint and caller
+    compatibility. Explicit levels use the stable integer range 0..9, with 0
+    meaning that all optional auditing and local repair computation is skipped.
+    """
+
+    if reasoning_level is None:
+        return None
+    if isinstance(reasoning_level, bool) or not isinstance(reasoning_level, int):
+        raise TypeError("reasoning_level must be an integer from 0 to 9 or None")
+    if not 0 <= reasoning_level <= _MAX_REASONING_LEVEL:
+        raise ValueError("reasoning_level must be between 0 and 9")
+    return reasoning_level
+
+
+def _reasoning_budget(reasoning_level: int | None) -> float:
+    """Map an SSRT level to its local-reasoning request budget.
+
+    The legacy/unspecified path retains the original full budget. Explicit
+    levels divide the available request intensity into nine monotonic bands.
+    """
+
+    return 1.0 if reasoning_level is None else reasoning_level / _MAX_REASONING_LEVEL
+
+
 @dataclass
 class SionOutput:
     """forward 결과 묶음.
@@ -121,6 +149,11 @@ class SionOutput:
     evidence_request_rate: torch.Tensor | None = None
     evidence_repair_gain_loss: torch.Tensor | None = None
     evidence_repair_gain: torch.Tensor | None = None
+    # Explicit SSRT request diagnostics. ``reasoning_level`` remains None for
+    # legacy calls that did not opt into the new input contract.
+    reasoning_level: torch.Tensor | None = None
+    reasoning_budget: torch.Tensor | None = None
+    reasoning_active: torch.Tensor | None = None
     semantic_parity_loss: torch.Tensor | None = None
     semantic_parity_score: torch.Tensor | None = None
 
@@ -134,6 +167,7 @@ class GenerationContext:
     register_context: torch.Tensor | None
     cross_key_values: tuple[tuple[torch.Tensor, torch.Tensor], ...]
     evidence_key_value: tuple[torch.Tensor, torch.Tensor] | None = None
+    reasoning_level: int | None = None
     memory_token_ids: torch.Tensor | None = None
     memory_mask: torch.Tensor | None = None
     memory_type_ids: torch.Tensor | None = None
@@ -473,14 +507,17 @@ class SionForConditionalGeneration(nn.Module):
         source_mask: torch.Tensor,
         *,
         evidence_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
+        reasoning_level: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-        if self.evidence_repair is None:
+        reasoning_level = _validate_reasoning_level(reasoning_level)
+        if self.evidence_repair is None or reasoning_level == 0:
             return decoder_states, None, None
         return self.evidence_repair(
             decoder_states,
             encoder_states,
             source_mask,
             evidence_key_value=evidence_key_value,
+            reasoning_budget=_reasoning_budget(reasoning_level),
         )
 
     def forward(
@@ -501,10 +538,13 @@ class SionForConditionalGeneration(nn.Module):
         alignment_targets: torch.Tensor | None = None,
         source_language_tag_ids: torch.Tensor | None = None,
         reverse_direction_trained: torch.Tensor | None = None,
+        reasoning_level: int | None = None,
     ) -> SionOutput:
         # Collator가 제공하는 사후학습용 방향 메타데이터입니다. 일반 SFT
         # forward에서는 의미가 없지만 batch를 그대로 전달할 수 있게 받습니다.
         del source_language_tag_ids, reverse_direction_trained
+        reasoning_level = _validate_reasoning_level(reasoning_level)
+        reasoning_is_active = self.evidence_repair is not None and reasoning_level != 0
         encoder_states = self.encode(
             input_ids,
             attention_mask,
@@ -534,7 +574,7 @@ class SionForConditionalGeneration(nn.Module):
         )
         pre_repair_error_targets = None
         pre_repair_token_nll = None
-        if labels is not None and self.evidence_repair is not None:
+        if labels is not None and reasoning_is_active:
             # Supervise "should I re-read?" from the base decoder, before the
             # request itself can change the answer. A post-repair target is
             # self-negating: once a useful repair fixes a token it would teach
@@ -555,12 +595,29 @@ class SionForConditionalGeneration(nn.Module):
             decoder_states,
             encoder_states,
             attention_mask,
+            reasoning_level=reasoning_level,
         )
         logits = self._logits(decoder_states)
 
+        requested_level = (
+            logits.new_tensor(reasoning_level, dtype=torch.long)
+            if reasoning_level is not None
+            else None
+        )
+        reasoning_budget = logits.new_tensor(_reasoning_budget(reasoning_level))
+        reasoning_active = logits.new_tensor(reasoning_is_active)
+
         if labels is None:
             request_rate = evidence_requests.mean() if evidence_requests is not None else None
-            return SionOutput(logits=logits, evidence_request_rate=request_rate)
+            if reasoning_level is not None and request_rate is None:
+                request_rate = logits.new_zeros(())
+            return SionOutput(
+                logits=logits,
+                evidence_request_rate=request_rate,
+                reasoning_level=requested_level,
+                reasoning_budget=reasoning_budget,
+                reasoning_active=reasoning_active,
+            )
         # label 이 -100 인 위치(패딩)는 loss 계산에서 제외합니다.
         token_count = labels.ne(-100).sum()
         # BF16 autocast 아래에서 loss 는 FP32 로 계산해야 하는데, `logits.float()`
@@ -651,7 +708,11 @@ class SionForConditionalGeneration(nn.Module):
             evidence_request_rate = (evidence_requests * valid).sum() / valid.sum().clamp_min(1.0)
             has_target = target_mask.any().to(logits.dtype)
             evidence_budget_loss = (
-                F.relu(evidence_request_rate - exp.evidence_budget_target).square() * has_target
+                F.relu(
+                    evidence_request_rate
+                    - exp.evidence_budget_target * _reasoning_budget(reasoning_level)
+                ).square()
+                * has_target
             )
             post_repair_token_nll = F.cross_entropy(
                 float_logits.transpose(1, 2),
@@ -702,6 +763,9 @@ class SionForConditionalGeneration(nn.Module):
             evidence_request_rate=evidence_request_rate,
             evidence_repair_gain_loss=evidence_repair_gain_loss,
             evidence_repair_gain=evidence_repair_gain,
+            reasoning_level=requested_level,
+            reasoning_budget=reasoning_budget,
+            reasoning_active=reasoning_active,
             semantic_parity_loss=semantic_parity_loss,
             semantic_parity_score=semantic_parity_score,
         )
@@ -720,6 +784,7 @@ class SionForConditionalGeneration(nn.Module):
         memory_mask: torch.Tensor | None = None,
         memory_type_ids: torch.Tensor | None = None,
         memory_mode_ids: torch.Tensor | None = None,
+        reasoning_level: int | None = None,
     ) -> torch.Tensor:
         """KV cache 를 사용해 새 토큰 1개를 디코딩합니다 (추론 전용).
 
@@ -752,6 +817,7 @@ class SionForConditionalGeneration(nn.Module):
             encoder_states,
             source_mask,
             evidence_key_value=evidence_key_value,
+            reasoning_level=reasoning_level,
         )
         return hidden
 
@@ -792,9 +858,11 @@ class SionForConditionalGeneration(nn.Module):
         memory_mask: torch.Tensor | None = None,
         memory_type_ids: torch.Tensor | None = None,
         memory_mode_ids: torch.Tensor | None = None,
+        reasoning_level: int | None = None,
         **encoder_features: torch.Tensor,
     ) -> GenerationContext:
         """Encode once and pre-project decoder cross-attention key/value states."""
+        reasoning_level = _validate_reasoning_level(reasoning_level)
         was_training = self.training
         self.eval()
         try:
@@ -812,7 +880,7 @@ class SionForConditionalGeneration(nn.Module):
             )
             evidence_key_value = (
                 self.evidence_repair.project_key_value(encoder_states)
-                if self.evidence_repair is not None
+                if self.evidence_repair is not None and reasoning_level != 0
                 else None
             )
             return GenerationContext(
@@ -821,6 +889,7 @@ class SionForConditionalGeneration(nn.Module):
                 register_context=register_context,
                 cross_key_values=cross_key_values,
                 evidence_key_value=evidence_key_value,
+                reasoning_level=reasoning_level,
                 memory_token_ids=memory_token_ids,
                 memory_mask=memory_mask,
                 memory_type_ids=memory_type_ids,
@@ -834,6 +903,7 @@ class SionForConditionalGeneration(nn.Module):
         context: GenerationContext,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
+        reasoning_level: int | None = None,
     ) -> None:
         if context.encoder_states.shape[0] != input_ids.shape[0]:
             raise ValueError("generation_context batch size does not match input_ids")
@@ -841,6 +911,8 @@ class SionForConditionalGeneration(nn.Module):
             raise ValueError("generation_context source mask does not match attention_mask")
         if context.encoder_states.device != input_ids.device:
             raise ValueError("generation_context and input_ids must be on the same device")
+        if reasoning_level is not None and context.reasoning_level != reasoning_level:
+            raise ValueError("generation_context reasoning_level does not match reasoning_level")
 
     @staticmethod
     def _apply_decode_constraints(
@@ -903,6 +975,7 @@ class SionForConditionalGeneration(nn.Module):
         min_new_tokens: int = 0,
         no_repeat_ngram_size: int = 0,
         max_new_tokens_per_row: torch.Tensor | None = None,
+        reasoning_level: int | None = None,
         **encoder_features: torch.Tensor,
     ) -> torch.Tensor:
         """번역문 생성.
@@ -914,6 +987,7 @@ class SionForConditionalGeneration(nn.Module):
         두 경로 모두 KV cache 를 사용해 토큰당 비용이 문장 길이에 선형입니다
         (이전 구현은 매 토큰마다 prefix 전체를 다시 계산했습니다).
         """
+        reasoning_level = _validate_reasoning_level(reasoning_level)
         if isinstance(max_new_tokens, bool):
             raise TypeError("max_new_tokens must be an integer")
         if not 1 <= max_new_tokens <= self.config.max_seq_len:
@@ -946,6 +1020,7 @@ class SionForConditionalGeneration(nn.Module):
                     memory_mask=memory_mask,
                     memory_type_ids=memory_type_ids,
                     memory_mode_ids=memory_mode_ids,
+                    reasoning_level=reasoning_level,
                     **encoder_features,
                 )
             else:
@@ -953,6 +1028,7 @@ class SionForConditionalGeneration(nn.Module):
                     generation_context,
                     input_ids,
                     attention_mask,
+                    reasoning_level,
                 )
             encoder_states = generation_context.encoder_states
             source_mask = generation_context.source_mask
@@ -967,6 +1043,7 @@ class SionForConditionalGeneration(nn.Module):
                     max_new_tokens=max_new_tokens,
                     cross_key_values=generation_context.cross_key_values,
                     evidence_key_value=generation_context.evidence_key_value,
+                    reasoning_level=generation_context.reasoning_level,
                     forbidden_token_ids=forbidden_token_ids,
                     min_new_tokens=min_new_tokens,
                     no_repeat_ngram_size=no_repeat_ngram_size,
@@ -987,6 +1064,7 @@ class SionForConditionalGeneration(nn.Module):
                 length_penalty=length_penalty,
                 cross_key_values=generation_context.cross_key_values,
                 evidence_key_value=generation_context.evidence_key_value,
+                reasoning_level=generation_context.reasoning_level,
                 forbidden_token_ids=forbidden_token_ids,
                 min_new_tokens=min_new_tokens,
                 no_repeat_ngram_size=no_repeat_ngram_size,
@@ -1021,9 +1099,11 @@ class SionForConditionalGeneration(nn.Module):
         min_new_tokens: int = 0,
         no_repeat_ngram_size: int = 0,
         max_new_tokens_per_row: torch.Tensor | None = None,
+        reasoning_level: int | None = None,
         **encoder_features: torch.Tensor,
     ) -> torch.Tensor:
         """MRT용 확률적 후보를 ``(batch, samples, length)``로 생성합니다."""
+        reasoning_level = _validate_reasoning_level(reasoning_level)
         if isinstance(max_new_tokens, bool):
             raise TypeError("max_new_tokens must be an integer")
         if not 1 <= max_new_tokens <= self.config.max_seq_len:
@@ -1062,6 +1142,7 @@ class SionForConditionalGeneration(nn.Module):
                     memory_mask=memory_mask,
                     memory_type_ids=memory_type_ids,
                     memory_mode_ids=memory_mode_ids,
+                    reasoning_level=reasoning_level,
                     **encoder_features,
                 )
             else:
@@ -1069,6 +1150,7 @@ class SionForConditionalGeneration(nn.Module):
                     generation_context,
                     input_ids,
                     attention_mask,
+                    reasoning_level,
                 )
             encoder_states = generation_context.encoder_states
             source_mask = generation_context.source_mask
@@ -1123,6 +1205,7 @@ class SionForConditionalGeneration(nn.Module):
                     memory_mask=memory_mask,
                     memory_type_ids=memory_type_ids,
                     memory_mode_ids=memory_mode_ids,
+                    reasoning_level=generation_context.reasoning_level,
                 )
                 logits = self._logits(hidden[:, -1]).float() / temperature
                 logits = self._apply_decode_constraints(
@@ -1182,6 +1265,7 @@ class SionForConditionalGeneration(nn.Module):
         memory_mask: torch.Tensor | None = None,
         memory_type_ids: torch.Tensor | None = None,
         memory_mode_ids: torch.Tensor | None = None,
+        reasoning_level: int | None = None,
     ) -> torch.Tensor:
         batch = encoder_states.shape[0]
         device = encoder_states.device
@@ -1205,6 +1289,7 @@ class SionForConditionalGeneration(nn.Module):
                 memory_mask=memory_mask,
                 memory_type_ids=memory_type_ids,
                 memory_mode_ids=memory_mode_ids,
+                reasoning_level=reasoning_level,
             )
             logits = self._apply_decode_constraints(
                 self._logits(hidden[:, -1]).float(),
@@ -1257,6 +1342,7 @@ class SionForConditionalGeneration(nn.Module):
         memory_mask: torch.Tensor | None = None,
         memory_type_ids: torch.Tensor | None = None,
         memory_mode_ids: torch.Tensor | None = None,
+        reasoning_level: int | None = None,
     ) -> torch.Tensor:
         """배치 beam search.
 
@@ -1331,6 +1417,7 @@ class SionForConditionalGeneration(nn.Module):
                 memory_mask=memory_mask,
                 memory_type_ids=memory_type_ids,
                 memory_mode_ids=memory_mode_ids,
+                reasoning_level=reasoning_level,
             )
             logits = self._apply_decode_constraints(
                 self._logits(hidden[:, -1]).float(),

@@ -115,6 +115,7 @@ class SionForConditionalGeneration(PreTrainedModel, GenerationMixin):
         src_vowel_ids: torch.Tensor | None = None,
         src_coda_ids: torch.Tensor | None = None,
         alignment_targets: torch.Tensor | None = None,
+        reasoning_level: int | None = None,
         return_dict: bool | None = None,
         **kwargs: Any,
     ) -> Seq2SeqLMOutput | tuple[torch.Tensor, ...]:
@@ -146,6 +147,7 @@ class SionForConditionalGeneration(PreTrainedModel, GenerationMixin):
             attention_mask=attention_mask,
             decoder_input_ids=decoder_input_ids,
             labels=labels,
+            reasoning_level=reasoning_level,
             **supported,
         )
         if return_dict is False:
@@ -163,6 +165,7 @@ class SionForConditionalGeneration(PreTrainedModel, GenerationMixin):
         num_return_sequences: int,
         length_penalty: float,
         native_inputs: dict[str, torch.Tensor],
+        reasoning_level: int | None = None,
         forbidden_token_ids: tuple[int, ...] = (),
         no_repeat_ngram_size: int = 0,
     ) -> torch.Tensor:
@@ -207,7 +210,7 @@ class SionForConditionalGeneration(PreTrainedModel, GenerationMixin):
             )
             evidence_key_value = (
                 model.evidence_repair.project_key_value(encoder_states)
-                if model.evidence_repair is not None
+                if model.evidence_repair is not None and reasoning_level != 0
                 else None
             )
 
@@ -250,6 +253,7 @@ class SionForConditionalGeneration(PreTrainedModel, GenerationMixin):
                     position,
                     register_context,
                     evidence_key_value=evidence_key_value,
+                    reasoning_level=reasoning_level,
                     **memory,
                 )
                 logits = model._apply_decode_constraints(
@@ -397,6 +401,7 @@ class SionForConditionalGeneration(PreTrainedModel, GenerationMixin):
         generator: torch.Generator | None = None,
         generation_config: GenerationConfig | None = None,
         synced_gpus: bool | None = None,
+        reasoning_level: int | None = None,
         **kwargs: Any,
     ) -> torch.Tensor | GenerateEncoderDecoderOutput:
         """Generate with the native cached decoder and HF-compatible options.
@@ -663,6 +668,7 @@ class SionForConditionalGeneration(PreTrainedModel, GenerationMixin):
                 generator=generator,
                 forbidden_token_ids=forbidden_token_ids,
                 no_repeat_ngram_size=no_repeat_ngram_size,
+                reasoning_level=reasoning_level,
                 **native_inputs,
             )
             sequences = sampled.reshape(-1, sampled.shape[-1])
@@ -677,6 +683,7 @@ class SionForConditionalGeneration(PreTrainedModel, GenerationMixin):
                 forbidden_token_ids=forbidden_token_ids,
                 no_repeat_ngram_size=no_repeat_ngram_size,
                 native_inputs=native_inputs,
+                reasoning_level=reasoning_level,
             )
         else:
             sequences = self.model.generate(
@@ -689,6 +696,7 @@ class SionForConditionalGeneration(PreTrainedModel, GenerationMixin):
                 length_penalty=length_penalty,
                 forbidden_token_ids=forbidden_token_ids,
                 no_repeat_ngram_size=no_repeat_ngram_size,
+                reasoning_level=reasoning_level,
                 **native_inputs,
             )
         sequences = sequences[:, : max_new_tokens + 1]
