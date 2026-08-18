@@ -1,4 +1,4 @@
-"""단일어 코퍼스를 foundation 학습용 indexed shard 로 변환한다.
+"""단일어와 구조화 reasoning 코퍼스를 foundation indexed shard로 변환한다.
 
 병렬 데이터셋과 **같은 shard 규격**을 씁니다. 복원 과제는 "원문을 망가뜨린
 것"이 입력이고 "원문"이 정답이라, ``src`` 와 ``tgt`` 에 같은 토큰열을 쓰고
@@ -11,6 +11,11 @@
   두 방향이 같은 예제라 그대로 두면 모든 문장이 두 번 학습됩니다.
 - ``src_language == tgt_language``. collator 가 이 값을 보고 ``<denoise_xx>``
   과제 태그를 고릅니다.
+
+파일명이 ``reasoning_*.jsonl``이면 일반 ``text`` 복원으로 해석하지 않습니다.
+``prompt``를 encoder 입력으로, delimiter가 붙은 ``think``/``answer``를 decoder
+정답으로 직렬화하고 첫 source token에 ``<reason_xx>``를 저장합니다. collator는
+이 태그를 다시 prefix로 옮겨 100% denoising 설정에서도 reasoning 행을 보존합니다.
 """
 
 # Foundation preparation aggregates dynamic worker result payloads.
@@ -23,6 +28,7 @@ import json
 import unicodedata
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Any, cast
 
 from sion_translate.artifacts import FOUNDATION_RELEASE_NAME
 from sion_translate.data.monolingual import (
@@ -34,12 +40,19 @@ from sion_translate.data.monolingual import (
     segment_text,
 )
 from sion_translate.data.prepare import INDEX_DTYPE, ShardWriter, infer_register
+from sion_translate.data.reasoning import (
+    ReasoningReadStats,
+    ReasoningRecord,
+    is_reasoning_jsonl,
+    iter_reasoning_records,
+    serialize_reasoning_record,
+)
 from sion_translate.fingerprint import file_sha256
 from sion_translate.splitting import choose_split_for_key
 from sion_translate.tokenizer import SionTokenizer, normalize_text
 
 FOUNDATION_INDEX_FORMAT = "sion-foundation-indexed-v1"
-FOUNDATION_PREPROCESSING_SCHEMA = "foundation-monolingual-v1"
+FOUNDATION_PREPROCESSING_SCHEMA = "foundation-mixed-objectives-v2"
 
 
 @dataclass
@@ -54,11 +67,27 @@ class LanguageStats:
     segments: int = 0
     duplicate: int = 0
     empty_after_tokenization: int = 0
+    reasoning_records: int = 0
+    reasoning_rejected: int = 0
+    reasoning_prompt_truncated: int = 0
+    reasoning_think_truncated: int = 0
+    reasoning_answer_truncated: int = 0
     read_rejects: dict[str, int] = field(default_factory=dict)
 
     def merge_read(self, stats: ReadStats) -> None:
         for reason, count in stats.reasons().items():
             self.read_rejects[reason] = self.read_rejects.get(reason, 0) + count
+
+    def merge_reasoning_read(self, stats: ReasoningReadStats) -> None:
+        self.reasoning_rejected += stats.rejected
+        for reason, count in (
+            ("reasoning_blank", stats.blank),
+            ("reasoning_malformed_json", stats.malformed_json),
+            ("reasoning_non_object", stats.non_object),
+            ("reasoning_invalid_record", stats.invalid_record),
+        ):
+            if count:
+                self.read_rejects[reason] = self.read_rejects.get(reason, 0) + count
 
 
 @dataclass
@@ -79,10 +108,100 @@ def _text_digest(language: str, text: str) -> bytes:
     return hashlib.blake2b(f"{language}\0{text}".encode("utf-8"), digest_size=16).digest()
 
 
+def _reasoning_digest(language: str, prompt: str, think: str, answer: str) -> bytes:
+    payload = f"reasoning\0{language}\0{prompt}\0{think}\0{answer}"
+    return hashlib.blake2b(payload.encode("utf-8"), digest_size=16).digest()
+
+
 def _is_usable(text: str) -> bool:
     """제어 문자만 있거나 눈에 보이는 글자가 없는 줄을 거른다."""
 
     return any(not unicodedata.category(char).startswith("C") for char in text)
+
+
+def foundation_dataset_problem(
+    output_dir: str | Path,
+    discovery: MonolingualDiscovery,
+    tokenizer_model: str | Path,
+    *,
+    minimum_characters: int,
+    maximum_characters: int,
+    max_tokens: int,
+    max_target_tokens: int,
+    deduplicate: bool,
+    shard_size: int,
+    validation_fraction: float,
+    reasoning_sample_share: float,
+    release_name: str,
+) -> str | None:
+    """Return why a prepared foundation dataset must be rebuilt, if anything."""
+
+    manifest_path = Path(output_dir) / "manifest.json"
+    try:
+        raw_manifest: object = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        return f"manifest를 읽을 수 없습니다: {error}"
+    if not isinstance(raw_manifest, dict):
+        return "manifest가 JSON object가 아닙니다"
+    manifest = cast(dict[str, Any], raw_manifest)
+    if manifest.get("preprocessing_schema") != FOUNDATION_PREPROCESSING_SCHEMA:
+        return "foundation 전처리 schema가 바뀌었습니다"
+    if manifest.get("release_name") != release_name:
+        return "foundation release_name이 바뀌었습니다"
+    try:
+        tokenizer_hash = file_sha256(tokenizer_model)
+    except OSError as error:
+        return f"tokenizer hash를 읽을 수 없습니다: {error}"
+    if manifest.get("tokenizer_sha256") != tokenizer_hash:
+        return "foundation tokenizer가 바뀌었습니다"
+
+    expected_options = {
+        "deduplicate": deduplicate,
+        "maximum_characters": maximum_characters,
+        "max_tokens": max_tokens,
+        "max_target_tokens": max_target_tokens,
+        "minimum_characters": minimum_characters,
+        "reasoning_sample_share": reasoning_sample_share,
+        "shard_size": shard_size,
+        "validation_fraction": validation_fraction,
+    }
+    raw_options: object = manifest.get("preprocessing_options")
+    options = cast(dict[str, Any], raw_options) if isinstance(raw_options, dict) else {}
+    if any(options.get(name) != value for name, value in expected_options.items()):
+        return "foundation 전처리 옵션이 바뀌었습니다"
+
+    raw_sources: object = manifest.get("sources")
+    if not isinstance(raw_sources, list):
+        return "foundation source 목록이 없습니다"
+    source_values = cast(list[object], raw_sources)
+    actual_sources: set[tuple[str, str, int, str]] = set()
+    for raw_source in source_values:
+        if not isinstance(raw_source, dict):
+            continue
+        source = cast(dict[str, Any], raw_source)
+        try:
+            actual_sources.add(
+                (
+                    str(source.get("language", "")),
+                    str(Path(str(source.get("path", ""))).resolve()),
+                    int(source.get("size_bytes", -1)),
+                    str(source.get("task", "")),
+                )
+            )
+        except (TypeError, ValueError):
+            return "foundation source 항목이 잘못되었습니다"
+    expected_sources = {
+        (
+            source.language,
+            str(source.path.resolve()),
+            source.size_bytes,
+            "reasoning" if is_reasoning_jsonl(source.path) else "denoising",
+        )
+        for source in discovery.sources
+    }
+    if actual_sources != expected_sources or len(actual_sources) != len(source_values):
+        return "foundation 원천 파일 목록/크기가 바뀌었습니다"
+    return None
 
 
 def prepare_foundation_dataset(
@@ -93,11 +212,13 @@ def prepare_foundation_dataset(
     minimum_characters: int = 8,
     maximum_characters: int = 4000,
     max_tokens: int = 510,
+    max_target_tokens: int | None = None,
     deduplicate: bool = True,
     shard_size: int = 200_000,
     validation_fraction: float = 0.002,
     language_sampling_alpha: float = DEFAULT_LANGUAGE_SAMPLING_ALPHA,
     minimum_language_share: float = 0.05,
+    reasoning_sample_share: float = 0.05,
     release_name: str = FOUNDATION_RELEASE_NAME,
 ) -> FoundationPrepareStats:
     """단일어 파일들을 ``output_dir`` 아래 train/validation shard 로 쓴다."""
@@ -113,10 +234,18 @@ def prepare_foundation_dataset(
         raise ValueError("maximum_characters must be greater than minimum_characters")
     if max_tokens < 1:
         raise ValueError("max_tokens must be positive")
+    if max_target_tokens is None:
+        max_target_tokens = max_tokens
+    if max_target_tokens < 6:
+        raise ValueError(
+            "max_target_tokens must leave room for reasoning trace markers and content"
+        )
     if shard_size < 1:
         raise ValueError("shard_size must be positive")
     if not 0.0 < validation_fraction < 0.5:
         raise ValueError("validation_fraction must be in (0, 0.5)")
+    if not 0.0 <= reasoning_sample_share <= 0.10:
+        raise ValueError("reasoning_sample_share must be in [0, 0.10]")
 
     output_dir = Path(output_dir)
     if output_dir.exists() and any(output_dir.iterdir()):
@@ -134,6 +263,17 @@ def prepare_foundation_dataset(
             "Tokenizer is missing denoise tags for the monolingual languages: "
             f"{missing_tags}; retrain it with these languages configured"
         )
+    reasoning_languages = tuple(
+        dict.fromkeys(
+            source.language for source in discovery.sources if is_reasoning_jsonl(source.path)
+        )
+    )
+    missing_reasoning_tags = sorted(set(reasoning_languages) - set(tokenizer.reasoning_tags))
+    if missing_reasoning_tags:
+        raise ValueError(
+            "Tokenizer is missing reasoning task tags for structured corpora: "
+            f"{missing_reasoning_tags}; retrain it after adding the reasoning files"
+        )
     language_to_id = {language: index for index, language in enumerate(languages)}
 
     writers = {
@@ -143,6 +283,7 @@ def prepare_foundation_dataset(
     stats = FoundationPrepareStats(languages={language: LanguageStats() for language in languages})
     seen: set[bytes] = set()
     source_ids = {source.path: index for index, source in enumerate(discovery.sources)}
+    source_record_counts = {source_id: 0 for source_id in source_ids.values()}
 
     def record_segment(
         text: str,
@@ -189,10 +330,80 @@ def prepare_foundation_dataset(
             stats.train_records += 1
         else:
             stats.validation_records += 1
+        source_record_counts[source_id] += 1
+
+    def record_reasoning(
+        record: ReasoningRecord,
+        *,
+        language: str,
+        language_stats: LanguageStats,
+        source_id: int,
+    ) -> None:
+        """Write one structured prompt-to-trace example without denoising it."""
+
+        digest = _reasoning_digest(language, record.prompt, record.think, record.answer)
+        if deduplicate and digest in seen:
+            language_stats.duplicate += 1
+            return
+        if deduplicate:
+            seen.add(digest)
+        encoded = serialize_reasoning_record(
+            record,
+            tokenizer,
+            # max_tokens historically limits source *content*.  The reasoning
+            # source additionally stores one task token that the collator pops.
+            max_source_tokens=max_tokens + 1,
+            max_target_tokens=max_target_tokens,
+        )
+        split = choose_split_for_key(
+            f"reasoning\0{language}\0{record.prompt}\0{record.answer}",
+            validation_fraction,
+            0.0,
+        )
+        if split == "test":
+            split = "train"
+        writers[split].add(
+            src_ids=encoded.source_ids,
+            tgt_ids=encoded.target_ids,
+            src_register=infer_register(record.prompt, language),
+            tgt_register=infer_register(record.answer, language),
+            src_language=language,
+            tgt_language=language,
+            source_id=source_id,
+            quality_score=100,
+            synthetic=False,
+            forward_only=True,
+        )
+        language_stats.accepted += 1
+        language_stats.reasoning_records += 1
+        language_stats.reasoning_prompt_truncated += int(encoded.prompt_truncated)
+        language_stats.reasoning_think_truncated += int(encoded.think_truncated)
+        language_stats.reasoning_answer_truncated += int(encoded.answer_truncated)
+        if split == "train":
+            stats.train_records += 1
+        else:
+            stats.validation_records += 1
+        source_record_counts[source_id] += 1
 
     for source in discovery.sources:
         language = source.language
         language_stats = stats.languages[language]
+        if is_reasoning_jsonl(source.path):
+            reasoning_read_stats = ReasoningReadStats()
+            for record in iter_reasoning_records(
+                source.path,
+                expected_language=language,
+                stats=reasoning_read_stats,
+            ):
+                record_reasoning(
+                    record,
+                    language=language,
+                    language_stats=language_stats,
+                    source_id=source_ids[source.path],
+                )
+            language_stats.lines_read += reasoning_read_stats.physical_lines
+            language_stats.merge_reasoning_read(reasoning_read_stats)
+            continue
         read_stats = ReadStats()
         for raw_text in iter_monolingual_lines(source.path, stats=read_stats):
             language_stats.lines_read += 1
@@ -241,7 +452,11 @@ def prepare_foundation_dataset(
         "format": FOUNDATION_INDEX_FORMAT,
         "stage": "foundation",
         "release_name": release_name,
-        "objective": "span-corruption-denoising",
+        "objective": (
+            "span-corruption-denoising+structured-reasoning"
+            if any(item.reasoning_records for item in stats.languages.values())
+            else "span-corruption-denoising"
+        ),
         "languages": list(languages),
         "language_to_id": language_to_id,
         # 복원 과제는 언어쌍이 아니라 언어 하나짜리 과제입니다. 같은 언어를
@@ -258,7 +473,9 @@ def prepare_foundation_dataset(
             "deduplicate": deduplicate,
             "maximum_characters": maximum_characters,
             "max_tokens": max_tokens,
+            "max_target_tokens": max_target_tokens,
             "minimum_characters": minimum_characters,
+            "reasoning_sample_share": reasoning_sample_share,
             "shard_size": shard_size,
             "validation_fraction": validation_fraction,
         },
@@ -275,6 +492,8 @@ def prepare_foundation_dataset(
                 "name": source.path.name,
                 "path": str(source.path),
                 "size_bytes": source.size_bytes,
+                "task": "reasoning" if is_reasoning_jsonl(source.path) else "denoising",
+                "records": source_record_counts[source_ids[source.path]],
             }
             for source in discovery.sources
         ],
@@ -288,6 +507,13 @@ def prepare_foundation_dataset(
                 language: asdict(language_stats)
                 for language, language_stats in stats.languages.items()
             },
+        },
+        "reasoning": {
+            "contract": "prompt-to-delimited-trace-v1",
+            "languages": list(reasoning_languages),
+            "records": sum(item.reasoning_records for item in stats.languages.values()),
+            "sample_share": reasoning_sample_share,
+            "trace_symbols": ["<think>", "</think>", "<answer>", "</answer>"],
         },
     }
     (output_dir / "manifest.json").write_text(
@@ -316,7 +542,13 @@ def render_prepare_report(stats: FoundationPrepareStats) -> list[str]:
         rendered = ", ".join(f"{name} {count:,}" for name, count in dropped.items() if count)
         lines.append(
             f"  {language}: 읽음 {language_stats.lines_read:,} → "
-            f"채택 {language_stats.accepted:,}" + (f" (제외: {rendered})" if rendered else "")
+            f"채택 {language_stats.accepted:,}"
+            + (
+                f" (reasoning {language_stats.reasoning_records:,})"
+                if language_stats.reasoning_records
+                else ""
+            )
+            + (f" (제외: {rendered})" if rendered else "")
         )
     return lines
 
@@ -326,6 +558,7 @@ __all__ = [
     "FOUNDATION_PREPROCESSING_SCHEMA",
     "FoundationPrepareStats",
     "LanguageStats",
+    "foundation_dataset_problem",
     "prepare_foundation_dataset",
     "render_prepare_report",
 ]

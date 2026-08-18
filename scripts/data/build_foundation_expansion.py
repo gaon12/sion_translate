@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Build the English and language-consistent reasoning foundation corpora.
 
-The generated files deliberately live under ``data/corpus/<language>`` and use
-the existing monolingual ``{"text": ...}`` contract.  Reasoning rows retain
-their structured fields for audit, while the foundation reader consumes only
-``text``.  Korean and Japanese traces are rejected when an otherwise native
-``think`` section changes to English prose; formula variables and product names
-are not treated as a language switch.
+The generated files deliberately live under ``data/corpus/<language>``.
+Reasoning rows retain ``text`` for tokenizer sampling and human audit, while the
+mixed-objective foundation reader consumes their explicit
+``prompt``/``think``/``answer`` fields. Korean and Japanese traces are rejected
+when an otherwise native ``think`` section changes to English prose; formula
+variables and product names are not treated as a language switch.
 """
 
 # The acquisition script reads third-party Arrow schemas and JSON payloads.

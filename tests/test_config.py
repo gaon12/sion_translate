@@ -532,6 +532,8 @@ def test_foundation_language_keys_are_validated() -> None:
         ("language_sampling_alpha", 1.5, "language_sampling_alpha"),
         ("minimum_language_share", 1.0, "minimum_language_share"),
         ("minimum_characters", 0, "minimum_characters"),
+        ("reasoning_sample_share", -0.01, "reasoning_sample_share"),
+        ("reasoning_sample_share", 0.11, "reasoning_sample_share"),
         ("noise_density", 0.0, "noise_density"),
         ("noise_density", 1.0, "noise_density"),
         ("mean_span", 0.0, "mean_span"),

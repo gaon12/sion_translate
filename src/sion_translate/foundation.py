@@ -123,12 +123,14 @@ def build_foundation_config(config: AppConfig) -> AppConfig:
     """번역 설정에서 foundation 단계 설정을 유도한다.
 
     물려받는 것: 모델 구조, 정밀도, 병렬 전략, seed, 토크나이저.
-    덮어쓰는 것: 데이터셋 경로, 목적(100% 복원), 학습 일정, 산출 경로.
+    덮어쓰는 것: 데이터셋 경로, 목적(복원 + 선택적 reasoning), 학습 일정,
+    산출 경로.
 
-    복원 확률을 학습·검증 **양쪽 다** 1.0 으로 둡니다. 이 단계의 shard 는
+    복원 확률을 학습·검증 **양쪽 다** 1.0 으로 둡니다. 일반 단일어 shard 는
     ``src == tgt`` 라, 복원을 걸지 않은 예제는 "입력을 그대로 베껴라" 가 되어
     아무것도 가르치지 않습니다. 검증만 0 으로 두면 검증 손실이 복사 과제의
-    손실이 되어 best 선택이 무의미해집니다.
+    손실이 되어 best 선택이 무의미해집니다. 구조화 reasoning 행은 별도 task
+    tag가 있어 collator가 이 확률과 무관하게 denoising을 우회합니다.
     """
 
     foundation = config.foundation

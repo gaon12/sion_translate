@@ -184,6 +184,7 @@ class SionBatchCollator:
             int(augmentation_key), dtype=torch.int64
         ).share_memory_()
         self.slot_ids: set[int] = set(tokenizer.slot_ids)
+        self.reasoning_task_ids: set[int] = set(getattr(tokenizer, "reasoning_tags", {}).values())
         self.features: dict[str, torch.Tensor] | None = None
         if token_features is not None:
             self.features = load_morphoscript_token_features(
@@ -224,12 +225,30 @@ class SionBatchCollator:
         tgt = list(map(int, item["tgt"]))
         target_register = int(item["target_register"])
         rng = self._sample_rng(item)
+        reasoning_task_id = src[0] if src and src[0] in self.reasoning_task_ids else None
+        if reasoning_task_id is not None:
+            # Reasoning shards store their task tag in the first source slot so
+            # they can share the ordinary indexed format.  Move it back to the
+            # collator-owned prefix position and leave the prompt as content.
+            src = src[1:]
+            if not src:
+                raise ValueError("reasoning example has a task tag but no prompt tokens")
+            if len(tgt) > self.max_target_length - 1:
+                raise ValueError(
+                    "reasoning target exceeds max_target_length; rebuild the foundation "
+                    "dataset so trace delimiters can be preserved during truncation"
+                )
         denoise = (
-            item["src_language"] not in self.source_only_languages
+            reasoning_task_id is None
+            and item["src_language"] not in self.source_only_languages
             and self.denoise_probability > 0
             and rng.random() < self.denoise_probability
         )
-        if denoise:
+        if reasoning_task_id is not None:
+            task_id = reasoning_task_id
+            source_language_tag_id = -1
+            reverse_direction_trained = False
+        elif denoise:
             # Truncate before deriving the target. The two sides are cut to
             # different limits further down, so restoring an un-truncated
             # source would ask the model to reconstruct tokens the (truncated)
@@ -275,7 +294,10 @@ class SionBatchCollator:
         src = src[: self.max_source_length - 2]
         tgt = tgt[: self.max_target_length - 1]
         input_ids = [task_id, *src, self.tokenizer.eos_id]
-        decoder_input_ids = [self.tokenizer.bos_id, *self._noise_decoder_input(tgt, rng)]
+        decoder_target = (
+            tgt if reasoning_task_id is not None else self._noise_decoder_input(tgt, rng)
+        )
+        decoder_input_ids = [self.tokenizer.bos_id, *decoder_target]
         labels = [*tgt, self.tokenizer.eos_id]
         memory_tokens = [token_id for token_id in src if token_id in self.slot_ids]
         return {

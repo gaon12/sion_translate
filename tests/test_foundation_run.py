@@ -12,17 +12,20 @@ import json
 import math
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
 from sion_translate.cli.train import (
     FOUNDATION_COMPLETION_FILENAME,
+    _foundation_completion_matches_inputs,
     _foundation_source_sampling_weights,
     run_foundation_stage,
 )
 from sion_translate.config import AppConfig, ExperimentalConfig, ModelConfig
 from sion_translate.data.prepare_foundation import prepare_foundation_dataset
 from sion_translate.foundation import foundation_run_directory, plan_foundation_stage
+from sion_translate.fingerprint import file_sha256
 from sion_translate.model import SionForConditionalGeneration
 from sion_translate.tokenizer import SionTokenizer, train_tokenizer
 from sion_translate.training.distributed import DistributedContext
@@ -154,6 +157,8 @@ def test_the_stage_trains_and_marks_itself_complete(
     assert marker["stage"] == "foundation"
     assert marker["release_name"] == "sion"
     assert sorted(marker["languages"]) == ["ja", "ko"]
+    assert len(marker["foundation_manifest_sha256"]) == 64
+    assert len(marker["tokenizer_sha256"]) == 64
     assert sampler_arguments[0]["source_sampling_weights_by_id"]
     assert math.isinf(sampler_arguments[0]["max_source_upsampling"])
     assert "source_sampling_weights_by_id" not in sampler_arguments[1]
@@ -176,6 +181,74 @@ def test_empty_prepared_language_has_zero_sampling_mass(tmp_path) -> None:
     weights = _foundation_source_sampling_weights(dataset)
 
     assert weights == {0: 1.0, 1: 0.0}
+
+
+def test_structured_reasoning_sampling_is_capped_at_the_manifest_row_share(tmp_path) -> None:
+    manifest = {
+        "language_sampling": {
+            "counts": {"ko": 900, "ja": 1_000},
+            "weights": {"ko": 0.5, "ja": 0.5},
+        },
+        "reasoning": {"sample_share": 0.05},
+        "sources": [
+            {"id": 0, "language": "ko", "name": "ko.txt", "task": "denoising"},
+            {"id": 1, "language": "ja", "name": "ja.txt", "task": "denoising"},
+            {
+                "id": 2,
+                "language": "ja",
+                "name": "reasoning_math.jsonl",
+                "task": "reasoning",
+            },
+        ],
+    }
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    pair_source_ids = np.asarray([0] * 900 + [1] * 900 + [2] * 100, dtype=np.uint16)
+    dataset = SimpleNamespace(
+        dataset_root=tmp_path,
+        source_names=["ko.txt", "ja.txt", "reasoning_math.jsonl"],
+        pair_source_ids=pair_source_ids,
+    )
+
+    weights = _foundation_source_sampling_weights(dataset)
+    masses = {
+        source_id: float(np.count_nonzero(pair_source_ids == source_id)) * weight
+        for source_id, weight in weights.items()
+    }
+    reasoning_share = masses[2] / sum(masses.values())
+
+    assert reasoning_share == pytest.approx(0.05)
+    assert masses[0] == pytest.approx(masses[1])
+
+
+def test_foundation_completion_is_invalidated_by_new_prepared_inputs(tmp_path) -> None:
+    dataset_dir = tmp_path / "foundation_dataset"
+    dataset_dir.mkdir()
+    manifest = dataset_dir / "manifest.json"
+    tokenizer = tmp_path / "tokenizer.model"
+    completion = tmp_path / FOUNDATION_COMPLETION_FILENAME
+    manifest.write_text('{"objective":"denoising"}\n', encoding="utf-8")
+    tokenizer.write_bytes(b"tokenizer-v1")
+    completion.write_text(
+        json.dumps(
+            {
+                "foundation_manifest_sha256": file_sha256(manifest),
+                "tokenizer_sha256": file_sha256(tokenizer),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert _foundation_completion_matches_inputs(
+        completion,
+        dataset_dir=dataset_dir,
+        tokenizer_path=tokenizer,
+    )
+    manifest.write_text('{"objective":"denoising+reasoning"}\n', encoding="utf-8")
+    assert not _foundation_completion_matches_inputs(
+        completion,
+        dataset_dir=dataset_dir,
+        tokenizer_path=tokenizer,
+    )
 
 
 def test_a_second_run_reuses_the_weights_instead_of_retraining(

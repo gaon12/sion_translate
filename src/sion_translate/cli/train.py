@@ -62,6 +62,7 @@ from sion_translate.artifacts import (
     TRANSLATION_RELEASE_NAME,
 )
 from sion_translate.data.collate import load_morphoscript_token_features
+from sion_translate.data.reasoning import is_reasoning_jsonl
 from sion_translate.locking import artifact_lock
 from sion_translate.foundation import (
     FoundationOutcome,
@@ -435,6 +436,7 @@ def tokenizer_policy_problem(
     tokenizer_path: str | Path,
     language_pairs: tuple[tuple[str, str], ...],
     foundation_languages: tuple[str, ...] | None = None,
+    reasoning_languages: tuple[str, ...] = (),
 ) -> str | None:
     """Return a concrete compatibility problem for a tokenizer, if any."""
 
@@ -483,6 +485,13 @@ def tokenizer_policy_problem(
             "토크나이저 복원 태그의 언어 집합이 foundation 설정과 다릅니다 "
             f"(tokenizer={sorted(tokenizer.denoise_tags)}, "
             f"config={sorted(expected_denoise_languages)})"
+        )
+    tokenizer_reasoning_languages = set(getattr(tokenizer, "reasoning_tags", {}))
+    if tokenizer_reasoning_languages != set(reasoning_languages):
+        return (
+            "토크나이저 reasoning 태그의 언어 집합이 구조화 코퍼스와 다릅니다 "
+            f"(tokenizer={sorted(tokenizer_reasoning_languages)}, "
+            f"corpus={sorted(reasoning_languages)})"
         )
     return None
 
@@ -573,6 +582,17 @@ def ensure_artifacts(
 
     if foundation_plan is None:
         foundation_plan = plan_foundation_stage(config)
+    reasoning_languages = (
+        tuple(
+            dict.fromkeys(
+                source.language
+                for source in foundation_plan.discovery.sources
+                if is_reasoning_jsonl(source.path)
+            )
+        )
+        if foundation_plan.enabled
+        else ()
+    )
     # 같은 artifacts/ 를 쓰는 작업 두 개가 동시에 "없으니 만들자"고 판단하면
     # 서로 다른 세대의 토크나이저와 데이터셋이 같은 경로에 섞입니다. 실패가
     # 아니라 **섞인 상태**라 지문 검사는 그 조합을 처음 보는 것으로만 인식합니다.
@@ -640,6 +660,7 @@ def ensure_artifacts(
                         monolingual=foundation_plan.discovery,
                         monolingual_sample_ratio=config.foundation.tokenizer_sample_ratio,
                         foundation_languages=foundation_plan.languages,
+                        reasoning_languages=reasoning_languages,
                         approximate_split=config.data.approximate_split,
                         source_only_languages=config.data.configured_source_only_languages(),
                         train_only_prefixes=config.data.configured_synthetic_prefixes(),
@@ -655,6 +676,7 @@ def ensure_artifacts(
                     tokenizer_path,
                     config.data.configured_language_pairs(),
                     config.foundation_languages(),
+                    reasoning_languages,
                 )
                 if policy_problem is not None:
                     existing_tokenizer = SionTokenizer(tokenizer_path)
@@ -673,6 +695,7 @@ def ensure_artifacts(
                             tokenizer_path,
                             config.data.configured_language_pairs(),
                             config.foundation_languages(),
+                            reasoning_languages,
                         )
                     if policy_problem is not None:
                         checkpoint_detail = (
@@ -737,16 +760,40 @@ def ensure_artifacts(
                     for warning in foundation_plan.warnings:
                         announce(f"[경고] foundation: {warning}", context)
                     foundation_dataset = Path(config.foundation.dataset_dir)
-                    if (foundation_dataset / "manifest.json").is_file():
+                    from sion_translate.data.prepare_foundation import (
+                        foundation_dataset_problem,
+                        prepare_foundation_dataset,
+                        render_prepare_report,
+                    )
+
+                    foundation_problem = foundation_dataset_problem(
+                        foundation_dataset,
+                        foundation_plan.discovery,
+                        tokenizer_path,
+                        minimum_characters=config.foundation.minimum_characters,
+                        maximum_characters=config.foundation.maximum_characters,
+                        max_tokens=config.data.max_source_length - 2,
+                        max_target_tokens=config.data.max_target_length - 1,
+                        deduplicate=config.foundation.deduplicate,
+                        shard_size=config.foundation.shard_size,
+                        validation_fraction=config.foundation.validation_fraction,
+                        reasoning_sample_share=config.foundation.reasoning_sample_share,
+                        release_name=config.foundation.release_name,
+                    )
+                    if foundation_problem is None:
                         announce("foundation 데이터셋 최신 상태 확인.", context)
                     else:
-                        from sion_translate.data.prepare_foundation import (
-                            prepare_foundation_dataset,
-                            render_prepare_report,
-                        )
+                        if foundation_dataset.exists() and any(foundation_dataset.iterdir()):
+                            backup = backup_stale_dataset(foundation_dataset)
+                            announce(
+                                f"{foundation_problem} → 기존 foundation 데이터셋을 "
+                                f"{backup.name}/ 으로 보관합니다.",
+                                context,
+                            )
 
                         announce(
-                            "foundation 데이터셋 준비 시작 (단일어 토큰화) — 시간이 걸립니다.",
+                            "foundation 데이터셋 준비 시작 (복원 + reasoning 토큰화) — "
+                            "시간이 걸립니다.",
                             context,
                         )
                         foundation_stats = prepare_foundation_dataset(
@@ -756,11 +803,13 @@ def ensure_artifacts(
                             minimum_characters=config.foundation.minimum_characters,
                             maximum_characters=config.foundation.maximum_characters,
                             max_tokens=config.data.max_source_length - 2,
+                            max_target_tokens=config.data.max_target_length - 1,
                             deduplicate=config.foundation.deduplicate,
                             shard_size=config.foundation.shard_size,
                             validation_fraction=config.foundation.validation_fraction,
                             language_sampling_alpha=config.foundation.language_sampling_alpha,
                             minimum_language_share=config.foundation.minimum_language_share,
+                            reasoning_sample_share=config.foundation.reasoning_sample_share,
                             release_name=config.foundation.release_name,
                         )
                         for line in render_prepare_report(foundation_stats):
@@ -770,6 +819,27 @@ def ensure_artifacts(
 
 
 FOUNDATION_COMPLETION_FILENAME = "stage_complete.json"
+
+
+def _foundation_completion_matches_inputs(
+    completion: Path,
+    *,
+    dataset_dir: str | Path,
+    tokenizer_path: str | Path,
+) -> bool:
+    """Whether a completed run was trained on the currently prepared inputs."""
+
+    manifest_path = Path(dataset_dir) / "manifest.json"
+    try:
+        raw_marker: object = json.loads(completion.read_text(encoding="utf-8"))
+        if not isinstance(raw_marker, dict):
+            return False
+        marker = cast(dict[str, Any], raw_marker)
+        return marker.get("foundation_manifest_sha256") == file_sha256(
+            manifest_path
+        ) and marker.get("tokenizer_sha256") == file_sha256(tokenizer_path)
+    except (OSError, json.JSONDecodeError):
+        return False
 
 
 def _foundation_source_sampling_weights(
@@ -796,7 +866,7 @@ def _foundation_source_sampling_weights(
             f"foundation manifest has no usable language sampling policy: {manifest_path}"
         ) from error
 
-    multipliers: dict[int, float] = {}
+    source_entries: list[dict[str, Any]] = []
     for raw_source in raw_sources:
         if not isinstance(raw_source, dict):
             raise ValueError(f"foundation manifest has an invalid source entry: {raw_source!r}")
@@ -807,34 +877,117 @@ def _foundation_source_sampling_weights(
             raise ValueError(f"foundation manifest has an invalid source id: {source!r}") from error
         name = str(source.get("name", ""))
         language = str(source.get("language", ""))
-        try:
-            count = float(language_counts[language])
-            target_share = float(language_weights[language])
-        except (KeyError, TypeError, ValueError) as error:
+        if language not in language_counts or language not in language_weights:
             raise ValueError(
                 f"foundation source {name!r} has no language sampling weight for {language!r}"
-            ) from error
-        if not name or count < 0.0 or target_share < 0.0:
-            raise ValueError(
-                f"foundation source {name!r} has invalid language sampling values: "
-                f"count={count}, weight={target_share}"
             )
-        if count == 0.0:
-            if not math.isclose(target_share, 0.0, abs_tol=1e-12):
+        if not name:
+            raise ValueError(f"foundation source has no usable name: {source!r}")
+        source_entries.append(source)
+
+    task_aware = bool(source_entries) and all(
+        source.get("task") in {"denoising", "reasoning"} for source in source_entries
+    )
+    multipliers: dict[int, float] = {}
+    if task_aware:
+        if dataset.pair_source_ids is None:
+            raise ValueError("foundation task sampling requires source_id metadata")
+        counts_by_source = np.bincount(
+            dataset.pair_source_ids.astype(np.int64, copy=False),
+            minlength=len(dataset.source_names),
+        ).astype(np.float64)
+        task_language_counts: dict[tuple[str, str], float] = {}
+        for source in source_entries:
+            source_id = int(source["id"])
+            task = str(source["task"])
+            language = str(source["language"])
+            task_language_counts[(task, language)] = (
+                task_language_counts.get((task, language), 0.0) + counts_by_source[source_id]
+            )
+
+        reasoning_manifest = manifest.get("reasoning")
+        reasoning_policy = (
+            cast(dict[str, Any], reasoning_manifest) if isinstance(reasoning_manifest, dict) else {}
+        )
+        reasoning_share = float(reasoning_policy.get("sample_share", 0.05))
+        if not 0.0 <= reasoning_share <= 0.10:
+            raise ValueError("foundation reasoning sample_share must be in [0, 0.10]")
+        configured_task_shares = {
+            "denoising": 1.0 - reasoning_share,
+            "reasoning": reasoning_share,
+        }
+        active_tasks = {
+            task
+            for task, _ in task_language_counts
+            if any(
+                count > 0.0
+                for (candidate_task, _), count in task_language_counts.items()
+                if candidate_task == task
+            )
+        }
+        task_mass = sum(configured_task_shares[task] for task in active_tasks)
+        if task_mass <= 0.0:
+            raise ValueError("foundation task sampling excludes every available source")
+
+        language_mass_by_task = {
+            task: sum(
+                float(language_weights[language])
+                for candidate_task, language in task_language_counts
+                if candidate_task == task and task_language_counts[(candidate_task, language)] > 0
+            )
+            for task in active_tasks
+        }
+        for source in source_entries:
+            source_id = int(source["id"])
+            task = str(source["task"])
+            language = str(source["language"])
+            count = counts_by_source[source_id]
+            task_language_count = task_language_counts[(task, language)]
+            language_mass = language_mass_by_task.get(task, 0.0)
+            if count <= 0.0 or task_language_count <= 0.0:
+                multipliers[source_id] = 0.0
+                continue
+            if language_mass <= 0.0:
+                raise ValueError(f"foundation task {task!r} has no language sampling mass")
+            normalized_task_share = configured_task_shares[task] / task_mass
+            normalized_language_share = float(language_weights[language]) / language_mass
+            multipliers[source_id] = (
+                normalized_task_share * normalized_language_share / task_language_count
+            )
+    else:
+        # Legacy foundation manifests predate explicit task metadata.  Preserve
+        # their language-only distribution so old denoising runs remain resumable.
+        for source in source_entries:
+            source_id = int(source["id"])
+            name = str(source.get("name", ""))
+            language = str(source.get("language", ""))
+            try:
+                count = float(language_counts[language])
+                target_share = float(language_weights[language])
+            except (KeyError, TypeError, ValueError) as error:
                 raise ValueError(
-                    f"foundation source {name!r} has a positive sampling weight "
-                    f"for empty language {language!r}"
+                    f"foundation source {name!r} has no language sampling weight for {language!r}"
+                ) from error
+            if count < 0.0 or target_share < 0.0:
+                raise ValueError(
+                    f"foundation source {name!r} has invalid language sampling values: "
+                    f"count={count}, weight={target_share}"
                 )
-            # ``require_all_languages=false`` permits a discovered language to
-            # yield no usable records. Keep its source id in the policy with
-            # zero mass so the prepared warning remains non-fatal.
-            multiplier = 0.0
-        else:
-            multiplier = target_share / count
-        previous = multipliers.get(source_id)
-        if previous is not None and not math.isclose(previous, multiplier):
-            raise ValueError(f"foundation source id {source_id} has conflicting language weights")
-        multipliers[source_id] = multiplier
+            if count == 0.0:
+                if not math.isclose(target_share, 0.0, abs_tol=1e-12):
+                    raise ValueError(
+                        f"foundation source {name!r} has a positive sampling weight "
+                        f"for empty language {language!r}"
+                    )
+                multiplier = 0.0
+            else:
+                multiplier = target_share / count
+            previous = multipliers.get(source_id)
+            if previous is not None and not math.isclose(previous, multiplier):
+                raise ValueError(
+                    f"foundation source id {source_id} has conflicting language weights"
+                )
+            multipliers[source_id] = multiplier
 
     missing = sorted(set(range(len(dataset.source_names))) - set(multipliers))
     if missing:
@@ -852,7 +1005,7 @@ def run_foundation_stage(
     tokenizer: SionTokenizer,
     context: DistributedContext,
 ) -> FoundationOutcome:
-    """번역 학습 전에 단일어 복원으로 encoder-decoder 를 먼저 만든다.
+    """번역 학습 전에 복원과 선택적 reasoning으로 encoder-decoder를 만든다.
 
     끝난 단계를 다시 돌리지 않는 것이 중요합니다. 이 단계는 파이프라인에서
     가장 오래 걸리는 구간이라, 번역 학습이 실패해 다시 실행할 때마다 며칠짜리
@@ -868,6 +1021,26 @@ def run_foundation_stage(
     completion = run_root / FOUNDATION_COMPLETION_FILENAME
     best_checkpoint = run_root / "checkpoints" / "best"
 
+    completed_inputs_match = completion.is_file() and _foundation_completion_matches_inputs(
+        completion,
+        dataset_dir=foundation_config.data.dataset_dir,
+        tokenizer_path=config.data.tokenizer_model,
+    )
+    stale_completed_run = (
+        completion.is_file()
+        and checkpoint_path_exists(best_checkpoint)
+        and not completed_inputs_match
+    )
+    if stale_completed_run:
+        if context.is_main:
+            backup = backup_stale_dataset(run_root)
+            announce(
+                "foundation 데이터/토크나이저 변경을 감지해 완료된 이전 실행을 "
+                f"{backup.name}/ 으로 보관합니다.",
+                context,
+            )
+        barrier(context)
+
     identity_for_transfer = build_checkpoint_identity(
         model_config=config.model,
         tokenizer_path=config.data.tokenizer_model,
@@ -876,7 +1049,7 @@ def run_foundation_stage(
         stage_name="pretrain",
     )
 
-    if completion.is_file() and checkpoint_path_exists(best_checkpoint):
+    if completed_inputs_match and checkpoint_path_exists(best_checkpoint):
         provenance = initialize_model_from_checkpoint(
             best_checkpoint,
             model,
@@ -973,7 +1146,7 @@ def run_foundation_stage(
         ),
     )
 
-    announce("0단계 foundation 사전학습(단일어 복원)을 시작합니다.", context)
+    announce("0단계 foundation 사전학습(복원 + 선택적 reasoning)을 시작합니다.", context)
     result = train(
         model,
         train_loader,
@@ -1015,6 +1188,10 @@ def run_foundation_stage(
                     "languages": list(foundation_plan.languages),
                     "selected_step": int(result["selected_step"]),
                     "best_validation_loss": float(result["best_validation_loss"]),
+                    "foundation_manifest_sha256": file_sha256(
+                        Path(foundation_config.data.dataset_dir) / "manifest.json"
+                    ),
+                    "tokenizer_sha256": file_sha256(config.data.tokenizer_model),
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -1324,7 +1501,7 @@ def main() -> None:
                 context,
             )
 
-        # ── 단계 ⑤-b: foundation 사전학습 (단일어 복원) ────────────────
+        # ── 단계 ⑤-b: foundation 사전학습 (복원 + reasoning) ───────────
         # 번역쌍을 보기 전에 encoder-decoder 를 먼저 만듭니다. 이 단계의
         # 산출물은 번역 모델이 아니라 그 파운데이션이라 별도 이름으로 나갑니다.
         foundation_outcome = run_foundation_before_translation(

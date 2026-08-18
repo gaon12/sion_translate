@@ -44,6 +44,7 @@ def tokenizer_model(tmp_path_factory):
         vocab_size=700,
         num_workers=1,
         language_pair=["ko", "ja"],
+        reasoning_languages=["ja"],
     )
 
 
@@ -239,3 +240,70 @@ def test_no_translation_direction_tag_appears_in_a_foundation_batch(
 
     translation_tags = set(tokenizer.language_tags.values())
     assert not translation_tags & set(batch["input_ids"][:, 0].tolist())
+
+
+def test_reasoning_rows_bypass_forced_denoising_and_keep_trace_markers(
+    tmp_path,
+    tokenizer_model,
+) -> None:
+    root = _corpus(tmp_path / "corpus", ko_lines=20, ja_lines=20)
+    reasoning_path = root / "ja" / "reasoning_math.jsonl"
+    reasoning_path.write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "prompt": f"{index} と 2 を足してください。",
+                    "think": "二つの数を順番に確認してから加算する。",
+                    "answer": f"答えは {index + 2} です。",
+                    "language": "ja",
+                    "category": "math",
+                },
+                ensure_ascii=False,
+            )
+            for index in range(12)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    discovery = discover_monolingual_sources(root, ["ko", "ja"])
+    stats = prepare_foundation_dataset(
+        discovery,
+        tokenizer_model,
+        tmp_path / "dataset",
+        max_tokens=62,
+        max_target_tokens=63,
+        validation_fraction=0.1,
+    )
+    tokenizer = SionTokenizer(tokenizer_model)
+    dataset = IndexedParallelDataset(tmp_path / "dataset", split="train", bidirectional=True)
+    reasoning_id = tokenizer.reasoning_tags["ja"]
+    reasoning_items = [
+        dataset[index]
+        for index in range(len(dataset))
+        if int(dataset[index]["src"][0]) == reasoning_id
+    ]
+    assert reasoning_items
+
+    collator = SionBatchCollator(
+        tokenizer,
+        max_source_length=64,
+        max_target_length=64,
+        denoise_probability=1.0,
+        denoise_noise_density=0.5,
+    )
+    batch = collator(reasoning_items[:4])
+
+    assert batch["input_ids"][:, 0].tolist() == [reasoning_id] * min(4, len(reasoning_items))
+    assert not (batch["input_ids"] == tokenizer.mask_id).any()
+    assert (batch["labels"][:, 0] == tokenizer.reasoning_trace_ids["<think>"]).all()
+    assert any(tokenizer.reasoning_trace_ids["</think>"] in row.tolist() for row in batch["labels"])
+    assert any(tokenizer.reasoning_trace_ids["<answer>"] in row.tolist() for row in batch["labels"])
+    assert any(
+        tokenizer.reasoning_trace_ids["</answer>"] in row.tolist() for row in batch["labels"]
+    )
+    assert stats.languages["ja"].reasoning_records == 12
+
+    manifest = json.loads((tmp_path / "dataset" / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["objective"] == "span-corruption-denoising+structured-reasoning"
+    assert manifest["reasoning"]["records"] == 12
+    assert manifest["reasoning"]["sample_share"] == 0.05

@@ -800,6 +800,9 @@ def test_tokenizer_policy_requires_digit_splitting_and_matching_identity(
     )
     assert tokenizer_policy_problem(model_path, pairs) is None
     assert "복원 태그" in str(tokenizer_policy_problem(model_path, pairs, ("ko", "ja", "en")))
+    assert "reasoning 태그" in str(
+        tokenizer_policy_problem(model_path, pairs, ("ko", "ja"), ("ja",))
+    )
 
     class MergedDigitTokenizer:
         splits_digits = False

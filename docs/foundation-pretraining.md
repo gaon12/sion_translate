@@ -1,12 +1,13 @@
-# foundation 사전학습 (단일어 복원)
+# foundation 사전학습 (단일어 복원 + 선택적 reasoning)
 
-번역 학습 **이전** 단계입니다. 언어별 단일어 텍스트로 span-corruption 복원만
-학습해 encoder-decoder 를 먼저 만들고, 그 위에서 번역을 학습합니다.
+번역 학습 **이전** 단계입니다. 언어별 단일어 텍스트의 span-corruption 복원과,
+구조화 데이터가 있을 때만 prompt→reasoning trace 보조 과제를 섞어
+encoder-decoder 를 먼저 만들고 그 위에서 번역을 학습합니다.
 
 단계 순서:
 
 ```
-foundation (단일어 복원)  →  SFT (번역)  →  MRT (사후학습)
+foundation (복원 + reasoning) → SFT (번역) → MRT (사후학습)
 runs/*/foundation/           runs/*/pretrain/   runs/*/posttrain/
 ```
 
@@ -33,7 +34,8 @@ data/corpus/
     science.jsonl
 ```
 
-허용 형식은 **`.txt` 와 `.jsonl` 둘뿐**이고, `.jsonl` 은 **`text` 키**를 씁니다.
+허용 형식은 **`.txt` 와 `.jsonl` 둘뿐**입니다. 일반 `.jsonl`은 **`text` 키**를
+쓰고, 이름이 `reasoning_`으로 시작하는 `.jsonl`만 아래의 구조화 계약을 씁니다.
 다른 확장자, 언어 코드가 아닌 폴더 이름, 최상위에 떠 있는 파일은 전부
 **건너뛰고 그 사실을 출력**합니다. 조용히 무시하지 않는 이유는 이 단계가
 가장 오래 걸리는데 입력 오류는 티가 나지 않기 때문입니다 — 키 이름 하나가
@@ -50,6 +52,42 @@ foundation:
 빈 목록이면 기존처럼 번역 설정에 등장하는 target 가능 언어를
 자동으로 사용합니다. 이 목록을 바꾸면 해당 `<denoise_xx>` 태그가
 필요하므로 토크나이저와 foundation dataset은 새로 만들어야 합니다.
+
+## 구조화 reasoning 보조 과제
+
+reasoning은 번역 행으로 가장하지 않고 foundation의 별도 encoder-decoder 과제로만
+학습합니다. 파일명은 `reasoning_*.jsonl`이고 각 행은 다음 필드를 가집니다.
+
+```json
+{
+  "prompt": "2와 3을 더하면?",
+  "think": "두 수를 순서대로 더한다.",
+  "answer": "5",
+  "language": "ko",
+  "source": "example/source",
+  "license": "Apache-2.0"
+}
+```
+
+encoder 입력은 `<reason_ko> + prompt`, decoder 정답은
+`<think> think </think> <answer> answer </answer>`입니다. 번역의 `<2xx>`나
+복원의 `<denoise_xx>`와 과제 태그가 다르므로 reasoning trace를 번역 출력으로
+학습하지 않습니다. foundation이 100% denoising으로 실행돼도 reasoning 행은
+손상시키지 않으며, trace delimiter가 잘리지 않도록 dataset 준비 단계에서
+내용만 예산에 맞춰 자릅니다.
+
+긴 trace는 짧은 복원 문장보다 decoder token을 많이 소비합니다. 그래서 기본
+혼합률은 행 기준 5%입니다.
+
+```yaml
+foundation:
+  reasoning_sample_share: 0.05
+```
+
+0이면 학습 표본에서 제외하고, 현재 안전 범위는 최대 0.10입니다. reasoning 파일의
+추가·삭제나 언어 변경은 `<reason_xx>` 및 trace 토큰 계약을 바꾸므로 토크나이저와
+foundation dataset을 다시 준비합니다. reasoning 데이터는 정답 검증과 라이선스가
+확인된 자료를 우선하며, 문맥 원문 없이 답할 수 없는 grounded QA는 넣지 않습니다.
 
 `python easy_run.py` 를 실행하면 학습 전에 보고가 나옵니다. 예를 들어 corpus를
 잘못 배치해 일본어가 누락된 경우에는 다음처럼 경고합니다.
@@ -124,7 +162,7 @@ crash를 우연히 피하려고 낮춘 값이었고 안전 경계가 아니었�
 그렇습니다. 그래서 export metadata 에 능력 계약을 적습니다.
 
 ```json
-{"release_name": "sion", "translation_capable": false, "languages": ["ko", "ja"]}
+{"release_name": "sion", "translation_capable": false, "languages": ["ko", "ja", "en"]}
 ```
 
 `language_pairs` 와 `translation_directions` 는 **적지 않습니다.** 복원 모델에게
@@ -168,6 +206,7 @@ foundation:
   minimum_characters: 8
   maximum_characters: 4000
   deduplicate: true
+  reasoning_sample_share: 0.05 # reasoning_*.jsonl 행의 목표 비중(0~0.10)
 
   noise_density: 0.15            # 복원 과제의 손상 비율
   mean_span: 3.0

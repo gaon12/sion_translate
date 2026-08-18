@@ -142,6 +142,9 @@ data:
 #   num_workers: 8           # 기본은 실제 할당 CPU/GPU 수에 맞춰 자동 결정
 
 foundation:
+  # reasoning_*.jsonl 은 prompt→delimited trace 보조 과제로 학습합니다.
+  # trace가 길어 decoder token 비중이 커지므로 행 기준 5%로 제한합니다.
+  reasoning_sample_share: 0.05
   # 번역 edge는 한↔일 그대로 두고, 영어는 encoder-decoder 복원
   # 학습에만 추가합니다. data.language_pairs에 en을 추가하면 영어 번역
   # 데이터가 없는 새 번역 방향이 생기므로 그렇게 하지 않습니다.

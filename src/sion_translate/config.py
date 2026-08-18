@@ -447,10 +447,15 @@ class FoundationConfig:
     minimum_characters: int = 8
     maximum_characters: int = 4000
     deduplicate: bool = True
+    # 구조화 reasoning 파일이 있을 때 foundation 배치에서 차지할 목표 행
+    # 비중입니다. trace는 일반 복원 target보다 길어서 작은 행 비중도 decoder
+    # token 기준으로는 충분한 보조 신호가 됩니다. 파일이 없으면 사용되지 않습니다.
+    reasoning_sample_share: float = 0.05
 
     # ── 복원 과제 ────────────────────────────────────────────────────
-    # 이 단계는 100% denoising 입니다. 번역 SFT 의 denoise_probability 와
-    # 달리 확률이 아니라 과제 자체이므로 별도 값을 두지 않습니다.
+    # 일반 단일어 행은 100% denoising 입니다. 번역 SFT 의
+    # denoise_probability와 달리 확률이 아니라 과제 자체이므로 별도 값을 두지
+    # 않습니다. reasoning_*.jsonl 행은 collator가 이 손상을 명시적으로 우회합니다.
     noise_density: float = 0.15
     mean_span: float = 3.0
 
@@ -515,6 +520,8 @@ class FoundationConfig:
             raise ValueError(
                 "foundation.maximum_characters must be greater than minimum_characters"
             )
+        if not 0.0 <= self.reasoning_sample_share <= 0.10:
+            raise ValueError("foundation.reasoning_sample_share must be in [0, 0.10]")
         if not 0.0 < self.noise_density < 1.0:
             raise ValueError("foundation.noise_density must be in (0, 1)")
         if self.mean_span <= 0:
