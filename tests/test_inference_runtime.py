@@ -204,6 +204,10 @@ def test_translator_validates_generation_lengths(monkeypatch, tmp_path: Path) ->
             target_language="ja",
             max_new_tokens=translator.model_config.max_seq_len + 1,
         )
+    with pytest.raises(ValueError, match="between 0 and 9"):
+        translator.translate(["문장"], target_language="ja", max_new_tokens=2, reasoning_level=10)
+    with pytest.raises(TypeError, match="integer from 0 to 9"):
+        translator.translate(["문장"], target_language="ja", max_new_tokens=2, reasoning_level=True)
 
 
 def test_revision_requires_exported_training_capability(monkeypatch, tmp_path: Path) -> None:
@@ -430,6 +434,7 @@ def test_translator_applies_safe_decode_limits_and_control_token_mask(
         max_output_length_ratio=2.0,
         max_output_length_margin=1,
         no_repeat_ngram_size=4,
+        reasoning_level=0,
     )
 
     # FakeTokenizer.encode()는 본문 토큰 2개를 내므로 2*2 + margin 1입니다.
@@ -440,6 +445,7 @@ def test_translator_applies_safe_decode_limits_and_control_token_mask(
     )
     assert captured["no_repeat_ngram_size"] == 4
     assert captured["min_new_tokens"] == 1
+    assert captured["reasoning_level"] == 0
     forbidden = set(captured["forbidden_token_ids"])
     assert {0, 2, 4, 5, 6, 7, 8, 9} <= forbidden
     assert 3 not in forbidden

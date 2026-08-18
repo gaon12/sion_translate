@@ -92,6 +92,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--length-penalty", type=float, default=1.0)
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument(
+        "--reasoning-level",
+        type=int,
+        choices=range(10),
+        default=0,
+        metavar="0-9",
+        help=(
+            "SSRT 선택적 검증/수정 예산 (0=직접 번역, 1-9=예산 증가; 기본 0). "
+            "evidence-repair가 학습된 체크포인트에서만 결과에 영향을 줍니다"
+        ),
+    )
+    parser.add_argument(
         "--no-repeat-ngram-size",
         type=int,
         default=4,
@@ -175,6 +186,7 @@ def main() -> None:
         top_k=args.top_k,
         no_repeat_ngram_size=args.no_repeat_ngram_size,
         max_output_length_ratio=args.max_output_length_ratio,
+        reasoning_level=args.reasoning_level,
     )
 
     if args.revise_rounds > 0:
@@ -194,6 +206,7 @@ def main() -> None:
                 num_beams=args.num_beams,
                 length_penalty=args.length_penalty,
                 max_new_tokens=args.max_new_tokens,
+                reasoning_level=args.reasoning_level,
             )
 
         results = refine_batch(

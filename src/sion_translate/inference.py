@@ -612,6 +612,7 @@ class Translator:
         no_repeat_ngram_size: int = 4,
         max_output_length_ratio: float | None = 3.0,
         max_output_length_margin: int = 16,
+        reasoning_level: int | None = None,
     ) -> list[str]:
         """문장 목록을 ``target_language`` 로 번역합니다.
 
@@ -635,6 +636,10 @@ class Translator:
 
         ``return_rerank_details`` 가 참이면 문자열 대신 ``RerankResult`` 목록을
         돌려줍니다 — 어느 후보가 왜 뽑혔는지 확인할 때 씁니다.
+
+        ``reasoning_level`` 은 SSRT의 선택적 evidence repair 예산입니다. 0은
+        auditor/repair를 완전히 우회하고, 1-9는 허용 예산을 단조롭게 늘립니다.
+        ``None``은 이전 체크포인트와 호출자의 기존 동작을 보존합니다.
 
         생성 중에는 학습 제어 토큰을 금지하고 ``no_repeat_ngram_size`` 크기의
         반복을 차단합니다. ``max_output_length_ratio``는 원문 토큰 수에 비해
@@ -667,6 +672,11 @@ class Translator:
             raise ValueError("max_output_length_ratio must be positive or None")
         if max_output_length_margin < 0:
             raise ValueError("max_output_length_margin must be non-negative")
+        if reasoning_level is not None:
+            if type(reasoning_level) is not int:
+                raise TypeError("reasoning_level must be an integer from 0 to 9 or None")
+            if not 0 <= reasoning_level <= 9:
+                raise ValueError("reasoning_level must be between 0 and 9")
         if seed is not None and sampling_seed is not None:
             raise ValueError("seed and sampling_seed are aliases; provide only one")
         resolved_seed = seed if seed is not None else sampling_seed
@@ -765,6 +775,7 @@ class Translator:
                 self.model.prepare_generation(
                     device_inputs,
                     device_mask,
+                    reasoning_level=reasoning_level,
                     **generation_features,
                 )
                 if num_candidates > 0
@@ -807,6 +818,7 @@ class Translator:
                 min_new_tokens=chunk_min_new_tokens,
                 no_repeat_ngram_size=no_repeat_ngram_size,
                 max_new_tokens_per_row=row_max_new_tokens,
+                reasoning_level=reasoning_level,
                 **({} if generation_context is not None else generation_features),
             )
             generated_rows = cast(
@@ -839,6 +851,7 @@ class Translator:
                 generator=generator,
                 generation_context=generation_context,
                 max_new_tokens_per_row=row_max_new_tokens,
+                reasoning_level=reasoning_level,
             )
             sampled_rows = cast(
                 list[list[list[int]]],
@@ -876,6 +889,7 @@ class Translator:
         length_penalty: float = 1.0,
         max_new_tokens: int = 256,
         batch_size: int = 16,
+        reasoning_level: int | None = None,
     ) -> list[str]:
         """``원문 + 초안`` 을 받아 고친 번역을 돌려줍니다.
 
@@ -928,4 +942,5 @@ class Translator:
             length_penalty=length_penalty,
             max_new_tokens=max_new_tokens,
             batch_size=batch_size,
+            reasoning_level=reasoning_level,
         )
