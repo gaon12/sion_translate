@@ -261,6 +261,13 @@ def test_export_metadata_records_evidence_and_parity_architecture() -> None:
     assert metadata["feature_flags"]["semantic_parity"] is True
 
 
+def test_export_metadata_identifies_the_public_1_0_model_generation() -> None:
+    metadata = build_export_metadata(export_config())
+
+    assert metadata["release_name"] == "sion_translate"
+    assert metadata["release_version"] == "1.0"
+
+
 def test_export_metadata_records_exact_trained_translation_directions() -> None:
     metadata = build_export_metadata(
         export_config(),

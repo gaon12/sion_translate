@@ -43,7 +43,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
-from sion_translate.artifacts import TRANSLATION_RELEASE_NAME
+from sion_translate.artifacts import MODEL_RELEASE_VERSION, TRANSLATION_RELEASE_NAME
 from sion_translate.config import ExperimentalConfig, ModelConfig
 from sion_translate.fp8 import DEFAULT_BLOCK, FORWARD_DTYPE, Fp8Policy, scale_for
 from sion_translate.fp8_runtime import apply_fp8_weights
@@ -465,6 +465,7 @@ def build_export_metadata(
     metadata: dict[str, Any] = {
         "created_unix": time.time(),
         "release_name": str(release_name),
+        "release_version": MODEL_RELEASE_VERSION,
         "translation_capable": bool(translation_capable),
     }
     if source is not None:

@@ -2,4 +2,6 @@
 
 from .config import AppConfig, ModelConfig, load_config
 
-__all__ = ["AppConfig", "ModelConfig", "load_config"]
+__version__ = "1.0.0"
+
+__all__ = ["AppConfig", "ModelConfig", "__version__", "load_config"]

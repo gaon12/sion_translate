@@ -1,4 +1,4 @@
-# sion_translate
+# sion_translate 1.0
 
 > 어느 문서를 읽어야 할지 모르겠다면 [`docs/README.md`](docs/README.md)가
 > 질문별 색인입니다.
