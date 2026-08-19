@@ -175,6 +175,7 @@ training:
 #   batch_size_per_gpu: 16   # OOM 이 나면 이 값을 낮추세요
 #   num_train_epochs: 3      # 전체 dataset을 중간 누락 없이 3회 완주
 #   ema_decay: 0.999         # 가중치 지수이동평균 (0 이면 끔; 기본 0.999 권장)
+#   early_stopping_min_epochs: 2  # 이 횟수 전에는 validation이 정체돼도 계속 학습
 #   early_stopping_patience: 5
 #   precision: bf16          # fp32 / bf16 / fp16
 #   parallel_strategy: auto  # auto / ddp / fsdp2. H100에 모델이 들어가면 DDP 우선
@@ -230,4 +231,5 @@ posttraining:
   eval_batch_size_per_gpu: 1
   eval_every: 250
   save_every: 1000
+  early_stopping_min_epochs: 2
   early_stopping_patience: 5

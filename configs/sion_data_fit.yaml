@@ -73,6 +73,7 @@ training:
   eval_every: 1000
   eval_batches: 200
   save_every: 5000
+  early_stopping_min_epochs: 2
   early_stopping_patience: 8
   early_stopping_min_delta: 0.001
   tensorboard: true
@@ -115,4 +116,5 @@ posttraining:
   eval_batch_size_per_gpu: 1
   eval_every: 250
   save_every: 1000
+  early_stopping_min_epochs: 2
   early_stopping_patience: 5

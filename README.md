@@ -20,6 +20,13 @@ foundation 단계는 `data/corpus/<언어코드>/`에 단일어 텍스트가 있
 보지 않았으므로 **번역 모델이 아니며**, `Translator`가 싣기를 거부합니다.
 자세한 내용은 [`docs/foundation-pretraining.md`](docs/foundation-pretraining.md).
 
+세 단계 모두 dataset 일부를 임의의 step 수만큼 보는 방식이 아니라, 설정된
+`num_train_epochs`만큼 전체 loader를 완주합니다. 조기 종료는 epoch 경계에서만
+판단하며 기본적으로 최소 2 epoch를 보장한 뒤 patience를 적용합니다. dropout,
+label smoothing, weight decay, 입력 증강, EMA 검증과 best 가중치 복원을 함께 써서
+학습 부족과 validation 과적합을 양쪽에서 제어합니다. `max_steps`는 디버그와 구버전
+설정 호환을 위한 명시적 override입니다.
+
 학습 데이터, 전처리 산출물, 체크포인트, 모델 가중치와 로컬 평가 결과는 Git 저장소에
 포함하지 않습니다. 사용자는 이용·가공·재배포 권한을 직접 확인한 JSONL만 준비해야
 합니다. 유지관리자가 별도로 만드는 `sion_translate.zip`은 권한 확인이 끝난 특정
