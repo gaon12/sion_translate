@@ -157,6 +157,7 @@ def build_foundation_config(config: AppConfig) -> AppConfig:
 
     training = derived.training
     training.output_dir = str(foundation_run_directory(config))
+    training.num_train_epochs = foundation.num_train_epochs
     training.max_steps = foundation.max_steps
     training.batch_size_per_gpu = foundation.batch_size_per_gpu
     training.gradient_accumulation_steps = foundation.gradient_accumulation_steps

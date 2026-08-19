@@ -503,7 +503,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--config", help=f"설정 파일 (기본: 루트의 {DEFAULT_CONFIG_FILE}, 없으면 전부 자동)"
     )
+    parser.add_argument("--epochs", type=int, help="SFT가 전체 학습 dataset을 완주할 횟수")
     parser.add_argument("--max-steps", type=int, help="최대 step 수동 지정 (자동값 무시)")
+    parser.add_argument(
+        "--posttrain-epochs", type=int, help="MRT가 전체 학습 dataset을 완주할 횟수"
+    )
     parser.add_argument("--posttrain-steps", type=int, help="MRT 사후학습 step 수동 지정")
     parser.add_argument("--skip-posttraining", action="store_true", help="SFT 사전학습까지만 실행")
     parser.add_argument(
@@ -547,10 +551,14 @@ def resolve_config(args: argparse.Namespace) -> tuple[AppConfig, dict[str, Any],
         source = "내장 기본값 (전부 자동)"
 
     # 커맨드라인 인자는 파일보다 우선하며, '사용자 지정'으로 취급합니다.
+    if args.epochs is not None:
+        raw.setdefault("training", {})["num_train_epochs"] = args.epochs
     if args.max_steps is not None:
         raw.setdefault("training", {})["max_steps"] = args.max_steps
     if args.resume_from is not None:
         raw.setdefault("training", {})["resume_from"] = args.resume_from
+    if args.posttrain_epochs is not None:
+        raw.setdefault("posttraining", {})["num_train_epochs"] = args.posttrain_epochs
     if args.posttrain_steps is not None:
         post = raw.setdefault("posttraining", {})
         post["max_steps"] = args.posttrain_steps
@@ -1554,6 +1562,7 @@ def main() -> None:
             post = config.posttraining
             post_config = copy.deepcopy(config)
             post_config.training.output_dir = str(run_root / "posttrain")
+            post_config.training.num_train_epochs = post.num_train_epochs
             post_config.training.max_steps = post.max_steps
             post_config.training.batch_size_per_gpu = post.batch_size_per_gpu
             post_config.training.gradient_accumulation_steps = post.gradient_accumulation_steps

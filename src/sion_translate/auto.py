@@ -302,19 +302,21 @@ MODEL_PRESETS: list[tuple[int, str, dict[str, int]]] = [
 TARGET_EFFECTIVE_BATCH = 256
 
 
-def target_epochs(pair_count: int) -> float:
+def target_epochs(pair_count: int) -> int:
     """corpus 통과 목표 횟수. 데이터가 커질수록 적은 epoch 으로 충분하므로
     (매 step 새 데이터를 보게 됨) step 예산이 데이터에 선형으로 폭주하지
     않도록 낮춥니다. early stopping 이 있어 넉넉해도 낭비되지 않습니다."""
     if pair_count < 500_000:
-        return 8.0
+        return 8
     if pair_count < 5_000_000:
-        return 5.0
+        return 5
     if pair_count < 30_000_000:
-        return 3.0
+        return 3
     if pair_count < 100_000_000:
-        return 2.0
-    return 1.2
+        return 2
+    # 공식 학습은 epoch 중간에서 끊지 않습니다. 초대형 corpus도 두 번은
+    # 완주해 첫 pass의 순서/초기화 편향을 다음 shuffle에서 다시 보게 합니다.
+    return 2
 
 
 def pick_vocab_size(pair_estimate: int) -> int:
@@ -442,24 +444,25 @@ def apply_auto_settings(
             f"(effective batch {effective} sequences/update)"
         )
 
-    # ── step 예산: 데이터 규모별 목표 epoch 수만큼 corpus 통과 ─────────
-    effective_batch = (
-        config.training.batch_size_per_gpu
-        * env.world_size
-        * config.training.gradient_accumulation_steps
+    # ── epoch 예산: corpus를 중간에서 자르지 않고 N번 완주 ─────────────
+    batches_per_epoch = math.ceil(
+        train_examples / max(1, config.training.batch_size_per_gpu * env.world_size)
     )
-    steps_per_epoch = max(1, train_examples // max(1, effective_batch))
+    steps_per_epoch = math.ceil(batches_per_epoch / config.training.gradient_accumulation_steps)
     epochs = target_epochs(pair_count)
-    if auto(raw_training, "max_steps"):
-        config.training.max_steps = _clamp(int(epochs * steps_per_epoch), 200, 1_000_000)
+    if auto(raw_training, "num_train_epochs") and auto(raw_training, "max_steps"):
+        config.training.num_train_epochs = epochs
+        config.training.max_steps = None
         decisions.append(
-            f"max_steps: {config.training.max_steps:,} "
-            f"(epoch당 약 {steps_per_epoch:,} step × {epochs:g}회, early stopping 있음)"
+            f"num_train_epochs: {epochs} "
+            f"(epoch당 약 {steps_per_epoch:,} optimizer step, 전체 corpus 완주 기준)"
         )
+    planned_steps = config.training.max_steps or (
+        config.training.num_train_epochs * steps_per_epoch
+    )
     if auto(raw_training, "warmup_steps"):
-        config.training.warmup_steps = _clamp(int(0.025 * config.training.max_steps), 10, 4000)
-        # warmup 은 max_steps 를 넘을 수 없습니다.
-        config.training.warmup_steps = min(config.training.warmup_steps, config.training.max_steps)
+        config.training.warmup_steps = _clamp(int(0.025 * planned_steps), 10, 4000)
+        config.training.warmup_steps = min(config.training.warmup_steps, planned_steps)
         decisions.append(f"warmup_steps: {config.training.warmup_steps:,}")
 
     # ── 검증/저장 주기: epoch 길이에 비례 ───────────────────────────────

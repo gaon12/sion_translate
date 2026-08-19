@@ -112,7 +112,8 @@ def test_auto_settings_fill_unspecified_fields() -> None:
     # effective batch 가 목표(256) 근처가 되도록 accumulation 조정
     effective = config.training.batch_size_per_gpu * 8 * config.training.gradient_accumulation_steps
     assert effective == 256
-    assert config.training.max_steps > 100_000  # 4 epoch 예산
+    assert config.training.num_train_epochs == 3
+    assert config.training.max_steps is None
     assert config.training.warmup_steps <= 4000
     config.validate()
 
@@ -282,7 +283,7 @@ def test_epoch_budget_shrinks_with_data() -> None:
     from sion_translate.auto import target_epochs
 
     assert target_epochs(100_000) > target_epochs(10_000_000) > target_epochs(200_000_000)
-    assert target_epochs(200_000_000) >= 1.0
+    assert target_epochs(200_000_000) >= 2
 
 
 def test_fingerprint_detects_data_changes(tmp_path: Path) -> None:

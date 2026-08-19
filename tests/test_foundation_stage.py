@@ -146,10 +146,18 @@ def test_the_derived_config_inherits_the_model_and_precision(tmp_path) -> None:
 
 
 def test_the_derived_config_takes_its_schedule_from_the_foundation_section(tmp_path) -> None:
-    config = _config(tmp_path, max_steps=777, learning_rate=1e-4, warmup_steps=11)
+    config = _config(
+        tmp_path,
+        num_train_epochs=4,
+        max_steps=777,
+        learning_rate=1e-4,
+        warmup_steps=11,
+    )
+    config.training.num_train_epochs = 2
     config.training.max_steps = 5
     config.training.learning_rate = 9e-9
     derived = build_foundation_config(config)
+    assert derived.training.num_train_epochs == 4
     assert derived.training.max_steps == 777
     assert derived.training.learning_rate == 1e-4
     assert derived.training.warmup_steps == 11

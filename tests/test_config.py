@@ -538,6 +538,7 @@ def test_foundation_language_keys_are_validated() -> None:
         ("noise_density", 1.0, "noise_density"),
         ("mean_span", 0.0, "mean_span"),
         ("tokenizer_sample_ratio", -0.5, "tokenizer_sample_ratio"),
+        ("num_train_epochs", 0, "num_train_epochs"),
         ("max_steps", 0, "max_steps"),
         ("learning_rate", 0.0, "learning_rate"),
         ("validation_fraction", 0.0, "validation_fraction"),
@@ -565,6 +566,15 @@ def test_foundation_warmup_cannot_exceed_its_own_step_budget() -> None:
     config.foundation.warmup_steps = 500
     with pytest.raises(ValueError, match="foundation.warmup_steps"):
         config.validate()
+
+
+def test_epoch_training_does_not_require_a_fixed_step_budget() -> None:
+    config = AppConfig()
+    config.training.max_steps = None
+    config.foundation.max_steps = None
+    config.posttraining.max_steps = None
+
+    config.validate()
 
 
 def test_foundation_export_formats_share_the_training_validator() -> None:

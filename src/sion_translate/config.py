@@ -328,7 +328,10 @@ class TrainingConfig:
     # 같은 기본값을 보고 모델을 자동으로 찾으므로 함께 움직입니다.
     output_dir: str = DEFAULT_RUN_DIRECTORY
     seed: int = 20260710
-    max_steps: int = 1000
+    # 공식 학습은 corpus를 중간에서 자르지 않고 이 횟수만큼 완주합니다.
+    # max_steps는 짧은 디버그와 구버전 설정을 위한 명시적 override입니다.
+    num_train_epochs: int = 3
+    max_steps: int | None = None
     batch_size_per_gpu: int = 8
     gradient_accumulation_steps: int = 1
     learning_rate: float = 3e-4
@@ -468,7 +471,8 @@ class FoundationConfig:
     tokenizer_sample_ratio: float = 0.4
 
     # ── 학습 ─────────────────────────────────────────────────────────
-    max_steps: int = 100_000
+    num_train_epochs: int = 3
+    max_steps: int | None = None
     batch_size_per_gpu: int = 16
     gradient_accumulation_steps: int = 1
     learning_rate: float = 3e-4
@@ -529,7 +533,7 @@ class FoundationConfig:
         if self.tokenizer_sample_ratio < 0:
             raise ValueError("foundation.tokenizer_sample_ratio must be non-negative")
         for name, value in (
-            ("max_steps", self.max_steps),
+            ("num_train_epochs", self.num_train_epochs),
             ("batch_size_per_gpu", self.batch_size_per_gpu),
             ("gradient_accumulation_steps", self.gradient_accumulation_steps),
             ("eval_every", self.eval_every),
@@ -539,12 +543,16 @@ class FoundationConfig:
         ):
             if value <= 0:
                 raise ValueError(f"foundation.{name} must be positive")
+        if self.max_steps is not None and self.max_steps <= 0:
+            raise ValueError("foundation.max_steps must be positive when specified")
         if self.learning_rate <= 0:
             raise ValueError("foundation.learning_rate must be positive")
         if not 0.0 <= self.min_learning_rate_ratio <= 1.0:
             raise ValueError("foundation.min_learning_rate_ratio must be in [0, 1]")
-        if self.warmup_steps < 0 or self.warmup_steps > self.max_steps:
-            raise ValueError("foundation.warmup_steps must be between 0 and max_steps")
+        if self.warmup_steps < 0:
+            raise ValueError("foundation.warmup_steps must be non-negative")
+        if self.max_steps is not None and self.warmup_steps > self.max_steps:
+            raise ValueError("foundation.warmup_steps cannot exceed max_steps")
         if self.early_stopping_patience < 0:
             raise ValueError("foundation.early_stopping_patience must be non-negative")
         if self.early_stopping_min_delta < 0:
@@ -560,7 +568,8 @@ class PostTrainingConfig:
 
     enabled: bool = True
     method: str = "mrt"
-    max_steps: int = 5_000
+    num_train_epochs: int = 2
+    max_steps: int | None = None
     batch_size_per_gpu: int = 1
     gradient_accumulation_steps: int = 16
     learning_rate: float = 3e-5
@@ -718,8 +727,10 @@ class AppConfig:
             raise ValueError(
                 "source_sampling_weights must have non-empty names and non-negative values"
             )
-        if self.training.max_steps <= 0:
-            raise ValueError("max_steps must be positive")
+        if self.training.num_train_epochs <= 0:
+            raise ValueError("num_train_epochs must be positive")
+        if self.training.max_steps is not None and self.training.max_steps <= 0:
+            raise ValueError("max_steps must be positive when specified")
         if self.training.batch_size_per_gpu <= 0:
             raise ValueError("batch_size_per_gpu must be positive")
         if self.training.gradient_accumulation_steps <= 0:
@@ -728,8 +739,13 @@ class AppConfig:
             raise ValueError("learning_rate must be positive")
         if not 0.0 <= self.training.min_learning_rate_ratio <= 1.0:
             raise ValueError("min_learning_rate_ratio must be in [0, 1]")
-        if self.training.warmup_steps < 0 or self.training.warmup_steps > self.training.max_steps:
-            raise ValueError("warmup_steps must be between 0 and max_steps")
+        if self.training.warmup_steps < 0:
+            raise ValueError("warmup_steps must be non-negative")
+        if (
+            self.training.max_steps is not None
+            and self.training.warmup_steps > self.training.max_steps
+        ):
+            raise ValueError("warmup_steps cannot exceed max_steps")
         if self.training.weight_decay < 0:
             raise ValueError("weight_decay must be non-negative")
         if not 0.0 <= self.training.adam_beta1 < 1.0:
@@ -778,7 +794,7 @@ class AppConfig:
         if post.method != "mrt":
             raise ValueError("posttraining.method must be 'mrt'")
         for name, value in (
-            ("max_steps", post.max_steps),
+            ("num_train_epochs", post.num_train_epochs),
             ("batch_size_per_gpu", post.batch_size_per_gpu),
             ("gradient_accumulation_steps", post.gradient_accumulation_steps),
             ("samples_per_source", post.samples_per_source),
@@ -793,6 +809,8 @@ class AppConfig:
         ):
             if value <= 0:
                 raise ValueError(f"posttraining.{name} must be positive")
+        if post.max_steps is not None and post.max_steps <= 0:
+            raise ValueError("posttraining.max_steps must be positive when specified")
         if post.samples_per_source < 2:
             raise ValueError("posttraining.samples_per_source must be at least 2")
         if post.learning_rate <= 0 or post.sampling_temperature <= 0 or post.mrt_alpha <= 0:
@@ -847,8 +865,10 @@ class AppConfig:
                 "posttraining.selection_metric must be one of: "
                 + ", ".join(sorted(supported_post_selection))
             )
-        if post.warmup_steps < 0 or post.warmup_steps > post.max_steps:
-            raise ValueError("posttraining.warmup_steps must be between 0 and max_steps")
+        if post.warmup_steps < 0:
+            raise ValueError("posttraining.warmup_steps must be non-negative")
+        if post.max_steps is not None and post.warmup_steps > post.max_steps:
+            raise ValueError("posttraining.warmup_steps cannot exceed max_steps")
         if post.early_stopping_patience < 0:
             raise ValueError("posttraining.early_stopping_patience must be non-negative")
 

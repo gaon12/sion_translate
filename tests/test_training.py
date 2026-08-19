@@ -27,6 +27,7 @@ from sion_translate.training.trainer import (
     build_optimizer_param_groups,
     cosine_scheduler,
     evaluate,
+    resolve_training_budget,
     train,
 )
 
@@ -176,6 +177,103 @@ def test_single_step_training_loop(tmp_path: Path) -> None:
         weights_only=True,
     )
     assert checkpoint["identity"]["pipeline"] == pipeline_identity
+
+
+def test_epoch_budget_traverses_every_batch_and_flushes_partial_accumulation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "sion_translate.training.trainer.export_inference_models",
+        lambda *args, **kwargs: None,
+    )
+
+    class TrackingLoader:
+        def __init__(self, batches: list[dict[str, torch.Tensor]]) -> None:
+            self.batches = batches
+            self.visits = [0] * len(batches)
+
+        def __len__(self) -> int:
+            return len(self.batches)
+
+        def __iter__(self):
+            for index, batch in enumerate(self.batches):
+                self.visits[index] += 1
+                yield batch
+
+    loader = TrackingLoader([tiny_batch(), tiny_batch(), tiny_batch()])
+    config = tiny_app_config(
+        tmp_path,
+        max_steps=None,
+        num_train_epochs=2,
+        gradient_accumulation_steps=2,
+        eval_every=1,
+        save_every=100,
+        ema_decay=0.0,
+    )
+    budget = resolve_training_budget(loader, config.training)
+    assert budget.max_optimizer_steps == 4
+    assert budget.target_epochs == 2
+
+    result = train(
+        SionForConditionalGeneration(config.model),
+        loader,
+        [tiny_batch()],
+        config,
+        DistributedContext(0, 0, 1, torch.device("cpu"), False),
+    )
+
+    assert loader.visits == [2, 2, 2]
+    assert result["step"] == 4
+    assert result["epoch"] == 2
+    assert result["stopped_early"] is False
+
+
+def test_epoch_early_stopping_waits_for_complete_epochs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "sion_translate.training.trainer.export_inference_models",
+        lambda *args, **kwargs: None,
+    )
+
+    class CountingLoader:
+        def __init__(self) -> None:
+            self.visits = 0
+
+        def __len__(self) -> int:
+            return 3
+
+        def __iter__(self):
+            for _ in range(3):
+                self.visits += 1
+                yield tiny_batch()
+
+    loader = CountingLoader()
+    config = tiny_app_config(
+        tmp_path,
+        max_steps=None,
+        num_train_epochs=5,
+        eval_every=1,
+        save_every=100,
+        ema_decay=0.0,
+        early_stopping_patience=1,
+        early_stopping_min_delta=1_000_000.0,
+    )
+    result = train(
+        SionForConditionalGeneration(config.model),
+        loader,
+        [tiny_batch()],
+        config,
+        DistributedContext(0, 0, 1, torch.device("cpu"), False),
+    )
+
+    assert loader.visits == 6
+    assert result["epoch"] == 2
+    assert result["step"] == 6
+    assert result["stopped_early"] is True
+    assert result["best_step"] == 3
 
 
 def test_intermediate_exports_advertise_only_trained_directions(

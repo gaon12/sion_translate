@@ -23,7 +23,9 @@ from __future__ import annotations
 import json
 import math
 import time
+from collections.abc import Sized
 from contextlib import nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
@@ -52,6 +54,54 @@ from .distributed import (
 from .ema import EMAWeights
 from .export import export_inference_models
 from .objectives import ObjectiveOutput
+
+
+@dataclass(frozen=True)
+class TrainingBudget:
+    """Resolved stopping budget based on either complete epochs or a step override."""
+
+    max_optimizer_steps: int
+    target_epochs: int | None
+    batches_per_epoch: int | None
+
+    @property
+    def epoch_limited(self) -> bool:
+        return self.target_epochs is not None
+
+    def should_continue(self, *, step: int, epoch: int) -> bool:
+        if self.target_epochs is not None:
+            return epoch < self.target_epochs
+        return step < self.max_optimizer_steps
+
+
+def resolve_training_budget(
+    loader: Iterable[dict[str, torch.Tensor]],
+    training: TrainingConfig,
+) -> TrainingBudget:
+    """Turn the public epoch contract into an exact optimizer-step horizon.
+
+    ``max_steps`` remains an explicit legacy/debug override. Normal training
+    requires a sized loader so it can finish every batch in every requested
+    epoch and build a scheduler with the exact number of optimizer updates.
+    """
+
+    batches_per_epoch = len(loader) if isinstance(loader, Sized) else None
+    if batches_per_epoch is not None and batches_per_epoch <= 0:
+        raise ValueError("training loader produced no batches")
+    if training.max_steps is not None:
+        return TrainingBudget(
+            max_optimizer_steps=training.max_steps,
+            target_epochs=None,
+            batches_per_epoch=batches_per_epoch,
+        )
+    if batches_per_epoch is None:
+        raise TypeError("epoch-based training requires a sized training loader")
+    updates_per_epoch = math.ceil(batches_per_epoch / training.gradient_accumulation_steps)
+    return TrainingBudget(
+        max_optimizer_steps=updates_per_epoch * training.num_train_epochs,
+        target_epochs=training.num_train_epochs,
+        batches_per_epoch=batches_per_epoch,
+    )
 
 
 def announce(message: str, context: DistributedContext) -> None:
@@ -576,6 +626,12 @@ def train(
     _fail_if_known_empty(validation_loader, "validation")
 
     training = config.training
+    budget = resolve_training_budget(train_loader, training)
+    if training.warmup_steps > budget.max_optimizer_steps:
+        raise ValueError(
+            f"warmup_steps ({training.warmup_steps}) cannot exceed the resolved training "
+            f"budget ({budget.max_optimizer_steps} optimizer steps)"
+        )
     output_dir = Path(training.output_dir)
     batch_sampler = getattr(train_loader, "batch_sampler", None)
     checkpoint_identity = build_training_checkpoint_identity(
@@ -605,7 +661,7 @@ def train(
     scheduler = cosine_scheduler(
         optimizer,
         warmup_steps=training.warmup_steps,
-        max_steps=training.max_steps,
+        max_steps=budget.max_optimizer_steps,
         min_ratio=training.min_learning_rate_ratio,
     )
     scaler = _make_grad_scaler(training, context)
@@ -932,16 +988,21 @@ def train(
         return should_stop
 
     # ── 단계 3/4: 학습 루프 ───────────────────────────────────────────────
+    target_description = (
+        f"전체 dataset {budget.target_epochs} epoch 완주"
+        if budget.target_epochs is not None
+        else f"최대 {budget.max_optimizer_steps} step override"
+    )
     announce(
-        f"단계 3/4: {stage_name} 학습 시작 (목표 {training.max_steps} step, "
-        f"현재 step {start_step}, epoch {epoch})",
+        f"단계 3/4: {stage_name} 학습 시작 (목표 {target_description}, "
+        f"현재 step {start_step}, 완료 epoch {epoch})",
         context,
     )
     model.train()
     optimizer.zero_grad(set_to_none=True)
     # 전체 학습 진행률 bar. optimizer step 단위로 1씩 증가합니다.
     progress = tqdm(
-        total=training.max_steps,
+        total=budget.max_optimizer_steps,
         initial=start_step,
         desc="학습",
         unit="step",
@@ -949,7 +1010,7 @@ def train(
         disable=not context.is_main,
     )
     try:
-        while step < training.max_steps and not stopped_early:
+        while budget.should_continue(step=step, epoch=epoch) and not stopped_early:
             # epoch 마다 sampler 의 셔플 순서를 바꿔 같은 배치 순서가 반복되지 않게 합니다.
             if hasattr(train_loader, "batch_sampler") and hasattr(
                 train_loader.batch_sampler, "set_epoch"
@@ -993,8 +1054,15 @@ def train(
                 batches_this_epoch += 1
                 batch_in_epoch += 1
                 batch = move_to_device(batch, context.device)
-                # accumulation 창의 마지막 micro-batch 에서만 gradient 를 동기화합니다.
-                is_last_micro = (micro_step + 1) % training.gradient_accumulation_steps == 0
+                # epoch의 마지막 불완전 accumulation 창도 반드시 반영합니다.
+                # 그렇지 않으면 dataset을 읽고도 마지막 배치들의 gradient가 버려집니다.
+                is_epoch_last_batch = (
+                    budget.batches_per_epoch is not None
+                    and batches_this_epoch >= budget.batches_per_epoch
+                )
+                is_last_micro = (
+                    micro_step + 1 >= training.gradient_accumulation_steps or is_epoch_last_batch
+                )
                 with maybe_no_sync(model, enabled=context.distributed and not is_last_micro):
                     with _autocast_context(training.precision, context.device):
                         if objective is None:
@@ -1080,6 +1148,7 @@ def train(
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 accumulated_local_normalizer.zero_()
+                micro_step = 0
                 if not optimizer_updated:
                     data_wait_started = time.perf_counter()
                     continue  # overflow 로 건너뛴 step 은 세지 않습니다
@@ -1172,8 +1241,10 @@ def train(
                     if context.device.type == "cuda":
                         torch.cuda.reset_peak_memory_stats(context.device)
 
-                # eval_every step 마다: 검증 + best 저장 + early stopping 판단
-                if step % training.eval_every == 0:
+                # step override는 eval_every, 공식 epoch 학습은 완주 경계에서만
+                # 검증합니다. 중간 평가가 epoch 종료 평가보다 먼저 best 기준을
+                # 바꾸면 patience가 같은 epoch 안에서 잘못 소모될 수 있습니다.
+                if not budget.epoch_limited and step % training.eval_every == 0:
                     stopped_early = validate_and_update_early_stopping()
                     if stopped_early:
                         announce(
@@ -1188,7 +1259,7 @@ def train(
                     announce(f"최신 체크포인트 저장: checkpoints/latest (step {step})", context)
                     save(output_dir / "checkpoints" / "latest")
                     export_models("latest")
-                if step >= training.max_steps:
+                if not budget.epoch_limited and step >= budget.max_optimizer_steps:
                     epoch_completed = False
                     break
                 data_wait_started = time.perf_counter()
@@ -1197,12 +1268,32 @@ def train(
             if not stopped_early and epoch_completed:
                 epoch += 1
                 batch_in_epoch = 0
+                if budget.epoch_limited:
+                    should_stop = validate_and_update_early_stopping()
+                    stopped_early = bool(
+                        should_stop
+                        and budget.target_epochs is not None
+                        and epoch < budget.target_epochs
+                    )
+                    if stopped_early:
+                        announce(
+                            f"Early stopping: {epoch}개 epoch를 완주한 뒤 "
+                            f"{bad_evals}회 연속 개선이 없어 종료합니다.",
+                            context,
+                        )
 
         # ── 단계 4/4: 마무리 저장 ─────────────────────────────────────────
         # 마지막 step 에서 검증을 아직 안 했다면 한 번 더 수행합니다.
         if last_eval_step != step:
             should_stop = validate_and_update_early_stopping()
-            stopped_early = stopped_early or (should_stop and step < training.max_steps)
+            stopped_early = stopped_early or (
+                should_stop
+                and (
+                    epoch < budget.target_epochs
+                    if budget.target_epochs is not None
+                    else step < budget.max_optimizer_steps
+                )
+            )
         announce(
             "단계 4/4: 종료 시점 모델을 저장합니다 "
             "(checkpoints/final + checkpoints/latest + exports/latest)",
