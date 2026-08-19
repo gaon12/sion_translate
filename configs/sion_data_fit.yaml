@@ -54,7 +54,7 @@ training:
   seed: 20260711
   # H100 80GB: use the headroom observed with batch 16. On 8 GPUs this remains
   # an effective batch of 256 sequences/update without an extra accumulation pass.
-  max_steps: 120000
+  num_train_epochs: 3
   batch_size_per_gpu: 32
   gradient_accumulation_steps: 1
   learning_rate: 0.0003
@@ -80,7 +80,7 @@ training:
 posttraining:
   enabled: true
   method: mrt
-  max_steps: 5000
+  num_train_epochs: 2
   batch_size_per_gpu: 4
   gradient_accumulation_steps: 4
   learning_rate: 0.00003

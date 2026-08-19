@@ -47,7 +47,7 @@ data:
 
 training:
   output_dir: runs/sion-8b
-  max_steps: 100000
+  num_train_epochs: 2
   batch_size_per_gpu: 2
   gradient_accumulation_steps: 4
   learning_rate: 0.00018

@@ -10,8 +10,8 @@
 #   - 정밀도 (bf16 지원 GPU → bf16, 아니면 fp16, CPU → fp32)
 #   - GPU당 배치 크기와 activation checkpointing (VRAM 기준),
 #     gradient accumulation (effective 256 목표)
-#   - max_steps (corpus 약 4회 통과 예산, early stopping 으로 조기 종료)
-#   - warmup / eval_every / save_every / eval_batches (step 예산에 비례)
+#   - num_train_epochs (전체 corpus 규모에 따라 2~8회 완주, epoch 경계 early stopping)
+#   - warmup / eval_every / save_every / eval_batches (계산된 step 예산에 비례)
 #   - DataLoader worker 수, DDP/FSDP2 (다중 GPU 시)
 #   - torch.compile은 GPU/컨테이너별 검증 뒤 training.compile로 명시적으로 활성화
 #
@@ -173,7 +173,7 @@ training:
   output_dir: runs/auto      # 체크포인트/로그 저장 위치
 #   learning_rate: 0.0003
 #   batch_size_per_gpu: 16   # OOM 이 나면 이 값을 낮추세요
-#   max_steps: 120000
+#   num_train_epochs: 3      # 전체 dataset을 중간 누락 없이 3회 완주
 #   ema_decay: 0.999         # 가중치 지수이동평균 (0 이면 끔; 기본 0.999 권장)
 #   early_stopping_patience: 5
 #   precision: bf16          # fp32 / bf16 / fp16
@@ -188,7 +188,7 @@ training:
 posttraining:
   enabled: true
   method: mrt
-  max_steps: 5000
+  num_train_epochs: 2
   # 후보 생성은 SFT보다 메모리 변동폭이 큽니다. micro-batch 1로 모든 VRAM
   # 등급에서 안전 여유를 두고 accumulation으로 기존 effective batch를 유지합니다.
   batch_size_per_gpu: 1

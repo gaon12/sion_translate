@@ -212,7 +212,7 @@ foundation:
   mean_span: 3.0
   tokenizer_sample_ratio: 0.4    # 0 이면 토크나이저 학습에서 단일어 제외
 
-  max_steps: 100000
+  num_train_epochs: 3             # 전체 단일어 dataset을 3회 완주
   batch_size_per_gpu: 16
   learning_rate: 0.0003
   warmup_steps: 2000
