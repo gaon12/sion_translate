@@ -255,6 +255,7 @@ def test_epoch_early_stopping_waits_for_complete_epochs(
         tmp_path,
         max_steps=None,
         num_train_epochs=5,
+        early_stopping_min_epochs=3,
         eval_every=1,
         save_every=100,
         ema_decay=0.0,
@@ -269,9 +270,9 @@ def test_epoch_early_stopping_waits_for_complete_epochs(
         DistributedContext(0, 0, 1, torch.device("cpu"), False),
     )
 
-    assert loader.visits == 6
-    assert result["epoch"] == 2
-    assert result["step"] == 6
+    assert loader.visits == 9
+    assert result["epoch"] == 3
+    assert result["step"] == 9
     assert result["stopped_early"] is True
     assert result["best_step"] == 3
 

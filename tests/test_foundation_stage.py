@@ -152,6 +152,7 @@ def test_the_derived_config_takes_its_schedule_from_the_foundation_section(tmp_p
         max_steps=777,
         learning_rate=1e-4,
         warmup_steps=11,
+        early_stopping_min_epochs=3,
     )
     config.training.num_train_epochs = 2
     config.training.max_steps = 5
@@ -159,6 +160,7 @@ def test_the_derived_config_takes_its_schedule_from_the_foundation_section(tmp_p
     derived = build_foundation_config(config)
     assert derived.training.num_train_epochs == 4
     assert derived.training.max_steps == 777
+    assert derived.training.early_stopping_min_epochs == 3
     assert derived.training.learning_rate == 1e-4
     assert derived.training.warmup_steps == 11
 

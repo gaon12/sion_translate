@@ -1272,6 +1272,7 @@ def train(
                     should_stop = validate_and_update_early_stopping()
                     stopped_early = bool(
                         should_stop
+                        and epoch >= training.early_stopping_min_epochs
                         and budget.target_epochs is not None
                         and epoch < budget.target_epochs
                     )

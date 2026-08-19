@@ -355,6 +355,8 @@ class TrainingConfig:
     eval_every: int = 250
     eval_batches: int = 20
     save_every: int = 500
+    # 초반 validation 변동으로 너무 일찍 끝나지 않도록 이만큼은 완주합니다.
+    early_stopping_min_epochs: int = 2
     early_stopping_patience: int = 5
     early_stopping_min_delta: float = 0.0
     # SFT best/early stopping 기준. 방향별 token NLL을 같은 비중으로 평균하면
@@ -481,6 +483,7 @@ class FoundationConfig:
     eval_every: int = 1_000
     eval_batches: int = 50
     save_every: int = 2_000
+    early_stopping_min_epochs: int = 2
     early_stopping_patience: int = 8
     early_stopping_min_delta: float = 0.0
     shard_size: int = 200_000
@@ -555,6 +558,10 @@ class FoundationConfig:
             raise ValueError("foundation.warmup_steps cannot exceed max_steps")
         if self.early_stopping_patience < 0:
             raise ValueError("foundation.early_stopping_patience must be non-negative")
+        if self.early_stopping_min_epochs <= 0:
+            raise ValueError("foundation.early_stopping_min_epochs must be positive")
+        if self.max_steps is None and self.early_stopping_min_epochs > self.num_train_epochs:
+            raise ValueError("foundation.early_stopping_min_epochs cannot exceed num_train_epochs")
         if self.early_stopping_min_delta < 0:
             raise ValueError("foundation.early_stopping_min_delta must be non-negative")
         if not 0.0 < self.validation_fraction < 0.5:
@@ -625,6 +632,7 @@ class PostTrainingConfig:
     eval_batch_size_per_gpu: int = 1
     eval_every: int = 250
     save_every: int = 1_000
+    early_stopping_min_epochs: int = 2
     early_stopping_patience: int = 5
 
 
@@ -774,6 +782,13 @@ class AppConfig:
                 raise ValueError(f"{name} must be positive")
         if self.training.early_stopping_patience < 0:
             raise ValueError("early_stopping_patience must be non-negative")
+        if self.training.early_stopping_min_epochs <= 0:
+            raise ValueError("early_stopping_min_epochs must be positive")
+        if (
+            self.training.max_steps is None
+            and self.training.early_stopping_min_epochs > self.training.num_train_epochs
+        ):
+            raise ValueError("early_stopping_min_epochs cannot exceed num_train_epochs")
         if self.training.early_stopping_min_delta < 0:
             raise ValueError("early_stopping_min_delta must be non-negative")
         supported_sft_selection_metrics = {
@@ -871,6 +886,12 @@ class AppConfig:
             raise ValueError("posttraining.warmup_steps cannot exceed max_steps")
         if post.early_stopping_patience < 0:
             raise ValueError("posttraining.early_stopping_patience must be non-negative")
+        if post.early_stopping_min_epochs <= 0:
+            raise ValueError("posttraining.early_stopping_min_epochs must be positive")
+        if post.max_steps is None and post.early_stopping_min_epochs > post.num_train_epochs:
+            raise ValueError(
+                "posttraining.early_stopping_min_epochs cannot exceed num_train_epochs"
+            )
 
     def validate_training_supervision(
         self,

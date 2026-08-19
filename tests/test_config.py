@@ -577,6 +577,18 @@ def test_epoch_training_does_not_require_a_fixed_step_budget() -> None:
     config.validate()
 
 
+@pytest.mark.parametrize("stage", ("training", "foundation", "posttraining"))
+def test_early_stopping_minimum_epochs_cannot_exceed_epoch_budget(stage: str) -> None:
+    config = AppConfig()
+    stage_config = getattr(config, stage)
+    stage_config.max_steps = None
+    stage_config.num_train_epochs = 2
+    stage_config.early_stopping_min_epochs = 3
+
+    with pytest.raises(ValueError, match="early_stopping_min_epochs"):
+        config.validate()
+
+
 def test_foundation_export_formats_share_the_training_validator() -> None:
     config = AppConfig()
     config.foundation.final_export_formats = ["onnx"]

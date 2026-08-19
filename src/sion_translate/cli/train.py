@@ -1570,6 +1570,7 @@ def main() -> None:
             post_config.training.warmup_steps = post.warmup_steps
             post_config.training.eval_every = post.eval_every
             post_config.training.save_every = post.save_every
+            post_config.training.early_stopping_min_epochs = post.early_stopping_min_epochs
             post_config.training.early_stopping_patience = post.early_stopping_patience
             post_config.training.resume_from = None
             post_config.training.tensorboard_dir = None

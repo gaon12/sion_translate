@@ -167,6 +167,7 @@ def build_foundation_config(config: AppConfig) -> AppConfig:
     training.eval_every = foundation.eval_every
     training.eval_batches = foundation.eval_batches
     training.save_every = foundation.save_every
+    training.early_stopping_min_epochs = foundation.early_stopping_min_epochs
     training.early_stopping_patience = foundation.early_stopping_patience
     training.early_stopping_min_delta = foundation.early_stopping_min_delta
     training.final_export_formats = list(foundation.final_export_formats)
