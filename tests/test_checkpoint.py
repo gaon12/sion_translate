@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
 import random
 from pathlib import Path
 from types import SimpleNamespace
@@ -212,6 +213,28 @@ def test_legacy_path_bearing_identity_normalizes_during_resume(tmp_path: Path) -
     legacy["data"]["config_sha256"] = "legacy-path-dependent-hash"
 
     checkpoint_module._validate_identity({"identity": legacy}, expected)
+
+
+def test_legacy_identity_accepts_only_disabled_candidate_refinement_defaults(
+    tmp_path: Path,
+) -> None:
+    expected = _identity_fixture(tmp_path / "disabled")
+    legacy = deepcopy(expected)
+    legacy_experimental = legacy["model"]["config"]["experimental"]
+    for name in tuple(legacy_experimental):
+        if name.startswith("candidate_refinement_"):
+            legacy_experimental.pop(name)
+    legacy["model"]["config_sha256"] = hashlib.sha256(
+        checkpoint_module._canonical_json(legacy["model"]["config"]).encode("utf-8")
+    ).hexdigest()
+
+    checkpoint_module._validate_identity({"identity": legacy}, expected)
+
+    enabled = deepcopy(expected)
+    enabled["model"]["config"]["experimental"]["candidate_refinement_enabled"] = True
+    enabled["model"]["config_sha256"] = "enabled-candidate-hash"
+    with pytest.raises(ValueError, match="identity does not match"):
+        checkpoint_module._validate_identity({"identity": legacy}, enabled)
 
 
 def test_checkpoint_identity_still_rejects_semantic_data_changes(tmp_path: Path) -> None:

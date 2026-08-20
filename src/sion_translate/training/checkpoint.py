@@ -279,6 +279,41 @@ def _normalize_identity_for_comparison(identity: Mapping[str, Any]) -> dict[str,
 
     payload = _json_compatible(identity)
     payload = cast(dict[str, Any], payload)
+    model_identity = payload.get("model")
+    if isinstance(model_identity, dict):
+        typed_model_identity = cast(dict[str, Any], model_identity)
+        model_config = typed_model_identity.get("config")
+        if isinstance(model_config, dict):
+            typed_model_config = cast(dict[str, Any], model_config)
+            experimental = typed_model_config.get("experimental")
+            if isinstance(experimental, dict):
+                typed_experimental = cast(dict[str, Any], experimental)
+                # Before candidate feedback existed, absence meant the exact
+                # architecture represented by today's disabled defaults. Add
+                # only those defaults; enabled=true must still mismatch. The
+                # old hash must authenticate the pre-injection config first so
+                # normalization cannot hide a corrupted identity hash.
+                candidate_defaults = (
+                    ("candidate_refinement_enabled", False),
+                    ("candidate_refinement_steps", 1),
+                    ("candidate_refinement_temperature", 1.0),
+                    ("candidate_refinement_loss_weight", 0.25),
+                    ("candidate_refinement_vocab_chunk_size", 2048),
+                )
+                missing_candidate_fields = [
+                    name for name, _ in candidate_defaults if name not in typed_experimental
+                ]
+                old_config_sha256 = hashlib.sha256(
+                    _canonical_json(typed_model_config).encode("utf-8")
+                ).hexdigest()
+                if len(missing_candidate_fields) == len(candidate_defaults) and (
+                    typed_model_identity.get("config_sha256") == old_config_sha256
+                ):
+                    for name, value in candidate_defaults:
+                        typed_experimental[name] = value
+                    typed_model_identity["config_sha256"] = hashlib.sha256(
+                        _canonical_json(typed_model_config).encode("utf-8")
+                    ).hexdigest()
     data_identity = payload.get("data")
     if not isinstance(data_identity, dict):
         return payload
