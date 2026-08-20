@@ -415,6 +415,38 @@ def _metadata_translation_capable(metadata: Mapping[str, Any]) -> bool:
     return value
 
 
+def _default_reasoning_level(model_config: ModelConfig) -> int:
+    experimental = model_config.experimental
+    return (
+        9
+        if experimental.evidence_repair_enabled or experimental.candidate_refinement_enabled
+        else 0
+    )
+
+
+def _validate_generation_defaults(
+    metadata: Mapping[str, Any],
+    model_config: ModelConfig,
+    *,
+    required: bool,
+) -> int:
+    expected = _default_reasoning_level(model_config)
+    raw_defaults = metadata.get("generation_defaults")
+    if raw_defaults is None and not required:
+        return expected
+    if not isinstance(raw_defaults, Mapping):
+        raise ValueError("generation_defaults must be an object")
+    stored_level = raw_defaults.get("reasoning_level")
+    if isinstance(stored_level, bool) or not isinstance(stored_level, int):
+        raise ValueError("generation_defaults.reasoning_level must be an integer")
+    if stored_level != expected:
+        raise ValueError(
+            "generation_defaults.reasoning_level does not match model features: "
+            f"stored={stored_level}, expected={expected}"
+        )
+    return expected
+
+
 def _metadata_revision_capability(metadata: Mapping[str, Any]) -> bool | None:
     capabilities = metadata.get("capabilities")
     if capabilities is None:
@@ -554,6 +586,7 @@ def build_export_metadata(
         "tetm": bool(experimental.tetm_enabled),
         "morphoscript": bool(experimental.morphoscript_enabled),
         "evidence_repair": bool(experimental.evidence_repair_enabled),
+        "candidate_refinement": bool(experimental.candidate_refinement_enabled),
         "semantic_parity": bool(experimental.semantic_parity_enabled),
         "situglu": bool(experimental.situglu_enabled),
         "recurrent_block": bool(
@@ -563,6 +596,9 @@ def build_export_metadata(
                 getattr(experimental, "recurrent_block_layers", 0),
             )
         ),
+    }
+    metadata["generation_defaults"] = {
+        "reasoning_level": _default_reasoning_level(model_config),
     }
     if revision_trained is not None:
         metadata["capabilities"] = {"revision_trained": bool(revision_trained)}
@@ -739,6 +775,29 @@ def _inspect_transformers_checkpoint(path: Path) -> dict[str, Any]:
         raise RuntimeError(
             "Transformers config and sion_export.json disagree about release_version"
         )
+    try:
+        transformers_reasoning_level = _validate_generation_defaults(
+            export_payload,
+            config.to_model_config(),
+            required=True,
+        )
+    except ValueError as error:
+        raise RuntimeError(str(error)) from error
+    generation_payload = json.loads((path / "generation_config.json").read_text(encoding="utf-8"))
+    if not isinstance(generation_payload, Mapping):
+        raise RuntimeError("Transformers generation_config.json must contain an object")
+    generation_reasoning_level = generation_payload.get("reasoning_level")
+    if isinstance(generation_reasoning_level, bool) or not isinstance(
+        generation_reasoning_level, int
+    ):
+        raise RuntimeError("Transformers generation_config reasoning_level must be an integer")
+    if not 0 <= generation_reasoning_level <= 9:
+        raise RuntimeError("Transformers generation_config reasoning_level must be between 0 and 9")
+    if generation_reasoning_level != transformers_reasoning_level:
+        raise RuntimeError(
+            "Transformers generation_config.json and sion_export.json disagree "
+            "about reasoning_level"
+        )
     config_translation_capable = getattr(config, "translation_capable", True)
     if not isinstance(config_translation_capable, bool):
         raise RuntimeError("Transformers config translation_capable must be a boolean")
@@ -835,6 +894,7 @@ def _inspect_transformers_checkpoint(path: Path) -> dict[str, Any]:
         "runtime_model_class": runtime_model_class,
         "release_name": config_release_name,
         "release_version": config_release_version,
+        "reasoning_level": generation_reasoning_level,
         "languages": list(config.languages),
         "language_pairs": [list(pair) for pair in config.language_pairs],
         "translation_directions": [list(direction) for direction in config.translation_directions],
@@ -1529,6 +1589,11 @@ def export_state_dict_formats(
     export_metadata["release_name"] = validated_name
     export_metadata["release_version"] = validated_version
     export_metadata["translation_capable"] = validated_capability
+    if "generation_defaults" not in export_metadata:
+        export_metadata["generation_defaults"] = {
+            "reasoning_level": _default_reasoning_level(model_config),
+        }
+    _validate_generation_defaults(export_metadata, model_config, required=True)
     export_metadata.setdefault("step", int(step))
     if tokenizer_path is not None:
         export_metadata["tokenizer"] = _file_identity(tokenizer_path)
@@ -2009,6 +2074,7 @@ def load_exported_model(
                 raise ValueError("FP8 export contains no quantized weights")
     model.eval()
     metadata = copy.deepcopy(payload.get("metadata") or {})
+    _validate_generation_defaults(metadata, config, required=False)
     if isinstance(quantization, Mapping):
         metadata.setdefault("quantization", copy.deepcopy(dict(quantization)))
     if return_metadata:
@@ -2300,6 +2366,16 @@ def validate_export_directory(
                     raise RuntimeError("Transformers release_name does not match the manifest")
                 if inspection["release_version"] != manifest_metadata.get("release_version"):
                     raise RuntimeError("Transformers release_version does not match the manifest")
+                manifest_defaults = manifest_metadata.get("generation_defaults")
+                manifest_reasoning_level = (
+                    manifest_defaults.get("reasoning_level")
+                    if isinstance(manifest_defaults, Mapping)
+                    else None
+                )
+                if inspection["reasoning_level"] != manifest_reasoning_level:
+                    raise RuntimeError(
+                        "Transformers reasoning endpoint does not match the manifest"
+                    )
                 expected_revision = _metadata_revision_capability(manifest_metadata)
                 if inspection["revision_trained"] is not expected_revision:
                     raise RuntimeError(

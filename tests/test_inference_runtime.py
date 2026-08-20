@@ -127,6 +127,7 @@ def make_translator(
             "tetm": config.experimental.tetm_enabled,
             "morphoscript": config.experimental.morphoscript_enabled,
             "evidence_repair": config.experimental.evidence_repair_enabled,
+            "candidate_refinement": config.experimental.candidate_refinement_enabled,
             "semantic_parity": config.experimental.semantic_parity_enabled,
             "situglu": config.experimental.situglu_enabled,
             "recurrent_block": False,
@@ -456,6 +457,24 @@ def test_translator_applies_safe_decode_limits_and_control_token_mask(
     forbidden = set(captured["forbidden_token_ids"])
     assert {0, 2, 4, 5, 6, 7, 8, 9, 16, 17, 18, 19, 21} <= forbidden
     assert 3 not in forbidden
+
+
+def test_translator_uses_exported_reasoning_endpoint_by_default(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    translator = make_translator(monkeypatch, tmp_path, runtime_config())
+    translator.export_metadata["generation_defaults"] = {"reasoning_level": 9}
+    captured: dict[str, object] = {}
+
+    def capture_generate(input_ids, _attention_mask, **kwargs):
+        captured.update(kwargs)
+        return torch.tensor([[2, 3]]).expand(input_ids.shape[0], -1)
+
+    monkeypatch.setattr(translator.model, "generate", capture_generate)
+    translator.translate(["문장"], target_language="ja", max_new_tokens=2)
+
+    assert captured["reasoning_level"] == 9
 
 
 def test_native_sampling_generator_is_reproducible() -> None:

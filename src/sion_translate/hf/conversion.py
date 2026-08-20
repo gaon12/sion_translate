@@ -90,6 +90,7 @@ def _copy_self_contained_runtime(output_dir: Path) -> list[str]:
     config_end = config_source.index("\n\n@dataclass\nclass DataConfig")
     native_config = (
         "from __future__ import annotations\n\n"
+        "import math\n"
         "import warnings\n"
         "from dataclasses import dataclass, field\n\n"
         f"{config_source[config_start:config_end]}\n"
@@ -344,6 +345,15 @@ def save_transformers_checkpoint(
     model.generation_config.length_penalty = 1.0
     model.generation_config.max_new_tokens = min(256, model_config.max_seq_len)
     model.generation_config.no_repeat_ngram_size = 4
+    default_reasoning_level = (
+        9
+        if model_config.experimental.evidence_repair_enabled
+        or model_config.experimental.candidate_refinement_enabled
+        else 0
+    )
+    model.generation_config.reasoning_level = (  # pyright: ignore[reportAttributeAccessIssue]
+        default_reasoning_level
+    )
     model.generation_config.suppress_tokens = _generation_suppress_tokens(
         tokenizer,
         pad_id=pad_id,
@@ -452,6 +462,9 @@ def save_transformers_checkpoint(
         "language_pairs": pairs,
         "translation_directions": directions,
         "translation_capable": translation_capable,
+        "generation_defaults": {
+            "reasoning_level": default_reasoning_level,
+        },
         "capabilities": (
             {"revision_trained": revision_trained} if revision_trained is not None else {}
         ),

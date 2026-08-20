@@ -8,6 +8,47 @@ from torch import nn
 from .layers import GQAAttention, RMSNorm
 
 
+class CandidateDistributionRefinement(nn.Module):
+    """Feed a preliminary next-token distribution back into decoder state.
+
+    The parent model computes the exact full-vocabulary embedding expectation.
+    This block fuses that dense candidate state with the decoder state and
+    produces a bounded residual update. The final LM head remains unrestricted,
+    so its winner does not have to be one of the preliminary top candidates.
+    """
+
+    def __init__(self, d_model: int, *, norm_eps: float):
+        super().__init__()
+        self.hidden_norm = RMSNorm(d_model, norm_eps)
+        self.candidate_norm = RMSNorm(d_model, norm_eps)
+        self.gate = nn.Linear(2 * d_model, d_model, bias=False)
+        self.proposal = nn.Sequential(
+            nn.Linear(2 * d_model, d_model, bias=False),
+            nn.SiLU(),
+            nn.Linear(d_model, d_model, bias=False),
+        )
+        # Exact identity at initialization keeps a new from-scratch run stable.
+        # The scalar receives a final-loss gradient immediately; the draft CE
+        # independently trains the preliminary distribution from step one.
+        self.refinement_scale = nn.Parameter(torch.zeros(1))
+
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        candidate_expectation: torch.Tensor,
+    ) -> torch.Tensor:
+        fused = torch.cat(
+            (
+                self.hidden_norm(hidden),
+                self.candidate_norm(candidate_expectation),
+            ),
+            dim=-1,
+        )
+        gate = torch.sigmoid(self.gate(fused))
+        proposal = self.proposal(fused)
+        return hidden + torch.tanh(self.refinement_scale) * gate * proposal
+
+
 class ActiveEvidenceRepair(nn.Module):
     """Uncertainty-gated source re-reading and local decoder-state repair.
 

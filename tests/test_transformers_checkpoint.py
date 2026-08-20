@@ -534,6 +534,31 @@ def test_transformers_checkpoint_preserves_source_precision(tmp_path: Path) -> N
         assert metadata["dtype"] == serialized_dtype
 
 
+def test_candidate_refinement_transformers_checkpoint_is_self_contained(
+    tmp_path: Path,
+) -> None:
+    native_config = tiny_model_config()
+    native_config.experimental.candidate_refinement_enabled = True
+    native_config.experimental.candidate_refinement_steps = 1
+    native_config.experimental.candidate_refinement_vocab_chunk_size = 16
+    native = NativeSionForConditionalGeneration(native_config, pad_id=0).eval()
+    save_transformers_checkpoint(tmp_path, native.state_dict(), native_config)
+
+    generation = json.loads((tmp_path / "generation_config.json").read_text(encoding="utf-8"))
+    metadata = json.loads((tmp_path / "sion_export.json").read_text(encoding="utf-8"))
+    assert generation["reasoning_level"] == 9
+    assert metadata["generation_defaults"]["reasoning_level"] == 9
+    restored = AutoModelForSeq2SeqLM.from_pretrained(tmp_path, trust_remote_code=True).eval()
+    assert restored.model.candidate_refinement is not None
+    input_ids = torch.tensor([[4, 5, 3]])
+    output = restored(
+        input_ids=input_ids,
+        attention_mask=input_ids.ne(0),
+        decoder_input_ids=torch.tensor([[2, 6]]),
+    )
+    assert output.logits.shape == (1, 2, native_config.vocab_size)
+
+
 def test_transformers_config_rejects_non_boolean_revision_capability() -> None:
     with pytest.raises(ValueError, match="revision_trained must be a boolean"):
         SionConfig(revision_trained="true")
@@ -628,6 +653,38 @@ def test_transformers_inspection_rejects_internal_release_disagreement(
     export_path.write_text(json.dumps(payload), encoding="utf-8")
 
     with pytest.raises(RuntimeError, match="disagree about release_version"):
+        _inspect_transformers_checkpoint(tmp_path)
+
+
+def test_transformers_inspection_rejects_tampered_reasoning_endpoint(
+    tmp_path: Path,
+) -> None:
+    config = tiny_model_config()
+    config.experimental.candidate_refinement_enabled = True
+    native = NativeSionForConditionalGeneration(config, pad_id=0)
+    save_transformers_checkpoint(tmp_path, native.state_dict(), config)
+    export_path = tmp_path / "sion_export.json"
+    payload = json.loads(export_path.read_text(encoding="utf-8"))
+    payload["generation_defaults"] = {"reasoning_level": 0}
+    export_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="does not match model features"):
+        _inspect_transformers_checkpoint(tmp_path)
+
+
+def test_transformers_inspection_rejects_tampered_generation_reasoning_endpoint(
+    tmp_path: Path,
+) -> None:
+    config = tiny_model_config()
+    config.experimental.candidate_refinement_enabled = True
+    native = NativeSionForConditionalGeneration(config, pad_id=0)
+    save_transformers_checkpoint(tmp_path, native.state_dict(), config)
+    generation_path = tmp_path / "generation_config.json"
+    payload = json.loads(generation_path.read_text(encoding="utf-8"))
+    payload["reasoning_level"] = 0
+    generation_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="disagree about reasoning_level"):
         _inspect_transformers_checkpoint(tmp_path)
 
 

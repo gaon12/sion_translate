@@ -1090,6 +1090,9 @@ def train(
                                     "evidence_request_rate",
                                     "evidence_repair_gain_loss",
                                     "evidence_repair_gain",
+                                    "candidate_refinement_loss",
+                                    "candidate_refinement_gain",
+                                    "candidate_refinement_steps",
                                     "semantic_parity_loss",
                                     "semantic_parity_score",
                                 )

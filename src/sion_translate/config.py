@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import asdict, dataclass, field
+import math
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -58,6 +59,14 @@ class ExperimentalConfig:
     evidence_budget_target: float = 0.25
     evidence_repair_gain_loss_weight: float = 0.005
     evidence_minimum_gain: float = 0.01
+    # 첫 next-token 분포 전체를 token embedding 기대값으로 압축해 decoder
+    # hidden state에 되먹인 뒤, 전체 vocabulary logits를 다시 계산합니다.
+    # 기존 checkpoint는 모듈 자체가 없도록 기본값을 꺼 둡니다.
+    candidate_refinement_enabled: bool = False
+    candidate_refinement_steps: int = 1
+    candidate_refinement_temperature: float = 1.0
+    candidate_refinement_loss_weight: float = 0.25
+    candidate_refinement_vocab_chunk_size: int = 2048
     # 원문/정답의 pooled semantic representation을 대조 학습해 직역 표면형이
     # 달라도 의미가 보존되도록 하는 보조 목적입니다.
     semantic_parity_enabled: bool = False
@@ -78,10 +87,40 @@ class ExperimentalConfig:
     situglu_up_beta: float = 25.0
 
     def validate(self) -> None:
+        if not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
+            self.candidate_refinement_enabled, bool
+        ):
+            raise ValueError("experimental.candidate_refinement_enabled must be a boolean")
+        if isinstance(self.candidate_refinement_steps, bool) or not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
+            self.candidate_refinement_steps, int
+        ):
+            raise ValueError("experimental.candidate_refinement_steps must be an integer")
+        if isinstance(self.candidate_refinement_vocab_chunk_size, bool) or not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
+            self.candidate_refinement_vocab_chunk_size, int
+        ):
+            raise ValueError(
+                "experimental.candidate_refinement_vocab_chunk_size must be an integer"
+            )
+        for name, value in (
+            ("candidate_refinement_temperature", self.candidate_refinement_temperature),
+            ("candidate_refinement_loss_weight", self.candidate_refinement_loss_weight),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))  # pyright: ignore[reportUnnecessaryIsInstance]
+                or not math.isfinite(value)
+            ):
+                raise ValueError(f"experimental.{name} must be a finite real number")
         if self.recurrent_block_layers < 0:
             raise ValueError("experimental.recurrent_block_layers must be non-negative")
         if self.recurrent_steps < 1:
             raise ValueError("experimental.recurrent_steps must be at least 1")
+        if not 1 <= self.candidate_refinement_steps <= 4:
+            raise ValueError("experimental.candidate_refinement_steps must be between 1 and 4")
+        if self.candidate_refinement_temperature <= 0:
+            raise ValueError("experimental.candidate_refinement_temperature must be positive")
+        if self.candidate_refinement_vocab_chunk_size <= 0:
+            raise ValueError("experimental.candidate_refinement_vocab_chunk_size must be positive")
         if self.situglu_gate_beta <= 0 or self.situglu_up_beta <= 0:
             raise ValueError("experimental SiTU-GLU beta values must be positive")
         if self.recurrent_block_layers and self.recurrent_steps == 1:
@@ -125,6 +164,7 @@ class ExperimentalConfig:
             ("evidence_uncertainty_loss_weight", self.evidence_uncertainty_loss_weight),
             ("evidence_budget_loss_weight", self.evidence_budget_loss_weight),
             ("evidence_repair_gain_loss_weight", self.evidence_repair_gain_loss_weight),
+            ("candidate_refinement_loss_weight", self.candidate_refinement_loss_weight),
             ("semantic_parity_loss_weight", self.semantic_parity_loss_weight),
         ):
             if value < 0:
@@ -133,6 +173,11 @@ class ExperimentalConfig:
             raise ValueError("experimental.evidence_budget_target must be in [0, 1]")
         if self.evidence_minimum_gain < 0:
             raise ValueError("experimental.evidence_minimum_gain must be non-negative")
+        if self.candidate_refinement_enabled and self.candidate_refinement_loss_weight == 0:
+            raise ValueError(
+                "experimental.candidate_refinement_loss_weight must be positive when "
+                "candidate refinement is enabled"
+            )
 
         # 모듈을 켜 두고 그 보조 손실 가중치를 모두 0으로 두면 파라미터와 순전파
         # 비용만 늘고 학습 신호는 없습니다. 조용히 낭비되므로 알려 줍니다.

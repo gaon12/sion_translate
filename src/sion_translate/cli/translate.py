@@ -95,11 +95,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--reasoning-level",
         type=int,
         choices=range(10),
-        default=0,
+        default=None,
         metavar="0-9",
         help=(
-            "SSRT 선택적 검증/수정 예산 (0=직접 번역, 1-9=예산 증가; 기본 0). "
-            "evidence-repair가 학습된 체크포인트에서만 결과에 영향을 줍니다"
+            "내부 검증/후보정제 endpoint (0=직접 번역, 1-9=설정된 반복의 "
+            "단조 단계; 반복 1이면 1-9가 동일). 생략하면 학습·검증과 같은 "
+            "checkpoint 기본 endpoint를 사용합니다"
         ),
     )
     parser.add_argument(

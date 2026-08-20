@@ -14,6 +14,7 @@ from sion_translate.config import ModelConfig
 from .experimental import (
     ActiveEvidenceRepair,
     BilingualAlignmentTransport,
+    CandidateDistributionRefinement,
     ContentRegisterState,
     MorphoScriptFusion,
     SemanticParityHead,
@@ -119,6 +120,20 @@ def _reasoning_budget(reasoning_level: int | None) -> float:
     return 1.0 if reasoning_level is None else reasoning_level / _MAX_REASONING_LEVEL
 
 
+def _candidate_refinement_steps(reasoning_level: int | None, configured_steps: int) -> int:
+    """Map the public compute level to a trained refinement endpoint."""
+
+    reasoning_level = _validate_reasoning_level(reasoning_level)
+    if reasoning_level == 0:
+        return 0
+    if reasoning_level is None:
+        return configured_steps
+    return max(
+        1,
+        (configured_steps * reasoning_level + _MAX_REASONING_LEVEL - 1) // _MAX_REASONING_LEVEL,
+    )
+
+
 @dataclass
 class SionOutput:
     """forward 결과 묶음.
@@ -149,6 +164,9 @@ class SionOutput:
     evidence_request_rate: torch.Tensor | None = None
     evidence_repair_gain_loss: torch.Tensor | None = None
     evidence_repair_gain: torch.Tensor | None = None
+    candidate_refinement_loss: torch.Tensor | None = None
+    candidate_refinement_gain: torch.Tensor | None = None
+    candidate_refinement_steps: torch.Tensor | None = None
     # Explicit SSRT request diagnostics. ``reasoning_level`` remains None for
     # legacy calls that did not opt into the new input contract.
     reasoning_level: torch.Tensor | None = None
@@ -315,6 +333,14 @@ class SionForConditionalGeneration(nn.Module):
             if exp.evidence_repair_enabled
             else None
         )
+        self.candidate_refinement: CandidateDistributionRefinement | None = (
+            CandidateDistributionRefinement(
+                config.d_model,
+                norm_eps=config.rms_norm_eps,
+            )
+            if exp.candidate_refinement_enabled
+            else None
+        )
         self.semantic_parity: SemanticParityHead | None = (
             SemanticParityHead(
                 config.d_model,
@@ -384,6 +410,8 @@ class SionForConditionalGeneration(nn.Module):
                 self.morph_gates.zero_()
             if self.evidence_repair is not None:
                 self.evidence_repair.repair_scale.zero_()
+            if self.candidate_refinement is not None:
+                self.candidate_refinement.refinement_scale.zero_()
             if self.register_state is not None:
                 self.register_state.inject_gate.zero_()
             if self.typed_memory is not None:
@@ -520,6 +548,160 @@ class SionForConditionalGeneration(nn.Module):
             reasoning_budget=_reasoning_budget(reasoning_level),
         )
 
+    def _candidate_distribution_statistics(
+        self,
+        hidden: torch.Tensor,
+        labels: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return exact full-vocabulary expectation and optional draft CE.
+
+        Vocabulary chunks bound the temporary probability/logit storage. This
+        is mathematically identical to ``softmax(logits / temperature) @ E``;
+        no top-k truncation or gradient detachment is used.
+        """
+
+        exp = self.config.experimental
+        flat_hidden = hidden.reshape(-1, hidden.shape[-1])
+        output_weight = (
+            self.lm_head.weight if self.lm_head is not None else self.token_embedding.weight
+        )
+        embedding_weight = self.token_embedding.weight
+        vocabulary_size = output_weight.shape[0]
+        chunk_size = min(exp.candidate_refinement_vocab_chunk_size, vocabulary_size)
+        row_count = flat_hidden.shape[0]
+        raw_log_normalizer = torch.full(
+            (row_count,),
+            float("-inf"),
+            device=hidden.device,
+            dtype=torch.float32,
+        )
+        logit_sum = torch.zeros_like(raw_log_normalizer)
+        target_logits = torch.zeros_like(raw_log_normalizer)
+        distribution_max = raw_log_normalizer.clone()
+        distribution_denominator = torch.zeros_like(raw_log_normalizer)
+        candidate_numerator = torch.zeros(
+            (row_count, hidden.shape[-1]),
+            device=hidden.device,
+            dtype=torch.float32,
+        )
+        flat_labels = labels.reshape(-1) if labels is not None else None
+        safe_labels = (
+            flat_labels.masked_fill(flat_labels.eq(-100), 0) if flat_labels is not None else None
+        )
+
+        for start in range(0, vocabulary_size, chunk_size):
+            stop = min(start + chunk_size, vocabulary_size)
+            chunk_logits = F.linear(flat_hidden, output_weight[start:stop]).float()
+            raw_log_normalizer = torch.logaddexp(
+                raw_log_normalizer,
+                chunk_logits.logsumexp(-1),
+            )
+            scaled_logits = chunk_logits / exp.candidate_refinement_temperature
+            chunk_max = scaled_logits.max(-1).values
+            next_distribution_max = torch.maximum(distribution_max, chunk_max)
+            previous_scale = torch.exp(distribution_max - next_distribution_max)
+            chunk_weights = torch.exp(scaled_logits - next_distribution_max[:, None])
+            distribution_denominator = (
+                distribution_denominator * previous_scale + chunk_weights.sum(-1)
+            )
+            candidate_numerator = (
+                candidate_numerator * previous_scale[:, None]
+                + chunk_weights @ embedding_weight[start:stop].float()
+            )
+            distribution_max = next_distribution_max
+            logit_sum = logit_sum + chunk_logits.sum(-1)
+            if safe_labels is not None:
+                selected_by_chunk = safe_labels.ge(start) & safe_labels.lt(stop)
+                local_labels = (safe_labels - start).clamp(0, stop - start - 1)
+                selected_logits = chunk_logits.gather(1, local_labels[:, None]).squeeze(1)
+                target_logits = torch.where(
+                    selected_by_chunk,
+                    selected_logits,
+                    target_logits,
+                )
+
+        candidate_expectation = (
+            (
+                candidate_numerator
+                / distribution_denominator.clamp_min(torch.finfo(torch.float32).tiny)[:, None]
+            )
+            .reshape_as(hidden)
+            .to(hidden.dtype)
+        )
+
+        if flat_labels is None:
+            token_nll = raw_log_normalizer.new_zeros(hidden.shape[:-1])
+            return candidate_expectation, hidden.new_zeros(()), token_nll
+        valid = flat_labels.ne(-100)
+        token_nll_flat = raw_log_normalizer - target_logits
+        smooth_loss = raw_log_normalizer - logit_sum / vocabulary_size
+        draft_loss_values = (
+            1.0 - self.config.label_smoothing
+        ) * token_nll_flat + self.config.label_smoothing * smooth_loss
+        draft_loss_sum = (draft_loss_values * valid.to(dtype=draft_loss_values.dtype)).sum()
+        token_nll = torch.where(valid, token_nll_flat, torch.zeros_like(token_nll_flat))
+        return (
+            candidate_expectation,
+            draft_loss_sum,
+            token_nll.reshape(hidden.shape[:-1]).detach(),
+        )
+
+    def _candidate_refinement_step(
+        self,
+        hidden: torch.Tensor,
+        labels: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        assert self.candidate_refinement is not None
+        candidate_expectation, draft_loss_sum, token_nll = self._candidate_distribution_statistics(
+            hidden, labels
+        )
+        return (
+            self.candidate_refinement(hidden, candidate_expectation),
+            draft_loss_sum,
+            token_nll,
+        )
+
+    def _apply_candidate_refinement(
+        self,
+        hidden: torch.Tensor,
+        labels: torch.Tensor | None,
+        *,
+        reasoning_level: int | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, int]:
+        steps = (
+            _candidate_refinement_steps(
+                reasoning_level,
+                self.config.experimental.candidate_refinement_steps,
+            )
+            if self.candidate_refinement is not None
+            else 0
+        )
+        draft_loss_sum = hidden.new_zeros(())
+        first_token_nll: torch.Tensor | None = None
+
+        def refinement_step(
+            states: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            return self._candidate_refinement_step(states, labels)
+
+        for _ in range(steps):
+            if self.training and torch.is_grad_enabled():
+                refined = cast(
+                    tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+                    checkpoint(
+                        refinement_step,
+                        hidden,
+                        use_reentrant=False,
+                    ),
+                )
+            else:
+                refined = self._candidate_refinement_step(hidden, labels)
+            hidden, step_loss_sum, token_nll = refined
+            draft_loss_sum = draft_loss_sum + step_loss_sum
+            if first_token_nll is None and labels is not None:
+                first_token_nll = token_nll
+        return hidden, draft_loss_sum, first_token_nll, steps
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -544,7 +726,16 @@ class SionForConditionalGeneration(nn.Module):
         # forward에서는 의미가 없지만 batch를 그대로 전달할 수 있게 받습니다.
         del source_language_tag_ids, reverse_direction_trained
         reasoning_level = _validate_reasoning_level(reasoning_level)
-        reasoning_is_active = self.evidence_repair is not None and reasoning_level != 0
+        evidence_reasoning_is_active = self.evidence_repair is not None and reasoning_level != 0
+        configured_candidate_steps = (
+            _candidate_refinement_steps(
+                reasoning_level,
+                self.config.experimental.candidate_refinement_steps,
+            )
+            if self.candidate_refinement is not None
+            else 0
+        )
+        reasoning_is_active = evidence_reasoning_is_active or configured_candidate_steps > 0
         encoder_states = self.encode(
             input_ids,
             attention_mask,
@@ -574,7 +765,7 @@ class SionForConditionalGeneration(nn.Module):
         )
         pre_repair_error_targets = None
         pre_repair_token_nll = None
-        if labels is not None and reasoning_is_active:
+        if labels is not None and evidence_reasoning_is_active:
             # Supervise "should I re-read?" from the base decoder, before the
             # request itself can change the answer. A post-repair target is
             # self-negating: once a useful repair fixes a token it would teach
@@ -597,6 +788,16 @@ class SionForConditionalGeneration(nn.Module):
             attention_mask,
             reasoning_level=reasoning_level,
         )
+        (
+            decoder_states,
+            candidate_draft_loss_sum,
+            pre_refinement_token_nll,
+            applied_candidate_steps,
+        ) = self._apply_candidate_refinement(
+            decoder_states,
+            labels,
+            reasoning_level=reasoning_level,
+        )
         logits = self._logits(decoder_states)
 
         requested_level = (
@@ -606,6 +807,7 @@ class SionForConditionalGeneration(nn.Module):
         )
         reasoning_budget = logits.new_tensor(_reasoning_budget(reasoning_level))
         reasoning_active = logits.new_tensor(reasoning_is_active)
+        candidate_steps_tensor = logits.new_tensor(applied_candidate_steps, dtype=torch.long)
 
         if labels is None:
             request_rate = evidence_requests.mean() if evidence_requests is not None else None
@@ -617,6 +819,7 @@ class SionForConditionalGeneration(nn.Module):
                 reasoning_level=requested_level,
                 reasoning_budget=reasoning_budget,
                 reasoning_active=reasoning_active,
+                candidate_refinement_steps=candidate_steps_tensor,
             )
         # label 이 -100 인 위치(패딩)는 loss 계산에서 제외합니다.
         token_count = labels.ne(-100).sum()
@@ -670,6 +873,8 @@ class SionForConditionalGeneration(nn.Module):
         evidence_request_rate = logits.new_zeros(())
         evidence_repair_gain_loss = logits.new_zeros(())
         evidence_repair_gain = logits.new_zeros(())
+        candidate_refinement_loss = logits.new_zeros(())
+        candidate_refinement_gain = logits.new_zeros(())
         semantic_parity_loss = logits.new_zeros(())
         semantic_parity_score = logits.new_zeros(())
         exp = self.config.experimental
@@ -692,6 +897,14 @@ class SionForConditionalGeneration(nn.Module):
             auxiliary_loss = auxiliary_loss + exp.bats_coverage_weight * coverage_loss
 
         target_mask = labels.ne(-100)
+        final_token_nll = None
+        if evidence_requests is not None or applied_candidate_steps:
+            final_token_nll = F.cross_entropy(
+                float_logits.transpose(1, 2),
+                labels,
+                ignore_index=-100,
+                reduction="none",
+            )
         if uncertainty_logits is not None and evidence_requests is not None:
             assert pre_repair_error_targets is not None
             assert pre_repair_token_nll is not None
@@ -714,13 +927,13 @@ class SionForConditionalGeneration(nn.Module):
                 ).square()
                 * has_target
             )
-            post_repair_token_nll = F.cross_entropy(
-                float_logits.transpose(1, 2),
-                labels,
-                ignore_index=-100,
-                reduction="none",
+            assert final_token_nll is not None
+            post_evidence_token_nll = (
+                pre_refinement_token_nll
+                if pre_refinement_token_nll is not None
+                else final_token_nll.detach()
             )
-            token_gain = (pre_repair_token_nll - post_repair_token_nll).detach()
+            token_gain = (pre_repair_token_nll - post_evidence_token_nll).detach()
             evidence_repair_gain = (token_gain * valid).sum() / valid.sum().clamp_min(1.0)
             unproductive_request_cost = F.relu(exp.evidence_minimum_gain - token_gain)
             evidence_repair_gain_loss = (
@@ -734,6 +947,19 @@ class SionForConditionalGeneration(nn.Module):
             )
             auxiliary_loss = auxiliary_loss + (
                 exp.evidence_repair_gain_loss_weight * evidence_repair_gain_loss
+            )
+
+        if applied_candidate_steps:
+            assert pre_refinement_token_nll is not None
+            assert final_token_nll is not None
+            candidate_refinement_loss = candidate_draft_loss_sum / (
+                token_count.clamp_min(1) * applied_candidate_steps
+            )
+            valid = target_mask.to(logits.dtype)
+            refinement_gain = (pre_refinement_token_nll - final_token_nll.detach()) * valid
+            candidate_refinement_gain = refinement_gain.sum() / valid.sum().clamp_min(1.0)
+            auxiliary_loss = auxiliary_loss + (
+                exp.candidate_refinement_loss_weight * candidate_refinement_loss
             )
 
         if self.semantic_parity is not None:
@@ -763,6 +989,9 @@ class SionForConditionalGeneration(nn.Module):
             evidence_request_rate=evidence_request_rate,
             evidence_repair_gain_loss=evidence_repair_gain_loss,
             evidence_repair_gain=evidence_repair_gain,
+            candidate_refinement_loss=candidate_refinement_loss,
+            candidate_refinement_gain=candidate_refinement_gain,
+            candidate_refinement_steps=candidate_steps_tensor,
             reasoning_level=requested_level,
             reasoning_budget=reasoning_budget,
             reasoning_active=reasoning_active,
@@ -817,6 +1046,11 @@ class SionForConditionalGeneration(nn.Module):
             encoder_states,
             source_mask,
             evidence_key_value=evidence_key_value,
+            reasoning_level=reasoning_level,
+        )
+        hidden, _, _, _ = self._apply_candidate_refinement(
+            hidden,
+            None,
             reasoning_level=reasoning_level,
         )
         return hidden

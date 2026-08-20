@@ -346,6 +346,7 @@ class Translator:
                 "tetm": bool(experimental.tetm_enabled),
                 "morphoscript": bool(experimental.morphoscript_enabled),
                 "evidence_repair": bool(experimental.evidence_repair_enabled),
+                "candidate_refinement": bool(experimental.candidate_refinement_enabled),
                 "semantic_parity": bool(experimental.semantic_parity_enabled),
                 "situglu": bool(experimental.situglu_enabled),
                 "recurrent_block": bool(experimental.recurrent_block_layers),
@@ -637,9 +638,10 @@ class Translator:
         ``return_rerank_details`` 가 참이면 문자열 대신 ``RerankResult`` 목록을
         돌려줍니다 — 어느 후보가 왜 뽑혔는지 확인할 때 씁니다.
 
-        ``reasoning_level`` 은 SSRT의 선택적 evidence repair 예산입니다. 0은
-        auditor/repair를 완전히 우회하고, 1-9는 허용 예산을 단조롭게 늘립니다.
-        ``None``은 이전 체크포인트와 호출자의 기존 동작을 보존합니다.
+        ``reasoning_level`` 은 선택적 evidence repair와 후보분포 정제 계산량입니다.
+        0은 두 경로를 완전히 우회하고, 1-9는 설정된 반복 endpoint를 단조롭게
+        선택합니다(반복이 하나면 1-9가 같습니다). ``None``은 학습·검증에서
+        사용한 checkpoint 기본값을 적용합니다.
 
         생성 중에는 학습 제어 토큰을 금지하고 ``no_repeat_ngram_size`` 크기의
         반복을 차단합니다. ``max_output_length_ratio``는 원문 토큰 수에 비해
@@ -677,6 +679,20 @@ class Translator:
                 raise TypeError("reasoning_level must be an integer from 0 to 9 or None")
             if not 0 <= reasoning_level <= 9:
                 raise ValueError("reasoning_level must be between 0 and 9")
+        else:
+            generation_defaults = self.export_metadata.get("generation_defaults")
+            if isinstance(generation_defaults, Mapping):
+                typed_generation_defaults = cast(Mapping[object, object], generation_defaults)
+                stored_level: object = typed_generation_defaults.get("reasoning_level")
+                if isinstance(stored_level, bool) or not isinstance(stored_level, int):
+                    raise ValueError(
+                        "model generation_defaults.reasoning_level must be an integer from 0 to 9"
+                    )
+                if not 0 <= stored_level <= 9:
+                    raise ValueError(
+                        "model generation_defaults.reasoning_level must be between 0 and 9"
+                    )
+                reasoning_level = stored_level
         if seed is not None and sampling_seed is not None:
             raise ValueError("seed and sampling_seed are aliases; provide only one")
         resolved_seed = seed if seed is not None else sampling_seed

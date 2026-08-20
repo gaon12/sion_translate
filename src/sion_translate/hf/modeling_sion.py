@@ -483,6 +483,14 @@ class SionForConditionalGeneration(PreTrainedModel, GenerationMixin):
             configured_value = getattr(active_generation_config, name, None)
             return fallback if configured_value is None else configured_value
 
+        configured_reasoning_level = configured(
+            reasoning_level,
+            "reasoning_level",
+            None,
+        )
+        reasoning_level = (
+            None if configured_reasoning_level is None else int(configured_reasoning_level)
+        )
         explicit_num_beams = num_beams is not None
         explicit_do_sample = do_sample is not None
         num_beams = int(configured(num_beams, "num_beams", 1))

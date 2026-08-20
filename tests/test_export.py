@@ -253,12 +253,49 @@ def test_export_metadata_records_tokenizer_hash(tmp_path: Path) -> None:
 def test_export_metadata_records_evidence_and_parity_architecture() -> None:
     config = export_config()
     config.experimental.evidence_repair_enabled = True
+    config.experimental.candidate_refinement_enabled = True
     config.experimental.semantic_parity_enabled = True
 
     metadata = build_export_metadata(config)
 
     assert metadata["feature_flags"]["evidence_repair"] is True
+    assert metadata["feature_flags"]["candidate_refinement"] is True
     assert metadata["feature_flags"]["semantic_parity"] is True
+    assert metadata["generation_defaults"]["reasoning_level"] == 9
+
+
+def test_export_rejects_a_reasoning_endpoint_that_bypasses_trained_refinement(
+    tmp_path: Path,
+) -> None:
+    config = export_config()
+    config.experimental.candidate_refinement_enabled = True
+    model = SionForConditionalGeneration(config)
+    metadata = build_export_metadata(config)
+    metadata["generation_defaults"] = {"reasoning_level": 0}
+
+    with pytest.raises(ValueError, match="does not match model features"):
+        export_state_dict_formats(
+            tmp_path,
+            model.state_dict(),
+            config,
+            0,
+            formats=("fp32",),
+            metadata=metadata,
+        )
+
+
+def test_native_loader_rejects_tampered_reasoning_endpoint(tmp_path: Path) -> None:
+    config = export_config()
+    config.experimental.candidate_refinement_enabled = True
+    model = SionForConditionalGeneration(config)
+    export_state_dict_formats(tmp_path, model.state_dict(), config, 0, formats=("fp32",))
+    payload = torch.load(tmp_path / "model.pt", weights_only=True)
+    payload["metadata"]["generation_defaults"] = {"reasoning_level": 0}
+    tampered = tmp_path / "tampered.pt"
+    torch.save(payload, tampered)
+
+    with pytest.raises(ValueError, match="does not match model features"):
+        load_exported_model(tampered)
 
 
 def test_export_metadata_identifies_the_target_1_5_model_generation() -> None:
