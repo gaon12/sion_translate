@@ -452,6 +452,7 @@ def build_export_metadata(
     step: int | None = None,
     source: str | Path | None = None,
     release_name: str = TRANSLATION_RELEASE_NAME,
+    release_version: str = MODEL_RELEASE_VERSION,
     translation_capable: bool = True,
 ) -> dict[str, Any]:
     """Build provenance and compatibility metadata shared by every format.
@@ -461,15 +462,24 @@ def build_export_metadata(
     그대로 실으면 방향 태그를 받아들이고 그럴듯한 쓰레기를 냅니다.
     """
 
+    release_name = str(release_name).strip()
+    release_version = str(release_version).strip()
+    if not release_name:
+        raise ValueError("release_name must be a non-empty string")
+    if not release_version:
+        raise ValueError("release_version must be a non-empty string")
+
     experimental = model_config.experimental
     metadata: dict[str, Any] = {
         "created_unix": time.time(),
-        "release_name": str(release_name),
-        "release_version": MODEL_RELEASE_VERSION,
+        "release_name": release_name,
+        "release_version": release_version,
         "translation_capable": bool(translation_capable),
     }
     if source is not None:
-        metadata["source"] = str(Path(source))
+        # Export metadata may be published. Preserve a content-addressed source
+        # identity without leaking a workstation or mounted-volume path.
+        metadata["source"] = _file_identity(source)
     if step is not None:
         metadata["step"] = int(step)
     if tokenizer_path is not None:
@@ -684,6 +694,21 @@ def _inspect_transformers_checkpoint(path: Path) -> dict[str, Any]:
 
     remote_config_class = load_remote_class("AutoConfig", auto_map)
     config = remote_config_class.from_pretrained(path)
+    config_release_name = getattr(config, "release_name", None)
+    config_release_version = getattr(config, "release_version", None)
+    if not isinstance(config_release_name, str) or not config_release_name.strip():
+        raise RuntimeError("Transformers config release_name must be a non-empty string")
+    if not isinstance(config_release_version, str) or not config_release_version.strip():
+        raise RuntimeError("Transformers config release_version must be a non-empty string")
+    export_payload = json.loads((path / "sion_export.json").read_text(encoding="utf-8"))
+    if not isinstance(export_payload, Mapping):
+        raise RuntimeError("Transformers sion_export.json must contain an object")
+    if export_payload.get("release_name") != config_release_name:
+        raise RuntimeError("Transformers config and sion_export.json disagree about release_name")
+    if export_payload.get("release_version") != config_release_version:
+        raise RuntimeError(
+            "Transformers config and sion_export.json disagree about release_version"
+        )
     config_translation_capable = getattr(config, "translation_capable", True)
     if not isinstance(config_translation_capable, bool):
         raise RuntimeError("Transformers config translation_capable must be a boolean")
@@ -778,6 +803,8 @@ def _inspect_transformers_checkpoint(path: Path) -> dict[str, Any]:
         "dtypes": sorted(dtypes),
         "model_type": config.model_type,
         "runtime_model_class": runtime_model_class,
+        "release_name": config_release_name,
+        "release_version": config_release_version,
         "languages": list(config.languages),
         "language_pairs": [list(pair) for pair in config.language_pairs],
         "translation_directions": [list(direction) for direction in config.translation_directions],
@@ -799,6 +826,8 @@ def _write_transformers_checkpoint(
     translation_directions: Sequence[Sequence[str]],
     translation_capable: bool,
     revision_trained: bool | None,
+    release_name: str,
+    release_version: str,
 ) -> dict[str, Any]:
     from sion_translate.hf.conversion import save_transformers_checkpoint
 
@@ -816,9 +845,15 @@ def _write_transformers_checkpoint(
             translation_directions=translation_directions,
             translation_capable=translation_capable,
             revision_trained=revision_trained,
+            release_name=release_name,
+            release_version=release_version,
             allow_language_subset=not bool(language_pairs),
         )
         inspection = _inspect_transformers_checkpoint(temporary)
+        if inspection["release_name"] != release_name:
+            raise RuntimeError("Transformers checkpoint release_name changed during export")
+        if inspection["release_version"] != release_version:
+            raise RuntimeError("Transformers checkpoint release_version changed during export")
         _atomic_replace_directory(temporary, path)
         return inspection
     finally:
@@ -1629,6 +1664,8 @@ def export_state_dict_formats(
                     translation_directions=resolved_translation_directions,
                     translation_capable=resolved_translation_capable,
                     revision_trained=_metadata_revision_capability(export_metadata),
+                    release_name=str(export_metadata["release_name"]),
+                    release_version=str(export_metadata["release_version"]),
                 )
                 details = {
                     "dtype": (
@@ -1705,6 +1742,7 @@ def convert_export(
     int4_backend: str = "auto",
     fp8_policy: Fp8Policy | None = None,
     release_name: str | None = None,
+    release_version: str | None = None,
     translation_capable: bool | None = None,
     llama_quantize: str | Path | None = None,
 ) -> dict[str, Any]:
@@ -1734,6 +1772,11 @@ def convert_export(
         str(release_name)
         if release_name is not None
         else str(inherited.get("release_name", TRANSLATION_RELEASE_NAME))
+    )
+    resolved_release_version = (
+        str(release_version)
+        if release_version is not None
+        else str(inherited.get("release_version", MODEL_RELEASE_VERSION))
     )
     resolved_translation_capable = (
         translation_capable
@@ -1775,6 +1818,7 @@ def convert_export(
         step=step,
         source=source,
         release_name=resolved_release_name,
+        release_version=resolved_release_version,
         translation_capable=resolved_translation_capable,
     )
     if tokenizer_path is None and inherited.get("tokenizer"):
@@ -2125,6 +2169,10 @@ def validate_export_directory(directory: str | Path) -> dict[str, Any]:
                     raise RuntimeError(
                         "Transformers translation capability does not match the manifest"
                     )
+                if inspection["release_name"] != manifest_metadata.get("release_name"):
+                    raise RuntimeError("Transformers release_name does not match the manifest")
+                if inspection["release_version"] != manifest_metadata.get("release_version"):
+                    raise RuntimeError("Transformers release_version does not match the manifest")
                 expected_revision = _metadata_revision_capability(manifest_metadata)
                 if inspection["revision_trained"] is not expected_revision:
                     raise RuntimeError(

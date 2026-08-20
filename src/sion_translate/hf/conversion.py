@@ -14,6 +14,10 @@ from typing import Sequence
 import numpy as np
 import torch
 
+from sion_translate.artifacts import (
+    MODEL_RELEASE_VERSION,
+    TRANSLATION_RELEASE_NAME,
+)
 from sion_translate.config import ModelConfig
 from sion_translate.tokenizer import (
     OPTIONAL_CONTROL_SYMBOLS,
@@ -252,6 +256,8 @@ def save_transformers_checkpoint(
     languages: Sequence[str] | None = None,
     language_pairs: Sequence[Sequence[str]] | None = None,
     translation_directions: Sequence[Sequence[str]] | None = None,
+    release_name: str = TRANSLATION_RELEASE_NAME,
+    release_version: str = MODEL_RELEASE_VERSION,
     translation_capable: bool = True,
     revision_trained: bool | None = None,
     allow_language_subset: bool = False,
@@ -318,6 +324,8 @@ def save_transformers_checkpoint(
         languages=list(languages or []),
         language_pairs=pairs,
         translation_directions=directions,
+        release_name=release_name,
+        release_version=release_version,
         translation_capable=translation_capable,
         revision_trained=revision_trained,
         slot_token_ids=slot_token_ids,
@@ -438,6 +446,8 @@ def save_transformers_checkpoint(
     metadata = {
         "format": "transformers-safetensors-v1",
         "dtype": str(export_dtype).removeprefix("torch."),
+        "release_name": config.release_name,
+        "release_version": config.release_version,
         "languages": list(languages or []),
         "language_pairs": pairs,
         "translation_directions": directions,

@@ -59,6 +59,8 @@ class SionConfig(PretrainedConfig):
         languages: list[str] | tuple[str, ...] | None = None,
         language_pairs: list[list[str]] | tuple[tuple[str, str], ...] | None = None,
         translation_directions: list[list[str]] | tuple[tuple[str, str], ...] | None = None,
+        release_name: str | None = None,
+        release_version: str | None = None,
         translation_capable: bool = True,
         revision_trained: bool | None = None,
         slot_token_ids: list[int] | tuple[int, ...] | None = None,
@@ -119,6 +121,8 @@ class SionConfig(PretrainedConfig):
                 for direction in (pair, list(reversed(pair)))
             ]
         )
+        self.release_name = release_name
+        self.release_version = release_version
         if not isinstance(translation_capable, bool):  # pyright: ignore[reportUnnecessaryIsInstance]
             raise ValueError("translation_capable must be a boolean")
         self.translation_capable = translation_capable
@@ -147,6 +151,11 @@ class SionConfig(PretrainedConfig):
 
     def validate(self) -> None:
         self.to_model_config().validate()
+        release_identity = (self.release_name, self.release_version)
+        if (self.release_name is None) != (self.release_version is None):
+            raise ValueError("release_name and release_version must be provided together")
+        if any(value is not None and not str(value).strip() for value in release_identity):
+            raise ValueError("release_name and release_version must be non-empty strings")
         if self.pad_token_id is None or self.pad_token_id < 0:
             raise ValueError("pad_token_id must be a non-negative integer")
         for name in ("bos_token_id", "eos_token_id", "decoder_start_token_id"):
@@ -232,6 +241,8 @@ class SionConfig(PretrainedConfig):
         languages: list[str] | tuple[str, ...] | None = None,
         language_pairs: list[list[str]] | tuple[tuple[str, str], ...] | None = None,
         translation_directions: list[list[str]] | tuple[tuple[str, str], ...] | None = None,
+        release_name: str | None = None,
+        release_version: str | None = None,
         translation_capable: bool = True,
         revision_trained: bool | None = None,
         slot_token_ids: list[int] | tuple[int, ...] | None = None,
@@ -249,6 +260,8 @@ class SionConfig(PretrainedConfig):
             languages=languages,
             language_pairs=language_pairs,
             translation_directions=translation_directions,
+            release_name=release_name,
+            release_version=release_version,
             translation_capable=translation_capable,
             revision_trained=revision_trained,
             slot_token_ids=slot_token_ids,

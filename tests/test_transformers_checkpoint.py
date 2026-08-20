@@ -237,6 +237,8 @@ def test_transformers_checkpoint_auto_classes_and_safe_weights(
     assert remote_tokenizer.__class__.__module__.startswith("transformers_modules.")
     assert remote_model.model.__class__.__module__.startswith("transformers_modules.")
     assert remote_model.config.revision_trained is True
+    assert remote_model.config.release_name == "sion_translate"
+    assert remote_model.config.release_version == "1.5"
     assert remote_model.config.slot_token_ids == tokenizer.slot_ids
     assert remote_model.config.token_features_shapes == {
         "script": [len(tokenizer)],
@@ -264,6 +266,8 @@ def test_transformers_checkpoint_auto_classes_and_safe_weights(
     assert local_config.revision_trained is True
     export_metadata = json.loads((output_dir / "sion_export.json").read_text(encoding="utf-8"))
     assert export_metadata["capabilities"]["revision_trained"] is True
+    assert export_metadata["release_name"] == "sion_translate"
+    assert export_metadata["release_version"] == "1.5"
 
     for text in (
         "  앞뒤 공백  ",
@@ -765,6 +769,7 @@ def test_foundation_conversion_preserves_release_and_rejects_translation(
 
     assert converted["metadata"]["release_name"] == "sion"
     assert converted["metadata"]["translation_capable"] is False
+    assert converted["metadata"]["release_version"] == "1.5"
     assert converted["metadata"]["languages"] == ["ko", "ja", "en"]
     checkpoint = tmp_path / "foundation-transformers" / converted["formats"]["transformers"]["file"]
     restored = AutoTokenizer.from_pretrained(checkpoint, trust_remote_code=True)

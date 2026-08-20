@@ -327,6 +327,37 @@ def test_conversion_inherits_source_tokenizer_hash_when_path_is_omitted(
     assert "tokenizer_path" in entry["message"]
 
 
+def test_conversion_preserves_old_model_generation_and_redacts_source_path(
+    tmp_path: Path,
+) -> None:
+    config = export_config()
+    model = SionForConditionalGeneration(config)
+    source_dir = tmp_path / "old-generation"
+    export_state_dict_formats(
+        source_dir,
+        model.state_dict(),
+        config,
+        0,
+        formats=("fp32",),
+        metadata=build_export_metadata(config, release_version="1.0"),
+    )
+    source = source_dir / "model.pt"
+
+    converted = convert_export(
+        source,
+        tmp_path / "converted",
+        formats=("fp16",),
+    )
+
+    assert converted["metadata"]["release_version"] == "1.0"
+    assert converted["metadata"]["source"] == {
+        "filename": source.name,
+        "size": source.stat().st_size,
+        "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+    }
+    assert str(tmp_path) not in json.dumps(converted["metadata"])
+
+
 def test_transformers_directory_hash_is_deterministic_and_tamper_evident(
     tmp_path: Path,
 ) -> None:
