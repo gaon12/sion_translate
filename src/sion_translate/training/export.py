@@ -52,6 +52,7 @@ from sion_translate.artifacts import (
 from sion_translate.config import ExperimentalConfig, ModelConfig
 from sion_translate.fp8 import DEFAULT_BLOCK, FORWARD_DTYPE, Fp8Policy, scale_for
 from sion_translate.fp8_runtime import apply_fp8_weights
+from sion_translate.locking import artifact_lock
 from sion_translate.model import SionForConditionalGeneration
 from sion_translate.model.layers import RotaryEmbedding, SwiGLU
 
@@ -88,6 +89,7 @@ _PRECISION_DTYPES = {
     "bf16": torch.bfloat16,
 }
 _INT4_GROUP_SIZE = 128
+_EXPORT_LOCK_TIMEOUT_SECONDS = 60.0
 
 
 @contextmanager
@@ -616,6 +618,21 @@ def _remove_artifact(path: Path) -> None:
         path.unlink(missing_ok=True)
 
 
+def _remove_staging_artifact(path: Path) -> None:
+    """Remove staging, tolerating only a locked and already-empty shell."""
+
+    try:
+        _remove_artifact(path)
+    except OSError:
+        if path.is_dir() and not path.is_symlink():
+            try:
+                if next(path.iterdir(), None) is None:
+                    return
+            except OSError:
+                pass
+        raise
+
+
 def _install_directory(temporary: Path, destination: Path) -> None:
     """staging 디렉터리를 목적지 자리에 설치한다.
 
@@ -643,18 +660,32 @@ def _install_directory(temporary: Path, destination: Path) -> None:
         if not temporary.is_dir():
             raise
 
-    destination.mkdir(parents=True, exist_ok=True)
-    for child in list(temporary.iterdir()):
-        os.replace(child, destination / child.name)
+    # Never expose a partially populated canonical destination. Move children
+    # into a fresh, unlocked handoff shell and rename that shell only after all
+    # child moves succeed.
+    handoff = destination.with_name(f".{destination.name}.handoff-{uuid.uuid4().hex}")
     try:
-        temporary.rmdir()
-    except OSError:
-        # 내용은 전부 옮겼습니다. 잠긴 빈 껍데기 때문에 성공한 export 를
-        # 실패로 만들지 않습니다.
-        pass
+        handoff.mkdir(parents=False, exist_ok=False)
+        for child in list(temporary.iterdir()):
+            os.replace(child, handoff / child.name)
+        try:
+            temporary.rmdir()
+        except OSError:
+            # 내용은 전부 옮겼습니다. 잠긴 빈 껍데기 때문에 성공한 export 를
+            # 실패로 만들지 않습니다.
+            pass
+        os.replace(handoff, destination)
+    except BaseException:
+        try:
+            _remove_artifact(handoff)
+        except OSError:
+            # A partial handoff has a randomized non-canonical name. Preserve
+            # the original installation error; recovery never reads handoffs.
+            pass
+        raise
 
 
-def _atomic_replace_directory(temporary: Path, destination: Path) -> None:
+def _atomic_replace_directory_unlocked(temporary: Path, destination: Path) -> None:
     """Install a fully written directory while retaining the prior one on failure."""
 
     backup = destination.with_name(f".{destination.name}.backup-{uuid.uuid4().hex}")
@@ -663,13 +694,30 @@ def _atomic_replace_directory(temporary: Path, destination: Path) -> None:
         if destination.exists():
             os.replace(destination, backup)
             moved_existing = True
-        try:
-            _install_directory(temporary, destination)
-        except Exception:
-            if moved_existing and backup.exists() and not destination.exists():
+        _install_directory(temporary, destination)
+    except BaseException as install_error:
+        rollback_errors: list[BaseException] = []
+        if destination.exists():
+            try:
+                _remove_artifact(destination)
+            except BaseException as error:
+                rollback_errors.append(error)
+        if moved_existing and backup.exists() and not destination.exists():
+            try:
                 os.replace(backup, destination)
                 moved_existing = False
-            raise
+            except BaseException as error:
+                rollback_errors.append(error)
+        if rollback_errors:
+            failure = RuntimeError(
+                "failed to restore the previous export directory after installation failed; "
+                f"recoverable backup: {backup}"
+            )
+            for error in rollback_errors:
+                failure.add_note(f"rollback error: {type(error).__name__}: {error}")
+            raise failure from install_error
+        raise
+    else:
         if moved_existing:
             moved_existing = False
             try:
@@ -678,9 +726,22 @@ def _atomic_replace_directory(temporary: Path, destination: Path) -> None:
                 # The new artifact is already installed atomically. A locked
                 # stale backup must not turn a valid export into a failed one.
                 pass
-    finally:
-        if moved_existing and backup.exists() and not destination.exists():
-            os.replace(backup, destination)
+
+
+def _atomic_replace_directory(temporary: Path, destination: Path) -> None:
+    """Serialize publication per parent and atomically replace one directory."""
+
+    parent = destination.parent
+    # Keep the lock outside the directory being installed. In strict exports,
+    # ``parent`` is itself a randomized staging directory; its parent is the
+    # stable export root, so this avoids leaking one lock directory per run.
+    lock_root = parent.parent / ".sion-export-publish-lock"
+    with artifact_lock(
+        lock_root,
+        timeout=_EXPORT_LOCK_TIMEOUT_SECONDS,
+        poll_interval=0.05,
+    ):
+        _atomic_replace_directory_unlocked(temporary, destination)
 
 
 def _atomic_torch_save(payload: object, path: Path) -> None:
@@ -948,7 +1009,7 @@ def _write_transformers_checkpoint(
         return inspection
     finally:
         if temporary.exists():
-            _remove_artifact(temporary)
+            _remove_staging_artifact(temporary)
 
 
 def _precision_state(

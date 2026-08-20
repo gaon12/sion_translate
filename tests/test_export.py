@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 import sys
+import textwrap
 import types
 from dataclasses import asdict
 from pathlib import Path
@@ -960,3 +962,184 @@ def test_strict_final_export_is_directory_transactional(
     assert (destination / "export_manifest.json").read_bytes() == original_manifest
     assert (destination / "model.pt").read_bytes() == original_artifact
     assert not list(tmp_path.glob(".best.tmp-*"))
+
+
+def test_atomic_replace_directory_restores_backup_after_partial_fallback_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "best"
+    destination.mkdir()
+    (destination / "original.txt").write_text("known good", encoding="utf-8")
+    temporary = tmp_path / ".best.tmp-test"
+    temporary.mkdir()
+    for name in ("first.txt", "second.txt", "third.txt"):
+        (temporary / name).write_text(name, encoding="utf-8")
+
+    real_replace = export_module.os.replace
+    child_moves = 0
+
+    def fail_after_one_child(source: str | Path, target: str | Path) -> None:
+        nonlocal child_moves
+        source_path = Path(source)
+        target_path = Path(target)
+        if source_path == temporary and target_path == destination:
+            raise PermissionError("injected Windows directory rename failure")
+        if source_path.parent == temporary:
+            child_moves += 1
+            if child_moves == 2:
+                raise OSError("injected child move failure")
+        real_replace(source_path, target_path)
+
+    monkeypatch.setattr(export_module.os, "replace", fail_after_one_child)
+
+    with pytest.raises(OSError, match="injected child move failure"):
+        export_module._atomic_replace_directory(temporary, destination)
+
+    assert child_moves == 2
+    assert (destination / "original.txt").read_text(encoding="utf-8") == "known good"
+    assert {path.name for path in destination.iterdir()} == {"original.txt"}
+    assert not list(tmp_path.glob(".best.backup-*"))
+
+
+def test_atomic_replace_directory_uses_a_cross_process_publish_lock(tmp_path: Path) -> None:
+    destination = tmp_path / "exports" / "best"
+    destination.mkdir(parents=True)
+    (destination / "generation.txt").write_text("old", encoding="utf-8")
+    temporary = tmp_path / "exports" / ".best.tmp-child"
+    temporary.mkdir()
+    (temporary / "generation.txt").write_text("new", encoding="utf-8")
+    lock_root = destination.parent.parent / ".sion-export-publish-lock"
+    script = textwrap.dedent(
+        f"""
+        import sys
+        from pathlib import Path
+        import sion_translate.training.export as export_module
+
+        export_module._EXPORT_LOCK_TIMEOUT_SECONDS = 0.15
+        try:
+            export_module._atomic_replace_directory(
+                Path({str(temporary)!r}),
+                Path({str(destination)!r}),
+            )
+        except RuntimeError as error:
+            print(error)
+            sys.exit(3)
+        """
+    )
+
+    with export_module.artifact_lock(lock_root):
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            cwd=Path.cwd(),
+            timeout=10.0,
+        )
+
+    assert result.returncode == 3, result.stderr
+    assert "다른 프로세스에 잠겨" in result.stdout
+    assert (destination / "generation.txt").read_text(encoding="utf-8") == "old"
+    assert (temporary / "generation.txt").read_text(encoding="utf-8") == "new"
+
+
+def test_handoff_cleanup_failure_never_exposes_a_partial_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "best"
+    destination.mkdir()
+    (destination / "original.txt").write_text("known good", encoding="utf-8")
+    temporary = tmp_path / ".best.tmp-test"
+    temporary.mkdir()
+    for name in ("first.txt", "second.txt"):
+        (temporary / name).write_text(name, encoding="utf-8")
+
+    real_remove = export_module._remove_artifact
+    real_replace = export_module.os.replace
+    child_moves = 0
+
+    def fail_install(source: str | Path, target: str | Path) -> None:
+        nonlocal child_moves
+        source_path = Path(source)
+        target_path = Path(target)
+        if source_path == temporary and target_path == destination:
+            raise PermissionError("injected Windows directory rename failure")
+        if source_path.parent == temporary:
+            child_moves += 1
+            if child_moves == 2:
+                raise OSError("injected child move failure")
+        real_replace(source_path, target_path)
+
+    def fail_handoff_cleanup(path: Path) -> None:
+        if path.name.startswith(".best.handoff-"):
+            raise PermissionError("injected handoff cleanup failure")
+        real_remove(path)
+
+    monkeypatch.setattr(export_module.os, "replace", fail_install)
+    monkeypatch.setattr(export_module, "_remove_artifact", fail_handoff_cleanup)
+
+    with pytest.raises(OSError, match="injected child move failure"):
+        export_module._atomic_replace_directory(temporary, destination)
+
+    assert child_moves == 2
+    assert {path.name for path in destination.iterdir()} == {"original.txt"}
+    assert not (destination / "first.txt").exists()
+    handoffs = list(tmp_path.glob(".best.handoff-*"))
+    assert len(handoffs) == 1
+    assert (handoffs[0] / "first.txt").is_file()
+
+
+def test_restore_failure_preserves_the_original_install_error_and_backup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "best"
+    destination.mkdir()
+    (destination / "original.txt").write_text("known good", encoding="utf-8")
+    temporary = tmp_path / ".best.tmp-test"
+    temporary.mkdir()
+    (temporary / "new.txt").write_text("new", encoding="utf-8")
+
+    real_replace = export_module.os.replace
+
+    def fail_install_and_restore(source: str | Path, target: str | Path) -> None:
+        source_path = Path(source)
+        target_path = Path(target)
+        if source_path == temporary and target_path == destination:
+            raise PermissionError("injected Windows directory rename failure")
+        if source_path.parent == temporary:
+            raise OSError("injected child install failure")
+        if source_path.name.startswith(".best.backup-") and target_path == destination:
+            raise PermissionError("injected restore failure")
+        real_replace(source_path, target_path)
+
+    monkeypatch.setattr(export_module.os, "replace", fail_install_and_restore)
+
+    with pytest.raises(RuntimeError, match="recoverable backup") as captured:
+        export_module._atomic_replace_directory(temporary, destination)
+
+    assert isinstance(captured.value.__cause__, OSError)
+    assert "injected child install failure" in str(captured.value.__cause__)
+    backups = list(tmp_path.glob(".best.backup-*"))
+    assert len(backups) == 1
+    assert (backups[0] / "original.txt").read_text(encoding="utf-8") == "known good"
+    assert not destination.exists()
+
+
+def test_locked_empty_staging_shell_does_not_turn_success_into_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    staging = tmp_path / ".transformers.tmp-locked"
+    staging.mkdir()
+
+    def locked_shell(_path: Path) -> None:
+        raise PermissionError("injected locked empty shell")
+
+    monkeypatch.setattr(export_module, "_remove_artifact", locked_shell)
+
+    export_module._remove_staging_artifact(staging)
+
+    assert staging.is_dir()
+    assert not list(staging.iterdir())
