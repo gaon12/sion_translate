@@ -1255,7 +1255,9 @@ def test_reward_weights_are_part_of_the_posttraining_identity() -> None:
     for field, value in (
         ("reward_chrf_weight", 0.1),
         ("roundtrip_enabled", True),
+        ("roundtrip_max_new_tokens", 128),
         ("samples_per_source", 8),
+        ("selection_metric", "macro_direction_reward"),
         ("validation_num_beams", 1),
     ):
         changed = _objective_config()

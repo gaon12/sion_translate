@@ -372,7 +372,9 @@ _POSTTRAINING_OBJECTIVE_FIELDS = (
     "roundtrip_failure_penalty",
     "roundtrip_min_score",
     "roundtrip_num_beams",
+    "roundtrip_max_new_tokens",
     "validation_num_beams",
+    "selection_metric",
 )
 
 
