@@ -493,7 +493,7 @@ def test_sparse_objective_metrics_use_one_rank_stable_ddp_layout(monkeypatch) ->
 def test_sft_direction_selection_falls_back_to_a_finite_global_nll() -> None:
     metrics = {
         "validation_ema_macro_direction_nll": float("nan"),
-        "validation_macro_direction_nll": float("inf"),
+        "validation_macro_direction_nll": 0.1,
         "validation_ema_nll": 0.75,
         "validation_nll": 0.8,
         "validation_ema_loss": 0.5,
@@ -528,6 +528,43 @@ def test_sft_selection_keeps_direction_balance_ahead_of_lower_global_nll() -> No
     assert value == pytest.approx(1.1)
     assert key == "validation_ema_macro_direction_nll"
     assert used_fallback is False
+
+
+def test_posttraining_direction_selection_prefers_the_ema_model_that_is_deployed() -> None:
+    metrics = {
+        "validation_worst_direction_reward": 0.9,
+        "validation_ema_worst_direction_reward": 0.2,
+        "validation_reward": 0.95,
+        "validation_ema_reward": 0.8,
+    }
+
+    value, key, used_fallback = trainer_module._select_posttraining_validation_metric(
+        metrics,
+        "worst_direction_reward",
+        prefer_ema=True,
+    )
+
+    assert value == pytest.approx(0.2)
+    assert key == "validation_ema_worst_direction_reward"
+    assert used_fallback is False
+
+
+def test_posttraining_direction_selection_falls_back_within_the_ema_family() -> None:
+    metrics = {
+        "validation_worst_direction_reward": 0.99,
+        "validation_reward": 0.95,
+        "validation_ema_reward": 0.8,
+    }
+
+    value, key, used_fallback = trainer_module._select_posttraining_validation_metric(
+        metrics,
+        "worst_direction_reward",
+        prefer_ema=True,
+    )
+
+    assert value == pytest.approx(0.8)
+    assert key == "validation_ema_reward"
+    assert used_fallback is True
 
 
 @pytest.mark.parametrize(

@@ -311,7 +311,7 @@ def _select_sft_validation_metric(
         "worst_direction_nll": "worst_direction_nll",
     }
     configured_suffix = suffix_by_setting[configured_metric.lower()]
-    prefixes = ["validation_ema_", "validation_"] if prefer_ema else ["validation_"]
+    prefixes = ["validation_ema_"] if prefer_ema else ["validation_"]
     candidate_keys: list[str] = []
     for suffix in (configured_suffix, "nll", "loss"):
         for prefix in prefixes:
@@ -326,6 +326,31 @@ def _select_sft_validation_metric(
             return value, key, _validation_metric_suffix(key) != configured_suffix
     requested_prefix = prefixes[0]
     return float("inf"), f"{requested_prefix}{configured_suffix}", True
+
+
+def _select_posttraining_validation_metric(
+    metrics: Mapping[str, float],
+    configured_metric: str,
+    *,
+    prefer_ema: bool,
+) -> tuple[float, str, bool]:
+    """Select the same raw/EMA model family that will be restored for deployment."""
+
+    prefixes = ["validation_ema_"] if prefer_ema else ["validation_"]
+    candidate_keys: list[str] = []
+    for suffix in (configured_metric, "reward"):
+        for prefix in prefixes:
+            key = f"{prefix}{suffix}"
+            if key not in candidate_keys:
+                candidate_keys.append(key)
+    for key in candidate_keys:
+        if key not in metrics:
+            continue
+        value = float(metrics[key])
+        if math.isfinite(value):
+            return value, key, _validation_metric_suffix(key) != configured_metric
+    requested_prefix = prefixes[0]
+    return float("-inf"), f"{requested_prefix}{configured_metric}", True
 
 
 def _selection_metric_label(key: str) -> str:
@@ -907,28 +932,19 @@ def train(
         # 사후학습은 실제 생성 reward를 최대화하고, SFT는 설정된 NLL 지표를 최소화합니다.
         # 기존 체크포인트 상태와 호환하기 위해 최대화 지표는 음수로 저장합니다.
         if objective is not None and "validation_reward" in metrics:
-            # 방향별 지표를 먼저 찾고, 없으면 평균 reward 로 되돌아갑니다.
-            # 방향 메타데이터가 없는 custom caller 를 막지 않기 위해서입니다.
             configured = config.posttraining.selection_metric
-            selection_key = None
-            if configured != "reward":
-                candidate_key = f"validation_{configured}"
-                if candidate_key in metrics:
-                    selection_key = candidate_key
-                elif not reward_fallback_reported:
-                    announce(
-                        f"posttraining.selection_metric={configured} 를 계산할 방향 "
-                        "메타데이터가 없어 평균 reward 로 선택합니다.",
-                        context,
-                    )
-                    reward_fallback_reported.append(True)
-            if selection_key is None:
-                selection_key = (
-                    "validation_ema_reward"
-                    if "validation_ema_reward" in metrics
-                    else "validation_reward"
+            selection_value, selection_key, used_fallback = _select_posttraining_validation_metric(
+                metrics,
+                configured,
+                prefer_ema=ema is not None,
+            )
+            if used_fallback and configured != "reward" and not reward_fallback_reported:
+                announce(
+                    f"posttraining.selection_metric={configured} 를 계산할 방향 "
+                    "메타데이터가 없어 평균 reward 로 선택합니다.",
+                    context,
                 )
-            selection_value = float(metrics[selection_key])
+                reward_fallback_reported.append(True)
             candidate = -selection_value
             selection_name = _selection_metric_label(selection_key)
         else:
