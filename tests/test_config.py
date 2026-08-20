@@ -171,6 +171,8 @@ def test_root_config_gives_every_enabled_module_a_training_signal() -> None:
         assert experimental.register_loss_weight > 0
     if experimental.semantic_parity_enabled:
         assert experimental.semantic_parity_loss_weight > 0
+    if experimental.candidate_refinement_enabled:
+        assert experimental.candidate_refinement_loss_weight > 0
 
 
 def test_root_config_keeps_the_experimental_surface_small() -> None:
@@ -193,14 +195,15 @@ def test_root_config_keeps_the_experimental_surface_small() -> None:
             ("tetm", experimental.tetm_enabled),
             ("morphoscript", experimental.morphoscript_enabled),
             ("evidence_repair", experimental.evidence_repair_enabled),
+            ("candidate_refinement", experimental.candidate_refinement_enabled),
             ("semantic_parity", experimental.semantic_parity_enabled),
         )
         if active
     ]
-    assert enabled == ["core"]
+    assert enabled == ["candidate_refinement"]
 
 
-def test_capacity_presets_are_clean_architecture_baselines() -> None:
+def test_capacity_presets_enable_only_candidate_refinement_for_1_5() -> None:
     config_root = Path(__file__).resolve().parents[1] / "configs"
     names = (
         "sion_1_3b.yaml",
@@ -216,9 +219,19 @@ def test_capacity_presets_are_clean_architecture_baselines() -> None:
             "tetm": experimental.tetm_enabled,
             "morphoscript": experimental.morphoscript_enabled,
             "evidence_repair": experimental.evidence_repair_enabled,
+            "candidate_refinement": experimental.candidate_refinement_enabled,
             "semantic_parity": experimental.semantic_parity_enabled,
         }
-        assert not any(enabled.values()), (name, enabled)
+        assert enabled == {
+            "situglu": False,
+            "bats": False,
+            "core": False,
+            "tetm": False,
+            "morphoscript": False,
+            "evidence_repair": False,
+            "candidate_refinement": True,
+            "semantic_parity": False,
+        }, (name, enabled)
 
 
 def test_negative_loss_weight_is_still_an_error() -> None:
@@ -232,6 +245,7 @@ def test_negative_loss_weight_is_still_an_error() -> None:
         "evidence_uncertainty_loss_weight",
         "evidence_budget_loss_weight",
         "evidence_repair_gain_loss_weight",
+        "candidate_refinement_loss_weight",
         "semantic_parity_loss_weight",
     ),
 )

@@ -37,7 +37,7 @@ model:
     bats_enabled: false
     bats_coverage_weight: 0.0
 
-    # ── 이번 ablation에서 켠 것 ─────────────────────────────────────────
+    # ── 이번 ablation에서 보류한 것 ─────────────────────────────────────
     # CoRe: 목표문의 경어체를 분류하는 보조 loss 입니다. 코퍼스 실측에서
     # 한국어 반말이 존댓말의 2.1배(41.28% 대 19.45%)이고, "존댓말을 요청했는데
     # 반말이 섞이는" 실패가 여기서 옵니다. register_classes 4 는 prepare 의
@@ -46,7 +46,7 @@ model:
     # 안전 장치: ContentRegisterState 의 inject_gate 가 0 에서 시작하므로
     # step 0 에서는 forward 에 아무 영향이 없고 보조 loss 만 흐릅니다.
     # 즉 모델이 이 신호를 쓸지 말지를 학습으로 정합니다.
-    core_enabled: true
+    core_enabled: false
     register_loss_weight: 0.05
 
     # ── 끈 것 ────────────────────────────────────────────────────────────
@@ -58,7 +58,7 @@ model:
     morphoscript_enabled: false
 
     # TETM(typed entity memory): 끕니다. 아래 "한 번에 하나씩" 원칙에 따라
-    # 이번 run 에서 검증할 모듈을 CoRe 하나로 좁힙니다.
+    # 이번 run 에서 검증할 모듈을 후보분포 정제 하나로 좁힙니다.
     tetm_enabled: false
 
     # 첨부 설계를 검증하기 위한 1차 ablation 구현입니다. evidence_repair 는
@@ -66,13 +66,22 @@ model:
     # gate를 학습합니다. 아직 입력 일부만 재인코딩하거나 출력 구간을 반복 수정하는
     # 완전한 폐루프는 아니므로 기본 run에서는 끕니다.
     evidence_repair_enabled: false
+    # 1차 next-token 분포 전체의 embedding 기대값을 decoder hidden에 되먹인 뒤
+    # 전체 vocabulary를 다시 예측합니다. top-k rerank가 아니므로 최종 토큰은
+    # 1차 상위 후보 밖에서도 나올 수 있습니다. vocabulary chunk는 정확한 확률을
+    # 유지하면서 peak memory만 제한하고, 초안 CE 0.25로 두 단계를 함께 학습합니다.
+    candidate_refinement_enabled: true
+    candidate_refinement_steps: 1
+    candidate_refinement_temperature: 1.0
+    candidate_refinement_loss_weight: 0.25
+    candidate_refinement_vocab_chunk_size: 2048
     # 원문 pooled state와 teacher-forced decoder state를 맞추는 학습용 대조 목적입니다.
     # 생성 결과를 독립적으로 다시 인코딩하는 checksum은 아니므로 별도 A/B 후 켭니다.
     semantic_parity_enabled: false
 
 # 실험 모듈은 한 번에 하나씩만 켜서 baseline 과 비교하십시오. 여러 개를 동시에
 # 켜면 좋아지거나 나빠졌을 때 무엇 때문인지 알 수 없습니다. 위 조합은
-# 이번 재학습에서 실제 동작을 바꾸는 것은 CoRe 하나뿐입니다.
+# 이번 1.5 재학습에서 실제 동작을 바꾸는 것은 후보분포 정제 하나뿐입니다.
 
 # 아래 모델 크기는 직접 고정하고 싶을 때만 주석 해제 (기본: 데이터 규모로 자동)
 #   d_model: 768

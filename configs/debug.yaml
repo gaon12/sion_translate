@@ -25,6 +25,11 @@ model:
     morphoscript_enabled: true
     morphoscript_interval: 1
     script_classes: 9
+    candidate_refinement_enabled: true
+    candidate_refinement_steps: 1
+    candidate_refinement_temperature: 1.0
+    candidate_refinement_loss_weight: 0.25
+    candidate_refinement_vocab_chunk_size: 64
 
 data:
   tokenizer_model: artifacts/tokenizer/sion.model

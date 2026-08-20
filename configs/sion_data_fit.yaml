@@ -22,6 +22,11 @@ model:
     core_enabled: false
     tetm_enabled: false
     morphoscript_enabled: false
+    candidate_refinement_enabled: true
+    candidate_refinement_steps: 1
+    candidate_refinement_temperature: 1.0
+    candidate_refinement_loss_weight: 0.25
+    candidate_refinement_vocab_chunk_size: 2048
 
 data:
   tokenizer_model: artifacts/tokenizer/sion.model
