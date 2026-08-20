@@ -45,6 +45,28 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="각 --language-pair의 SOURCE→TARGET 방향만 학습된 것으로 기록",
     )
+    parser.add_argument(
+        "--release-name",
+        help="metadata가 없는 구형 export의 배포 이름(예: sion 또는 sion_translate)",
+    )
+    parser.add_argument(
+        "--release-version",
+        help="metadata가 없는 구형 export의 모델 세대(예: 1.0); 추측하지 않음",
+    )
+    release_capability = parser.add_mutually_exclusive_group()
+    release_capability.add_argument(
+        "--translation-capable",
+        dest="translation_capable",
+        action="store_true",
+        help="metadata가 없는 구형 export가 번역 학습을 마쳤음을 명시",
+    )
+    release_capability.add_argument(
+        "--foundation-only",
+        dest="translation_capable",
+        action="store_false",
+        help="metadata가 없는 구형 export가 번역 불가 foundation 가중치임을 명시",
+    )
+    parser.set_defaults(translation_capable=None)
     capability = parser.add_mutually_exclusive_group()
     capability.add_argument(
         "--revision-trained",
@@ -88,6 +110,9 @@ def main() -> None:
         language_pairs=args.language_pairs,
         bidirectional=not args.unidirectional,
         revision_trained=revision_trained,
+        release_name=args.release_name,
+        release_version=args.release_version,
+        translation_capable=args.translation_capable,
         int4_backend=args.int4_backend,
         llama_quantize=args.llama_quantize,
     )

@@ -26,6 +26,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import sys
 import time
@@ -43,7 +44,11 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
-from sion_translate.artifacts import MODEL_RELEASE_VERSION, TRANSLATION_RELEASE_NAME
+from sion_translate.artifacts import (
+    FOUNDATION_RELEASE_NAME,
+    MODEL_RELEASE_VERSION,
+    TRANSLATION_RELEASE_NAME,
+)
 from sion_translate.config import ExperimentalConfig, ModelConfig
 from sion_translate.fp8 import DEFAULT_BLOCK, FORWARD_DTYPE, Fp8Policy, scale_for
 from sion_translate.fp8_runtime import apply_fp8_weights
@@ -180,6 +185,32 @@ def _is_sha256(value: object) -> bool:
     except ValueError:
         return False
     return True
+
+
+_MODEL_VERSION_PATTERN = re.compile(r"[0-9]+\.[0-9]+(?:\.[0-9]+)?")
+
+
+def _validated_release_identity(
+    release_name: object,
+    release_version: object,
+    *,
+    translation_capable: object,
+) -> tuple[str, str, bool]:
+    if not isinstance(release_name, str) or not release_name.strip():
+        raise ValueError("release_name must be a non-empty string")
+    if not isinstance(release_version, str) or not _MODEL_VERSION_PATTERN.fullmatch(
+        release_version.strip()
+    ):
+        raise ValueError("release_version must use a numeric major.minor[.patch] value")
+    if not isinstance(translation_capable, bool):
+        raise ValueError("translation_capable must be a boolean")
+    normalized_name = release_name.strip()
+    normalized_version = release_version.strip()
+    if normalized_name == FOUNDATION_RELEASE_NAME and translation_capable:
+        raise ValueError("the sion foundation release cannot be translation-capable")
+    if normalized_name == TRANSLATION_RELEASE_NAME and not translation_capable:
+        raise ValueError("the sion_translate release must be translation-capable")
+    return normalized_name, normalized_version, translation_capable
 
 
 def _file_entry(path: Path) -> dict[str, Any]:
@@ -462,12 +493,11 @@ def build_export_metadata(
     그대로 실으면 방향 태그를 받아들이고 그럴듯한 쓰레기를 냅니다.
     """
 
-    release_name = str(release_name).strip()
-    release_version = str(release_version).strip()
-    if not release_name:
-        raise ValueError("release_name must be a non-empty string")
-    if not release_version:
-        raise ValueError("release_version must be a non-empty string")
+    release_name, release_version, translation_capable = _validated_release_identity(
+        release_name,
+        release_version,
+        translation_capable=translation_capable,
+    )
 
     experimental = model_config.experimental
     metadata: dict[str, Any] = {
@@ -1491,6 +1521,14 @@ def export_state_dict_formats(
                 translation_capable=translation_capable,
             )
         )
+    validated_name, validated_version, validated_capability = _validated_release_identity(
+        export_metadata.get("release_name"),
+        export_metadata.get("release_version"),
+        translation_capable=export_metadata.get("translation_capable"),
+    )
+    export_metadata["release_name"] = validated_name
+    export_metadata["release_version"] = validated_version
+    export_metadata["translation_capable"] = validated_capability
     export_metadata.setdefault("step", int(step))
     if tokenizer_path is not None:
         export_metadata["tokenizer"] = _file_identity(tokenizer_path)
@@ -1768,20 +1806,48 @@ def convert_export(
     step = int(payload.get("step", 0))
     pad_id = int(payload.get("pad_id", 0))
     inherited = copy.deepcopy(payload.get("metadata") or {})
-    resolved_release_name = (
-        str(release_name)
-        if release_name is not None
-        else str(inherited.get("release_name", TRANSLATION_RELEASE_NAME))
-    )
-    resolved_release_version = (
-        str(release_version)
-        if release_version is not None
-        else str(inherited.get("release_version", MODEL_RELEASE_VERSION))
-    )
+
+    def resolve_release_identity(explicit: str | None, metadata_name: str) -> str:
+        inherited_value: object = inherited.get(metadata_name)
+        if (
+            explicit is not None
+            and isinstance(inherited_value, str)
+            and inherited_value.strip()
+            and explicit.strip() != inherited_value.strip()
+        ):
+            raise ValueError(
+                f"explicit {metadata_name} {explicit!r} conflicts with source metadata "
+                f"{inherited_value!r}; conversion cannot relabel weights"
+            )
+        value: object = explicit if explicit is not None else inherited_value
+        if not isinstance(value, str) or not value.strip():
+            option = metadata_name.replace("_", "-")
+            raise ValueError(
+                f"source export has no trustworthy {metadata_name}; pass --{option} explicitly"
+            )
+        return value.strip()
+
+    resolved_release_name = resolve_release_identity(release_name, "release_name")
+    resolved_release_version = resolve_release_identity(release_version, "release_version")
+    inherited_translation_capable = inherited.get("translation_capable")
+    if (
+        translation_capable is not None
+        and isinstance(inherited_translation_capable, bool)
+        and translation_capable is not inherited_translation_capable
+    ):
+        raise ValueError(
+            "explicit translation_capable conflicts with source metadata; "
+            "conversion cannot relabel weights"
+        )
+    if translation_capable is None and not isinstance(inherited_translation_capable, bool):
+        raise ValueError(
+            "source export has no trustworthy translation_capable; pass "
+            "--translation-capable or --foundation-only explicitly"
+        )
     resolved_translation_capable = (
         translation_capable
         if translation_capable is not None
-        else _metadata_translation_capable(inherited)
+        else cast(bool, inherited_translation_capable)
     )
 
     def resolve_inherited_sidecar(
@@ -1950,8 +2016,35 @@ def load_exported_model(
     return model, config, pad_id
 
 
-def validate_export_directory(directory: str | Path) -> dict[str, Any]:
+def validate_export_directory(
+    directory: str | Path,
+    *,
+    expected_release_name: str | None = None,
+    expected_release_version: str | None = None,
+    expected_translation_capable: bool | None = None,
+) -> dict[str, Any]:
     """Verify manifest integrity and minimally load every successful artifact."""
+
+    if expected_translation_capable is not None and not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
+        expected_translation_capable, bool
+    ):
+        raise TypeError("expected_translation_capable must be a boolean or None")
+    if expected_release_name is not None and (
+        not isinstance(expected_release_name, str)  # pyright: ignore[reportUnnecessaryIsInstance]
+        or not expected_release_name.strip()
+    ):
+        raise ValueError("expected_release_name must be a non-empty string or None")
+    if expected_release_version is not None and (
+        not isinstance(expected_release_version, str)  # pyright: ignore[reportUnnecessaryIsInstance]
+        or _MODEL_VERSION_PATTERN.fullmatch(expected_release_version.strip()) is None
+    ):
+        raise ValueError(
+            "expected_release_version must use a numeric major.minor[.patch] value or None"
+        )
+    if expected_release_name == FOUNDATION_RELEASE_NAME and expected_translation_capable is True:
+        raise ValueError("expected sion foundation identity cannot be translation-capable")
+    if expected_release_name == TRANSLATION_RELEASE_NAME and expected_translation_capable is False:
+        raise ValueError("expected sion_translate identity must be translation-capable")
 
     directory = Path(directory)
     manifest_path = directory / "export_manifest.json"
@@ -1991,6 +2084,40 @@ def validate_export_directory(directory: str | Path) -> dict[str, Any]:
             }
         )
         return report
+    try:
+        validated_name, validated_version, validated_capability = _validated_release_identity(
+            manifest_metadata.get("release_name"),
+            manifest_metadata.get("release_version"),
+            translation_capable=manifest_metadata.get("translation_capable"),
+        )
+        if (
+            manifest_metadata.get("release_name") != validated_name
+            or manifest_metadata.get("release_version") != validated_version
+            or manifest_metadata.get("translation_capable") is not validated_capability
+        ):
+            raise ValueError("manifest release identity is not normalized")
+    except (TypeError, ValueError) as error:
+        report["errors"].append(
+            {
+                "error_type": "InvalidReleaseIdentity",
+                "message": str(error),
+            }
+        )
+    for metadata_name, expected in (
+        ("release_name", expected_release_name),
+        ("release_version", expected_release_version),
+        ("translation_capable", expected_translation_capable),
+    ):
+        if expected is not None and manifest_metadata.get(metadata_name) != expected:
+            report["errors"].append(
+                {
+                    "error_type": "UnexpectedIdentity",
+                    "message": (
+                        f"manifest.metadata.{metadata_name} is "
+                        f"{manifest_metadata.get(metadata_name)!r}, expected {expected!r}"
+                    ),
+                }
+            )
     metadata_compatibility_id = _metadata_compatibility_id(manifest_metadata)
     report["metadata_compatibility_id"] = metadata_compatibility_id
     stored_metadata_compatibility_id = manifest.get("metadata_compatibility_id")

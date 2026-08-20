@@ -268,6 +268,47 @@ def test_export_metadata_identifies_the_target_1_5_model_generation() -> None:
     assert metadata["release_version"] == "1.5"
 
 
+@pytest.mark.parametrize("release_version", [None, 15, "", "v1.5", "1"])
+def test_export_metadata_rejects_malformed_model_versions(release_version: object) -> None:
+    with pytest.raises(ValueError, match="numeric major.minor"):
+        build_export_metadata(export_config(), release_version=release_version)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("release_name", "translation_capable"),
+    [("sion", True), ("sion_translate", False)],
+)
+def test_export_metadata_rejects_contradictory_repository_roles(
+    release_name: str,
+    translation_capable: bool,
+) -> None:
+    with pytest.raises(ValueError, match="translation-capable"):
+        build_export_metadata(
+            export_config(),
+            release_name=release_name,
+            translation_capable=translation_capable,
+        )
+
+
+def test_export_rejects_caller_metadata_that_bypasses_repository_role(
+    tmp_path: Path,
+) -> None:
+    config = export_config()
+    model = SionForConditionalGeneration(config)
+    metadata = build_export_metadata(config)
+    metadata["release_name"] = "sion"
+
+    with pytest.raises(ValueError, match="foundation release cannot be translation-capable"):
+        export_state_dict_formats(
+            tmp_path,
+            model.state_dict(),
+            config,
+            0,
+            formats=("fp32",),
+            metadata=metadata,
+        )
+
+
 def test_export_metadata_records_exact_trained_translation_directions() -> None:
     metadata = build_export_metadata(
         export_config(),
@@ -356,6 +397,64 @@ def test_conversion_preserves_old_model_generation_and_redacts_source_path(
         "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
     }
     assert str(tmp_path) not in json.dumps(converted["metadata"])
+
+
+def test_conversion_requires_explicit_identity_for_unversioned_legacy_weights(
+    tmp_path: Path,
+) -> None:
+    config = export_config()
+    model = SionForConditionalGeneration(config)
+    source_dir = tmp_path / "source"
+    export_state_dict_formats(
+        source_dir,
+        model.state_dict(),
+        config,
+        0,
+        formats=("fp32",),
+    )
+    legacy_source = tmp_path / "legacy.pt"
+    payload = torch.load(source_dir / "model.pt", weights_only=True)
+    payload["metadata"].pop("release_name")
+    payload["metadata"].pop("release_version")
+    payload["metadata"].pop("translation_capable")
+    torch.save(payload, legacy_source)
+
+    with pytest.raises(ValueError, match="pass --release-name explicitly"):
+        convert_export(legacy_source, tmp_path / "ambiguous", formats=("fp16",))
+
+    converted = convert_export(
+        legacy_source,
+        tmp_path / "identified",
+        formats=("fp16",),
+        release_name="sion",
+        release_version="0.9",
+        translation_capable=False,
+    )
+    assert converted["metadata"]["release_name"] == "sion"
+    assert converted["metadata"]["release_version"] == "0.9"
+
+
+def test_conversion_rejects_release_identity_relabeling(tmp_path: Path) -> None:
+    config = export_config()
+    model = SionForConditionalGeneration(config)
+    source_dir = tmp_path / "source"
+    export_state_dict_formats(source_dir, model.state_dict(), config, 0, formats=("fp32",))
+
+    with pytest.raises(ValueError, match="conversion cannot relabel weights"):
+        convert_export(
+            source_dir / "model.pt",
+            tmp_path / "relabeled",
+            formats=("fp16",),
+            release_version="1.4",
+        )
+
+    with pytest.raises(ValueError, match="translation_capable conflicts"):
+        convert_export(
+            source_dir / "model.pt",
+            tmp_path / "recapabilitized",
+            formats=("fp16",),
+            translation_capable=False,
+        )
 
 
 def test_transformers_directory_hash_is_deterministic_and_tamper_evident(
@@ -560,11 +659,19 @@ def test_export_cli_accepts_repeated_language_pairs_and_transformers_default() -
             "en",
             "ru",
             "--unidirectional",
+            "--release-name",
+            "sion",
+            "--release-version",
+            "1.0",
+            "--foundation-only",
         ]
     )
     assert args.language_pairs == [["ko", "ja"], ["en", "ru"]]
     assert args.unidirectional is True
     assert "transformers" in args.formats.split(",")
+    assert args.release_name == "sion"
+    assert args.release_version == "1.0"
+    assert args.translation_capable is False
 
 
 def test_training_export_manifest_merges_base_and_quantized_formats(

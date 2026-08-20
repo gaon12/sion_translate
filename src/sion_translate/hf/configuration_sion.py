@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+import re
 from typing import Any
 
 from transformers import PretrainedConfig
@@ -154,8 +155,24 @@ class SionConfig(PretrainedConfig):
         release_identity = (self.release_name, self.release_version)
         if (self.release_name is None) != (self.release_version is None):
             raise ValueError("release_name and release_version must be provided together")
-        if any(value is not None and not str(value).strip() for value in release_identity):
+        if any(
+            value is not None
+            and (
+                not isinstance(value, str)  # pyright: ignore[reportUnnecessaryIsInstance]
+                or not value.strip()
+            )
+            for value in release_identity
+        ):
             raise ValueError("release_name and release_version must be non-empty strings")
+        if (
+            self.release_version is not None
+            and re.fullmatch(r"[0-9]+\.[0-9]+(?:\.[0-9]+)?", self.release_version) is None
+        ):
+            raise ValueError("release_version must use a numeric major.minor[.patch] value")
+        if self.release_name == "sion" and self.translation_capable:
+            raise ValueError("the sion foundation release cannot be translation-capable")
+        if self.release_name == "sion_translate" and not self.translation_capable:
+            raise ValueError("the sion_translate release must be translation-capable")
         if self.pad_token_id is None or self.pad_token_id < 0:
             raise ValueError("pad_token_id must be a non-negative integer")
         for name in ("bos_token_id", "eos_token_id", "decoder_start_token_id"):

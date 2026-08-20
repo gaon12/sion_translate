@@ -32,6 +32,7 @@ from sion_translate.model import (
 from sion_translate.tokenizer import SionTokenizer as NativeSionTokenizer
 from sion_translate.tokenizer import train_tokenizer
 from sion_translate.training.export import (
+    _inspect_transformers_checkpoint,
     build_export_metadata,
     convert_export,
     export_state_dict_formats,
@@ -536,6 +537,98 @@ def test_transformers_checkpoint_preserves_source_precision(tmp_path: Path) -> N
 def test_transformers_config_rejects_non_boolean_revision_capability() -> None:
     with pytest.raises(ValueError, match="revision_trained must be a boolean"):
         SionConfig(revision_trained="true")
+
+
+@pytest.mark.parametrize(
+    ("release_name", "release_version"),
+    [(123, "1.5"), ("sion", 1.5), ("", "1.5"), ("sion", "")],
+)
+def test_transformers_config_rejects_invalid_release_identity(
+    release_name: object,
+    release_version: object,
+) -> None:
+    with pytest.raises(ValueError, match="non-empty strings"):
+        SionConfig(  # pyright: ignore[reportArgumentType]
+            release_name=release_name,
+            release_version=release_version,
+        )
+
+
+@pytest.mark.parametrize("release_version", ["1", "v1.5", "1.5-beta"])
+def test_transformers_config_rejects_malformed_release_version(
+    release_version: str,
+) -> None:
+    with pytest.raises(ValueError, match="numeric major.minor"):
+        SionConfig(release_name="sion", release_version=release_version)
+
+
+@pytest.mark.parametrize(
+    ("release_name", "translation_capable"),
+    [("sion", True), ("sion_translate", False)],
+)
+def test_transformers_config_rejects_contradictory_repository_role(
+    release_name: str,
+    translation_capable: bool,
+) -> None:
+    with pytest.raises(ValueError, match="translation-capable"):
+        SionConfig(
+            release_name=release_name,
+            release_version="1.5",
+            translation_capable=translation_capable,
+        )
+
+
+def test_export_validation_enforces_expected_repository_role(tmp_path: Path) -> None:
+    config = tiny_model_config()
+    native = NativeSionForConditionalGeneration(config, pad_id=0)
+    manifest = export_state_dict_formats(
+        tmp_path,
+        native.state_dict(),
+        config,
+        0,
+        formats=("fp32",),
+    )
+    assert manifest["metadata"]["release_name"] == "sion_translate"
+
+    mismatch = validate_export_directory(
+        tmp_path,
+        expected_release_name="sion",
+        expected_release_version="1.5",
+        expected_translation_capable=False,
+    )
+    assert not mismatch["valid"]
+    assert {error["error_type"] for error in mismatch["errors"]} == {"UnexpectedIdentity"}
+
+    manifest_path = tmp_path / "export_manifest.json"
+    corrupted = json.loads(manifest_path.read_text(encoding="utf-8"))
+    corrupted["metadata"]["release_name"] = "sion"
+    manifest_path.write_text(json.dumps(corrupted), encoding="utf-8")
+    invalid_role = validate_export_directory(tmp_path)
+    assert not invalid_role["valid"]
+    assert "InvalidReleaseIdentity" in {error["error_type"] for error in invalid_role["errors"]}
+
+    with pytest.raises(ValueError, match="expected sion foundation identity"):
+        validate_export_directory(
+            tmp_path,
+            expected_release_name="sion",
+            expected_release_version="1.5",
+            expected_translation_capable=True,
+        )
+
+
+def test_transformers_inspection_rejects_internal_release_disagreement(
+    tmp_path: Path,
+) -> None:
+    config = tiny_model_config()
+    native = NativeSionForConditionalGeneration(config, pad_id=0)
+    save_transformers_checkpoint(tmp_path, native.state_dict(), config)
+    export_path = tmp_path / "sion_export.json"
+    payload = json.loads(export_path.read_text(encoding="utf-8"))
+    payload["release_version"] = "1.4"
+    export_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="disagree about release_version"):
+        _inspect_transformers_checkpoint(tmp_path)
 
 
 def test_transformers_export_rejects_incompatible_tokenizer_and_features(
