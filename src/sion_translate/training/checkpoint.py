@@ -35,6 +35,7 @@ from .distributed import DistributedContext, barrier
 CHECKPOINT_SCHEMA = "sion-training-checkpoint-v2"
 CHECKPOINT_IDENTITY_SCHEMA = "sion-checkpoint-identity-v1"
 DCP_COMPLETION_FILENAME = ".sion_checkpoint_complete.json"
+DCP_COMPLETION_SCHEMA = "sion-dcp-completion-v2"
 RUNTIME_DATA_PATH_FIELDS = frozenset(
     {
         "raw_dir",
@@ -901,10 +902,26 @@ def _write_dcp_completion(
     world_size: int,
 ) -> None:
     marker = directory / DCP_COMPLETION_FILENAME
+    inventory: list[dict[str, Any]] = []
+    for artifact in sorted(directory.rglob("*")):
+        if artifact == marker:
+            continue
+        if artifact.is_symlink():
+            raise ValueError(f"distributed checkpoint contains a symlink: {artifact}")
+        if not artifact.is_file():
+            continue
+        inventory.append(
+            {
+                "path": artifact.relative_to(directory).as_posix(),
+                "size": artifact.stat().st_size,
+                "sha256": _sha256_file(artifact),
+            }
+        )
     payload = {
-        "schema": CHECKPOINT_SCHEMA,
+        "schema": DCP_COMPLETION_SCHEMA,
         "step": int(step),
         "world_size": int(world_size),
+        "files": inventory,
     }
     descriptor, temporary_name = tempfile.mkstemp(
         dir=directory,
@@ -924,15 +941,48 @@ def _write_dcp_completion(
         raise
 
 
-def _publish_dcp_staging(staging: Path, destination: Path) -> None:
-    """Publish a complete DCP directory while retaining one recoverable version."""
+def _publish_dcp_staging(
+    staging: Path,
+    destination: Path,
+    *,
+    world_size: int,
+    staging_verified: bool = False,
+) -> None:
+    """Publish a complete DCP directory while retaining one recoverable version.
+
+    ``staging_verified`` is reserved for the immediate caller that just built
+    the hashed completion marker; it avoids reading every large shard a second
+    time before the atomic rename.
+    """
 
     previous = _dcp_sibling(destination, "previous")
-    _remove_path(previous)
+    staging_is_valid = (
+        (staging / DCP_COMPLETION_FILENAME).is_file()
+        if staging_verified
+        else _dcp_completion_status(staging, world_size=world_size) == "valid"
+    )
+    if not staging_is_valid:
+        raise ValueError(f"refusing to publish an incomplete DCP staging directory: {staging}")
+    destination_status = _dcp_completion_status(destination, world_size=world_size)
+    previous_status = _dcp_completion_status(previous, world_size=world_size)
+    destination_recoverable = destination_status in {"valid", "legacy"} or (
+        destination_status == "absent" and (destination / ".metadata").is_file()
+    )
+    previous_recoverable = previous_status in {"valid", "legacy"} or (
+        previous_status == "absent" and (previous / ".metadata").is_file()
+    )
     moved_previous = False
-    if destination.exists() or destination.is_symlink():
+    if destination_recoverable:
+        _remove_path(previous)
         os.replace(destination, previous)
         moved_previous = True
+    else:
+        # A corrupt current publication must never replace the last valid
+        # predecessor. Remove only the corrupt current; keep a recoverable
+        # predecessor until the new staging directory is installed.
+        _remove_path(destination)
+        if not previous_recoverable:
+            _remove_path(previous)
     try:
         os.replace(staging, destination)
     except BaseException:
@@ -941,30 +991,72 @@ def _publish_dcp_staging(staging: Path, destination: Path) -> None:
         raise
 
 
-def _valid_dcp_completion(path: Path, *, world_size: int) -> bool:
+def _dcp_completion_status(path: Path, *, world_size: int) -> str:
     marker = path / DCP_COMPLETION_FILENAME
+    if not marker.is_file():
+        return "absent"
     try:
         payload = json.loads(marker.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return False
+        return "invalid"
     if not isinstance(payload, Mapping):
-        return False
+        return "invalid"
     marker_payload = cast(Mapping[object, object], payload)
-    return (
-        marker_payload.get("schema") == CHECKPOINT_SCHEMA
-        and isinstance(marker_payload.get("step"), int)
-        and marker_payload.get("world_size") == world_size
-        and (path / ".metadata").is_file()
-    )
+    if type(marker_payload.get("step")) is not int:
+        return "invalid"
+    if marker_payload.get("world_size") != world_size:
+        return "invalid"
+    schema = marker_payload.get("schema")
+    if schema == CHECKPOINT_SCHEMA:
+        required = [path / ".metadata"] + [
+            path / f"rng-rank-{rank:05d}.pt" for rank in range(world_size)
+        ]
+        return "legacy" if all(item.is_file() for item in required) else "invalid"
+    if schema != DCP_COMPLETION_SCHEMA:
+        return "invalid"
+    stored_inventory = marker_payload.get("files")
+    if not isinstance(stored_inventory, list):
+        return "invalid"
+    try:
+        current_inventory: list[dict[str, Any]] = []
+        for artifact in sorted(path.rglob("*")):
+            if artifact == marker:
+                continue
+            if artifact.is_symlink():
+                return "invalid"
+            if not artifact.is_file():
+                continue
+            current_inventory.append(
+                {
+                    "path": artifact.relative_to(path).as_posix(),
+                    "size": artifact.stat().st_size,
+                    "sha256": _sha256_file(artifact),
+                }
+            )
+    except OSError:
+        return "invalid"
+    if stored_inventory != current_inventory:
+        return "invalid"
+    inventory_paths = {item.get("path") for item in current_inventory}
+    required_paths = {".metadata"} | {f"rng-rank-{rank:05d}.pt" for rank in range(world_size)}
+    return "valid" if required_paths <= inventory_paths else "invalid"
 
 
 def _resolve_dcp_checkpoint(path: Path, *, world_size: int) -> Path:
     """Resolve a complete current DCP checkpoint, or its retained predecessor."""
 
-    if _valid_dcp_completion(path, world_size=world_size):
+    current_status = _dcp_completion_status(path, world_size=world_size)
+    if current_status in {"valid", "legacy"}:
+        if current_status == "legacy":
+            warnings.warn(
+                f"{path} uses a legacy checkpoint completion marker without file hashes",
+                RuntimeWarning,
+                stacklevel=3,
+            )
         return path
     previous = _dcp_sibling(path, "previous")
-    if _valid_dcp_completion(previous, world_size=world_size):
+    previous_status = _dcp_completion_status(previous, world_size=world_size)
+    if previous_status in {"valid", "legacy"}:
         warnings.warn(
             f"{path} is incomplete; resuming from retained checkpoint {previous}",
             RuntimeWarning,
@@ -973,7 +1065,7 @@ def _resolve_dcp_checkpoint(path: Path, *, world_size: int) -> Path:
         return previous
     # Accept pre-v2 DCP directories once for backward compatibility. New saves
     # always carry a completion marker and never overwrite this directory in place.
-    if (path / ".metadata").is_file():
+    if current_status == "absent" and (path / ".metadata").is_file():
         warnings.warn(
             "legacy distributed checkpoint has no Sion completion marker; "
             "loading it without atomic-publication verification",
@@ -981,7 +1073,10 @@ def _resolve_dcp_checkpoint(path: Path, *, world_size: int) -> Path:
             stacklevel=3,
         )
         return path
-    raise FileNotFoundError(f"no complete distributed checkpoint found at {path}")
+    raise FileNotFoundError(
+        f"no complete distributed checkpoint found at {path} "
+        f"(current={current_status}, previous={previous_status})"
+    )
 
 
 def checkpoint_path_exists(path: str | Path) -> bool:
@@ -1079,7 +1174,12 @@ def save_checkpoint(
         barrier(context)
         if context.is_main:
             _write_dcp_completion(staging, step=step, world_size=context.world_size)
-            _publish_dcp_staging(staging, path)
+            _publish_dcp_staging(
+                staging,
+                path,
+                world_size=context.world_size,
+                staging_verified=True,
+            )
     elif context.is_main:
         # 단일 프로세스: 파일 하나로 충분합니다.
         state["model"] = _unwrap_compiled_model(model).state_dict()
@@ -1327,6 +1427,21 @@ def load_checkpoint(
         _validate_identity(state, expected_identity)
         if ema is not None:
             ema.validate_state_dict(state.get("ema"))
+        rng_file = path / f"rng-rank-{context.rank:05d}.pt"
+        if not rng_file.is_file():
+            raise ValueError(f"distributed checkpoint RNG payload is missing: {rng_file}")
+        rng_payload = torch.load(
+            rng_file,
+            map_location="cpu",
+            weights_only=True,
+            mmap=True,
+        )
+        if not isinstance(rng_payload, Mapping):
+            raise ValueError("distributed checkpoint RNG payload is invalid")
+        typed_rng_payload = cast(Mapping[str, Any], rng_payload)
+        if not isinstance(typed_rng_payload.get("rng_state"), Mapping):
+            raise ValueError("distributed checkpoint RNG payload is invalid")
+        validated_rng_state = cast(Mapping[str, Any], typed_rng_payload["rng_state"])
         set_state_dict(
             checkpoint_model,
             optimizer,
@@ -1340,20 +1455,7 @@ def load_checkpoint(
             ema.load_state_dict(state["ema"])
         if training_state is not None:
             training_state.update(state.get("training_state", {}))
-        rng_file = path / f"rng-rank-{context.rank:05d}.pt"
-        if rng_file.is_file():
-            rng_payload = torch.load(
-                rng_file,
-                map_location="cpu",
-                weights_only=True,
-                mmap=True,
-            )
-            if not isinstance(rng_payload, Mapping):
-                raise ValueError("distributed checkpoint RNG payload is invalid")
-            typed_rng_payload = cast(Mapping[str, Any], rng_payload)
-            if not isinstance(typed_rng_payload.get("rng_state"), Mapping):
-                raise ValueError("distributed checkpoint RNG payload is invalid")
-            _restore_rng_state(cast(Mapping[str, Any], typed_rng_payload["rng_state"]))
+        _restore_rng_state(validated_rng_state)
         return int(state["step"])
 
     # 단일 프로세스: 임의 코드 실행이 가능한 일반 pickle 로드는 사용하지 않습니다.
@@ -1372,6 +1474,15 @@ def load_checkpoint(
     loaded_state = _validate_loaded_state(loaded)
     # 모델/optimizer를 변경하기 전에 현재 실행과 체크포인트의 정체성을 비교합니다.
     _validate_identity(loaded_state, expected_identity)
+    current_schema = loaded_state.get("schema") == CHECKPOINT_SCHEMA
+    scaler_state = loaded_state.get("scaler")
+    if scaler is not None:
+        if scaler_state is None and current_schema:
+            raise ValueError(
+                "checkpoint resume has a scaler enabled but the checkpoint scaler state is missing"
+            )
+        if scaler_state is not None and not isinstance(scaler_state, Mapping):
+            raise ValueError("checkpoint scaler state must be an object")
     if ema is not None:
         ema_state = loaded_state.get("ema")
         if ema_state is None:
@@ -1379,18 +1490,20 @@ def load_checkpoint(
                 "checkpoint resume has EMA enabled but the checkpoint EMA state is missing"
             )
         ema.validate_state_dict(ema_state)
+    rng_state = loaded_state.get("rng_state")
+    if rng_state is None and current_schema:
+        raise ValueError("checkpoint RNG state is missing")
+    if rng_state is not None and not isinstance(rng_state, Mapping):
+        raise ValueError("checkpoint RNG state must be an object")
     _unwrap_compiled_model(model).load_state_dict(loaded_state["model"])
     optimizer.load_state_dict(loaded_state["optimizer"])
     scheduler.load_state_dict(loaded_state["scheduler"])
-    if scaler is not None and loaded_state.get("scaler"):
-        scaler.load_state_dict(loaded_state["scaler"])
+    if scaler is not None and scaler_state is not None:
+        scaler.load_state_dict(scaler_state)
     if ema is not None:
         ema.load_state_dict(loaded_state["ema"])
     if training_state is not None:
         training_state.update(loaded_state.get("training_state", {}))
-    rng_state = loaded_state.get("rng_state")
     if rng_state is not None:
-        if not isinstance(rng_state, Mapping):
-            raise ValueError("checkpoint RNG state must be an object")
         _restore_rng_state(cast(Mapping[str, Any], rng_state))
     return int(loaded_state["step"])

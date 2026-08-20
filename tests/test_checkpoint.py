@@ -484,6 +484,51 @@ def test_resume_requires_a_complete_ema_before_mutating_training_state(
         torch.testing.assert_close(tensor, ema_before[name])
 
 
+@pytest.mark.parametrize("missing_field", ["rng_state", "scaler"])
+def test_resume_requires_current_rng_and_active_scaler_before_model_mutation(
+    tmp_path: Path,
+    missing_field: str,
+) -> None:
+    model, optimizer, scheduler, context = _components()
+    checkpoint = tmp_path / f"resume-{missing_field}"
+    source_scaler = FakeScaler(8.0) if missing_field == "scaler" else None
+    save_checkpoint(
+        checkpoint,
+        model,
+        optimizer,
+        scheduler,
+        3,
+        context,
+        scaler=source_scaler,
+    )
+    payload = torch.load(checkpoint / "checkpoint.pt", weights_only=True)
+    payload.pop(missing_field)
+    torch.save(payload, checkpoint / "checkpoint.pt")
+
+    fresh, fresh_optimizer, fresh_scheduler, _ = _components()
+    fresh_scaler = FakeScaler(2.0) if missing_field == "scaler" else None
+    model_before = {name: tensor.clone() for name, tensor in fresh.state_dict().items()}
+    optimizer_before = deepcopy(fresh_optimizer.state_dict())
+    scheduler_before = deepcopy(fresh_scheduler.state_dict())
+
+    with pytest.raises(ValueError, match="RNG|scaler"):
+        load_checkpoint(
+            checkpoint,
+            fresh,
+            fresh_optimizer,
+            fresh_scheduler,
+            context,
+            scaler=fresh_scaler,
+        )
+
+    for name, tensor in fresh.state_dict().items():
+        torch.testing.assert_close(tensor, model_before[name])
+    assert fresh_optimizer.state_dict() == optimizer_before
+    assert fresh_scheduler.state_dict() == scheduler_before
+    if fresh_scaler is not None:
+        assert fresh_scaler.scale == 2.0
+
+
 def test_local_checkpoint_restores_python_numpy_and_torch_rng(tmp_path: Path) -> None:
     model, optimizer, scheduler, context = _components()
     checkpoint = tmp_path / "checkpoint"
@@ -688,6 +733,80 @@ def test_distributed_checkpoint_publishes_complete_directory_and_falls_back(
         torch.testing.assert_close(model.token_embedding.weight, first_weight)
     finally:
         torch.distributed.destroy_process_group()
+
+
+def _write_fake_complete_dcp(path: Path, *, step: int) -> None:
+    path.mkdir(parents=True)
+    (path / ".metadata").write_bytes(f"metadata-{step}".encode())
+    (path / "__0_0.distcp").write_bytes(f"shard-{step}".encode())
+    (path / "rng-rank-00000.pt").write_bytes(f"rng-{step}".encode())
+    checkpoint_module._write_dcp_completion(path, step=step, world_size=1)
+
+
+@pytest.mark.parametrize("tamper", ["shard", "rng", "marker"])
+def test_dcp_completion_inventory_falls_back_from_corruption(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    current = tmp_path / "latest"
+    previous = current.with_name(".latest.previous")
+    _write_fake_complete_dcp(previous, step=1)
+    _write_fake_complete_dcp(current, step=2)
+    if tamper == "shard":
+        (current / "__0_0.distcp").write_bytes(b"corrupt")
+    elif tamper == "rng":
+        (current / "rng-rank-00000.pt").unlink()
+    else:
+        (current / checkpoint_module.DCP_COMPLETION_FILENAME).write_text(
+            "{broken",
+            encoding="utf-8",
+        )
+
+    with pytest.warns(RuntimeWarning, match="retained checkpoint"):
+        resolved = checkpoint_module._resolve_dcp_checkpoint(current, world_size=1)
+
+    assert resolved == previous
+
+
+def test_invalid_dcp_marker_cannot_fall_through_to_legacy_metadata(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "latest"
+    _write_fake_complete_dcp(checkpoint, step=1)
+    (checkpoint / checkpoint_module.DCP_COMPLETION_FILENAME).write_text(
+        "{broken",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(FileNotFoundError, match="current=invalid"):
+        checkpoint_module._resolve_dcp_checkpoint(checkpoint, world_size=1)
+
+
+def test_dcp_publish_keeps_valid_previous_when_corrupt_current_install_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current = tmp_path / "latest"
+    previous = current.with_name(".latest.previous")
+    staging = current.with_name(".latest.staging")
+    _write_fake_complete_dcp(previous, step=1)
+    _write_fake_complete_dcp(current, step=2)
+    _write_fake_complete_dcp(staging, step=3)
+    (current / "__0_0.distcp").write_bytes(b"corrupt")
+    real_replace = checkpoint_module.os.replace
+
+    def fail_staging_install(source: str | Path, destination: str | Path) -> None:
+        if Path(source) == staging and Path(destination) == current:
+            raise OSError("injected staging install failure")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(checkpoint_module.os, "replace", fail_staging_install)
+    with pytest.raises(OSError, match="injected staging install failure"):
+        checkpoint_module._publish_dcp_staging(staging, current, world_size=1)
+
+    assert not current.exists()
+    assert staging.exists()
+    assert checkpoint_module._dcp_completion_status(previous, world_size=1) == "valid"
+    with pytest.warns(RuntimeWarning, match="retained checkpoint"):
+        assert checkpoint_module._resolve_dcp_checkpoint(current, world_size=1) == previous
 
 
 def test_distributed_stage_transfer_supports_ddp_canonical_model_keys(
