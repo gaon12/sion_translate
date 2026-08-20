@@ -618,6 +618,53 @@ def test_distributed_checkpoint_publishes_complete_directory_and_falls_back(
         torch.distributed.destroy_process_group()
 
 
+def test_distributed_stage_transfer_supports_ddp_canonical_model_keys(
+    tmp_path: Path,
+) -> None:
+    if not torch.distributed.is_available() or not torch.distributed.is_gloo_available():
+        pytest.skip("distributed checkpoint test requires Gloo")
+    if torch.distributed.is_initialized():
+        pytest.skip("test requires ownership of the default process group")
+
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=(tmp_path / "dcp-stage-rendezvous").resolve().as_uri(),
+        rank=0,
+        world_size=1,
+    )
+    try:
+        source, _, _, _ = _components()
+        source_ddp = torch.nn.parallel.DistributedDataParallel(source)
+        optimizer = torch.optim.AdamW(source_ddp.parameters(), lr=1e-3)
+        scheduler = cosine_scheduler(optimizer, warmup_steps=0, max_steps=2, min_ratio=0.1)
+        with torch.no_grad():
+            source.token_embedding.weight.fill_(1.0)
+        ema = EMAWeights(source_ddp, decay=0.9)
+        with torch.no_grad():
+            ema.shadow["module.token_embedding.weight"].fill_(2.0)
+        checkpoint = tmp_path / "foundation-ddp"
+        context = DistributedContext(0, 0, 1, torch.device("cpu"), True, "gloo")
+        save_checkpoint(
+            checkpoint,
+            source_ddp,
+            optimizer,
+            scheduler,
+            9,
+            context,
+            ema=ema,
+        )
+
+        fresh, _, _, _ = _components()
+        fresh_ddp = torch.nn.parallel.DistributedDataParallel(fresh)
+        provenance = initialize_model_from_checkpoint(checkpoint, fresh_ddp, context)
+
+        assert torch.all(fresh.token_embedding.weight == 2.0)
+        assert provenance["weights"] == "ema"
+        assert provenance["step"] == 9
+    finally:
+        torch.distributed.destroy_process_group()
+
+
 # ── 단계 인계 (foundation → SFT) ────────────────────────────────────────
 
 
@@ -667,6 +714,222 @@ def test_stage_transfer_loads_weights_without_optimizer_or_step(tmp_path: Path) 
     assert provenance["step"] == 4200
     assert fresh_scheduler.state_dict() == scheduler_before
     assert fresh_optimizer.state_dict() == optimizer_before
+
+
+def test_stage_transfer_selects_ema_weights_without_inheriting_optimizer_state(
+    tmp_path: Path,
+) -> None:
+    model, optimizer, scheduler, context = _components()
+    checkpoint = tmp_path / "foundation"
+    with torch.no_grad():
+        model.token_embedding.weight.fill_(1.0)
+    ema = EMAWeights(model, decay=0.9)
+    with torch.no_grad():
+        ema.shadow["token_embedding.weight"].fill_(2.0)
+    save_checkpoint(
+        checkpoint,
+        model,
+        optimizer,
+        scheduler,
+        7,
+        context,
+        ema=ema,
+    )
+
+    fresh, fresh_optimizer, fresh_scheduler, _ = _components()
+    optimizer_before = deepcopy(fresh_optimizer.state_dict())
+    scheduler_before = deepcopy(fresh_scheduler.state_dict())
+    provenance = initialize_model_from_checkpoint(checkpoint, fresh, context)
+
+    assert torch.all(fresh.token_embedding.weight == 2.0)
+    assert provenance == {
+        "source": str(checkpoint),
+        "step": 7,
+        "stage": None,
+        "weights": "ema",
+    }
+    assert fresh_optimizer.state_dict() == optimizer_before
+    assert fresh_scheduler.state_dict() == scheduler_before
+
+
+def test_stage_transfer_rejects_missing_required_ema_before_mutating_the_model(
+    tmp_path: Path,
+) -> None:
+    model, optimizer, scheduler, context = _components()
+    checkpoint = tmp_path / "foundation"
+    identity = _identity(
+        model,
+        tmp_path,
+        dataset_name="foundation_dataset",
+        stage="foundation",
+    )
+    training = AppConfig().training
+    training.ema_decay = 0.999
+    identity["objective"] = checkpoint_module.build_objective_identity(training)
+    save_checkpoint(
+        checkpoint,
+        model,
+        optimizer,
+        scheduler,
+        7,
+        context,
+        identity=identity,
+    )
+
+    fresh, _, _, _ = _components()
+    before = {name: tensor.clone() for name, tensor in fresh.state_dict().items()}
+    with pytest.raises(ValueError, match="trained with EMA enabled"):
+        initialize_model_from_checkpoint(checkpoint, fresh, context)
+
+    for name, tensor in fresh.state_dict().items():
+        torch.testing.assert_close(tensor, before[name])
+
+
+def test_stage_transfer_rejects_ema_that_contradicts_a_disabled_source_policy(
+    tmp_path: Path,
+) -> None:
+    model, optimizer, scheduler, context = _components()
+    checkpoint = tmp_path / "foundation"
+    identity = _identity(
+        model,
+        tmp_path,
+        dataset_name="foundation_dataset",
+        stage="foundation",
+    )
+    training = AppConfig().training
+    training.ema_decay = 0.0
+    identity["objective"] = checkpoint_module.build_objective_identity(training)
+    ema = EMAWeights(model, decay=0.9)
+    save_checkpoint(
+        checkpoint,
+        model,
+        optimizer,
+        scheduler,
+        7,
+        context,
+        identity=identity,
+        ema=ema,
+    )
+
+    fresh, _, _, _ = _components()
+    before = {name: tensor.clone() for name, tensor in fresh.state_dict().items()}
+    with pytest.raises(ValueError, match="records EMA as disabled"):
+        initialize_model_from_checkpoint(checkpoint, fresh, context)
+
+    for name, tensor in fresh.state_dict().items():
+        torch.testing.assert_close(tensor, before[name])
+
+
+def test_stage_transfer_validates_all_raw_tensors_before_loading_any(
+    tmp_path: Path,
+) -> None:
+    model, optimizer, scheduler, context = _components()
+    checkpoint = tmp_path / "foundation"
+    save_checkpoint(checkpoint, model, optimizer, scheduler, 7, context)
+    payload = torch.load(checkpoint / "checkpoint.pt", weights_only=True)
+    model_names = list(payload["model"])
+    payload["model"][model_names[0]] = torch.full_like(payload["model"][model_names[0]], 9.0)
+    last_name = model_names[-1]
+    payload["model"][last_name] = payload["model"][last_name].reshape(-1)[:1]
+    torch.save(payload, checkpoint / "checkpoint.pt")
+
+    fresh, _, _, _ = _components()
+    before = {name: tensor.clone() for name, tensor in fresh.state_dict().items()}
+    with pytest.raises(ValueError, match="model tensor metadata mismatch"):
+        initialize_model_from_checkpoint(checkpoint, fresh, context)
+
+    for name, tensor in fresh.state_dict().items():
+        torch.testing.assert_close(tensor, before[name])
+
+
+def test_stage_transfer_validates_all_ema_tensors_before_copying_any(
+    tmp_path: Path,
+) -> None:
+    model, optimizer, scheduler, context = _components()
+    checkpoint = tmp_path / "foundation"
+    ema = EMAWeights(model, decay=0.9)
+    save_checkpoint(checkpoint, model, optimizer, scheduler, 7, context, ema=ema)
+    payload = torch.load(checkpoint / "checkpoint.pt", weights_only=True)
+    ema_names = list(payload["ema"])
+    payload["ema"][ema_names[0]] = torch.full_like(payload["ema"][ema_names[0]], 9.0)
+    last_name = ema_names[-1]
+    payload["ema"][last_name] = payload["ema"][last_name].reshape(-1)[:1]
+    torch.save(payload, checkpoint / "checkpoint.pt")
+
+    fresh, _, _, _ = _components()
+    before = {name: tensor.clone() for name, tensor in fresh.state_dict().items()}
+    with pytest.raises(ValueError, match="tensor metadata mismatch"):
+        initialize_model_from_checkpoint(checkpoint, fresh, context)
+
+    for name, tensor in fresh.state_dict().items():
+        torch.testing.assert_close(tensor, before[name])
+
+
+def test_distributed_stage_transfer_selects_the_checkpoint_ema_weights(
+    tmp_path: Path,
+) -> None:
+    import torch.distributed.checkpoint as dcp
+
+    model, _, _, _ = _components()
+    with torch.no_grad():
+        model.token_embedding.weight.fill_(1.0)
+    ema = EMAWeights(model, decay=0.9)
+    with torch.no_grad():
+        ema.shadow["token_embedding.weight"].fill_(2.0)
+    checkpoint = tmp_path / "foundation-dcp"
+    dcp.save(
+        {
+            "model": model.state_dict(),
+            "step": 9,
+            "ema": ema.state_dict(),
+        },
+        checkpoint_id=checkpoint,
+    )
+
+    fresh, _, _, _ = _components()
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), True, "gloo")
+    with pytest.warns(RuntimeWarning, match="legacy distributed checkpoint"):
+        provenance = initialize_model_from_checkpoint(checkpoint, fresh, context)
+
+    assert torch.all(fresh.token_embedding.weight == 2.0)
+    assert provenance["weights"] == "ema"
+    assert provenance["step"] == 9
+
+
+@pytest.mark.parametrize("tamper", ["dtype", "unexpected"])
+def test_distributed_stage_transfer_preflights_ema_metadata(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    import torch.distributed.checkpoint as dcp
+
+    model, _, _, _ = _components()
+    ema = EMAWeights(model, decay=0.9)
+    ema_state = ema.state_dict()
+    if tamper == "dtype":
+        first_name = next(iter(ema_state))
+        ema_state[first_name] = ema_state[first_name].double()
+    else:
+        ema_state["injected.unexpected"] = torch.tensor([3.0])
+    checkpoint = tmp_path / f"foundation-dcp-{tamper}"
+    dcp.save(
+        {
+            "model": model.state_dict(),
+            "step": 9,
+            "ema": ema_state,
+        },
+        checkpoint_id=checkpoint,
+    )
+
+    fresh, _, _, _ = _components()
+    before = {name: tensor.clone() for name, tensor in fresh.state_dict().items()}
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), True, "gloo")
+    with pytest.warns(RuntimeWarning, match="legacy distributed checkpoint"):
+        with pytest.raises(ValueError, match="distributed checkpoint ema"):
+            initialize_model_from_checkpoint(checkpoint, fresh, context)
+
+    for name, tensor in fresh.state_dict().items():
+        torch.testing.assert_close(tensor, before[name])
 
 
 def test_stage_transfer_accepts_a_different_dataset(tmp_path: Path) -> None:

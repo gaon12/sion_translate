@@ -116,6 +116,202 @@ def _unwrap_compiled_model(model: nn.Module) -> nn.Module:
         unwrapped = original
 
 
+def _stage_transfer_ema_template(model: nn.Module) -> dict[str, torch.Tensor]:
+    """Allocate the exact tensor mapping DCP needs to restore EMA parameters."""
+
+    return {
+        name: parameter.detach().clone()
+        for name, parameter in _unwrap_compiled_model(model).named_parameters()
+        if parameter.requires_grad
+    }
+
+
+def _canonical_stage_transfer_key(raw_name: str) -> str:
+    name = raw_name
+    while name.startswith("_orig_mod."):
+        name = name.removeprefix("_orig_mod.")
+    return name
+
+
+def _validate_stage_transfer_model_state(
+    model: nn.Module,
+    model_state: object,
+) -> dict[str, torch.Tensor]:
+    """Preflight every raw model tensor before ``load_state_dict`` can mutate it."""
+
+    if not isinstance(model_state, Mapping):
+        raise ValueError("stage-transfer checkpoint model state must be an object")
+    expected = _unwrap_compiled_model(model).state_dict()
+    normalized: dict[str, torch.Tensor] = {}
+    for raw_name, raw_tensor in cast(Mapping[object, object], model_state).items():
+        if not isinstance(raw_name, str) or not isinstance(raw_tensor, torch.Tensor):
+            raise ValueError("stage-transfer checkpoint model state is malformed")
+        name = _canonical_stage_transfer_key(raw_name)
+        if name in normalized:
+            raise ValueError(f"stage-transfer checkpoint model contains duplicate key: {name}")
+        normalized[name] = raw_tensor
+    missing = sorted(set(expected) - set(normalized))
+    unexpected = sorted(set(normalized) - set(expected))
+    if missing or unexpected:
+        raise ValueError(
+            "stage-transfer checkpoint model does not match the architecture: "
+            f"missing={missing[:8]}, unexpected={unexpected[:8]}"
+        )
+    for name, target in expected.items():
+        source = normalized[name]
+        if source.shape != target.shape or source.dtype != target.dtype:
+            raise ValueError(
+                "stage-transfer checkpoint model tensor metadata mismatch for "
+                f"{name}: checkpoint=(shape={tuple(source.shape)}, dtype={source.dtype}), "
+                f"model=(shape={tuple(target.shape)}, dtype={target.dtype})"
+            )
+    return normalized
+
+
+def _validate_dcp_tensor_group_metadata(
+    metadata: Any,
+    *,
+    prefix: str,
+    expected: Mapping[str, torch.Tensor],
+) -> bool:
+    """Validate DCP keys/shapes/dtypes before its loader can cast or ignore them."""
+
+    prefix_with_dot = f"{prefix}."
+    actual: dict[str, Any] = {}
+    for raw_key, tensor_metadata in metadata.state_dict_metadata.items():
+        flat_key = str(raw_key)
+        if not flat_key.startswith(prefix_with_dot):
+            continue
+        name = _canonical_stage_transfer_key(flat_key.removeprefix(prefix_with_dot))
+        if name in actual:
+            raise ValueError(f"distributed checkpoint {prefix} contains duplicate key: {name}")
+        actual[name] = tensor_metadata
+    if not actual:
+        return False
+    missing = sorted(set(expected) - set(actual))
+    unexpected = sorted(set(actual) - set(expected))
+    if missing or unexpected:
+        raise ValueError(
+            f"distributed checkpoint {prefix} does not match the model: "
+            f"missing={missing[:8]}, unexpected={unexpected[:8]}"
+        )
+    for name, target in expected.items():
+        stored = actual[name]
+        size = getattr(stored, "size", None)
+        properties = getattr(stored, "properties", None)
+        dtype = getattr(properties, "dtype", None)
+        if tuple(size or ()) != tuple(target.shape) or dtype != target.dtype:
+            raise ValueError(
+                f"distributed checkpoint {prefix} tensor metadata mismatch for {name}: "
+                f"checkpoint=(shape={tuple(size or ())}, dtype={dtype}), "
+                f"model=(shape={tuple(target.shape)}, dtype={target.dtype})"
+            )
+    return True
+
+
+def _validate_stage_transfer_ema(
+    model: nn.Module,
+    ema_state: object,
+) -> dict[str, torch.Tensor] | None:
+    """Validate a complete EMA parameter set without mutating the live model."""
+
+    if ema_state is None:
+        return None
+    if not isinstance(ema_state, Mapping):
+        raise ValueError("stage-transfer checkpoint EMA state must be an object")
+    expected = {
+        name: parameter
+        for name, parameter in _unwrap_compiled_model(model).named_parameters()
+        if parameter.requires_grad
+    }
+    normalized: dict[str, torch.Tensor] = {}
+    for raw_name, raw_tensor in cast(Mapping[object, object], ema_state).items():
+        if not isinstance(raw_name, str) or not isinstance(raw_tensor, torch.Tensor):
+            raise ValueError("stage-transfer checkpoint EMA state is malformed")
+        name = _canonical_stage_transfer_key(raw_name)
+        if name in normalized:
+            raise ValueError(f"stage-transfer checkpoint EMA contains duplicate key: {name}")
+        normalized[name] = raw_tensor
+    missing = sorted(set(expected) - set(normalized))
+    unexpected = sorted(set(normalized) - set(expected))
+    if missing or unexpected:
+        raise ValueError(
+            "stage-transfer checkpoint EMA does not match the model parameters: "
+            f"missing={missing[:8]}, unexpected={unexpected[:8]}"
+        )
+    mismatched = [
+        name
+        for name, parameter in expected.items()
+        if normalized[name].shape != parameter.shape or normalized[name].dtype != parameter.dtype
+    ]
+    if mismatched:
+        name = mismatched[0]
+        tensor = normalized[name]
+        parameter = expected[name]
+        raise ValueError(
+            "stage-transfer checkpoint EMA tensor metadata mismatch for "
+            f"{name}: checkpoint=(shape={tuple(tensor.shape)}, dtype={tensor.dtype}), "
+            f"model=(shape={tuple(parameter.shape)}, dtype={parameter.dtype})"
+        )
+    return normalized
+
+
+@torch.no_grad()
+def _copy_validated_stage_transfer_ema(
+    model: nn.Module,
+    ema_state: Mapping[str, torch.Tensor] | None,
+) -> bool:
+    """Select a preflighted EMA parameter set for the next stage."""
+
+    if ema_state is None:
+        return False
+    expected = {
+        name: parameter
+        for name, parameter in _unwrap_compiled_model(model).named_parameters()
+        if parameter.requires_grad
+    }
+    for name, parameter in expected.items():
+        parameter.copy_(ema_state[name])
+    return True
+
+
+def _source_identity_ema_policy(state: Mapping[str, Any]) -> bool | None:
+    """Return a hash-authenticated EMA policy, or None for a legacy identity."""
+
+    identity = state.get("identity")
+    if not isinstance(identity, Mapping):
+        return None
+    identity_mapping = cast(Mapping[object, object], identity)
+    objective = identity_mapping.get("objective")
+    if not isinstance(objective, Mapping):
+        return None
+    objective_mapping = cast(Mapping[object, object], objective)
+    stored_sha256 = objective_mapping.get("sha256")
+    if stored_sha256 is None:
+        return None
+    if not isinstance(stored_sha256, str):
+        raise ValueError("checkpoint objective identity SHA256 is invalid")
+    unhashed_objective = {
+        str(key): value for key, value in objective_mapping.items() if key != "sha256"
+    }
+    calculated_sha256 = hashlib.sha256(
+        _canonical_json(unhashed_objective).encode("utf-8")
+    ).hexdigest()
+    if stored_sha256 != calculated_sha256:
+        raise ValueError("checkpoint objective identity SHA256 does not authenticate its fields")
+    supervised = objective_mapping.get("supervised")
+    if not isinstance(supervised, Mapping) or "ema_decay" not in supervised:
+        return None
+    supervised_mapping = cast(Mapping[object, object], supervised)
+    decay = supervised_mapping.get("ema_decay")
+    if isinstance(decay, bool) or not isinstance(decay, (int, float)):
+        raise ValueError("checkpoint objective ema_decay is invalid")
+    numeric_decay = float(decay)
+    if not np.isfinite(numeric_decay) or not 0.0 <= numeric_decay < 1.0:
+        raise ValueError("checkpoint objective ema_decay is invalid")
+    return numeric_decay > 0.0
+
+
 def _portable_data_config(data_config: Any) -> Any:
     """Remove storage locations while retaining every semantic data setting."""
 
@@ -526,11 +722,9 @@ def _preflight_dcp_identity(
 def _preflight_dcp_stage_transfer(
     path: Path,
     expected_identity: Mapping[str, Any] | None,
-) -> None:
+) -> Mapping[str, Any]:
     """Validate model/tokenizer ancestry before DCP touches the live model."""
 
-    if expected_identity is None:
-        return
     import torch.distributed.checkpoint as dcp
 
     metadata = dcp.FileSystemReader(  # pyright: ignore[reportPrivateImportUsage]
@@ -539,7 +733,7 @@ def _preflight_dcp_stage_transfer(
     probe = _dcp_identity_probe(metadata)
     if "identity" not in probe:
         _validate_stage_transfer(probe, expected_identity, source=path)
-        return
+        return probe
     try:
         dcp.load(  # pyright: ignore[reportUnknownMemberType, reportPrivateImportUsage]
             probe,
@@ -550,12 +744,13 @@ def _preflight_dcp_stage_transfer(
             f"distributed stage-transfer identity could not be preflighted: {path}"
         ) from error
     stored_identity = probe.get("identity")
-    if isinstance(stored_identity, dict):
+    if isinstance(stored_identity, dict) and expected_identity is not None:
         _restore_expected_empty_mappings(
             cast(dict[str, Any], stored_identity),
             cast(Mapping[str, Any], _json_compatible(expected_identity)),
         )
     _validate_stage_transfer(probe, expected_identity, source=path)
+    return probe
 
 
 def preflight_checkpoint_identity(
@@ -909,10 +1104,14 @@ def initialize_model_from_checkpoint(
     foundation → SFT 처럼 단계가 바뀔 때 쓰는 경로입니다. ``load_checkpoint``
     와 의도적으로 다릅니다.
 
-    - optimizer/scheduler/scaler/EMA/RNG/step 을 **복원하지 않습니다.** 새
+    - optimizer/scheduler/scaler/RNG/step 을 **복원하지 않습니다.** 새
       단계는 새 목적함수와 새 LR schedule 을 가지므로, 이전 단계의 Adam
       moment 와 step 카운터를 이어받으면 warmup 이 건너뛰어지고 momentum 이
       다른 loss 표면의 것을 가리킵니다.
+    - 단, 체크포인트에 EMA shadow가 있으면 raw model 대신 그 파라미터를 다음
+      단계의 초기 가중치로 선택합니다. 이는 fresh foundation 종료 직후 trainer가
+      선택하는 가중치와 완료-marker 재사용 경로를 동일하게 만듭니다. EMA의
+      decay/history 자체를 새 단계로 이어받는 것은 아닙니다.
     - dataset identity 를 비교하지 않습니다. 두 단계는 서로 다른 데이터셋을
       쓰는 것이 정상입니다(단일어 대 병렬).
     - 대신 **tokenizer 와 model config 는 반드시 같아야 합니다.** 토크나이저가
@@ -931,18 +1130,47 @@ def initialize_model_from_checkpoint(
         )
 
         resolved = _resolve_dcp_checkpoint(path, world_size=context.world_size)
-        _preflight_dcp_stage_transfer(resolved, expected_identity)
+        source_identity = _preflight_dcp_stage_transfer(resolved, expected_identity)
         checkpoint_model = _unwrap_compiled_model(model)
         # DCP 는 여기 넣어 둔 값 '안으로' 읽어들이므로, 가져올 것만 등록합니다.
-        # optimizer/scheduler/EMA 를 등록하지 않는 것이 곧 "가중치만" 입니다.
+        # optimizer/scheduler는 등록하지 않고, EMA는 초기 파라미터 선택용으로만
+        # 읽습니다. 새 단계가 EMA history 자체를 이어받는 것은 아닙니다.
         state: dict[str, Any] = {"model": get_model_state_dict(checkpoint_model), "step": 0}
+        metadata = dcp.FileSystemReader(  # pyright: ignore[reportPrivateImportUsage]
+            resolved
+        ).read_metadata()
+        _validate_dcp_tensor_group_metadata(
+            metadata,
+            prefix="model",
+            expected=cast(Mapping[str, torch.Tensor], state["model"]),
+        )
+        ema_template = _stage_transfer_ema_template(model)
+        has_ema = _validate_dcp_tensor_group_metadata(
+            metadata,
+            prefix="ema",
+            expected=ema_template,
+        )
+        ema_policy = _source_identity_ema_policy(source_identity)
+        if ema_policy is True and not has_ema:
+            raise ValueError(
+                "stage-transfer checkpoint was trained with EMA enabled but its EMA state "
+                "is missing"
+            )
+        if ema_policy is False and has_ema:
+            raise ValueError(
+                "stage-transfer checkpoint records EMA as disabled but contains EMA state"
+            )
+        if has_ema:
+            state["ema"] = ema_template
         if expected_identity is not None:
             state["identity"] = _json_compatible(expected_identity)
         dcp.load(  # pyright: ignore[reportUnknownMemberType, reportPrivateImportUsage]
             state, checkpoint_id=resolved
         )
         _validate_stage_transfer(state, expected_identity, source=resolved)
+        selected_ema_state = _validate_stage_transfer_ema(model, state.get("ema"))
         set_model_state_dict(checkpoint_model, state["model"])
+        selected_ema = _copy_validated_stage_transfer_ema(model, selected_ema_state)
         identity = state.get("identity")
         identity_mapping: Mapping[object, object] = (
             cast(Mapping[object, object], identity) if isinstance(identity, Mapping) else {}
@@ -951,12 +1179,13 @@ def initialize_model_from_checkpoint(
             "source": str(resolved),
             "step": int(state.get("step") or 0),
             "stage": identity_mapping.get("stage"),
+            "weights": "ema" if selected_ema else "raw",
         }
 
     try:
         loaded = torch.load(
             path / "checkpoint.pt",
-            map_location=context.device,
+            map_location="cpu",
             weights_only=True,
             mmap=True,
         )
@@ -967,7 +1196,21 @@ def initialize_model_from_checkpoint(
         ) from error
     loaded_state = _validate_loaded_state(loaded)
     _validate_stage_transfer(loaded_state, expected_identity, source=path)
-    _unwrap_compiled_model(model).load_state_dict(loaded_state["model"])
+    ema_policy = _source_identity_ema_policy(loaded_state)
+    has_ema = loaded_state.get("ema") is not None
+    if ema_policy is True and not has_ema:
+        raise ValueError(
+            "stage-transfer checkpoint was trained with EMA enabled but its EMA state is missing"
+        )
+    if ema_policy is False and has_ema:
+        raise ValueError("stage-transfer checkpoint records EMA as disabled but contains EMA state")
+    validated_model_state = _validate_stage_transfer_model_state(
+        model,
+        loaded_state["model"],
+    )
+    selected_ema_state = _validate_stage_transfer_ema(model, loaded_state.get("ema"))
+    _unwrap_compiled_model(model).load_state_dict(validated_model_state)
+    selected_ema = _copy_validated_stage_transfer_ema(model, selected_ema_state)
     identity = loaded_state.get("identity")
     identity_mapping: Mapping[object, object] = (
         cast(Mapping[object, object], identity) if isinstance(identity, Mapping) else {}
@@ -976,6 +1219,7 @@ def initialize_model_from_checkpoint(
         "source": str(path),
         "step": int(loaded_state.get("step") or 0),
         "stage": identity_mapping.get("stage"),
+        "weights": "ema" if selected_ema else "raw",
     }
 
 
