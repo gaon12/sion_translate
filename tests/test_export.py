@@ -1009,7 +1009,7 @@ def test_atomic_replace_directory_uses_a_cross_process_publish_lock(tmp_path: Pa
     temporary = tmp_path / "exports" / ".best.tmp-child"
     temporary.mkdir()
     (temporary / "generation.txt").write_text("new", encoding="utf-8")
-    lock_root = destination.parent.parent / ".sion-export-publish-lock"
+    lock_root = export_module._export_publish_lock_root(destination)
     script = textwrap.dedent(
         f"""
         import sys
@@ -1041,6 +1041,58 @@ def test_atomic_replace_directory_uses_a_cross_process_publish_lock(tmp_path: Pa
     assert "다른 프로세스에 잠겨" in result.stdout
     assert (destination / "generation.txt").read_text(encoding="utf-8") == "old"
     assert (temporary / "generation.txt").read_text(encoding="utf-8") == "new"
+
+
+def test_complete_file_and_manifest_generation_uses_a_cross_process_lock(tmp_path: Path) -> None:
+    destination = tmp_path / "exports" / "best"
+    script = textwrap.dedent(
+        f"""
+        import sys
+        from pathlib import Path
+        import torch
+        import sion_translate.training.export as export_module
+        from sion_translate.config import ExperimentalConfig, ModelConfig
+
+        export_module._EXPORT_LOCK_TIMEOUT_SECONDS = 0.15
+        config = ModelConfig(
+            vocab_size=64,
+            d_model=32,
+            encoder_layers=1,
+            decoder_layers=1,
+            num_heads=4,
+            num_kv_heads=2,
+            d_ff=64,
+            max_seq_len=16,
+            dropout=0.0,
+            gradient_checkpointing=False,
+            experimental=ExperimentalConfig(),
+        )
+        try:
+            export_module.export_state_dict_formats(
+                Path({str(destination)!r}),
+                {{"sentinel": torch.tensor([2.0])}},
+                config,
+                0,
+                formats=("fp32",),
+            )
+        except RuntimeError as error:
+            print(error)
+            sys.exit(3)
+        """
+    )
+
+    with export_module.artifact_lock(export_module._export_publish_lock_root(destination)):
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            cwd=Path.cwd(),
+            timeout=10.0,
+        )
+
+    assert result.returncode == 3, result.stderr
+    assert "다른 프로세스에 잠겨" in result.stdout
+    assert not destination.exists()
 
 
 def test_handoff_cleanup_failure_never_exposes_a_partial_destination(

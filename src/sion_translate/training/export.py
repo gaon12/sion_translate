@@ -633,6 +633,13 @@ def _remove_staging_artifact(path: Path) -> None:
         raise
 
 
+def _export_publish_lock_root(destination: Path) -> Path:
+    """Return a stable sibling lock root for one canonical export destination."""
+
+    lock_name = f".{destination.name}.sion-export-publish-lock"
+    return destination.parent / lock_name
+
+
 def _install_directory(temporary: Path, destination: Path) -> None:
     """staging 디렉터리를 목적지 자리에 설치한다.
 
@@ -729,15 +736,10 @@ def _atomic_replace_directory_unlocked(temporary: Path, destination: Path) -> No
 
 
 def _atomic_replace_directory(temporary: Path, destination: Path) -> None:
-    """Serialize publication per parent and atomically replace one directory."""
+    """Serialize publication per destination and atomically replace one directory."""
 
-    parent = destination.parent
-    # Keep the lock outside the directory being installed. In strict exports,
-    # ``parent`` is itself a randomized staging directory; its parent is the
-    # stable export root, so this avoids leaking one lock directory per run.
-    lock_root = parent.parent / ".sion-export-publish-lock"
     with artifact_lock(
-        lock_root,
+        _export_publish_lock_root(destination),
         timeout=_EXPORT_LOCK_TIMEOUT_SECONDS,
         poll_interval=0.05,
     ):
@@ -1005,7 +1007,9 @@ def _write_transformers_checkpoint(
             raise RuntimeError("Transformers checkpoint release_name changed during export")
         if inspection["release_version"] != release_version:
             raise RuntimeError("Transformers checkpoint release_version changed during export")
-        _atomic_replace_directory(temporary, path)
+        # The public export transaction owns the destination lock. Reacquiring
+        # it here would deadlock on platforms with non-reentrant file locks.
+        _atomic_replace_directory_unlocked(temporary, path)
         return inspection
     finally:
         if temporary.exists():
@@ -1580,7 +1584,7 @@ def _normalize_formats(formats: Sequence[str]) -> tuple[str, ...]:
     return normalized
 
 
-def export_state_dict_formats(
+def _export_state_dict_formats_unlocked(
     directory: str | Path,
     state_dict: Mapping[str, torch.Tensor],
     model_config: ModelConfig,
@@ -1890,6 +1894,73 @@ def export_state_dict_formats(
     }
     _atomic_json_dump(manifest, manifest_path)
     return manifest
+
+
+def export_state_dict_formats(
+    directory: str | Path,
+    state_dict: Mapping[str, torch.Tensor],
+    model_config: ModelConfig,
+    pad_id: int,
+    *,
+    step: int = 0,
+    formats: Sequence[str] = DEFAULT_CONVERSION_FORMATS,
+    metadata: Mapping[str, Any] | None = None,
+    tokenizer_path: str | Path | None = None,
+    token_features_path: str | Path | None = None,
+    language_pairs: Sequence[Sequence[str]] | None = None,
+    int4_backend: str = "auto",
+    fp8_policy: Fp8Policy | None = None,
+    release_name: str = TRANSLATION_RELEASE_NAME,
+    translation_capable: bool = True,
+    llama_quantize: str | Path | None = None,
+    _filename_overrides: Mapping[str, str] | None = None,
+    _acquire_publish_lock: bool = True,
+) -> dict[str, Any]:
+    """Export one complete file/manifest generation under a destination lock."""
+
+    if not _acquire_publish_lock:
+        return _export_state_dict_formats_unlocked(
+            directory,
+            state_dict,
+            model_config,
+            pad_id,
+            step=step,
+            formats=formats,
+            metadata=metadata,
+            tokenizer_path=tokenizer_path,
+            token_features_path=token_features_path,
+            language_pairs=language_pairs,
+            int4_backend=int4_backend,
+            fp8_policy=fp8_policy,
+            release_name=release_name,
+            translation_capable=translation_capable,
+            llama_quantize=llama_quantize,
+            _filename_overrides=_filename_overrides,
+        )
+    destination = Path(directory)
+    with artifact_lock(
+        _export_publish_lock_root(destination),
+        timeout=_EXPORT_LOCK_TIMEOUT_SECONDS,
+        poll_interval=0.05,
+    ):
+        return _export_state_dict_formats_unlocked(
+            destination,
+            state_dict,
+            model_config,
+            pad_id,
+            step=step,
+            formats=formats,
+            metadata=metadata,
+            tokenizer_path=tokenizer_path,
+            token_features_path=token_features_path,
+            language_pairs=language_pairs,
+            int4_backend=int4_backend,
+            fp8_policy=fp8_policy,
+            release_name=release_name,
+            translation_capable=translation_capable,
+            llama_quantize=llama_quantize,
+            _filename_overrides=_filename_overrides,
+        )
 
 
 def convert_export(
@@ -2626,6 +2697,7 @@ def export_inference_models(
                 release_name=release_name,
                 translation_capable=translation_capable,
                 _filename_overrides=filename_overrides,
+                _acquire_publish_lock=not strict,
             )
             if strict:
                 # Conversion is complete. Release the full deployment snapshot
