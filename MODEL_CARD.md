@@ -22,7 +22,7 @@ widget:
     text: "죄송하지만 여기 성함을 기입해 주시겠어요?"
 ---
 
-# sion_translate 1.0 Korean–Japanese Translation
+# sion_translate Korean–Japanese Translation
 
 sion_translate is a custom PyTorch encoder-decoder model for bidirectional Korean↔Japanese
 translation. The uploaded release contains inference exports and its SentencePiece tokenizer;

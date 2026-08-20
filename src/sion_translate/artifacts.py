@@ -6,6 +6,8 @@ release-looking directory name.  Keep these paths stable for scripts and users.
 
 from __future__ import annotations
 
+from sion_translate._version import MODEL_RELEASE_VERSION
+
 DEFAULT_ARTIFACT_ROOT = "artifacts"
 DEFAULT_TOKENIZER_MODEL = f"{DEFAULT_ARTIFACT_ROOT}/tokenizer/sion.model"
 DEFAULT_TOKENIZER_FEATURES = f"{DEFAULT_ARTIFACT_ROOT}/tokenizer/token_features.npz"
@@ -23,10 +25,9 @@ DEFAULT_FOUNDATION_DATASET_DIRECTORY = f"{DEFAULT_ARTIFACT_ROOT}/foundation_data
 # 이름으로 나가면 어느 가중치가 번역을 할 수 있는지 구분되지 않습니다.
 FOUNDATION_RELEASE_NAME = "sion"
 TRANSLATION_RELEASE_NAME = "sion_translate"
-# 공개 모델 세대. Python 패키지는 semantic versioning(1.0.0)을 사용하지만
-# 모델 계보는 사용자가 보는 major.minor 이름으로 고정합니다. 번역 모델은 같은
-# 세대의 sion에서 파생되므로 두 배포가 이 값을 함께 기록합니다.
-MODEL_RELEASE_VERSION = "1.0"
+# 공개 모델 세대. Python 패키지는 semantic versioning을 사용하지만 모델 계보는
+# 사용자가 보는 major.minor 이름으로 고정합니다. 번역 모델은 같은 세대의
+# sion에서 파생되므로 새로 학습한 두 배포가 이 값을 함께 기록합니다.
 
 # 실행 디렉터리 안의 단계별 하위 경로. `pretrain` 은 이미 번역 SFT 를 가리키는
 # 이름이라, 그 앞 단계는 다른 이름을 씁니다.
