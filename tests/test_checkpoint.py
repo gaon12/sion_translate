@@ -412,6 +412,78 @@ def test_checkpoint_model_and_ema_keys_are_compile_independent(
         torch.testing.assert_close(target_ema.shadow[name], source_ema.shadow[name])
 
 
+@pytest.mark.parametrize("tamper", ["missing", "unexpected", "shape", "dtype"])
+def test_ema_state_validation_is_exact_and_non_mutating(tamper: str) -> None:
+    model, _, _, _ = _components()
+    ema = EMAWeights(model, 0.9)
+    state = {name: tensor.clone() for name, tensor in ema.state_dict().items()}
+    first_name = next(iter(state))
+    if tamper == "missing":
+        state.pop(first_name)
+    elif tamper == "unexpected":
+        state["injected.unexpected"] = torch.tensor([1.0])
+    elif tamper == "shape":
+        state[first_name] = state[first_name].reshape(-1)[:1]
+    else:
+        state[first_name] = state[first_name].double()
+    before = {name: tensor.clone() for name, tensor in ema.shadow.items()}
+
+    with pytest.raises(ValueError, match="EMA checkpoint"):
+        ema.load_state_dict(state)
+
+    for name, tensor in ema.shadow.items():
+        torch.testing.assert_close(tensor, before[name])
+
+
+@pytest.mark.parametrize("tamper", ["missing", "partial"])
+def test_resume_requires_a_complete_ema_before_mutating_training_state(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    model, optimizer, scheduler, context = _components()
+    ema = EMAWeights(model, 0.9)
+    checkpoint = tmp_path / f"resume-{tamper}"
+    save_checkpoint(
+        checkpoint,
+        model,
+        optimizer,
+        scheduler,
+        3,
+        context,
+        ema=ema,
+    )
+    payload = torch.load(checkpoint / "checkpoint.pt", weights_only=True)
+    if tamper == "missing":
+        payload.pop("ema")
+    else:
+        payload["ema"].pop(next(iter(payload["ema"])))
+    torch.save(payload, checkpoint / "checkpoint.pt")
+
+    fresh, fresh_optimizer, fresh_scheduler, _ = _components()
+    fresh_ema = EMAWeights(fresh, 0.9)
+    model_before = {name: tensor.clone() for name, tensor in fresh.state_dict().items()}
+    optimizer_before = deepcopy(fresh_optimizer.state_dict())
+    scheduler_before = deepcopy(fresh_scheduler.state_dict())
+    ema_before = {name: tensor.clone() for name, tensor in fresh_ema.shadow.items()}
+
+    with pytest.raises(ValueError, match="EMA"):
+        load_checkpoint(
+            checkpoint,
+            fresh,
+            fresh_optimizer,
+            fresh_scheduler,
+            context,
+            ema=fresh_ema,
+        )
+
+    for name, tensor in fresh.state_dict().items():
+        torch.testing.assert_close(tensor, model_before[name])
+    assert fresh_optimizer.state_dict() == optimizer_before
+    assert fresh_scheduler.state_dict() == scheduler_before
+    for name, tensor in fresh_ema.shadow.items():
+        torch.testing.assert_close(tensor, ema_before[name])
+
+
 def test_local_checkpoint_restores_python_numpy_and_torch_rng(tmp_path: Path) -> None:
     model, optimizer, scheduler, context = _components()
     checkpoint = tmp_path / "checkpoint"

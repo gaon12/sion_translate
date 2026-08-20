@@ -1300,9 +1300,21 @@ def load_checkpoint(
         if scaler is not None:
             state["scaler"] = scaler.state_dict()
         if ema is not None:
-            # DCP 는 여기 넣어 둔 텐서 '안으로' 값을 읽어들이므로,
-            # 현재 shadow 텐서를 로드 대상으로 미리 등록합니다.
-            state["ema"] = ema.state_dict()
+            metadata = dcp.FileSystemReader(  # pyright: ignore[reportPrivateImportUsage]
+                path
+            ).read_metadata()
+            ema_template = ema.state_dict()
+            if not _validate_dcp_tensor_group_metadata(
+                metadata,
+                prefix="ema",
+                expected=ema_template,
+            ):
+                raise ValueError(
+                    "checkpoint resume has EMA enabled but the checkpoint EMA state is missing"
+                )
+            # DCP loads into supplied tensors. Use detached clones so a failed
+            # load cannot partially overwrite the live EMA shadow.
+            state["ema"] = {name: tensor.detach().clone() for name, tensor in ema_template.items()}
         if expected_identity is not None:
             state["identity"] = _json_compatible(expected_identity)
         state["schema"] = CHECKPOINT_SCHEMA
@@ -1313,6 +1325,8 @@ def load_checkpoint(
         )
         _validate_loaded_state(state)
         _validate_identity(state, expected_identity)
+        if ema is not None:
+            ema.validate_state_dict(state.get("ema"))
         set_state_dict(
             checkpoint_model,
             optimizer,
@@ -1322,7 +1336,7 @@ def load_checkpoint(
         scheduler.load_state_dict(state["scheduler"])
         if scaler is not None and state.get("scaler"):
             scaler.load_state_dict(state["scaler"])
-        if ema is not None and state.get("ema"):
+        if ema is not None:
             ema.load_state_dict(state["ema"])
         if training_state is not None:
             training_state.update(state.get("training_state", {}))
@@ -1358,12 +1372,19 @@ def load_checkpoint(
     loaded_state = _validate_loaded_state(loaded)
     # 모델/optimizer를 변경하기 전에 현재 실행과 체크포인트의 정체성을 비교합니다.
     _validate_identity(loaded_state, expected_identity)
+    if ema is not None:
+        ema_state = loaded_state.get("ema")
+        if ema_state is None:
+            raise ValueError(
+                "checkpoint resume has EMA enabled but the checkpoint EMA state is missing"
+            )
+        ema.validate_state_dict(ema_state)
     _unwrap_compiled_model(model).load_state_dict(loaded_state["model"])
     optimizer.load_state_dict(loaded_state["optimizer"])
     scheduler.load_state_dict(loaded_state["scheduler"])
     if scaler is not None and loaded_state.get("scaler"):
         scaler.load_state_dict(loaded_state["scaler"])
-    if ema is not None and loaded_state.get("ema"):
+    if ema is not None:
         ema.load_state_dict(loaded_state["ema"])
     if training_state is not None:
         training_state.update(loaded_state.get("training_state", {}))

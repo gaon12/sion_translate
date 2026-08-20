@@ -19,7 +19,8 @@ DTensor 에서도 그대로 동작합니다.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Iterator
+from collections.abc import Mapping
+from typing import Iterator, cast
 
 import torch
 from torch import nn
@@ -111,10 +112,44 @@ class EMAWeights:
         """체크포인트에 함께 저장해 재개 시 EMA 이력이 끊기지 않게 합니다."""
         return dict(self.shadow)
 
-    def load_state_dict(self, state: dict[str, torch.Tensor]) -> None:
-        for name, tensor in state.items():
-            canonical_name = name
+    def _validated_state_dict(self, state: object) -> dict[str, torch.Tensor]:
+        if not isinstance(state, Mapping):
+            raise ValueError("EMA checkpoint state must be an object")
+        normalized: dict[str, torch.Tensor] = {}
+        for raw_name, raw_tensor in cast(Mapping[object, object], state).items():
+            if not isinstance(raw_name, str) or not isinstance(raw_tensor, torch.Tensor):
+                raise ValueError("EMA checkpoint state is malformed")
+            canonical_name = raw_name
             while canonical_name.startswith("_orig_mod."):
                 canonical_name = canonical_name.removeprefix("_orig_mod.")
-            if canonical_name in self.shadow:
-                self.shadow[canonical_name].copy_(tensor)
+            if canonical_name in normalized:
+                raise ValueError(f"EMA checkpoint contains duplicate key: {canonical_name}")
+            normalized[canonical_name] = raw_tensor
+        missing = sorted(set(self.shadow) - set(normalized))
+        unexpected = sorted(set(normalized) - set(self.shadow))
+        if missing or unexpected:
+            raise ValueError(
+                "EMA checkpoint does not match the model parameters: "
+                f"missing={missing[:8]}, unexpected={unexpected[:8]}"
+            )
+        for name, target in self.shadow.items():
+            source = normalized[name]
+            if source.shape != target.shape or source.dtype != target.dtype:
+                raise ValueError(
+                    "EMA checkpoint tensor metadata mismatch for "
+                    f"{name}: checkpoint=(shape={tuple(source.shape)}, dtype={source.dtype}), "
+                    f"model=(shape={tuple(target.shape)}, dtype={target.dtype})"
+                )
+        return normalized
+
+    def validate_state_dict(self, state: object) -> None:
+        """Validate a complete EMA snapshot without changing any shadow tensor."""
+
+        self._validated_state_dict(state)
+
+    @torch.no_grad()
+    def load_state_dict(self, state: object) -> None:
+        normalized = self._validated_state_dict(state)
+        for name, tensor in normalized.items():
+            canonical_name = name
+            self.shadow[canonical_name].copy_(tensor)
