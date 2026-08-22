@@ -157,6 +157,24 @@ def test_artifact_preparation_locks_every_independent_mutation_root(tmp_path: Pa
     ) == tuple(root for root in roots if root.name != "foundation-root")
 
 
+def test_configured_foundation_root_is_leased_while_raw_corpus_is_offline(
+    tmp_path: Path,
+) -> None:
+    config = AppConfig()
+    config.data.tokenizer_model = str(tmp_path / "tokenizer-root" / "sion.model")
+    config.data.dataset_dir = str(tmp_path / "translation-root" / "dataset")
+    config.foundation.dataset_dir = str(tmp_path / "foundation-root" / "dataset")
+    offline_plan = SimpleNamespace(enabled=False)
+
+    roots = train_module._artifact_mutation_roots(
+        config,
+        offline_plan,
+        prepare_foundation=True,
+    )
+
+    assert (tmp_path / "foundation-root").resolve() in roots
+
+
 def test_artifact_run_leases_remain_held_until_the_run_scope_exits(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -970,6 +988,145 @@ def test_resume_preflight_retains_the_exact_generation_until_load(
     assert active
     scope.close()
     assert not active
+
+
+@pytest.mark.parametrize("rejected_phase", ["identity", "structure"])
+def test_resume_candidate_selection_closes_rejected_generation_and_keeps_previous(
+    monkeypatch: pytest.MonkeyPatch,
+    rejected_phase: str,
+) -> None:
+    active: set[str] = set()
+    closed: list[str] = []
+    bindings = (
+        SimpleNamespace(artifact_sha256="a" * 64),
+        SimpleNamespace(artifact_sha256="b" * 64),
+    )
+
+    class Lease:
+        def __init__(self, source: str) -> None:
+            self.source = source
+
+        def __enter__(self) -> None:
+            active.add(self.source)
+
+        def __exit__(self, *_args: object) -> None:
+            active.remove(self.source)
+            closed.append(self.source)
+
+    def bind_candidate(
+        _candidate: object,
+        _identity: object,
+        _context: object,
+        *,
+        lease_scope: ExitStack,
+        expected_artifact_sha256: str,
+        **_kwargs: object,
+    ) -> str:
+        source = "current" if expected_artifact_sha256 == "a" * 64 else "previous"
+        lease_scope.enter_context(Lease(source))
+        return source
+
+    monkeypatch.setattr(
+        train_module,
+        "checkpoint_generation_bindings",
+        lambda *_args: bindings,
+    )
+    monkeypatch.setattr(train_module, "_coordinated_resume_preflight", bind_candidate)
+    monkeypatch.setattr(
+        train_module,
+        "_coordinated_checkpoint_pipeline_identity",
+        lambda source, *_args: {"candidate": source},
+    )
+    monkeypatch.setattr(
+        train_module,
+        "build_training_checkpoint_identity",
+        lambda _config, **kwargs: {"pipeline": kwargs["pipeline_identity"]},
+    )
+
+    def identity_preflight(source: str, *_args: object, **_kwargs: object) -> int:
+        if source == "current" and rejected_phase == "identity":
+            raise ValueError("current identity mismatch")
+        return 5 if source == "current" else 4
+
+    def structure_preflight(source: str, *_args: object, **_kwargs: object) -> int:
+        if source == "current" and rejected_phase == "structure":
+            raise ValueError("current structure mismatch")
+        return 5 if source == "current" else 4
+
+    monkeypatch.setattr(
+        train_module,
+        "_coordinated_exact_checkpoint_identity_preflight",
+        identity_preflight,
+    )
+    monkeypatch.setattr(
+        train_module,
+        "_coordinated_checkpoint_load_structure",
+        structure_preflight,
+    )
+    config = AppConfig()
+    plan = SimpleNamespace(enabled=True)
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+
+    with ExitStack() as winner_scope:
+        source, pipeline = train_module._select_translation_resume_candidate(
+            "logical/latest",
+            config,
+            plan,
+            torch.nn.Linear(2, 2),
+            SimpleNamespace(),
+            context,
+            stage="SFT",
+            stage_name="pretrain/SFT",
+            include_posttraining=False,
+            lease_scope=winner_scope,
+        )
+        assert source == "previous"
+        assert pipeline == {"candidate": "previous"}
+        assert active == {"previous"}
+        assert closed == ["current"]
+    assert not active
+    assert closed == ["current", "previous"]
+
+
+def test_configured_foundation_branch_stays_enabled_when_raw_corpus_is_offline() -> None:
+    config = AppConfig()
+    offline = train_module.FoundationPlan(
+        enabled=False,
+        reason="offline",
+        discovery=SimpleNamespace(),  # type: ignore[arg-type]
+        languages=("ko", "ja"),
+    )
+
+    branch = train_module._configured_foundation_branch_plan(config, offline)
+
+    assert branch.enabled
+    assert branch.languages == ("ko", "ja")
+
+
+def test_translation_only_resume_conflicts_with_configured_offline_foundation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = AppConfig()
+    offline_plan = SimpleNamespace(enabled=False, languages=config.foundation_languages())
+    monkeypatch.setattr(
+        train_module,
+        "inspect_checkpoint_identity",
+        lambda *_args: {
+            "pipeline": {
+                "schema": "sion-translation-pipeline-v2",
+                "branch": "translation-only",
+            }
+        },
+    )
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+
+    with pytest.raises(ValueError, match="configured foundation-first"):
+        train_module._checkpoint_pipeline_identity(
+            "authenticated-sft",
+            config,
+            offline_plan,
+            context,
+        )
 
 
 def test_sft_resume_uses_its_authenticated_lineage_without_base_artifacts(

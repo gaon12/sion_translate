@@ -110,12 +110,14 @@ from sion_translate.training.distributed import (
 from sion_translate.training.checkpoint import (
     DCP_COMPLETION_FILENAME,
     DCP_COMPLETION_SCHEMA,
+    checkpoint_generation_bindings,
     checkpoint_generation_candidates,
     checkpoint_path_exists,
     initialize_model_from_checkpoint,
     inspect_checkpoint_identity,
     inspect_checkpoint_training_state,
     preflight_checkpoint_identity,
+    preflight_checkpoint_load_structure,
     resolve_checkpoint_source,
     verified_checkpoint_generation_lease,
 )
@@ -910,7 +912,7 @@ def _artifact_mutation_roots(
         Path(config.data.tokenizer_model).resolve().parent,
         Path(config.data.dataset_dir).resolve().parent,
     }
-    if foundation_plan.enabled and prepare_foundation:
+    if config.foundation.enabled and prepare_foundation:
         mutation_roots.add(Path(config.foundation.dataset_dir).resolve().parent)
     return tuple(
         sorted(
@@ -934,7 +936,7 @@ def coordinated_artifact_run_locks(
         # A foundation-enabled run may open this dataset well after initial
         # preparation, so its lease is needed even when SFT resume initially
         # defers foundation preparation.
-        prepare_foundation=bool(foundation_plan.enabled),
+        prepare_foundation=bool(config.foundation.enabled),
     )
     scope = ExitStack()
     acquisition_error: Exception | None = None
@@ -2150,9 +2152,15 @@ def _inspect_foundation_lineage(
 
     if not foundation_plan.enabled:
         raise ValueError("translation-only pipeline has no foundation lineage")
-    foundation_problem = _foundation_dataset_problem_for_lineage(config, foundation_plan)
-    if foundation_problem is not None:
-        raise RuntimeError(f"foundation prepared inputs are stale: {foundation_problem}")
+    if foundation_plan.discovery.sources:
+        foundation_problem = _foundation_dataset_problem_for_lineage(config, foundation_plan)
+        if foundation_problem is not None:
+            raise RuntimeError(f"foundation prepared inputs are stale: {foundation_problem}")
+    else:
+        # A completed/in-progress base remains reusable while the raw corpus is
+        # temporarily offline. Authenticate the published prepared generation;
+        # do not reinterpret missing raw files as proof that its lineage changed.
+        validate_dataset_artifact_inventory(config.foundation.dataset_dir)
     foundation_config = build_foundation_config(config)
     checkpoint_identity = _foundation_checkpoint_identity(foundation_config, context)
     run_root = foundation_run_directory(config)
@@ -2572,6 +2580,7 @@ def run_foundation_stage(
         export_binding_matches = broadcast_bool(export_binding_matches_here, context)
         repaired_export = False
         if not export_binding_matches:
+            preflight_final_export_dependencies(config.foundation.final_export_formats)
             announce(
                 "foundation 완료 checkpoint는 유효하지만 최종 base export가 없거나 "
                 "손상됐거나 같은 가중치 세대로 증명되지 않아 재학습 없이 다시 내보냅니다.",
@@ -2767,6 +2776,7 @@ def run_foundation_stage(
                 "새 학습과 분리합니다"
             )
 
+    preflight_final_export_dependencies(config.foundation.final_export_formats)
     train_dataset = IndexedParallelDataset(
         foundation_config.data.dataset_dir,
         foundation_config.data.train_split,
@@ -3042,10 +3052,9 @@ def _checkpoint_pipeline_identity(
                 "checkpoint foundation lineage tokenizer does not match its tokenizer identity"
             )
     elif branch == "translation-only":
-        if foundation_plan.enabled:
+        if config.foundation.enabled:
             raise ValueError(
-                "translation-only checkpoint conflicts with the currently runnable "
-                "foundation-first branch"
+                "translation-only checkpoint conflicts with the configured foundation-first branch"
             )
         pipeline = build_translation_pipeline_identity(foundation_plan)
     else:
@@ -3147,6 +3156,161 @@ def _coordinated_resume_preflight(
         return str(generation.source)
 
 
+def _configured_foundation_branch_plan(
+    config: AppConfig,
+    discovered_plan: FoundationPlan,
+) -> FoundationPlan:
+    """Keep configured ancestry separate from today's raw-corpus availability."""
+
+    if not config.foundation.enabled or discovered_plan.enabled:
+        return discovered_plan
+    return FoundationPlan(
+        enabled=True,
+        reason=(
+            "foundation은 설정상 활성화되어 있으나 원천 코퍼스가 현재 보이지 않습니다. "
+            "인증된 downstream checkpoint 또는 준비된 base 세대만 재사용합니다."
+        ),
+        discovery=discovered_plan.discovery,
+        languages=discovered_plan.languages,
+        report=discovered_plan.report,
+        warnings=discovered_plan.warnings,
+    )
+
+
+def _build_posttraining_config(config: AppConfig, run_root: Path) -> AppConfig:
+    post = config.posttraining
+    post_config = copy.deepcopy(config)
+    post_config.training.output_dir = str(run_root / "posttrain")
+    post_config.training.num_train_epochs = post.num_train_epochs
+    post_config.training.max_steps = post.max_steps
+    post_config.training.batch_size_per_gpu = post.batch_size_per_gpu
+    post_config.training.gradient_accumulation_steps = post.gradient_accumulation_steps
+    post_config.training.learning_rate = post.learning_rate
+    post_config.training.warmup_steps = post.warmup_steps
+    post_config.training.eval_every = post.eval_every
+    post_config.training.save_every = post.save_every
+    post_config.training.early_stopping_min_epochs = post.early_stopping_min_epochs
+    post_config.training.early_stopping_patience = post.early_stopping_patience
+    post_config.training.resume_from = None
+    post_config.training.tensorboard_dir = None
+    return post_config
+
+
+def _coordinated_checkpoint_load_structure(
+    source: str | Path,
+    model: torch.nn.Module,
+    config: AppConfig,
+    context: DistributedContext,
+    *,
+    stage: str,
+) -> int:
+    checkpoint_step: int | None = None
+    structure_error: Exception | None = None
+    try:
+        checkpoint_step = preflight_checkpoint_load_structure(
+            source,
+            model,
+            context,
+            require_scaler=(
+                context.device.type == "cuda" and config.training.precision.lower() == "fp16"
+            ),
+            require_ema=config.training.ema_decay > 0,
+        )
+    except Exception as error:
+        structure_error = error
+    failure_scope = distributed_failure_scope(structure_error is not None, context)
+    if failure_scope != "none":
+        failure = RuntimeError(
+            f"{stage} checkpoint load structure could not be validated on every rank"
+        )
+        if structure_error is not None:
+            raise failure from structure_error
+        raise failure
+    assert checkpoint_step is not None
+    consensus_step = broadcast_int(checkpoint_step if context.is_main else None, context)
+    mismatch_scope = distributed_failure_scope(checkpoint_step != consensus_step, context)
+    if mismatch_scope != "none":
+        raise RuntimeError(f"{stage} checkpoint structural step differs across ranks")
+    return checkpoint_step
+
+
+def _select_translation_resume_candidate(
+    candidate: str | Path,
+    config: AppConfig,
+    foundation_plan: FoundationPlan,
+    model: torch.nn.Module,
+    batch_sampler: Any,
+    context: DistributedContext,
+    *,
+    stage: str,
+    stage_name: str,
+    include_posttraining: bool,
+    lease_scope: ExitStack,
+) -> tuple[str, dict[str, Any]]:
+    """Select current/previous transactionally and retain only the winner's lease."""
+
+    bindings = checkpoint_generation_bindings(candidate, context)
+    if not bindings:
+        raise FileNotFoundError(f"{stage} checkpoint has no discoverable generation: {candidate}")
+    last_error: BaseException | None = None
+    for binding in bindings:
+        attempt_scope = ExitStack()
+        try:
+            source = _coordinated_resume_preflight(
+                candidate,
+                None,
+                context,
+                stage=stage,
+                lease_scope=attempt_scope,
+                expected_artifact_sha256=binding.artifact_sha256,
+            )
+            candidate_pipeline_identity = _coordinated_checkpoint_pipeline_identity(
+                source,
+                config,
+                foundation_plan,
+                context,
+            )
+            expected_identity = build_training_checkpoint_identity(
+                config,
+                batch_sampler=batch_sampler,
+                context=context,
+                stage_name=stage_name,
+                include_posttraining=include_posttraining,
+                pipeline_identity=candidate_pipeline_identity,
+            )
+            identity_step = _coordinated_exact_checkpoint_identity_preflight(
+                source,
+                expected_identity,
+                context,
+                stage=stage,
+            )
+            structure_step = _coordinated_checkpoint_load_structure(
+                source,
+                model,
+                config,
+                context,
+                stage=stage,
+            )
+            if structure_step != identity_step:
+                raise RuntimeError(
+                    f"{stage} checkpoint identity/structure step mismatch "
+                    f"({identity_step} != {structure_step})"
+                )
+        except BaseException as error:
+            last_error = error
+            attempt_scope.close()
+            continue
+        lease_scope.enter_context(attempt_scope.pop_all())
+        return source, candidate_pipeline_identity
+    failure = RuntimeError(
+        f"no authenticated, compatible, structurally loadable {stage} generation matched "
+        f"{candidate}"
+    )
+    if last_error is not None:
+        raise failure from last_error
+    raise failure
+
+
 def run_foundation_before_translation(
     config: AppConfig,
     foundation_plan: Any,
@@ -3225,12 +3389,16 @@ def main() -> None:
 
         # ── 단계 ③: 원천 데이터 인식 + 토크나이저/데이터셋 자동 준비 ──
         announce("준비 ③: 원천 데이터를 확인합니다.", context)
-        foundation_plan = plan_foundation_stage(config)
+        discovered_foundation_plan = plan_foundation_stage(config)
+        foundation_plan = _configured_foundation_branch_plan(
+            config,
+            discovered_foundation_plan,
+        )
         if not args.prepare_only:
-            required_final_formats = list(config.training.final_export_formats)
-            if foundation_plan.enabled:
-                required_final_formats.extend(config.foundation.final_export_formats)
-            preflight_final_export_dependencies(required_final_formats)
+            # Translation formats are unavoidable. Foundation-only converters
+            # are checked later, after downstream resume candidates have had a
+            # chance to supersede every base-stage action.
+            preflight_final_export_dependencies(config.training.final_export_formats)
         run_scope.enter_context(
             coordinated_artifact_run_locks(
                 config,
@@ -3247,10 +3415,18 @@ def main() -> None:
             context=context,
             stage="SFT",
         )
+        posttrain_resume_candidate = None
+        if config.posttraining.enabled and not explicit_pretrain_resume:
+            posttrain_resume_candidate = _find_distributed_auto_resume(
+                explicit=None,
+                automatic=initial_run_root / "posttrain" / "checkpoints" / "latest",
+                context=context,
+                stage="posttraining",
+            )
         ensure_artifacts(
             config,
             context,
-            foundation_plan,
+            discovered_foundation_plan,
             # Effective auto-sized training identity and the exact SFT resume
             # generation must be known before deciding whether base preparation
             # can safely be skipped. A coarse `.metadata` presence check is not
@@ -3322,6 +3498,9 @@ def main() -> None:
         run_root = Path(config.training.output_dir)
         pretrain_config = copy.deepcopy(config)
         pretrain_config.training.output_dir = str(run_root / "pretrain")
+        post_config = (
+            _build_posttraining_config(config, run_root) if config.posttraining.enabled else None
+        )
 
         # ── 단계 ⑤: 이전 사전학습 자동 재개 ────────────────────────────
         if not pretrain_config.training.resume_from and pretrain_resume_candidate:
@@ -3329,6 +3508,11 @@ def main() -> None:
         if pretrain_config.training.resume_from:
             announce(
                 f"준비 ⑤: 이전 SFT 체크포인트 후보 발견 → {pretrain_config.training.resume_from}",
+                context,
+            )
+        if posttrain_resume_candidate:
+            announce(
+                f"준비 ⑤: 이전 MRT 체크포인트 후보 발견 → {posttrain_resume_candidate}",
                 context,
             )
 
@@ -3361,81 +3545,28 @@ def main() -> None:
             source_sampling_weights=config.data.source_sampling_weights,
             max_source_upsampling=config.data.max_source_upsampling,
         )
-        validated_pretrain_resume = False
-        if pretrain_config.training.resume_from:
-            resume_error: BaseException | None = None
-            resume_attempt_scope = ExitStack()
-            try:
-                # Auto sizing changes the effective model and sampler identity,
-                # so the exact generation is authenticated first, then its own
-                # content-addressed ancestry is checked against final settings.
-                announce(
-                    "준비 ⑤: SFT resume identity를 foundation 단계보다 먼저 검증합니다.",
-                    context,
-                )
-                pretrain_config.training.resume_from = _coordinated_resume_preflight(
-                    pretrain_config.training.resume_from,
-                    None,
-                    context,
-                    stage="SFT",
-                    lease_scope=resume_attempt_scope,
-                )
-                pipeline_identity = _coordinated_checkpoint_pipeline_identity(
-                    pretrain_config.training.resume_from,
-                    config,
-                    foundation_plan,
-                    context,
-                )
-                expected_pretrain_identity = build_training_checkpoint_identity(
-                    pretrain_config,
-                    batch_sampler=train_sampler,
-                    context=context,
-                    stage_name="pretrain/SFT",
-                    include_posttraining=False,
-                    pipeline_identity=pipeline_identity,
-                )
-                _coordinated_exact_checkpoint_identity_preflight(
-                    pretrain_config.training.resume_from,
-                    expected_pretrain_identity,
-                    context,
-                    stage="SFT",
-                )
-            except BaseException as error:
-                resume_error = error
-
-            if resume_error is not None:
-                resume_attempt_scope.close()
-                if explicit_pretrain_resume:
-                    raise RuntimeError(
-                        "explicit SFT resume authentication failed"
-                    ) from resume_error
-                _archive_invalid_automatic_resume(
-                    run_root / "pretrain",
-                    context,
-                    stage="SFT",
-                    error=resume_error,
-                )
-                pretrain_config.training.resume_from = None
-                pretrain_resume_candidate = None
-            else:
-                checkpoint_lease_scope.enter_context(resume_attempt_scope.pop_all())
-                validated_pretrain_resume = True
-                announce(
-                    "준비 ⑤: SFT resume identity 검증 완료 — 이 체크포인트가 foundation "
-                    "실행/로드보다 우선합니다.",
-                    context,
-                )
-
-        if foundation_plan.enabled and not validated_pretrain_resume:
-            # The first pass intentionally deferred potentially multi-hour base
-            # preparation until the exact SFT generation was checked. No valid
-            # SFT state supersedes it now, so prepare/verify every base artifact.
-            ensure_artifacts(
-                config,
-                context,
-                foundation_plan,
-                prepare_foundation=True,
-                locks_held=True,
+        post_sampler: DistributedBucketBatchSampler | None = None
+        post_validation_sampler: DistributedBucketBatchSampler | None = None
+        if post_config is not None:
+            post = config.posttraining
+            post_sampler = DistributedBucketBatchSampler(
+                train_dataset,
+                post.batch_size_per_gpu,
+                rank=context.rank,
+                world_size=context.world_size,
+                bucket_size=config.data.bucket_size,
+                seed=config.training.seed + 2,
+                source_sampling_alpha=config.data.source_sampling_alpha,
+                source_sampling_weights=config.data.source_sampling_weights,
+                max_source_upsampling=config.data.max_source_upsampling,
+            )
+            post_validation_sampler = DistributedBucketBatchSampler(
+                validation_dataset,
+                post.eval_batch_size_per_gpu,
+                rank=context.rank,
+                world_size=context.world_size,
+                bucket_size=config.data.bucket_size,
+                seed=config.training.seed + 3,
             )
         validation_sampler = DistributedBucketBatchSampler(
             validation_dataset,
@@ -3458,19 +3589,6 @@ def main() -> None:
             context.device,
             training=False,
         )
-        train_loader = DataLoader(
-            train_dataset,
-            batch_sampler=train_sampler,
-            collate_fn=train_collator,
-            **train_loader_args,
-        )
-        validation_loader = DataLoader(
-            validation_dataset,
-            batch_sampler=validation_sampler,
-            collate_fn=validation_collator,
-            **validation_loader_args,
-        )
-
         # ── 모델 생성과 분산 배치 ────────────────────────────────────────
         announce("모델을 생성하고 장치에 배치합니다.", context)
         # 모든 CUDA 전략은 meta device에서 파라미터 수와 영구 상태 용량을 먼저
@@ -3517,18 +3635,117 @@ def main() -> None:
                 context,
             )
 
+        # ── 단계 ⑤: downstream-first 체크포인트 선택 ──────────────────
+        # 가장 진행된 단계를 먼저 복구해야 이미 끝난 foundation/SFT를 다시
+        # 실행하지 않습니다. 각 논리 체크포인트의 current와 previous는 서로
+        # 독립된 lease에서 검증하고, 완전히 검증된 하나만 실제 load까지 유지합니다.
+        validated_posttrain_resume = False
+        if posttrain_resume_candidate:
+            assert post_config is not None
+            assert post_sampler is not None
+            try:
+                selected_posttrain, selected_pipeline = _select_translation_resume_candidate(
+                    posttrain_resume_candidate,
+                    post_config,
+                    foundation_plan,
+                    model,
+                    post_sampler,
+                    context,
+                    stage="posttraining",
+                    stage_name="posttrain/composite-MRT+preference",
+                    include_posttraining=True,
+                    lease_scope=checkpoint_lease_scope,
+                )
+            except BaseException as error:
+                _archive_invalid_automatic_resume(
+                    run_root / "posttrain",
+                    context,
+                    stage="posttraining",
+                    error=error,
+                )
+                posttrain_resume_candidate = None
+            else:
+                post_config.training.resume_from = selected_posttrain
+                pipeline_identity = selected_pipeline
+                validated_posttrain_resume = True
+                announce(
+                    "준비 ⑤: MRT resume 전체 검증 완료 — foundation과 SFT 실행/로드를 건너뜁니다.",
+                    context,
+                )
+
+        validated_pretrain_resume = False
+        if not validated_posttrain_resume and pretrain_config.training.resume_from:
+            try:
+                selected_pretrain, selected_pipeline = _select_translation_resume_candidate(
+                    pretrain_config.training.resume_from,
+                    pretrain_config,
+                    foundation_plan,
+                    model,
+                    train_sampler,
+                    context,
+                    stage="SFT",
+                    stage_name="pretrain/SFT",
+                    include_posttraining=False,
+                    lease_scope=checkpoint_lease_scope,
+                )
+            except BaseException as error:
+                if explicit_pretrain_resume:
+                    raise RuntimeError("explicit SFT resume authentication failed") from error
+                _archive_invalid_automatic_resume(
+                    run_root / "pretrain",
+                    context,
+                    stage="SFT",
+                    error=error,
+                )
+                pretrain_config.training.resume_from = None
+                pretrain_resume_candidate = None
+            else:
+                pretrain_config.training.resume_from = selected_pretrain
+                pipeline_identity = selected_pipeline
+                validated_pretrain_resume = True
+                announce(
+                    "준비 ⑤: SFT resume 전체 검증 완료 — foundation 실행/로드를 건너뜁니다.",
+                    context,
+                )
+
         # ── 단계 ⑤-b: foundation 사전학습 (복원 + reasoning) ───────────
         # 번역쌍을 보기 전에 encoder-decoder 를 먼저 만듭니다. 이 단계의
         # 산출물은 번역 모델이 아니라 그 파운데이션이라 별도 이름으로 나갑니다.
-        foundation_outcome = run_foundation_before_translation(
-            config,
-            foundation_plan,
-            model,
-            tokenizer,
-            context,
-            validated_pretrain_resume=pretrain_config.training.resume_from,
-            artifacts_verified=True,
-        )
+        if validated_posttrain_resume or validated_pretrain_resume:
+            foundation_outcome = FoundationOutcome(
+                ran=False,
+                reason="검증된 downstream resume가 foundation 실행/로드보다 우선합니다.",
+            )
+        else:
+            if discovered_foundation_plan.enabled:
+                ensure_artifacts(
+                    config,
+                    context,
+                    discovered_foundation_plan,
+                    prepare_foundation=True,
+                    locks_held=True,
+                )
+            elif foundation_plan.enabled:
+                _verify_prepared_artifact_consensus(
+                    config,
+                    foundation_plan,
+                    context,
+                    prepare_foundation=True,
+                )
+                announce(
+                    "foundation 원천 코퍼스가 오프라인이므로 인증된 준비 데이터와 "
+                    "checkpoint만 사용합니다.",
+                    context,
+                )
+            foundation_outcome = run_foundation_before_translation(
+                config,
+                foundation_plan,
+                model,
+                tokenizer,
+                context,
+                validated_pretrain_resume=None,
+                artifacts_verified=True,
+            )
         if pipeline_identity is None:
             if not foundation_plan.enabled:
                 raise RuntimeError("translation pipeline identity was not initialized")
@@ -3541,71 +3758,75 @@ def main() -> None:
                 foundation_plan,
                 foundation_lineage=foundation_lineage,
             )
-        announce(
-            translation_initialization_message(
-                foundation_outcome,
-                resume_from=pretrain_config.training.resume_from,
-                foundation_release_name=config.foundation.release_name,
-                pipeline_branch=pipeline_identity["branch"],
-            ),
-            context,
-        )
-
-        # ── 단계 ⑥: SFT 사전학습 ───────────────────────────────────────
-        announce("1단계 SFT 사전학습을 시작합니다.", context)
-        pretrain_result = train(
-            model,
-            train_loader,
-            validation_loader,
-            pretrain_config,
-            context,
-            stage_name="pretrain/SFT",
-            language_tags=tokenizer.language_tags,
-            pipeline_identity=pipeline_identity,
-        )
-        barrier(context)
-        memory = release_stage_resources(context, train_loader, validation_loader)
-        del train_loader, validation_loader
-        del train_sampler, validation_sampler
-        del train_collator, validation_collator
-        if memory:
+        if validated_posttrain_resume:
+            assert post_config is not None
             announce(
-                "사전학습 메모리 정리: "
-                f"allocated {memory['before_allocated_gib']:.2f}→"
-                f"{memory['after_allocated_gib']:.2f} GiB, "
-                f"reserved {memory['before_reserved_gib']:.2f}→"
-                f"{memory['after_reserved_gib']:.2f} GiB",
+                f"검증된 MRT 체크포인트 {post_config.training.resume_from} 를 직접 재개합니다. "
+                "foundation과 SFT는 이번 실행에서 학습하거나 로드하지 않습니다.",
+                context,
+            )
+        else:
+            announce(
+                translation_initialization_message(
+                    foundation_outcome,
+                    resume_from=pretrain_config.training.resume_from,
+                    foundation_release_name=config.foundation.release_name,
+                    pipeline_branch=pipeline_identity["branch"],
+                ),
                 context,
             )
 
-        # ── 단계 ⑦: MRT 사후학습 ───────────────────────────────────────
-        if config.posttraining.enabled:
-            post = config.posttraining
-            post_config = copy.deepcopy(config)
-            post_config.training.output_dir = str(run_root / "posttrain")
-            post_config.training.num_train_epochs = post.num_train_epochs
-            post_config.training.max_steps = post.max_steps
-            post_config.training.batch_size_per_gpu = post.batch_size_per_gpu
-            post_config.training.gradient_accumulation_steps = post.gradient_accumulation_steps
-            post_config.training.learning_rate = post.learning_rate
-            post_config.training.warmup_steps = post.warmup_steps
-            post_config.training.eval_every = post.eval_every
-            post_config.training.save_every = post.save_every
-            post_config.training.early_stopping_min_epochs = post.early_stopping_min_epochs
-            post_config.training.early_stopping_patience = post.early_stopping_patience
-            post_config.training.resume_from = None
-            post_config.training.tensorboard_dir = None
-            post_config.training.resume_from = _find_distributed_auto_resume(
-                explicit=None,
-                automatic=Path(post_config.training.output_dir) / "checkpoints" / "latest",
-                context=context,
-                stage="posttraining",
+        # ── 단계 ⑥: SFT 사전학습 ───────────────────────────────────────
+        pretrain_result: dict[str, float | int | bool | str] | None = None
+        if validated_posttrain_resume:
+            announce(
+                "검증된 MRT resume가 있으므로 SFT DataLoader 생성과 학습을 건너뜁니다.",
+                context,
             )
-            if post_config.training.resume_from:
+        else:
+            train_loader = DataLoader(
+                train_dataset,
+                batch_sampler=train_sampler,
+                collate_fn=train_collator,
+                **train_loader_args,
+            )
+            validation_loader = DataLoader(
+                validation_dataset,
+                batch_sampler=validation_sampler,
+                collate_fn=validation_collator,
+                **validation_loader_args,
+            )
+            announce("1단계 SFT 사전학습을 시작합니다.", context)
+            pretrain_result = train(
+                model,
+                train_loader,
+                validation_loader,
+                pretrain_config,
+                context,
+                stage_name="pretrain/SFT",
+                language_tags=tokenizer.language_tags,
+                pipeline_identity=pipeline_identity,
+            )
+            barrier(context)
+            memory = release_stage_resources(context, train_loader, validation_loader)
+            del train_loader, validation_loader
+            if memory:
                 announce(
-                    f"이전 사후학습 발견 → {post_config.training.resume_from} 에서 자동 재개합니다.",
+                    "사전학습 메모리 정리: "
+                    f"allocated {memory['before_allocated_gib']:.2f}→"
+                    f"{memory['after_allocated_gib']:.2f} GiB, "
+                    f"reserved {memory['before_reserved_gib']:.2f}→"
+                    f"{memory['after_reserved_gib']:.2f} GiB",
                     context,
                 )
+        del train_sampler, validation_sampler
+        del train_collator, validation_collator
+
+        # ── 단계 ⑦: MRT 사후학습 ───────────────────────────────────────
+        if post_config is not None:
+            post = config.posttraining
+            assert post_sampler is not None
+            assert post_validation_sampler is not None
 
             # 보상 계산은 깨끗한 원문/정답을 기준으로 해야 하므로 증강을 끕니다.
             post_collator = SionBatchCollator(
@@ -3614,50 +3835,6 @@ def main() -> None:
                 source_token_dropout=0.0,
                 decoder_input_noise=0.0,
             )
-            post_sampler = DistributedBucketBatchSampler(
-                train_dataset,
-                post.batch_size_per_gpu,
-                rank=context.rank,
-                world_size=context.world_size,
-                bucket_size=config.data.bucket_size,
-                seed=config.training.seed + 2,
-                source_sampling_alpha=config.data.source_sampling_alpha,
-                source_sampling_weights=config.data.source_sampling_weights,
-                max_source_upsampling=config.data.max_source_upsampling,
-            )
-            post_validation_sampler = DistributedBucketBatchSampler(
-                validation_dataset,
-                post.eval_batch_size_per_gpu,
-                rank=context.rank,
-                world_size=context.world_size,
-                bucket_size=config.data.bucket_size,
-                seed=config.training.seed + 3,
-            )
-            if post_config.training.resume_from:
-                expected_posttrain_identity = build_training_checkpoint_identity(
-                    post_config,
-                    batch_sampler=post_sampler,
-                    context=context,
-                    stage_name="posttrain/composite-MRT+preference",
-                    include_posttraining=True,
-                    pipeline_identity=pipeline_identity,
-                )
-                try:
-                    post_config.training.resume_from = _coordinated_resume_preflight(
-                        post_config.training.resume_from,
-                        expected_posttrain_identity,
-                        context,
-                        stage="posttraining",
-                        lease_scope=checkpoint_lease_scope,
-                    )
-                except BaseException as error:
-                    _archive_invalid_automatic_resume(
-                        run_root / "posttrain",
-                        context,
-                        stage="posttraining",
-                        error=error,
-                    )
-                    post_config.training.resume_from = None
             post_loader = DataLoader(
                 train_dataset,
                 batch_sampler=post_sampler,
@@ -3707,6 +3884,7 @@ def main() -> None:
             final_step = int(posttrain_result["selected_step"])
         else:
             announce("posttraining.enabled=false — 사후학습을 건너뜁니다.", context)
+            assert pretrain_result is not None
             final_step = int(pretrain_result["selected_step"])
 
         # 중간 best/latest에서는 학습 재개와 빠른 확인에 필요한 경량 포맷만
