@@ -123,6 +123,50 @@ def test_language_pair_normalization_removes_reverse_duplicates() -> None:
     assert languages_from_pairs(pairs) == ("ko", "ja", "en", "ru")
 
 
+def test_language_pair_normalization_canonicalizes_script_and_region_tags() -> None:
+    assert normalize_language_pairs(
+        language_pairs=(("pt-br", "ZH-hant"), ("sr-latn-rs", "de"))
+    ) == (("pt-BR", "zh-Hant"), ("sr-Latn-RS", "de"))
+
+
+def test_record_expansion_resolves_canonical_alias_keys() -> None:
+    expansion = expand_parallel_record(
+        {"PT-br": "Olá.", "zh-hant": "您好。"},
+        (("pt-BR", "zh-Hant"),),
+    )
+
+    assert expansion.issues == ()
+    assert [
+        (pair.language_a, pair.text_a, pair.language_b, pair.text_b) for pair in expansion.pairs
+    ] == [("pt-BR", "Olá.", "zh-Hant", "您好。")]
+
+
+def test_record_expansion_rejects_duplicate_canonical_language_keys() -> None:
+    expansion = expand_parallel_record(
+        {"pt-BR": "primeiro", "pt-br": "segundo", "en": "English"},
+        (("pt-BR", "en"),),
+    )
+
+    assert expansion.pairs == ()
+    assert "duplicate_language_key" in expansion.issues
+
+
+def test_hyphenated_language_pair_containers_use_unambiguous_separators() -> None:
+    expansion = expand_parallel_record(
+        {
+            "zh-Hant/en": {"source": "您好。", "target": "Hello."},
+            "en_to_sr-Latn-RS": {"source": "Hello.", "target": "Zdravo."},
+        },
+        (("zh-Hant", "en"), ("en", "sr-Latn-RS")),
+    )
+
+    assert expansion.issues == ()
+    assert [(pair.language_a, pair.language_b) for pair in expansion.pairs] == [
+        ("zh-Hant", "en"),
+        ("en", "sr-Latn-RS"),
+    ]
+
+
 def test_multilingual_inference_requires_and_validates_source_language() -> None:
     translator = Translator.__new__(Translator)
     translator.tokenizer = type(

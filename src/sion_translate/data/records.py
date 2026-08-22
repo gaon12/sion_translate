@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-import re
 from typing import cast
+
+from sion_translate.language_tags import canonicalize_language_tag
 
 from .record_metadata import inherit_record_metadata
 
 
-_LANGUAGE = re.compile(r"^[A-Za-z][A-Za-z0-9]{0,15}$")
 _SOURCE_KEYS = ("source", "src", "input")
 _TARGET_KEYS = ("target", "tgt", "reference", "translation", "output")
 _CONTAINER_KEYS = ("records", "items", "pairs", "translations")
@@ -32,12 +32,7 @@ class RecordExpansion:
 
 
 def _validate_language(language: object) -> str:
-    if not isinstance(language, str) or not _LANGUAGE.fullmatch(language):
-        raise ValueError(
-            "language keys must be 1-16 ASCII alphanumeric characters and start "
-            f"with a letter; got {language!r}"
-        )
-    return language
+    return canonicalize_language_tag(language, field="language key")
 
 
 def normalize_language_pairs(
@@ -71,7 +66,8 @@ def normalize_language_pairs(
 def languages_from_pairs(language_pairs: Sequence[Sequence[str]]) -> tuple[str, ...]:
     """Return languages in first-appearance order."""
 
-    return tuple(dict.fromkeys(language for pair in language_pairs for language in pair))
+    pairs = normalize_language_pairs(language_pairs=language_pairs)
+    return tuple(dict.fromkeys(language for pair in pairs for language in pair))
 
 
 def normalize_translation_directions(
@@ -158,15 +154,25 @@ def normalize_translation_directions(
     return tuple(directions)
 
 
-def _pair_labels(language_a: str, language_b: str) -> tuple[str, ...]:
-    return (
-        f"{language_a}-{language_b}",
-        f"{language_b}-{language_a}",
-        f"{language_a}/{language_b}",
-        f"{language_b}/{language_a}",
-        f"{language_a}_to_{language_b}",
-        f"{language_b}_to_{language_a}",
-    )
+def _pair_labels(
+    language_a: str,
+    language_b: str,
+) -> tuple[tuple[str, tuple[str, str]], ...]:
+    labels = [
+        (f"{language_a}/{language_b}", (language_a, language_b)),
+        (f"{language_b}/{language_a}", (language_b, language_a)),
+        (f"{language_a}_to_{language_b}", (language_a, language_b)),
+        (f"{language_b}_to_{language_a}", (language_b, language_a)),
+    ]
+    # A hyphen is also the BCP 47 subtag separator.  Keep legacy ``ko-ja``
+    # containers for simple tags, but require an unambiguous slash or ``_to_``
+    # separator when either language itself contains a hyphen.
+    if "-" not in language_a and "-" not in language_b:
+        labels[0:0] = [
+            (f"{language_a}-{language_b}", (language_a, language_b)),
+            (f"{language_b}-{language_a}", (language_b, language_a)),
+        ]
+    return tuple(labels)
 
 
 def _first_value(mapping: Mapping[object, object], names: Sequence[str]) -> object | None:
@@ -189,6 +195,7 @@ def expand_parallel_record(
 
     configured = normalize_language_pairs(language_pairs=language_pairs)
     configured_edges = {frozenset(pair): pair for pair in configured}
+    configured_languages = set(languages_from_pairs(configured))
     output: list[ParallelText] = []
     issues: list[str] = []
     seen: set[tuple[str, str, str, str]] = set()
@@ -290,29 +297,49 @@ def expand_parallel_record(
         metadata = inherit_record_metadata(mapping, inherited_metadata)
         explicit = emit_explicit(mapping, context, metadata)
         if not explicit:
+            language_keys: dict[str, object] = {}
+            ambiguous_languages: set[str] = set()
+            for raw_key in mapping:
+                if not isinstance(raw_key, str):
+                    continue
+                try:
+                    language = _validate_language(raw_key)
+                except ValueError:
+                    continue
+                if language not in configured_languages:
+                    continue
+                if language in language_keys and language_keys[language] != raw_key:
+                    ambiguous_languages.add(language)
+                    issue("duplicate_language_key")
+                    continue
+                language_keys[language] = raw_key
+            for language in ambiguous_languages:
+                language_keys.pop(language, None)
+
             for language_a, language_b in configured:
-                if language_a in mapping or language_b in mapping:
-                    if language_a not in mapping or language_b not in mapping:
+                if language_a in language_keys or language_b in language_keys:
+                    if language_a not in language_keys or language_b not in language_keys:
                         issue("missing_text")
                     else:
                         emit(
                             language_a,
-                            mapping[language_a],
+                            mapping[language_keys[language_a]],
                             language_b,
-                            mapping[language_b],
+                            mapping[language_keys[language_b]],
                             metadata,
                         )
 
         nested: dict[str, tuple[str, str]] = {}
         for language_a, language_b in configured:
-            for label in _pair_labels(language_a, language_b):
+            for label, direction in _pair_labels(language_a, language_b):
                 if label not in mapping:
                     continue
-                nested[label] = (
-                    (language_a, language_b)
-                    if label.startswith((f"{language_a}-", f"{language_a}/", f"{language_a}_to_"))
-                    else (language_b, language_a)
-                )
+                previous = nested.get(label)
+                if previous is not None and previous != direction:
+                    issue("ambiguous_pair_container")
+                    nested.pop(label, None)
+                    continue
+                nested[label] = direction
 
         for key, value in mapping.items():
             if not isinstance(key, str):

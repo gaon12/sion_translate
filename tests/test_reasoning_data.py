@@ -61,9 +61,14 @@ def _row(**overrides: object) -> dict[str, object]:
 
 def test_reasoning_task_symbol_validates_language_keys() -> None:
     assert reasoning_task_symbol("ja") == "<reason_ja>"
-    assert reasoning_task_symbol("zh2") == "<reason_zh2>"
-    with pytest.raises(ReasoningDataError, match="ASCII key"):
+    assert reasoning_task_symbol("zh-hant") == "<reason_zh-Hant>"
+    with pytest.raises(ReasoningDataError, match="BCP 47"):
         reasoning_task_symbol("日本語")
+
+
+def test_reasoning_rows_compare_canonical_language_identities() -> None:
+    record = parse_reasoning_row(_row(language="pt-br"), expected_language="pt-BR")
+    assert record.language == "pt-BR"
 
 
 def test_parse_reasoning_row_keeps_structured_fields_and_metadata() -> None:

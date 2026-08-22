@@ -27,7 +27,11 @@ from sion_translate.data.monolingual import (
     DEFAULT_LANGUAGE_SAMPLING_ALPHA,
     foundation_languages,
 )
-from sion_translate.data.records import normalize_translation_directions
+from sion_translate.data.records import (
+    normalize_language_pairs,
+    normalize_translation_directions,
+)
+from sion_translate.language_tags import canonicalize_language_tags
 from sion_translate.synthetic import (
     DEFAULT_SYNTHETIC_PREFIXES,
     DEFAULT_SYNTHETIC_SAMPLING_WEIGHT,
@@ -334,7 +338,7 @@ class DataConfig:
 
     def configured_language_pairs(self) -> tuple[tuple[str, str], ...]:
         raw_pairs = self.language_pairs or [self.language_pair]
-        return tuple((str(pair[0]), str(pair[1])) for pair in raw_pairs)
+        return normalize_language_pairs(language_pairs=raw_pairs)
 
     def configured_synthetic_prefixes(self) -> tuple[str, ...]:
         return normalize_synthetic_prefixes(
@@ -343,7 +347,11 @@ class DataConfig:
         )
 
     def configured_source_only_languages(self) -> tuple[str, ...]:
-        return tuple(dict.fromkeys(str(language) for language in self.source_only_languages))
+        return canonicalize_language_tags(
+            self.source_only_languages,
+            field="data.source_only_languages",
+            reject_duplicates=False,
+        )
 
     def configured_translation_directions(self) -> tuple[tuple[str, str], ...]:
         """Return the directed edges the indexed dataset can actually train."""
@@ -552,17 +560,12 @@ class FoundationConfig:
                 "foundation.release_name must differ from the translation release name "
                 f"({TRANSLATION_RELEASE_NAME!r}); the two stages are published separately"
             )
-        if len(set(self.languages)) != len(self.languages):
-            raise ValueError("foundation.languages must not contain duplicates")
-        if any(
-            not language
-            or not language.isascii()
-            or not language.isalnum()
-            or not language[0].isalpha()
-            or len(language) > 16
-            for language in self.languages
-        ):
-            raise ValueError("foundation.languages must contain 1-16 character ASCII language keys")
+        self.languages = list(
+            canonicalize_language_tags(
+                self.languages,
+                field="foundation.languages",
+            )
+        )
         if not 0.0 < self.language_sampling_alpha <= 1.0:
             raise ValueError("foundation.language_sampling_alpha must be in (0, 1]")
         if not 0.0 <= self.minimum_language_share < 1.0:
@@ -701,28 +704,16 @@ class AppConfig:
 
     def validate(self) -> None:
         self.model.validate()
-        pairs = self.data.language_pairs or [self.data.language_pair]
-        if not pairs:
-            raise ValueError("at least one language pair is required")
-        seen_edges: set[frozenset[str]] = set()
-        for pair in pairs:
-            if (
-                len(pair) != 2
-                or pair[0] == pair[1]
-                or any(
-                    not lang or not lang.isascii() or not lang.isalnum() or not lang[0].isalpha()
-                    for lang in pair
-                )
-            ):
-                raise ValueError(
-                    "each language pair must contain two distinct ASCII language "
-                    "keys, e.g. ['ko', 'ja']"
-                )
-            edge = frozenset(pair)
-            if edge in seen_edges:
-                raise ValueError(f"duplicate or reversed language pair: {pair!r}")
-            seen_edges.add(edge)
+        raw_pairs = self.data.language_pairs or [self.data.language_pair]
+        pairs = self.data.configured_language_pairs()
+        if len(pairs) != len(raw_pairs):
+            raise ValueError("duplicate or reversed language pair after BCP 47 canonicalization")
+        if self.data.language_pairs:
+            self.data.language_pairs = [list(pair) for pair in pairs]
+        else:
+            self.data.language_pair = list(pairs[0])
         source_only = self.data.configured_source_only_languages()
+        self.data.source_only_languages = list(source_only)
         if source_only:
             known = set(self.data.languages)
             unknown = sorted(set(source_only) - known)
@@ -744,7 +735,9 @@ class AppConfig:
                     )
         # This also verifies explicit directions are connected to configured
         # pairs, cover every pair, and never target a source-only language.
-        self.data.configured_translation_directions()
+        directions = self.data.configured_translation_directions()
+        if self.data.translation_directions:
+            self.data.translation_directions = [list(direction) for direction in directions]
         if not 0.0 <= self.data.source_token_dropout < 0.5:
             raise ValueError("source_token_dropout must be in [0, 0.5)")
         if not 0.0 <= self.data.decoder_input_noise < 0.5:

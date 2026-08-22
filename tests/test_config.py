@@ -411,7 +411,42 @@ def test_language_identifier_length_is_rejected_during_config_preflight() -> Non
         data=DataConfig(language_pair=["languageidentifier", "de"]),
     )
 
-    with pytest.raises(ValueError, match="1-16 ASCII"):
+    with pytest.raises(ValueError, match="BCP 47"):
+        config.validate()
+
+
+def test_language_graph_is_canonicalized_as_one_bcp47_identity() -> None:
+    config = AppConfig(
+        data=DataConfig(
+            language_pairs=[["pt-br", "ZH-hant"], ["sr-latn-rs", "de"]],
+            translation_directions=[
+                ["PT-br", "zh-Hant"],
+                ["zh-hant", "pt-BR"],
+                ["SR-Latn-rs", "DE"],
+            ],
+        )
+    )
+    config.foundation.languages = ["pt-br", "zh-hant", "SR-latn-rs"]
+
+    config.validate()
+
+    assert config.data.language_pairs == [["pt-BR", "zh-Hant"], ["sr-Latn-RS", "de"]]
+    assert config.data.translation_directions == [
+        ["pt-BR", "zh-Hant"],
+        ["zh-Hant", "pt-BR"],
+        ["sr-Latn-RS", "de"],
+    ]
+    assert config.foundation.languages == ["pt-BR", "zh-Hant", "sr-Latn-RS"]
+
+
+def test_language_graph_rejects_duplicates_after_bcp47_canonicalization() -> None:
+    config = AppConfig(
+        data=DataConfig(
+            language_pairs=[["pt-BR", "en"], ["EN", "pt-br"]],
+        )
+    )
+
+    with pytest.raises(ValueError, match="after BCP 47 canonicalization"):
         config.validate()
 
 
@@ -612,7 +647,7 @@ def test_foundation_can_add_a_non_translation_language() -> None:
 
 def test_foundation_language_keys_are_validated() -> None:
     config = AppConfig()
-    config.foundation.languages = ["ko", "not-a-language-key"]
+    config.foundation.languages = ["ko", "en_US"]
 
     with pytest.raises(ValueError, match="foundation.languages"):
         config.validate()

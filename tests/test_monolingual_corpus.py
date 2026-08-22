@@ -81,6 +81,18 @@ def test_a_valid_language_code_that_is_not_configured_is_named(tmp_path) -> None
     assert "en" not in discovery.languages
 
 
+def test_script_and_region_language_folders_are_canonicalized(tmp_path) -> None:
+    root = tmp_path / "corpus"
+    _write(root / "pt-br" / "wiki.txt", ["uma frase em português"])
+    _write(root / "ZH-hant" / "wiki.txt", ["一個繁體中文句子"])
+
+    discovery = discover_monolingual_sources(root, ["pt-BR", "zh-Hant"])
+
+    assert discovery.languages == ("pt-BR", "zh-Hant")
+    assert len(discovery.paths_for("PT-br")) == 1
+    assert discovery.languages_without_data == ()
+
+
 def test_unsupported_extensions_are_reported(tmp_path) -> None:
     root = _corpus(tmp_path)
     _write(root / "ko" / "notes.md", ["마크다운"])

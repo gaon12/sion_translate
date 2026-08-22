@@ -18,9 +18,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
-import re
 from typing import Any, Iterator, Mapping, Protocol, cast
 
+from sion_translate.language_tags import LanguageTagError, canonicalize_language_tag
 from sion_translate.tokenizer import normalize_text
 
 
@@ -29,7 +29,6 @@ THINK_CLOSE = "</think>"
 ANSWER_OPEN = "<answer>"
 ANSWER_CLOSE = "</answer>"
 TRACE_SYMBOLS = (THINK_OPEN, THINK_CLOSE, ANSWER_OPEN, ANSWER_CLOSE)
-_LANGUAGE_KEY = re.compile(r"^[A-Za-z][A-Za-z0-9]{0,15}$")
 
 
 class ReasoningTokenizer(Protocol):
@@ -89,12 +88,11 @@ class SerializedReasoningRecord:
 def reasoning_task_symbol(language: str) -> str:
     """Return the reserved encoder task symbol for a validated language key."""
 
-    if not _LANGUAGE_KEY.fullmatch(language):
-        raise ReasoningDataError(
-            "reasoning language must be a 1-16 character ASCII key beginning "
-            f"with a letter; got {language!r}"
-        )
-    return f"<reason_{language}>"
+    try:
+        normalized = canonicalize_language_tag(language, field="reasoning language")
+    except LanguageTagError as error:
+        raise ReasoningDataError(str(error)) from error
+    return f"<reason_{normalized}>"
 
 
 def is_reasoning_jsonl(path: str | Path) -> bool:
@@ -138,12 +136,17 @@ def parse_reasoning_row(
     raw_language = row.get("language", expected_language)
     if not isinstance(raw_language, str):
         raise ReasoningDataError("reasoning field 'language' must be a string")
-    language = raw_language.strip()
-    reasoning_task_symbol(language)
-    if expected_language is not None and language != expected_language:
+    language_symbol = reasoning_task_symbol(raw_language.strip())
+    language = language_symbol[len("<reason_") : -1]
+    normalized_expected = (
+        reasoning_task_symbol(expected_language)[len("<reason_") : -1]
+        if expected_language is not None
+        else None
+    )
+    if normalized_expected is not None and language != normalized_expected:
         raise ReasoningDataError(
             "reasoning row language does not match its corpus directory: "
-            f"row={language!r}, expected={expected_language!r}"
+            f"row={language!r}, expected={normalized_expected!r}"
         )
     return ReasoningRecord(
         prompt=_clean_required_text(row, "prompt"),

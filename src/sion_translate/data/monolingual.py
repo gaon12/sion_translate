@@ -30,9 +30,25 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator, Sequence
 
-# 설정의 언어 키 규칙과 같습니다 (`AppConfig.validate` 참고): ASCII 영숫자,
-# 첫 글자는 알파벳. 폴더 이름이 곧 언어 키이므로 규칙이 갈라지면 안 됩니다.
-LANGUAGE_DIRECTORY_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9]{0,15}$")
+from sion_translate.language_tags import (
+    LanguageTagError,
+    canonicalize_language_tag,
+    canonicalize_language_tags,
+    is_well_formed_language_tag,
+)
+
+
+class _LanguageDirectoryValidator:
+    """Compatibility facade for the former public regex constant."""
+
+    @staticmethod
+    def match(value: object) -> bool:
+        return is_well_formed_language_tag(value)
+
+    fullmatch = match
+
+
+LANGUAGE_DIRECTORY_PATTERN = _LanguageDirectoryValidator()
 
 TEXT_SUFFIX = ".txt"
 JSONL_SUFFIX = ".jsonl"
@@ -84,7 +100,8 @@ class MonolingualDiscovery:
         return tuple(dict.fromkeys(source.language for source in self.sources))
 
     def paths_for(self, language: str) -> tuple[Path, ...]:
-        return tuple(source.path for source in self.sources if source.language == language)
+        normalized = canonicalize_language_tag(language)
+        return tuple(source.path for source in self.sources if source.language == normalized)
 
     def bytes_per_language(self) -> dict[str, int]:
         totals: dict[str, int] = {}
@@ -106,12 +123,19 @@ def foundation_languages(
     거스르는 것을 먼저 가르치게 됩니다.
     """
 
-    excluded = frozenset(str(language) for language in source_only_languages)
-    return tuple(
-        language
-        for language in dict.fromkeys(str(x) for x in languages)
-        if language not in excluded
+    normalized = canonicalize_language_tags(
+        list(languages),
+        field="foundation languages",
+        reject_duplicates=False,
     )
+    excluded = frozenset(
+        canonicalize_language_tags(
+            list(source_only_languages),
+            field="source-only languages",
+            reject_duplicates=False,
+        )
+    )
+    return tuple(language for language in normalized if language not in excluded)
 
 
 def discover_monolingual_sources(
@@ -121,7 +145,11 @@ def discover_monolingual_sources(
     """언어 코드 폴더를 훑어 학습 가능한 파일과 건너뛴 것을 함께 돌려준다."""
 
     root = Path(root)
-    configured = tuple(dict.fromkeys(str(language) for language in languages))
+    configured = canonicalize_language_tags(
+        list(languages),
+        field="monolingual languages",
+        reject_duplicates=False,
+    )
     if not configured:
         raise ValueError("at least one language is required to discover monolingual sources")
 
@@ -136,21 +164,34 @@ def discover_monolingual_sources(
     sources: list[MonolingualSource] = []
     skipped: list[SkippedEntry] = []
     unconfigured: list[str] = []
+    seen_language_directories: set[str] = set()
 
     for entry in sorted(root.iterdir()):
         if not entry.is_dir():
             skipped.append(SkippedEntry(entry, "언어 폴더가 아닌 최상위 파일"))
             continue
-        if entry.name not in configured_set:
-            reason = (
-                f"설정에 없는 언어 폴더 (설정된 언어: {', '.join(configured)})"
-                if LANGUAGE_DIRECTORY_PATTERN.match(entry.name)
-                else "언어 코드 형식이 아닌 폴더 이름"
+        try:
+            entry_language = canonicalize_language_tag(
+                entry.name,
+                field="monolingual language directory",
             )
-            skipped.append(SkippedEntry(entry, reason))
-            if LANGUAGE_DIRECTORY_PATTERN.match(entry.name):
-                unconfigured.append(entry.name)
+        except LanguageTagError:
+            skipped.append(SkippedEntry(entry, "언어 코드 형식이 아닌 폴더 이름"))
             continue
+        if entry_language not in configured_set:
+            reason = f"설정에 없는 언어 폴더 (설정된 언어: {', '.join(configured)})"
+            skipped.append(SkippedEntry(entry, reason))
+            unconfigured.append(entry_language)
+            continue
+        if entry_language in seen_language_directories:
+            skipped.append(
+                SkippedEntry(
+                    entry,
+                    f"같은 언어 태그로 정규화되는 중복 폴더 ({entry_language})",
+                )
+            )
+            continue
+        seen_language_directories.add(entry_language)
         found = False
         for candidate in sorted(entry.rglob("*")):
             if not candidate.is_file():
@@ -167,7 +208,7 @@ def discover_monolingual_sources(
             if size == 0:
                 skipped.append(SkippedEntry(candidate, "빈 파일"))
                 continue
-            sources.append(MonolingualSource(entry.name, candidate, size))
+            sources.append(MonolingualSource(entry_language, candidate, size))
             found = True
         if not found:
             skipped.append(SkippedEntry(entry, "읽을 수 있는 .txt/.jsonl 이 없습니다"))
