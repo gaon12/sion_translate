@@ -177,6 +177,72 @@ def test_single_step_training_loop(tmp_path: Path) -> None:
         weights_only=True,
     )
     assert checkpoint["identity"]["pipeline"] == pipeline_identity
+    resolved = json.loads((tmp_path / "run" / "resolved_config.json").read_text(encoding="utf-8"))
+    assert resolved == config.to_dict()
+
+
+@pytest.mark.parametrize("failure_phase", ("preflight", "load"))
+def test_failed_resume_preserves_the_previous_resolved_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_phase: str,
+) -> None:
+    config = tiny_app_config(tmp_path, ema_decay=0.0)
+    config.training.resume_from = str(tmp_path / "checkpoint")
+    resolved_path = Path(config.training.output_dir) / "resolved_config.json"
+    resolved_path.parent.mkdir(parents=True)
+    original = b'{"generation":"known-good"}\n'
+    resolved_path.write_bytes(original)
+
+    if failure_phase == "preflight":
+        monkeypatch.setattr(
+            trainer_module,
+            "preflight_checkpoint_identity",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("incompatible resume")),
+        )
+    else:
+        monkeypatch.setattr(
+            trainer_module,
+            "preflight_checkpoint_identity",
+            lambda *_args, **_kwargs: None,
+        )
+        monkeypatch.setattr(
+            trainer_module,
+            "load_checkpoint",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("corrupt resume")),
+        )
+
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+    with pytest.raises((ValueError, RuntimeError), match="resume"):
+        train(
+            SionForConditionalGeneration(config.model),
+            [tiny_batch()],
+            [tiny_batch()],
+            config,
+            context,
+        )
+
+    assert resolved_path.read_bytes() == original
+
+
+def test_resolved_config_replace_failure_preserves_the_previous_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "resolved_config.json"
+    original = b'{"generation":"known-good"}\n'
+    path.write_bytes(original)
+
+    def reject_replace(_source: Path, _destination: Path) -> None:
+        raise PermissionError("injected resolved config replace failure")
+
+    monkeypatch.setattr(trainer_module.os, "replace", reject_replace)
+
+    with pytest.raises(PermissionError, match="injected resolved config replace failure"):
+        trainer_module._atomic_write_resolved_config(path, {"generation": "retry"})
+
+    assert path.read_bytes() == original
+    assert not list(tmp_path.glob(".resolved_config.json.*.tmp"))
 
 
 def test_epoch_budget_traverses_every_batch_and_flushes_partial_accumulation(

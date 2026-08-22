@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import tempfile
 import time
 from collections.abc import Sized
 from contextlib import nullcontext
@@ -42,6 +44,7 @@ from .checkpoint import (
     build_checkpoint_identity,
     build_objective_identity,
     load_checkpoint,
+    preflight_checkpoint_identity,
     save_checkpoint,
 )
 from .distributed import (
@@ -72,6 +75,59 @@ class TrainingBudget:
         if self.target_epochs is not None:
             return epoch < self.target_epochs
         return step < self.max_optimizer_steps
+
+
+def _atomic_write_resolved_config(path: Path, payload: Mapping[str, Any]) -> None:
+    """Durably publish one complete resolved configuration generation."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        if os.name != "nt":
+            directory_descriptor = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _publish_resolved_config(
+    config: AppConfig,
+    output_dir: Path,
+    context: DistributedContext,
+) -> None:
+    """Publish on rank 0 and make every peer observe a write failure."""
+
+    write_error: Exception | None = None
+    if context.is_main:
+        try:
+            _atomic_write_resolved_config(output_dir / "resolved_config.json", config.to_dict())
+        except Exception as error:
+            write_error = error
+    write_failed = broadcast_bool(write_error is not None, context)
+    if not write_failed:
+        return
+    if write_error is not None:
+        raise write_error
+    raise RuntimeError("rank 0 failed to publish resolved_config.json")
 
 
 def resolve_training_budget(
@@ -667,11 +723,14 @@ def train(
         include_posttraining=objective is not None,
         pipeline_identity=pipeline_identity,
     )
-    if context.is_main:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        # 이 run 이 정확히 어떤 설정으로 돌았는지 나중에 확인할 수 있도록 저장합니다.
-        with (output_dir / "resolved_config.json").open("w", encoding="utf-8") as handle:
-            json.dump(config.to_dict(), handle, ensure_ascii=False, indent=2)
+    if training.resume_from:
+        # Incompatible or corrupt retries must fail before mutating the live
+        # model/optimizer or replacing the prior run's configuration evidence.
+        preflight_checkpoint_identity(
+            training.resume_from,
+            context,
+            checkpoint_identity,
+        )
 
     # ── 단계 1/4: optimizer · scheduler · AMP scaler 준비 ─────────────────
     announce("단계 1/4: optimizer(AdamW)와 학습률 스케줄러를 준비합니다.", context)
@@ -747,6 +806,9 @@ def train(
             )
     else:
         announce("단계 2/4: 재개할 체크포인트가 없어 처음부터 학습합니다.", context)
+    # A retry becomes this run generation only after its checkpoint has loaded
+    # successfully. Until then, retain the previous resolved configuration.
+    _publish_resolved_config(config, output_dir, context)
     training_state["configured_selection_metric"] = configured_selection_metric
 
     writer = _make_summary_writer(training, output_dir, context, start_step)
