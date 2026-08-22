@@ -23,7 +23,7 @@ from sion_translate.data.quality import (
     apply_record_quality_profile,
     assess_pair,
 )
-from sion_translate.data.prepare import protect_shared_spans
+from sion_translate.data.prepare import infer_register, protect_shared_spans
 from sion_translate.glossary import restore_targets
 from sion_translate.structured import (
     extract_structured_spans,
@@ -67,6 +67,21 @@ class _FakePrepareTokenizer:
 
     def encode(self, text: str) -> list[int]:
         return [4 + byte for byte in text.encode("utf-8")]
+
+
+@pytest.mark.parametrize(
+    ("text", "base_language", "variant_language"),
+    [
+        ("안녕하세요.", "ko", "KO-kr"),
+        ("こんにちはです。", "ja", "JA-jp"),
+    ],
+)
+def test_register_inference_inherits_the_primary_language_policy(
+    text: str,
+    base_language: str,
+    variant_language: str,
+) -> None:
+    assert infer_register(text, variant_language) == infer_register(text, base_language) == 2
 
 
 def _write_atomic_prepare_source(path: Path, *, marker: str = "A") -> None:

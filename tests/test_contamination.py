@@ -131,6 +131,21 @@ def test_an_unsupported_direction_returns_nothing_and_says_so() -> None:
     assert supported_direction("ko", "ja")
 
 
+def test_language_variants_inherit_the_supported_contamination_direction() -> None:
+    assert supported_direction("KO-kr", "ja-jp")
+    findings = assess_contamination(
+        "씨발 진짜 짜증나네",
+        "種まき 本当にうざい",
+        source_language="KO-kr",
+        target_language="ja-jp",
+    )
+    assert any(finding.rule == "known_literal_mistranslation" for finding in findings)
+
+
+def test_invalid_language_tags_are_not_supported_for_contamination() -> None:
+    assert not supported_direction("ko_KR", "ja-JP")
+
+
 def test_normalize_strips_spacing_and_repetition() -> None:
     assert normalize("씨 발!!!") == "씨발"
     assert normalize("아아아 진짜") == "아진짜"

@@ -15,16 +15,22 @@ Deliberate scope choices, because a screen that flags everything gets switched o
 * Numeric ages are read with their counter attached (``12살``, ``12歳``), so a
   quantity like ``12개`` or a year like ``2012`` never matches.
 
-The tables are per language and live behind :func:`markers_for`, so a pair the
-project does not configure is simply not screened rather than silently passing.
-Reports carry marker names and row identifiers, never the matched sentence: the
-point is to remove the rows, not to reproduce them somewhere else.
+The tables are per language and live behind :func:`markers_for`, so a valid pair
+the project does not configure is simply not screened rather than silently
+passing. Malformed language tags are rejected instead of being mistaken for an
+unconfigured policy. Reports carry marker names and row identifiers, never the
+matched sentence: the point is to remove the rows, not to reproduce them
+somewhere else.
 """
 
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from typing import TypeVar
+
+from sion_translate.language_tags import LanguageTag, parse_language_tag
 
 # You can make the model safe through censorship.
 # Existing data has been removed due to concerns about a decline in model performance.
@@ -91,6 +97,19 @@ _SPELLED_AGE_PATTERNS: dict[str, re.Pattern[str]] = {
 # The highest age that counts as a child marker on its own.
 MAX_CHILD_AGE = 14
 
+_PolicyValue = TypeVar("_PolicyValue")
+
+
+def _policy_for(
+    policies: Mapping[str, _PolicyValue],
+    language: LanguageTag,
+) -> _PolicyValue | None:
+    """Resolve an exact BCP 47 policy before inheriting its primary policy."""
+
+    if language.canonical in policies:
+        return policies[language.canonical]
+    return policies.get(language.language)
+
 
 @dataclass
 class ScreenResult:
@@ -124,24 +143,24 @@ def known_languages() -> tuple[str, ...]:
 def markers_for(language: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """The child and sexual marker lists for ``language``, empty when unconfigured."""
 
-    name = str(language).strip().lower()
-    return CHILD_MARKERS.get(name, ()), SEXUAL_MARKERS.get(name, ())
+    tag = parse_language_tag(language, field="content-screen language")
+    return _policy_for(CHILD_MARKERS, tag) or (), _policy_for(SEXUAL_MARKERS, tag) or ()
 
 
 def child_ages(text: str, language: str) -> tuple[int, ...]:
     """Ages at or below :data:`MAX_CHILD_AGE`, read with their counter attached."""
 
-    name = str(language).strip().lower()
+    tag = parse_language_tag(language, field="content-screen language")
     found: list[int] = []
-    pattern = _AGE_PATTERNS.get(name)
+    pattern = _policy_for(_AGE_PATTERNS, tag)
     if pattern is not None:
         for match in pattern.finditer(text):
             value = int(match.group(1))
             if 0 < value <= MAX_CHILD_AGE:
                 found.append(value)
-    spelled_pattern = _SPELLED_AGE_PATTERNS.get(name)
-    if spelled_pattern is not None:
-        spelled = _SPELLED_AGES[name]
+    spelled_pattern = _policy_for(_SPELLED_AGE_PATTERNS, tag)
+    spelled = _policy_for(_SPELLED_AGES, tag)
+    if spelled_pattern is not None and spelled is not None:
         for match in spelled_pattern.finditer(text):
             value = spelled[match.group(1)]
             if 0 < value <= MAX_CHILD_AGE:

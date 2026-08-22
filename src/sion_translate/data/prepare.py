@@ -25,6 +25,7 @@ from sion_translate.fingerprint import (
     FileFingerprint,
     file_sha256,
 )
+from sion_translate.language_tags import parse_language_tag
 from sion_translate.performance import bounded_ordered_map, build_cpu_plan
 from sion_translate.splitting import (
     TargetSplitGuard,
@@ -133,15 +134,16 @@ def infer_register(text: str, language: str) -> int:
 
     한국어/일본어에만 규칙이 있으며, 그 외 언어는 0(미상)을 반환합니다.
     """
+    primary_language = parse_language_tag(language, field="register language").language
     stripped = text.rstrip(" \t\r\n.!?。！？\"'“”‘’")
-    if language == "ko":
+    if primary_language == "ko":
         if re.search(r"(옵니다|사옵니다|드리겠습니다|주시기 바랍니다|하십시오)$", stripped):
             return 3
         if re.search(r"(습니다|ㅂ니다|입니다|합니다|됩니다|세요|어요|아요|예요|이에요)$", stripped):
             return 2
         if re.search(r"(다|한다|했다|이다|한다면|하자|해)$", stripped):
             return 1
-    elif language == "ja":
+    elif primary_language == "ja":
         if re.search(r"(でございます|いたします|くださいませ|なさいます)$", stripped):
             return 3
         if re.search(r"(です|ます|でした|ません|ください)$", stripped):

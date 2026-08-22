@@ -6,6 +6,8 @@ is decoration. These tests pin both failure modes.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 import sion_translate.content_screen as content_screen
@@ -17,6 +19,7 @@ from sion_translate.content_screen import (
     screen_pair,
     screen_text,
 )
+from sion_translate.language_tags import LanguageTagError
 
 
 pytestmark = pytest.mark.usefixtures("configured_content_screen")
@@ -145,8 +148,69 @@ def test_an_unconfigured_language_is_not_screened() -> None:
     assert not pair.flagged
 
 
-def test_language_tags_are_case_and_space_insensitive() -> None:
-    assert screen_text("초등학생과 성관계", " KO ").flagged
+def test_language_tags_are_case_insensitive() -> None:
+    assert screen_text("초등학생과 성관계", "KO").flagged
+
+
+@pytest.mark.parametrize(
+    ("text", "language", "expected_age"),
+    [
+        ("초등학생과 성관계, 12살", "KO-kr", 12),
+        ("小学生と性交、12歳", "JA-jp", 12),
+    ],
+)
+def test_variant_tags_inherit_primary_screening_policies(
+    text: str,
+    language: str,
+    expected_age: int,
+) -> None:
+    result = screen_text(text, language)
+    assert result.flagged
+    assert result.ages == (expected_age,)
+
+
+def test_exact_variant_policy_takes_priority_over_primary_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        content_screen,
+        "CHILD_MARKERS",
+        {"ko": ("base-child",), "ko-KR": ("variant-child",)},
+    )
+    monkeypatch.setattr(
+        content_screen,
+        "SEXUAL_MARKERS",
+        {"ko": ("base-sexual",), "ko-KR": ("variant-sexual",)},
+    )
+
+    assert markers_for("KO-kr") == (("variant-child",), ("variant-sexual",))
+    assert not screen_text("base-child base-sexual", "ko-KR").flagged
+    assert screen_text("variant-child variant-sexual", "ko-KR").flagged
+
+
+def test_exact_variant_age_policy_takes_priority_over_primary_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        content_screen,
+        "_AGE_PATTERNS",
+        {
+            "ko": re.compile(r"(?<!\d)(\d{1,2})살(?!\d)"),
+            "ko-KR": re.compile(r"(?<!\d)(\d{1,2})개월(?!\d)"),
+        },
+    )
+
+    assert child_ages("12살, 7개월", "KO-kr") == (7,)
+
+
+@pytest.mark.parametrize("language", ["", "ko_KR", " ko-KR"])
+def test_invalid_language_tags_are_rejected_fail_closed(language: str) -> None:
+    with pytest.raises(LanguageTagError):
+        markers_for(language)
+    with pytest.raises(LanguageTagError):
+        child_ages("12살", language)
+    with pytest.raises(LanguageTagError):
+        screen_text("초등학생과 성관계", language)
 
 
 def test_empty_input_is_safe() -> None:

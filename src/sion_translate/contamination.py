@@ -47,6 +47,8 @@ import unicodedata
 from dataclasses import dataclass, field
 from typing import Iterable, Sequence
 
+from sion_translate.language_tags import LanguageTagError, parse_language_tag
+
 # 한국어 욕설·비속 표현. 자소 분리와 반복을 견디도록 정규화 후 검사합니다.
 KOREAN_PROFANITY = (
     "씨발",
@@ -406,7 +408,16 @@ def supported_direction(source_language: str, target_language: str) -> bool:
     규칙이 없는 방향을 "오염 없음" 으로 보고하면 감사가 있으나 마나 합니다.
     """
 
-    return (str(source_language), str(target_language)) == ("ko", "ja")
+    try:
+        source_primary = parse_language_tag(
+            source_language, field="contamination source language"
+        ).language
+        target_primary = parse_language_tag(
+            target_language, field="contamination target language"
+        ).language
+    except LanguageTagError:
+        return False
+    return (source_primary, target_primary) == ("ko", "ja")
 
 
 def rank_findings(findings: Sequence[ContaminationFinding]) -> ContaminationFinding | None:
