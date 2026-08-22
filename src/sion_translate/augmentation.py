@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -22,8 +23,8 @@ from sion_translate.data.prepare import prepare_preprocessing_options
 from sion_translate.data.quality import assess_pair, canonical_text
 from sion_translate.fingerprint import DatasetFingerprint, file_sha256
 
-AUGMENT_LEDGER_SCHEMA = "sion-augment-ledger-v1"
-AUGMENT_ROW_SCHEMA = "sion-augment-row-v1"
+AUGMENT_LEDGER_SCHEMA = "sion-augment-ledger-v2"
+AUGMENT_ROW_SCHEMA = "sion-augment-row-v2"
 AUGMENT_STATE_DIRECTORY = ".sion_augment"
 _JOB_ID = re.compile(r"^[0-9a-f]{24}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -87,6 +88,7 @@ class DirectionCount:
 @dataclass(frozen=True)
 class AugmentationIdentity:
     job_id: str
+    synthetic_prefix: str
     pair: tuple[str, str]
     mono_language: str
     input: FileSnapshot
@@ -100,6 +102,7 @@ class AugmentationIdentity:
     def to_dict(self) -> dict[str, object]:
         return {
             "job_id": self.job_id,
+            "synthetic_prefix": self.synthetic_prefix,
             "pair": list(self.pair),
             "mono_language": self.mono_language,
             "input": self.input.to_dict(),
@@ -130,6 +133,7 @@ class AugmentationIdentity:
             return values[0], values[1]
 
         job_id = fields.get("job_id")
+        synthetic_prefix = fields.get("synthetic_prefix")
         mono_language = fields.get("mono_language")
         model_identity = fields.get("model_identity")
         tokenizer_sha = fields.get("generator_tokenizer_sha256")
@@ -137,6 +141,12 @@ class AugmentationIdentity:
         max_new_tokens = fields.get("max_new_tokens")
         if not isinstance(job_id, str) or _JOB_ID.fullmatch(job_id) is None:
             raise ValueError("augmentation ledger job_id is invalid")
+        if (
+            not isinstance(synthetic_prefix, str)
+            or not synthetic_prefix
+            or Path(synthetic_prefix).name != synthetic_prefix
+        ):
+            raise ValueError("augmentation ledger synthetic_prefix is invalid")
         if not isinstance(mono_language, str) or not mono_language:
             raise ValueError("augmentation ledger mono_language is invalid")
         if not isinstance(model_identity, str) or _SHA256.fullmatch(model_identity) is None:
@@ -166,6 +176,7 @@ class AugmentationIdentity:
             raise ValueError("augmentation ledger direction contract is invalid")
         identity = cls(
             job_id=job_id,
+            synthetic_prefix=synthetic_prefix,
             pair=pair,
             mono_language=mono_language,
             input=FileSnapshot.from_dict(fields.get("input")),
@@ -176,8 +187,17 @@ class AugmentationIdentity:
             num_beams=num_beams,
             max_new_tokens=max_new_tokens,
         )
-        if identity.job_id != augmentation_job_id(identity.pair, identity.input.filename):
-            raise ValueError("augmentation ledger job_id does not match its pair/input")
+        if identity.job_id != augmentation_job_id(
+            synthetic_prefix=identity.synthetic_prefix,
+            pair=identity.pair,
+            mono_language=identity.mono_language,
+            input_snapshot=identity.input,
+            model_identity=identity.model_identity,
+            generator_tokenizer_sha256=identity.generator_tokenizer_sha256,
+            num_beams=identity.num_beams,
+            max_new_tokens=identity.max_new_tokens,
+        ):
+            raise ValueError("augmentation ledger job_id does not match its immutable identity")
         return identity
 
 
@@ -312,10 +332,71 @@ def language_pair_slug(pair: Sequence[str]) -> str:
     return f"{readable}__{digest}"
 
 
-def augmentation_job_id(pair: Sequence[str], mono_filename: str) -> str:
-    canonical_pair = tuple(sorted(map(str, pair)))
-    payload = "\0".join((*canonical_pair, Path(mono_filename).name))
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+def _canonical_json(value: object) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def _job_identity_payload(
+    *,
+    synthetic_prefix: str,
+    pair: Sequence[str],
+    mono_language: str,
+    input_snapshot: FileSnapshot,
+    model_identity: str,
+    generator_tokenizer_sha256: str,
+    num_beams: int,
+    max_new_tokens: int,
+) -> dict[str, object]:
+    normalized_pair = tuple(map(str, pair))
+    other_language = (
+        normalized_pair[0] if mono_language == normalized_pair[1] else normalized_pair[1]
+    )
+    return {
+        "synthetic_prefix": synthetic_prefix,
+        "pair": list(normalized_pair),
+        "mono_language": mono_language,
+        "input": input_snapshot.to_dict(),
+        "model_identity": model_identity,
+        "generator_tokenizer_sha256": generator_tokenizer_sha256,
+        "generation_direction": [mono_language, other_language],
+        "training_direction": [other_language, mono_language],
+        "num_beams": num_beams,
+        "max_new_tokens": max_new_tokens,
+    }
+
+
+def augmentation_job_id(
+    *,
+    synthetic_prefix: str,
+    pair: Sequence[str],
+    mono_language: str,
+    input_snapshot: FileSnapshot,
+    model_identity: str,
+    generator_tokenizer_sha256: str,
+    num_beams: int,
+    max_new_tokens: int,
+) -> str:
+    payload = _job_identity_payload(
+        synthetic_prefix=synthetic_prefix,
+        pair=pair,
+        mono_language=mono_language,
+        input_snapshot=input_snapshot,
+        model_identity=model_identity,
+        generator_tokenizer_sha256=generator_tokenizer_sha256,
+        num_beams=num_beams,
+        max_new_tokens=max_new_tokens,
+    )
+    return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()[:24]
+
+
+def augmentation_identity_sha256(identity: AugmentationIdentity) -> str:
+    return hashlib.sha256(_canonical_json(identity.to_dict()).encode("utf-8")).hexdigest()
 
 
 def _safe_mono_stem(filename: str) -> str:
@@ -326,12 +407,11 @@ def _safe_mono_stem(filename: str) -> str:
 
 def augmentation_shard_path(
     data_dir: Path,
-    synthetic_prefix: str,
     identity: AugmentationIdentity,
     sequence: int,
 ) -> Path:
     filename = (
-        f"{synthetic_prefix}{language_pair_slug(identity.pair)}_"
+        f"{identity.synthetic_prefix}{language_pair_slug(identity.pair)}_"
         f"{_safe_mono_stem(identity.input.filename)}_{identity.job_id}_"
         f"{sequence:06d}.jsonl"
     )
@@ -343,6 +423,7 @@ def augmentation_shard_path(
 
 def build_job_identity(
     *,
+    synthetic_prefix: str,
     pair: tuple[str, str],
     mono_language: str,
     input_snapshot: FileSnapshot,
@@ -355,7 +436,17 @@ def build_job_identity(
         raise ValueError(f"monolingual language {mono_language!r} is outside pair {pair!r}")
     other_language = pair[0] if mono_language == pair[1] else pair[1]
     identity = AugmentationIdentity(
-        job_id=augmentation_job_id(pair, input_snapshot.filename),
+        job_id=augmentation_job_id(
+            synthetic_prefix=synthetic_prefix,
+            pair=pair,
+            mono_language=mono_language,
+            input_snapshot=input_snapshot,
+            model_identity=model_identity,
+            generator_tokenizer_sha256=generator_tokenizer_sha256,
+            num_beams=num_beams,
+            max_new_tokens=max_new_tokens,
+        ),
+        synthetic_prefix=synthetic_prefix,
         pair=pair,
         mono_language=mono_language,
         input=input_snapshot,
@@ -377,6 +468,7 @@ def _expected_preprocessing_options(data: DataConfig) -> dict[str, object]:
         source_only_languages=data.configured_source_only_languages(),
         translation_directions=data.configured_translation_directions(),
         train_only_prefixes=data.configured_synthetic_prefixes(),
+        managed_augmentation_prefix=data.synthetic_prefix,
         synthetic_sampling_weight=data.synthetic_sampling_weight,
         language_pair_count=len(pairs),
     )
@@ -490,6 +582,22 @@ def _ledger_path(data_dir: Path, job_id: str) -> Path:
     return data_dir / AUGMENT_STATE_DIRECTORY / f"{job_id}.json"
 
 
+def _fsync_parent(path: Path) -> None:
+    """Persist directory entries where the platform exposes directory fsync."""
+
+    try:
+        descriptor = os.open(path.parent, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        # Windows and some network filesystems do not expose directory fsync.
+        pass
+    finally:
+        os.close(descriptor)
+
+
 def _atomic_write_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path: Path | None = None
@@ -509,6 +617,7 @@ def _atomic_write_json(path: Path, value: object) -> None:
             os.fsync(handle.fileno())
         os.replace(temporary_path, path)
         temporary_path = None
+        _fsync_parent(path)
     finally:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
@@ -521,11 +630,20 @@ def write_job_progress(data_dir: Path, progress: JobProgress) -> None:
         "cursor_line": progress.cursor_line,
         "eof": progress.eof,
         "shards": [shard.to_dict() for shard in progress.shards],
+        "mono_text_hashes": sorted(progress.mono_text_hashes),
     }
     _atomic_write_json(_ledger_path(data_dir, progress.identity.job_id), payload)
 
 
-def _read_ledger(path: Path) -> tuple[AugmentationIdentity, int, bool, tuple[ShardSummary, ...]]:
+def _read_ledger(
+    path: Path,
+) -> tuple[
+    AugmentationIdentity,
+    int,
+    bool,
+    tuple[ShardSummary, ...],
+    frozenset[str],
+]:
     try:
         raw: object = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -539,16 +657,24 @@ def _read_ledger(path: Path) -> tuple[AugmentationIdentity, int, bool, tuple[Sha
     cursor = values.get("cursor_line")
     eof = values.get("eof")
     raw_shards = values.get("shards")
+    raw_hashes = values.get("mono_text_hashes")
     if (
         not isinstance(cursor, int)
         or isinstance(cursor, bool)
         or cursor < 0
         or not isinstance(eof, bool)
         or not isinstance(raw_shards, list)
+        or not isinstance(raw_hashes, list)
     ):
         raise ValueError(f"augmentation ledger progress가 잘못되었습니다: {path}")
     shards = tuple(ShardSummary.from_dict(value) for value in cast(list[object], raw_shards))
-    return identity, cursor, eof, shards
+    hashes = cast(list[object], raw_hashes)
+    if any(not isinstance(value, str) or _SHA256.fullmatch(value) is None for value in hashes):
+        raise ValueError(f"augmentation ledger mono hash inventory가 잘못되었습니다: {path}")
+    typed_hashes = cast(list[str], hashes)
+    if len(typed_hashes) != len(set(typed_hashes)):
+        raise ValueError(f"augmentation ledger mono hash inventory가 중복됩니다: {path}")
+    return identity, cursor, eof, shards, frozenset(typed_hashes)
 
 
 def _validate_shard(
@@ -561,6 +687,7 @@ def _validate_shard(
     first_line: int | None = None
     last_line = previous_input_line
     mono_hashes: set[str] = set()
+    identity_sha256 = augmentation_identity_sha256(identity)
     try:
         with path.open("r", encoding="utf-8") as handle:
             for raw_line in handle:
@@ -576,15 +703,19 @@ def _validate_shard(
                 markers = cast(dict[object, object], metadata)
                 input_line = markers.get("input_line")
                 mono_hash = markers.get("mono_text_sha256")
+                synthetic_hash = markers.get("synthetic_text_sha256")
                 if (
                     markers.get("schema") != AUGMENT_ROW_SCHEMA
                     or markers.get("job_id") != identity.job_id
+                    or markers.get("identity_sha256") != identity_sha256
                     or markers.get("input_sha256") != identity.input.sha256
                     or not isinstance(input_line, int)
                     or isinstance(input_line, bool)
                     or input_line <= last_line
                     or not isinstance(mono_hash, str)
                     or _SHA256.fullmatch(mono_hash) is None
+                    or not isinstance(synthetic_hash, str)
+                    or _SHA256.fullmatch(synthetic_hash) is None
                     or mono_hash in mono_hashes
                     or row.get("synthetic") is not True
                     or row.get("training_direction") != list(identity.training_direction)
@@ -592,6 +723,10 @@ def _validate_shard(
                     or not isinstance(row.get(identity.pair[1]), str)
                     or _sha256_text(canonical_text(cast(str, row[identity.mono_language])))
                     != mono_hash
+                    or _sha256_text(
+                        canonical_text(cast(str, row[identity.generation_direction[1]]))
+                    )
+                    != synthetic_hash
                 ):
                     raise ValueError("row contract is invalid")
                 first_line = input_line if first_line is None else first_line
@@ -610,23 +745,22 @@ def _validate_shard(
     )
 
 
-def _shard_pattern(prefix: str, identity: AugmentationIdentity) -> re.Pattern[str]:
-    base = augmentation_shard_path(Path("."), prefix, identity, 0).name
+def _shard_pattern(identity: AugmentationIdentity) -> re.Pattern[str]:
+    base = augmentation_shard_path(Path("."), identity, 0).name
     stem = base[: -len("000000.jsonl")]
     return re.compile(rf"^{re.escape(stem)}([0-9]{{6}})\.jsonl$")
 
 
 def _load_job_progress(
     data_dir: Path,
-    prefix: str,
     ledger_path: Path,
 ) -> JobProgress:
-    identity, cursor, eof, declared = _read_ledger(ledger_path)
+    identity, cursor, eof, declared, declared_hashes = _read_ledger(ledger_path)
     if ledger_path.stem != identity.job_id:
         raise ValueError(f"augmentation ledger filename과 job_id가 다릅니다: {ledger_path}")
-    pattern = _shard_pattern(prefix, identity)
+    pattern = _shard_pattern(identity)
     discovered: list[tuple[int, Path]] = []
-    for path in data_dir.glob(f"{prefix}*.jsonl"):
+    for path in data_dir.glob(f"{identity.synthetic_prefix}*.jsonl"):
         match = pattern.fullmatch(path.name)
         if match is not None:
             discovered.append((int(match.group(1)), path))
@@ -635,7 +769,7 @@ def _load_job_progress(
         raise ValueError(f"augmentation shard sequence에 빈 구간이 있습니다: {identity.job_id}")
 
     summaries: list[ShardSummary] = []
-    mono_hashes: set[str] = set()
+    mono_hashes: set[str] = set(declared_hashes)
     previous_input_line = -1
     for _, path in discovered:
         summary, shard_hashes = _validate_shard(
@@ -652,13 +786,16 @@ def _load_job_progress(
     minimum_cursor = previous_input_line + 1
     if cursor < (declared[-1].last_input_line + 1 if declared else 0):
         raise ValueError(f"augmentation ledger cursor가 shard보다 뒤처졌습니다: {identity.job_id}")
-    return JobProgress(
+    progress = JobProgress(
         identity=identity,
         cursor_line=max(cursor, minimum_cursor),
         eof=False if recovered else eof,
         shards=tuple(summaries),
         mono_text_hashes=frozenset(mono_hashes),
     )
+    if recovered:
+        write_job_progress(data_dir, progress)
+    return progress
 
 
 def load_augmentation_registry(
@@ -667,24 +804,41 @@ def load_augmentation_registry(
     prepared_names: Sequence[str],
 ) -> AugmentationRegistry:
     state_dir = data_dir / AUGMENT_STATE_DIRECTORY
-    # Private temp files are never training inputs and can only be remnants of
-    # a process that died before atomic publication.
-    for partial in data_dir.glob(f".{synthetic_prefix}*.partial"):
-        if partial.is_file():
-            partial.unlink()
-    if state_dir.is_dir():
-        for partial in state_dir.glob(".*.partial"):
-            if partial.is_file():
-                partial.unlink()
+    if state_dir.exists() and not state_dir.is_dir():
+        raise ValueError(f"augmentation state path is not a directory: {state_dir}")
     jobs: dict[str, JobProgress] = {}
     if state_dir.is_dir():
         for ledger_path in sorted(state_dir.glob("*.json")):
-            progress = _load_job_progress(data_dir, synthetic_prefix, ledger_path)
+            progress = _load_job_progress(data_dir, ledger_path)
             if progress.identity.job_id in jobs:
                 raise ValueError(f"duplicate augmentation job_id: {progress.identity.job_id}")
             jobs[progress.identity.job_id] = progress
+
+        # Clean only tool-owned private files. Broad ``.{prefix}*.partial``
+        # deletion could destroy an unrelated user file such as notes.partial.
+        ledger_partial = re.compile(r"^\.[0-9a-f]{24}\.json\.[^.]+\.partial$")
+        for partial in state_dir.iterdir():
+            if partial.is_file() and ledger_partial.fullmatch(partial.name):
+                partial.unlink()
+        partial_patterns: list[re.Pattern[str]] = []
+        for progress in jobs.values():
+            public_pattern = _shard_pattern(progress.identity).pattern
+            partial_patterns.append(re.compile(rf"^\.(?:{public_pattern[1:-1]})\.[^.]+\.partial$"))
+        for partial in data_dir.iterdir():
+            if partial.is_file() and any(
+                pattern.fullmatch(partial.name) for pattern in partial_patterns
+            ):
+                partial.unlink()
+
     owned = {shard.name for progress in jobs.values() for shard in progress.shards}
-    actual = {path.name for path in data_dir.glob(f"{synthetic_prefix}*.jsonl") if path.is_file()}
+    known_prefixes = {synthetic_prefix}
+    known_prefixes.update(progress.identity.synthetic_prefix for progress in jobs.values())
+    actual = {
+        path.name
+        for prefix in known_prefixes
+        for path in data_dir.glob(f"{prefix}*.jsonl")
+        if path.is_file()
+    }
     if actual != owned:
         raise ValueError(
             "ledger가 인증하지 않은 legacy/corrupt augmentation output이 있습니다: "
@@ -704,6 +858,7 @@ def _publish_shard(
     if output_path.exists():
         raise FileExistsError(f"augmentation shard already exists: {output_path}")
     os.replace(temporary_path, output_path)
+    _fsync_parent(output_path)
     return ShardSummary(
         output_path.name,
         rows,
@@ -730,6 +885,8 @@ def run_augmentation_job(
     if accepted_budget < 1 or batch_size < 1:
         raise ValueError("accepted_budget and batch_size must be positive")
     identity = progress.identity
+    if synthetic_prefix != identity.synthetic_prefix:
+        raise ValueError("augmentation job prefix differs from its immutable identity")
     if snapshot_file(mono_path) != identity.input:
         raise RuntimeError(f"단일어 입력이 augmentation ledger 생성 뒤 변경되었습니다: {mono_path}")
     # Establish ownership before a shard can be published. If the process dies
@@ -738,10 +895,10 @@ def run_augmentation_job(
     write_job_progress(data_dir, progress)
     output_path = augmentation_shard_path(
         data_dir,
-        synthetic_prefix,
         identity,
         len(progress.shards),
     )
+    identity_sha256 = augmentation_identity_sha256(identity)
 
     def always_fits(_text: str) -> bool:
         return True
@@ -788,9 +945,11 @@ def run_augmentation_job(
                 "_sion_augment": {
                     "schema": AUGMENT_ROW_SCHEMA,
                     "job_id": identity.job_id,
+                    "identity_sha256": identity_sha256,
                     "input_sha256": identity.input.sha256,
                     "input_line": line_number,
                     "mono_text_sha256": mono_hash,
+                    "synthetic_text_sha256": _sha256_text(synthetic_text),
                 },
             }
             assessment = assess_pair(
@@ -800,10 +959,13 @@ def run_augmentation_job(
             )
             cursor = line_number + 1
             processed += 1
-            run_hashes.add(mono_hash)
             if not assessment.accepted:
                 quality_filtered += 1
                 continue
+            # Cross-job deduplication is reserved for rows that were actually
+            # published. A better future generator must be allowed to retry a
+            # sentence whose old pseudo-source failed the quality gate.
+            run_hashes.add(mono_hash)
             out.write(json.dumps(row, ensure_ascii=False) + "\n")
             written += 1
             first_written_line = line_number if first_written_line is None else first_written_line
@@ -832,7 +994,12 @@ def run_augmentation_job(
                         continue
                     mono_text = canonical_text(raw_line)
                     mono_hash = _sha256_text(mono_text)
-                    if not mono_text or mono_hash in seen_mono_hashes or mono_hash in queued_hashes:
+                    if (
+                        not mono_text
+                        or mono_hash in seen_mono_hashes
+                        or mono_hash in run_hashes
+                        or mono_hash in queued_hashes
+                    ):
                         duplicates += bool(mono_text)
                         if not batch:
                             cursor = line_number + 1
@@ -847,8 +1014,6 @@ def run_augmentation_job(
                     if len(batch) < batch_size:
                         continue
                     processed, stop = translate_batch(batch, out)
-                    for _, _, processed_hash in batch[:processed]:
-                        seen_mono_hashes.add(processed_hash)
                     batch = batch[processed:]
                     queued_hashes = {item[2] for item in batch}
                     if stop:
@@ -857,14 +1022,17 @@ def run_augmentation_job(
                 else:
                     if batch:
                         processed, stop = translate_batch(batch, out)
-                        for _, _, processed_hash in batch[:processed]:
-                            seen_mono_hashes.add(processed_hash)
                         if stop and processed < len(batch):
                             reached_eof = False
                         else:
                             cursor = total_lines
                     else:
                         cursor = total_lines
+            if progress.cursor_line > total_lines:
+                raise ValueError(
+                    "augmentation ledger cursor가 단일어 입력 행 수보다 큽니다: "
+                    f"{progress.cursor_line} > {total_lines}"
+                )
             out.flush()
             os.fsync(out.fileno())
 
@@ -891,6 +1059,7 @@ def run_augmentation_job(
             mono_text_hashes=frozenset((*progress.mono_text_hashes, *run_hashes)),
         )
         write_job_progress(data_dir, updated)
+        seen_mono_hashes.update(run_hashes)
         return JobRunResult(updated, written, quality_filtered, duplicates, too_long)
     finally:
         if temporary_path is not None:
@@ -905,6 +1074,18 @@ def reconcile_job_identity(
     if existing is None:
         return JobProgress(identity=identity)
     if existing.identity != identity:
+        # The first write is only a crash-recovery reservation. A translator
+        # error can happen immediately afterwards, before even one input line
+        # or shard is committed. Such an empty reservation owns no reusable
+        # work and must not permanently poison the filename when the user fixes
+        # the model or generation settings and retries under the same lock.
+        if (
+            existing.cursor_line == 0
+            and not existing.eof
+            and not existing.shards
+            and not existing.mono_text_hashes
+        ):
+            return JobProgress(identity=identity)
         raise RuntimeError(
             "기존 augmentation job의 입력·모델·토크나이저·생성 설정이 현재와 "
             f"다릅니다: {identity.input.filename}. 기존 shard를 임의 재사용하지 않습니다."
@@ -913,7 +1094,17 @@ def reconcile_job_identity(
 
 
 def synthetic_budget(real_pairs: int, existing_synthetic: int, max_ratio: float) -> int:
-    return max(0, int(real_pairs * max_ratio) - existing_synthetic)
+    if real_pairs < 0 or existing_synthetic < 0:
+        raise ValueError("augmentation row counts must be non-negative")
+    if not math.isfinite(max_ratio) or max_ratio < 0:
+        raise ValueError("augmentation max_ratio must be finite and non-negative")
+    if real_pairs == 0 or max_ratio == 0:
+        return 0
+    # Avoid ``int(inf)`` for a finite but very large ratio. ``as_integer_ratio``
+    # computes the exact floor using Python integers without allocating rows.
+    numerator, denominator = max_ratio.as_integer_ratio()
+    limit = (real_pairs * numerator) // denominator
+    return max(0, limit - existing_synthetic)
 
 
 __all__ = [
@@ -926,6 +1117,7 @@ __all__ = [
     "JobProgress",
     "JobRunResult",
     "augmentation_job_id",
+    "augmentation_identity_sha256",
     "augmentation_shard_path",
     "build_job_identity",
     "count_prepared_direction_pairs",
