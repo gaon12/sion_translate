@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import pickle
 from pathlib import Path
 
@@ -9,12 +10,14 @@ import numpy as np
 import pytest
 import torch
 
+import sion_translate.data.prepare as prepare_module
 from sion_translate.data import (
     DistributedBucketBatchSampler,
     IndexedParallelDataset,
     SionBatchCollator,
     prepare_dataset,
 )
+from sion_translate.fingerprint import DatasetFingerprint, build_dataset_fingerprint
 from sion_translate.data.quality import (
     QualityPolicy,
     apply_record_quality_profile,
@@ -54,6 +57,78 @@ def write_tiny_jsonl(path: Path) -> None:
     with path.open("ab") as handle:
         handle.write(b"\xff\n")
         handle.write(b'{"ko":"\\ud800","ja":"\\u65e5\\u672c\\u8a9e\\u3067\\u3059"}\n')
+
+
+class _FakePrepareTokenizer:
+    languages = ("ko", "ja")
+
+    def __init__(self, _model_path: str | Path) -> None:
+        pass
+
+    def encode(self, text: str) -> list[int]:
+        return [4 + byte for byte in text.encode("utf-8")]
+
+
+def _write_atomic_prepare_source(path: Path, *, marker: str = "A") -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "ko": f"충분히 긴 한국어 원문 {marker}1입니다.",
+                "ja": f"十分に長い日本語の原文{marker}1です。",
+                "marker": marker,
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _atomic_prepare_fingerprint(source: Path, tokenizer: Path) -> DatasetFingerprint:
+    policy = QualityPolicy()
+    options = prepare_module.prepare_preprocessing_options(
+        shard_size=8,
+        validation_fraction=0.0,
+        test_fraction=0.0,
+        max_tokens_per_side=510,
+        quality_policy=policy,
+        filter_quality=False,
+        prevent_target_leakage=True,
+        approximate_split=False,
+        dedup_backend="memory",
+        source_only_languages=(),
+        train_only_prefixes=prepare_module.DEFAULT_TRAIN_ONLY_PREFIXES,
+        synthetic_sampling_weight=0.25,
+        language_pair_count=1,
+    )
+    return build_dataset_fingerprint(
+        [source],
+        language_pairs=(("ko", "ja"),),
+        tokenizer_model=tokenizer,
+        preprocessing_options=options,
+    )
+
+
+def _prepare_atomic_dataset(
+    source_pattern: str,
+    tokenizer: Path,
+    output: Path,
+    *,
+    expected_fingerprint: DatasetFingerprint,
+) -> prepare_module.PrepareStats:
+    return prepare_module.prepare_dataset(
+        [source_pattern],
+        tokenizer,
+        output,
+        shard_size=8,
+        validation_fraction=0.0,
+        test_fraction=0.0,
+        filter_quality=False,
+        dedup_backend="memory",
+        synthetic_sampling_weight=0.25,
+        num_workers=1,
+        expected_fingerprint=expected_fingerprint,
+    )
 
 
 def test_tokenizer_prepare_dataset_and_collate(tmp_path: Path) -> None:
@@ -169,6 +244,362 @@ def test_parallel_preparation_matches_single_worker(tmp_path: Path) -> None:
         single_index = IndexedParallelDataset(tmp_path / "single", split)
         parallel_index = IndexedParallelDataset(tmp_path / "parallel", split)
         assert len(single_index) == len(parallel_index)
+
+
+def test_prepare_publishes_one_caller_fingerprint_and_preprocessing_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "pairs.jsonl"
+    tokenizer = tmp_path / "sion.model"
+    output = tmp_path / "dataset"
+    _write_atomic_prepare_source(source)
+    tokenizer.write_bytes(b"stable-tokenizer")
+    expected = _atomic_prepare_fingerprint(source, tokenizer)
+    observed_inventory_boundary = False
+    original_inventory = prepare_module.build_dataset_artifact_inventory
+
+    def inspect_inventory_boundary(root: Path) -> dict[str, object]:
+        nonlocal observed_inventory_boundary
+        observed_inventory_boundary = True
+        assert (root / prepare_module.RAW_FINGERPRINT_FILENAME).is_file()
+        assert not (root / "manifest.json").exists()
+        return original_inventory(root)
+
+    monkeypatch.setattr(prepare_module, "SionTokenizer", _FakePrepareTokenizer)
+    monkeypatch.setattr(
+        prepare_module,
+        "build_dataset_artifact_inventory",
+        inspect_inventory_boundary,
+    )
+
+    stats = _prepare_atomic_dataset(
+        str(source),
+        tokenizer,
+        output,
+        expected_fingerprint=expected,
+    )
+
+    assert stats.valid_pairs == 1
+    assert observed_inventory_boundary
+    raw_fingerprint = json.loads(
+        (output / prepare_module.RAW_FINGERPRINT_FILENAME).read_text(encoding="utf-8")
+    )
+    manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+    assert raw_fingerprint == expected.to_dict() == manifest["fingerprint"]
+    assert manifest["preprocessing_options"] == raw_fingerprint["preprocessing_options"]
+    assert manifest["preprocessing_schema"] == raw_fingerprint["preprocessing_schema"]
+    assert (output / prepare_module.PREPARE_COMPLETION_FILENAME).is_file()
+
+
+def test_prepare_rejects_same_size_same_mtime_source_mutation_after_workers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "pairs.jsonl"
+    tokenizer = tmp_path / "sion.model"
+    output = tmp_path / "dataset"
+    _write_atomic_prepare_source(source, marker="A")
+    tokenizer.write_bytes(b"stable-tokenizer")
+    expected = _atomic_prepare_fingerprint(source, tokenizer)
+    original_process = prepare_module._process_prepare_batch
+    mutated = False
+
+    def mutate_after_processing(args: object) -> list[prepare_module._PrepareEvent]:
+        nonlocal mutated
+        events = original_process(args)  # type: ignore[arg-type]
+        if not mutated:
+            before = source.stat()
+            changed = source.read_bytes().replace(b'"marker": "A"', b'"marker": "B"')
+            assert len(changed) == before.st_size
+            source.write_bytes(changed)
+            os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+            assert source.stat().st_size == before.st_size
+            assert source.stat().st_mtime_ns == before.st_mtime_ns
+            mutated = True
+        return events
+
+    monkeypatch.setattr(prepare_module, "SionTokenizer", _FakePrepareTokenizer)
+    monkeypatch.setattr(prepare_module, "_process_prepare_batch", mutate_after_processing)
+
+    with pytest.raises(RuntimeError, match="input file set or bytes changed"):
+        _prepare_atomic_dataset(
+            str(source),
+            tokenizer,
+            output,
+            expected_fingerprint=expected,
+        )
+
+    assert not output.exists()
+    assert not list(tmp_path.glob(".dataset.staging-*"))
+
+
+def test_prepare_rejects_tokenizer_mutation_before_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "pairs.jsonl"
+    tokenizer = tmp_path / "sion.model"
+    output = tmp_path / "dataset"
+    _write_atomic_prepare_source(source)
+    tokenizer.write_bytes(b"tokenizer-version-A")
+    expected = _atomic_prepare_fingerprint(source, tokenizer)
+    original_inventory = prepare_module.build_dataset_artifact_inventory
+
+    def mutate_tokenizer(root: Path) -> dict[str, object]:
+        inventory = original_inventory(root)
+        before = tokenizer.stat()
+        tokenizer.write_bytes(b"tokenizer-version-B")
+        os.utime(tokenizer, ns=(before.st_atime_ns, before.st_mtime_ns))
+        assert tokenizer.stat().st_size == before.st_size
+        return inventory
+
+    monkeypatch.setattr(prepare_module, "SionTokenizer", _FakePrepareTokenizer)
+    monkeypatch.setattr(prepare_module, "build_dataset_artifact_inventory", mutate_tokenizer)
+
+    with pytest.raises(RuntimeError, match="Tokenizer bytes changed"):
+        _prepare_atomic_dataset(
+            str(source),
+            tokenizer,
+            output,
+            expected_fingerprint=expected,
+        )
+
+    assert not output.exists()
+
+
+def test_prepare_rechecks_inputs_after_staging_fsync_before_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "pairs.jsonl"
+    tokenizer = tmp_path / "sion.model"
+    output = tmp_path / "dataset"
+    _write_atomic_prepare_source(source, marker="A")
+    tokenizer.write_bytes(b"stable-tokenizer")
+    expected = _atomic_prepare_fingerprint(source, tokenizer)
+    original_fsync = prepare_module._fsync_staging_tree
+    mutated = False
+
+    def mutate_after_fsync(root: Path) -> None:
+        nonlocal mutated
+        original_fsync(root)
+        if not mutated:
+            before = source.stat()
+            changed = source.read_bytes().replace(b'"marker": "A"', b'"marker": "B"')
+            assert len(changed) == before.st_size
+            source.write_bytes(changed)
+            os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+            mutated = True
+
+    monkeypatch.setattr(prepare_module, "SionTokenizer", _FakePrepareTokenizer)
+    monkeypatch.setattr(prepare_module, "_fsync_staging_tree", mutate_after_fsync)
+
+    with pytest.raises(RuntimeError, match="input file set or bytes changed"):
+        _prepare_atomic_dataset(
+            str(source),
+            tokenizer,
+            output,
+            expected_fingerprint=expected,
+        )
+
+    assert not output.exists()
+    assert not list(tmp_path.glob(".dataset.staging-*"))
+
+
+def test_prepare_rejects_a_new_wildcard_source_discovered_during_build(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "pairs.jsonl"
+    tokenizer = tmp_path / "sion.model"
+    output = tmp_path / "dataset"
+    _write_atomic_prepare_source(source)
+    tokenizer.write_bytes(b"stable-tokenizer")
+    expected = _atomic_prepare_fingerprint(source, tokenizer)
+    original_process = prepare_module._process_prepare_batch
+    added = False
+
+    def add_source_after_processing(args: object) -> list[prepare_module._PrepareEvent]:
+        nonlocal added
+        events = original_process(args)  # type: ignore[arg-type]
+        if not added:
+            _write_atomic_prepare_source(tmp_path / "new-pairs.jsonl", marker="B")
+            added = True
+        return events
+
+    monkeypatch.setattr(prepare_module, "SionTokenizer", _FakePrepareTokenizer)
+    monkeypatch.setattr(prepare_module, "_process_prepare_batch", add_source_after_processing)
+
+    with pytest.raises(RuntimeError, match="input file set or bytes changed"):
+        _prepare_atomic_dataset(
+            str(tmp_path / "*.jsonl"),
+            tokenizer,
+            output,
+            expected_fingerprint=expected,
+        )
+
+    assert not output.exists()
+
+
+def test_prepare_recovers_a_complete_exact_orphan_without_rebuilding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "pairs.jsonl"
+    tokenizer = tmp_path / "sion.model"
+    output = tmp_path / "dataset"
+    _write_atomic_prepare_source(source)
+    tokenizer.write_bytes(b"stable-tokenizer")
+    expected = _atomic_prepare_fingerprint(source, tokenizer)
+    monkeypatch.setattr(prepare_module, "SionTokenizer", _FakePrepareTokenizer)
+    original_stats = _prepare_atomic_dataset(
+        str(source),
+        tokenizer,
+        output,
+        expected_fingerprint=expected,
+    )
+    orphan = tmp_path / ".dataset.staging-recoverable"
+    output.rename(orphan)
+
+    def unexpected_rebuild(_args: object) -> list[prepare_module._PrepareEvent]:
+        raise AssertionError("complete authenticated staging should be recovered")
+
+    monkeypatch.setattr(prepare_module, "_process_prepare_batch", unexpected_rebuild)
+    recovered = _prepare_atomic_dataset(
+        str(source),
+        tokenizer,
+        output,
+        expected_fingerprint=expected,
+    )
+
+    assert recovered == original_stats
+    assert output.is_dir()
+    assert not orphan.exists()
+
+
+def test_prepare_quarantines_a_contradictory_orphan_then_rebuilds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "pairs.jsonl"
+    tokenizer = tmp_path / "sion.model"
+    output = tmp_path / "dataset"
+    _write_atomic_prepare_source(source)
+    tokenizer.write_bytes(b"stable-tokenizer")
+    expected = _atomic_prepare_fingerprint(source, tokenizer)
+    monkeypatch.setattr(prepare_module, "SionTokenizer", _FakePrepareTokenizer)
+    _prepare_atomic_dataset(
+        str(source),
+        tokenizer,
+        output,
+        expected_fingerprint=expected,
+    )
+    orphan = tmp_path / ".dataset.staging-contradictory"
+    output.rename(orphan)
+    (orphan / prepare_module.RAW_FINGERPRINT_FILENAME).write_text(
+        "{}\n",
+        encoding="utf-8",
+    )
+
+    rebuilt = _prepare_atomic_dataset(
+        str(source),
+        tokenizer,
+        output,
+        expected_fingerprint=expected,
+    )
+
+    assert rebuilt.valid_pairs == 1
+    assert output.is_dir()
+    assert not orphan.exists()
+    assert not list(tmp_path.glob(".dataset.rejected-*"))
+
+
+def test_prepare_rejects_an_authenticated_manifest_with_wrong_index_totals(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "pairs.jsonl"
+    tokenizer = tmp_path / "sion.model"
+    output = tmp_path / "dataset"
+    _write_atomic_prepare_source(source)
+    tokenizer.write_bytes(b"stable-tokenizer")
+    expected = _atomic_prepare_fingerprint(source, tokenizer)
+    monkeypatch.setattr(prepare_module, "SionTokenizer", _FakePrepareTokenizer)
+    _prepare_atomic_dataset(
+        str(source),
+        tokenizer,
+        output,
+        expected_fingerprint=expected,
+    )
+    orphan = tmp_path / ".dataset.staging-wrong-index-totals"
+    output.rename(orphan)
+    manifest_path = orphan / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["stats"]["valid_pairs"] += 1
+    manifest["stats"]["train"] += 1
+    manifest["sources"][0]["stats"]["valid_pairs"] += 1
+    manifest["sources"][0]["stats"]["train"] += 1
+    manifest["mean_quality_score"] = (
+        manifest["stats"]["quality_score_sum"] / manifest["stats"]["valid_pairs"]
+    )
+    manifest["sources"][0]["mean_quality_score"] = (
+        manifest["sources"][0]["stats"]["quality_score_sum"]
+        / manifest["sources"][0]["stats"]["valid_pairs"]
+    )
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    completion_path = orphan / prepare_module.PREPARE_COMPLETION_FILENAME
+    completion_path.unlink()
+    completion_path.write_text(
+        json.dumps(prepare_module._completion_payload(orphan, manifest)),
+        encoding="utf-8",
+    )
+    rebuilds = 0
+    original_process = prepare_module._process_prepare_batch
+
+    def count_rebuild(args: object) -> list[prepare_module._PrepareEvent]:
+        nonlocal rebuilds
+        rebuilds += 1
+        return original_process(args)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(prepare_module, "_process_prepare_batch", count_rebuild)
+
+    rebuilt = _prepare_atomic_dataset(
+        str(source),
+        tokenizer,
+        output,
+        expected_fingerprint=expected,
+    )
+
+    assert rebuilt.valid_pairs == 1
+    assert rebuilds == 1
+    assert not orphan.exists()
+
+
+def test_prepare_refuses_a_file_at_an_orphan_staging_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "pairs.jsonl"
+    tokenizer = tmp_path / "sion.model"
+    output = tmp_path / "dataset"
+    unsafe = tmp_path / ".dataset.staging-not-a-directory"
+    _write_atomic_prepare_source(source)
+    tokenizer.write_bytes(b"stable-tokenizer")
+    unsafe.write_bytes(b"do-not-delete")
+    expected = _atomic_prepare_fingerprint(source, tokenizer)
+    monkeypatch.setattr(prepare_module, "SionTokenizer", _FakePrepareTokenizer)
+
+    with pytest.raises(RuntimeError, match="unsafe orphan staging path"):
+        _prepare_atomic_dataset(
+            str(source),
+            tokenizer,
+            output,
+            expected_fingerprint=expected,
+        )
+
+    assert unsafe.read_bytes() == b"do-not-delete"
+    assert not output.exists()
 
 
 def test_pair_quality_rejects_obvious_damage() -> None:
