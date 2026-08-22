@@ -1454,8 +1454,8 @@ def _write_transformers_checkpoint(
             tokenizer_path=tokenizer_path,
             token_features_path=token_features_path,
             languages=languages,
-            language_pairs=language_pairs,
-            translation_directions=translation_directions,
+            language_pairs=language_pairs or None,
+            translation_directions=translation_directions or None,
             translation_capable=translation_capable,
             revision_trained=revision_trained,
             release_name=release_name,
@@ -2395,10 +2395,32 @@ def _export_state_dict_formats_unlocked(
             if export_metadata.get("translation_capable") is not False:
                 export_metadata.pop("languages", None)
             export_metadata.pop("translation_directions", None)
+    resolved_translation_capable = _metadata_translation_capable(export_metadata)
+    if language_pairs is not None and not resolved_language_pairs and resolved_translation_capable:
+        raise ValueError(
+            "translation-capable exports cannot explicitly erase the authenticated "
+            "language graph with empty language_pairs"
+        )
+    if language_pairs is None and not resolved_language_pairs and tokenizer_path is not None:
+        from sion_translate.tokenizer import load_tokenizer_metadata
+
+        tokenizer_metadata = load_tokenizer_metadata(tokenizer_path)
+        if tokenizer_metadata is not None:
+            discovered_pairs = _metadata_language_pairs(tokenizer_metadata)
+            if discovered_pairs:
+                resolved_language_pairs = discovered_pairs
+                export_metadata["language_pairs"] = discovered_pairs
+                if len(discovered_pairs) == 1:
+                    export_metadata["language_pair"] = discovered_pairs[0]
+                else:
+                    export_metadata.pop("language_pair", None)
+                discovered_directions = _metadata_translation_directions(tokenizer_metadata)
+                if discovered_directions:
+                    export_metadata["translation_directions"] = discovered_directions
     if (
         "transformers" in requested
         and tokenizer_path is not None
-        and _metadata_languages(export_metadata) is None
+        and "languages" not in export_metadata
     ):
         from sion_translate.tokenizer import SionTokenizer
 
@@ -2411,7 +2433,6 @@ def _export_state_dict_formats_unlocked(
     # 번역 불가 산출물(foundation)에는 방향을 유도해 넣지 않습니다. 이 함수는
     # 방향이 비어 있으면 language_pairs 에서 만들어 채우는데, 그 가중치는
     # 어떤 방향으로도 번역할 수 없습니다.
-    resolved_translation_capable = _metadata_translation_capable(export_metadata)
     resolved_translation_directions: list[list[str]] = []
     if resolved_translation_capable:
         resolved_translation_directions = _metadata_translation_directions(export_metadata)

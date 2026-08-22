@@ -77,6 +77,8 @@ def train_tiny_tokenizer(
             "ja": f"日本語チェックポイント例文{index}です。",
             "en": f"English checkpoint sentence {index}.",
             "ru": f"Русское предложение контрольной точки {index}.",
+            "pt-BR": f"Frase de checkpoint em português número {index}.",
+            "zh-Hant": f"這是第 {index} 個繁體中文檢查點句子。",
         }
         for index in range(40)
     ]
@@ -142,7 +144,7 @@ def test_hf_tokenizer_discovers_every_reserved_language_past_id_256(
 ) -> None:
     import sion_translate.hf.tokenization_sion as tokenizer_module
 
-    languages = [f"l{index:03d}" for index in range(150)]
+    languages = [f"qaa-x-l{index:03d}" for index in range(150)]
     processor = _LargeControlVocabulary(languages)
     assert processor.piece_to_id(f"<denoise_{languages[-1]}>") > 256
 
@@ -207,6 +209,53 @@ def test_hf_multilingual_tokenizer_requires_an_explicit_pair_graph(
         ["sw", "ar"],
         ["ar", "sw"],
     ]
+
+
+def test_current_two_language_hf_tokenizer_cannot_erase_its_direction_graph(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import sion_translate.hf.tokenization_sion as tokenizer_module
+
+    processor = _LargeControlVocabulary(["ko", "ja"])
+    monkeypatch.setattr(
+        tokenizer_module.spm,
+        "SentencePieceProcessor",
+        lambda **_kwargs: processor,
+    )
+    tokenizer_path = tmp_path / "tokenizer.model"
+    tokenizer_path.write_bytes(b"stub")
+
+    with pytest.raises(ValueError, match="non-empty authenticated"):
+        HFSionTokenizer(
+            str(tokenizer_path),
+            language_pairs=[],
+            translation_directions=[],
+            release_name="sion_translate",
+            release_version="1.5",
+        )
+
+
+def test_hf_reasoning_tags_require_every_trace_marker(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import sion_translate.hf.tokenization_sion as tokenizer_module
+
+    processor = _LargeControlVocabulary(["en", "de"])
+    byte_boundary = processor._pieces.index("<0x00>")
+    processor._pieces.insert(byte_boundary, "<reason_en>")
+    processor._index = {piece: index for index, piece in enumerate(processor._pieces)}
+    monkeypatch.setattr(
+        tokenizer_module.spm,
+        "SentencePieceProcessor",
+        lambda **_kwargs: processor,
+    )
+    tokenizer_path = tmp_path / "tokenizer.model"
+    tokenizer_path.write_bytes(b"stub")
+
+    with pytest.raises(ValueError, match="require every trace marker"):
+        HFSionTokenizer(str(tokenizer_path), translation_capable=False)
 
 
 def test_transformers_wrapper_matches_native_forward_and_config() -> None:
@@ -712,6 +761,49 @@ def test_transformers_checkpoint_preserves_source_precision(tmp_path: Path) -> N
         assert metadata["dtype"] == serialized_dtype
 
 
+def test_tokenizerless_transformers_export_canonicalizes_every_language_sidecar(
+    tmp_path: Path,
+) -> None:
+    native_config = tiny_model_config()
+    native = NativeSionForConditionalGeneration(native_config, pad_id=0).eval()
+    save_transformers_checkpoint(
+        tmp_path,
+        native.state_dict(),
+        native_config,
+        languages=["PT-br", "zh-hant"],
+        language_pairs=[["PT-br", "zh-hant"]],
+        translation_directions=[["PT-br", "zh-hant"]],
+    )
+
+    config = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
+    metadata = json.loads((tmp_path / "sion_export.json").read_text(encoding="utf-8"))
+    for payload in (config, metadata):
+        assert payload["languages"] == ["pt-BR", "zh-Hant"]
+        assert payload["language_pairs"] == [["pt-BR", "zh-Hant"]]
+        assert payload["translation_directions"] == [["pt-BR", "zh-Hant"]]
+
+
+def test_translation_export_rejects_a_subset_of_reserved_tokenizer_languages() -> None:
+    class FourLanguageTokenizer:
+        pad_id = 0
+        languages = ("ko", "ja", "en", "de")
+        denoise_languages = languages
+        language_tags = {language: index + 4 for index, language in enumerate(languages)}
+
+        def __len__(self) -> int:
+            return 128
+
+    with pytest.raises(ValueError, match="must cover every reserved tokenizer language"):
+        hf_conversion._validate_language_contract(
+            FourLanguageTokenizer(),
+            model_config=tiny_model_config(),
+            pad_id=0,
+            languages=["ko", "ja"],
+            language_pairs=[["ko", "ja"]],
+            allow_language_subset=True,
+        )
+
+
 def test_candidate_refinement_transformers_checkpoint_is_self_contained(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1115,6 +1207,103 @@ def test_transformers_tokenizer_enforces_trained_direction(tmp_path: Path) -> No
         _inspect_transformers_checkpoint(output_dir)
 
 
+def test_transformers_checkpoint_bundles_bcp47_identity_runtime(
+    tmp_path: Path,
+) -> None:
+    tokenizer_path = train_tiny_tokenizer(
+        tmp_path,
+        language_pairs=[("PT-br", "zh-hant")],
+        foundation_languages=("sr-latn-rs",),
+    )
+    tokenizer = NativeSionTokenizer(tokenizer_path)
+    config = tiny_model_config(len(tokenizer))
+    native = NativeSionForConditionalGeneration(config, pad_id=tokenizer.pad_id)
+    metadata_path = tokenizer_path.parent / "tokenizer_metadata.json"
+    tokenizer_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    tokenizer_metadata["translation_directions"] = [["pt-BR", "zh-Hant"]]
+    metadata_path.write_text(
+        json.dumps(tokenizer_metadata, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    rejected_output = tmp_path / "unauthenticated-reverse"
+    with pytest.raises(ValueError, match="not authenticated by tokenizer metadata"):
+        save_transformers_checkpoint(
+            rejected_output,
+            native.state_dict(),
+            config,
+            pad_id=tokenizer.pad_id,
+            tokenizer_path=tokenizer_path,
+            languages=["PT-br", "zh-hant"],
+            language_pairs=[("PT-br", "zh-hant")],
+            translation_directions=[("zh-hant", "PT-br")],
+        )
+    assert not rejected_output.exists()
+
+    output_dir = tmp_path / "bcp47-transformers"
+    save_transformers_checkpoint(
+        output_dir,
+        native.state_dict(),
+        config,
+        pad_id=tokenizer.pad_id,
+        tokenizer_path=tokenizer_path,
+        languages=["PT-br", "zh-hant"],
+        language_pairs=[("PT-br", "zh-hant")],
+        translation_directions=[("PT-br", "zh-hant")],
+    )
+
+    assert (output_dir / "sion_language_tags.py").is_file()
+    for filename in ("configuration_sion.py", "tokenization_sion.py"):
+        source = (output_dir / filename).read_text(encoding="utf-8")
+        assert "from sion_translate.language_tags" not in source
+        assert "from .sion_language_tags import" in source
+
+    clean_process = textwrap.dedent(
+        """
+        import sys
+
+        import sion_translate.language_tags as ambient_language_tags
+        from transformers import AutoConfig, AutoTokenizer
+
+        def reject_ambient_runtime(*_args, **_kwargs):
+            raise AssertionError("exported checkpoint imported ambient language-tag helpers")
+
+        ambient_language_tags.canonicalize_language_tag = reject_ambient_runtime
+        ambient_language_tags.canonicalize_language_tags = reject_ambient_runtime
+        ambient_language_tags.canonicalize_language_pair = reject_ambient_runtime
+        checkpoint = sys.argv[1]
+        config = AutoConfig.from_pretrained(checkpoint, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(checkpoint, trust_remote_code=True)
+        assert config.languages == ["pt-BR", "zh-Hant"]
+        assert config.language_pairs == [["pt-BR", "zh-Hant"]]
+        assert config.translation_directions == [["pt-BR", "zh-Hant"]]
+        assert tokenizer.language_pairs == [["pt-BR", "zh-Hant"]]
+        assert tokenizer.translation_directions == [["pt-BR", "zh-Hant"]]
+        encoded = tokenizer._build_translation_inputs(
+            "Uma frase de teste.",
+            return_tensors="pt",
+            src_lang="PT-br",
+            tgt_lang="zh-hant",
+        )
+        assert encoded.input_ids.shape[0] == 1
+        """
+    )
+    subprocess.run(
+        [sys.executable, "-c", clean_process, str(output_dir)],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_transformers_export_rejects_duplicate_canonical_direction_aliases() -> None:
+    with pytest.raises(ValueError, match="duplicate export translation direction"):
+        hf_conversion._translation_directions(
+            [["pt-BR", "en"]],
+            [["pt-br", "EN"], ["pt-BR", "en"]],
+        )
+
+
 def test_transformers_export_failure_leaves_no_partial_checkpoint(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1157,6 +1346,29 @@ def test_transformers_export_failure_leaves_no_partial_checkpoint(
         )
     assert marker.read_text(encoding="utf-8") == "previous generation"
     assert {path.name for path in output_dir.iterdir()} == {"complete.marker"}
+
+
+def test_transformers_export_cannot_erase_a_tokenizer_direction_graph(
+    tmp_path: Path,
+) -> None:
+    tokenizer_path = train_tiny_tokenizer(tmp_path)
+    tokenizer = NativeSionTokenizer(tokenizer_path)
+    config = tiny_model_config(len(tokenizer))
+    native = NativeSionForConditionalGeneration(config, pad_id=tokenizer.pad_id)
+    output_dir = tmp_path / "empty-graph"
+
+    with pytest.raises(ValueError, match="explicit empty language_pairs"):
+        save_transformers_checkpoint(
+            output_dir,
+            native.state_dict(),
+            config,
+            pad_id=tokenizer.pad_id,
+            tokenizer_path=tokenizer_path,
+            language_pairs=[],
+            translation_directions=[],
+        )
+
+    assert not output_dir.exists()
 
 
 def test_hf_tokenizer_caps_protected_slot_occurrences_and_checks_feature_hash(

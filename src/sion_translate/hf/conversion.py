@@ -20,6 +20,10 @@ from sion_translate.artifacts import (
     TRANSLATION_RELEASE_NAME,
 )
 from sion_translate.config import ModelConfig
+from sion_translate.language_tags import (
+    canonicalize_language_pair,
+    canonicalize_language_tags,
+)
 from sion_translate.tokenizer import (
     OPTIONAL_CONTROL_SYMBOLS,
     SHARED_CONTROL_SYMBOLS,
@@ -45,6 +49,30 @@ def _file_sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _canonical_pair_list(
+    values: Sequence[Sequence[str]],
+    *,
+    field: str,
+) -> list[list[str]]:
+    pairs: list[list[str]] = []
+    seen: set[frozenset[str]] = set()
+    for index, value in enumerate(values):
+        pair = list(
+            canonicalize_language_pair(
+                value,
+                field=f"{field}[{index}]",
+            )
+        )
+        edge = frozenset(pair)
+        if edge in seen:
+            raise ValueError(
+                f"duplicate or reversed {field} after BCP 47 canonicalization: {value!r}"
+            )
+        seen.add(edge)
+        pairs.append(pair)
+    return pairs
 
 
 def _token_feature_metadata(
@@ -98,6 +126,7 @@ def _copy_self_contained_runtime(output_dir: Path) -> list[str]:
         f"{config_source[config_start:config_end]}\n"
     )
     runtime_sources = {
+        "sion_language_tags.py": (package_dir / "language_tags.py").read_text(encoding="utf-8"),
         "sion_native_config.py": native_config,
         "sion_native_layers.py": (model_dir / "layers.py").read_text(encoding="utf-8"),
         "sion_native_experimental.py": (
@@ -145,8 +174,12 @@ def _validate_language_contract(
     tokenizer_languages = list(
         tokenizer.languages if language_pairs else tokenizer.denoise_languages
     )
-    exported_languages = (
-        tokenizer_languages if languages is None else list(dict.fromkeys(map(str, languages)))
+    exported_languages = list(
+        canonicalize_language_tags(
+            tokenizer_languages if languages is None else list(languages),
+            field="export languages",
+            reject_duplicates=False,
+        )
     )
     if allow_language_subset:
         unknown_languages = sorted(set(exported_languages) - set(tokenizer_languages))
@@ -160,21 +193,20 @@ def _validate_language_contract(
             "configured languages do not match tokenizer language tags: "
             f"{sorted(exported_languages)} != {sorted(tokenizer_languages)}"
         )
-    pairs: list[list[str]] = []
-    for raw_pair in language_pairs or ():
-        if isinstance(raw_pair, (str, bytes)) or not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
-            raw_pair, Sequence
-        ):
-            raise ValueError("each language pair must be a two-item language sequence")
-        pair = list(map(str, raw_pair))
-        if len(pair) != 2 or pair[0] == pair[1]:
-            raise ValueError(f"invalid language pair: {raw_pair!r}")
+    pairs = _canonical_pair_list(language_pairs or (), field="export language pair")
+    pair_languages = {language for pair in pairs for language in pair}
+    if pairs and pair_languages != set(tokenizer.languages):
+        raise ValueError(
+            "translation exports must cover every reserved tokenizer language; "
+            "subsetting a tokenizer requires rebuilding its control vocabulary: "
+            f"{sorted(pair_languages)} != {sorted(tokenizer.languages)}"
+        )
+    for pair in pairs:
         if any(language not in tokenizer.language_tags for language in pair):
             raise ValueError(
                 f"language pair {pair!r} is not represented by tokenizer tags "
                 f"{sorted(tokenizer.language_tags)}"
             )
-        pairs.append(pair)
     return exported_languages, pairs
 
 
@@ -196,7 +228,7 @@ def _translation_directions(
     language_pairs: Sequence[Sequence[str]],
     configured: Sequence[Sequence[str]] | None,
 ) -> list[list[str]]:
-    pairs = [list(map(str, pair)) for pair in language_pairs]
+    pairs = _canonical_pair_list(language_pairs, field="export language pair")
     allowed_edges = {frozenset(pair) for pair in pairs}
     if pairs and configured is None:
         raise ValueError(
@@ -215,7 +247,12 @@ def _translation_directions(
             raw_direction, Sequence
         ):
             raise ValueError("each translation direction must be a two-item language sequence")
-        direction = list(map(str, raw_direction))
+        direction = list(
+            canonicalize_language_pair(
+                raw_direction,
+                field="export translation direction",
+            )
+        )
         key = tuple(direction)
         if (
             len(direction) != 2
@@ -223,9 +260,13 @@ def _translation_directions(
             or frozenset(direction) not in allowed_edges
         ):
             raise ValueError(f"invalid translation direction: {raw_direction!r}")
-        if key not in seen:
-            seen.add(key)
-            directions.append(direction)
+        if key in seen:
+            raise ValueError(
+                "duplicate export translation direction after BCP 47 "
+                f"canonicalization: {raw_direction!r}"
+            )
+        seen.add(key)
+        directions.append(direction)
     covered_edges = {frozenset(direction) for direction in directions}
     missing_pairs = [pair for pair in pairs if frozenset(pair) not in covered_edges]
     if missing_pairs:
@@ -254,23 +295,15 @@ def _tokenizer_metadata_contract(
         return requested_pairs, None
     if not isinstance(raw_pairs, Sequence) or isinstance(raw_pairs, (str, bytes)):
         raise ValueError("tokenizer metadata language_pairs must be a sequence")
-    metadata_pairs: list[list[str]] = []
-    metadata_edges_seen: set[frozenset[str]] = set()
-    for raw_pair in raw_pairs:
-        if isinstance(raw_pair, (str, bytes)) or not isinstance(raw_pair, Sequence):
-            raise ValueError("each tokenizer metadata language pair must be a two-item sequence")
-        pair = list(map(str, raw_pair))
-        if len(pair) != 2 or pair[0] == pair[1]:
-            raise ValueError(f"invalid tokenizer metadata language pair: {raw_pair!r}")
-        edge = frozenset(pair)
-        if edge in metadata_edges_seen:
-            raise ValueError(
-                f"duplicate or reversed tokenizer metadata language pair: {raw_pair!r}"
-            )
-        metadata_edges_seen.add(edge)
-        metadata_pairs.append(pair)
+    metadata_pairs = _canonical_pair_list(
+        raw_pairs,
+        field="tokenizer metadata language pair",
+    )
     effective_pairs = metadata_pairs if requested_pairs is None else requested_pairs
-    normalized_requested = [list(map(str, pair)) for pair in effective_pairs]
+    normalized_requested = _canonical_pair_list(
+        effective_pairs,
+        field="requested language pair",
+    )
     metadata_edges = {frozenset(pair) for pair in metadata_pairs}
     missing_pairs = [pair for pair in normalized_requested if frozenset(pair) not in metadata_edges]
     if missing_pairs:
@@ -290,7 +323,12 @@ def _tokenizer_metadata_contract(
             raise ValueError(
                 "each tokenizer metadata translation direction must be a two-item sequence"
             )
-        direction = list(map(str, raw_direction))
+        direction = list(
+            canonicalize_language_pair(
+                raw_direction,
+                field="tokenizer metadata translation direction",
+            )
+        )
         key = tuple(direction)
         if (
             len(direction) != 2
@@ -364,6 +402,14 @@ def _save_transformers_checkpoint_unpublished(
     tokenizer_metadata_directions: Sequence[Sequence[str]] | None = None
     tokenizer_sha256: str | None = None
     slot_token_ids: list[int] = []
+    if languages is not None:
+        languages = list(
+            canonicalize_language_tags(
+                list(languages),
+                field="export languages",
+                reject_duplicates=False,
+            )
+        )
     if tokenizer_path is not None:
         tokenizer_path = Path(tokenizer_path)
         tokenizer = NativeSionTokenizer(tokenizer_path)
@@ -385,13 +431,20 @@ def _save_transformers_checkpoint_unpublished(
         tokenizer_sha256 = _file_sha256(tokenizer_path)
         slot_token_ids = list(tokenizer.slot_ids)
     else:
-        pairs = []
-        for raw_pair in language_pairs or ():
-            if isinstance(raw_pair, (str, bytes)) or not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
-                raw_pair, Sequence
-            ):
-                raise ValueError("each language pair must be a two-item language sequence")
-            pairs.append(list(map(str, raw_pair)))
+        pairs = _canonical_pair_list(language_pairs or (), field="export language pair")
+        if languages is None:
+            languages = list(
+                canonicalize_language_tags(
+                    [language for pair in pairs for language in pair],
+                    field="export pair languages",
+                    reject_duplicates=False,
+                )
+            )
+    if tokenizer is not None and translation_capable and not pairs:
+        raise ValueError(
+            "translation-capable tokenizer exports require a non-empty authenticated "
+            "language graph; explicit empty language_pairs cannot erase trained directions"
+        )
     directions = _translation_directions(
         pairs,
         (
@@ -400,6 +453,21 @@ def _save_transformers_checkpoint_unpublished(
             else tokenizer_metadata_directions
         ),
     )
+    if translation_directions is not None and tokenizer_metadata_directions is not None:
+        authenticated_directions = {
+            tuple(direction)
+            for direction in _translation_directions(pairs, tokenizer_metadata_directions)
+        }
+        unauthenticated = [
+            direction
+            for direction in directions
+            if tuple(direction) not in authenticated_directions
+        ]
+        if unauthenticated:
+            raise ValueError(
+                "requested translation directions are not authenticated by tokenizer "
+                f"metadata: {unauthenticated!r}"
+            )
 
     if token_features_path is None and tokenizer_path is not None:
         sibling_features = tokenizer_path.parent / "token_features.npz"
@@ -583,6 +651,54 @@ def _save_transformers_checkpoint_unpublished(
                 "    SionForConditionalGeneration as NativeSionForConditionalGeneration,\n"
                 ")\n",
             )
+        if filename == "configuration_sion.py":
+            ambient_language_tags = (
+                "try:\n"
+                "    from sion_translate.language_tags import (\n"
+                "        canonicalize_language_pair,\n"
+                "        canonicalize_language_tags,\n"
+                "    )\n"
+                "except ImportError:\n"
+                "    from .sion_language_tags import (  # type: ignore[import-not-found]\n"
+                "        canonicalize_language_pair,\n"
+                "        canonicalize_language_tags,\n"
+                "    )\n"
+            )
+            bundled_language_tags = (
+                "from .sion_language_tags import (\n"
+                "    canonicalize_language_pair,\n"
+                "    canonicalize_language_tags,\n"
+                ")\n"
+            )
+            if ambient_language_tags not in source:
+                raise RuntimeError("could not bind configuration_sion.py to bundled language tags")
+            source = source.replace(ambient_language_tags, bundled_language_tags)
+        elif filename == "tokenization_sion.py":
+            ambient_language_tags = (
+                "try:\n"
+                "    from sion_translate.language_tags import (\n"
+                "        LanguageTagError,\n"
+                "        canonicalize_language_pair,\n"
+                "        canonicalize_language_tag,\n"
+                "    )\n"
+                "except ImportError:\n"
+                "    # Hub remote-code checkpoints bundle this dependency as a sibling module.\n"
+                "    from .sion_language_tags import (  # type: ignore[import-not-found]\n"
+                "        LanguageTagError,\n"
+                "        canonicalize_language_pair,\n"
+                "        canonicalize_language_tag,\n"
+                "    )\n"
+            )
+            bundled_language_tags = (
+                "from .sion_language_tags import (\n"
+                "    LanguageTagError,\n"
+                "    canonicalize_language_pair,\n"
+                "    canonicalize_language_tag,\n"
+                ")\n"
+            )
+            if ambient_language_tags not in source:
+                raise RuntimeError("could not bind tokenization_sion.py to bundled language tags")
+            source = source.replace(ambient_language_tags, bundled_language_tags)
         (output_dir / filename).write_text(source, encoding="utf-8")
     runtime_files = _copy_self_contained_runtime(output_dir)
     metadata = {

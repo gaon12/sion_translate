@@ -24,6 +24,17 @@ except ImportError:
     ExperimentalConfig = _native_config.ExperimentalConfig
     ModelConfig = _native_config.ModelConfig
 
+try:
+    from sion_translate.language_tags import (
+        canonicalize_language_pair,
+        canonicalize_language_tags,
+    )
+except ImportError:
+    from .sion_language_tags import (  # type: ignore[import-not-found]
+        canonicalize_language_pair,
+        canonicalize_language_tags,
+    )
+
 
 class SionConfig(PretrainedConfig):
     """Serializable Transformers counterpart of :class:`ModelConfig`."""
@@ -118,10 +129,25 @@ class SionConfig(PretrainedConfig):
                 raw_pair, Sequence
             ):
                 raise ValueError("each language pair must be a two-item language sequence")
-            self.language_pairs.append([str(language) for language in raw_pair])
+            self.language_pairs.append(
+                list(
+                    canonicalize_language_pair(
+                        raw_pair,
+                        field="config language pair",
+                    )
+                )
+            )
+        configured_languages = (
+            list(languages)
+            if languages is not None
+            else [language for pair in self.language_pairs for language in pair]
+        )
         self.languages = list(
-            languages
-            or dict.fromkeys(language for pair in self.language_pairs for language in pair)
+            canonicalize_language_tags(
+                configured_languages,
+                field="config languages",
+                reject_duplicates=False,
+            )
         )
         self.release_name = release_name
         self.release_version = release_version
@@ -153,7 +179,14 @@ class SionConfig(PretrainedConfig):
                     raise ValueError(
                         "each translation direction must be a two-item language sequence"
                     )
-                self.translation_directions.append([str(language) for language in raw_direction])
+                self.translation_directions.append(
+                    list(
+                        canonicalize_language_pair(
+                            raw_direction,
+                            field="config translation direction",
+                        )
+                    )
+                )
         if not isinstance(translation_capable, bool):  # pyright: ignore[reportUnnecessaryIsInstance]
             raise ValueError("translation_capable must be a boolean")
         self.translation_capable = translation_capable
@@ -248,7 +281,12 @@ class SionConfig(PretrainedConfig):
                 or any(language not in self.languages for language in pair)
             ):
                 raise ValueError(f"invalid language pair: {pair!r}")
-            allowed_edges.add(frozenset(pair))
+            edge = frozenset(pair)
+            if edge in allowed_edges:
+                raise ValueError(
+                    f"duplicate or reversed language pair after BCP 47 canonicalization: {pair!r}"
+                )
+            allowed_edges.add(edge)
         seen_directions: set[tuple[str, str]] = set()
         if self.language_pairs and not self.translation_directions:
             raise ValueError(

@@ -18,8 +18,23 @@ import sentencepiece as spm
 import torch
 from transformers import PreTrainedTokenizer
 
+try:
+    from sion_translate.language_tags import (
+        LanguageTagError,
+        canonicalize_language_pair,
+        canonicalize_language_tag,
+    )
+except ImportError:
+    # Hub remote-code checkpoints bundle this dependency as a sibling module.
+    from .sion_language_tags import (  # type: ignore[import-not-found]
+        LanguageTagError,
+        canonicalize_language_pair,
+        canonicalize_language_tag,
+    )
+
 
 _FEATURE_NAMES = ("script", "onset", "vowel", "coda")
+_REASONING_TRACE_SYMBOLS = ("<think>", "</think>", "<answer>", "</answer>")
 _FEATURE_MAXIMUM_IDS = {
     "onset": 20,
     "vowel": 22,
@@ -84,12 +99,22 @@ class SionTokenizer(PreTrainedTokenizer):
                 f"expected {tokenizer_sha256}, got {actual_tokenizer_sha256}"
             )
         self.sp_model = spm.SentencePieceProcessor(model_file=self.vocab_file)
-        self.src_lang = src_lang
-        self.tgt_lang = tgt_lang
+        self.src_lang = (
+            canonicalize_language_tag(src_lang, field="tokenizer src_lang")
+            if src_lang is not None
+            else None
+        )
+        self.tgt_lang = (
+            canonicalize_language_tag(tgt_lang, field="tokenizer tgt_lang")
+            if tgt_lang is not None
+            else None
+        )
         self.language_tags: dict[str, int] = {}
         self.denoise_tags: dict[str, int] = {}
-        language_pattern = re.compile(r"^<2([A-Za-z0-9]+)>$")
-        denoise_pattern = re.compile(r"^<denoise_([A-Za-z0-9]+)>$")
+        self.reasoning_tags: dict[str, int] = {}
+        language_pattern = re.compile(r"^<2([^<>\s]+)>$")
+        denoise_pattern = re.compile(r"^<denoise_([^<>\s]+)>$")
+        reasoning_pattern = re.compile(r"^<reason_([^<>\s]+)>$")
         byte_fallback_pattern = re.compile(r"^<0x[0-9A-Fa-f]{2}>$")
         base_special_tokens = {"<pad>", "<unk>", "<s>", "</s>"}
         reserved_control_pieces: list[str] = []
@@ -105,10 +130,40 @@ class SionTokenizer(PreTrainedTokenizer):
                 break
             if piece.startswith("<") and piece.endswith(">") and piece not in base_special_tokens:
                 reserved_control_pieces.append(piece)
-            if match := language_pattern.fullmatch(piece):
-                self.language_tags[match.group(1)] = token_id
-            elif match := denoise_pattern.fullmatch(piece):
-                self.denoise_tags[match.group(1)] = token_id
+            destination: dict[str, int] | None = None
+            kind = ""
+            match = language_pattern.fullmatch(piece)
+            if match is not None:
+                destination = self.language_tags
+                kind = "translation"
+            else:
+                match = denoise_pattern.fullmatch(piece)
+                if match is not None:
+                    destination = self.denoise_tags
+                    kind = "denoising"
+                else:
+                    match = reasoning_pattern.fullmatch(piece)
+                    if match is not None:
+                        destination = self.reasoning_tags
+                        kind = "reasoning"
+            if destination is None or match is None:
+                continue
+            raw_language = match.group(1)
+            try:
+                language = canonicalize_language_tag(
+                    raw_language,
+                    field=f"tokenizer {kind} control symbol",
+                )
+            except LanguageTagError as error:
+                raise ValueError(f"invalid tokenizer control symbol {piece!r}: {error}") from error
+            if language != raw_language:
+                raise ValueError(
+                    f"non-canonical tokenizer control symbol {piece!r}; "
+                    f"expected language identity {language!r}"
+                )
+            if language in destination:
+                raise ValueError(f"duplicate tokenizer {kind} control language {language!r}")
+            destination[language] = token_id
         discovered_slot_ids: list[int] = []
         for index in range(64):
             symbol = f"<slot_{index}>"
@@ -132,17 +187,22 @@ class SionTokenizer(PreTrainedTokenizer):
                 raw_pair, Sequence
             ):
                 raise ValueError("each tokenizer language pair must be a two-item sequence")
-            pair = [str(language) for language in raw_pair]
+            pair = list(
+                canonicalize_language_pair(
+                    raw_pair,
+                    field="tokenizer language pair",
+                )
+            )
             edge = frozenset(pair)
-            if (
-                len(pair) != 2
-                or len(edge) != 2
-                or any(language not in self.language_tags for language in pair)
-            ):
+            if any(language not in self.language_tags for language in pair):
                 raise ValueError(f"invalid tokenizer language pair: {raw_pair!r}")
-            if edge not in seen_pairs:
-                seen_pairs.add(edge)
-                self.language_pairs.append(pair)
+            if edge in seen_pairs:
+                raise ValueError(
+                    "duplicate or reversed tokenizer language pair after BCP 47 "
+                    f"canonicalization: {raw_pair!r}"
+                )
+            seen_pairs.add(edge)
+            self.language_pairs.append(pair)
         self._language_pair_edges = seen_pairs
         current_direction_contract = bool(
             kwargs.get("pipeline") is not None
@@ -177,7 +237,12 @@ class SionTokenizer(PreTrainedTokenizer):
                 raw_direction, Sequence
             ):
                 raise ValueError("each tokenizer translation direction must be a two-item sequence")
-            direction = [str(language) for language in raw_direction]
+            direction = list(
+                canonicalize_language_pair(
+                    raw_direction,
+                    field="tokenizer translation direction",
+                )
+            )
             key = tuple(direction)
             if (
                 len(direction) != 2
@@ -185,9 +250,13 @@ class SionTokenizer(PreTrainedTokenizer):
                 or frozenset(direction) not in self._language_pair_edges
             ):
                 raise ValueError(f"invalid tokenizer translation direction: {raw_direction!r}")
-            if key not in seen_directions:
-                seen_directions.add(key)
-                self.translation_directions.append(direction)
+            if key in seen_directions:
+                raise ValueError(
+                    "duplicate tokenizer translation direction after BCP 47 "
+                    f"canonicalization: {raw_direction!r}"
+                )
+            seen_directions.add(key)
+            self.translation_directions.append(direction)
         covered_edges = {frozenset(direction) for direction in seen_directions}
         missing_pairs = [
             pair for pair in self.language_pairs if frozenset(pair) not in covered_edges
@@ -215,10 +284,31 @@ class SionTokenizer(PreTrainedTokenizer):
                 "tokenizer language pairs must cover every reserved translation language; "
                 f"paired={sorted(paired_languages)}, reserved={sorted(self.language_tags)}"
             )
+        if self.translation_capable and current_direction_contract and not self.language_pairs:
+            raise ValueError(
+                "current translation tokenizers require a non-empty authenticated "
+                "language_pairs and translation_directions graph"
+            )
         if self.translation_capable and len(self.language_tags) > 2 and not self.language_pairs:
             raise ValueError(
                 "multilingual translation tokenizers require language_pairs metadata; "
                 "the trained direction graph cannot be inferred from language tags alone"
+            )
+        unknown_reasoning_languages = sorted(set(self.reasoning_tags) - set(self.denoise_tags))
+        if unknown_reasoning_languages:
+            raise ValueError(
+                "tokenizer reasoning tags require matching denoise languages; "
+                f"found reasoning-only languages {unknown_reasoning_languages}"
+            )
+        self.reasoning_trace_ids: dict[str, int] = {}
+        for symbol in _REASONING_TRACE_SYMBOLS:
+            token_id = int(self.sp_model.piece_to_id(symbol))
+            if token_id >= 0 and self.sp_model.id_to_piece(token_id) == symbol:
+                self.reasoning_trace_ids[symbol] = token_id
+        if self.reasoning_tags and len(self.reasoning_trace_ids) != len(_REASONING_TRACE_SYMBOLS):
+            missing = sorted(set(_REASONING_TRACE_SYMBOLS) - set(self.reasoning_trace_ids))
+            raise ValueError(
+                f"tokenizer reasoning task tags require every trace marker; missing {missing}"
             )
         self.script_classes = int(script_classes)
         if self.script_classes < 1:
@@ -514,6 +604,10 @@ class SionTokenizer(PreTrainedTokenizer):
             raise ValueError("Sion tokenizer does not accept paired sentence inputs")
         prefix: list[int] = []
         if self.tgt_lang is not None:
+            self.tgt_lang = canonicalize_language_tag(
+                self.tgt_lang,
+                field="tokenizer tgt_lang",
+            )
             if self.tgt_lang not in self.language_tags:
                 raise ValueError(
                     f"unsupported tgt_lang={self.tgt_lang!r}; "
@@ -550,6 +644,8 @@ class SionTokenizer(PreTrainedTokenizer):
             )
         if src_lang is None or tgt_lang is None:
             raise ValueError("src_lang and tgt_lang are required for translation")
+        src_lang = canonicalize_language_tag(src_lang, field="src_lang")
+        tgt_lang = canonicalize_language_tag(tgt_lang, field="tgt_lang")
         if src_lang not in self.language_tags or tgt_lang not in self.language_tags:
             raise ValueError(
                 f"unsupported translation direction {src_lang}-{tgt_lang}; "
