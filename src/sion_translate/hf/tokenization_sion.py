@@ -172,6 +172,21 @@ class SionTokenizer(PreTrainedTokenizer):
             raise ValueError(
                 "translation-incapable tokenizers cannot advertise language pairs or directions"
             )
+        paired_languages = {language for pair in self.language_pairs for language in pair}
+        if (
+            self.translation_capable
+            and self.language_pairs
+            and paired_languages != set(self.language_tags)
+        ):
+            raise ValueError(
+                "tokenizer language pairs must cover every reserved translation language; "
+                f"paired={sorted(paired_languages)}, reserved={sorted(self.language_tags)}"
+            )
+        if self.translation_capable and len(self.language_tags) > 2 and not self.language_pairs:
+            raise ValueError(
+                "multilingual translation tokenizers require language_pairs metadata; "
+                "the trained direction graph cannot be inferred from language tags alone"
+            )
         self.script_classes = int(script_classes)
         if self.script_classes < 1:
             raise ValueError("script_classes must be positive")

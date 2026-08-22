@@ -164,6 +164,29 @@ def test_hf_tokenizer_discovers_every_reserved_language_past_id_256(
     assert "<2learned>" not in tokenizer.all_special_tokens
 
 
+def test_hf_multilingual_tokenizer_requires_an_explicit_pair_graph(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import sion_translate.hf.tokenization_sion as tokenizer_module
+
+    processor = _LargeControlVocabulary(["de", "fr", "sw", "ar"])
+
+    def processor_factory(**_kwargs: object) -> _LargeControlVocabulary:
+        return processor
+
+    monkeypatch.setattr(
+        tokenizer_module.spm,
+        "SentencePieceProcessor",
+        processor_factory,
+    )
+    tokenizer_path = tmp_path / "tokenizer.model"
+    tokenizer_path.write_bytes(b"stub")
+
+    with pytest.raises(ValueError, match="require language_pairs metadata"):
+        HFSionTokenizer(str(tokenizer_path))
+
+
 def test_transformers_wrapper_matches_native_forward_and_config() -> None:
     torch.manual_seed(17)
     native_config = tiny_model_config()

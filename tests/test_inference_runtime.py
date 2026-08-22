@@ -55,10 +55,11 @@ class FakeTokenizer:
         return " ".join(map(str, ids))
 
 
-class MultilingualFakeTokenizer(FakeTokenizer):
-    language_tags = {"ja": 4, "ko": 5, "en": 12, "ru": 13}
-    denoise_tags = {"ja": 7, "ko": 8, "en": 14, "ru": 15}
-    languages = ("ja", "ko", "en", "ru")
+class ArbitraryGraphFakeTokenizer(FakeTokenizer):
+    language_tags = {"de": 4, "fr": 5, "sw": 12, "ar": 13}
+    denoise_tags = {"de": 7, "fr": 8, "sw": 14, "ar": 15}
+    reasoning_tags = {}
+    languages = ("de", "fr", "sw", "ar")
 
 
 def runtime_config(*, experimental: ExperimentalConfig | None = None) -> ModelConfig:
@@ -512,15 +513,30 @@ def test_disconnected_multilingual_graph_rejects_untrained_direction(
         monkeypatch,
         tmp_path,
         runtime_config(),
-        language_pairs=(("ko", "ja"), ("en", "ru")),
-        tokenizer_class=MultilingualFakeTokenizer,
+        language_pairs=(("de", "fr"), ("sw", "ar")),
+        tokenizer_class=ArbitraryGraphFakeTokenizer,
     )
+    assert translator._resolve_source_language("de", "fr") == "de"
     with pytest.raises(ValueError, match="학습되지 않은 번역 방향"):
         translator.translate(
-            ["문장"],
-            source_language="ko",
-            target_language="ru",
+            ["ein Satz"],
+            source_language="de",
+            target_language="ar",
             max_new_tokens=2,
+        )
+
+
+def test_multilingual_inference_requires_an_explicit_trained_graph(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="language_pairs metadata"):
+        make_translator(
+            monkeypatch,
+            tmp_path,
+            runtime_config(),
+            language_pairs=(),
+            tokenizer_class=ArbitraryGraphFakeTokenizer,
         )
 
 

@@ -40,20 +40,23 @@ def _language_pairs_from_metadata(
     if raw_pairs is None and metadata.get("language_pair") is not None:
         raw_pairs = [metadata["language_pair"]]
     if not isinstance(raw_pairs, Sequence) or isinstance(raw_pairs, (str, bytes)):
-        return ()
+        raise ValueError("language_pairs metadata must be a sequence")
     pairs: list[tuple[str, str]] = []
     seen: set[frozenset[str]] = set()
     for raw_pair in cast(Sequence[object], raw_pairs):
         if not isinstance(raw_pair, Sequence) or isinstance(raw_pair, (str, bytes)):
-            continue
+            raise ValueError(f"invalid language pair metadata: {raw_pair!r}")
         pair_items = cast(Sequence[object], raw_pair)
         if len(pair_items) != 2:
-            continue
+            raise ValueError(f"invalid language pair metadata: {raw_pair!r}")
         pair = (str(pair_items[0]), str(pair_items[1]))
         edge = frozenset(pair)
-        if len(edge) == 2 and edge not in seen:
-            seen.add(edge)
-            pairs.append(pair)
+        if not all(pair) or len(edge) != 2:
+            raise ValueError(f"invalid language pair metadata: {raw_pair!r}")
+        if edge in seen:
+            raise ValueError(f"duplicate or reversed language pair metadata: {raw_pair!r}")
+        seen.add(edge)
+        pairs.append(pair)
     return tuple(pairs)
 
 
@@ -195,6 +198,12 @@ class Translator:
             self.language_pairs = _language_pairs_from_metadata(self.tokenizer_metadata)
         if not self.language_pairs and len(self.tokenizer.languages) == 2:
             self.language_pairs = ((self.tokenizer.languages[0], self.tokenizer.languages[1]),)
+        if not self.language_pairs and len(self.tokenizer.languages) > 2:
+            raise ValueError(
+                "다국어 번역 모델에는 language_pairs metadata가 필요합니다. "
+                "학습된 방향 그래프를 알 수 없는 상태에서 모든 언어 조합을 "
+                "지원한다고 추측할 수 없습니다."
+            )
         self.translation_directions = _translation_directions_from_metadata(self.export_metadata)
         if not self.translation_directions:
             self.translation_directions = _translation_directions_from_metadata(
@@ -551,7 +560,7 @@ class Translator:
         return self.tokenizer.languages
 
     def _other_language(self, target_language: str) -> str:
-        """양방향 모델에서 목표 언어가 아닌 쪽을 원문 언어로 간주합니다."""
+        """언어가 정확히 둘일 때 목표가 아닌 언어를 원문으로 추론합니다."""
         others = [lang for lang in self.languages if lang != target_language]
         return others[0] if len(others) == 1 else ""
 
