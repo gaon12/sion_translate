@@ -505,6 +505,15 @@ def test_reusing_the_translation_release_name_is_rejected() -> None:
         config.validate()
 
 
+@pytest.mark.parametrize("release_name", ["", " ", " base", "base ", "베이스"])
+def test_foundation_release_name_must_be_normalized_ascii(release_name: str) -> None:
+    config = AppConfig()
+    config.foundation.release_name = release_name
+
+    with pytest.raises(ValueError, match="normalized non-empty ASCII"):
+        config.validate()
+
+
 def test_foundation_languages_drop_the_source_only_varieties() -> None:
     """단일어 복원은 그 언어를 디코더 출력으로 만드는 학습이다."""
     config = AppConfig()

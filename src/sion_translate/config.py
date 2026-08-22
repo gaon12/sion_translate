@@ -544,8 +544,12 @@ class FoundationConfig:
             raise ValueError("foundation.corpus_dir must be non-empty")
         if not self.dataset_dir:
             raise ValueError("foundation.dataset_dir must be non-empty")
-        if not self.release_name or not self.release_name.isascii():
-            raise ValueError("foundation.release_name must be a non-empty ASCII name")
+        if (
+            not self.release_name
+            or self.release_name != self.release_name.strip()
+            or not self.release_name.isascii()
+        ):
+            raise ValueError("foundation.release_name must be a normalized non-empty ASCII name")
         if self.release_name == TRANSLATION_RELEASE_NAME:
             raise ValueError(
                 "foundation.release_name must differ from the translation release name "
