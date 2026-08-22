@@ -41,6 +41,12 @@ from sion_translate.training.export import (
 )
 
 
+TRANSLATION_PIPELINE_IDENTITY = {
+    "schema": "sion-translation-pipeline-v2",
+    "branch": "translation-only",
+}
+
+
 def tiny_model_config(vocab_size: int = 128) -> ModelConfig:
     return ModelConfig(
         vocab_size=vocab_size,
@@ -607,12 +613,17 @@ def test_transformers_config_rejects_contradictory_repository_role(
 def test_export_validation_enforces_expected_repository_role(tmp_path: Path) -> None:
     config = tiny_model_config()
     native = NativeSionForConditionalGeneration(config, pad_id=0)
+    metadata = build_export_metadata(
+        config,
+        pipeline_identity=TRANSLATION_PIPELINE_IDENTITY,
+    )
     manifest = export_state_dict_formats(
         tmp_path,
         native.state_dict(),
         config,
         0,
         formats=("fp32",),
+        metadata=metadata,
     )
     assert manifest["metadata"]["release_name"] == "sion_translate"
 
@@ -853,12 +864,19 @@ def test_export_pipeline_writes_and_validates_hf_tokenizer(tmp_path: Path) -> No
     config = tiny_model_config(len(tokenizer))
     model = NativeSionForConditionalGeneration(config, pad_id=tokenizer.pad_id)
     output_dir = tmp_path / "export"
+    metadata = build_export_metadata(
+        config,
+        tokenizer_path=tokenizer_path,
+        language_pairs=(("ko", "ja"),),
+        pipeline_identity=TRANSLATION_PIPELINE_IDENTITY,
+    )
     manifest = export_state_dict_formats(
         output_dir,
         model.state_dict(),
         config,
         tokenizer.pad_id,
         formats=("transformers",),
+        metadata=metadata,
         tokenizer_path=tokenizer_path,
         language_pairs=(("ko", "ja"),),
     )
@@ -871,7 +889,7 @@ def test_export_pipeline_writes_and_validates_hf_tokenizer(tmp_path: Path) -> No
     assert restored.vocab_size == len(tokenizer)
 
 
-def test_legacy_export_without_language_metadata_keeps_tokenizer_discovery(
+def test_transformers_export_promotes_tokenizer_language_discovery_to_manifest(
     tmp_path: Path,
 ) -> None:
     tokenizer_path = train_tiny_tokenizer(tmp_path)
@@ -879,6 +897,11 @@ def test_legacy_export_without_language_metadata_keeps_tokenizer_discovery(
     config = tiny_model_config(len(tokenizer))
     model = NativeSionForConditionalGeneration(config, pad_id=tokenizer.pad_id)
     output_dir = tmp_path / "legacy-export"
+    metadata = build_export_metadata(
+        config,
+        tokenizer_path=tokenizer_path,
+        pipeline_identity=TRANSLATION_PIPELINE_IDENTITY,
+    )
 
     manifest = export_state_dict_formats(
         output_dir,
@@ -886,10 +909,11 @@ def test_legacy_export_without_language_metadata_keeps_tokenizer_discovery(
         config,
         tokenizer.pad_id,
         formats=("transformers",),
+        metadata=metadata,
         tokenizer_path=tokenizer_path,
     )
 
-    assert "languages" not in manifest["metadata"]
+    assert set(manifest["metadata"]["languages"]) == set(tokenizer.denoise_languages)
     checkpoint = output_dir / manifest["formats"]["transformers"]["file"]
     config_payload = json.loads((checkpoint / "config.json").read_text(encoding="utf-8"))
     assert set(config_payload["languages"]) == set(tokenizer.languages)

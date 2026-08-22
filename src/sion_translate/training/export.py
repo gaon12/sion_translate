@@ -38,7 +38,7 @@ import zipfile
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, BinaryIO, cast
 
 import numpy as np
 import torch
@@ -93,6 +93,13 @@ _INT4_GROUP_SIZE = 128
 _EXPORT_LOCK_TIMEOUT_SECONDS = 60.0
 _TRANSFORMERS_INSPECTION_PREFIX = "SION_TRANSFORMERS_INSPECTION="
 _TRANSFORMERS_INSPECTION_TIMEOUT_SECONDS = 600.0
+_TRAINING_EXPORT_STATUS_SCHEMA = "sion-training-export-status-v1"
+_TRAINING_EXPORT_STATUS_FILE_BYTES = 16 * 1024
+_TRAINING_EXPORT_STATUS_TIMEOUT_SECONDS = 24 * 60 * 60.0
+_TRAINING_EXPORT_STATUS_POLL_SECONDS = 0.25
+_TRANSLATION_PIPELINE_SCHEMA = "sion-translation-pipeline-v2"
+_FOUNDATION_LINEAGE_SCHEMA = "sion-foundation-lineage-v1"
+_LOWERCASE_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 
 @contextmanager
@@ -216,6 +223,30 @@ def _validated_release_identity(
     if normalized_name == TRANSLATION_RELEASE_NAME and not translation_capable:
         raise ValueError("the sion_translate release must be translation-capable")
     return normalized_name, normalized_version, translation_capable
+
+
+def _release_version_at_least(release_version: str, minimum: tuple[int, int]) -> bool:
+    version_parts = tuple(int(part) for part in release_version.split("."))
+    return version_parts[:2] >= minimum
+
+
+def _legacy_inspection_release_identity(
+    metadata: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Return the outer identity only for pre-1.5 artifacts with no pipeline contract."""
+
+    release_name, release_version, translation_capable = _validated_release_identity(
+        metadata.get("release_name"),
+        metadata.get("release_version"),
+        translation_capable=metadata.get("translation_capable"),
+    )
+    if _release_version_at_least(release_version, (1, 5)) or metadata.get("pipeline") is not None:
+        return None
+    return {
+        "release_name": release_name,
+        "release_version": release_version,
+        "translation_capable": translation_capable,
+    }
 
 
 def _file_entry(path: Path) -> dict[str, Any]:
@@ -464,6 +495,138 @@ def _metadata_revision_capability(metadata: Mapping[str, Any]) -> bool | None:
     return value
 
 
+def _json_safe_pipeline_identity(value: Mapping[str, Any]) -> dict[str, Any]:
+    try:
+        encoded = json.dumps(
+            dict(value),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        decoded: object = json.loads(encoded)
+    except (TypeError, ValueError) as error:
+        raise ValueError("pipeline_identity must contain only JSON-safe values") from error
+    if not isinstance(decoded, dict):
+        raise ValueError("pipeline_identity must encode as a JSON object")
+    return cast(dict[str, Any], decoded)
+
+
+def _metadata_pipeline_identity(metadata: Mapping[str, Any]) -> dict[str, Any] | None:
+    raw_pipeline = metadata.get("pipeline")
+    if raw_pipeline is None:
+        return None
+    if not isinstance(raw_pipeline, Mapping):
+        raise ValueError("metadata.pipeline must be a JSON object")
+    return _json_safe_pipeline_identity(cast(Mapping[str, Any], raw_pipeline))
+
+
+def _validated_pipeline_identity_contract(
+    metadata: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Validate the exact, content-addressed ancestry contract for public exports."""
+
+    release_name, release_version, translation_capable = _validated_release_identity(
+        metadata.get("release_name"),
+        metadata.get("release_version"),
+        translation_capable=metadata.get("translation_capable"),
+    )
+    if not translation_capable:
+        if "pipeline" in metadata:
+            raise ValueError("foundation-only export metadata must not contain pipeline identity")
+        return None
+
+    pipeline = _metadata_pipeline_identity(metadata)
+    if pipeline is None:
+        if _release_version_at_least(release_version, (1, 5)):
+            raise ValueError("translation-capable release 1.5 or newer requires pipeline identity")
+        return None
+
+    if pipeline.get("schema") != _TRANSLATION_PIPELINE_SCHEMA:
+        raise ValueError(f"metadata.pipeline.schema must be {_TRANSLATION_PIPELINE_SCHEMA!r}")
+    branch = pipeline.get("branch")
+    if branch == "translation-only":
+        if set(pipeline) != {"schema", "branch"}:
+            raise ValueError(
+                "translation-only pipeline identity must contain exactly schema and branch"
+            )
+        return pipeline
+    if branch != "foundation-then-translation":
+        raise ValueError("metadata.pipeline.branch is unsupported")
+    if set(pipeline) != {"schema", "branch", "foundation"}:
+        raise ValueError(
+            "foundation pipeline identity must contain exactly schema, branch, and foundation"
+        )
+    foundation = pipeline.get("foundation")
+    if not isinstance(foundation, Mapping):
+        raise ValueError("metadata.pipeline.foundation must be a JSON object")
+    expected_foundation_fields = {
+        "schema",
+        "release_name",
+        "release_version",
+        "languages",
+        "selected_step",
+        "foundation_manifest_sha256",
+        "tokenizer_sha256",
+        "checkpoint_identity_sha256",
+        "checkpoint_artifact_sha256",
+    }
+    if set(foundation) != expected_foundation_fields:
+        raise ValueError(
+            "foundation lineage must contain exactly its schema, release identity, languages, "
+            "selected step, and four SHA-256 digests"
+        )
+    if foundation.get("schema") != _FOUNDATION_LINEAGE_SCHEMA:
+        raise ValueError(f"foundation lineage schema must be {_FOUNDATION_LINEAGE_SCHEMA!r}")
+    foundation_release_name = foundation.get("release_name")
+    if (
+        not isinstance(foundation_release_name, str)
+        or not foundation_release_name
+        or foundation_release_name != foundation_release_name.strip()
+        or not foundation_release_name.isascii()
+    ):
+        raise ValueError("foundation lineage release_name must be normalized non-empty ASCII")
+    if foundation_release_name == release_name:
+        raise ValueError(
+            "foundation lineage release_name must differ from the translation release name"
+        )
+    if foundation.get("release_version") != release_version:
+        raise ValueError("foundation lineage release_version must match the translation release")
+    languages = foundation.get("languages")
+    if (
+        not isinstance(languages, list)
+        or not languages
+        or any(
+            not isinstance(language, str) or not language or language.strip() != language
+            for language in languages
+        )
+        or len(set(languages)) != len(languages)
+    ):
+        raise ValueError(
+            "foundation lineage languages must be a non-empty list of unique normalized strings"
+        )
+    selected_step = foundation.get("selected_step")
+    if isinstance(selected_step, bool) or not isinstance(selected_step, int) or selected_step < 0:
+        raise ValueError("foundation lineage selected_step must be a non-negative integer")
+    for field_name in (
+        "foundation_manifest_sha256",
+        "tokenizer_sha256",
+        "checkpoint_identity_sha256",
+        "checkpoint_artifact_sha256",
+    ):
+        digest = foundation.get(field_name)
+        if not isinstance(digest, str) or _LOWERCASE_SHA256_PATTERN.fullmatch(digest) is None:
+            raise ValueError(f"foundation lineage {field_name} must be a lowercase SHA-256 digest")
+    tokenizer_identity = metadata.get("tokenizer")
+    if not isinstance(tokenizer_identity, Mapping) or tokenizer_identity.get(
+        "sha256"
+    ) != foundation.get("tokenizer_sha256"):
+        raise ValueError(
+            "foundation lineage tokenizer_sha256 must exactly match metadata.tokenizer.sha256"
+        )
+    return pipeline
+
+
 def _languages_from_pairs(language_pairs: Sequence[Sequence[str]]) -> list[str]:
     return list(
         dict.fromkeys(
@@ -478,25 +641,18 @@ def _metadata_compatibility_id(metadata: Mapping[str, Any]) -> str:
     material = {
         str(key): copy.deepcopy(value)
         for key, value in metadata.items()
-        if key
-        not in {
-            "created_unix",
-            "source",
-            "step",
-            "quantization",
-            "language_pair",
-            "language_pairs",
-            "languages",
-            "translation_directions",
-        }
+        if key not in {"created_unix", "quantization"}
     }
     pairs = _metadata_language_pairs(metadata)
     if pairs:
+        material.pop("language_pair", None)
         material["language_pairs"] = pairs
-        material["languages"] = _languages_from_pairs(pairs)
         material["translation_directions"] = _metadata_translation_directions(metadata)
-    elif metadata.get("languages"):
-        material["languages"] = [str(value) for value in metadata["languages"]]
+    languages = _metadata_languages(metadata)
+    if languages is None:
+        material.pop("languages", None)
+    else:
+        material["languages"] = languages
     encoded = json.dumps(
         material,
         ensure_ascii=False,
@@ -522,6 +678,7 @@ def build_export_metadata(
     release_name: str = TRANSLATION_RELEASE_NAME,
     release_version: str = MODEL_RELEASE_VERSION,
     translation_capable: bool = True,
+    pipeline_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build provenance and compatibility metadata shared by every format.
 
@@ -549,6 +706,8 @@ def build_export_metadata(
         metadata["source"] = _file_identity(source)
     if step is not None:
         metadata["step"] = int(step)
+    if pipeline_identity is not None:
+        metadata["pipeline"] = _json_safe_pipeline_identity(pipeline_identity)
     if tokenizer_path is not None:
         metadata["tokenizer"] = _file_identity(tokenizer_path)
     if token_features_path is not None:
@@ -566,14 +725,22 @@ def build_export_metadata(
         not explicit_languages or any(not language for language in explicit_languages)
     ):
         raise ValueError("languages must contain at least one non-empty language")
+    pair_languages = _languages_from_pairs(pairs)
+    if explicit_languages is not None:
+        missing_pair_languages = sorted(set(pair_languages) - set(explicit_languages))
+        if missing_pair_languages:
+            raise ValueError(
+                "languages must include every configured language-pair member: "
+                f"{missing_pair_languages}"
+            )
     if pairs and not translation_capable:
         # 파운데이션 모델에는 언어쌍이 없습니다. 단일어 복원만 학습했으므로
         # 다룰 줄 아는 것은 **언어**이고, 쌍도 방향도 존재하지 않습니다.
         # 쌍을 적어 두면 아래 검증이 방향을 요구하고, 그 방향은 거짓입니다.
-        metadata["languages"] = explicit_languages or _languages_from_pairs(pairs)
+        metadata["languages"] = explicit_languages or pair_languages
     elif pairs:
         metadata["language_pairs"] = pairs
-        metadata["languages"] = _languages_from_pairs(pairs)
+        metadata["languages"] = explicit_languages or pair_languages
         metadata["translation_directions"] = _normalize_translation_directions(
             pairs,
             translation_directions=translation_directions,
@@ -607,6 +774,7 @@ def build_export_metadata(
     }
     if revision_trained is not None:
         metadata["capabilities"] = {"revision_trained": bool(revision_trained)}
+    _validated_pipeline_identity_contract(metadata)
     return metadata
 
 
@@ -798,6 +966,8 @@ def _atomic_json_dump(payload: Mapping[str, Any], path: Path) -> None:
 
 def _inspect_transformers_checkpoint_in_process(  # pyright: ignore[reportUnusedFunction]
     path: Path,
+    *,
+    legacy_release_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     try:
         from safetensors import safe_open
@@ -810,6 +980,8 @@ def _inspect_transformers_checkpoint_in_process(  # pyright: ignore[reportUnused
         raise RuntimeError("transformers is required for checkpoint validation") from error
 
     config_payload = json.loads((path / "config.json").read_text(encoding="utf-8"))
+    if not isinstance(config_payload, Mapping):
+        raise RuntimeError("Transformers config.json must contain an object")
     auto_map = config_payload.get("auto_map")
     if not isinstance(auto_map, Mapping):
         raise RuntimeError("Transformers checkpoint is missing its remote-code auto_map")
@@ -828,47 +1000,131 @@ def _inspect_transformers_checkpoint_in_process(  # pyright: ignore[reportUnused
 
     remote_config_class = load_remote_class("AutoConfig", auto_map)
     config = remote_config_class.from_pretrained(path)
-    config_release_name = getattr(config, "release_name", None)
-    config_release_version = getattr(config, "release_version", None)
-    if not isinstance(config_release_name, str) or not config_release_name.strip():
-        raise RuntimeError("Transformers config release_name must be a non-empty string")
-    if not isinstance(config_release_version, str) or not config_release_version.strip():
-        raise RuntimeError("Transformers config release_version must be a non-empty string")
     export_payload = json.loads((path / "sion_export.json").read_text(encoding="utf-8"))
     if not isinstance(export_payload, Mapping):
         raise RuntimeError("Transformers sion_export.json must contain an object")
-    if export_payload.get("release_name") != config_release_name:
-        raise RuntimeError("Transformers config and sion_export.json disagree about release_name")
-    if export_payload.get("release_version") != config_release_version:
+    legacy_identity: dict[str, Any] | None = None
+    if legacy_release_identity is not None:
+        legacy_identity = _legacy_inspection_release_identity(legacy_release_identity)
+        if legacy_identity is None:
+            raise RuntimeError(
+                "Transformers legacy identity fallback is restricted to pre-1.5 releases"
+            )
+    modern_identity_markers = ("release_name", "release_version", "pipeline")
+    legacy_sidecars = legacy_identity is not None and not any(
+        marker in config_payload or marker in export_payload for marker in modern_identity_markers
+    )
+    if legacy_sidecars:
+        assert legacy_identity is not None
+        config_release_name = legacy_identity["release_name"]
+        config_release_version = legacy_identity["release_version"]
+    else:
+        config_release_name = getattr(config, "release_name", None)
+        config_release_version = getattr(config, "release_version", None)
+        if not isinstance(config_release_name, str) or not config_release_name.strip():
+            raise RuntimeError("Transformers config release_name must be a non-empty string")
+        if not isinstance(config_release_version, str) or not config_release_version.strip():
+            raise RuntimeError("Transformers config release_version must be a non-empty string")
+        if export_payload.get("release_name") != config_release_name:
+            raise RuntimeError(
+                "Transformers config and sion_export.json disagree about release_name"
+            )
+        if export_payload.get("release_version") != config_release_version:
+            raise RuntimeError(
+                "Transformers config and sion_export.json disagree about release_version"
+            )
+    config_pipeline = config_payload.get("pipeline")
+    export_pipeline = export_payload.get("pipeline")
+    if config_pipeline != export_pipeline:
         raise RuntimeError(
-            "Transformers config and sion_export.json disagree about release_version"
+            "Transformers config and sion_export.json disagree about pipeline identity"
         )
-    try:
-        transformers_reasoning_level = _validate_generation_defaults(
-            export_payload,
-            config.to_model_config(),
-            required=True,
-        )
-    except ValueError as error:
-        raise RuntimeError(str(error)) from error
+    if config_pipeline is not None and not isinstance(config_pipeline, Mapping):
+        raise RuntimeError("Transformers pipeline identity must be a JSON object")
+    pipeline_identity = (
+        _json_safe_pipeline_identity(cast(Mapping[str, Any], config_pipeline))
+        if isinstance(config_pipeline, Mapping)
+        else None
+    )
     generation_payload = json.loads((path / "generation_config.json").read_text(encoding="utf-8"))
     if not isinstance(generation_payload, Mapping):
         raise RuntimeError("Transformers generation_config.json must contain an object")
-    generation_reasoning_level = generation_payload.get("reasoning_level")
-    if isinstance(generation_reasoning_level, bool) or not isinstance(
-        generation_reasoning_level, int
-    ):
-        raise RuntimeError("Transformers generation_config reasoning_level must be an integer")
-    if not 0 <= generation_reasoning_level <= 9:
-        raise RuntimeError("Transformers generation_config reasoning_level must be between 0 and 9")
-    if generation_reasoning_level != transformers_reasoning_level:
-        raise RuntimeError(
-            "Transformers generation_config.json and sion_export.json disagree "
-            "about reasoning_level"
-        )
+    has_export_reasoning = "generation_defaults" in export_payload
+    has_generation_reasoning = "reasoning_level" in generation_payload
+    if legacy_sidecars and not has_export_reasoning and not has_generation_reasoning:
+        generation_reasoning_level: int | None = None
+    else:
+        if has_export_reasoning != has_generation_reasoning:
+            raise RuntimeError(
+                "Transformers generation_config.json and sion_export.json disagree "
+                "about reasoning metadata presence"
+            )
+        try:
+            transformers_reasoning_level = _validate_generation_defaults(
+                export_payload,
+                config.to_model_config(),
+                required=True,
+            )
+        except ValueError as error:
+            raise RuntimeError(str(error)) from error
+        raw_generation_reasoning_level = generation_payload.get("reasoning_level")
+        if isinstance(raw_generation_reasoning_level, bool) or not isinstance(
+            raw_generation_reasoning_level, int
+        ):
+            raise RuntimeError("Transformers generation_config reasoning_level must be an integer")
+        if not 0 <= raw_generation_reasoning_level <= 9:
+            raise RuntimeError(
+                "Transformers generation_config reasoning_level must be between 0 and 9"
+            )
+        if raw_generation_reasoning_level != transformers_reasoning_level:
+            raise RuntimeError(
+                "Transformers generation_config.json and sion_export.json disagree "
+                "about reasoning_level"
+            )
+        generation_reasoning_level = raw_generation_reasoning_level
     config_translation_capable = getattr(config, "translation_capable", True)
     if not isinstance(config_translation_capable, bool):
         raise RuntimeError("Transformers config translation_capable must be a boolean")
+    config_tokenizer_sha256 = getattr(config, "tokenizer_sha256", None)
+    if config_tokenizer_sha256 is not None and not isinstance(config_tokenizer_sha256, str):
+        raise RuntimeError("Transformers config tokenizer_sha256 must be a string or null")
+    if export_payload.get("tokenizer_sha256") != config_tokenizer_sha256:
+        raise RuntimeError(
+            "Transformers config and sion_export.json disagree about tokenizer_sha256"
+        )
+    if export_payload.get("languages") != list(config.languages):
+        raise RuntimeError("Transformers config and sion_export.json disagree about languages")
+    config_language_pairs = [list(pair) for pair in config.language_pairs]
+    if export_payload.get("language_pairs") != config_language_pairs:
+        raise RuntimeError("Transformers config and sion_export.json disagree about language_pairs")
+    config_translation_directions = [list(direction) for direction in config.translation_directions]
+    if export_payload.get("translation_directions") != config_translation_directions:
+        raise RuntimeError(
+            "Transformers config and sion_export.json disagree about translation_directions"
+        )
+    if export_payload.get("translation_capable") is not config_translation_capable:
+        raise RuntimeError(
+            "Transformers config and sion_export.json disagree about translation_capable"
+        )
+    expected_capabilities = (
+        {"revision_trained": config.revision_trained} if config.revision_trained is not None else {}
+    )
+    if export_payload.get("capabilities") != expected_capabilities:
+        raise RuntimeError("Transformers config and sion_export.json disagree about capabilities")
+    transformers_identity: dict[str, Any] = {
+        "release_name": config_release_name,
+        "release_version": config_release_version,
+        "translation_capable": config_translation_capable,
+        "languages": list(config.languages),
+    }
+    if config_tokenizer_sha256 is not None:
+        transformers_identity["tokenizer"] = {"sha256": config_tokenizer_sha256}
+    if pipeline_identity is not None:
+        transformers_identity["pipeline"] = pipeline_identity
+    try:
+        _validated_pipeline_identity_contract(transformers_identity)
+    except ValueError as error:
+        raise RuntimeError(f"invalid Transformers pipeline identity: {error}") from error
     weight_files = sorted(path.glob("model*.safetensors"))
     if not weight_files:
         raise RuntimeError("Transformers checkpoint has no model*.safetensors weights")
@@ -968,10 +1224,17 @@ def _inspect_transformers_checkpoint_in_process(  # pyright: ignore[reportUnused
         "translation_directions": [list(direction) for direction in config.translation_directions],
         "translation_capable": config_translation_capable,
         "revision_trained": config.revision_trained,
+        "tokenizer_sha256": config_tokenizer_sha256,
+        "pipeline": pipeline_identity,
+        "identity_source": "legacy-manifest" if legacy_sidecars else "sidecars",
     }
 
 
-def _inspect_transformers_checkpoint(path: Path) -> dict[str, Any]:
+def _inspect_transformers_checkpoint(
+    path: Path,
+    *,
+    legacy_release_identity: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """Validate remote code in a short-lived process so Windows releases its files."""
 
     script = f"""
@@ -981,7 +1244,11 @@ from pathlib import Path
 from sion_translate.training.export import _inspect_transformers_checkpoint_in_process
 
 try:
-    inspection = _inspect_transformers_checkpoint_in_process(Path(sys.argv[1]))
+    legacy_identity = json.loads(sys.argv[2]) if len(sys.argv) > 2 else None
+    inspection = _inspect_transformers_checkpoint_in_process(
+        Path(sys.argv[1]),
+        legacy_release_identity=legacy_identity,
+    )
 except BaseException as error:
     payload = {{
         "ok": False,
@@ -1000,7 +1267,15 @@ print({_TRANSFORMERS_INSPECTION_PREFIX!r} + json.dumps(payload, ensure_ascii=Fal
     }
     try:
         result = subprocess.run(
-            [sys.executable, "-c", script, str(path.resolve())],
+            [
+                sys.executable,
+                "-c",
+                script,
+                str(path.resolve()),
+                json.dumps(dict(legacy_release_identity), separators=(",", ":"))
+                if legacy_release_identity is not None
+                else "null",
+            ],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -1060,6 +1335,7 @@ def _write_transformers_checkpoint(
     revision_trained: bool | None,
     release_name: str,
     release_version: str,
+    pipeline_identity: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
     from sion_translate.hf.conversion import save_transformers_checkpoint
 
@@ -1081,11 +1357,24 @@ def _write_transformers_checkpoint(
             release_version=release_version,
             allow_language_subset=not bool(language_pairs),
         )
+        for sidecar_name in ("config.json", "sion_export.json"):
+            sidecar_path = temporary / sidecar_name
+            raw_sidecar: object = json.loads(sidecar_path.read_text(encoding="utf-8"))
+            if not isinstance(raw_sidecar, dict):
+                raise RuntimeError(f"Transformers {sidecar_name} must contain an object")
+            sidecar = cast(dict[str, Any], raw_sidecar)
+            if pipeline_identity is None:
+                sidecar.pop("pipeline", None)
+            else:
+                sidecar["pipeline"] = copy.deepcopy(dict(pipeline_identity))
+            _atomic_json_dump(sidecar, sidecar_path)
         inspection = _inspect_transformers_checkpoint(temporary)
         if inspection["release_name"] != release_name:
             raise RuntimeError("Transformers checkpoint release_name changed during export")
         if inspection["release_version"] != release_version:
             raise RuntimeError("Transformers checkpoint release_version changed during export")
+        if inspection["pipeline"] != pipeline_identity:
+            raise RuntimeError("Transformers checkpoint pipeline identity changed during export")
         # The public export transaction owns the destination lock. Reacquiring
         # it here would deadlock on platforms with non-reentrant file locks.
         _atomic_replace_directory_unlocked(temporary, path)
@@ -1426,20 +1715,35 @@ def _write_sion_gguf(
     counts = {"q4_k": 0, "q5_k": 0, "f16": 0}
     writer = None
     try:
+        release_name, release_version, translation_capable = _validated_release_identity(
+            metadata.get("release_name"),
+            metadata.get("release_version"),
+            translation_capable=metadata.get("translation_capable"),
+        )
+        _validated_pipeline_identity_contract(metadata)
         writer = gguf.GGUFWriter(temporary, "sion")
-        writer.add_name("sion_translate")
+        writer.add_name(release_name)
         writer.add_description(
             "Custom Sion encoder-decoder Transformer; storage/interchange only. "
             "No llama.cpp runtime implementation is provided."
         )
         writer.add_string("sion.runtime_support", "unsupported-by-llama.cpp")
         writer.add_string("sion.export_schema", EXPORT_SCHEMA)
+        writer.add_string("sion.release_name", release_name)
+        writer.add_string("sion.release_version", release_version)
+        writer.add_bool("sion.translation_capable", translation_capable)
         writer.add_uint32("sion.vocab_size", int(model_config.vocab_size))
         writer.add_uint32("sion.embedding_length", int(model_config.d_model))
         writer.add_uint32("sion.encoder.block_count", int(model_config.encoder_layers))
         writer.add_uint32("sion.decoder.block_count", int(model_config.decoder_layers))
         writer.add_uint32("sion.context_length", int(model_config.max_seq_len))
         writer.add_uint32("sion.pad_token_id", int(pad_id))
+        languages = _metadata_languages(metadata)
+        if languages is not None:
+            writer.add_string(
+                "sion.languages",
+                json.dumps(languages, ensure_ascii=False, separators=(",", ":")),
+            )
         language_pairs = _metadata_language_pairs(metadata)
         if language_pairs:
             writer.add_string(
@@ -1448,9 +1752,31 @@ def _write_sion_gguf(
             )
             if len(language_pairs) == 1:
                 writer.add_array("sion.language_pair", language_pairs[0])
+        translation_directions = _metadata_translation_directions(metadata)
+        if translation_directions:
+            writer.add_string(
+                "sion.translation_directions",
+                json.dumps(
+                    translation_directions,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            )
         tokenizer = metadata.get("tokenizer")
         if isinstance(tokenizer, Mapping) and tokenizer.get("sha256"):
             writer.add_string("sion.tokenizer.sha256", str(tokenizer["sha256"]))
+        pipeline_identity = _metadata_pipeline_identity(metadata)
+        if pipeline_identity is not None:
+            writer.add_string(
+                "sion.pipeline",
+                json.dumps(
+                    pipeline_identity,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ),
+            )
         writer.add_quantization_version(gguf.GGML_QUANT_VERSION)
         writer.add_file_type(int(gguf.LlamaFileType.MOSTLY_Q4_K_M))
         writer.add_string(
@@ -1501,7 +1827,11 @@ def _write_sion_gguf(
         temporary.unlink(missing_ok=True)
 
 
-def _inspect_sion_gguf(path: Path) -> dict[str, Any]:
+def _inspect_sion_gguf(
+    path: Path,
+    *,
+    legacy_release_identity: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     try:
         import gguf
     except ImportError as error:
@@ -1514,9 +1844,136 @@ def _inspect_sion_gguf(path: Path) -> dict[str, Any]:
             name = tensor.tensor_type.name.lower()
             if name in counts:
                 counts[name] += 1
+        pipeline_identity: dict[str, Any] | None = None
+        pipeline_field = reader.fields.get("sion.pipeline")
+        if pipeline_field is not None:
+            raw_pipeline = pipeline_field.contents()
+            if not isinstance(raw_pipeline, str):
+                raise RuntimeError("GGUF sion.pipeline must be a JSON string")
+            try:
+                decoded_pipeline: object = json.loads(raw_pipeline)
+            except json.JSONDecodeError as error:
+                raise RuntimeError("GGUF sion.pipeline is not valid JSON") from error
+            if not isinstance(decoded_pipeline, dict):
+                raise RuntimeError("GGUF sion.pipeline must contain a JSON object")
+            pipeline_identity = cast(dict[str, Any], decoded_pipeline)
+
+        languages: list[str] | None = None
+        languages_field = reader.fields.get("sion.languages")
+        if languages_field is not None:
+            raw_languages = languages_field.contents()
+            if not isinstance(raw_languages, str):
+                raise RuntimeError("GGUF sion.languages must be a JSON string")
+            try:
+                decoded_languages: object = json.loads(raw_languages)
+            except json.JSONDecodeError as error:
+                raise RuntimeError("GGUF sion.languages is not valid JSON") from error
+            if not isinstance(decoded_languages, list) or any(
+                not isinstance(language, str) for language in decoded_languages
+            ):
+                raise RuntimeError("GGUF sion.languages must contain a JSON string array")
+            languages = cast(list[str], decoded_languages)
+
+        reader_fields = reader.fields
+
+        def pair_list_field(name: str) -> list[list[str]] | None:
+            field = reader_fields.get(name)
+            if field is None:
+                return None
+            raw_value = field.contents()
+            if not isinstance(raw_value, str):
+                raise RuntimeError(f"GGUF {name} must be a JSON string")
+            try:
+                decoded_value: object = json.loads(raw_value)
+            except json.JSONDecodeError as error:
+                raise RuntimeError(f"GGUF {name} is not valid JSON") from error
+            if not isinstance(decoded_value, list) or any(
+                not isinstance(pair, list)
+                or len(pair) != 2
+                or any(not isinstance(language, str) for language in pair)
+                for pair in decoded_value
+            ):
+                raise RuntimeError(f"GGUF {name} must contain a JSON array of language pairs")
+            return cast(list[list[str]], decoded_value)
+
+        language_pairs = pair_list_field("sion.language_pairs")
+        translation_directions = pair_list_field("sion.translation_directions")
+
+        def string_field(name: str) -> str:
+            field = reader_fields.get(name)
+            value = field.contents() if field is not None else None
+            if not isinstance(value, str) or not value:
+                raise RuntimeError(f"GGUF {name} must be a non-empty string")
+            return value
+
+        general_name = string_field("general.name")
+        legacy_identity: dict[str, Any] | None = None
+        if legacy_release_identity is not None:
+            legacy_identity = _legacy_inspection_release_identity(legacy_release_identity)
+            if legacy_identity is None:
+                raise RuntimeError(
+                    "GGUF legacy identity fallback is restricted to pre-1.5 releases"
+                )
+        modern_identity_fields = (
+            "sion.release_name",
+            "sion.release_version",
+            "sion.translation_capable",
+            "sion.pipeline",
+            "sion.languages",
+            "sion.translation_directions",
+        )
+        legacy_fields = legacy_identity is not None and not any(
+            name in reader_fields for name in modern_identity_fields
+        )
+        if legacy_fields:
+            assert legacy_identity is not None
+            release_name = str(legacy_identity["release_name"])
+            release_version = str(legacy_identity["release_version"])
+            translation_capable = bool(legacy_identity["translation_capable"])
+        else:
+            capability_field = reader_fields.get("sion.translation_capable")
+            translation_capable = (
+                capability_field.contents() if capability_field is not None else None
+            )
+            if not isinstance(translation_capable, bool):
+                raise RuntimeError("GGUF sion.translation_capable must be a boolean")
+            release_name = string_field("sion.release_name")
+            release_version = string_field("sion.release_version")
+        if general_name != release_name:
+            raise RuntimeError("GGUF general.name and sion.release_name disagree")
+        gguf_identity: dict[str, Any] = {
+            "release_name": release_name,
+            "release_version": release_version,
+            "translation_capable": translation_capable,
+        }
+        if languages is not None:
+            gguf_identity["languages"] = languages
+        tokenizer_sha256: str | None = None
+        tokenizer_field = reader_fields.get("sion.tokenizer.sha256")
+        if tokenizer_field is not None:
+            tokenizer_sha256 = tokenizer_field.contents()
+            if not isinstance(tokenizer_sha256, str):
+                raise RuntimeError("GGUF sion.tokenizer.sha256 must be a string")
+            gguf_identity["tokenizer"] = {"sha256": tokenizer_sha256}
+        if pipeline_identity is not None:
+            gguf_identity["pipeline"] = pipeline_identity
+        try:
+            _validated_pipeline_identity_contract(gguf_identity)
+        except ValueError as error:
+            raise RuntimeError(f"invalid GGUF pipeline identity: {error}") from error
         return {
             "tensor_count": len(reader.tensors),
             "tensor_counts": counts,
+            "general_name": general_name,
+            "release_name": release_name,
+            "release_version": release_version,
+            "translation_capable": translation_capable,
+            "languages": languages,
+            "language_pairs": language_pairs,
+            "translation_directions": translation_directions,
+            "tokenizer_sha256": tokenizer_sha256,
+            "pipeline": pipeline_identity,
+            "identity_source": "legacy-manifest" if legacy_fields else "fields",
         }
     finally:
         memory_map = getattr(reader.data, "_mmap", None)
@@ -1733,6 +2190,7 @@ def _export_state_dict_formats_unlocked(
     export_metadata["release_name"] = validated_name
     export_metadata["release_version"] = validated_version
     export_metadata["translation_capable"] = validated_capability
+    _validated_pipeline_identity_contract(export_metadata)
     if "generation_defaults" not in export_metadata:
         export_metadata["generation_defaults"] = {
             "reasoning_level": _default_reasoning_level(model_config),
@@ -1750,10 +2208,6 @@ def _export_state_dict_formats_unlocked(
     ):
         identity = export_metadata.get(metadata_name)
         if sidecar_path is not None and isinstance(identity, Mapping):
-            _atomic_copy_file(
-                sidecar_path,
-                directory / str(identity["filename"]),
-            )
             embedded_sidecars.append(metadata_name)
     if embedded_sidecars:
         export_metadata["embedded_sidecars"] = embedded_sidecars
@@ -1765,7 +2219,16 @@ def _export_state_dict_formats_unlocked(
     if language_pairs is not None:
         if resolved_language_pairs:
             export_metadata["language_pairs"] = resolved_language_pairs
-            export_metadata["languages"] = _languages_from_pairs(resolved_language_pairs)
+            pair_languages = _languages_from_pairs(resolved_language_pairs)
+            existing_languages = _metadata_languages(export_metadata)
+            if existing_languages is not None:
+                missing_pair_languages = sorted(set(pair_languages) - set(existing_languages))
+                if missing_pair_languages:
+                    raise ValueError(
+                        "metadata.languages omits configured language-pair members: "
+                        f"{missing_pair_languages}"
+                    )
+            export_metadata["languages"] = existing_languages or pair_languages
             if len(resolved_language_pairs) == 1:
                 export_metadata["language_pair"] = resolved_language_pairs[0]
             else:
@@ -1779,6 +2242,19 @@ def _export_state_dict_formats_unlocked(
             if export_metadata.get("translation_capable") is not False:
                 export_metadata.pop("languages", None)
             export_metadata.pop("translation_directions", None)
+    if (
+        "transformers" in requested
+        and tokenizer_path is not None
+        and _metadata_languages(export_metadata) is None
+    ):
+        from sion_translate.tokenizer import SionTokenizer
+
+        tokenizer = SionTokenizer(tokenizer_path)
+        discovered_languages = list(
+            tokenizer.languages if resolved_language_pairs else tokenizer.denoise_languages
+        )
+        if discovered_languages:
+            export_metadata["languages"] = discovered_languages
     # 번역 불가 산출물(foundation)에는 방향을 유도해 넣지 않습니다. 이 함수는
     # 방향이 비어 있으면 language_pairs 에서 만들어 채우는데, 그 가중치는
     # 어떤 방향으로도 번역할 수 없습니다.
@@ -1788,6 +2264,20 @@ def _export_state_dict_formats_unlocked(
         resolved_translation_directions = _metadata_translation_directions(export_metadata)
         if resolved_translation_directions:
             export_metadata["translation_directions"] = resolved_translation_directions
+    # Tokenizer/language overrides are part of the ancestry trust boundary.
+    # Revalidate only after every metadata mutation, before copying sidecars or
+    # publishing any model artifact, so a successful export is self-validating.
+    _validated_pipeline_identity_contract(export_metadata)
+    for sidecar_path, metadata_name in (
+        (tokenizer_path, "tokenizer"),
+        (token_features_path, "token_features"),
+    ):
+        identity = export_metadata.get(metadata_name)
+        if sidecar_path is not None and isinstance(identity, Mapping):
+            _atomic_copy_file(
+                sidecar_path,
+                directory / str(identity["filename"]),
+            )
     resolved_languages = _metadata_languages(export_metadata)
     metadata_compatibility_id = _metadata_compatibility_id(export_metadata)
     previous_metadata_compatibility_id = None
@@ -1913,6 +2403,7 @@ def _export_state_dict_formats_unlocked(
                     revision_trained=_metadata_revision_capability(export_metadata),
                     release_name=str(export_metadata["release_name"]),
                     release_version=str(export_metadata["release_version"]),
+                    pipeline_identity=_metadata_pipeline_identity(export_metadata),
                 )
                 details = {
                     "dtype": (
@@ -1972,6 +2463,38 @@ def _export_state_dict_formats_unlocked(
         "metadata": export_metadata,
     }
     _atomic_json_dump(manifest, manifest_path)
+    referenced_names = {
+        str(entry["file"])
+        for entry in format_entries.values()
+        if isinstance(entry, Mapping)
+        and entry.get("status") == "ok"
+        and isinstance(entry.get("file"), str)
+    }
+    for metadata_name in ("tokenizer", "token_features"):
+        identity = export_metadata.get(metadata_name)
+        if isinstance(identity, Mapping) and isinstance(identity.get("filename"), str):
+            referenced_names.add(str(identity["filename"]))
+    stale_names = set(filenames.values())
+    if previous_manifest is not None:
+        previous_format_entries = previous_manifest.get("formats")
+        if isinstance(previous_format_entries, Mapping):
+            for entry in previous_format_entries.values():
+                if isinstance(entry, Mapping) and isinstance(entry.get("file"), str):
+                    stale_names.add(str(entry["file"]))
+        previous_metadata = previous_manifest.get("metadata")
+        if isinstance(previous_metadata, Mapping):
+            for metadata_name in ("tokenizer", "token_features"):
+                identity = previous_metadata.get(metadata_name)
+                if isinstance(identity, Mapping) and isinstance(identity.get("filename"), str):
+                    stale_names.add(str(identity["filename"]))
+    for stale_name in sorted(stale_names - referenced_names):
+        # Only remove direct children owned by a known format/sidecar entry.
+        # Arbitrary user files and nested paths are never cleanup targets.
+        if Path(stale_name).name != stale_name:
+            continue
+        stale_path = directory / stale_name
+        if stale_path.exists() or stale_path.is_symlink():
+            _remove_artifact(stale_path)
     return manifest
 
 
@@ -2130,9 +2653,18 @@ def convert_export(
         explicit: str | Path | None,
         metadata_name: str,
     ) -> str | Path | None:
-        if explicit is not None or "transformers" not in requested:
-            return explicit
         identity = inherited.get(metadata_name)
+        if explicit is not None:
+            if isinstance(identity, Mapping):
+                expected_hash = identity.get("sha256")
+                if _is_sha256(expected_hash):
+                    explicit_hash = _file_identity(explicit)["sha256"]
+                    if explicit_hash != expected_hash:
+                        raise ValueError(
+                            f"explicit {metadata_name} conflicts with source metadata; "
+                            "conversion cannot relabel weights"
+                        )
+            return explicit
         if not isinstance(identity, Mapping):
             return None
         filename = identity.get("filename")
@@ -2149,36 +2681,67 @@ def convert_export(
         token_features_path,
         "token_features",
     )
+    inherited_pairs = _metadata_language_pairs(inherited)
+    pair_override_supplied = language_pair is not None or language_pairs is not None
+    resolved_pairs = (
+        _normalize_language_pairs(
+            language_pair=language_pair,
+            language_pairs=language_pairs,
+        )
+        if pair_override_supplied
+        else inherited_pairs
+    )
+    if pair_override_supplied and inherited_pairs and resolved_pairs != inherited_pairs:
+        raise ValueError(
+            "explicit language pairs conflict with source metadata; "
+            "conversion cannot relabel translation capabilities"
+        )
+    inherited_directions = _metadata_translation_directions(inherited) if inherited_pairs else []
+    resolved_directions = inherited_directions
+    if bidirectional is not None:
+        explicit_directions = _normalize_translation_directions(
+            resolved_pairs,
+            bidirectional=bidirectional,
+        )
+        if inherited_pairs and explicit_directions != inherited_directions:
+            raise ValueError(
+                "explicit bidirectional policy conflicts with source translation directions; "
+                "conversion cannot relabel translation capabilities"
+            )
+        resolved_directions = explicit_directions
+    inherited_revision = _metadata_revision_capability(inherited)
+    if (
+        revision_trained is not None
+        and inherited_revision is not None
+        and revision_trained is not inherited_revision
+    ):
+        raise ValueError(
+            "explicit revision_trained conflicts with source metadata; "
+            "conversion cannot relabel weights"
+        )
+    resolved_revision = revision_trained if revision_trained is not None else inherited_revision
     metadata = build_export_metadata(
         config,
         tokenizer_path=tokenizer_path,
         token_features_path=token_features_path,
-        language_pair=language_pair,
-        language_pairs=language_pairs,
+        language_pairs=resolved_pairs,
+        languages=_metadata_languages(inherited),
+        translation_directions=resolved_directions or None,
         bidirectional=True if bidirectional is None else bidirectional,
-        revision_trained=revision_trained,
+        revision_trained=resolved_revision,
         step=step,
         source=source,
         release_name=resolved_release_name,
         release_version=resolved_release_version,
         translation_capable=resolved_translation_capable,
+        pipeline_identity=_metadata_pipeline_identity(inherited),
     )
     if tokenizer_path is None and inherited.get("tokenizer"):
         metadata["tokenizer"] = inherited["tokenizer"]
     if token_features_path is None and inherited.get("token_features"):
         metadata["token_features"] = inherited["token_features"]
-    if language_pair is None and language_pairs is None:
-        inherited_pairs = _metadata_language_pairs(inherited)
-        if inherited_pairs:
-            metadata["language_pairs"] = inherited_pairs
-            metadata["languages"] = _languages_from_pairs(inherited_pairs)
-            if len(inherited_pairs) == 1:
-                metadata["language_pair"] = inherited_pairs[0]
-            metadata["translation_directions"] = _metadata_translation_directions(inherited)
-        elif inherited.get("languages"):
-            metadata["languages"] = _metadata_languages(inherited)
     if revision_trained is None and inherited.get("capabilities"):
-        metadata["capabilities"] = inherited["capabilities"]
+        metadata["capabilities"] = copy.deepcopy(inherited["capabilities"])
     return export_state_dict_formats(
         directory,
         dict(stored),
@@ -2238,6 +2801,21 @@ def load_exported_model(
         raise ValueError(f"{path} is a legacy export without {EXPORT_SCHEMA} metadata")
     if schema is not None and schema != EXPORT_SCHEMA:
         raise ValueError(f"unsupported export schema: {schema}")
+    raw_metadata = payload.get("metadata") or {}
+    if not isinstance(raw_metadata, Mapping):
+        raise ValueError("export metadata must be an object")
+    metadata = copy.deepcopy(dict(raw_metadata))
+    declares_release_contract = schema == EXPORT_SCHEMA or any(
+        field_name in metadata
+        for field_name in ("release_name", "release_version", "translation_capable")
+    )
+    if declares_release_contract:
+        _validated_release_identity(
+            metadata.get("release_name"),
+            metadata.get("release_version"),
+            translation_capable=metadata.get("translation_capable"),
+        )
+        _validated_pipeline_identity_contract(metadata)
     config = _model_config_from_dict(payload["model_config"])
     pad_id = int(payload["pad_id"])
     stored = payload["model"]
@@ -2284,7 +2862,6 @@ def load_exported_model(
             if not replaced:
                 raise ValueError("FP8 export contains no quantized weights")
     model.eval()
-    metadata = copy.deepcopy(payload.get("metadata") or {})
     _validate_generation_defaults(metadata, config, required=False)
     if isinstance(quantization, Mapping):
         metadata.setdefault("quantization", copy.deepcopy(dict(quantization)))
@@ -2361,6 +2938,7 @@ def validate_export_directory(
             }
         )
         return report
+    legacy_release_identity: dict[str, Any] | None = None
     try:
         validated_name, validated_version, validated_capability = _validated_release_identity(
             manifest_metadata.get("release_name"),
@@ -2373,10 +2951,20 @@ def validate_export_directory(
             or manifest_metadata.get("translation_capable") is not validated_capability
         ):
             raise ValueError("manifest release identity is not normalized")
+        legacy_release_identity = _legacy_inspection_release_identity(manifest_metadata)
     except (TypeError, ValueError) as error:
         report["errors"].append(
             {
                 "error_type": "InvalidReleaseIdentity",
+                "message": str(error),
+            }
+        )
+    try:
+        report["pipeline"] = _validated_pipeline_identity_contract(manifest_metadata)
+    except (TypeError, ValueError) as error:
+        report["errors"].append(
+            {
+                "error_type": "InvalidPipelineIdentity",
                 "message": str(error),
             }
         )
@@ -2529,12 +3117,45 @@ def validate_export_directory(
                 del model, config, artifact_metadata
                 gc.collect()
             elif format_name == "gguf_q4_k_m":
-                inspection = _inspect_sion_gguf(artifact)
+                inspection = _inspect_sion_gguf(
+                    artifact,
+                    legacy_release_identity=legacy_release_identity,
+                )
                 expected_counts = raw_entry.get("tensor_counts")
                 if isinstance(expected_counts, Mapping) and dict(inspection["tensor_counts"]) != {
                     str(name): int(count) for name, count in expected_counts.items()
                 }:
                     raise RuntimeError("GGUF tensor counts do not match the manifest")
+                if inspection["release_name"] != manifest_metadata.get("release_name"):
+                    raise RuntimeError("GGUF release_name does not match the manifest")
+                if inspection["general_name"] != manifest_metadata.get("release_name"):
+                    raise RuntimeError("GGUF general.name does not match the manifest role")
+                if inspection["release_version"] != manifest_metadata.get("release_version"):
+                    raise RuntimeError("GGUF release_version does not match the manifest")
+                if inspection["translation_capable"] is not _metadata_translation_capable(
+                    manifest_metadata
+                ):
+                    raise RuntimeError("GGUF translation capability does not match the manifest")
+                expected_gguf_pairs = _metadata_language_pairs(manifest_metadata)
+                if inspection["language_pairs"] != (expected_gguf_pairs or None):
+                    raise RuntimeError("GGUF language pairs do not match the manifest")
+                manifest_tokenizer = manifest_metadata.get("tokenizer")
+                expected_tokenizer_sha256 = (
+                    manifest_tokenizer.get("sha256")
+                    if isinstance(manifest_tokenizer, Mapping)
+                    else None
+                )
+                if inspection["tokenizer_sha256"] != expected_tokenizer_sha256:
+                    raise RuntimeError("GGUF tokenizer identity does not match the manifest")
+                if inspection["identity_source"] != "legacy-manifest":
+                    expected_gguf_languages = _metadata_languages(manifest_metadata)
+                    if inspection["languages"] != expected_gguf_languages:
+                        raise RuntimeError("GGUF languages do not match the manifest")
+                    expected_gguf_directions = _metadata_translation_directions(manifest_metadata)
+                    if inspection["translation_directions"] != (expected_gguf_directions or None):
+                        raise RuntimeError("GGUF translation directions do not match the manifest")
+                    if inspection["pipeline"] != _metadata_pipeline_identity(manifest_metadata):
+                        raise RuntimeError("GGUF pipeline identity does not match the manifest")
                 validation["inspection"] = inspection
             else:
                 for metadata_name, default_filename in (
@@ -2556,12 +3177,15 @@ def validate_export_directory(
                         raise RuntimeError(
                             f"Transformers {metadata_name} does not match manifest metadata"
                         )
-                inspection = _inspect_transformers_checkpoint(artifact)
+                inspection = _inspect_transformers_checkpoint(
+                    artifact,
+                    legacy_release_identity=legacy_release_identity,
+                )
                 expected_languages = _metadata_languages(manifest_metadata)
-                if expected_languages is not None and inspection["languages"] != expected_languages:
+                if inspection["languages"] != (expected_languages or []):
                     raise RuntimeError("Transformers languages do not match the manifest")
                 expected_pairs = _metadata_language_pairs(manifest_metadata)
-                if expected_pairs and inspection["language_pairs"] != expected_pairs:
+                if inspection["language_pairs"] != expected_pairs:
                     raise RuntimeError("Transformers language pairs do not match the manifest")
                 expected_directions = _metadata_translation_directions(manifest_metadata)
                 if inspection["translation_directions"] != expected_directions:
@@ -2577,6 +3201,16 @@ def validate_export_directory(
                     raise RuntimeError("Transformers release_name does not match the manifest")
                 if inspection["release_version"] != manifest_metadata.get("release_version"):
                     raise RuntimeError("Transformers release_version does not match the manifest")
+                manifest_tokenizer = manifest_metadata.get("tokenizer")
+                expected_tokenizer_sha256 = (
+                    manifest_tokenizer.get("sha256")
+                    if isinstance(manifest_tokenizer, Mapping)
+                    else None
+                )
+                if inspection["tokenizer_sha256"] != expected_tokenizer_sha256:
+                    raise RuntimeError(
+                        "Transformers tokenizer identity does not match the manifest"
+                    )
                 manifest_defaults = manifest_metadata.get("generation_defaults")
                 manifest_reasoning_level = (
                     manifest_defaults.get("reasoning_level")
@@ -2592,6 +3226,8 @@ def validate_export_directory(
                     raise RuntimeError(
                         "Transformers revision capability does not match the manifest"
                     )
+                if inspection["pipeline"] != _metadata_pipeline_identity(manifest_metadata):
+                    raise RuntimeError("Transformers pipeline identity does not match the manifest")
                 validation["inspection"] = inspection
             validation["valid"] = True
         except Exception as error:
@@ -2656,7 +3292,7 @@ def gather_full_state_dict(
 
 def _synchronize_rank0_exception(
     context: DistributedContext,
-    error: Exception | None,
+    error: BaseException | None,
 ) -> None:
     """Broadcast a rank-0 export failure so peers never wait at a blind barrier."""
 
@@ -2684,6 +3320,214 @@ def _synchronize_rank0_exception(
     )
 
 
+def _training_export_status_path(directory: Path, *, invocation: str) -> Path:
+    """Keep each concurrent invocation outside the export tree and isolated."""
+
+    if re.fullmatch(r"[0-9A-Za-z_-]+", invocation) is None:
+        raise ValueError("training export invocation must be a path-safe identifier")
+    return directory.parent / f".{directory.name}.{invocation}.training-export-status.json"
+
+
+def _training_export_status_paths(status_path: Path) -> tuple[Path, Path]:
+    return status_path, status_path.with_name(f"{status_path.name}.backup")
+
+
+def _bounded_training_export_status_text(
+    value: object,
+    *,
+    max_bytes: int = 6000,
+) -> str:
+    """Bound diagnostics by encoded size so terminal publication cannot overflow."""
+
+    normalized = "".join(character if ord(character) >= 32 else " " for character in str(value))
+    encoded = normalized.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return normalized
+    marker = "…"
+    tail_budget = max(0, max_bytes - len(marker.encode("utf-8")))
+    tail = encoded[-tail_budget:].decode("utf-8", errors="ignore") if tail_budget else ""
+    return marker + tail
+
+
+def _encode_training_export_status(payload: Mapping[str, Any]) -> bytes:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    if len(encoded) + 1 > _TRAINING_EXPORT_STATUS_FILE_BYTES:
+        raise ValueError("training export status exceeds its preallocated file size")
+    return encoded + b" " * (_TRAINING_EXPORT_STATUS_FILE_BYTES - len(encoded) - 1) + b"\n"
+
+
+def _overwrite_training_export_status(
+    handle: BinaryIO,
+    payload: Mapping[str, Any],
+) -> None:
+    encoded = _encode_training_export_status(payload)
+    handle.seek(0)
+    written = handle.write(encoded)
+    if written != len(encoded):
+        raise OSError(f"short training export status write: {written}/{len(encoded)} bytes")
+    handle.flush()
+    os.fsync(handle.fileno())
+
+
+def _atomic_initialize_training_export_status(
+    path: Path,
+    payload: Mapping[str, Any],
+) -> BinaryIO:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = _temporary_path(path)
+    try:
+        with temporary.open("w+b", buffering=0) as handle:
+            _overwrite_training_export_status(handle, payload)
+        os.replace(temporary, path)
+        if os.name != "nt":
+            directory_descriptor = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+        handle = path.open("r+b", buffering=0)
+        try:
+            _overwrite_training_export_status(handle, payload)
+        except BaseException:
+            handle.close()
+            raise
+        return handle
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _initialize_training_export_status(
+    status_path: Path,
+    payload: Mapping[str, Any],
+) -> tuple[BinaryIO, BinaryIO]:
+    """Preallocate redundant channels before rank 0 begins long export I/O."""
+
+    handles: list[BinaryIO] = []
+    try:
+        for path in _training_export_status_paths(status_path):
+            handles.append(_atomic_initialize_training_export_status(path, payload))
+    except BaseException:
+        for handle in handles:
+            handle.close()
+        raise
+    return handles[0], handles[1]
+
+
+def _publish_training_export_status(
+    handles: tuple[BinaryIO, BinaryIO],
+    payload: Mapping[str, Any],
+) -> None:
+    failures: list[BaseException] = []
+    successes = 0
+    for handle in handles:
+        try:
+            _overwrite_training_export_status(handle, payload)
+            successes += 1
+        except BaseException as error:
+            failures.append(error)
+    if successes == 0:
+        raise RuntimeError(
+            "both preallocated training export status channels failed"
+        ) from failures[0]
+
+
+def _close_training_export_status(
+    handles: tuple[BinaryIO, BinaryIO] | None,
+) -> None:
+    if handles is None:
+        return
+    for handle in handles:
+        try:
+            handle.close()
+        except OSError:
+            pass
+
+
+def _read_training_export_status(status_path: Path) -> list[dict[str, Any]]:
+    statuses: list[dict[str, Any]] = []
+    for candidate in _training_export_status_paths(status_path):
+        try:
+            raw_status: object = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if isinstance(raw_status, dict):
+            statuses.append(cast(dict[str, Any], raw_status))
+    return statuses
+
+
+def _training_export_status_is_visible(
+    status_path: Path,
+    *,
+    invocation: str,
+) -> bool:
+    return any(
+        status.get("schema") == _TRAINING_EXPORT_STATUS_SCHEMA
+        and status.get("invocation") == invocation
+        and status.get("state") == "running"
+        for status in _read_training_export_status(status_path)
+    )
+
+
+def _broadcast_training_export_invocation(
+    context: DistributedContext,
+    invocation: str | None,
+) -> str:
+    payload = [invocation if context.is_main else None]
+    if context.distributed:
+        dist.broadcast_object_list(payload, src=0, device=context.device)
+    if not isinstance(payload[0], str):
+        raise RuntimeError("rank 0 did not publish a training export invocation")
+    return payload[0]
+
+
+def _all_ranks_observe_training_export_status(
+    context: DistributedContext,
+    visible_here: bool,
+) -> bool:
+    visible = torch.tensor(int(visible_here), device=context.device, dtype=torch.int32)
+    if context.distributed:
+        dist.all_reduce(visible, op=dist.ReduceOp.MIN)
+    return bool(visible.item())
+
+
+def _wait_for_training_export_status(
+    status_path: Path,
+    *,
+    invocation: str,
+    step: int,
+    release_name: str,
+) -> None:
+    """Wait on durable files, not a process-group collective, during rank-0 I/O."""
+
+    deadline = time.monotonic() + _TRAINING_EXPORT_STATUS_TIMEOUT_SECONDS
+    while True:
+        for status in _read_training_export_status(status_path):
+            matches_export = (
+                status.get("schema") == _TRAINING_EXPORT_STATUS_SCHEMA
+                and status.get("invocation") == invocation
+                and status.get("step") == step
+                and status.get("release_name") == release_name
+            )
+            if matches_export and status.get("state") == "complete":
+                return
+            if matches_export and status.get("state") == "failed":
+                error_type = status.get("error_type", "RuntimeError")
+                message = status.get("message", "unknown rank-0 export failure")
+                raise RuntimeError(f"rank 0 training export failed: {error_type}: {message}")
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                "timed out waiting for rank 0 training export after "
+                f"{_TRAINING_EXPORT_STATUS_TIMEOUT_SECONDS:g} seconds: {status_path}"
+            )
+        time.sleep(_TRAINING_EXPORT_STATUS_POLL_SECONDS)
+
+
 def export_inference_models(
     directory: str | Path,
     model: nn.Module,
@@ -2701,6 +3545,7 @@ def export_inference_models(
     translation_directions: Sequence[Sequence[str]] | None = None,
     bidirectional: bool = True,
     revision_trained: bool | None = None,
+    pipeline_identity: Mapping[str, Any] | None = None,
     int4_backend: str = "auto",
     fp8_policy: Fp8Policy | None = None,
     release_name: str = TRANSLATION_RELEASE_NAME,
@@ -2715,7 +3560,7 @@ def export_inference_models(
     manifest: dict[str, Any] | None = None
     metadata: dict[str, Any] | None = None
     pad_id = 0
-    setup_error: Exception | None = None
+    setup_error: BaseException | None = None
     if context.is_main:
         try:
             pad_id = int(getattr(unwrap_model(model), "pad_id", 0))
@@ -2732,8 +3577,9 @@ def export_inference_models(
                 step=step,
                 release_name=release_name,
                 translation_capable=translation_capable,
+                pipeline_identity=pipeline_identity,
             )
-        except Exception as error:
+        except BaseException as error:
             setup_error = error
     _synchronize_rank0_exception(context, setup_error)
 
@@ -2746,16 +3592,65 @@ def export_inference_models(
     else:
         deployment_state = gather_full_state_dict(model, context)
 
-    # The final seven-format CPU conversion can take longer than the process
-    # group's collective timeout for 8B/32B models. The full-state gather is
-    # complete, so non-main ranks can release their process groups while rank 0
-    # finishes the transactional export. torchrun still propagates rank-0 failure.
+    # Any CPU conversion can take longer than the process group's collective
+    # timeout for large models. Strict final export has an outer durable-status
+    # coordinator; regular training export establishes its own status channels
+    # after the full-state gather and before rank 0 starts long filesystem I/O.
     if strict and not context.is_main:
         del deployment_state
         gc.collect()
         return None
 
-    export_error: Exception | None = None
+    status_path: Path | None = None
+    status_handles: tuple[BinaryIO, BinaryIO] | None = None
+    invocation = "single-process"
+    if context.distributed and not strict:
+        invocation = _broadcast_training_export_invocation(
+            context,
+            uuid.uuid4().hex if context.is_main else None,
+        )
+        status_path = _training_export_status_path(directory, invocation=invocation)
+        status_setup_error: BaseException | None = None
+        if context.is_main:
+            try:
+                status_handles = _initialize_training_export_status(
+                    status_path,
+                    {
+                        "schema": _TRAINING_EXPORT_STATUS_SCHEMA,
+                        "state": "running",
+                        "invocation": invocation,
+                        "step": step,
+                        "release_name": release_name,
+                        "formats": list(requested),
+                    },
+                )
+            except BaseException as error:
+                status_setup_error = error
+        _synchronize_rank0_exception(context, status_setup_error)
+        visible_everywhere = _all_ranks_observe_training_export_status(
+            context,
+            _training_export_status_is_visible(
+                status_path,
+                invocation=invocation,
+            ),
+        )
+        if not visible_everywhere:
+            _close_training_export_status(status_handles)
+            raise RuntimeError(
+                "training export status is not coherently visible to every distributed rank"
+            )
+        if not context.is_main:
+            del deployment_state
+            gc.collect()
+            _wait_for_training_export_status(
+                status_path,
+                invocation=invocation,
+                step=step,
+                release_name=release_name,
+            )
+            return None
+
+    export_error: BaseException | None = None
     if context.is_main:
         assert metadata is not None
         try:
@@ -2809,15 +3704,43 @@ def export_inference_models(
                 # 새로 만든 핸들은 잡지 못합니다.
                 gc.collect()
                 _atomic_replace_directory(working_directory, directory)
-        except Exception as error:
+        except BaseException as error:
             export_error = error
             if strict and working_directory.exists():
                 _remove_artifact(working_directory)
+    if context.distributed and not strict and context.is_main:
+        assert status_path is not None
+        assert status_handles is not None
+        terminal_status: dict[str, Any] = {
+            "schema": _TRAINING_EXPORT_STATUS_SCHEMA,
+            "state": "failed" if export_error is not None else "complete",
+            "invocation": invocation,
+            "step": step,
+            "release_name": release_name,
+            "formats": list(requested),
+        }
+        if export_error is not None:
+            terminal_status.update(
+                {
+                    "error_type": type(export_error).__name__,
+                    "message": _bounded_training_export_status_text(export_error),
+                }
+            )
+        try:
+            _publish_training_export_status(status_handles, terminal_status)
+        except BaseException as status_error:
+            if export_error is not None:
+                status_error.add_note(
+                    f"rank-0 export also failed: {type(export_error).__name__}: {export_error}"
+                )
+            export_error = status_error
+        finally:
+            _close_training_export_status(status_handles)
     if strict:
         if export_error is not None:
             raise export_error
-    else:
-        _synchronize_rank0_exception(context, export_error)
+    elif export_error is not None:
+        raise export_error
     del deployment_state
     gc.collect()
     return manifest

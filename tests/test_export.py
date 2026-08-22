@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 import hashlib
 import json
 import subprocess
@@ -8,6 +9,7 @@ import textwrap
 import types
 from dataclasses import asdict
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -23,10 +25,10 @@ from sion_translate.training.export import (
     EXPORT_SCHEMA,
     _cpu_model,
     _quantize_affine_k,
-    build_export_metadata,
+    build_export_metadata as _build_export_metadata,
     convert_export,
     export_inference_models,
-    export_state_dict_formats,
+    export_state_dict_formats as _export_state_dict_formats,
     load_exported_model,
     validate_export_directory,
 )
@@ -45,6 +47,108 @@ def export_config(*, d_model: int = 32) -> ModelConfig:
         dropout=0.0,
         gradient_checkpointing=False,
         experimental=ExperimentalConfig(),
+    )
+
+
+def translation_pipeline_identity() -> dict[str, Any]:
+    return {
+        "schema": "sion-translation-pipeline-v2",
+        "branch": "translation-only",
+    }
+
+
+def foundation_pipeline_identity() -> dict[str, Any]:
+    return {
+        "schema": "sion-translation-pipeline-v2",
+        "branch": "foundation-then-translation",
+        "foundation": {
+            "schema": "sion-foundation-lineage-v1",
+            "release_name": "sion",
+            "release_version": "1.5",
+            "languages": ["ko", "ja"],
+            "selected_step": 7,
+            "foundation_manifest_sha256": "a" * 64,
+            "tokenizer_sha256": "b" * 64,
+            "checkpoint_identity_sha256": "c" * 64,
+            "checkpoint_artifact_sha256": "d" * 64,
+        },
+    }
+
+
+def build_export_metadata(
+    model_config: ModelConfig,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Default existing tests to the exact pipeline contract introduced in 1.5."""
+
+    release_version = kwargs.get("release_version", "1.5")
+    translation_capable = bool(kwargs.get("translation_capable", True))
+    if "pipeline_identity" not in kwargs and translation_capable and release_version == "1.5":
+        kwargs["pipeline_identity"] = translation_pipeline_identity()
+    return _build_export_metadata(model_config, **kwargs)
+
+
+def export_state_dict_formats(
+    directory: str | Path,
+    state_dict: Mapping[str, torch.Tensor],
+    model_config: ModelConfig,
+    pad_id: int,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Give unrelated export tests the valid current translation ancestry."""
+
+    if kwargs.get("metadata") is None:
+        translation_capable = bool(kwargs.get("translation_capable", True))
+        kwargs["metadata"] = build_export_metadata(
+            model_config,
+            release_name=str(kwargs.get("release_name", "sion_translate")),
+            translation_capable=translation_capable,
+            pipeline_identity=(translation_pipeline_identity() if translation_capable else None),
+        )
+    return _export_state_dict_formats(
+        directory,
+        state_dict,
+        model_config,
+        pad_id,
+        **kwargs,
+    )
+
+
+def _write_0b_style_legacy_gguf(
+    path: Path,
+    state_dict: Mapping[str, torch.Tensor],
+    *,
+    language_pairs: list[list[str]],
+) -> dict[str, int]:
+    gguf = pytest.importorskip("gguf")
+    counts = {"q4_k": 0, "q5_k": 0, "f16": 0}
+    writer = gguf.GGUFWriter(path, "sion")
+    try:
+        writer.add_name("sion_translate")
+        writer.add_string("sion.export_schema", EXPORT_SCHEMA)
+        if language_pairs:
+            writer.add_string(
+                "sion.language_pairs",
+                json.dumps(language_pairs, ensure_ascii=False, separators=(",", ":")),
+            )
+        for name, tensor in state_dict.items():
+            writer.add_tensor(name, tensor.detach().float().cpu().numpy().astype(np.float16))
+            counts["f16"] += 1
+        writer.write_header_to_file()
+        writer.write_kv_data_to_file()
+        writer.write_tensors_to_file(progress=False)
+        writer.close()
+        writer = None
+    finally:
+        if writer is not None:
+            writer.close()
+    return counts
+
+
+def _store_manifest(directory: Path, manifest: dict[str, Any]) -> None:
+    (directory / "export_manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
     )
 
 
@@ -266,6 +370,288 @@ def test_export_metadata_records_evidence_and_parity_architecture() -> None:
     assert metadata["generation_defaults"]["reasoning_level"] == 9
 
 
+def test_export_metadata_records_an_independent_json_safe_pipeline_identity(
+    tmp_path: Path,
+) -> None:
+    tokenizer = tmp_path / "tokenizer.model"
+    tokenizer.write_bytes(b"pipeline tokenizer fixture")
+    tokenizer_sha256 = hashlib.sha256(tokenizer.read_bytes()).hexdigest()
+    lineage: dict[str, object] = {
+        "schema": "sion-foundation-lineage-v1",
+        "release_name": "sion",
+        "release_version": "1.5",
+        "languages": ["ko", "ja"],
+        "selected_step": 7,
+        "foundation_manifest_sha256": "a" * 64,
+        "tokenizer_sha256": tokenizer_sha256,
+        "checkpoint_identity_sha256": "c" * 64,
+        "checkpoint_artifact_sha256": "d" * 64,
+    }
+    pipeline = {
+        "schema": "sion-translation-pipeline-v2",
+        "branch": "foundation-then-translation",
+        "foundation": lineage,
+    }
+
+    metadata = build_export_metadata(
+        export_config(),
+        tokenizer_path=tokenizer,
+        languages=("ko", "ja"),
+        pipeline_identity=pipeline,
+    )
+    lineage["foundation_manifest_sha256"] = "changed"
+
+    assert metadata["pipeline"] == {
+        "schema": "sion-translation-pipeline-v2",
+        "branch": "foundation-then-translation",
+        "foundation": {
+            "schema": "sion-foundation-lineage-v1",
+            "release_name": "sion",
+            "release_version": "1.5",
+            "languages": ["ko", "ja"],
+            "selected_step": 7,
+            "foundation_manifest_sha256": "a" * 64,
+            "tokenizer_sha256": tokenizer_sha256,
+            "checkpoint_identity_sha256": "c" * 64,
+            "checkpoint_artifact_sha256": "d" * 64,
+        },
+    }
+    json.dumps(metadata, allow_nan=False)
+
+
+def test_foundation_pipeline_accepts_a_configured_distinct_base_release_name(
+    tmp_path: Path,
+) -> None:
+    tokenizer = tmp_path / "tokenizer.model"
+    tokenizer.write_bytes(b"custom foundation release tokenizer")
+    pipeline = foundation_pipeline_identity()
+    pipeline["foundation"]["release_name"] = "my_base"
+    pipeline["foundation"]["tokenizer_sha256"] = hashlib.sha256(tokenizer.read_bytes()).hexdigest()
+
+    metadata = _build_export_metadata(
+        export_config(),
+        tokenizer_path=tokenizer,
+        languages=("ko", "ja", "en"),
+        pipeline_identity=pipeline,
+    )
+
+    assert metadata["pipeline"]["foundation"]["release_name"] == "my_base"
+
+
+@pytest.mark.parametrize(
+    "pipeline_identity",
+    [
+        {"objective": object()},
+        {"loss": float("nan")},
+    ],
+)
+def test_export_metadata_rejects_non_json_pipeline_identity(
+    pipeline_identity: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match="JSON-safe"):
+        build_export_metadata(export_config(), pipeline_identity=pipeline_identity)
+
+
+@pytest.mark.parametrize(
+    "pipeline_identity",
+    [
+        {"schema": "sion-translation-pipeline-v1", "branch": "translation-only"},
+        {
+            "schema": "sion-translation-pipeline-v2",
+            "branch": "translation-only",
+            "unverifiable": True,
+        },
+        {
+            **foundation_pipeline_identity(),
+            "foundation": {
+                **foundation_pipeline_identity()["foundation"],
+                "checkpoint_artifact_sha256": "D" * 64,
+            },
+        },
+        {
+            **foundation_pipeline_identity(),
+            "foundation": {
+                key: value
+                for key, value in foundation_pipeline_identity()["foundation"].items()
+                if key != "release_version"
+            },
+        },
+    ],
+)
+def test_export_metadata_rejects_nonexact_pipeline_contracts(
+    pipeline_identity: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match="pipeline|lineage"):
+        _build_export_metadata(export_config(), pipeline_identity=pipeline_identity)
+
+
+def test_foundation_export_metadata_forbids_translation_pipeline_identity() -> None:
+    with pytest.raises(ValueError, match="foundation-only.*must not contain pipeline"):
+        _build_export_metadata(
+            export_config(),
+            release_name="sion",
+            translation_capable=False,
+            pipeline_identity=translation_pipeline_identity(),
+        )
+
+
+def test_foundation_pipeline_binds_tokenizer_without_conflating_translation_languages(
+    tmp_path: Path,
+) -> None:
+    tokenizer = tmp_path / "tokenizer.model"
+    tokenizer.write_bytes(b"foundation binding fixture")
+    tokenizer_sha256 = hashlib.sha256(tokenizer.read_bytes()).hexdigest()
+    pipeline = foundation_pipeline_identity()
+    pipeline["foundation"]["tokenizer_sha256"] = tokenizer_sha256
+
+    metadata = build_export_metadata(
+        export_config(),
+        tokenizer_path=tokenizer,
+        languages=("ko", "ja"),
+        pipeline_identity=pipeline,
+    )
+
+    assert metadata["pipeline"] == pipeline
+    wrong_tokenizer = json.loads(json.dumps(pipeline))
+    wrong_tokenizer["foundation"]["tokenizer_sha256"] = "e" * 64
+    with pytest.raises(ValueError, match="exactly match metadata.tokenizer"):
+        _build_export_metadata(
+            export_config(),
+            tokenizer_path=tokenizer,
+            languages=("ko", "ja"),
+            pipeline_identity=wrong_tokenizer,
+        )
+    independent_languages = _build_export_metadata(
+        export_config(),
+        tokenizer_path=tokenizer,
+        languages=("ko", "en"),
+        pipeline_identity=pipeline,
+    )
+    assert independent_languages["languages"] == ["ko", "en"]
+    assert independent_languages["pipeline"]["foundation"]["languages"] == ["ko", "ja"]
+
+
+def test_export_revalidates_pipeline_after_tokenizer_and_language_overrides(
+    tmp_path: Path,
+) -> None:
+    tokenizer_a = tmp_path / "tokenizer-a.model"
+    tokenizer_b = tmp_path / "tokenizer-b.model"
+    tokenizer_a.write_bytes(b"foundation tokenizer A")
+    tokenizer_b.write_bytes(b"foundation tokenizer B")
+    pipeline = foundation_pipeline_identity()
+    pipeline["foundation"]["tokenizer_sha256"] = hashlib.sha256(
+        tokenizer_a.read_bytes()
+    ).hexdigest()
+    config = export_config()
+    model = SionForConditionalGeneration(config)
+    metadata = build_export_metadata(
+        config,
+        tokenizer_path=tokenizer_a,
+        languages=("ko", "ja"),
+        pipeline_identity=pipeline,
+    )
+
+    tokenizer_destination = tmp_path / "wrong-tokenizer"
+    with pytest.raises(ValueError, match="exactly match metadata.tokenizer"):
+        export_module.export_state_dict_formats(
+            tokenizer_destination,
+            model.state_dict(),
+            config,
+            0,
+            formats=("fp32",),
+            metadata=metadata,
+            tokenizer_path=tokenizer_b,
+        )
+    assert not (tokenizer_destination / tokenizer_b.name).exists()
+    assert not (tokenizer_destination / "model.pt").exists()
+    assert not (tokenizer_destination / "export_manifest.json").exists()
+
+    language_destination = tmp_path / "relabeled-languages"
+    with pytest.raises(ValueError, match="omits configured language-pair members"):
+        export_module.export_state_dict_formats(
+            language_destination,
+            model.state_dict(),
+            config,
+            0,
+            formats=("fp32",),
+            metadata=metadata,
+            tokenizer_path=tokenizer_a,
+            language_pairs=(("ko", "en"),),
+        )
+    assert not (language_destination / "model.pt").exists()
+    assert not (language_destination / "export_manifest.json").exists()
+
+
+def test_foundation_languages_are_independent_of_translation_capabilities(
+    tmp_path: Path,
+) -> None:
+    tokenizer = tmp_path / "tokenizer.model"
+    tokenizer.write_bytes(b"production language-union fixture")
+    pipeline = foundation_pipeline_identity()
+    pipeline["foundation"]["languages"] = ["ko", "ja", "en"]
+    pipeline["foundation"]["tokenizer_sha256"] = hashlib.sha256(tokenizer.read_bytes()).hexdigest()
+
+    metadata = build_export_metadata(
+        export_config(),
+        tokenizer_path=tokenizer,
+        language_pairs=(("ko", "ja"),),
+        pipeline_identity=pipeline,
+    )
+
+    assert metadata["languages"] == ["ko", "ja"]
+    assert metadata["pipeline"] == pipeline
+
+
+def test_validation_rejects_consistently_replicated_false_foundation_tokenizer(
+    tmp_path: Path,
+) -> None:
+    tokenizer = tmp_path / "tokenizer.model"
+    tokenizer.write_bytes(b"foundation validation fixture")
+    tokenizer_sha256 = hashlib.sha256(tokenizer.read_bytes()).hexdigest()
+    pipeline = foundation_pipeline_identity()
+    pipeline["foundation"]["tokenizer_sha256"] = tokenizer_sha256
+    metadata = build_export_metadata(
+        export_config(),
+        tokenizer_path=tokenizer,
+        languages=("ko", "ja"),
+        pipeline_identity=pipeline,
+    )
+    model = SionForConditionalGeneration(export_config())
+    manifest = export_state_dict_formats(
+        tmp_path / "export",
+        model.state_dict(),
+        model.config,
+        0,
+        formats=("fp32",),
+        metadata=metadata,
+        tokenizer_path=tokenizer,
+    )
+    export_dir = tmp_path / "export"
+    artifact = export_dir / "model.pt"
+    payload = torch.load(artifact, weights_only=True)
+    false_digest = "e" * 64
+    payload["metadata"]["pipeline"]["foundation"]["tokenizer_sha256"] = false_digest
+    manifest["metadata"]["pipeline"]["foundation"]["tokenizer_sha256"] = false_digest
+    torch.save(payload, artifact)
+    manifest["metadata_compatibility_id"] = export_module._metadata_compatibility_id(
+        manifest["metadata"]
+    )
+    manifest["formats"]["fp32"].update(export_module._file_entry(artifact))
+    (export_dir / "export_manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    validation = validate_export_directory(export_dir)
+
+    assert not validation["valid"]
+    assert any(
+        error["error_type"] == "InvalidPipelineIdentity"
+        and "metadata.tokenizer" in error["message"]
+        for error in validation["errors"]
+    )
+
+
 def test_export_rejects_a_reasoning_endpoint_that_bypasses_trained_refinement(
     tmp_path: Path,
 ) -> None:
@@ -297,6 +683,75 @@ def test_native_loader_rejects_tampered_reasoning_endpoint(tmp_path: Path) -> No
     torch.save(payload, tampered)
 
     with pytest.raises(ValueError, match="does not match model features"):
+        load_exported_model(tampered)
+
+
+def test_native_loader_rejects_current_schema_without_pipeline_identity(
+    tmp_path: Path,
+) -> None:
+    config = export_config()
+    model = SionForConditionalGeneration(config)
+    export_state_dict_formats(tmp_path, model.state_dict(), config, 0, formats=("fp32",))
+    payload = torch.load(tmp_path / "model.pt", weights_only=True)
+    payload["metadata"].pop("pipeline")
+    tampered = tmp_path / "missing-pipeline.pt"
+    torch.save(payload, tampered)
+
+    with pytest.raises(ValueError, match="requires pipeline identity"):
+        load_exported_model(tampered)
+
+
+def test_native_loader_rejects_schema_stripping_from_declared_1_5(
+    tmp_path: Path,
+) -> None:
+    config = export_config()
+    model = SionForConditionalGeneration(config)
+    export_state_dict_formats(tmp_path, model.state_dict(), config, 0, formats=("fp32",))
+    payload = torch.load(tmp_path / "model.pt", weights_only=True)
+    payload.pop("schema")
+    payload["metadata"].pop("pipeline")
+    tampered = tmp_path / "schema-stripped-1.5.pt"
+    torch.save(payload, tampered)
+
+    with pytest.raises(ValueError, match="requires pipeline identity"):
+        load_exported_model(tampered)
+
+
+def test_native_loader_accepts_schema_less_declared_1_0(tmp_path: Path) -> None:
+    config = export_config()
+    model = SionForConditionalGeneration(config)
+    metadata = build_export_metadata(config, release_version="1.0")
+    export_state_dict_formats(
+        tmp_path,
+        model.state_dict(),
+        config,
+        0,
+        formats=("fp32",),
+        metadata=metadata,
+    )
+    payload = torch.load(tmp_path / "model.pt", weights_only=True)
+    payload.pop("schema")
+    declared_legacy = tmp_path / "schema-less-1.0.pt"
+    torch.save(payload, declared_legacy)
+
+    _, loaded_config, pad_id = load_exported_model(declared_legacy)
+
+    assert loaded_config == config
+    assert pad_id == 0
+
+
+def test_native_loader_rejects_current_schema_role_capability_mismatch(
+    tmp_path: Path,
+) -> None:
+    config = export_config()
+    model = SionForConditionalGeneration(config)
+    export_state_dict_formats(tmp_path, model.state_dict(), config, 0, formats=("fp32",))
+    payload = torch.load(tmp_path / "model.pt", weights_only=True)
+    payload["metadata"]["release_name"] = "sion"
+    tampered = tmp_path / "contradictory-role.pt"
+    torch.save(payload, tampered)
+
+    with pytest.raises(ValueError, match="foundation release cannot be translation-capable"):
         load_exported_model(tampered)
 
 
@@ -453,9 +908,11 @@ def test_conversion_requires_explicit_identity_for_unversioned_legacy_weights(
     )
     legacy_source = tmp_path / "legacy.pt"
     payload = torch.load(source_dir / "model.pt", weights_only=True)
+    payload.pop("schema")
     payload["metadata"].pop("release_name")
     payload["metadata"].pop("release_version")
     payload["metadata"].pop("translation_capable")
+    payload["metadata"].pop("pipeline")
     torch.save(payload, legacy_source)
 
     with pytest.raises(ValueError, match="pass --release-name explicitly"):
@@ -494,6 +951,110 @@ def test_conversion_rejects_release_identity_relabeling(tmp_path: Path) -> None:
             formats=("fp16",),
             translation_capable=False,
         )
+
+
+def test_conversion_rejects_tokenizer_identity_relabeling(tmp_path: Path) -> None:
+    config = export_config()
+    model = SionForConditionalGeneration(config)
+    tokenizer_a = tmp_path / "tokenizer-a.model"
+    tokenizer_b = tmp_path / "tokenizer-b.model"
+    tokenizer_a.write_bytes(b"trusted tokenizer A")
+    tokenizer_b.write_bytes(b"different tokenizer B")
+    source_dir = tmp_path / "source"
+    export_state_dict_formats(
+        source_dir,
+        model.state_dict(),
+        config,
+        0,
+        formats=("fp32",),
+        metadata=build_export_metadata(config, tokenizer_path=tokenizer_a),
+        tokenizer_path=tokenizer_a,
+    )
+
+    with pytest.raises(ValueError, match="tokenizer conflicts.*cannot relabel"):
+        convert_export(
+            source_dir / "model.pt",
+            tmp_path / "relabeled-tokenizer",
+            formats=("fp16",),
+            tokenizer_path=tokenizer_b,
+        )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"language_pairs": (("en", "ru"),)},
+        {"bidirectional": True},
+        {"revision_trained": False},
+    ],
+    ids=("language-pairs", "directions", "revision-capability"),
+)
+def test_conversion_rejects_translation_capability_relabeling(
+    tmp_path: Path,
+    overrides: dict[str, Any],
+) -> None:
+    config = export_config()
+    model = SionForConditionalGeneration(config)
+    source_dir = tmp_path / "source"
+    export_state_dict_formats(
+        source_dir,
+        model.state_dict(),
+        config,
+        0,
+        formats=("fp32",),
+        metadata=build_export_metadata(
+            config,
+            language_pairs=(("ko", "ja"),),
+            bidirectional=False,
+            revision_trained=True,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="conflict.*source"):
+        convert_export(
+            source_dir / "model.pt",
+            tmp_path / "relabeled-capability",
+            formats=("fp16",),
+            **overrides,
+        )
+
+
+def test_gguf_only_conversion_resolves_inherited_foundation_tokenizer(
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("gguf")
+    config = export_config()
+    model = SionForConditionalGeneration(config)
+    tokenizer = tmp_path / "tokenizer.model"
+    tokenizer.write_bytes(b"foundation-bound tokenizer")
+    pipeline = foundation_pipeline_identity()
+    pipeline["foundation"]["tokenizer_sha256"] = hashlib.sha256(tokenizer.read_bytes()).hexdigest()
+    source_dir = tmp_path / "source"
+    export_state_dict_formats(
+        source_dir,
+        model.state_dict(),
+        config,
+        0,
+        formats=("fp32",),
+        metadata=build_export_metadata(
+            config,
+            tokenizer_path=tokenizer,
+            language_pairs=(("ko", "ja"),),
+            pipeline_identity=pipeline,
+        ),
+        tokenizer_path=tokenizer,
+    )
+
+    converted = convert_export(
+        source_dir / "model.pt",
+        tmp_path / "converted",
+        formats=("gguf_q4_k_m",),
+    )
+
+    assert converted["formats"]["gguf_q4_k_m"]["status"] == "ok"
+    assert (
+        converted["metadata"]["tokenizer"]["sha256"] == pipeline["foundation"]["tokenizer_sha256"]
+    )
 
 
 def test_transformers_directory_hash_is_deterministic_and_tamper_evident(
@@ -544,6 +1105,76 @@ def test_transformers_directory_hash_is_deterministic_and_tamper_evident(
     invalid = validate_export_directory(tmp_path / "first")
     assert not invalid["valid"]
     assert invalid["formats"]["transformers"]["error_type"] == "RuntimeError"
+
+
+def test_0b_style_transformers_sidecars_are_legacy_only_before_1_5(
+    tmp_path: Path,
+) -> None:
+    config = export_config()
+    model = SionForConditionalGeneration(config)
+    pairs = (("ko", "ja"),)
+    metadata = build_export_metadata(
+        config,
+        release_version="1.0",
+        language_pairs=pairs,
+    )
+    manifest = export_state_dict_formats(
+        tmp_path,
+        model.state_dict(),
+        config,
+        0,
+        formats=("transformers",),
+        metadata=metadata,
+        language_pairs=pairs,
+    )
+    checkpoint = tmp_path / "transformers"
+    for sidecar_name in ("config.json", "sion_export.json"):
+        sidecar_path = checkpoint / sidecar_name
+        sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        sidecar.pop("release_name", None)
+        sidecar.pop("release_version", None)
+        sidecar.pop("pipeline", None)
+        if sidecar_name == "sion_export.json":
+            sidecar.pop("generation_defaults", None)
+        sidecar_path.write_text(json.dumps(sidecar, ensure_ascii=False, indent=2), encoding="utf-8")
+    generation_path = checkpoint / "generation_config.json"
+    generation = json.loads(generation_path.read_text(encoding="utf-8"))
+    generation.pop("reasoning_level", None)
+    generation_path.write_text(
+        json.dumps(generation, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    manifest["metadata"].pop("generation_defaults", None)
+    manifest["metadata_compatibility_id"] = export_module._metadata_compatibility_id(
+        manifest["metadata"]
+    )
+    manifest["formats"]["transformers"].update(export_module._directory_entry(checkpoint))
+    _store_manifest(tmp_path, manifest)
+
+    legacy_validation = validate_export_directory(tmp_path)
+
+    assert legacy_validation["valid"]
+    assert (
+        legacy_validation["formats"]["transformers"]["inspection"]["identity_source"]
+        == "legacy-manifest"
+    )
+
+    manifest["metadata"]["release_version"] = "1.5"
+    manifest["metadata"]["pipeline"] = translation_pipeline_identity()
+    manifest["metadata"]["generation_defaults"] = {"reasoning_level": 0}
+    manifest["metadata_compatibility_id"] = export_module._metadata_compatibility_id(
+        manifest["metadata"]
+    )
+    _store_manifest(tmp_path, manifest)
+
+    current_validation = validate_export_directory(tmp_path)
+
+    assert not current_validation["valid"]
+    assert any(
+        error.get("format") == "transformers"
+        and "release_name must be a non-empty string" in error["message"]
+        for error in current_validation["errors"]
+    )
 
 
 def test_transformers_export_rejects_broken_bundled_remote_code(
@@ -667,6 +1298,7 @@ def test_transformers_options_flow_through_conversion_and_training_export(
         formats=("transformers",),
         tokenizer_path=tokenizer_marker,
         language_pairs=pairs,
+        pipeline_identity=translation_pipeline_identity(),
     )
     assert trained is not None
     assert trained["formats"]["transformers"]["status"] == "ok"
@@ -728,11 +1360,474 @@ def test_training_export_manifest_merges_base_and_quantized_formats(
         4,
         ema=None,
         formats=("fp32", "int8"),
+        pipeline_identity=translation_pipeline_identity(),
     )
     assert manifest is not None
     assert set(manifest["formats"]) == {"fp32", "int8"}
     stored = json.loads((tmp_path / "export_manifest.json").read_text())
     assert set(stored["formats"]) == {"fp32", "int8"}
+
+
+@pytest.mark.parametrize("strict", [False, True])
+def test_training_export_preserves_pipeline_identity_in_every_mode(
+    tmp_path: Path,
+    strict: bool,
+) -> None:
+    config = export_config()
+    model = SionForConditionalGeneration(config)
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+    pipeline = translation_pipeline_identity()
+
+    manifest = export_inference_models(
+        tmp_path / ("strict" if strict else "regular"),
+        model,
+        config,
+        context,
+        11,
+        formats=("fp32",),
+        pipeline_identity=pipeline,
+        strict=strict,
+    )
+
+    assert manifest is not None
+    assert manifest["metadata"]["pipeline"] == pipeline
+
+
+def test_translation_1_5_export_fails_closed_without_pipeline_identity(
+    tmp_path: Path,
+) -> None:
+    config = export_config()
+    model = SionForConditionalGeneration(config)
+    destination = tmp_path / "missing-pipeline"
+
+    with pytest.raises(ValueError, match="requires pipeline identity"):
+        export_module.export_state_dict_formats(
+            destination,
+            model.state_dict(),
+            config,
+            0,
+            formats=("fp32",),
+        )
+
+    assert not (destination / "model.pt").exists()
+    assert not (destination / "export_manifest.json").exists()
+
+
+def test_export_validation_fails_closed_when_pipeline_identity_is_removed(
+    tmp_path: Path,
+) -> None:
+    config = export_config()
+    model = SionForConditionalGeneration(config)
+    manifest = export_state_dict_formats(
+        tmp_path,
+        model.state_dict(),
+        config,
+        0,
+        formats=("fp32",),
+    )
+    manifest["metadata"].pop("pipeline")
+    (tmp_path / "export_manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    validation = validate_export_directory(tmp_path)
+
+    assert not validation["valid"]
+    assert any(error["error_type"] == "InvalidPipelineIdentity" for error in validation["errors"])
+
+
+def test_conversion_preserves_inherited_pipeline_identity(tmp_path: Path) -> None:
+    config = export_config()
+    model = SionForConditionalGeneration(config)
+    pipeline = translation_pipeline_identity()
+    source_dir = tmp_path / "source"
+    export_state_dict_formats(
+        source_dir,
+        model.state_dict(),
+        config,
+        0,
+        formats=("fp32",),
+        metadata=build_export_metadata(config, pipeline_identity=pipeline),
+    )
+
+    converted = convert_export(
+        source_dir / "model.pt",
+        tmp_path / "converted",
+        formats=("fp16",),
+    )
+
+    assert converted["metadata"]["pipeline"] == pipeline
+
+
+def test_transformers_pipeline_sidecars_cross_validate_exact_identity(tmp_path: Path) -> None:
+    config = export_config()
+    model = SionForConditionalGeneration(config)
+    pipeline = translation_pipeline_identity()
+    metadata = build_export_metadata(config, pipeline_identity=pipeline)
+
+    manifest = export_state_dict_formats(
+        tmp_path,
+        model.state_dict(),
+        config,
+        0,
+        formats=("transformers",),
+        metadata=metadata,
+    )
+
+    assert manifest["formats"]["transformers"]["status"] == "ok"
+    transformers_dir = tmp_path / "transformers"
+    config_payload = json.loads((transformers_dir / "config.json").read_text(encoding="utf-8"))
+    export_payload = json.loads((transformers_dir / "sion_export.json").read_text(encoding="utf-8"))
+    assert config_payload["pipeline"] == pipeline
+    assert export_payload["pipeline"] == pipeline
+    assert validate_export_directory(tmp_path)["valid"]
+
+    config_payload["pipeline"]["branch"] = "tampered"
+    (transformers_dir / "config.json").write_text(
+        json.dumps(config_payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    manifest["formats"]["transformers"].update(export_module._directory_entry(transformers_dir))
+    (tmp_path / "export_manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    validation = validate_export_directory(tmp_path)
+    assert not validation["valid"]
+    assert any(
+        "disagree about pipeline identity" in error["message"] for error in validation["errors"]
+    )
+
+
+def test_transformers_tokenizer_identity_is_cross_checked_with_manifest(
+    tmp_path: Path,
+) -> None:
+    config = export_config()
+    model = SionForConditionalGeneration(config)
+    manifest = export_state_dict_formats(
+        tmp_path,
+        model.state_dict(),
+        config,
+        0,
+        formats=("transformers",),
+    )
+    transformers_dir = tmp_path / "transformers"
+    false_digest = "e" * 64
+    for sidecar_name in ("config.json", "sion_export.json"):
+        sidecar_path = transformers_dir / sidecar_name
+        payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        payload["tokenizer_sha256"] = false_digest
+        sidecar_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    manifest["formats"]["transformers"].update(export_module._directory_entry(transformers_dir))
+    (tmp_path / "export_manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    validation = validate_export_directory(tmp_path)
+
+    assert not validation["valid"]
+    assert any(
+        "tokenizer identity does not match the manifest" in error["message"]
+        for error in validation["errors"]
+    )
+
+
+def test_transformers_sion_export_contract_is_cross_checked_with_config(
+    tmp_path: Path,
+) -> None:
+    config = export_config()
+    model = SionForConditionalGeneration(config)
+    manifest = export_state_dict_formats(
+        tmp_path,
+        model.state_dict(),
+        config,
+        0,
+        formats=("transformers",),
+    )
+    transformers_dir = tmp_path / "transformers"
+    sidecar_path = transformers_dir / "sion_export.json"
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    sidecar["translation_capable"] = False
+    sidecar_path.write_text(
+        json.dumps(sidecar, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    manifest["formats"]["transformers"].update(export_module._directory_entry(transformers_dir))
+    (tmp_path / "export_manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    validation = validate_export_directory(tmp_path)
+
+    assert not validation["valid"]
+    assert any(
+        "disagree about translation_capable" in error["message"] for error in validation["errors"]
+    )
+
+
+def _mock_distributed_export_control_plane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[tuple[int, BaseException | None]]:
+    synchronizations: list[tuple[int, BaseException | None]] = []
+
+    def record_synchronization(
+        context: DistributedContext,
+        error: BaseException | None,
+    ) -> None:
+        synchronizations.append((context.rank, error))
+        if error is not None:
+            raise error
+
+    def clone_state(
+        model: torch.nn.Module,
+        _context: DistributedContext,
+    ) -> dict[str, torch.Tensor]:
+        return {name: tensor.detach().cpu().clone() for name, tensor in model.state_dict().items()}
+
+    monkeypatch.setattr(
+        export_module,
+        "_broadcast_training_export_invocation",
+        lambda _context, _invocation: "test-export-invocation",
+    )
+    monkeypatch.setattr(
+        export_module,
+        "_all_ranks_observe_training_export_status",
+        lambda _context, _visible: True,
+    )
+    monkeypatch.setattr(
+        export_module,
+        "_synchronize_rank0_exception",
+        record_synchronization,
+    )
+    monkeypatch.setattr(export_module, "gather_full_state_dict", clone_state)
+    return synchronizations
+
+
+def test_distributed_regular_export_waits_on_durable_success_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    synchronizations = _mock_distributed_export_control_plane(monkeypatch)
+    config = export_config()
+    model = SionForConditionalGeneration(config)
+    directory = tmp_path / "regular"
+    main = DistributedContext(0, 0, 2, torch.device("cpu"), True, "gloo")
+    peer = DistributedContext(1, 1, 2, torch.device("cpu"), True, "gloo")
+
+    manifest = export_inference_models(
+        directory,
+        model,
+        config,
+        main,
+        17,
+        formats=("fp32",),
+        pipeline_identity=translation_pipeline_identity(),
+    )
+    peer_manifest = export_inference_models(
+        directory,
+        model,
+        config,
+        peer,
+        17,
+        formats=("fp32",),
+        pipeline_identity=translation_pipeline_identity(),
+    )
+
+    assert manifest is not None
+    assert peer_manifest is None
+    statuses = export_module._read_training_export_status(
+        export_module._training_export_status_path(
+            directory,
+            invocation="test-export-invocation",
+        )
+    )
+    assert any(
+        status.get("invocation") == "test-export-invocation" and status.get("state") == "complete"
+        for status in statuses
+    )
+    # Each invocation uses only short setup/status-publication collectives before
+    # rank 0 starts conversion. No peer waits in a process-group collective while
+    # rank 0 performs conversion or publishing.
+    assert synchronizations == [(0, None), (0, None), (1, None), (1, None)]
+
+
+def test_distributed_regular_export_propagates_failure_through_durable_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    synchronizations = _mock_distributed_export_control_plane(monkeypatch)
+    config = export_config()
+    model = SionForConditionalGeneration(config)
+    directory = tmp_path / "regular"
+    main = DistributedContext(0, 0, 2, torch.device("cpu"), True, "gloo")
+    peer = DistributedContext(1, 1, 2, torch.device("cpu"), True, "gloo")
+
+    def fail_export(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise RuntimeError("injected long export failure")
+
+    monkeypatch.setattr(export_module, "export_state_dict_formats", fail_export)
+
+    with pytest.raises(RuntimeError, match="injected long export failure"):
+        export_inference_models(
+            directory,
+            model,
+            config,
+            main,
+            19,
+            formats=("fp32",),
+            pipeline_identity=translation_pipeline_identity(),
+        )
+    with pytest.raises(
+        RuntimeError,
+        match="rank 0 training export failed: RuntimeError: injected long export failure",
+    ):
+        export_inference_models(
+            directory,
+            model,
+            config,
+            peer,
+            19,
+            formats=("fp32",),
+            pipeline_identity=translation_pipeline_identity(),
+        )
+
+    assert synchronizations == [(0, None), (0, None), (1, None), (1, None)]
+
+
+def test_training_export_wait_rejects_a_stale_completion_nonce(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stale = {
+        "schema": export_module._TRAINING_EXPORT_STATUS_SCHEMA,
+        "state": "complete",
+        "invocation": "stale-invocation",
+        "step": 23,
+        "release_name": "sion_translate",
+    }
+    current_running = {
+        **stale,
+        "state": "running",
+        "invocation": "current-invocation",
+    }
+    current_complete = {**current_running, "state": "complete"}
+    observations = iter([[stale], [current_running], [current_complete]])
+    reads = 0
+
+    def observe(_status_path: Path) -> list[dict[str, object]]:
+        nonlocal reads
+        reads += 1
+        return next(observations)
+
+    monkeypatch.setattr(export_module, "_read_training_export_status", observe)
+    monkeypatch.setattr(export_module.time, "sleep", lambda _seconds: None)
+
+    export_module._wait_for_training_export_status(
+        tmp_path / "status.json",
+        invocation="current-invocation",
+        step=23,
+        release_name="sion_translate",
+    )
+
+    assert reads == 3
+
+
+def test_training_export_terminal_status_survives_one_channel_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    status_path = tmp_path / "status.json"
+    running = {
+        "schema": export_module._TRAINING_EXPORT_STATUS_SCHEMA,
+        "state": "running",
+        "invocation": "redundancy-test",
+        "step": 29,
+        "release_name": "sion_translate",
+    }
+    complete = {**running, "state": "complete"}
+    handles = export_module._initialize_training_export_status(status_path, running)
+    real_overwrite = export_module._overwrite_training_export_status
+
+    def fail_primary(
+        handle: object,
+        payload: dict[str, object],
+    ) -> None:
+        if handle is handles[0] and payload.get("state") == "complete":
+            raise OSError("injected primary status failure")
+        real_overwrite(handle, payload)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        export_module,
+        "_overwrite_training_export_status",
+        fail_primary,
+    )
+    try:
+        export_module._publish_training_export_status(handles, complete)
+    finally:
+        export_module._close_training_export_status(handles)
+
+    statuses = export_module._read_training_export_status(status_path)
+    assert any(status.get("state") == "complete" for status in statuses)
+
+
+def test_concurrent_training_exports_keep_status_generations_isolated(
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / "shared-export"
+    paths = {
+        invocation: export_module._training_export_status_path(
+            directory,
+            invocation=invocation,
+        )
+        for invocation in ("invocation-a", "invocation-b")
+    }
+    assert paths["invocation-a"] != paths["invocation-b"]
+
+    def status(invocation: str, state: str) -> dict[str, object]:
+        return {
+            "schema": export_module._TRAINING_EXPORT_STATUS_SCHEMA,
+            "state": state,
+            "invocation": invocation,
+            "step": 31,
+            "release_name": "sion_translate",
+        }
+
+    # Interleave both generations exactly as concurrent rank-0 exporters can:
+    # B initializes after A, then A publishes through its still-open handles.
+    handles_a = export_module._initialize_training_export_status(
+        paths["invocation-a"],
+        status("invocation-a", "running"),
+    )
+    handles_b = export_module._initialize_training_export_status(
+        paths["invocation-b"],
+        status("invocation-b", "running"),
+    )
+    try:
+        export_module._publish_training_export_status(
+            handles_a,
+            status("invocation-a", "complete"),
+        )
+        export_module._publish_training_export_status(
+            handles_b,
+            status("invocation-b", "complete"),
+        )
+    finally:
+        export_module._close_training_export_status(handles_a)
+        export_module._close_training_export_status(handles_b)
+
+    for invocation, path in paths.items():
+        statuses = export_module._read_training_export_status(path)
+        assert any(
+            item.get("invocation") == invocation and item.get("state") == "complete"
+            for item in statuses
+        )
 
 
 def test_subset_export_preserves_unrequested_manifest_entries(
@@ -816,6 +1911,91 @@ def test_subset_export_does_not_merge_incompatible_metadata(tmp_path: Path) -> N
     assert validate_export_directory(tmp_path)["valid"]
 
 
+@pytest.mark.parametrize(
+    ("first_overrides", "second_overrides"),
+    [
+        ({"step": 1}, {"step": 2}),
+        (
+            {"language_pairs": (("ko", "ja"),), "languages": ("ko", "ja", "en")},
+            {"language_pairs": (("ko", "ja"),), "languages": ("ko", "ja", "ru")},
+        ),
+        (
+            {"source": "source-a"},
+            {"source": "source-b"},
+        ),
+    ],
+)
+def test_subset_export_does_not_merge_contradictory_provenance(
+    tmp_path: Path,
+    first_overrides: dict[str, Any],
+    second_overrides: dict[str, Any],
+) -> None:
+    config = export_config()
+    model = SionForConditionalGeneration(config)
+    first_overrides = dict(first_overrides)
+    second_overrides = dict(second_overrides)
+    for overrides in (first_overrides, second_overrides):
+        source_name = overrides.get("source")
+        if isinstance(source_name, str):
+            source = tmp_path / source_name
+            source.write_bytes(source_name.encode("utf-8"))
+            overrides["source"] = source
+    first = export_state_dict_formats(
+        tmp_path,
+        model.state_dict(),
+        config,
+        0,
+        formats=("fp32",),
+        metadata=build_export_metadata(config, **first_overrides),
+    )
+    second = export_state_dict_formats(
+        tmp_path,
+        model.state_dict(),
+        config,
+        0,
+        formats=("bf16",),
+        metadata=build_export_metadata(config, **second_overrides),
+    )
+
+    assert first["artifact_set_id"] == second["artifact_set_id"]
+    assert first["metadata_compatibility_id"] != second["metadata_compatibility_id"]
+    assert set(second["formats"]) == {"bf16"}
+    assert validate_export_directory(tmp_path)["valid"]
+
+
+def test_new_weight_generation_removes_unreferenced_known_artifacts(
+    tmp_path: Path,
+) -> None:
+    config = export_config()
+    first_model = SionForConditionalGeneration(config)
+    second_state = {
+        name: tensor.detach().clone() for name, tensor in first_model.state_dict().items()
+    }
+    first_name = next(iter(second_state))
+    second_state[first_name] = second_state[first_name] + 1
+    export_state_dict_formats(
+        tmp_path,
+        first_model.state_dict(),
+        config,
+        0,
+        formats=("fp32",),
+    )
+    assert (tmp_path / "model.pt").is_file()
+
+    manifest = export_state_dict_formats(
+        tmp_path,
+        second_state,
+        config,
+        0,
+        formats=("bf16",),
+    )
+
+    assert set(manifest["formats"]) == {"bf16"}
+    assert not (tmp_path / "model.pt").exists()
+    assert (tmp_path / "model_bf16.pt").is_file()
+    assert validate_export_directory(tmp_path)["valid"]
+
+
 def test_failed_reexport_does_not_delete_existing_valid_artifact(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -861,12 +2041,18 @@ def test_custom_sion_gguf_is_real_mixed_k_quant(tmp_path: Path) -> None:
     gguf = pytest.importorskip("gguf")
     config = export_config(d_model=256)
     model = SionForConditionalGeneration(config)
+    pipeline = translation_pipeline_identity()
     manifest = export_state_dict_formats(
         tmp_path,
         model.state_dict(),
         config,
         0,
         formats=("gguf_q4_k_m",),
+        metadata=build_export_metadata(
+            config,
+            language_pairs=(("ko", "ja"),),
+            pipeline_identity=pipeline,
+        ),
     )
     entry = manifest["formats"]["gguf_q4_k_m"]
     assert entry["status"] == "ok"
@@ -874,6 +2060,13 @@ def test_custom_sion_gguf_is_real_mixed_k_quant(tmp_path: Path) -> None:
     assert entry["tensor_counts"]["q4_k"] > 0
     assert entry["tensor_counts"]["q5_k"] > 0
     reader = gguf.GGUFReader(tmp_path / entry["file"])
+    assert json.loads(reader.fields["sion.pipeline"].contents()) == pipeline
+    assert json.loads(reader.fields["sion.languages"].contents()) == ["ko", "ja"]
+    assert json.loads(reader.fields["sion.language_pairs"].contents()) == [["ko", "ja"]]
+    assert json.loads(reader.fields["sion.translation_directions"].contents()) == [
+        ["ko", "ja"],
+        ["ja", "ko"],
+    ]
     tensor_types = {tensor.tensor_type.name for tensor in reader.tensors}
     assert {"Q4_K", "Q5_K", "F16"} <= tensor_types
     state = model.state_dict()
@@ -881,6 +2074,171 @@ def test_custom_sion_gguf_is_real_mixed_k_quant(tmp_path: Path) -> None:
         assert tuple(map(int, tensor.shape)) == tuple(reversed(state[tensor.name].shape))
     stored_manifest = json.loads((tmp_path / "export_manifest.json").read_text())
     assert stored_manifest["formats"]["gguf_q4_k_m"]["sha256"] == entry["sha256"]
+    assert validate_export_directory(tmp_path)["valid"]
+
+
+def test_0b_style_gguf_identity_fallback_is_legacy_only_before_1_5(
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("gguf")
+    config = export_config()
+    model = SionForConditionalGeneration(config)
+    pairs = (("ko", "ja"),)
+    metadata = build_export_metadata(
+        config,
+        release_version="1.0",
+        language_pairs=pairs,
+    )
+    manifest = export_state_dict_formats(
+        tmp_path,
+        model.state_dict(),
+        config,
+        0,
+        formats=("gguf_q4_k_m",),
+        metadata=metadata,
+    )
+    artifact = tmp_path / manifest["formats"]["gguf_q4_k_m"]["file"]
+    artifact.unlink()
+    counts = _write_0b_style_legacy_gguf(
+        artifact,
+        model.state_dict(),
+        language_pairs=[["ko", "ja"]],
+    )
+    manifest["formats"]["gguf_q4_k_m"].update(export_module._file_entry(artifact))
+    manifest["formats"]["gguf_q4_k_m"]["tensor_counts"] = counts
+    _store_manifest(tmp_path, manifest)
+
+    legacy_validation = validate_export_directory(tmp_path)
+
+    assert legacy_validation["valid"]
+    assert (
+        legacy_validation["formats"]["gguf_q4_k_m"]["inspection"]["identity_source"]
+        == "legacy-manifest"
+    )
+
+    manifest["metadata"]["release_version"] = "1.5"
+    manifest["metadata"]["pipeline"] = translation_pipeline_identity()
+    manifest["metadata_compatibility_id"] = export_module._metadata_compatibility_id(
+        manifest["metadata"]
+    )
+    _store_manifest(tmp_path, manifest)
+
+    current_validation = validate_export_directory(tmp_path)
+
+    assert not current_validation["valid"]
+    assert any(
+        error.get("format") == "gguf_q4_k_m"
+        and "sion.translation_capable must be a boolean" in error["message"]
+        for error in current_validation["errors"]
+    )
+
+
+def test_foundation_gguf_records_its_role_without_translation_pipeline(
+    tmp_path: Path,
+) -> None:
+    gguf = pytest.importorskip("gguf")
+    config = export_config()
+    model = SionForConditionalGeneration(config)
+    metadata = build_export_metadata(
+        config,
+        release_name="sion",
+        translation_capable=False,
+    )
+
+    manifest = export_state_dict_formats(
+        tmp_path,
+        model.state_dict(),
+        config,
+        0,
+        formats=("gguf_q4_k_m",),
+        metadata=metadata,
+        release_name="sion",
+        translation_capable=False,
+    )
+
+    entry = manifest["formats"]["gguf_q4_k_m"]
+    assert entry["status"] == "ok"
+    reader = gguf.GGUFReader(tmp_path / entry["file"])
+    assert reader.fields["general.name"].contents() == "sion"
+    assert reader.fields["sion.release_name"].contents() == "sion"
+    assert reader.fields["sion.release_version"].contents() == "1.5"
+    assert reader.fields["sion.translation_capable"].contents() is False
+    assert "sion.pipeline" not in reader.fields
+    assert validate_export_directory(tmp_path)["valid"]
+
+
+def test_foundation_branch_translation_gguf_binds_lineage_inputs(
+    tmp_path: Path,
+) -> None:
+    gguf = pytest.importorskip("gguf")
+    tokenizer = tmp_path / "tokenizer.model"
+    tokenizer.write_bytes(b"foundation branch GGUF tokenizer")
+    tokenizer_sha256 = hashlib.sha256(tokenizer.read_bytes()).hexdigest()
+    pipeline = foundation_pipeline_identity()
+    pipeline["foundation"]["tokenizer_sha256"] = tokenizer_sha256
+    config = export_config()
+    model = SionForConditionalGeneration(config)
+    metadata = build_export_metadata(
+        config,
+        tokenizer_path=tokenizer,
+        languages=("ko", "ja"),
+        pipeline_identity=pipeline,
+    )
+
+    manifest = export_state_dict_formats(
+        tmp_path / "export",
+        model.state_dict(),
+        config,
+        0,
+        formats=("gguf_q4_k_m",),
+        metadata=metadata,
+        tokenizer_path=tokenizer,
+    )
+
+    entry = manifest["formats"]["gguf_q4_k_m"]
+    assert entry["status"] == "ok"
+    reader = gguf.GGUFReader(tmp_path / "export" / entry["file"])
+    assert json.loads(reader.fields["sion.languages"].contents()) == ["ko", "ja"]
+    assert reader.fields["sion.tokenizer.sha256"].contents() == tokenizer_sha256
+    assert json.loads(reader.fields["sion.pipeline"].contents()) == pipeline
+    assert validate_export_directory(tmp_path / "export")["valid"]
+
+
+def test_gguf_inspection_is_cross_checked_with_manifest_language_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = export_config()
+    model = SionForConditionalGeneration(config)
+    metadata = build_export_metadata(
+        config,
+        language_pairs=(("ko", "ja"),),
+        pipeline_identity=translation_pipeline_identity(),
+    )
+    export_state_dict_formats(
+        tmp_path,
+        model.state_dict(),
+        config,
+        0,
+        formats=("gguf_q4_k_m",),
+        metadata=metadata,
+    )
+    real_inspect = export_module._inspect_sion_gguf
+
+    def tampered_inspection(path: Path, **kwargs: Any) -> dict[str, Any]:
+        inspection = real_inspect(path, **kwargs)
+        inspection["language_pairs"] = [["en", "ru"]]
+        return inspection
+
+    monkeypatch.setattr(export_module, "_inspect_sion_gguf", tampered_inspection)
+
+    validation = validate_export_directory(tmp_path)
+
+    assert not validation["valid"]
+    assert any(
+        "GGUF language pairs do not match the manifest" in error["message"]
+        for error in validation["errors"]
+    )
 
 
 def test_native_export_embeds_and_validates_token_feature_identity(tmp_path: Path) -> None:
@@ -956,6 +2314,7 @@ def test_strict_final_export_is_directory_transactional(
             context,
             2,
             formats=("fp32", "gguf_q4_k_m"),
+            pipeline_identity=translation_pipeline_identity(),
             strict=True,
         )
 
@@ -1074,6 +2433,13 @@ def test_complete_file_and_manifest_generation_uses_a_cross_process_lock(tmp_pat
                 config,
                 0,
                 formats=("fp32",),
+                metadata=export_module.build_export_metadata(
+                    config,
+                    pipeline_identity={{
+                        "schema": "sion-translation-pipeline-v2",
+                        "branch": "translation-only",
+                    }},
+                ),
             )
         except RuntimeError as error:
             print(error)
