@@ -17,6 +17,7 @@ import numpy as np
 import torch
 
 from sion_translate.glossary import Glossary, apply_source_placeholders, restore_targets
+from sion_translate.language_tags import canonicalize_language_pair, canonicalize_language_tag
 from sion_translate.model import SionForConditionalGeneration
 from sion_translate.rerank import select as rerank_select
 from sion_translate.revision import DRAFT_SEPARATOR, serialize_revision_input
@@ -29,8 +30,8 @@ from sion_translate.tokenizer import (
 )
 from sion_translate.fp8_runtime import describe_runtime, prepare_fp8_model_for_device
 from sion_translate.training.export import (
-    _metadata_requires_explicit_direction_graph,
     load_exported_model,
+    metadata_requires_explicit_direction_graph,
     resolve_manifest_artifact,
 )
 
@@ -53,7 +54,10 @@ def _language_pairs_from_metadata(
         pair_items = cast(Sequence[object], raw_pair)
         if len(pair_items) != 2:
             raise ValueError(f"invalid language pair metadata: {raw_pair!r}")
-        pair = (str(pair_items[0]), str(pair_items[1]))
+        pair = canonicalize_language_pair(
+            pair_items,
+            field="language pair metadata",
+        )
         edge = frozenset(pair)
         if not all(pair) or len(edge) != 2:
             raise ValueError(f"invalid language pair metadata: {raw_pair!r}")
@@ -72,7 +76,7 @@ def _translation_directions_from_metadata(
     pairs = _language_pairs_from_metadata(metadata)
     raw_directions: object = metadata.get("translation_directions")
     if raw_directions is None:
-        if pairs and _metadata_requires_explicit_direction_graph(metadata):
+        if pairs and metadata_requires_explicit_direction_graph(metadata):
             raise ValueError(
                 "current translation metadata with language pairs requires explicit "
                 "translation_directions"
@@ -96,7 +100,10 @@ def _translation_directions_from_metadata(
         direction_items = cast(Sequence[object], raw_direction)
         if len(direction_items) != 2:
             raise ValueError(f"invalid translation direction metadata: {raw_direction!r}")
-        direction = (str(direction_items[0]), str(direction_items[1]))
+        direction = canonicalize_language_pair(
+            direction_items,
+            field="translation direction metadata",
+        )
         if direction[0] == direction[1] or frozenset(direction) not in allowed_edges:
             raise ValueError(f"invalid translation direction metadata: {raw_direction!r}")
         if direction not in seen:
@@ -346,21 +353,12 @@ class Translator:
                         "tokenizer metadata SHA256 does not match the selected tokenizer"
                     )
 
-        raw_pairs: object = self.export_metadata.get("language_pairs")
-        if raw_pairs is None and self.export_metadata.get("language_pair") is not None:
-            raw_pairs = [self.export_metadata["language_pair"]]
-        if isinstance(raw_pairs, Sequence) and not isinstance(raw_pairs, (str, bytes)):
-            expected_languages = {
-                str(language)
-                for pair in cast(Sequence[object], raw_pairs)
-                if isinstance(pair, Sequence) and not isinstance(pair, (str, bytes))
-                for language in cast(Sequence[object], pair)
-            }
-            if expected_languages and expected_languages != set(self.tokenizer.languages):
-                raise ValueError(
-                    "tokenizer languages do not match model metadata: "
-                    f"{sorted(self.tokenizer.languages)} != {sorted(expected_languages)}"
-                )
+        expected_languages = {language for pair in self.language_pairs for language in pair}
+        if expected_languages and expected_languages != set(self.tokenizer.languages):
+            raise ValueError(
+                "tokenizer languages do not match model metadata: "
+                f"{sorted(self.tokenizer.languages)} != {sorted(expected_languages)}"
+            )
 
         feature_flags = self.export_metadata.get("feature_flags")
         if isinstance(feature_flags, Mapping):
@@ -412,20 +410,13 @@ class Translator:
             digest = hashlib.sha256(tokenizer_path.read_bytes()).hexdigest()
             if digest != metadata_sha256:
                 raise ValueError("tokenizer sidecar model identity does not match tokenizer.model")
-        metadata_pairs: object = tokenizer_metadata.get("language_pairs")
-        if isinstance(metadata_pairs, Sequence) and not isinstance(metadata_pairs, (str, bytes)):
-            metadata_languages = {
-                str(language)
-                for pair in cast(Sequence[object], metadata_pairs)
-                if isinstance(pair, Sequence) and not isinstance(pair, (str, bytes))
-                for language in cast(Sequence[object], pair)
-            }
-            if metadata_languages and metadata_languages != set(self.tokenizer.languages):
-                raise ValueError(
-                    "tokenizer sidecar languages do not match tokenizer.model: "
-                    f"{sorted(metadata_languages)} != {sorted(self.tokenizer.languages)}"
-                )
         sidecar_pairs = _language_pairs_from_metadata(tokenizer_metadata)
+        metadata_languages = {language for pair in sidecar_pairs for language in pair}
+        if metadata_languages and metadata_languages != set(self.tokenizer.languages):
+            raise ValueError(
+                "tokenizer sidecar languages do not match tokenizer.model: "
+                f"{sorted(metadata_languages)} != {sorted(self.tokenizer.languages)}"
+            )
         export_pairs = _language_pairs_from_metadata(self.export_metadata)
         if (
             sidecar_pairs
@@ -436,6 +427,17 @@ class Translator:
             raise ValueError(
                 "tokenizer sidecar language pairs do not match model metadata: "
                 f"{sidecar_pairs} != {export_pairs}"
+            )
+        sidecar_directions = _translation_directions_from_metadata(tokenizer_metadata)
+        export_directions = _translation_directions_from_metadata(self.export_metadata)
+        if (
+            sidecar_directions
+            and export_directions
+            and set(sidecar_directions) != set(export_directions)
+        ):
+            raise ValueError(
+                "tokenizer sidecar translation directions do not match model metadata: "
+                f"{sidecar_directions} != {export_directions}"
             )
 
     def _load_token_features(
@@ -586,6 +588,12 @@ class Translator:
         source_language: str | None,
         target_language: str,
     ) -> str:
+        target_language = canonicalize_language_tag(target_language, field="target_language")
+        source_language = (
+            canonicalize_language_tag(source_language, field="source_language")
+            if source_language is not None
+            else None
+        )
         if source_language is None:
             source_language = self._other_language(target_language)
             if not source_language:
@@ -727,6 +735,12 @@ class Translator:
         if resolved_seed is not None:
             generator = torch.Generator(device=self.device)
             generator.manual_seed(int(resolved_seed))
+        target_language = canonicalize_language_tag(target_language, field="target_language")
+        source_language = (
+            canonicalize_language_tag(source_language, field="source_language")
+            if source_language is not None
+            else None
+        )
         tag_id = self.tokenizer.language_tags.get(target_language)
         if tag_id is None:
             raise ValueError(

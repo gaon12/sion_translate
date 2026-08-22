@@ -43,6 +43,11 @@ from typing import Any, BinaryIO, cast
 
 import numpy as np
 import torch
+
+from sion_translate.language_tags import (
+    canonicalize_language_pair,
+    canonicalize_language_tags,
+)
 import torch.distributed as dist
 from torch import nn
 
@@ -361,19 +366,21 @@ def _normalize_language_pairs(
     if not raw_pairs:
         return []
     normalized: list[list[str]] = []
-    seen: set[tuple[str, str]] = set()
-    for raw_pair in raw_pairs:
-        if isinstance(raw_pair, (str, bytes)) or not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
-            raw_pair, Sequence
-        ):
-            raise ValueError("each language pair must be a two-item language sequence")
-        pair = [str(language).strip() for language in raw_pair]
-        if len(pair) != 2 or not all(pair) or pair[0] == pair[1]:
-            raise ValueError("each language pair must contain two distinct non-empty languages")
-        key = (pair[0], pair[1])
-        if key not in seen:
-            seen.add(key)
-            normalized.append(pair)
+    seen: set[frozenset[str]] = set()
+    for index, raw_pair in enumerate(raw_pairs):
+        pair = list(
+            canonicalize_language_pair(
+                raw_pair,
+                field=f"language pair[{index}]",
+            )
+        )
+        key = frozenset(pair)
+        if key in seen:
+            raise ValueError(
+                f"duplicate or reversed language pair after BCP 47 canonicalization: {raw_pair!r}"
+            )
+        seen.add(key)
+        normalized.append(pair)
     return normalized
 
 
@@ -398,10 +405,13 @@ def _metadata_languages(metadata: Mapping[str, Any]) -> list[str] | None:
         return _languages_from_pairs(pairs) if pairs else None
     if not isinstance(raw_languages, Sequence) or isinstance(raw_languages, (str, bytes)):
         raise ValueError("metadata.languages must be a sequence")
-    languages = list(dict.fromkeys(str(language).strip() for language in raw_languages))
-    if any(not language for language in languages):
-        raise ValueError("metadata.languages must contain only non-empty languages")
-    return languages
+    return list(
+        canonicalize_language_tags(
+            raw_languages,
+            field="metadata.languages",
+            reject_duplicates=False,
+        )
+    )
 
 
 def _normalize_translation_directions(
@@ -418,7 +428,22 @@ def _normalize_translation_directions(
             if bidirectional:
                 directions.append([target, source])
         return directions
-    directions = _normalize_language_pairs(language_pairs=translation_directions)
+    directions: list[list[str]] = []
+    seen_directions: set[tuple[str, str]] = set()
+    for index, raw_direction in enumerate(translation_directions):
+        direction = list(
+            canonicalize_language_pair(
+                raw_direction,
+                field=f"translation direction[{index}]",
+            )
+        )
+        key = (direction[0], direction[1])
+        if key in seen_directions:
+            raise ValueError(
+                f"duplicate translation direction after BCP 47 canonicalization: {raw_direction!r}"
+            )
+        seen_directions.add(key)
+        directions.append(direction)
     if pairs and not directions:
         raise ValueError(
             "translation_directions cannot be empty when language pairs are configured"
@@ -445,7 +470,7 @@ def _metadata_translation_directions(metadata: Mapping[str, Any]) -> list[list[s
     pairs = _metadata_language_pairs(metadata)
     raw_directions = metadata.get("translation_directions")
     if raw_directions is None:
-        if pairs and _metadata_requires_explicit_direction_graph(metadata):
+        if pairs and metadata_requires_explicit_direction_graph(metadata):
             raise ValueError(
                 "current translation metadata with language pairs requires explicit "
                 "translation_directions"
@@ -466,7 +491,7 @@ def _metadata_translation_directions(metadata: Mapping[str, Any]) -> list[list[s
     )
 
 
-def _metadata_requires_explicit_direction_graph(metadata: Mapping[str, Any]) -> bool:
+def metadata_requires_explicit_direction_graph(metadata: Mapping[str, Any]) -> bool:
     """Whether this artifact belongs to the authenticated direction era."""
 
     if metadata.get("pipeline") is not None:
@@ -664,8 +689,10 @@ def _validated_pipeline_identity_contract(
 
 def _languages_from_pairs(language_pairs: Sequence[Sequence[str]]) -> list[str]:
     return list(
-        dict.fromkeys(
-            str(language) for language_pair in language_pairs for language in language_pair
+        canonicalize_language_tags(
+            [language for language_pair in language_pairs for language in language_pair],
+            field="language pair members",
+            reject_duplicates=False,
         )
     )
 
@@ -752,14 +779,18 @@ def build_export_metadata(
         language_pairs=language_pairs,
     )
     explicit_languages = (
-        list(dict.fromkeys(str(language).strip() for language in languages))
+        list(
+            canonicalize_language_tags(
+                languages,
+                field="languages",
+                reject_duplicates=False,
+            )
+        )
         if languages is not None
         else None
     )
-    if explicit_languages is not None and (
-        not explicit_languages or any(not language for language in explicit_languages)
-    ):
-        raise ValueError("languages must contain at least one non-empty language")
+    if explicit_languages is not None and not explicit_languages:
+        raise ValueError("languages must contain at least one BCP 47 language tag")
     pair_languages = _languages_from_pairs(pairs)
     if explicit_languages is not None:
         missing_pair_languages = sorted(set(pair_languages) - set(explicit_languages))

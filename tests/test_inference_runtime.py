@@ -62,6 +62,13 @@ class ArbitraryGraphFakeTokenizer(FakeTokenizer):
     languages = ("de", "fr", "sw", "ar")
 
 
+class BCP47GraphFakeTokenizer(FakeTokenizer):
+    language_tags = {"pt-BR": 4, "zh-Hant": 5}
+    denoise_tags = {"pt-BR": 7, "zh-Hant": 8}
+    reasoning_tags = {}
+    languages = ("pt-BR", "zh-Hant")
+
+
 def runtime_config(*, experimental: ExperimentalConfig | None = None) -> ModelConfig:
     return ModelConfig(
         vocab_size=64,
@@ -556,6 +563,46 @@ def test_unidirectional_export_rejects_untrained_reverse_direction(
     assert translator._resolve_source_language("ko", "ja") == "ko"
     with pytest.raises(ValueError, match="학습되지 않은 번역 방향"):
         translator._resolve_source_language("ja", "ko")
+
+
+def test_inference_canonicalizes_bcp47_aliases_at_the_api_boundary(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    translator = make_translator(
+        monkeypatch,
+        tmp_path,
+        runtime_config(),
+        language_pairs=(("PT-br", "zh-hant"),),
+        translation_directions=(("PT-br", "zh-hant"),),
+        tokenizer_class=BCP47GraphFakeTokenizer,
+    )
+
+    assert translator.language_pairs == (("pt-BR", "zh-Hant"),)
+    assert translator.translation_directions == (("pt-BR", "zh-Hant"),)
+    assert translator._resolve_source_language("PT-br", "zh-hant") == "pt-BR"
+
+
+def test_inference_rejects_sidecar_and_export_direction_graph_mismatch(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        inference,
+        "load_tokenizer_metadata",
+        lambda _path: {
+            "language_pairs": [["ko", "ja"]],
+            "translation_directions": [["ja", "ko"]],
+        },
+    )
+
+    with pytest.raises(ValueError, match="translation directions do not match"):
+        make_translator(
+            monkeypatch,
+            tmp_path,
+            runtime_config(),
+            translation_directions=(("ko", "ja"),),
+        )
 
 
 def test_translation_direction_metadata_rejects_disconnected_edges(
