@@ -22,6 +22,7 @@ import os
 import platform as platform_module
 import shutil
 import time
+import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -207,7 +208,19 @@ def backup_stale_dataset(dataset_dir: str | Path) -> Path:
     삭제하지 않고 이름을 바꿔 보관하므로, 필요하면 수동으로 되돌릴 수 있습니다.
     """
     dataset_dir = Path(dataset_dir)
-    backup = dataset_dir.with_name(f"{dataset_dir.name}.stale-{time.strftime('%Y%m%d-%H%M%S')}")
+    if not dataset_dir.exists() and not dataset_dir.is_symlink():
+        raise FileNotFoundError(dataset_dir)
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    while True:
+        backup = dataset_dir.with_name(
+            f"{dataset_dir.name}.stale-{timestamp}-{uuid.uuid4().hex[:12]}"
+        )
+        if not backup.exists() and not backup.is_symlink():
+            break
+    # The UUID makes the destination unoccupied, so shutil.move cannot interpret
+    # it as an existing directory and nest the source inside it. Keep shutil's
+    # copy/remove fallback for Windows paths that temporarily reject rename while
+    # a just-closed training artifact is still releasing an OS handle.
     shutil.move(str(dataset_dir), str(backup))
     return backup
 

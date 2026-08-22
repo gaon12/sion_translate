@@ -14,6 +14,7 @@ from sion_translate.auto import (
     EnvironmentInfo,
     _all_devices_support_native_bf16,
     apply_auto_settings,
+    backup_stale_dataset,
     pick_model_preset,
     pick_parallel_strategy,
     pick_vocab_size,
@@ -50,6 +51,22 @@ def gpu_environment(vram: float = 24.0, world_size: int = 8) -> EnvironmentInfo:
         cpu_count=32,
         os_name="Linux",
     )
+
+
+def test_stale_dataset_backups_cannot_collide_or_nest(tmp_path: Path) -> None:
+    dataset = tmp_path / "prepared"
+    dataset.mkdir()
+    (dataset / "generation.txt").write_text("first", encoding="utf-8")
+    first = backup_stale_dataset(dataset)
+    dataset.mkdir()
+    (dataset / "generation.txt").write_text("second", encoding="utf-8")
+    second = backup_stale_dataset(dataset)
+
+    assert first != second
+    assert first.parent == second.parent == tmp_path
+    assert (first / "generation.txt").read_text(encoding="utf-8") == "first"
+    assert (second / "generation.txt").read_text(encoding="utf-8") == "second"
+    assert not (first / second.name).exists()
 
 
 def test_distributed_environment_uses_the_least_capable_rank(monkeypatch) -> None:
