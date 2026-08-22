@@ -289,6 +289,133 @@ def test_row_scoped_training_direction_prevents_synthetic_reverse_labels(
     assert sample["training_direction"] == ["sw", "ar"]
 
 
+def test_real_duplicate_precedes_a_row_scoped_synthetic_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepare_module = importlib.import_module("sion_translate.data.prepare")
+
+    class StubTokenizer:
+        languages = ("sw", "ar")
+
+        def __init__(self, _model_path: str | Path):
+            pass
+
+        @staticmethod
+        def encode(text: str) -> list[int]:
+            return [ord(character) for character in text]
+
+    monkeypatch.setattr(prepare_module, "SionTokenizer", StubTokenizer)
+    tokenizer_path = tmp_path / "tokenizer.model"
+    tokenizer_path.write_bytes(b"stub tokenizer")
+    parallel = {
+        "sw": "sentensi ile ile ya majaribio",
+        "ar": "هذه هي جملة الاختبار نفسها",
+    }
+    (tmp_path / "bt_a.jsonl").write_text(
+        json.dumps(
+            {
+                **parallel,
+                "synthetic": True,
+                "training_direction": ["sw", "ar"],
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "real.jsonl").write_text(
+        json.dumps(parallel, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    dataset_root = tmp_path / "dataset"
+
+    stats = prepare_dataset(
+        [str(tmp_path)],
+        tokenizer_path,
+        dataset_root,
+        language_pairs=(("sw", "ar"),),
+        translation_directions=(("sw", "ar"), ("ar", "sw")),
+        validation_fraction=0.0,
+        test_fraction=0.0,
+        filter_quality=False,
+        dedup_backend="memory",
+        num_workers=1,
+    )
+    dataset = IndexedParallelDataset(dataset_root, "train", bidirectional=True)
+
+    assert stats.valid_pairs == 1
+    assert stats.synthetic_pairs == 0
+    assert stats.forward_only_pairs == 0
+    assert dataset.pair_count == 1
+    assert len(dataset) == 2
+    assert dataset.pair_synthetic_flags is not None
+    assert not bool(dataset.pair_synthetic_flags[0])
+
+
+@pytest.mark.parametrize("dedup_backend", ["memory", "sqlite"])
+def test_opposite_row_scoped_directions_are_distinct_supervision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    dedup_backend: str,
+) -> None:
+    prepare_module = importlib.import_module("sion_translate.data.prepare")
+
+    class StubTokenizer:
+        languages = ("sw", "ar")
+
+        def __init__(self, _model_path: str | Path):
+            pass
+
+        @staticmethod
+        def encode(text: str) -> list[int]:
+            return [ord(character) for character in text]
+
+    monkeypatch.setattr(prepare_module, "SionTokenizer", StubTokenizer)
+    tokenizer_path = tmp_path / "tokenizer.model"
+    tokenizer_path.write_bytes(b"stub tokenizer")
+    parallel = {
+        "sw": "sentensi ile ile ya majaribio",
+        "ar": "هذه هي جملة الاختبار نفسها",
+        "synthetic": True,
+    }
+    for index, direction in enumerate((("sw", "ar"), ("ar", "sw"))):
+        (tmp_path / f"bt_{index}.jsonl").write_text(
+            json.dumps(
+                {**parallel, "training_direction": list(direction)},
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    dataset_root = tmp_path / "dataset"
+
+    stats = prepare_dataset(
+        [str(tmp_path)],
+        tokenizer_path,
+        dataset_root,
+        language_pairs=(("sw", "ar"),),
+        translation_directions=(("sw", "ar"), ("ar", "sw")),
+        validation_fraction=0.0,
+        test_fraction=0.0,
+        filter_quality=False,
+        dedup_backend=dedup_backend,
+        num_workers=1,
+    )
+    dataset = IndexedParallelDataset(dataset_root, "train", bidirectional=True)
+    observed_directions = {
+        (sample["src_language"], sample["target_language"])
+        for sample in (dataset[index] for index in range(len(dataset)))
+    }
+
+    assert stats.valid_pairs == 2
+    assert stats.synthetic_pairs == 2
+    assert stats.forward_only_pairs == 2
+    assert dataset.pair_count == 2
+    assert len(dataset) == 2
+    assert observed_directions == {("sw", "ar"), ("ar", "sw")}
+
+
 def test_prepare_rejects_row_direction_outside_the_training_graph(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

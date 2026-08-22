@@ -426,18 +426,36 @@ def _prepare_input_batches(
     quality_policy: QualityPolicy,
     filter_quality: bool,
     language_pairs: tuple[tuple[str, str], ...],
+    train_only_prefixes: tuple[str, ...],
     batch_size: int = 512,
 ) -> Iterator[_PrepareBatchInput]:
-    for source_id, path in enumerate(paths):
-        with path.open("rb") as handle:
-            rows: list[bytes] = []
-            for raw_line in handle:
-                rows.append(raw_line)
-                if len(rows) >= batch_size:
+    # Real rows own duplicate precedence even when a synthetic filename sorts
+    # first or a single source mixes row-level ``synthetic`` markers. Reading
+    # mixed files twice avoids buffering an unbounded corpus merely to reorder
+    # it; every line is yielded in exactly one pass.
+    for synthetic_pass in (False, True):
+        for source_id, path in enumerate(paths):
+            path_is_synthetic = synthetic_path(path, train_only_prefixes)
+            if path_is_synthetic != synthetic_pass and path_is_synthetic:
+                continue
+            with path.open("rb") as handle:
+                rows: list[bytes] = []
+                for raw_line in handle:
+                    row_is_synthetic = path_is_synthetic
+                    if not path_is_synthetic:
+                        try:
+                            decoded = raw_line.decode("utf-8-sig")
+                            row_is_synthetic = synthetic_record(json.loads(decoded))
+                        except (UnicodeDecodeError, json.JSONDecodeError):
+                            row_is_synthetic = False
+                    if row_is_synthetic != synthetic_pass:
+                        continue
+                    rows.append(raw_line)
+                    if len(rows) >= batch_size:
+                        yield source_id, rows, quality_policy, filter_quality, language_pairs
+                        rows = []
+                if rows:
                     yield source_id, rows, quality_policy, filter_quality, language_pairs
-                    rows = []
-            if rows:
-                yield source_id, rows, quality_policy, filter_quality, language_pairs
 
 
 def _increment(stats: PrepareStats, field: str, amount: int = 1) -> None:
@@ -1663,6 +1681,7 @@ def prepare_dataset(
         quality_policy,
         filter_quality,
         normalized_pairs,
+        train_only_prefixes,
     )
     try:
         if workers <= 1:
@@ -1746,6 +1765,8 @@ def prepare_dataset(
                     rejection_reasons,
                     warning_reasons,
                 ) = payload
+                dedup_language_a, dedup_language_b = language_a, language_b
+                dedup_text_a, dedup_text_b = text_a, text_b
                 _record_quality_reasons(targets, rejection_reasons)
                 if "structured_span_mismatch" in warning_reasons:
                     for target in targets:
@@ -1834,14 +1855,33 @@ def prepare_dataset(
                             _increment(target, "split_conflicts")
                         continue
 
-                pair_key = (
-                    f"{language_a}\0{dedup_key(text_a)}\0{language_b}\0{dedup_key(text_b)}"
-                ).encode("utf-8")
-                pair_digest = hashlib.sha256(pair_key).digest()[:16]
-                if not digest_store.add_if_new(pair_digest):
+                supervised_directions = [(language_a, language_b)]
+                if not forward_only:
+                    supervised_directions.append((language_b, language_a))
+                claimed_directions: list[tuple[str, str]] = []
+                for supervised_direction in supervised_directions:
+                    direction_key = (
+                        f"{dedup_language_a}\0{dedup_key(dedup_text_a)}\0"
+                        f"{dedup_language_b}\0{dedup_key(dedup_text_b)}\0"
+                        f"{supervised_direction[0]}\0{supervised_direction[1]}"
+                    ).encode("utf-8")
+                    direction_digest = hashlib.sha256(direction_key).digest()[:16]
+                    if digest_store.add_if_new(direction_digest):
+                        claimed_directions.append(supervised_direction)
+                if not claimed_directions:
                     for target in targets:
                         _increment(target, "duplicates")
                     continue
+                if len(claimed_directions) == 1 and len(supervised_directions) == 2:
+                    claimed_direction = claimed_directions[0]
+                    if (language_a, language_b) != claimed_direction:
+                        language_a, language_b = language_b, language_a
+                        text_a, text_b = text_b, text_a
+                        ids_a, ids_b = ids_b, ids_a
+                        register_a, register_b = register_b, register_a
+                    forward_only = True
+                    metadata = dict(metadata)
+                    metadata["training_direction"] = list(claimed_direction)
 
                 writers[split].add(
                     ids_a,
