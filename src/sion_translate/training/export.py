@@ -363,6 +363,8 @@ def _normalize_language_pairs(
     normalized: list[list[str]] = []
     seen: set[tuple[str, str]] = set()
     for raw_pair in raw_pairs:
+        if isinstance(raw_pair, (str, bytes)) or not isinstance(raw_pair, Sequence):
+            raise ValueError("each language pair must be a two-item language sequence")
         pair = [str(language).strip() for language in raw_pair]
         if len(pair) != 2 or not all(pair) or pair[0] == pair[1]:
             raise ValueError("each language pair must contain two distinct non-empty languages")
@@ -427,6 +429,13 @@ def _normalize_translation_directions(
         raise ValueError(
             f"translation directions must belong to configured language pairs: {disconnected!r}"
         )
+    covered_edges = {frozenset(direction) for direction in directions}
+    missing_pairs = [pair for pair in pairs if frozenset(pair) not in covered_edges]
+    if missing_pairs:
+        raise ValueError(
+            "every language pair must have at least one translation direction: "
+            f"missing={missing_pairs!r}"
+        )
     return directions
 
 
@@ -434,9 +443,16 @@ def _metadata_translation_directions(metadata: Mapping[str, Any]) -> list[list[s
     pairs = _metadata_language_pairs(metadata)
     raw_directions = metadata.get("translation_directions")
     if raw_directions is None:
-        # Manifests predating explicit direction metadata represented
-        # bidirectional checkpoints, so preserve their historical contract.
-        return _normalize_translation_directions(pairs, bidirectional=True)
+        if pairs and _metadata_requires_explicit_direction_graph(metadata):
+            raise ValueError(
+                "current translation metadata with language pairs requires explicit "
+                "translation_directions"
+            )
+        # Older exports did not record whether DataConfig.bidirectional was
+        # true or false.  An absent graph is therefore unknown, not evidence
+        # that both directions were trained.  Conversion may authenticate it
+        # only through an explicit caller policy.
+        return []
     if not isinstance(raw_directions, Sequence) or isinstance(
         raw_directions,
         (str, bytes),
@@ -445,6 +461,19 @@ def _metadata_translation_directions(metadata: Mapping[str, Any]) -> list[list[s
     return _normalize_translation_directions(
         pairs,
         translation_directions=raw_directions,
+    )
+
+
+def _metadata_requires_explicit_direction_graph(metadata: Mapping[str, Any]) -> bool:
+    """Whether this artifact belongs to the authenticated direction era."""
+
+    if metadata.get("pipeline") is not None:
+        return True
+    release_version = metadata.get("release_version")
+    return bool(
+        isinstance(release_version, str)
+        and _MODEL_VERSION_PATTERN.fullmatch(release_version.strip())
+        and _release_version_at_least(release_version.strip(), (1, 5))
     )
 
 
@@ -2638,6 +2667,7 @@ def convert_export(
     token_features_path: str | Path | None = None,
     language_pair: Sequence[str] | None = None,
     language_pairs: Sequence[Sequence[str]] | None = None,
+    translation_directions: Sequence[Sequence[str]] | None = None,
     bidirectional: bool | None = None,
     revision_trained: bool | None = None,
     int4_backend: str = "auto",
@@ -2760,19 +2790,49 @@ def convert_export(
             "explicit language pairs conflict with source metadata; "
             "conversion cannot relabel translation capabilities"
         )
+    if (
+        pair_override_supplied
+        and resolved_pairs
+        and not inherited_pairs
+        and translation_directions is None
+        and bidirectional is None
+    ):
+        raise ValueError(
+            "source export has no trained direction graph; explicit language pairs require "
+            "translation_directions or an explicit bidirectional policy"
+        )
     inherited_directions = _metadata_translation_directions(inherited) if inherited_pairs else []
+    inherited_graph_authenticated = "translation_directions" in inherited
     resolved_directions = inherited_directions
-    if bidirectional is not None:
+    if translation_directions is not None and bidirectional is not None:
+        raise ValueError("use translation_directions or bidirectional, not both")
+    if translation_directions is not None:
+        explicit_directions = _normalize_translation_directions(
+            resolved_pairs,
+            translation_directions=translation_directions,
+        )
+        if inherited_graph_authenticated and explicit_directions != inherited_directions:
+            raise ValueError(
+                "explicit translation directions conflict with source metadata; "
+                "conversion cannot relabel translation capabilities"
+            )
+        resolved_directions = explicit_directions
+    elif bidirectional is not None:
         explicit_directions = _normalize_translation_directions(
             resolved_pairs,
             bidirectional=bidirectional,
         )
-        if inherited_pairs and explicit_directions != inherited_directions:
+        if inherited_graph_authenticated and explicit_directions != inherited_directions:
             raise ValueError(
                 "explicit bidirectional policy conflicts with source translation directions; "
                 "conversion cannot relabel translation capabilities"
             )
         resolved_directions = explicit_directions
+    elif inherited_pairs and not inherited_graph_authenticated:
+        raise ValueError(
+            "legacy source export has language pairs but no authenticated direction graph; "
+            "pass translation_directions or an explicit bidirectional policy"
+        )
     inherited_revision = _metadata_revision_capability(inherited)
     if (
         revision_trained is not None
@@ -2880,6 +2940,8 @@ def load_exported_model(
             translation_capable=metadata.get("translation_capable"),
         )
         _validated_pipeline_identity_contract(metadata)
+        if _metadata_translation_capable(metadata) and _metadata_language_pairs(metadata):
+            _metadata_translation_directions(metadata)
     config = _model_config_from_dict(payload["model_config"])
     pad_id = int(payload["pad_id"])
     stored = payload["model"]

@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
+from types import SimpleNamespace
 
 import pytest
 
+import sion_translate.cli.evaluate as evaluate_cli
+from sion_translate.cli.evaluate import resolve_evaluation_directions
+from sion_translate.cli.translate import resolve_translation_target
 from sion_translate.data.prepare import prepare_dataset
 from sion_translate.evaluation import (
     DirectionResult,
@@ -83,6 +88,120 @@ def test_load_benchmark_pairs_expands_multiple_language_pairs(tmp_path: Path) ->
         ("ru", "en"),
     }
     assert pairs[("en", "ru")] == [("An English sentence.", "Русское предложение.")]
+
+
+def test_load_benchmark_pairs_respects_an_exact_mixed_direction_graph(
+    tmp_path: Path,
+) -> None:
+    benchmark = tmp_path / "mixed.jsonl"
+    benchmark.write_text(
+        json.dumps(
+            {
+                "de": "Ein deutscher Satz.",
+                "fr": "Une phrase française.",
+                "sw": "Sentensi ya Kiswahili.",
+                "ar": "جملة عربية.",
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    directions = (("de", "fr"), ("fr", "de"), ("sw", "ar"))
+
+    pairs = load_benchmark_pairs(
+        [benchmark],
+        (("de", "fr"), ("sw", "ar")),
+        translation_directions=directions,
+        max_samples_per_direction=10,
+    )
+
+    assert tuple(pairs) == directions
+    assert ("ar", "sw") not in pairs
+    assert pairs[("sw", "ar")] == [("Sentensi ya Kiswahili.", "جملة عربية.")]
+
+
+def test_cli_direction_resolution_uses_only_the_model_graph() -> None:
+    directions = (("de", "fr"), ("fr", "de"), ("sw", "ar"))
+
+    assert resolve_evaluation_directions("both", directions) == list(directions)
+    assert resolve_evaluation_directions("sw-ar", directions) == [("sw", "ar")]
+    with pytest.raises(SystemExit, match="다음 중 하나"):
+        resolve_evaluation_directions("ar-sw", directions)
+
+
+def test_translate_target_resolution_uses_reachable_model_edges() -> None:
+    directions = (("de", "fr"), ("fr", "de"), ("sw", "ar"))
+
+    assert resolve_translation_target(None, None, directions) == "fr"
+    assert resolve_translation_target(None, "sw", directions) == "ar"
+    assert resolve_translation_target("de", "fr", directions) == "de"
+    with pytest.raises(SystemExit, match="출발하는 학습 방향"):
+        resolve_translation_target(None, "ar", directions)
+    with pytest.raises(SystemExit, match="학습된 target"):
+        resolve_translation_target("sw", None, directions)
+
+
+def test_evaluate_main_records_model_owned_language_pairs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class FakeTranslator:
+        language_pairs = (("sw", "ar"),)
+        translation_directions = (("sw", "ar"),)
+        tokenizer = object()
+
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def translate(self, *_args: object, **_kwargs: object) -> list[str]:
+            return ["الهدف"]
+
+    config = SimpleNamespace(
+        training=SimpleNamespace(output_dir="exports"),
+        data=SimpleNamespace(tokenizer_model="tokenizer.model", glossary=None),
+    )
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(evaluate_cli, "load_raw_config", lambda *_args: {})
+    monkeypatch.setattr(evaluate_cli, "config_from_raw", lambda _raw: config)
+    monkeypatch.setattr(evaluate_cli, "Translator", FakeTranslator)
+    monkeypatch.setattr(
+        evaluate_cli,
+        "load_benchmark_pairs",
+        lambda *_args, **_kwargs: {("sw", "ar"): [("chanzo", "الهدف")]},
+    )
+    monkeypatch.setattr(
+        evaluate_cli,
+        "score_translations",
+        lambda *_args, **_kwargs: (100.0, 100.0, "char"),
+    )
+
+    def capture_results(
+        _results: object,
+        _output: object,
+        *,
+        metadata: dict[str, object],
+    ) -> None:
+        captured.update(metadata)
+
+    monkeypatch.setattr(evaluate_cli, "save_results", capture_results)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "sion-evaluate",
+            "--benchmark",
+            "benchmark.jsonl",
+            "--model",
+            "model.pt",
+            "--output",
+            str(tmp_path / "evaluation"),
+        ],
+    )
+
+    evaluate_cli.main()
+
+    assert captured["language_pairs"] == [["sw", "ar"]]
 
 
 def test_load_split_pairs_round_trips_text(tmp_path: Path) -> None:

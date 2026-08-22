@@ -92,6 +92,29 @@ def log(message: str) -> None:
     print(f"[sion] {message}", flush=True)
 
 
+def resolve_evaluation_directions(
+    requested: str,
+    trained_directions: tuple[tuple[str, str], ...],
+) -> list[tuple[str, str]]:
+    """Resolve CLI direction labels against the model's exact trained graph."""
+
+    if not trained_directions:
+        raise SystemExit("모델에 인증된 translation_directions가 없습니다")
+    if requested == "both":
+        return list(trained_directions)
+    matches = [
+        direction
+        for direction in trained_directions
+        if f"{direction[0]}-{direction[1]}" == requested
+    ]
+    if len(matches) != 1:
+        valid = ", ".join(
+            ["both", *(f"{source}-{target}" for source, target in trained_directions)]
+        )
+        raise SystemExit(f"--direction 은 다음 중 하나여야 합니다: {valid}")
+    return matches
+
+
 def main() -> None:
     configure_stdio()
     args = build_parser().parse_args()
@@ -100,20 +123,11 @@ def main() -> None:
         DEFAULT_CONFIG_FILE if Path(DEFAULT_CONFIG_FILE).exists() else None
     )
     config = config_from_raw(load_raw_config(config_path) if config_path else {})
-    configured_pairs = config.data.configured_language_pairs()
-    configured_edges = {frozenset(pair) for pair in configured_pairs}
+    model_path = args.model or find_exported_model(config.training.output_dir, int8=args.int8)
+    translator = Translator(model_path, config.data.tokenizer_model)
 
     # ── 평가 방향 결정 ──────────────────────────────────────────────────
-    if args.direction == "both":
-        directions = [
-            direction for pair in configured_pairs for direction in (pair, (pair[1], pair[0]))
-        ]
-    else:
-        source, _, target = args.direction.partition("-")
-        if frozenset((source, target)) not in configured_edges:
-            valid = ", ".join(f"{left}-{right}/{right}-{left}" for left, right in configured_pairs)
-            raise SystemExit(f"--direction 은 both 또는 다음 중 하나여야 합니다: {valid}")
-        directions = [(source, target)]
+    directions = resolve_evaluation_directions(args.direction, translator.translation_directions)
     if (args.compare or args.export_sources) and len(directions) != 1:
         raise SystemExit(
             "--compare / --export-sources 는 --direction 을 한 방향으로 지정해야 합니다"
@@ -127,13 +141,12 @@ def main() -> None:
         log(f"글로서리 적용: {glossary_path} ({len(glossary)}개 용어)")
 
     # ── 평가쌍 로드 ─────────────────────────────────────────────────────
-    model_path = args.model or find_exported_model(config.training.output_dir, int8=args.int8)
-    translator = Translator(model_path, config.data.tokenizer_model)
     if args.benchmark:
         log(f"벤치마크 로드: {', '.join(args.benchmark)}")
         pairs = load_benchmark_pairs(
             args.benchmark,
-            configured_pairs,
+            translator.language_pairs,
+            translation_directions=translator.translation_directions,
             max_samples_per_direction=args.max_samples,
         )
         eval_set_name = ";".join(args.benchmark)
@@ -259,7 +272,7 @@ def main() -> None:
             "eval_set": eval_set_name,
             "num_beams": args.num_beams,
             "max_samples": args.max_samples,
-            "language_pairs": [list(pair) for pair in configured_pairs],
+            "language_pairs": [list(pair) for pair in translator.language_pairs],
         },
     )
     log(f"저장: {output}.json / {output}.md")

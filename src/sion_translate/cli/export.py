@@ -40,7 +40,20 @@ def build_parser() -> argparse.ArgumentParser:
         metavar=("SOURCE", "TARGET"),
         help=("내보낼 언어 방향. 여러 번 지정 가능: --language-pair ko ja --language-pair en ru"),
     )
-    parser.add_argument(
+    direction_policy = parser.add_mutually_exclusive_group()
+    direction_policy.add_argument(
+        "--translation-direction",
+        nargs=2,
+        action="append",
+        metavar=("SOURCE", "TARGET"),
+        help="실제로 학습된 방향을 반복 지정; 기존 metadata와 정확히 일치해야 함",
+    )
+    direction_policy.add_argument(
+        "--bidirectional",
+        action="store_true",
+        help="각 --language-pair의 양방향이 모두 학습됐음을 명시적으로 인증",
+    )
+    direction_policy.add_argument(
         "--unidirectional",
         action="store_true",
         help="각 --language-pair의 SOURCE→TARGET 방향만 학습된 것으로 기록",
@@ -108,7 +121,8 @@ def main() -> None:
         tokenizer_path=args.tokenizer,
         token_features_path=args.token_features,
         language_pairs=args.language_pairs,
-        bidirectional=not args.unidirectional,
+        translation_directions=args.translation_direction,
+        bidirectional=(True if args.bidirectional else False if args.unidirectional else None),
         revision_trained=revision_trained,
         release_name=args.release_name,
         release_version=args.release_version,

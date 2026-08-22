@@ -28,7 +28,11 @@ from sion_translate.tokenizer import (
     tokenizer_split_digits_policy,
 )
 from sion_translate.fp8_runtime import describe_runtime, prepare_fp8_model_for_device
-from sion_translate.training.export import load_exported_model, resolve_manifest_artifact
+from sion_translate.training.export import (
+    _metadata_requires_explicit_direction_graph,
+    load_exported_model,
+    resolve_manifest_artifact,
+)
 
 
 def _language_pairs_from_metadata(
@@ -68,7 +72,12 @@ def _translation_directions_from_metadata(
     pairs = _language_pairs_from_metadata(metadata)
     raw_directions: object = metadata.get("translation_directions")
     if raw_directions is None:
-        return tuple(direction for pair in pairs for direction in (pair, (pair[1], pair[0])))
+        if pairs and _metadata_requires_explicit_direction_graph(metadata):
+            raise ValueError(
+                "current translation metadata with language pairs requires explicit "
+                "translation_directions"
+            )
+        return ()
     if not isinstance(raw_directions, Sequence) or isinstance(
         raw_directions,
         (str, bytes),
@@ -93,6 +102,13 @@ def _translation_directions_from_metadata(
         if direction not in seen:
             seen.add(direction)
             directions.append(direction)
+    covered_edges = {frozenset(direction) for direction in directions}
+    missing_pairs = [pair for pair in pairs if frozenset(pair) not in covered_edges]
+    if missing_pairs:
+        raise ValueError(
+            "translation direction metadata must cover every language pair: "
+            f"missing={missing_pairs!r}"
+        )
     return tuple(directions)
 
 
@@ -210,10 +226,11 @@ class Translator:
                 self.tokenizer_metadata
             )
         if not self.translation_directions:
-            self.translation_directions = tuple(
-                direction
-                for pair in self.language_pairs
-                for direction in (pair, (pair[1], pair[0]))
+            raise ValueError(
+                "번역 방향 metadata가 없습니다. 구형 export의 language_pairs만으로는 "
+                "단방향/양방향 학습 여부를 인증할 수 없습니다. sion-export에서 "
+                "--bidirectional, --unidirectional 또는 --translation-direction을 "
+                "명시해 다시 변환하세요."
             )
         self._translation_direction_edges: set[tuple[str, str]] = set(self.translation_directions)
         self._validate_compatibility(tokenizer_path)

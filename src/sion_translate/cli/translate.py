@@ -36,7 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="원문 언어 (다국어 모델에서는 필수)",
     )
     parser.add_argument(
-        "--to", dest="target", help="목표 언어 (기본: 언어쌍의 두 번째, ko-ja 면 ja)"
+        "--to", dest="target", help="목표 언어 (기본: 모델이 기록한 첫 학습 방향의 target)"
     )
     parser.add_argument("--model", help="내보낸 모델 경로 (기본: exports 에서 자동 탐색)")
     parser.add_argument(
@@ -128,6 +128,35 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def resolve_translation_target(
+    requested: str | None,
+    source_language: str | None,
+    trained_directions: Sequence[Sequence[str]],
+) -> str:
+    """Resolve a target only from directions authenticated by the model artifact."""
+
+    directions = [tuple(map(str, direction)) for direction in trained_directions]
+    if not directions:
+        raise SystemExit("모델에 인증된 translation_directions가 없습니다")
+    if requested is not None:
+        target = requested
+    elif source_language is not None:
+        reachable = [target for source, target in directions if source == source_language]
+        if not reachable:
+            supported = ", ".join(f"{source}→{target}" for source, target in directions)
+            raise SystemExit(
+                f"--from {source_language} 에서 출발하는 학습 방향이 없습니다 (지원: {supported})"
+            )
+        target = reachable[0]
+    else:
+        target = directions[0][1]
+    trained_targets = {direction[1] for direction in directions}
+    if target not in trained_targets:
+        supported = ", ".join(f"{source}→{destination}" for source, destination in directions)
+        raise SystemExit(f"--to {target} 는 학습된 target이 아닙니다 (지원: {supported})")
+    return target
+
+
 def main() -> None:
     configure_stdio()
     args = build_parser().parse_args()
@@ -141,13 +170,19 @@ def main() -> None:
     model_path = args.model or find_exported_model(config.training.output_dir, int8=args.int8)
     translator = Translator(model_path, config.data.tokenizer_model)
 
-    # 목표 언어: 지정하지 않으면 언어쌍의 두 번째 언어 (ko-ja 면 ja).
-    default_pair = config.data.configured_language_pairs()[0]
-    target = args.target or default_pair[1]
-    if target not in translator.languages:
-        raise SystemExit(
-            f"--to {target} 는 이 모델이 지원하지 않습니다 (지원: {sorted(translator.languages)})"
+    target = resolve_translation_target(
+        args.target,
+        args.source,
+        translator.translation_directions,
+    )
+    if args.source is not None and (
+        args.source,
+        target,
+    ) not in set(translator.translation_directions):
+        supported = ", ".join(
+            f"{source}→{destination}" for source, destination in translator.translation_directions
         )
+        raise SystemExit(f"{args.source}→{target} 는 학습되지 않은 방향입니다 (지원: {supported})")
 
     # 글로서리: --glossary > 설정 data.glossary. --no-glossary 면 끔.
     glossary = None

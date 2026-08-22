@@ -27,7 +27,11 @@ from pathlib import Path
 from typing import Sequence
 
 from sion_translate.data import IndexedParallelDataset
-from sion_translate.data.records import expand_parallel_record, normalize_language_pairs
+from sion_translate.data.records import (
+    expand_parallel_record,
+    normalize_language_pairs,
+    normalize_translation_directions,
+)
 from sion_translate.structured import structured_signature
 from sion_translate.tokenizer import SionTokenizer
 
@@ -268,6 +272,7 @@ def load_benchmark_pairs(
     paths: Sequence[str | Path],
     language_pair: Sequence[str] | Sequence[Sequence[str]],
     *,
+    translation_directions: Sequence[Sequence[str]] | None = None,
     max_samples_per_direction: int,
 ) -> dict[tuple[str, str], list[tuple[str, str]]]:
     """외부 벤치마크 JSONL(FLORES 변환본 등)을 평가쌍으로 읽습니다.
@@ -281,8 +286,12 @@ def load_benchmark_pairs(
         language_pairs = normalize_language_pairs(
             language_pairs=language_pair  # type: ignore[arg-type]
         )
+    directions = normalize_translation_directions(
+        language_pairs,
+        translation_directions,
+    )
     output: dict[tuple[str, str], list[tuple[str, str]]] = {
-        direction: [] for pair in language_pairs for direction in (pair, (pair[1], pair[0]))
+        direction: [] for direction in directions
     }
     for path in paths:
         with Path(path).open("r", encoding="utf-8") as handle:
@@ -293,11 +302,11 @@ def load_benchmark_pairs(
                 row = json.loads(line)
                 expansion = expand_parallel_record(row, language_pairs)
                 for pair in expansion.pairs:
-                    forward = output[(pair.language_a, pair.language_b)]
-                    reverse = output[(pair.language_b, pair.language_a)]
-                    if len(forward) < max_samples_per_direction:
+                    forward = output.get((pair.language_a, pair.language_b))
+                    reverse = output.get((pair.language_b, pair.language_a))
+                    if forward is not None and len(forward) < max_samples_per_direction:
                         forward.append((pair.text_a, pair.text_b))
-                    if len(reverse) < max_samples_per_direction:
+                    if reverse is not None and len(reverse) < max_samples_per_direction:
                         reverse.append((pair.text_b, pair.text_a))
                 if all(len(samples) >= max_samples_per_direction for samples in output.values()):
                     break

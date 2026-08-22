@@ -142,9 +142,12 @@ def make_translator(
         metadata["capabilities"] = {"revision_trained": revision_trained}
     if quantization is not None:
         metadata["quantization"] = quantization
-    if translation_directions is not None:
+    authenticated_directions = translation_directions or tuple(
+        direction for pair in language_pairs for direction in (pair, (pair[1], pair[0]))
+    )
+    if authenticated_directions:
         metadata["translation_directions"] = [
-            list(direction) for direction in translation_directions
+            list(direction) for direction in authenticated_directions
         ]
     monkeypatch.setattr(inference, "SionTokenizer", tokenizer_class)
     monkeypatch.setattr(
@@ -566,6 +569,48 @@ def test_translation_direction_metadata_rejects_disconnected_edges(
             runtime_config(),
             translation_directions=(("ko", "ru"),),
         )
+
+
+def test_translation_direction_metadata_rejects_an_uncovered_pair(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="cover every language pair"):
+        make_translator(
+            monkeypatch,
+            tmp_path,
+            runtime_config(),
+            language_pairs=(("de", "fr"), ("sw", "ar")),
+            translation_directions=(("de", "fr"),),
+            tokenizer_class=ArbitraryGraphFakeTokenizer,
+        )
+
+
+def test_current_translation_metadata_rejects_a_missing_direction_graph() -> None:
+    metadata = {
+        "release_name": "sion_translate",
+        "release_version": "1.5",
+        "translation_capable": True,
+        "pipeline": {
+            "schema": "sion-translation-pipeline-v2",
+            "branch": "translation-only",
+        },
+        "language_pairs": [["de", "fr"], ["sw", "ar"]],
+    }
+
+    with pytest.raises(ValueError, match="requires explicit translation_directions"):
+        inference._translation_directions_from_metadata(metadata)
+
+
+def test_legacy_missing_direction_graph_remains_unknown() -> None:
+    metadata = {
+        "release_name": "sion_translate",
+        "release_version": "1.4",
+        "translation_capable": True,
+        "language_pairs": [["de", "fr"], ["sw", "ar"]],
+    }
+
+    assert inference._translation_directions_from_metadata(metadata) == ()
 
 
 def test_cpu_only_quantization_metadata_overrides_requested_cuda(

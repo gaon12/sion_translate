@@ -813,6 +813,138 @@ def test_export_metadata_records_exact_trained_translation_directions() -> None:
     assert metadata["translation_directions"] == [["ko", "ja"], ["en", "ru"]]
 
 
+def test_export_metadata_rejects_an_uncovered_language_pair() -> None:
+    with pytest.raises(ValueError, match="every language pair"):
+        build_export_metadata(
+            export_config(),
+            language_pairs=(("de", "fr"), ("sw", "ar")),
+            translation_directions=(("de", "fr"),),
+        )
+
+
+@pytest.mark.parametrize(
+    "language_pairs",
+    [
+        ("de",),
+        ({"source": "de", "target": "fr"},),
+    ],
+)
+def test_export_metadata_rejects_non_sequence_pair_entries(
+    language_pairs: object,
+) -> None:
+    with pytest.raises(ValueError, match="two-item language sequence"):
+        build_export_metadata(
+            export_config(),
+            language_pairs=language_pairs,  # type: ignore[arg-type]
+        )
+
+
+def test_conversion_preserves_an_exact_mixed_translation_graph(tmp_path: Path) -> None:
+    config = export_config()
+    model = SionForConditionalGeneration(config)
+    source_dir = tmp_path / "source"
+    directions = (("de", "fr"), ("fr", "de"), ("sw", "ar"))
+    export_state_dict_formats(
+        source_dir,
+        model.state_dict(),
+        config,
+        0,
+        formats=("fp32",),
+        metadata=build_export_metadata(
+            config,
+            language_pairs=(("de", "fr"), ("sw", "ar")),
+            translation_directions=directions,
+        ),
+    )
+
+    converted = convert_export(
+        source_dir / "model.pt",
+        tmp_path / "converted",
+        formats=("fp16",),
+    )
+
+    assert converted["metadata"]["language_pairs"] == [["de", "fr"], ["sw", "ar"]]
+    assert converted["metadata"]["translation_directions"] == [
+        list(direction) for direction in directions
+    ]
+    rejected_dir = tmp_path / "rejected"
+    with pytest.raises(ValueError, match="cannot relabel translation capabilities"):
+        convert_export(
+            source_dir / "model.pt",
+            rejected_dir,
+            formats=("fp16",),
+            translation_directions=(("de", "fr"), ("sw", "ar")),
+        )
+    assert not rejected_dir.exists()
+
+
+def test_current_export_rejects_a_missing_direction_graph(tmp_path: Path) -> None:
+    config = export_config()
+    model = SionForConditionalGeneration(config)
+    source_dir = tmp_path / "source"
+    export_state_dict_formats(
+        source_dir,
+        model.state_dict(),
+        config,
+        0,
+        formats=("fp32",),
+        metadata=build_export_metadata(
+            config,
+            language_pairs=(("de", "fr"),),
+            translation_directions=(("de", "fr"),),
+        ),
+    )
+    source = source_dir / "model.pt"
+    payload = torch.load(source, weights_only=True)
+    payload["metadata"].pop("translation_directions")
+    torch.save(payload, source)
+
+    with pytest.raises(ValueError, match="requires explicit translation_directions"):
+        load_exported_model(source)
+    with pytest.raises(ValueError, match="requires explicit translation_directions"):
+        convert_export(
+            source,
+            tmp_path / "converted",
+            formats=("fp16",),
+            bidirectional=False,
+        )
+
+
+def test_legacy_conversion_requires_and_accepts_an_explicit_direction_policy(
+    tmp_path: Path,
+) -> None:
+    config = export_config()
+    model = SionForConditionalGeneration(config)
+    source_dir = tmp_path / "source"
+    export_state_dict_formats(
+        source_dir,
+        model.state_dict(),
+        config,
+        0,
+        formats=("fp32",),
+        metadata=build_export_metadata(
+            config,
+            language_pairs=(("de", "fr"),),
+            release_version="1.4",
+        ),
+    )
+    source = source_dir / "model.pt"
+    payload = torch.load(source, weights_only=True)
+    payload["metadata"].pop("translation_directions")
+    torch.save(payload, source)
+
+    with pytest.raises(ValueError, match="no authenticated direction graph"):
+        convert_export(source, tmp_path / "ambiguous", formats=("fp16",))
+
+    converted = convert_export(
+        source,
+        tmp_path / "unidirectional",
+        formats=("fp16",),
+        bidirectional=False,
+    )
+    assert converted["metadata"]["translation_directions"] == [["de", "fr"]]
+
+
 def test_cpu_export_model_reuses_stable_snapshot_storage() -> None:
     config = export_config()
     source = SionForConditionalGeneration(config).state_dict()
@@ -1284,6 +1416,7 @@ def test_transformers_options_flow_through_conversion_and_training_export(
         formats=("transformers",),
         tokenizer_path=tokenizer_marker,
         language_pairs=pairs,
+        bidirectional=True,
     )
     assert converted["formats"]["transformers"]["status"] == "ok"
     assert converted["metadata"]["language_pairs"] == [["ko", "ja"], ["en", "ru"]]
@@ -1339,10 +1472,61 @@ def test_export_cli_accepts_repeated_language_pairs_and_transformers_default() -
     )
     assert args.language_pairs == [["ko", "ja"], ["en", "ru"]]
     assert args.unidirectional is True
+    assert args.bidirectional is False
+    assert args.translation_direction is None
     assert "transformers" in args.formats.split(",")
     assert args.release_name == "sion"
     assert args.release_version == "1.0"
     assert args.translation_capable is False
+
+
+def test_export_cli_leaves_direction_policy_unspecified_by_default() -> None:
+    from sion_translate.cli.export import build_parser
+
+    args = build_parser().parse_args(["model.pt", "--output", "converted"])
+
+    assert args.translation_direction is None
+    assert args.unidirectional is False
+    assert args.bidirectional is False
+
+
+def test_export_cli_accepts_repeated_exact_translation_directions() -> None:
+    from sion_translate.cli.export import build_parser
+
+    args = build_parser().parse_args(
+        [
+            "model.pt",
+            "--output",
+            "converted",
+            "--translation-direction",
+            "de",
+            "fr",
+            "--translation-direction",
+            "sw",
+            "ar",
+        ]
+    )
+
+    assert args.translation_direction == [["de", "fr"], ["sw", "ar"]]
+    assert args.unidirectional is False
+    assert args.bidirectional is False
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(
+            [
+                "model.pt",
+                "--output",
+                "converted",
+                "--translation-direction",
+                "de",
+                "fr",
+                "--unidirectional",
+            ]
+        )
+
+    bidirectional = build_parser().parse_args(
+        ["model.pt", "--output", "converted", "--bidirectional"]
+    )
+    assert bidirectional.bidirectional is True
 
 
 def test_training_export_manifest_merges_base_and_quantized_formats(
