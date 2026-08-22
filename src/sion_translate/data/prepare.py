@@ -15,7 +15,7 @@ from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import Any, BinaryIO, Sequence, TypeAlias, cast
+from typing import AbstractSet, Any, BinaryIO, Sequence, TypeAlias, cast
 
 import numpy as np
 
@@ -59,6 +59,7 @@ from .record_metadata import (
     RECORD_METADATA_FORMAT,
     RECORD_METADATA_INDEX_DTYPE,
     RECORD_METADATA_INDEX_SUFFIX,
+    decode_record_metadata,
     encode_record_metadata,
 )
 from .records import (
@@ -86,8 +87,8 @@ INDEX_DTYPE = np.dtype(
         ("source_id", "<u2"),
         ("quality_score", "u1"),
         ("synthetic", "u1"),
-        # 1 when the reverse direction must never be trained, because it would
-        # put a source-only language (한본어 kj) on the target side.
+        # 1 when the reverse direction must not be trained, either because the
+        # global graph is one-way or this row carries a scoped training edge.
         ("forward_only", "u1"),
     ]
 )
@@ -300,6 +301,40 @@ _PrepareBatchInput: TypeAlias = tuple[
 _PrepareEvent: TypeAlias = tuple[str, tuple[Any, ...]]
 
 _PREPARE_WORKER_TOKENIZER: SionTokenizer | None = None
+
+
+def _record_training_direction(
+    metadata: Mapping[str, object],
+    language_pair: tuple[str, str],
+    trained_directions: AbstractSet[tuple[str, str]],
+) -> tuple[str, str] | None:
+    """Validate an optional row-scoped edge against the dataset graph."""
+
+    raw_direction = metadata.get("training_direction")
+    if raw_direction is None:
+        return None
+    direction_items = (
+        cast(Sequence[object], raw_direction)
+        if isinstance(raw_direction, Sequence) and not isinstance(raw_direction, (str, bytes))
+        else None
+    )
+    if (
+        direction_items is None
+        or len(direction_items) != 2
+        or not all(isinstance(language, str) and language for language in direction_items)
+    ):
+        raise ValueError("record training_direction must contain two non-empty language strings")
+    direction = (cast(str, direction_items[0]), cast(str, direction_items[1]))
+    if frozenset(direction) != frozenset(language_pair):
+        raise ValueError(
+            "record training_direction must belong to its physical language pair: "
+            f"direction={direction!r}, pair={language_pair!r}"
+        )
+    if direction not in trained_directions:
+        raise ValueError(
+            f"record training_direction is absent from the configured training graph: {direction!r}"
+        )
+    return direction
 
 
 def _initialize_prepare_worker(tokenizer_model: str) -> None:
@@ -952,12 +987,11 @@ def _validate_indexed_payload_semantics(
     allowed_language_pairs: set[tuple[int, int]] = set()
     language_to_id = {language: index for index, language in enumerate(languages)}
     direction_set = set(translation_directions)
-    for left, right in normalized_pairs:
-        storage_direction = (left, right) if (left, right) in direction_set else (right, left)
+    for source_language, target_language in translation_directions:
         allowed_language_pairs.add(
             (
-                language_to_id[storage_direction[0]],
-                language_to_id[storage_direction[1]],
+                language_to_id[source_language],
+                language_to_id[target_language],
             )
         )
 
@@ -1042,28 +1076,29 @@ def _validate_indexed_payload_semantics(
                 np.isin(np.asarray(index["tgt_register"], dtype=np.int64), (0, 1, 2, 3)).all()
             ):
                 raise ValueError(f"Dataset index register is invalid: {index_path}")
-            for src_language_id, tgt_language_id, forward_flag in zip(
-                src_language_ids,
-                tgt_language_ids,
-                forward_only,
-                strict=True,
+            scoped_direction_rows: dict[int, list[str]] = {}
+            for row_id, (src_language_id, tgt_language_id, forward_flag) in enumerate(
+                zip(
+                    src_language_ids,
+                    tgt_language_ids,
+                    forward_only,
+                    strict=True,
+                )
             ):
                 pair = (int(src_language_id), int(tgt_language_id))
                 if pair not in allowed_language_pairs:
                     raise ValueError(f"Dataset index language pair is not configured: {index_path}")
                 source_language = languages[pair[0]]
                 target_language = languages[pair[1]]
-                expected_forward_only = (
-                    target_language,
-                    source_language,
-                ) not in direction_set
-                if (
-                    bool(forward_flag) != expected_forward_only
-                    or target_language in source_only_set
+                reverse_trained = (target_language, source_language) in direction_set
+                if (not bool(forward_flag) and not reverse_trained) or (
+                    target_language in source_only_set
                 ):
                     raise ValueError(
                         f"Dataset index translation direction is invalid: {index_path}"
                     )
+                if bool(forward_flag) and reverse_trained:
+                    scoped_direction_rows[row_id] = [source_language, target_language]
 
             row_count = len(index)
             split_total += row_count
@@ -1130,7 +1165,27 @@ def _validate_indexed_payload_semantics(
                     raise ValueError(
                         f"Dataset record metadata offsets exceed their payload: {metadata_index_path}"
                     )
+                if scoped_direction_rows:
+                    metadata_store = np.memmap(metadata_data_path, dtype=np.uint8, mode="r")
+                    for row_id, expected_direction in scoped_direction_rows.items():
+                        metadata_row = metadata_index[row_id]
+                        offset = int(metadata_row["offset"])
+                        length = int(metadata_row["length"])
+                        payload = np.asarray(
+                            metadata_store[offset : offset + length],
+                            dtype=np.uint8,
+                        ).tobytes()
+                        if (
+                            decode_record_metadata(payload).get("training_direction")
+                            != expected_direction
+                        ):
+                            raise ValueError(
+                                "Dataset row-scoped direction lacks matching metadata: "
+                                f"{index_path} row={row_id}"
+                            )
                 expected_artifacts.update({metadata_index_path.name, metadata_data_path.name})
+            elif scoped_direction_rows:
+                raise ValueError(f"Dataset row-scoped directions require metadata: {index_path}")
         actual_artifacts = {path.name for path in split_dir.iterdir()}
         if actual_artifacts != expected_artifacts:
             raise ValueError(
@@ -1700,16 +1755,33 @@ def prepare_dataset(
                         _increment(target, "ja_no_kana_warnings")
 
                 # Side A is the physical direction exposed as virtual direction
-                # zero.  For a reverse-only configured edge, swap every aligned
-                # field before split/dedup so tokenizer and dataset partitioning
-                # use the same source endpoint.  ``forward_only`` then suppresses
-                # only the untrained reverse edge; bidirectional pairs keep both.
-                if (language_a, language_b) not in direction_set:
+                # zero. A row-scoped edge is used by backtranslation so the
+                # synthetic source -> real target example is never virtualized
+                # into a pseudo-label reverse example, even when the global pair
+                # is bidirectional.
+                row_direction = _record_training_direction(
+                    metadata,
+                    (language_a, language_b),
+                    direction_set,
+                )
+                storage_direction = row_direction or (
+                    (language_a, language_b)
+                    if (language_a, language_b) in direction_set
+                    else (language_b, language_a)
+                )
+                if (language_a, language_b) != storage_direction:
                     language_a, language_b = language_b, language_a
                     text_a, text_b = text_b, text_a
                     ids_a, ids_b = ids_b, ids_a
                     register_a, register_b = register_b, register_a
-                forward_only = (language_b, language_a) not in direction_set
+                forward_only = (
+                    row_direction is not None
+                    or (
+                        language_b,
+                        language_a,
+                    )
+                    not in direction_set
+                )
 
                 # A row that can never be written must not reserve endpoint
                 # ownership and suppress a usable row encountered later.

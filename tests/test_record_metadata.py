@@ -8,6 +8,7 @@ import pickle
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from sion_translate.data.indexed import IndexedParallelDataset
 from sion_translate.data.prepare import INDEX_DTYPE, prepare_dataset
@@ -223,6 +224,120 @@ def test_prepare_round_trips_optional_metadata_sidecars(
     assert restored.include_metadata is True
     assert restored[0]["metadata"] == expected[0]
     assert restored[-1]["metadata"] == {}
+
+
+def test_row_scoped_training_direction_prevents_synthetic_reverse_labels(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepare_module = importlib.import_module("sion_translate.data.prepare")
+
+    class StubTokenizer:
+        languages = ("sw", "ar")
+
+        def __init__(self, _model_path: str | Path):
+            pass
+
+        @staticmethod
+        def encode(text: str) -> list[int]:
+            return [ord(character) for character in text]
+
+    monkeypatch.setattr(prepare_module, "SionTokenizer", StubTokenizer)
+    tokenizer_path = tmp_path / "tokenizer.model"
+    tokenizer_path.write_bytes(b"stub tokenizer")
+    source_path = tmp_path / "bt_fixture.jsonl"
+    source_path.write_text(
+        json.dumps(
+            {
+                "sw": "sentensi ya chanzo sintetiki",
+                "ar": "هذه جملة هدف حقيقية",
+                "synthetic": True,
+                "training_direction": ["sw", "ar"],
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    dataset_root = tmp_path / "dataset"
+
+    stats = prepare_dataset(
+        [str(source_path)],
+        tokenizer_path,
+        dataset_root,
+        language_pairs=(("sw", "ar"),),
+        translation_directions=(("sw", "ar"), ("ar", "sw")),
+        validation_fraction=0.0,
+        test_fraction=0.0,
+        filter_quality=False,
+        dedup_backend="memory",
+        num_workers=1,
+    )
+    dataset = IndexedParallelDataset(
+        dataset_root,
+        "train",
+        bidirectional=True,
+        include_metadata=True,
+    )
+
+    assert stats.valid_pairs == 1
+    assert stats.forward_only_pairs == 1
+    assert len(dataset) == 1
+    sample = dataset[0]
+    assert (sample["src_language"], sample["target_language"]) == ("sw", "ar")
+    assert sample["reverse_direction_trained"] is False
+    assert sample["training_direction"] == ["sw", "ar"]
+
+
+def test_prepare_rejects_row_direction_outside_the_training_graph(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepare_module = importlib.import_module("sion_translate.data.prepare")
+
+    class StubTokenizer:
+        languages = ("sw", "ar")
+
+        def __init__(self, _model_path: str | Path):
+            pass
+
+        @staticmethod
+        def encode(text: str) -> list[int]:
+            return [ord(character) for character in text]
+
+    monkeypatch.setattr(prepare_module, "SionTokenizer", StubTokenizer)
+    tokenizer_path = tmp_path / "tokenizer.model"
+    tokenizer_path.write_bytes(b"stub tokenizer")
+    source_path = tmp_path / "bt_invalid.jsonl"
+    source_path.write_text(
+        json.dumps(
+            {
+                "sw": "sentensi ya chanzo sintetiki",
+                "ar": "هذه جملة هدف حقيقية",
+                "training_direction": ["ar", "sw"],
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    dataset_root = tmp_path / "dataset"
+
+    with pytest.raises(ValueError, match="absent from the configured training graph"):
+        prepare_dataset(
+            [str(source_path)],
+            tokenizer_path,
+            dataset_root,
+            language_pairs=(("sw", "ar"),),
+            translation_directions=(("sw", "ar"),),
+            validation_fraction=0.0,
+            test_fraction=0.0,
+            filter_quality=False,
+            dedup_backend="memory",
+            num_workers=1,
+        )
+
+    assert not dataset_root.exists()
 
 
 def test_legacy_v2_index_without_metadata_sidecars_still_loads(tmp_path: Path) -> None:

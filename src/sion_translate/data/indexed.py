@@ -59,6 +59,7 @@ class IndexedParallelDataset(Dataset[dict[str, object]]):
             raise FileNotFoundError(f"No index shards found under {self.root}")
         self.indices = self._open_indices()
         self.record_metadata_indices = self._open_record_metadata_indices()
+        self._record_metadata_cache: dict[int, np.memmap] = {}
         self.has_record_metadata = any(index is not None for index in self.record_metadata_indices)
         self.is_v3 = bool(
             self.indices
@@ -113,7 +114,6 @@ class IndexedParallelDataset(Dataset[dict[str, object]]):
         self.translation_directions = self._load_translation_directions()
         self._validate_translation_direction_rows()
         self._token_cache: dict[tuple[int, str], np.memmap] = {}
-        self._record_metadata_cache: dict[int, np.memmap] = {}
         self._bidirectional_pairs: np.ndarray | None = None
         self._forward_only_pairs: np.ndarray | None = None
         self._build_direction_maps()
@@ -419,18 +419,14 @@ class IndexedParallelDataset(Dataset[dict[str, object]]):
             return
 
         required_fields = {"src_language_id", "tgt_language_id", "forward_only"}
-        expected: dict[tuple[int, int], bool] = {}
         language_to_id = {language: index for index, language in enumerate(self.languages)}
         direction_set = set(self.translation_directions)
-        for left, right in self.language_pairs:
-            storage = (left, right) if (left, right) in direction_set else (right, left)
-            expected[(language_to_id[storage[0]], language_to_id[storage[1]])] = (
-                storage[1],
-                storage[0],
-            ) not in direction_set
+        allowed = {
+            (language_to_id[source], language_to_id[target]) for source, target in direction_set
+        }
 
         language_count = len(self.languages)
-        for index in self.indices:
+        for shard, index in enumerate(self.indices):
             names = set(index.dtype.names or ())
             if not required_fields <= names:
                 raise ValueError("current dataset index lacks translation direction fields")
@@ -438,13 +434,26 @@ class IndexedParallelDataset(Dataset[dict[str, object]]):
             target_ids = np.asarray(index["tgt_language_id"], dtype=np.int64)
             forward_only = np.asarray(index["forward_only"], dtype=np.int64)
             packed = (source_ids * language_count + target_ids) * 2 + forward_only
-            for packed_row in np.unique(packed):
+            for local, packed_row in enumerate(packed):
                 pair_value, forward_flag = divmod(int(packed_row), 2)
                 source_id, target_id = divmod(pair_value, language_count)
-                if expected.get((source_id, target_id)) != bool(forward_flag):
+                if (source_id, target_id) not in allowed or (
+                    not bool(forward_flag) and (target_id, source_id) not in allowed
+                ):
                     raise ValueError(
                         "dataset index direction rows disagree with the manifest graph"
                     )
+                if bool(forward_flag) and (target_id, source_id) in allowed:
+                    metadata = self._metadata_for_physical_pair(shard, local)
+                    expected_direction = [
+                        self.languages[source_id],
+                        self.languages[target_id],
+                    ]
+                    if metadata.get("training_direction") != expected_direction:
+                        raise ValueError(
+                            "dataset index direction rows disagree with the manifest graph: "
+                            "row-scoped direction lacks matching metadata"
+                        )
 
     def _load_synthetic_sampling_weight(self) -> float:
         if not self._manifest:
@@ -578,15 +587,7 @@ class IndexedParallelDataset(Dataset[dict[str, object]]):
             self._record_metadata_cache[shard] = np.memmap(path, dtype=np.uint8, mode="r")
         return self._record_metadata_cache[shard]
 
-    def metadata_at(self, index: int) -> dict[str, object]:
-        """Return preserved raw-record annotations for one virtual sample."""
-
-        if index < 0:
-            index += len(self)
-        if index < 0 or index >= len(self):
-            raise IndexError(index)
-        pair_index = self._pair_index(index)
-        shard, local = self._resolve(pair_index)
+    def _metadata_for_physical_pair(self, shard: int, local: int) -> dict[str, object]:
         metadata_index = self.record_metadata_indices[shard]
         if metadata_index is None:
             return {}
@@ -597,6 +598,17 @@ class IndexedParallelDataset(Dataset[dict[str, object]]):
         store = self._record_metadata_bytes(shard)
         payload = np.asarray(store[offset : offset + length], dtype=np.uint8).tobytes()
         return decode_record_metadata(payload)
+
+    def metadata_at(self, index: int) -> dict[str, object]:
+        """Return preserved raw-record annotations for one virtual sample."""
+
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
+        pair_index = self._pair_index(index)
+        shard, local = self._resolve(pair_index)
+        return self._metadata_for_physical_pair(shard, local)
 
     def length_at(self, index: int) -> int:
         pair_index = self._pair_index(index)

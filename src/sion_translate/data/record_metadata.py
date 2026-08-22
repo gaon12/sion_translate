@@ -14,9 +14,10 @@ RECORD_METADATA_FIELDS = (
     "domain",
     "category",
     "original_direction",
+    "training_direction",
     "quality_profile",
 )
-RECORD_METADATA_FORMAT = "sion-record-metadata-json-offsets-v1"
+RECORD_METADATA_FORMAT = "sion-record-metadata-json-offsets-v2"
 RECORD_METADATA_INDEX_DTYPE = np.dtype(
     [
         ("offset", "<u8"),
