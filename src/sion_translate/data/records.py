@@ -182,6 +182,20 @@ def _first_value(mapping: Mapping[object, object], names: Sequence[str]) -> obje
     return None
 
 
+def _parse_pair_container_label(label: str) -> tuple[str, str] | None:
+    """Parse unambiguous separators plus legacy two-simple-tag labels."""
+
+    for separator in ("/", "_to_", "-"):
+        if label.count(separator) != 1:
+            continue
+        source, target = label.split(separator, 1)
+        try:
+            return _validate_language(source), _validate_language(target)
+        except ValueError:
+            return None
+    return None
+
+
 def expand_parallel_record(
     record: object,
     language_pairs: Sequence[Sequence[str]],
@@ -329,17 +343,34 @@ def expand_parallel_record(
                             metadata,
                         )
 
-        nested: dict[str, tuple[str, str]] = {}
+        exact_pair_labels: dict[str, tuple[str, str]] = {}
         for language_a, language_b in configured:
             for label, direction in _pair_labels(language_a, language_b):
-                if label not in mapping:
-                    continue
-                previous = nested.get(label)
+                previous = exact_pair_labels.get(label)
                 if previous is not None and previous != direction:
-                    issue("ambiguous_pair_container")
-                    nested.pop(label, None)
+                    exact_pair_labels.pop(label, None)
                     continue
-                nested[label] = direction
+                exact_pair_labels[label] = direction
+
+        nested: dict[str, tuple[str, str]] = {}
+        direction_labels: dict[tuple[str, str], str] = {}
+        blocked_directions: set[tuple[str, str]] = set()
+        for raw_key in mapping:
+            if not isinstance(raw_key, str):
+                continue
+            direction = exact_pair_labels.get(raw_key) or _parse_pair_container_label(raw_key)
+            if direction is None or frozenset(direction) not in configured_edges:
+                continue
+            if direction in blocked_directions:
+                continue
+            previous_label = direction_labels.get(direction)
+            if previous_label is not None and previous_label != raw_key:
+                nested.pop(previous_label, None)
+                blocked_directions.add(direction)
+                issue("duplicate_pair_container")
+                continue
+            direction_labels[direction] = raw_key
+            nested[raw_key] = direction
 
         for key, value in mapping.items():
             if not isinstance(key, str):

@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from sion_translate.data.records import (
     expand_parallel_record,
     languages_from_pairs,
@@ -165,6 +167,51 @@ def test_hyphenated_language_pair_containers_use_unambiguous_separators() -> Non
         ("zh-Hant", "en"),
         ("en", "sr-Latn-RS"),
     ]
+
+
+def test_pair_container_labels_resolve_canonical_language_aliases() -> None:
+    expansion = expand_parallel_record(
+        {"pt-br/EN": {"source": "Olá.", "target": "Hello."}},
+        (("pt-BR", "en"),),
+    )
+
+    assert expansion.issues == ()
+    assert [(pair.language_a, pair.language_b) for pair in expansion.pairs] == [("pt-BR", "en")]
+
+
+@pytest.mark.parametrize(
+    ("label", "expected_texts"),
+    [
+        ("EN-DE", ("source text", "target text")),
+        ("DE-EN", ("target text", "source text")),
+    ],
+)
+def test_legacy_simple_pair_containers_are_case_canonicalized(
+    label: str,
+    expected_texts: tuple[str, str],
+) -> None:
+    expansion = expand_parallel_record(
+        {label: {"source": "source text", "target": "target text"}},
+        (("en", "de"),),
+    )
+
+    assert expansion.issues == ()
+    assert [
+        (pair.language_a, pair.text_a, pair.language_b, pair.text_b) for pair in expansion.pairs
+    ] == [("en", expected_texts[0], "de", expected_texts[1])]
+
+
+def test_canonical_duplicate_pair_containers_are_rejected() -> None:
+    expansion = expand_parallel_record(
+        {
+            "pt-BR/en": {"source": "primeiro", "target": "first"},
+            "pt-br/EN": {"source": "segundo", "target": "second"},
+        },
+        (("pt-BR", "en"),),
+    )
+
+    assert expansion.pairs == ()
+    assert expansion.issues == ("duplicate_pair_container",)
 
 
 def test_multilingual_inference_requires_and_validates_source_language() -> None:
