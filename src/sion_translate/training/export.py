@@ -30,6 +30,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import types
 import uuid
@@ -94,8 +95,11 @@ _EXPORT_LOCK_TIMEOUT_SECONDS = 60.0
 _TRANSFORMERS_INSPECTION_PREFIX = "SION_TRANSFORMERS_INSPECTION="
 _TRANSFORMERS_INSPECTION_TIMEOUT_SECONDS = 600.0
 _TRAINING_EXPORT_STATUS_SCHEMA = "sion-training-export-status-v1"
+_TRAINING_EXPORT_ACK_SCHEMA = "sion-training-export-ack-v1"
 _TRAINING_EXPORT_STATUS_FILE_BYTES = 16 * 1024
-_TRAINING_EXPORT_STATUS_TIMEOUT_SECONDS = 24 * 60 * 60.0
+_TRAINING_EXPORT_HEARTBEAT_SECONDS = 5.0
+_TRAINING_EXPORT_STALE_SECONDS = 120.0
+_TRAINING_EXPORT_ACK_TIMEOUT_SECONDS = 120.0
 _TRAINING_EXPORT_STATUS_POLL_SECONDS = 0.25
 _TRANSLATION_PIPELINE_SCHEMA = "sion-translation-pipeline-v2"
 _FOUNDATION_LINEAGE_SCHEMA = "sion-foundation-lineage-v1"
@@ -3444,6 +3448,12 @@ def _training_export_status_paths(status_path: Path) -> tuple[Path, Path]:
     return status_path, status_path.with_name(f"{status_path.name}.backup")
 
 
+def _training_export_ack_path(status_path: Path, rank: int) -> Path:
+    if rank <= 0:
+        raise ValueError("training export acknowledgement rank must be positive")
+    return status_path.with_name(f"{status_path.name}.rank-{rank}.ack.json")
+
+
 def _bounded_training_export_status_text(
     value: object,
     *,
@@ -3561,6 +3571,57 @@ def _close_training_export_status(
             pass
 
 
+def _start_training_export_heartbeat(
+    handles: tuple[BinaryIO, BinaryIO],
+    running_status: Mapping[str, Any],
+    *,
+    interval_seconds: float = _TRAINING_EXPORT_HEARTBEAT_SECONDS,
+) -> tuple[threading.Event, threading.Thread, list[BaseException]]:
+    """Keep peer liveness independent of the total conversion duration."""
+
+    if interval_seconds <= 0.0:
+        raise ValueError("training export heartbeat interval must be positive")
+    stop = threading.Event()
+    errors: list[BaseException] = []
+
+    def publish() -> None:
+        sequence = 0
+        while not stop.wait(interval_seconds):
+            sequence += 1
+            try:
+                _publish_training_export_status(
+                    handles,
+                    {
+                        **running_status,
+                        "state": "running",
+                        "heartbeat_sequence": sequence,
+                        "updated_unix_ns": time.time_ns(),
+                    },
+                )
+            except BaseException as error:
+                errors.append(error)
+                return
+
+    thread = threading.Thread(
+        target=publish,
+        name="sion-training-export-heartbeat",
+        daemon=True,
+    )
+    thread.start()
+    return stop, thread, errors
+
+
+def _stop_training_export_heartbeat(
+    heartbeat: tuple[threading.Event, threading.Thread, list[BaseException]] | None,
+) -> list[BaseException]:
+    if heartbeat is None:
+        return []
+    stop, thread, errors = heartbeat
+    stop.set()
+    thread.join()
+    return errors
+
+
 def _read_training_export_status(status_path: Path) -> list[dict[str, Any]]:
     statuses: list[dict[str, Any]] = []
     for candidate in _training_export_status_paths(status_path):
@@ -3571,6 +3632,128 @@ def _read_training_export_status(status_path: Path) -> list[dict[str, Any]]:
         if isinstance(raw_status, dict):
             statuses.append(cast(dict[str, Any], raw_status))
     return statuses
+
+
+def _publish_training_export_acknowledgement(
+    status_path: Path,
+    *,
+    invocation: str,
+    step: int,
+    release_name: str,
+    rank: int,
+    observed_state: str,
+    error: BaseException | None = None,
+) -> None:
+    if observed_state not in {"complete", "failed", "observer_failed"}:
+        raise ValueError(f"invalid training export acknowledgement state: {observed_state!r}")
+    payload: dict[str, Any] = {
+        "schema": _TRAINING_EXPORT_ACK_SCHEMA,
+        "invocation": invocation,
+        "step": step,
+        "release_name": release_name,
+        "rank": rank,
+        "observed_state": observed_state,
+    }
+    if error is not None:
+        payload.update(
+            {
+                "error_type": type(error).__name__,
+                "message": _bounded_training_export_status_text(error),
+            }
+        )
+    path = _training_export_ack_path(status_path, rank)
+    temporary = _temporary_path(path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        encoded = (
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+        with temporary.open("wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        if os.name != "nt":
+            descriptor = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _read_training_export_acknowledgement(path: Path) -> dict[str, Any] | None:
+    try:
+        raw: object = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return cast(dict[str, Any], raw) if isinstance(raw, dict) else None
+
+
+def _wait_for_training_export_acknowledgements(
+    status_path: Path,
+    *,
+    invocation: str,
+    step: int,
+    release_name: str,
+    world_size: int,
+    terminal_state: str,
+    timeout_seconds: float = _TRAINING_EXPORT_ACK_TIMEOUT_SECONDS,
+) -> None:
+    """Require every peer to report what it observed after terminal publication."""
+
+    if terminal_state not in {"complete", "failed"}:
+        raise ValueError("training export terminal state must be complete or failed")
+    if timeout_seconds <= 0.0:
+        raise ValueError("training export acknowledgement timeout must be positive")
+    pending = set(range(1, world_size))
+    deadline = time.monotonic() + timeout_seconds
+    while pending:
+        for rank in tuple(pending):
+            acknowledgement = _read_training_export_acknowledgement(
+                _training_export_ack_path(status_path, rank)
+            )
+            if acknowledgement is None:
+                continue
+            matches = (
+                acknowledgement.get("schema") == _TRAINING_EXPORT_ACK_SCHEMA
+                and acknowledgement.get("invocation") == invocation
+                and acknowledgement.get("step") == step
+                and acknowledgement.get("release_name") == release_name
+                and acknowledgement.get("rank") == rank
+            )
+            if not matches:
+                continue
+            observed_state = acknowledgement.get("observed_state")
+            if observed_state == "observer_failed":
+                raise RuntimeError(
+                    f"rank {rank} failed while observing training export: "
+                    f"{acknowledgement.get('error_type', 'RuntimeError')}: "
+                    f"{acknowledgement.get('message', 'unknown observer failure')}"
+                )
+            if observed_state != terminal_state:
+                raise RuntimeError(
+                    f"rank {rank} acknowledged training export state {observed_state!r}; "
+                    f"expected {terminal_state!r}"
+                )
+            pending.remove(rank)
+        if not pending:
+            return
+        if time.monotonic() >= deadline:
+            missing = ", ".join(str(rank) for rank in sorted(pending))
+            raise TimeoutError(
+                "timed out waiting for training export terminal acknowledgements from ranks "
+                f"{missing} after {timeout_seconds:g} seconds"
+            )
+        time.sleep(_TRAINING_EXPORT_STATUS_POLL_SECONDS)
 
 
 def _training_export_status_is_visible(
@@ -3614,10 +3797,14 @@ def _wait_for_training_export_status(
     invocation: str,
     step: int,
     release_name: str,
-) -> None:
+    stale_timeout_seconds: float = _TRAINING_EXPORT_STALE_SECONDS,
+) -> dict[str, Any]:
     """Wait on durable files, not a process-group collective, during rank-0 I/O."""
 
-    deadline = time.monotonic() + _TRAINING_EXPORT_STATUS_TIMEOUT_SECONDS
+    if stale_timeout_seconds <= 0.0:
+        raise ValueError("training export stale timeout must be positive")
+    last_sequence: int | None = None
+    last_progress = time.monotonic()
     while True:
         for status in _read_training_export_status(status_path):
             matches_export = (
@@ -3627,15 +3814,24 @@ def _wait_for_training_export_status(
                 and status.get("release_name") == release_name
             )
             if matches_export and status.get("state") == "complete":
-                return
+                return status
             if matches_export and status.get("state") == "failed":
-                error_type = status.get("error_type", "RuntimeError")
-                message = status.get("message", "unknown rank-0 export failure")
-                raise RuntimeError(f"rank 0 training export failed: {error_type}: {message}")
-        if time.monotonic() >= deadline:
+                return status
+            raw_sequence = status.get("heartbeat_sequence")
+            if (
+                matches_export
+                and status.get("state") == "running"
+                and not isinstance(raw_sequence, bool)
+                and isinstance(raw_sequence, int)
+                and raw_sequence >= 0
+                and (last_sequence is None or raw_sequence > last_sequence)
+            ):
+                last_sequence = raw_sequence
+                last_progress = time.monotonic()
+        if time.monotonic() - last_progress >= stale_timeout_seconds:
             raise TimeoutError(
-                "timed out waiting for rank 0 training export after "
-                f"{_TRAINING_EXPORT_STATUS_TIMEOUT_SECONDS:g} seconds: {status_path}"
+                "rank 0 training export stopped publishing heartbeats for "
+                f"{stale_timeout_seconds:g} seconds: {status_path}"
             )
         time.sleep(_TRAINING_EXPORT_STATUS_POLL_SECONDS)
 
@@ -3715,6 +3911,8 @@ def export_inference_models(
 
     status_path: Path | None = None
     status_handles: tuple[BinaryIO, BinaryIO] | None = None
+    running_status: dict[str, Any] | None = None
+    heartbeat: tuple[threading.Event, threading.Thread, list[BaseException]] | None = None
     invocation = "single-process"
     if context.distributed and not strict:
         invocation = _broadcast_training_export_invocation(
@@ -3725,16 +3923,19 @@ def export_inference_models(
         status_setup_error: BaseException | None = None
         if context.is_main:
             try:
+                running_status = {
+                    "schema": _TRAINING_EXPORT_STATUS_SCHEMA,
+                    "state": "running",
+                    "invocation": invocation,
+                    "step": step,
+                    "release_name": release_name,
+                    "formats": list(requested),
+                    "heartbeat_sequence": 0,
+                    "updated_unix_ns": time.time_ns(),
+                }
                 status_handles = _initialize_training_export_status(
                     status_path,
-                    {
-                        "schema": _TRAINING_EXPORT_STATUS_SCHEMA,
-                        "state": "running",
-                        "invocation": invocation,
-                        "step": step,
-                        "release_name": release_name,
-                        "formats": list(requested),
-                    },
+                    running_status,
                 )
             except BaseException as error:
                 status_setup_error = error
@@ -3751,15 +3952,50 @@ def export_inference_models(
             raise RuntimeError(
                 "training export status is not coherently visible to every distributed rank"
             )
+        if context.is_main:
+            assert status_handles is not None
+            assert running_status is not None
+            heartbeat = _start_training_export_heartbeat(status_handles, running_status)
         if not context.is_main:
             del deployment_state
             gc.collect()
-            _wait_for_training_export_status(
+            try:
+                terminal_status = _wait_for_training_export_status(
+                    status_path,
+                    invocation=invocation,
+                    step=step,
+                    release_name=release_name,
+                )
+            except BaseException as observer_error:
+                try:
+                    _publish_training_export_acknowledgement(
+                        status_path,
+                        invocation=invocation,
+                        step=step,
+                        release_name=release_name,
+                        rank=context.rank,
+                        observed_state="observer_failed",
+                        error=observer_error,
+                    )
+                except BaseException as acknowledgement_error:
+                    observer_error.add_note(
+                        "failed to publish training export observer acknowledgement: "
+                        f"{type(acknowledgement_error).__name__}: {acknowledgement_error}"
+                    )
+                raise
+            terminal_state = cast(str, terminal_status["state"])
+            _publish_training_export_acknowledgement(
                 status_path,
                 invocation=invocation,
                 step=step,
                 release_name=release_name,
+                rank=context.rank,
+                observed_state=terminal_state,
             )
+            if terminal_state == "failed":
+                error_type = terminal_status.get("error_type", "RuntimeError")
+                message = terminal_status.get("message", "unknown rank-0 export failure")
+                raise RuntimeError(f"rank 0 training export failed: {error_type}: {message}")
             return None
 
     export_error: BaseException | None = None
@@ -3823,6 +4059,18 @@ def export_inference_models(
     if context.distributed and not strict and context.is_main:
         assert status_path is not None
         assert status_handles is not None
+        heartbeat_errors = _stop_training_export_heartbeat(heartbeat)
+        heartbeat = None
+        if heartbeat_errors:
+            heartbeat_error = RuntimeError("training export heartbeat publication failed")
+            heartbeat_error.__cause__ = heartbeat_errors[0]
+            if export_error is None:
+                export_error = heartbeat_error
+            else:
+                export_error.add_note(
+                    "training export heartbeat also failed: "
+                    f"{type(heartbeat_errors[0]).__name__}: {heartbeat_errors[0]}"
+                )
         terminal_status: dict[str, Any] = {
             "schema": _TRAINING_EXPORT_STATUS_SCHEMA,
             "state": "failed" if export_error is not None else "complete",
@@ -3838,8 +4086,10 @@ def export_inference_models(
                     "message": _bounded_training_export_status_text(export_error),
                 }
             )
+        terminal_published = False
         try:
             _publish_training_export_status(status_handles, terminal_status)
+            terminal_published = True
         except BaseException as status_error:
             if export_error is not None:
                 status_error.add_note(
@@ -3848,6 +4098,24 @@ def export_inference_models(
             export_error = status_error
         finally:
             _close_training_export_status(status_handles)
+        if terminal_published:
+            try:
+                _wait_for_training_export_acknowledgements(
+                    status_path,
+                    invocation=invocation,
+                    step=step,
+                    release_name=release_name,
+                    world_size=context.world_size,
+                    terminal_state=cast(str, terminal_status["state"]),
+                )
+            except BaseException as acknowledgement_error:
+                if export_error is None:
+                    export_error = acknowledgement_error
+                else:
+                    export_error.add_note(
+                        "training export terminal acknowledgement failed: "
+                        f"{type(acknowledgement_error).__name__}: {acknowledgement_error}"
+                    )
     if strict:
         if export_error is not None:
             raise export_error

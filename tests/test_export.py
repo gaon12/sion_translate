@@ -1603,6 +1603,11 @@ def _mock_distributed_export_control_plane(
     )
     monkeypatch.setattr(
         export_module,
+        "_wait_for_training_export_acknowledgements",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        export_module,
         "_synchronize_rank0_exception",
         record_synchronization,
     )
@@ -1737,6 +1742,95 @@ def test_training_export_wait_rejects_a_stale_completion_nonce(
     )
 
     assert reads == 3
+
+
+def test_training_export_wait_fails_when_rank_zero_heartbeat_stalls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    running = {
+        "schema": export_module._TRAINING_EXPORT_STATUS_SCHEMA,
+        "state": "running",
+        "invocation": "heartbeat-stall",
+        "step": 27,
+        "release_name": "sion_translate",
+        "heartbeat_sequence": 0,
+    }
+    clock = iter((0.0, 1.0, 3.0))
+    monkeypatch.setattr(
+        export_module,
+        "_read_training_export_status",
+        lambda _path: [running],
+    )
+    monkeypatch.setattr(export_module.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(export_module.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(TimeoutError, match="stopped publishing heartbeats"):
+        export_module._wait_for_training_export_status(
+            tmp_path / "status.json",
+            invocation="heartbeat-stall",
+            step=27,
+            release_name="sion_translate",
+            stale_timeout_seconds=2.0,
+        )
+
+
+def test_training_export_terminal_status_cannot_be_overwritten_by_heartbeat(
+    tmp_path: Path,
+) -> None:
+    status_path = tmp_path / "status.json"
+    running = {
+        "schema": export_module._TRAINING_EXPORT_STATUS_SCHEMA,
+        "state": "running",
+        "invocation": "heartbeat-race",
+        "step": 28,
+        "release_name": "sion_translate",
+        "heartbeat_sequence": 0,
+    }
+    handles = export_module._initialize_training_export_status(status_path, running)
+    heartbeat = export_module._start_training_export_heartbeat(
+        handles,
+        running,
+        interval_seconds=0.001,
+    )
+    try:
+        export_module.time.sleep(0.01)
+        assert not export_module._stop_training_export_heartbeat(heartbeat)
+        export_module._publish_training_export_status(
+            handles,
+            {**running, "state": "complete"},
+        )
+        export_module.time.sleep(0.005)
+    finally:
+        export_module._close_training_export_status(handles)
+
+    statuses = export_module._read_training_export_status(status_path)
+    assert statuses
+    assert {status["state"] for status in statuses} == {"complete"}
+
+
+def test_training_export_rank_zero_rejects_peer_observer_failure(tmp_path: Path) -> None:
+    status_path = tmp_path / "status.json"
+    export_module._publish_training_export_acknowledgement(
+        status_path,
+        invocation="observer-failure",
+        step=30,
+        release_name="sion_translate",
+        rank=1,
+        observed_state="observer_failed",
+        error=TimeoutError("lost heartbeat"),
+    )
+
+    with pytest.raises(RuntimeError, match=r"rank 1.*TimeoutError.*lost heartbeat"):
+        export_module._wait_for_training_export_acknowledgements(
+            status_path,
+            invocation="observer-failure",
+            step=30,
+            release_name="sion_translate",
+            world_size=2,
+            terminal_state="complete",
+            timeout_seconds=1.0,
+        )
 
 
 def test_training_export_terminal_status_survives_one_channel_failure(
