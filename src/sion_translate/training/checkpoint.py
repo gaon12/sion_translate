@@ -67,6 +67,19 @@ class VerifiedCheckpointGeneration:
     artifact_sha256: str
 
 
+@dataclass(frozen=True)
+class CheckpointGenerationBinding:
+    """Discovery hint that binds one logical generation to its artifact digest.
+
+    This object is not load authority. Pass its digest back to
+    ``verified_checkpoint_generation_lease`` so that a semantic failure in the
+    current generation can be followed by an exact attempt of retained previous.
+    """
+
+    source: Path
+    artifact_sha256: str
+
+
 class _VerifiedCheckpointLeaseState(threading.local):
     active: _VerifiedCheckpointLease | None
 
@@ -1969,6 +1982,44 @@ def _coordinated_checkpoint_generation_bindings(
     return tuple(bindings)
 
 
+def checkpoint_generation_bindings(
+    path: str | Path,
+    context: DistributedContext,
+) -> tuple[CheckpointGenerationBinding, ...]:
+    """Return ordered current/previous digest bindings for semantic attempts.
+
+    Discovery never grants permission to load. Distributed bindings authenticate
+    only the small v2 marker contract; local bindings hash the payload file. Each
+    returned digest must be supplied to ``verified_checkpoint_generation_lease``,
+    which performs the full inventory and identity checks inside a one-shot lease.
+    """
+
+    logical_path = Path(path)
+    if context.distributed:
+        return tuple(
+            CheckpointGenerationBinding(source, artifact_sha256)
+            for source, artifact_sha256, _step in _coordinated_checkpoint_generation_bindings(
+                logical_path,
+                context,
+                expected_artifact_sha256=None,
+            )
+        )
+
+    current = _logical_checkpoint_current(logical_path)
+    _reject_mixed_checkpoint_formats(current)
+    bindings: list[CheckpointGenerationBinding] = []
+    for candidate in (current, _dcp_sibling(current, "previous")):
+        payload = candidate / "checkpoint.pt"
+        try:
+            if payload.is_symlink() or not payload.is_file():
+                continue
+            artifact_sha256 = _sha256_file(payload)
+        except OSError:
+            continue
+        bindings.append(CheckpointGenerationBinding(candidate, artifact_sha256))
+    return tuple(bindings)
+
+
 def _preflight_verified_checkpoint_candidate(
     source: Path,
     context: DistributedContext,
@@ -2043,7 +2094,10 @@ def verified_checkpoint_generation_lease(
         for candidate in (current, _dcp_sibling(current, "previous")):
             try:
                 source = resolve_checkpoint_source(candidate, context)
-                actual_digest = _sha256_file(source / "checkpoint.pt")
+                payload = source / "checkpoint.pt"
+                if payload.is_symlink() or not payload.is_file():
+                    raise ValueError("local checkpoint payload is not a regular file")
+                actual_digest = _sha256_file(payload)
                 if (
                     expected_artifact_sha256 is not None
                     and actual_digest != expected_artifact_sha256

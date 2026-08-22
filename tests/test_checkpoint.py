@@ -1382,6 +1382,46 @@ def test_checkpoint_generation_candidates_orders_current_then_previous_without_h
     )
 
 
+def test_local_checkpoint_generation_bindings_preserve_digest_order(tmp_path: Path) -> None:
+    current = tmp_path / "latest"
+    previous = current.with_name(".latest.previous")
+    current.mkdir()
+    previous.mkdir()
+    current_payload = current / "checkpoint.pt"
+    previous_payload = previous / "checkpoint.pt"
+    current_payload.write_bytes(b"current generation")
+    previous_payload.write_bytes(b"previous generation")
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+
+    bindings = checkpoint_module.checkpoint_generation_bindings(current, context)
+
+    assert [binding.source for binding in bindings] == [current, previous]
+    assert [binding.artifact_sha256 for binding in bindings] == [
+        hashlib.sha256(current_payload.read_bytes()).hexdigest(),
+        hashlib.sha256(previous_payload.read_bytes()).hexdigest(),
+    ]
+
+
+def test_dcp_checkpoint_generation_bindings_preserve_marker_order(tmp_path: Path) -> None:
+    current = tmp_path / "latest"
+    previous = current.with_name(".latest.previous")
+    _write_fake_complete_dcp(current, step=2)
+    _write_fake_complete_dcp(previous, step=1)
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), True, "gloo")
+
+    bindings = checkpoint_module.checkpoint_generation_bindings(current, context)
+
+    assert [binding.source for binding in bindings] == [current.resolve(), previous.resolve()]
+    assert [binding.artifact_sha256 for binding in bindings] == [
+        hashlib.sha256(
+            (current / checkpoint_module.DCP_COMPLETION_FILENAME).read_bytes()
+        ).hexdigest(),
+        hashlib.sha256(
+            (previous / checkpoint_module.DCP_COMPLETION_FILENAME).read_bytes()
+        ).hexdigest(),
+    ]
+
+
 def test_checkpoint_generation_candidate_metadata_reads_only_the_small_marker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
