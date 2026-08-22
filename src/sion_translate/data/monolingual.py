@@ -161,10 +161,8 @@ def discover_monolingual_sources(
         )
 
     configured_set = set(configured)
-    sources: list[MonolingualSource] = []
     skipped: list[SkippedEntry] = []
-    unconfigured: list[str] = []
-    seen_language_directories: set[str] = set()
+    language_directories: list[tuple[Path, str]] = []
 
     for entry in sorted(root.iterdir()):
         if not entry.is_dir():
@@ -178,20 +176,34 @@ def discover_monolingual_sources(
         except LanguageTagError:
             skipped.append(SkippedEntry(entry, "언어 코드 형식이 아닌 폴더 이름"))
             continue
+        language_directories.append((entry, entry_language))
+
+    configured_directories: dict[str, list[Path]] = {}
+    for entry, entry_language in language_directories:
+        if entry_language in configured_set:
+            configured_directories.setdefault(entry_language, []).append(entry)
+
+    alias_collisions = {
+        language: paths for language, paths in configured_directories.items() if len(paths) > 1
+    }
+    if alias_collisions:
+        details = "; ".join(
+            f"{language}: {', '.join(str(path) for path in paths)}"
+            for language, paths in alias_collisions.items()
+        )
+        raise ValueError(
+            "multiple monolingual corpus directories canonicalize to the same "
+            f"configured language ({details})"
+        )
+
+    sources: list[MonolingualSource] = []
+    unconfigured: list[str] = []
+    for entry, entry_language in language_directories:
         if entry_language not in configured_set:
             reason = f"설정에 없는 언어 폴더 (설정된 언어: {', '.join(configured)})"
             skipped.append(SkippedEntry(entry, reason))
             unconfigured.append(entry_language)
             continue
-        if entry_language in seen_language_directories:
-            skipped.append(
-                SkippedEntry(
-                    entry,
-                    f"같은 언어 태그로 정규화되는 중복 폴더 ({entry_language})",
-                )
-            )
-            continue
-        seen_language_directories.add(entry_language)
         found = False
         for candidate in sorted(entry.rglob("*")):
             if not candidate.is_file():

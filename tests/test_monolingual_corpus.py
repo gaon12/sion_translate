@@ -93,6 +93,29 @@ def test_script_and_region_language_folders_are_canonicalized(tmp_path) -> None:
     assert discovery.languages_without_data == ()
 
 
+def test_configured_extension_order_alias_directories_fail_before_scanning(
+    tmp_path, monkeypatch
+) -> None:
+    root = tmp_path / "corpus"
+    first = root / "en-a-aaa-b-ccc-bbb"
+    second = root / "en-b-ccc-bbb-a-aaa"
+    _write(first / "first.txt", ["first corpus"])
+    _write(second / "second.txt", ["second corpus"])
+
+    def reject_scan(*_args, **_kwargs):
+        raise AssertionError("corpus files were scanned before alias validation")
+
+    monkeypatch.setattr(type(root), "rglob", reject_scan)
+
+    with pytest.raises(ValueError) as exc_info:
+        discover_monolingual_sources(root, ["en-a-aaa-b-ccc-bbb"])
+
+    message = str(exc_info.value)
+    assert "same configured language" in message
+    assert str(first) in message
+    assert str(second) in message
+
+
 def test_unsupported_extensions_are_reported(tmp_path) -> None:
     root = _corpus(tmp_path)
     _write(root / "ko" / "notes.md", ["마크다운"])
