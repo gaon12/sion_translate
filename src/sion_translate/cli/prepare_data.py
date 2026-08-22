@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict
 import json
+from pathlib import Path
 
 from sion_translate.console import configure_stdio
 from sion_translate.data.prepare import DEFAULT_TRAIN_ONLY_PREFIXES, prepare_dataset
 from sion_translate.data.quality import QualityPolicy
+from sion_translate.locking import artifact_locks
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -94,29 +96,35 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     configure_stdio()
     args = build_parser().parse_args()
-    stats = prepare_dataset(
-        args.input,
-        args.tokenizer,
-        args.output_dir,
-        shard_size=args.shard_size,
-        validation_fraction=args.validation_fraction,
-        test_fraction=args.test_fraction,
-        max_tokens_per_side=args.max_tokens_per_side,
-        quality_policy=QualityPolicy(
-            min_chars_per_side=args.min_chars_per_side,
-            max_length_ratio=args.max_length_ratio,
-            min_language_fraction=args.min_language_fraction,
-        ),
-        filter_quality=not args.no_quality_filter,
-        prevent_target_leakage=not args.allow_target_leakage,
-        approximate_split=args.approximate_split,
-        dedup_backend=args.dedup_backend,
-        language_pair=args.language_pair,
-        language_pairs=args.language_pairs,
-        source_only_languages=args.source_only_language,
-        train_only_prefixes=args.train_only_prefix,
-        num_workers=args.workers,
-    )
+    with artifact_locks(
+        (
+            Path(args.tokenizer).resolve().parent,
+            Path(args.output_dir).resolve().parent,
+        )
+    ):
+        stats = prepare_dataset(
+            args.input,
+            args.tokenizer,
+            args.output_dir,
+            shard_size=args.shard_size,
+            validation_fraction=args.validation_fraction,
+            test_fraction=args.test_fraction,
+            max_tokens_per_side=args.max_tokens_per_side,
+            quality_policy=QualityPolicy(
+                min_chars_per_side=args.min_chars_per_side,
+                max_length_ratio=args.max_length_ratio,
+                min_language_fraction=args.min_language_fraction,
+            ),
+            filter_quality=not args.no_quality_filter,
+            prevent_target_leakage=not args.allow_target_leakage,
+            approximate_split=args.approximate_split,
+            dedup_backend=args.dedup_backend,
+            language_pair=args.language_pair,
+            language_pairs=args.language_pairs,
+            source_only_languages=args.source_only_language,
+            train_only_prefixes=args.train_only_prefix,
+            num_workers=args.workers,
+        )
     print(json.dumps(asdict(stats), ensure_ascii=False, indent=2))
 
 

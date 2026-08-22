@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 
 from sion_translate.console import configure_stdio
+from sion_translate.locking import artifact_locks
 from sion_translate.synthetic import DEFAULT_SYNTHETIC_PREFIXES
 from sion_translate.tokenizer import train_tokenizer
 
@@ -101,25 +103,26 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     configure_stdio()
     args = build_parser().parse_args()
-    model_path = train_tokenizer(
-        args.input,
-        args.output_dir,
-        vocab_size=args.vocab_size,
-        input_sentence_size=args.input_sentence_size,
-        character_coverage=args.character_coverage,
-        required_character_min_occurrences=args.required_character_min_occurrences,
-        seed_sentencepiece_size=args.seed_sentencepiece_size,
-        validation_fraction=args.validation_fraction,
-        test_fraction=args.test_fraction,
-        language_pair=args.language_pair,
-        language_pairs=args.language_pairs,
-        approximate_split=args.approximate_split,
-        source_only_languages=args.source_only_language,
-        train_only_prefixes=args.train_only_prefix,
-        num_workers=args.workers,
-        num_threads=args.threads,
-        split_digits=args.split_digits,
-    )
+    with artifact_locks((Path(args.output_dir),)):
+        model_path = train_tokenizer(
+            args.input,
+            args.output_dir,
+            vocab_size=args.vocab_size,
+            input_sentence_size=args.input_sentence_size,
+            character_coverage=args.character_coverage,
+            required_character_min_occurrences=args.required_character_min_occurrences,
+            seed_sentencepiece_size=args.seed_sentencepiece_size,
+            validation_fraction=args.validation_fraction,
+            test_fraction=args.test_fraction,
+            language_pair=args.language_pair,
+            language_pairs=args.language_pairs,
+            approximate_split=args.approximate_split,
+            source_only_languages=args.source_only_language,
+            train_only_prefixes=args.train_only_prefix,
+            num_workers=args.workers,
+            num_threads=args.threads,
+            split_digits=args.split_digits,
+        )
     print(model_path)
 
 

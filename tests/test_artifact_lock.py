@@ -20,6 +20,7 @@ from sion_translate.locking import (
     LOCK_FILENAME,
     TRAINING_RUN_LOCK_FILENAME,
     artifact_lock,
+    artifact_locks,
     training_run_lock,
 )
 from sion_translate.training.distributed import DistributedContext
@@ -44,6 +45,15 @@ def test_the_lock_is_reentrant_across_sequential_uses(tmp_path) -> None:
     for _ in range(3):
         with artifact_lock(tmp_path):
             pass
+
+
+def test_multiple_artifact_locks_are_deduplicated_and_canonically_ordered(tmp_path) -> None:
+    first = tmp_path / "z-root"
+    second = tmp_path / "a-root"
+
+    with artifact_locks((first, second, first / ".." / first.name)) as roots:
+        assert roots == tuple(sorted((first.resolve(), second.resolve()), key=str))
+        assert all((root / LOCK_FILENAME).is_file() for root in roots)
 
 
 def test_training_run_lock_uses_a_separate_lock_file(tmp_path) -> None:

@@ -17,7 +17,8 @@ import os
 import socket
 import sys
 import time
-from contextlib import contextmanager
+from collections.abc import Iterable
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import IO, Callable, Iterator
 
@@ -157,6 +158,32 @@ def artifact_lock(
 
 
 @contextmanager  # pyright: ignore[reportDeprecated]
+def artifact_locks(
+    roots: Iterable[str | Path],
+    *,
+    timeout: float = 0.0,
+    poll_interval: float = 1.0,
+) -> Iterator[tuple[Path, ...]]:
+    """Acquire a canonical set of artifact roots in one deterministic order."""
+
+    canonical_by_key: dict[str, Path] = {}
+    for root in roots:
+        canonical = Path(root).resolve()
+        canonical_by_key.setdefault(os.path.normcase(str(canonical)), canonical)
+    ordered = tuple(canonical_by_key[key] for key in sorted(canonical_by_key))
+    with ExitStack() as scope:
+        for root in ordered:
+            scope.enter_context(
+                artifact_lock(
+                    root,
+                    timeout=timeout,
+                    poll_interval=poll_interval,
+                )
+            )
+        yield ordered
+
+
+@contextmanager  # pyright: ignore[reportDeprecated]
 def training_run_lock(
     root: str | Path,
     *,
@@ -179,5 +206,6 @@ __all__ = [
     "LOCK_FILENAME",
     "TRAINING_RUN_LOCK_FILENAME",
     "artifact_lock",
+    "artifact_locks",
     "training_run_lock",
 ]
