@@ -765,10 +765,9 @@ def preflight_checkpoint_identity(
 
     if expected_identity is None:
         return
-    path = Path(path)
+    path = resolve_checkpoint_source(path, context)
     if context.distributed:
-        resolved = _resolve_dcp_checkpoint(path, world_size=context.world_size)
-        _preflight_dcp_identity(resolved, expected_identity)
+        _preflight_dcp_identity(path, expected_identity)
         return
     try:
         loaded = torch.load(
@@ -1095,6 +1094,20 @@ def checkpoint_path_exists(path: str | Path) -> bool:
     )
 
 
+def resolve_checkpoint_source(
+    path: str | Path,
+    context: DistributedContext,
+) -> Path:
+    """Resolve the exact authenticated checkpoint generation a load will use."""
+
+    path = Path(path)
+    if context.distributed:
+        return _resolve_dcp_checkpoint(path, world_size=context.world_size)
+    if (path / "checkpoint.pt").is_file():
+        return path
+    raise FileNotFoundError(f"no local checkpoint payload found at {path}")
+
+
 def _validate_loaded_state(state: Any) -> Mapping[str, Any]:
     if not isinstance(state, Mapping):
         raise ValueError("checkpoint payload must be an object")
@@ -1223,7 +1236,7 @@ def initialize_model_from_checkpoint(
     반환값은 출처 정보(step, stage)로, 호출자가 provenance 에 기록합니다.
     """
 
-    path = Path(path)
+    path = resolve_checkpoint_source(path, context)
     if context.distributed:
         import torch.distributed.checkpoint as dcp
         from torch.distributed.checkpoint.state_dict import (
@@ -1231,7 +1244,7 @@ def initialize_model_from_checkpoint(
             set_model_state_dict,
         )
 
-        resolved = _resolve_dcp_checkpoint(path, world_size=context.world_size)
+        resolved = path
         source_identity = _preflight_dcp_stage_transfer(resolved, expected_identity)
         checkpoint_model = _unwrap_compiled_model(model)
         # DCP 는 여기 넣어 둔 값 '안으로' 읽어들이므로, 가져올 것만 등록합니다.

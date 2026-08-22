@@ -18,6 +18,7 @@ from sion_translate.training.checkpoint import (
     initialize_model_from_checkpoint,
     CHECKPOINT_SCHEMA,
     load_checkpoint,
+    resolve_checkpoint_source,
     save_checkpoint,
 )
 from sion_translate.training.distributed import DistributedContext
@@ -89,6 +90,7 @@ def test_local_checkpoint_round_trip(tmp_path: Path) -> None:
         scaler=scaler,
         training_state=progress,
     )
+    assert resolve_checkpoint_source(checkpoint, context) == checkpoint
     with torch.no_grad():
         model.token_embedding.weight.add_(1.0)
     scaler.scale = 1.0
