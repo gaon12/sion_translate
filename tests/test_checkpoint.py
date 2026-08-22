@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from datetime import timedelta
+from functools import partial
 import hashlib
+import json
+import multiprocessing
 import random
 from pathlib import Path
+import threading
+import time
 from types import SimpleNamespace
 
 import numpy as np
@@ -18,6 +24,7 @@ from sion_translate.training.checkpoint import (
     initialize_model_from_checkpoint,
     CHECKPOINT_SCHEMA,
     load_checkpoint,
+    preflight_checkpoint_identity,
     resolve_checkpoint_source,
     save_checkpoint,
 )
@@ -70,6 +77,80 @@ def _components() -> tuple[
     return model, optimizer, scheduler, context
 
 
+def _distributed_save_heartbeat_worker(
+    rank: int,
+    world_size: int,
+    rendezvous_uri: str,
+    checkpoint_text: str,
+    result_directory_text: str,
+    mode: str,
+) -> None:
+    checkpoint = Path(checkpoint_text)
+    result_directory = Path(result_directory_text)
+    result = ""
+    try:
+        torch.distributed.init_process_group(
+            "gloo",
+            init_method=rendezvous_uri,
+            rank=rank,
+            world_size=world_size,
+            timeout=timedelta(seconds=4),
+        )
+        checkpoint_module._CHECKPOINT_IO_HEARTBEAT_SECONDS = 0.1
+        if rank == 0 and mode == "prepare-failure":
+            real_remove_path = checkpoint_module._remove_path
+
+            def fail_staging_cleanup(path: Path) -> None:
+                time.sleep(5.0)
+                if path.name.endswith(".staging"):
+                    raise OSError("injected staging cleanup failure")
+                real_remove_path(path)
+
+            checkpoint_module._remove_path = fail_staging_cleanup
+        if rank == 0 and mode in {"publish-success", "publish-failure"}:
+            real_write_completion = checkpoint_module._write_dcp_completion
+
+            def delayed_completion(*args, **kwargs):
+                time.sleep(5.0)
+                if mode == "publish-failure":
+                    raise OSError("injected completion publication failure")
+                return real_write_completion(*args, **kwargs)
+
+            checkpoint_module._write_dcp_completion = delayed_completion
+
+        model = torch.nn.parallel.DistributedDataParallel(torch.nn.Linear(4, 4))
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _step: 1.0)
+        context = DistributedContext(
+            rank,
+            rank,
+            world_size,
+            torch.device("cpu"),
+            True,
+            "gloo",
+        )
+        try:
+            save_checkpoint(
+                checkpoint,
+                model,
+                optimizer,
+                scheduler,
+                3,
+                context,
+            )
+        except BaseException as error:
+            result = f"{type(error).__name__}|{error}"
+        else:
+            result = "ok"
+    except BaseException as error:
+        result = f"worker-{type(error).__name__}|{error}"
+    finally:
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+        result_directory.mkdir(parents=True, exist_ok=True)
+        (result_directory / f"rank-{rank}.txt").write_text(result, encoding="utf-8")
+
+
 def test_local_checkpoint_round_trip(tmp_path: Path) -> None:
     model, optimizer, scheduler, context = _components()
     checkpoint = tmp_path / "checkpoint"
@@ -112,6 +193,51 @@ def test_local_checkpoint_round_trip(tmp_path: Path) -> None:
     payload = torch.load(checkpoint / "checkpoint.pt", weights_only=True)
     assert payload["schema"] == CHECKPOINT_SCHEMA
     assert "rng_state" in payload
+
+
+@pytest.mark.parametrize("distributed", [False, True])
+def test_checkpoint_source_rejects_mixed_local_and_distributed_formats(
+    tmp_path: Path,
+    distributed: bool,
+) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    (checkpoint / "checkpoint.pt").write_bytes(b"local")
+    (checkpoint / ".metadata").write_bytes(b"distributed")
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), distributed)
+
+    with pytest.raises(ValueError, match="mixes local checkpoint.pt"):
+        resolve_checkpoint_source(checkpoint, context)
+
+
+@pytest.mark.parametrize("local_generation", ["current", "previous"])
+@pytest.mark.parametrize("distributed", [False, True])
+def test_checkpoint_pair_rejects_mixed_formats_through_every_load_entrypoint(
+    tmp_path: Path,
+    local_generation: str,
+    distributed: bool,
+) -> None:
+    current = tmp_path / "latest"
+    previous = current.with_name(".latest.previous")
+    current.mkdir()
+    previous.mkdir()
+    local = current if local_generation == "current" else previous
+    dcp = previous if local_generation == "current" else current
+    (local / "checkpoint.pt").write_bytes(b"local checkpoint")
+    (dcp / ".metadata").write_bytes(b"distributed checkpoint")
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), distributed, "gloo")
+    model, optimizer, scheduler, _ = _components()
+
+    for requested in (current, previous):
+        operations = (
+            partial(resolve_checkpoint_source, requested, context),
+            partial(preflight_checkpoint_identity, requested, context, None),
+            partial(initialize_model_from_checkpoint, requested, model, context),
+            partial(load_checkpoint, requested, model, optimizer, scheduler, context),
+        )
+        for operation in operations:
+            with pytest.raises(ValueError, match="mixes local checkpoint.pt"):
+                operation()
 
 
 def test_local_checkpoint_replace_is_atomic(
@@ -288,9 +414,9 @@ def test_dcp_preflight_round_trips_the_full_training_identity(tmp_path: Path) ->
         },
     )
     checkpoint = tmp_path / "dcp-full-identity"
-    dcp.save({"identity": identity}, checkpoint_id=checkpoint)
+    dcp.save({"identity": identity, "step": 13}, checkpoint_id=checkpoint)
 
-    checkpoint_module._preflight_dcp_identity(checkpoint, identity)
+    assert checkpoint_module._preflight_dcp_identity(checkpoint, identity) == 13
     checkpoint_module._preflight_dcp_stage_transfer(checkpoint, identity)
     metadata = dcp.FileSystemReader(checkpoint).read_metadata()
     probe = checkpoint_module._dcp_identity_probe(metadata)
@@ -298,6 +424,296 @@ def test_dcp_preflight_round_trips_the_full_training_identity(tmp_path: Path) ->
     checkpoint_module._restore_expected_empty_mappings(probe["identity"], identity)
 
     assert probe == {"identity": identity}
+
+
+def _write_test_dcp_generation(
+    checkpoint: Path,
+    state: dict[str, object],
+    *,
+    marker_step: int,
+) -> None:
+    import torch.distributed.checkpoint as dcp
+
+    dcp.save(state, checkpoint_id=checkpoint)
+    _seal_test_dcp(checkpoint, step=marker_step)
+
+
+def _seal_test_dcp(checkpoint: Path, *, step: int) -> None:
+    torch.save(
+        {
+            "schema": CHECKPOINT_SCHEMA,
+            "rng_state": checkpoint_module._capture_rng_state(),
+        },
+        checkpoint / "rng-rank-00000.pt",
+    )
+    checkpoint_module._write_dcp_completion(
+        checkpoint,
+        step=step,
+        world_size=1,
+    )
+
+
+def _clone_model_state(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    return {name: tensor.detach().clone() for name, tensor in model.state_dict().items()}
+
+
+def _assert_model_state_unchanged(
+    model: torch.nn.Module,
+    expected: dict[str, torch.Tensor],
+) -> None:
+    for name, tensor in model.state_dict().items():
+        torch.testing.assert_close(tensor, expected[name])
+
+
+def test_dcp_resume_rejects_a_non_integer_step_before_model_mutation(tmp_path: Path) -> None:
+    from torch.distributed.checkpoint.state_dict import get_state_dict
+
+    source, source_optimizer, source_scheduler, _ = _components()
+    target, target_optimizer, target_scheduler, _ = _components()
+    with torch.no_grad():
+        source.token_embedding.weight.fill_(9.0)
+        target.token_embedding.weight.fill_(1.0)
+    model_state, optimizer_state = get_state_dict(source, source_optimizer)
+    checkpoint = tmp_path / "bad-resume-step"
+    _write_test_dcp_generation(
+        checkpoint,
+        {
+            "schema": CHECKPOINT_SCHEMA,
+            "model": model_state,
+            "optimizer": optimizer_state,
+            "scheduler": source_scheduler.state_dict(),
+            "step": "not-an-integer",
+            "training_state": {},
+        },
+        marker_step=3,
+    )
+    before = _clone_model_state(target)
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), True, "gloo")
+
+    with pytest.raises(ValueError, match="step must be an integer"):
+        load_checkpoint(
+            checkpoint,
+            target,
+            target_optimizer,
+            target_scheduler,
+            context,
+            expected_identity=None,
+        )
+
+    _assert_model_state_unchanged(target, before)
+
+
+def test_dcp_resume_restores_optional_best_generation_binding_fields(tmp_path: Path) -> None:
+    from torch.distributed.checkpoint.state_dict import get_state_dict
+
+    source, source_optimizer, source_scheduler, _ = _components()
+    target, target_optimizer, target_scheduler, _ = _components()
+    model_state, optimizer_state = get_state_dict(source, source_optimizer)
+    checkpoint = tmp_path / "resume-best-binding"
+    expected_progress = {
+        "best_validation_loss": 1.25,
+        "best_step": 3,
+        "early_stopping_bad_evals": 2,
+        "epoch": 1,
+        "batch_in_epoch": 4,
+        "configured_selection_metric": "macro_direction_nll",
+        "best_selection_metric": "validation_macro_direction_nll",
+        "best_checkpoint_artifact_sha256": "a" * 64,
+    }
+    _write_test_dcp_generation(
+        checkpoint,
+        {
+            "schema": CHECKPOINT_SCHEMA,
+            "model": model_state,
+            "optimizer": optimizer_state,
+            "scheduler": source_scheduler.state_dict(),
+            "step": 3,
+            "training_state": expected_progress,
+        },
+        marker_step=3,
+    )
+    restored_progress = {
+        "best_validation_loss": float("inf"),
+        "best_step": -1,
+        "early_stopping_bad_evals": 0,
+        "epoch": 0,
+        "batch_in_epoch": 0,
+    }
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), True, "gloo")
+
+    step = load_checkpoint(
+        checkpoint,
+        target,
+        target_optimizer,
+        target_scheduler,
+        context,
+        training_state=restored_progress,
+        expected_identity=None,
+    )
+
+    assert step == 3
+    assert restored_progress == expected_progress
+
+
+def test_dcp_stage_transfer_rejects_a_non_integer_step_before_model_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import torch.distributed.checkpoint as dcp
+
+    source, _, _, _ = _components()
+    target, _, _, _ = _components()
+    with torch.no_grad():
+        source.token_embedding.weight.fill_(8.0)
+        target.token_embedding.weight.fill_(2.0)
+    identity = {
+        "schema": "test",
+        "tokenizer": {"sha256": "a" * 64},
+        "model": {"config_sha256": "b" * 64},
+    }
+    checkpoint = tmp_path / "bad-stage-transfer-step"
+    _write_test_dcp_generation(
+        checkpoint,
+        {
+            "model": source.state_dict(),
+            "step": "not-an-integer",
+            "identity": identity,
+        },
+        marker_step=3,
+    )
+    before = _clone_model_state(target)
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), True, "gloo")
+    real_load = dcp.load
+    preflight_no_dist: list[bool] = []
+
+    def record_preflight_load(*args, **kwargs):
+        preflight_no_dist.append(bool(kwargs.get("no_dist")))
+        return real_load(*args, **kwargs)
+
+    monkeypatch.setattr(dcp, "load", record_preflight_load)
+
+    with pytest.raises(ValueError, match="stage-transfer checkpoint step must be an integer"):
+        initialize_model_from_checkpoint(
+            checkpoint,
+            target,
+            context,
+            expected_identity=identity,
+        )
+
+    assert preflight_no_dist == [True]
+    _assert_model_state_unchanged(target, before)
+
+
+def test_dcp_resume_normalizes_a_second_load_checkpoint_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.checkpoint.state_dict import get_state_dict
+
+    source, source_optimizer, source_scheduler, _ = _components()
+    target, target_optimizer, target_scheduler, _ = _components()
+    identity = {"schema": "test", "tokenizer": {"sha256": "a" * 64}}
+    model_state, optimizer_state = get_state_dict(source, source_optimizer)
+    checkpoint = tmp_path / "second-load-failure"
+    _write_test_dcp_generation(
+        checkpoint,
+        {
+            "schema": CHECKPOINT_SCHEMA,
+            "model": model_state,
+            "optimizer": optimizer_state,
+            "scheduler": source_scheduler.state_dict(),
+            "step": 5,
+            "training_state": {},
+            "identity": identity,
+        },
+        marker_step=5,
+    )
+    before = _clone_model_state(target)
+    real_load = dcp.load
+    load_calls = 0
+
+    def fail_second_load(*args, **kwargs):
+        nonlocal load_calls
+        load_calls += 1
+        if load_calls == 1:
+            assert kwargs.get("no_dist") is True
+            return real_load(*args, **kwargs)
+        assert kwargs.get("no_dist", False) is False
+        raise dcp.CheckpointException("injected second-load failure", {})
+
+    monkeypatch.setattr(dcp, "load", fail_second_load)
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), True, "gloo")
+
+    with pytest.raises(ValueError, match="distributed checkpoint payload could not be loaded"):
+        load_checkpoint(
+            checkpoint,
+            target,
+            target_optimizer,
+            target_scheduler,
+            context,
+            expected_identity=identity,
+        )
+
+    assert load_calls == 2
+    _assert_model_state_unchanged(target, before)
+
+
+def test_dcp_resume_normalizes_a_second_metadata_checkpoint_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.checkpoint.state_dict import get_state_dict
+
+    source, source_optimizer, source_scheduler, _ = _components()
+    target, target_optimizer, target_scheduler, _ = _components()
+    identity = {"schema": "test", "tokenizer": {"sha256": "a" * 64}}
+    source_ema = EMAWeights(source, decay=0.9)
+    target_ema = EMAWeights(target, decay=0.9)
+    model_state, optimizer_state = get_state_dict(source, source_optimizer)
+    checkpoint = tmp_path / "second-metadata-failure"
+    _write_test_dcp_generation(
+        checkpoint,
+        {
+            "schema": CHECKPOINT_SCHEMA,
+            "model": model_state,
+            "optimizer": optimizer_state,
+            "scheduler": source_scheduler.state_dict(),
+            "step": 5,
+            "training_state": {},
+            "identity": identity,
+            "ema": source_ema.state_dict(),
+        },
+        marker_step=5,
+    )
+    before = _clone_model_state(target)
+    real_read_metadata = dcp.FileSystemReader.read_metadata
+    metadata_calls = 0
+
+    def fail_second_metadata_read(reader):
+        nonlocal metadata_calls
+        metadata_calls += 1
+        if metadata_calls <= 2:
+            return real_read_metadata(reader)
+        raise dcp.CheckpointException("injected second-metadata failure", {})
+
+    monkeypatch.setattr(dcp.FileSystemReader, "read_metadata", fail_second_metadata_read)
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), True, "gloo")
+
+    with pytest.raises(ValueError, match="distributed checkpoint metadata could not be loaded"):
+        load_checkpoint(
+            checkpoint,
+            target,
+            target_optimizer,
+            target_scheduler,
+            context,
+            ema=target_ema,
+            expected_identity=identity,
+        )
+
+    assert metadata_calls == 3
+    _assert_model_state_unchanged(target, before)
 
 
 def test_dcp_identity_probe_preserves_integer_list_paths(tmp_path: Path) -> None:
@@ -334,6 +750,70 @@ def test_checkpoint_identity_rejects_a_different_pipeline_branch(tmp_path: Path)
 
     with pytest.raises(ValueError, match=r"identity\.pipeline\.branch"):
         checkpoint_module._validate_identity({"identity": incompatible}, expected)
+
+
+def test_checkpoint_identity_upgrades_exact_legacy_translation_only_pipeline() -> None:
+    legacy = {
+        "schema": "test",
+        "pipeline": {
+            "schema": "sion-translation-pipeline-v1",
+            "branch": "translation-only",
+        },
+    }
+    expected = {
+        "schema": "test",
+        "pipeline": {
+            "schema": "sion-translation-pipeline-v2",
+            "branch": "translation-only",
+        },
+    }
+
+    checkpoint_module._validate_identity({"identity": legacy}, expected)
+
+
+def test_checkpoint_identity_does_not_upgrade_nonexact_legacy_translation_pipeline() -> None:
+    legacy = {
+        "schema": "test",
+        "pipeline": {
+            "schema": "sion-translation-pipeline-v1",
+            "branch": "translation-only",
+            "unverifiable_lineage": "present",
+        },
+    }
+    expected = {
+        "schema": "test",
+        "pipeline": {
+            "schema": "sion-translation-pipeline-v2",
+            "branch": "translation-only",
+        },
+    }
+
+    with pytest.raises(ValueError, match=r"identity\.pipeline"):
+        checkpoint_module._validate_identity({"identity": legacy}, expected)
+
+
+def test_checkpoint_identity_keeps_legacy_foundation_pipeline_unverifiable() -> None:
+    legacy = {
+        "schema": "test",
+        "pipeline": {
+            "schema": "sion-translation-pipeline-v1",
+            "branch": "foundation-then-translation",
+        },
+    }
+    expected = {
+        "schema": "test",
+        "pipeline": {
+            "schema": "sion-translation-pipeline-v2",
+            "branch": "foundation-then-translation",
+            "foundation": {
+                "schema": "sion-foundation-lineage-v1",
+                "checkpoint_artifact_sha256": "a" * 64,
+            },
+        },
+    }
+
+    with pytest.raises(ValueError, match=r"identity\.pipeline"):
+        checkpoint_module._validate_identity({"identity": legacy}, expected)
 
 
 @pytest.mark.parametrize("state", [{}, {"identity": {"schema": "legacy"}}])
@@ -737,12 +1217,838 @@ def test_distributed_checkpoint_publishes_complete_directory_and_falls_back(
         torch.distributed.destroy_process_group()
 
 
-def _write_fake_complete_dcp(path: Path, *, step: int) -> None:
+@pytest.mark.parametrize(
+    "mode",
+    ["prepare-failure", "publish-success", "publish-failure"],
+)
+def test_distributed_save_long_io_heartbeats_and_propagates_rank_zero_result(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    if not torch.distributed.is_available() or not torch.distributed.is_gloo_available():
+        pytest.skip("distributed checkpoint test requires Gloo")
+    if torch.distributed.is_initialized():
+        pytest.skip("test requires ownership of the default process group")
+
+    checkpoint = tmp_path / "latest"
+    result_directory = tmp_path / "results"
+    rendezvous_uri = (tmp_path / "heartbeat-rendezvous").resolve().as_uri()
+    process_context = multiprocessing.get_context("spawn")
+    processes = [
+        process_context.Process(
+            target=_distributed_save_heartbeat_worker,
+            args=(
+                rank,
+                2,
+                rendezvous_uri,
+                str(checkpoint),
+                str(result_directory),
+                mode,
+            ),
+        )
+        for rank in range(2)
+    ]
+    for process in processes:
+        process.start()
+    deadline = time.monotonic() + 30.0
+    for process in processes:
+        process.join(max(0.0, deadline - time.monotonic()))
+    hanging = [process for process in processes if process.is_alive()]
+    for process in hanging:
+        process.terminate()
+        process.join(5.0)
+    assert not hanging, "distributed checkpoint save processes hung"
+    assert [process.exitcode for process in processes] == [0, 0]
+
+    results = [
+        (result_directory / f"rank-{rank}.txt").read_text(encoding="utf-8") for rank in range(2)
+    ]
+    assert all("timeout" not in result.lower() for result in results)
+    if mode == "publish-success":
+        assert results == ["ok", "ok"]
+        assert (checkpoint / checkpoint_module.DCP_COMPLETION_FILENAME).is_file()
+    else:
+        expected_detail = (
+            "injected staging cleanup failure"
+            if mode == "prepare-failure"
+            else "injected completion publication failure"
+        )
+        assert results[0].startswith("OSError|")
+        assert results[1].startswith("RuntimeError|")
+        assert all(expected_detail in result for result in results)
+
+
+def test_checkpoint_io_collective_failure_waits_for_worker_ownership_to_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    action_started = threading.Event()
+    release_action = threading.Event()
+    action_completed = threading.Event()
+    context = DistributedContext(0, 0, 2, torch.device("cpu"), True, "gloo")
+
+    def blocking_action() -> None:
+        action_started.set()
+        release_action.wait(10.0)
+        action_completed.set()
+
+    def fail_heartbeat(*_args, **_kwargs) -> None:
+        assert action_started.wait(1.0)
+        raise RuntimeError("injected heartbeat collective failure")
+
+    monkeypatch.setattr(checkpoint_module.torch.distributed, "all_reduce", fail_heartbeat)
+    releaser = threading.Timer(0.1, release_action.set)
+    releaser.start()
+    started = time.monotonic()
+    try:
+        with pytest.raises(RuntimeError, match="injected heartbeat collective failure"):
+            checkpoint_module._run_checkpoint_io_action(
+                blocking_action,
+                context,
+                operation="blocked test action",
+                rank_zero_only=True,
+            )
+    finally:
+        release_action.set()
+        releaser.join()
+
+    assert action_completed.is_set()
+    assert time.monotonic() - started >= 0.05
+
+
+def _write_fake_complete_dcp(path: Path, *, step: int, world_size: int = 1) -> object:
     path.mkdir(parents=True)
     (path / ".metadata").write_bytes(f"metadata-{step}".encode())
     (path / "__0_0.distcp").write_bytes(f"shard-{step}".encode())
-    (path / "rng-rank-00000.pt").write_bytes(f"rng-{step}".encode())
-    checkpoint_module._write_dcp_completion(path, step=step, world_size=1)
+    for rank in range(world_size):
+        (path / f"rng-rank-{rank:05d}.pt").write_bytes(f"rng-{rank}-{step}".encode())
+    return checkpoint_module._write_dcp_completion(
+        path,
+        step=step,
+        world_size=world_size,
+    )
+
+
+def test_checkpoint_discovery_includes_a_retained_local_previous_generation(
+    tmp_path: Path,
+) -> None:
+    latest = tmp_path / "latest"
+    previous = tmp_path / ".latest.previous"
+    previous.mkdir()
+    (previous / "checkpoint.pt").write_bytes(b"retained local checkpoint")
+
+    assert checkpoint_module.checkpoint_path_exists(latest)
+    assert checkpoint_module.checkpoint_path_exists(previous)
+
+
+def _write_markerless_scalar_dcp(path: Path, *, step: int) -> None:
+    import torch.distributed.checkpoint as dcp
+
+    dcp.save({"step": step}, checkpoint_id=path)
+    torch.save(
+        {
+            "schema": CHECKPOINT_SCHEMA,
+            "rng_state": checkpoint_module._capture_rng_state(),
+        },
+        path / "rng-rank-00000.pt",
+    )
+
+
+def test_checkpoint_generation_candidates_orders_current_then_previous_without_hashing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current = tmp_path / "latest"
+    previous = current.with_name(".latest.previous")
+    _write_fake_complete_dcp(current, step=2)
+    _write_fake_complete_dcp(previous, step=1)
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), True, "gloo")
+    monkeypatch.setattr(
+        checkpoint_module,
+        "_sha256_file",
+        lambda _path: pytest.fail("candidate ordering must not hash shard contents"),
+    )
+
+    assert checkpoint_module.checkpoint_generation_candidates(current, context) == (
+        current,
+        previous,
+    )
+    assert checkpoint_module.checkpoint_generation_candidates(previous, context) == (
+        current,
+        previous,
+    )
+
+
+def test_checkpoint_generation_candidate_metadata_reads_only_the_small_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint = tmp_path / "candidate"
+    _write_fake_complete_dcp(checkpoint, step=7)
+    marker = checkpoint / checkpoint_module.DCP_COMPLETION_FILENAME
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), True, "gloo")
+    monkeypatch.setattr(
+        checkpoint_module,
+        "_sha256_file",
+        lambda _path: pytest.fail("candidate metadata must not hash shard contents"),
+    )
+
+    artifact_sha256, marker_step = checkpoint_module.checkpoint_generation_candidate_metadata(
+        checkpoint, context
+    )
+
+    assert artifact_sha256 == hashlib.sha256(marker.read_bytes()).hexdigest()
+    assert marker_step == 7
+
+
+@pytest.mark.parametrize("invalid_current", ["broken-marker", "missing-rng"])
+def test_checkpoint_generation_candidates_skips_structurally_invalid_current(
+    tmp_path: Path,
+    invalid_current: str,
+) -> None:
+    current = tmp_path / "latest"
+    previous = current.with_name(".latest.previous")
+    _write_fake_complete_dcp(current, step=2)
+    _write_fake_complete_dcp(previous, step=1)
+    if invalid_current == "broken-marker":
+        (current / checkpoint_module.DCP_COMPLETION_FILENAME).write_bytes(b"{broken")
+    else:
+        (current / "rng-rank-00000.pt").unlink()
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), True, "gloo")
+
+    assert checkpoint_module.checkpoint_generation_candidates(current, context) == (previous,)
+
+
+def test_checkpoint_generation_candidates_excludes_unsealed_legacy_dcp(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "legacy"
+    _write_markerless_scalar_dcp(checkpoint, step=3)
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), True, "gloo")
+
+    assert checkpoint_module.checkpoint_generation_candidates(checkpoint, context) == ()
+
+
+def test_checkpoint_candidate_lease_falls_back_from_corrupt_current_to_previous(
+    tmp_path: Path,
+) -> None:
+    current = tmp_path / "latest"
+    previous = current.with_name(".latest.previous")
+    _write_fake_complete_dcp(current, step=2)
+    _write_fake_complete_dcp(previous, step=1)
+    (current / "__0_0.distcp").write_bytes(b"broken")
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), True, "gloo")
+    selected: Path | None = None
+
+    for candidate in checkpoint_module.checkpoint_generation_candidates(current, context):
+        marker = candidate / checkpoint_module.DCP_COMPLETION_FILENAME
+        marker_digest = hashlib.sha256(marker.read_bytes()).hexdigest()
+        try:
+            with checkpoint_module.verified_checkpoint_source_lease(
+                candidate,
+                context,
+                marker_digest,
+            ) as leased:
+                selected = leased
+        except (RuntimeError, ValueError):
+            continue
+        break
+
+    assert selected == previous
+
+
+def test_verified_generation_lease_falls_back_after_identity_preflight(
+    tmp_path: Path,
+) -> None:
+    current = tmp_path / "latest"
+    previous = current.with_name(".latest.previous")
+    expected_identity = {"schema": "test", "tokenizer": {"sha256": "a" * 64}}
+    _write_test_dcp_generation(
+        current,
+        {
+            "identity": {"schema": "test", "tokenizer": {"sha256": "b" * 64}},
+            "step": 8,
+        },
+        marker_step=8,
+    )
+    _write_test_dcp_generation(
+        previous,
+        {"identity": expected_identity, "step": 7},
+        marker_step=7,
+    )
+    previous_marker = previous / checkpoint_module.DCP_COMPLETION_FILENAME
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), True, "gloo")
+
+    with checkpoint_module.verified_checkpoint_generation_lease(
+        current,
+        context,
+        expected_identity,
+        expected_step=7,
+    ) as selected:
+        assert selected.source == previous
+        assert selected.step == 7
+        assert selected.artifact_sha256 == hashlib.sha256(previous_marker.read_bytes()).hexdigest()
+        assert checkpoint_module._active_checkpoint_lease() is not None
+
+    assert checkpoint_module._active_checkpoint_lease() is None
+
+
+def test_verified_generation_lease_honors_an_exact_previous_marker_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current = tmp_path / "best"
+    previous = current.with_name(".best.previous")
+    _write_test_dcp_generation(current, {"step": 9}, marker_step=9)
+    _write_test_dcp_generation(previous, {"step": 8}, marker_step=8)
+    previous_marker = previous / checkpoint_module.DCP_COMPLETION_FILENAME
+    previous_digest = hashlib.sha256(previous_marker.read_bytes()).hexdigest()
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), True, "gloo")
+    real_sha256_file = checkpoint_module._sha256_file
+    hashed_paths: list[Path] = []
+
+    def record_sha256(path: Path) -> str:
+        hashed_paths.append(path)
+        return real_sha256_file(path)
+
+    monkeypatch.setattr(checkpoint_module, "_sha256_file", record_sha256)
+
+    with checkpoint_module.verified_checkpoint_generation_lease(
+        current,
+        context,
+        expected_artifact_sha256=previous_digest,
+        expected_step=8,
+    ) as selected:
+        assert selected.source == previous
+
+    assert hashed_paths
+    assert all(path.parent == previous for path in hashed_paths)
+    assert len(hashed_paths) == 3
+
+
+def test_checkpoint_generation_candidates_preserves_mixed_pair_guard(tmp_path: Path) -> None:
+    current = tmp_path / "latest"
+    previous = current.with_name(".latest.previous")
+    current.mkdir()
+    (current / "checkpoint.pt").write_bytes(b"local")
+    _write_fake_complete_dcp(previous, step=1)
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), True, "gloo")
+
+    with pytest.raises(ValueError, match="mixes local checkpoint.pt"):
+        checkpoint_module.checkpoint_generation_candidates(current, context)
+
+
+def test_dcp_completion_rehashes_inventory_at_each_public_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint = tmp_path / "cached"
+    _write_fake_complete_dcp(checkpoint, step=4)
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), True, "gloo")
+    real_sha256_file = checkpoint_module._sha256_file
+    hashed_paths: list[Path] = []
+
+    def record_sha256(path: Path) -> str:
+        hashed_paths.append(path)
+        return real_sha256_file(path)
+
+    monkeypatch.setattr(checkpoint_module, "_sha256_file", record_sha256)
+
+    assert resolve_checkpoint_source(checkpoint, context) == checkpoint
+    first_hash_count = len(hashed_paths)
+    assert {path.name for path in hashed_paths} == {
+        ".metadata",
+        "__0_0.distcp",
+        "rng-rank-00000.pt",
+    }
+    assert resolve_checkpoint_source(checkpoint, context) == checkpoint
+    assert len(hashed_paths) == first_hash_count * 2
+
+
+def test_dcp_completion_revalidates_after_marker_content_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint = tmp_path / "changed-marker"
+    _write_fake_complete_dcp(checkpoint, step=5)
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), True, "gloo")
+    real_sha256_file = checkpoint_module._sha256_file
+    hash_count = 0
+
+    def count_sha256(path: Path) -> str:
+        nonlocal hash_count
+        hash_count += 1
+        return real_sha256_file(path)
+
+    monkeypatch.setattr(checkpoint_module, "_sha256_file", count_sha256)
+    assert resolve_checkpoint_source(checkpoint, context) == checkpoint
+    first_hash_count = hash_count
+    marker = checkpoint / checkpoint_module.DCP_COMPLETION_FILENAME
+    marker.write_bytes(marker.read_bytes() + b" ")
+
+    assert resolve_checkpoint_source(checkpoint, context) == checkpoint
+    assert hash_count == first_hash_count * 2
+
+
+def test_dcp_completion_rejects_same_marker_after_shard_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint = tmp_path / "replaced-shard"
+    _write_fake_complete_dcp(checkpoint, step=6)
+    real_sha256_file = checkpoint_module._sha256_file
+    hashed_paths: list[Path] = []
+
+    def record_sha256(path: Path) -> str:
+        hashed_paths.append(path)
+        return real_sha256_file(path)
+
+    monkeypatch.setattr(checkpoint_module, "_sha256_file", record_sha256)
+    assert checkpoint_module._dcp_completion_status(checkpoint, world_size=1) == "valid"
+    first_hash_count = len(hashed_paths)
+    shard = checkpoint / "__0_0.distcp"
+    replacement = checkpoint / "replacement.tmp"
+    replacement.write_bytes(b"broken-")
+    checkpoint_module.os.replace(replacement, shard)
+
+    assert checkpoint_module._dcp_completion_status(checkpoint, world_size=1) == "invalid"
+    assert len(hashed_paths) > first_hash_count
+
+
+def test_dcp_completion_rejects_same_length_metadata_mutation_with_restored_mtime(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "restored-mtime"
+    _write_fake_complete_dcp(checkpoint, step=6)
+    metadata = checkpoint / ".metadata"
+    original_stat = metadata.stat()
+    assert checkpoint_module._dcp_completion_status(checkpoint, world_size=1) == "valid"
+    metadata.write_bytes(b"tampered-6")
+    checkpoint_module.os.utime(
+        metadata,
+        ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+    )
+
+    assert metadata.stat().st_size == original_stat.st_size
+    assert metadata.stat().st_mtime_ns == original_stat.st_mtime_ns
+    assert checkpoint_module._dcp_completion_status(checkpoint, world_size=1) == "invalid"
+
+
+def test_peer_registration_hashes_every_visible_inventory_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint = tmp_path / "peer-cache"
+    _write_fake_complete_dcp(checkpoint, step=6, world_size=2)
+    marker = checkpoint / checkpoint_module.DCP_COMPLETION_FILENAME
+    marker_digest = hashlib.sha256(marker.read_bytes()).hexdigest()
+    context = DistributedContext(1, 1, 2, torch.device("cpu"), False)
+    real_sha256_file = checkpoint_module._sha256_file
+    hashed_paths: list[Path] = []
+
+    def record_sha256(path: Path) -> str:
+        hashed_paths.append(path)
+        return real_sha256_file(path)
+
+    monkeypatch.setattr(checkpoint_module, "_sha256_file", record_sha256)
+
+    assert (
+        checkpoint_module.register_verified_checkpoint_source(
+            checkpoint,
+            context,
+            marker_digest,
+        )
+        == checkpoint
+    )
+    assert {path.name for path in hashed_paths} == {
+        ".metadata",
+        "__0_0.distcp",
+        "rng-rank-00000.pt",
+        "rng-rank-00001.pt",
+    }
+
+
+def test_peer_registration_rejects_a_missing_inventory_shard(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "peer-missing-shard"
+    _write_fake_complete_dcp(checkpoint, step=7, world_size=2)
+    marker = checkpoint / checkpoint_module.DCP_COMPLETION_FILENAME
+    marker_digest = hashlib.sha256(marker.read_bytes()).hexdigest()
+    (checkpoint / "__0_0.distcp").unlink()
+    context = DistributedContext(1, 1, 2, torch.device("cpu"), False)
+
+    with pytest.raises(ValueError, match="inventory verification failed"):
+        checkpoint_module.register_verified_checkpoint_source(
+            checkpoint,
+            context,
+            marker_digest,
+        )
+
+
+def test_peer_registration_rejects_marker_digest_mismatch_without_hashing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint = tmp_path / "peer-mismatch"
+    _write_fake_complete_dcp(checkpoint, step=7, world_size=2)
+    context = DistributedContext(1, 1, 2, torch.device("cpu"), False)
+    monkeypatch.setattr(
+        checkpoint_module,
+        "_sha256_file",
+        lambda _path: pytest.fail("digest mismatch must be rejected before shard hashing"),
+    )
+
+    with pytest.raises(ValueError, match="marker digest does not match"):
+        checkpoint_module.register_verified_checkpoint_source(
+            checkpoint,
+            context,
+            "0" * 64,
+        )
+
+
+@pytest.mark.parametrize("marker_kind", ["legacy", "missing-required-file"])
+def test_peer_registration_rejects_non_v2_or_invalid_markers_without_hashing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    marker_kind: str,
+) -> None:
+    checkpoint = tmp_path / marker_kind
+    _write_fake_complete_dcp(checkpoint, step=8, world_size=2)
+    marker = checkpoint / checkpoint_module.DCP_COMPLETION_FILENAME
+    if marker_kind == "legacy":
+        marker.write_text(
+            json.dumps(
+                {
+                    "schema": CHECKPOINT_SCHEMA,
+                    "step": 8,
+                    "world_size": 2,
+                }
+            ),
+            encoding="utf-8",
+        )
+    else:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+        payload["files"] = [
+            entry for entry in payload["files"] if entry["path"] != "rng-rank-00001.pt"
+        ]
+        marker.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    marker_digest = hashlib.sha256(marker.read_bytes()).hexdigest()
+    context = DistributedContext(1, 1, 2, torch.device("cpu"), False)
+    monkeypatch.setattr(
+        checkpoint_module,
+        "_sha256_file",
+        lambda _path: pytest.fail("invalid peer marker must not trigger shard hashing"),
+    )
+
+    with pytest.raises(ValueError, match="not v2|missing required files"):
+        checkpoint_module.register_verified_checkpoint_source(
+            checkpoint,
+            context,
+            marker_digest,
+        )
+
+
+def test_peer_registration_keeps_mixed_pair_guard_after_verification(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "mixed-after-cache"
+    _write_fake_complete_dcp(checkpoint, step=9, world_size=2)
+    marker = checkpoint / checkpoint_module.DCP_COMPLETION_FILENAME
+    marker_digest = hashlib.sha256(marker.read_bytes()).hexdigest()
+    context = DistributedContext(1, 1, 2, torch.device("cpu"), False)
+    checkpoint_module.register_verified_checkpoint_source(
+        checkpoint,
+        context,
+        marker_digest,
+    )
+    (checkpoint / "checkpoint.pt").write_bytes(b"mixed local payload")
+
+    with pytest.raises(ValueError, match="mixes local checkpoint.pt"):
+        checkpoint_module.register_verified_checkpoint_source(
+            checkpoint,
+            context,
+            marker_digest,
+        )
+
+
+def test_verified_checkpoint_lease_hashes_once_then_expires(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint = tmp_path / "leased"
+    _write_fake_complete_dcp(checkpoint, step=9)
+    marker = checkpoint / checkpoint_module.DCP_COMPLETION_FILENAME
+    marker_digest = hashlib.sha256(marker.read_bytes()).hexdigest()
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), True, "gloo")
+    real_sha256_file = checkpoint_module._sha256_file
+    hashed_paths: list[Path] = []
+
+    def record_sha256(path: Path) -> str:
+        hashed_paths.append(path)
+        return real_sha256_file(path)
+
+    monkeypatch.setattr(checkpoint_module, "_sha256_file", record_sha256)
+
+    with checkpoint_module.verified_checkpoint_source_lease(
+        checkpoint,
+        context,
+        marker_digest,
+    ) as source:
+        assert source == checkpoint
+        first_hash_count = len(hashed_paths)
+        assert first_hash_count == 3
+        assert resolve_checkpoint_source(source, context) == checkpoint
+        assert resolve_checkpoint_source(source, context) == checkpoint
+        assert len(hashed_paths) == first_hash_count
+
+    assert resolve_checkpoint_source(checkpoint, context) == checkpoint
+    assert len(hashed_paths) == first_hash_count * 2
+
+
+def test_verified_checkpoint_lease_covers_repeated_public_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import torch.distributed.checkpoint as dcp
+
+    checkpoint = tmp_path / "leased-preflight"
+    dcp.save({"step": 15}, checkpoint_id=checkpoint)
+    _seal_test_dcp(checkpoint, step=15)
+    marker = checkpoint / checkpoint_module.DCP_COMPLETION_FILENAME
+    marker_digest = hashlib.sha256(marker.read_bytes()).hexdigest()
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), True, "gloo")
+    real_sha256_file = checkpoint_module._sha256_file
+    hashed_paths: list[Path] = []
+
+    def record_sha256(path: Path) -> str:
+        hashed_paths.append(path)
+        return real_sha256_file(path)
+
+    monkeypatch.setattr(checkpoint_module, "_sha256_file", record_sha256)
+
+    with checkpoint_module.verified_checkpoint_source_lease(
+        checkpoint,
+        context,
+        marker_digest,
+    ) as source:
+        initial_hash_count = len(hashed_paths)
+        assert preflight_checkpoint_identity(source, context, None) == 15
+        assert preflight_checkpoint_identity(source, context, None) == 15
+        assert len(hashed_paths) == initial_hash_count
+
+    assert initial_hash_count == 3
+
+
+def test_verified_checkpoint_lease_revokes_on_marker_change(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "changed-lease-marker"
+    _write_fake_complete_dcp(checkpoint, step=10)
+    marker = checkpoint / checkpoint_module.DCP_COMPLETION_FILENAME
+    marker_digest = hashlib.sha256(marker.read_bytes()).hexdigest()
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), True, "gloo")
+
+    with checkpoint_module.verified_checkpoint_source_lease(
+        checkpoint,
+        context,
+        marker_digest,
+    ):
+        marker.write_bytes(marker.read_bytes() + b" ")
+        with pytest.raises(ValueError, match="marker digest changed"):
+            resolve_checkpoint_source(checkpoint, context)
+
+    assert checkpoint_module._active_checkpoint_lease() is None
+
+
+def test_verified_checkpoint_lease_rejects_another_source_without_hashing_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint = tmp_path / "leased-source"
+    other = tmp_path / "other-source"
+    _write_fake_complete_dcp(checkpoint, step=11)
+    _write_fake_complete_dcp(other, step=12)
+    marker = checkpoint / checkpoint_module.DCP_COMPLETION_FILENAME
+    marker_digest = hashlib.sha256(marker.read_bytes()).hexdigest()
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), True, "gloo")
+    real_sha256_file = checkpoint_module._sha256_file
+    hashed_paths: list[Path] = []
+
+    def record_sha256(path: Path) -> str:
+        hashed_paths.append(path)
+        return real_sha256_file(path)
+
+    monkeypatch.setattr(checkpoint_module, "_sha256_file", record_sha256)
+
+    with checkpoint_module.verified_checkpoint_source_lease(
+        checkpoint,
+        context,
+        marker_digest,
+    ):
+        with pytest.raises(ValueError, match="lease source does not match"):
+            resolve_checkpoint_source(other, context)
+
+    assert all(path.parent != other for path in hashed_paths)
+
+
+@pytest.mark.parametrize("fails", [False, True], ids=["success", "failure"])
+def test_full_checkpoint_load_consumes_a_verification_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fails: bool,
+) -> None:
+    checkpoint = tmp_path / "load-lease"
+    _write_fake_complete_dcp(checkpoint, step=11)
+    marker = checkpoint / checkpoint_module.DCP_COMPLETION_FILENAME
+    marker_digest = hashlib.sha256(marker.read_bytes()).hexdigest()
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), True, "gloo")
+    model, optimizer, scheduler, _ = _components()
+
+    def fake_load(*_args, **_kwargs) -> int:
+        if fails:
+            raise RuntimeError("injected full load failure")
+        return 11
+
+    monkeypatch.setattr(checkpoint_module, "_load_checkpoint_impl", fake_load)
+
+    with checkpoint_module.verified_checkpoint_source_lease(
+        checkpoint,
+        context,
+        marker_digest,
+    ):
+        if fails:
+            with pytest.raises(RuntimeError, match="injected full load failure"):
+                load_checkpoint(checkpoint, model, optimizer, scheduler, context)
+        else:
+            assert load_checkpoint(checkpoint, model, optimizer, scheduler, context) == 11
+        assert checkpoint_module._active_checkpoint_lease() is None
+
+
+@pytest.mark.parametrize("fails", [False, True], ids=["success", "failure"])
+def test_stage_transfer_load_consumes_a_verification_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fails: bool,
+) -> None:
+    checkpoint = tmp_path / "stage-lease"
+    _write_fake_complete_dcp(checkpoint, step=12)
+    marker = checkpoint / checkpoint_module.DCP_COMPLETION_FILENAME
+    marker_digest = hashlib.sha256(marker.read_bytes()).hexdigest()
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), True, "gloo")
+    model, _, _, _ = _components()
+
+    def fake_load(*_args, **_kwargs) -> dict[str, object]:
+        if fails:
+            raise RuntimeError("injected stage load failure")
+        return {"source": str(checkpoint), "step": 12}
+
+    monkeypatch.setattr(
+        checkpoint_module,
+        "_initialize_model_from_checkpoint_impl",
+        fake_load,
+    )
+
+    with checkpoint_module.verified_checkpoint_source_lease(
+        checkpoint,
+        context,
+        marker_digest,
+    ):
+        if fails:
+            with pytest.raises(RuntimeError, match="injected stage load failure"):
+                initialize_model_from_checkpoint(checkpoint, model, context)
+        else:
+            assert initialize_model_from_checkpoint(checkpoint, model, context)["step"] == 12
+        assert checkpoint_module._active_checkpoint_lease() is None
+
+
+def test_markerless_dcp_is_not_a_default_resume_source(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "unsealed-legacy"
+    _write_markerless_scalar_dcp(checkpoint, step=10)
+
+    with pytest.raises(FileNotFoundError, match="authenticated v2"):
+        checkpoint_module._resolve_dcp_checkpoint(checkpoint, world_size=1)
+
+
+def test_explicit_upgrade_markerless_dcp_publishes_v2_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint = tmp_path / "legacy-markerless"
+    _write_markerless_scalar_dcp(checkpoint, step=10)
+    marker = checkpoint / checkpoint_module.DCP_COMPLETION_FILENAME
+    assert not marker.exists()
+
+    marker_digest = checkpoint_module.upgrade_legacy_dcp_completion(
+        checkpoint,
+        world_size=1,
+        step=10,
+    )
+
+    assert marker_digest == hashlib.sha256(marker.read_bytes()).hexdigest()
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert payload["schema"] == checkpoint_module.DCP_COMPLETION_SCHEMA
+    assert payload["step"] == 10
+    real_sha256_file = checkpoint_module._sha256_file
+    hashed_paths: list[Path] = []
+
+    def record_sha256(path: Path) -> str:
+        hashed_paths.append(path)
+        return real_sha256_file(path)
+
+    monkeypatch.setattr(checkpoint_module, "_sha256_file", record_sha256)
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), True, "gloo")
+    assert resolve_checkpoint_source(checkpoint, context) == checkpoint
+    assert {path.name for path in hashed_paths} == {
+        ".metadata",
+        "__0_0.distcp",
+        "rng-rank-00000.pt",
+    }
+
+
+def test_upgrade_existing_v2_marker_is_a_verified_byte_for_byte_noop(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "already-v2"
+    _write_markerless_scalar_dcp(checkpoint, step=11)
+    first_digest = checkpoint_module.upgrade_legacy_dcp_completion(checkpoint, 1, 11)
+    marker = checkpoint / checkpoint_module.DCP_COMPLETION_FILENAME
+    original_marker = marker.read_bytes()
+
+    second_digest = checkpoint_module.upgrade_legacy_dcp_completion(checkpoint, 1, 11)
+
+    assert second_digest == first_digest
+    assert marker.read_bytes() == original_marker
+
+
+@pytest.mark.parametrize(
+    ("world_size", "step", "match"),
+    [(1, 13, "payload step"), (2, 12, "RNG files")],
+)
+def test_upgrade_markerless_dcp_rejects_step_or_world_mismatch_without_marker(
+    tmp_path: Path,
+    world_size: int,
+    step: int,
+    match: str,
+) -> None:
+    checkpoint = tmp_path / f"mismatch-{world_size}-{step}"
+    _write_markerless_scalar_dcp(checkpoint, step=12)
+    marker = checkpoint / checkpoint_module.DCP_COMPLETION_FILENAME
+
+    with pytest.raises(ValueError, match=match):
+        checkpoint_module.upgrade_legacy_dcp_completion(
+            checkpoint,
+            world_size=world_size,
+            step=step,
+        )
+
+    assert not marker.exists()
+
+
+def test_upgrade_rejects_an_invalid_existing_marker_without_overwriting_it(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "invalid-marker"
+    _write_markerless_scalar_dcp(checkpoint, step=14)
+    marker = checkpoint / checkpoint_module.DCP_COMPLETION_FILENAME
+    marker.write_bytes(b"{broken")
+    original_marker = marker.read_bytes()
+
+    with pytest.raises(ValueError, match="completion marker is invalid"):
+        checkpoint_module.upgrade_legacy_dcp_completion(checkpoint, 1, 14)
+
+    assert marker.read_bytes() == original_marker
 
 
 @pytest.mark.parametrize("tamper", ["shard", "rng", "marker"])
@@ -791,7 +2097,7 @@ def test_dcp_publish_keeps_valid_previous_when_corrupt_current_install_fails(
     staging = current.with_name(".latest.staging")
     _write_fake_complete_dcp(previous, step=1)
     _write_fake_complete_dcp(current, step=2)
-    _write_fake_complete_dcp(staging, step=3)
+    verified_staging = _write_fake_complete_dcp(staging, step=3)
     (current / "__0_0.distcp").write_bytes(b"corrupt")
     real_replace = checkpoint_module.os.replace
 
@@ -802,13 +2108,88 @@ def test_dcp_publish_keeps_valid_previous_when_corrupt_current_install_fails(
 
     monkeypatch.setattr(checkpoint_module.os, "replace", fail_staging_install)
     with pytest.raises(OSError, match="injected staging install failure"):
-        checkpoint_module._publish_dcp_staging(staging, current, world_size=1)
+        checkpoint_module._publish_dcp_staging(
+            staging,
+            current,
+            world_size=1,
+            verified=verified_staging,
+        )
 
     assert not current.exists()
     assert staging.exists()
     assert checkpoint_module._dcp_completion_status(previous, world_size=1) == "valid"
     with pytest.warns(RuntimeWarning, match="retained checkpoint"):
         assert checkpoint_module._resolve_dcp_checkpoint(current, world_size=1) == previous
+
+
+@pytest.mark.parametrize("missing", [".metadata", "rng-rank-00000.pt"])
+def test_dcp_completion_writer_requires_the_exact_core_inventory(
+    tmp_path: Path,
+    missing: str,
+) -> None:
+    staging = tmp_path / f"missing-{missing.lstrip('.')}"
+    staging.mkdir()
+    (staging / ".metadata").write_bytes(b"metadata")
+    (staging / "__0_0.distcp").write_bytes(b"shard")
+    (staging / "rng-rank-00000.pt").write_bytes(b"rng")
+    (staging / missing).unlink()
+
+    with pytest.raises(ValueError, match="missing required files"):
+        checkpoint_module._write_dcp_completion(staging, step=1, world_size=1)
+
+    assert not (staging / checkpoint_module.DCP_COMPLETION_FILENAME).exists()
+
+
+def test_dcp_completion_writer_rejects_rng_files_outside_world_size(tmp_path: Path) -> None:
+    staging = tmp_path / "extra-rng"
+    staging.mkdir()
+    (staging / ".metadata").write_bytes(b"metadata")
+    (staging / "__0_0.distcp").write_bytes(b"shard")
+    (staging / "rng-rank-00000.pt").write_bytes(b"rng-0")
+    (staging / "rng-rank-00001.pt").write_bytes(b"rng-1")
+
+    with pytest.raises(ValueError, match="unexpected RNG files"):
+        checkpoint_module._write_dcp_completion(staging, step=1, world_size=1)
+
+
+def test_dcp_publish_requires_a_capability_for_the_exact_staging_source(
+    tmp_path: Path,
+) -> None:
+    staging = tmp_path / ".latest.staging"
+    other = tmp_path / ".other.staging"
+    destination = tmp_path / "latest"
+    _write_fake_complete_dcp(staging, step=2)
+    wrong_capability = _write_fake_complete_dcp(other, step=2)
+
+    with pytest.raises(ValueError, match="capability source does not match"):
+        checkpoint_module._publish_dcp_staging(
+            staging,
+            destination,
+            world_size=1,
+            verified=wrong_capability,
+        )
+
+    assert staging.is_dir()
+    assert not destination.exists()
+
+
+def test_dcp_publish_rejects_a_marker_changed_after_capability_issue(tmp_path: Path) -> None:
+    staging = tmp_path / ".latest.staging"
+    destination = tmp_path / "latest"
+    capability = _write_fake_complete_dcp(staging, step=3)
+    marker = staging / checkpoint_module.DCP_COMPLETION_FILENAME
+    marker.write_bytes(marker.read_bytes() + b" ")
+
+    with pytest.raises(ValueError, match="marker changed before publication"):
+        checkpoint_module._publish_dcp_staging(
+            staging,
+            destination,
+            world_size=1,
+            verified=capability,
+        )
+
+    assert staging.is_dir()
+    assert not destination.exists()
 
 
 def test_distributed_stage_transfer_supports_ddp_canonical_model_keys(
@@ -1078,11 +2459,11 @@ def test_distributed_stage_transfer_selects_the_checkpoint_ema_weights(
         },
         checkpoint_id=checkpoint,
     )
+    _seal_test_dcp(checkpoint, step=9)
 
     fresh, _, _, _ = _components()
     context = DistributedContext(0, 0, 1, torch.device("cpu"), True, "gloo")
-    with pytest.warns(RuntimeWarning, match="legacy distributed checkpoint"):
-        provenance = initialize_model_from_checkpoint(checkpoint, fresh, context)
+    provenance = initialize_model_from_checkpoint(checkpoint, fresh, context)
 
     assert torch.all(fresh.token_embedding.weight == 2.0)
     assert provenance["weights"] == "ema"
@@ -1113,13 +2494,13 @@ def test_distributed_stage_transfer_preflights_ema_metadata(
         },
         checkpoint_id=checkpoint,
     )
+    _seal_test_dcp(checkpoint, step=9)
 
     fresh, _, _, _ = _components()
     before = {name: tensor.clone() for name, tensor in fresh.state_dict().items()}
     context = DistributedContext(0, 0, 1, torch.device("cpu"), True, "gloo")
-    with pytest.warns(RuntimeWarning, match="legacy distributed checkpoint"):
-        with pytest.raises(ValueError, match="distributed checkpoint ema"):
-            initialize_model_from_checkpoint(checkpoint, fresh, context)
+    with pytest.raises(ValueError, match="distributed checkpoint ema"):
+        initialize_model_from_checkpoint(checkpoint, fresh, context)
 
     for name, tensor in fresh.state_dict().items():
         torch.testing.assert_close(tensor, before[name])

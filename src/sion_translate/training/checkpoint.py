@@ -19,23 +19,62 @@ import json
 import os
 import random
 import shutil
+import stat
 import tempfile
+import threading
+import time
 import warnings
-from collections.abc import Mapping
-from dataclasses import asdict, is_dataclass
-from pathlib import Path
+from collections.abc import Callable, Generator, Mapping
+from contextlib import ExitStack, contextmanager
+from dataclasses import asdict, dataclass, is_dataclass
+from functools import partial
+from pathlib import Path, PurePosixPath
 from typing import Any, cast
 
 import numpy as np
 import torch
 from torch import nn
 
-from .distributed import DistributedContext, barrier
+from .distributed import DistributedContext, broadcast_text
 
 CHECKPOINT_SCHEMA = "sion-training-checkpoint-v2"
 CHECKPOINT_IDENTITY_SCHEMA = "sion-checkpoint-identity-v1"
 DCP_COMPLETION_FILENAME = ".sion_checkpoint_complete.json"
 DCP_COMPLETION_SCHEMA = "sion-dcp-completion-v2"
+_CHECKPOINT_IO_HEARTBEAT_SECONDS = 1.0
+
+
+@dataclass(frozen=True)
+class _VerifiedDcpPublication:
+    source: str
+    world_size: int
+    marker_sha256: str
+
+
+@dataclass(frozen=True)
+class _VerifiedCheckpointLease:
+    source: str
+    world_size: int
+    marker_sha256: str
+
+
+@dataclass(frozen=True)
+class VerifiedCheckpointGeneration:
+    """Exact source selected by an authenticated checkpoint-generation lease."""
+
+    source: Path
+    step: int
+    artifact_sha256: str
+
+
+class _VerifiedCheckpointLeaseState(threading.local):
+    active: _VerifiedCheckpointLease | None
+
+    def __init__(self) -> None:
+        self.active = None
+
+
+_VERIFIED_CHECKPOINT_LEASE = _VerifiedCheckpointLeaseState()
 RUNTIME_DATA_PATH_FIELDS = frozenset(
     {
         "raw_dir",
@@ -82,6 +121,14 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _sha256_bytes(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _canonical_checkpoint_path(path: Path) -> str:
+    return os.path.normcase(str(path.resolve()))
 
 
 def _file_identity(path: Path) -> dict[str, Any]:
@@ -513,6 +560,15 @@ def _normalize_identity_for_comparison(identity: Mapping[str, Any]) -> dict[str,
                     typed_model_identity["config_sha256"] = hashlib.sha256(
                         _canonical_json(typed_model_config).encode("utf-8")
                     ).hexdigest()
+    pipeline_identity = payload.get("pipeline")
+    if pipeline_identity == {
+        "schema": "sion-translation-pipeline-v1",
+        "branch": "translation-only",
+    }:
+        payload["pipeline"] = {
+            "schema": "sion-translation-pipeline-v2",
+            "branch": "translation-only",
+        }
     data_identity = payload.get("data")
     if not isinstance(data_identity, dict):
         return payload
@@ -690,61 +746,75 @@ def _restore_expected_empty_mappings(
 def _preflight_dcp_identity(
     path: Path,
     expected_identity: Mapping[str, Any] | None,
-) -> None:
-    """Validate DCP identity without binding checkpoint data to live tensors."""
+) -> int:
+    """Validate DCP identity and step without touching live training tensors."""
 
-    if expected_identity is None:
-        return
     import torch.distributed.checkpoint as dcp
 
-    metadata = dcp.FileSystemReader(  # pyright: ignore[reportPrivateImportUsage]
-        path
-    ).read_metadata()
+    try:
+        metadata = dcp.FileSystemReader(  # pyright: ignore[reportPrivateImportUsage]
+            path
+        ).read_metadata()
+    except dcp.CheckpointException as error:  # pyright: ignore[reportPrivateImportUsage]
+        raise ValueError(
+            f"distributed checkpoint metadata could not be preflighted: {path}"
+        ) from error
     probe = _dcp_identity_probe(metadata)
-    if "identity" not in probe:
-        _validate_identity(probe, expected_identity)
-        return
+    if "step" not in metadata.state_dict_metadata:
+        raise ValueError("distributed checkpoint is missing step metadata")
+    probe["step"] = 0
     try:
         dcp.load(  # pyright: ignore[reportUnknownMemberType, reportPrivateImportUsage]
             probe,
             checkpoint_id=path,
+            no_dist=True,
         )
     except dcp.CheckpointException as error:  # pyright: ignore[reportPrivateImportUsage]
         raise ValueError(
-            f"distributed checkpoint identity could not be preflighted: {path}"
+            f"distributed checkpoint identity/step could not be preflighted: {path}"
         ) from error
     stored_identity = probe.get("identity")
-    if isinstance(stored_identity, dict):
+    if isinstance(stored_identity, dict) and expected_identity is not None:
         _restore_expected_empty_mappings(
             cast(dict[str, Any], stored_identity),
             cast(Mapping[str, Any], _json_compatible(expected_identity)),
         )
     _validate_identity(probe, expected_identity)
+    step = probe.get("step")
+    if isinstance(step, bool) or not isinstance(step, int):
+        raise ValueError("distributed checkpoint step must be an integer")
+    return step
 
 
 def _preflight_dcp_stage_transfer(
     path: Path,
     expected_identity: Mapping[str, Any] | None,
 ) -> Mapping[str, Any]:
-    """Validate model/tokenizer ancestry before DCP touches the live model."""
+    """Validate ancestry and step before DCP touches the live model."""
 
     import torch.distributed.checkpoint as dcp
 
-    metadata = dcp.FileSystemReader(  # pyright: ignore[reportPrivateImportUsage]
-        path
-    ).read_metadata()
+    try:
+        metadata = dcp.FileSystemReader(  # pyright: ignore[reportPrivateImportUsage]
+            path
+        ).read_metadata()
+    except dcp.CheckpointException as error:  # pyright: ignore[reportPrivateImportUsage]
+        raise ValueError(
+            f"distributed stage-transfer metadata could not be preflighted: {path}"
+        ) from error
     probe = _dcp_identity_probe(metadata)
-    if "identity" not in probe:
-        _validate_stage_transfer(probe, expected_identity, source=path)
-        return probe
+    if "step" not in metadata.state_dict_metadata:
+        raise ValueError("distributed stage-transfer checkpoint is missing step metadata")
+    probe["step"] = 0
     try:
         dcp.load(  # pyright: ignore[reportUnknownMemberType, reportPrivateImportUsage]
             probe,
             checkpoint_id=path,
+            no_dist=True,
         )
     except dcp.CheckpointException as error:  # pyright: ignore[reportPrivateImportUsage]
         raise ValueError(
-            f"distributed stage-transfer identity could not be preflighted: {path}"
+            f"distributed stage-transfer identity/step could not be preflighted: {path}"
         ) from error
     stored_identity = probe.get("identity")
     if isinstance(stored_identity, dict) and expected_identity is not None:
@@ -753,6 +823,9 @@ def _preflight_dcp_stage_transfer(
             cast(Mapping[str, Any], _json_compatible(expected_identity)),
         )
     _validate_stage_transfer(probe, expected_identity, source=path)
+    step = probe.get("step")
+    if isinstance(step, bool) or not isinstance(step, int):
+        raise ValueError("distributed stage-transfer checkpoint step must be an integer")
     return probe
 
 
@@ -760,15 +833,12 @@ def preflight_checkpoint_identity(
     path: str | Path,
     context: DistributedContext,
     expected_identity: Mapping[str, Any] | None,
-) -> None:
-    """Fail on incompatible resume provenance before mutating training state."""
+) -> int | None:
+    """Validate resume provenance and step before mutating training state."""
 
-    if expected_identity is None:
-        return
     path = resolve_checkpoint_source(path, context)
     if context.distributed:
-        _preflight_dcp_identity(path, expected_identity)
-        return
+        return _preflight_dcp_identity(path, expected_identity)
     try:
         loaded = torch.load(
             path / "checkpoint.pt",
@@ -782,6 +852,64 @@ def preflight_checkpoint_identity(
         ) from error
     loaded_state = _validate_loaded_state(loaded)
     _validate_identity(loaded_state, expected_identity)
+    return int(loaded_state["step"])
+
+
+def inspect_checkpoint_identity(
+    path: str | Path,
+    context: DistributedContext,
+) -> dict[str, Any]:
+    """Read the authenticated recorded identity without mutating live state.
+
+    Distributed callers should invoke this inside a verified generation lease;
+    ``resolve_checkpoint_source`` then performs only the lease's small marker
+    check instead of hashing every shard again.
+    """
+
+    source = resolve_checkpoint_source(path, context)
+    if context.distributed:
+        import torch.distributed.checkpoint as dcp
+
+        try:
+            metadata = dcp.FileSystemReader(  # pyright: ignore[reportPrivateImportUsage]
+                source
+            ).read_metadata()
+        except dcp.CheckpointException as error:  # pyright: ignore[reportPrivateImportUsage]
+            raise ValueError(
+                f"distributed checkpoint metadata could not be inspected: {source}"
+            ) from error
+        probe = _dcp_identity_probe(metadata)
+        try:
+            dcp.load(  # pyright: ignore[reportUnknownMemberType, reportPrivateImportUsage]
+                probe,
+                checkpoint_id=source,
+                no_dist=True,
+            )
+        except dcp.CheckpointException as error:  # pyright: ignore[reportPrivateImportUsage]
+            raise ValueError(
+                f"distributed checkpoint identity could not be inspected: {source}"
+            ) from error
+        raw_identity = probe.get("identity")
+    else:
+        try:
+            loaded = torch.load(
+                source / "checkpoint.pt",
+                map_location="cpu",
+                weights_only=True,
+                mmap=True,
+            )
+        except Exception as error:
+            raise RuntimeError(
+                "checkpoint identity could not be inspected with PyTorch's safe loader"
+            ) from error
+        loaded_state = _validate_loaded_state(loaded)
+        raw_identity = loaded_state.get("identity")
+    if not isinstance(raw_identity, Mapping):
+        raise ValueError("checkpoint has no recorded identity object")
+    normalized = _json_compatible(cast(Mapping[str, Any], raw_identity))
+    if not isinstance(normalized, dict):
+        raise ValueError("checkpoint identity must normalize to an object")
+    return cast(dict[str, Any], normalized)
 
 
 def _capture_rng_state() -> dict[str, Any]:
@@ -871,15 +999,143 @@ def _atomic_torch_save(payload: Mapping[str, Any], destination: Path) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary_path, destination)
-        if os.name != "nt":
-            directory_descriptor = os.open(destination.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_descriptor)
-            finally:
-                os.close(directory_descriptor)
+        _fsync_directory(destination.parent)
     except BaseException:
         temporary_path.unlink(missing_ok=True)
         raise
+
+
+def _fsync_file(path: Path) -> None:
+    """Flush a closed regular file before publishing a completion marker."""
+
+    # Windows' ``os.fsync`` delegates to ``_commit`` and rejects a descriptor
+    # opened read-only with EBADF. DCP artifacts are files owned by this
+    # publication transaction, so open without truncation but with write access
+    # on every platform before issuing the durable flush.
+    with path.open("r+b") as handle:
+        os.fsync(handle.fileno())
+
+
+def _fsync_directory(path: Path) -> None:
+    """Persist namespace mutations where directory fsync is supported."""
+
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_directory_tree(root: Path) -> None:
+    directories = [root] + [
+        candidate
+        for candidate in root.rglob("*")
+        if candidate.is_dir() and not candidate.is_symlink()
+    ]
+    for directory in sorted(directories, key=lambda item: len(item.parts), reverse=True):
+        _fsync_directory(directory)
+
+
+def _run_checkpoint_io_action(
+    action: Callable[[], None],
+    context: DistributedContext,
+    *,
+    operation: str,
+    rank_zero_only: bool,
+) -> None:
+    """Run slow checkpoint I/O without parking peers in one long collective.
+
+    The I/O runs in worker threads while every rank's main thread exchanges a
+    tiny completion heartbeat. No individual collective includes the long I/O,
+    so a filesystem scan may safely exceed the process-group operation timeout.
+    Once every participating worker finishes, the lowest failing rank broadcasts
+    a bounded diagnostic before any rank raises.
+    """
+
+    should_run = not rank_zero_only or context.is_main
+    if not context.distributed or context.world_size == 1:
+        if should_run:
+            action()
+        return
+
+    import torch.distributed as dist
+
+    completed = threading.Event()
+    abort_requested = threading.Event()
+    errors: list[BaseException] = []
+
+    def run_action() -> None:
+        try:
+            if not abort_requested.is_set():
+                action()
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            completed.set()
+
+    worker: threading.Thread | None = None
+    if should_run:
+        worker = threading.Thread(
+            target=run_action,
+            name=f"sion-checkpoint-{operation}",
+            daemon=False,
+        )
+        worker.start()
+    else:
+        completed.set()
+
+    try:
+        all_completed = torch.zeros((), dtype=torch.int32, device=context.device)
+        while True:
+            all_completed.fill_(int(completed.is_set()))
+            dist.all_reduce(  # pyright: ignore[reportUnknownMemberType]
+                all_completed,
+                op=dist.ReduceOp.MIN,
+            )
+            if bool(all_completed.item()):
+                break
+            if should_run:
+                completed.wait(_CHECKPOINT_IO_HEARTBEAT_SECONDS)
+            else:
+                time.sleep(_CHECKPOINT_IO_HEARTBEAT_SECONDS)
+    except BaseException:
+        abort_requested.set()
+        raise
+    finally:
+        if worker is not None:
+            # A failed collective must not let an orphaned worker keep hashing,
+            # renaming, or publishing checkpoint bytes after this call returns.
+            # Python cannot safely cancel arbitrary filesystem I/O, so wait for
+            # ownership to end before propagating the collective failure.
+            worker.join()
+
+    failure_source = torch.tensor(
+        context.rank if errors else context.world_size,
+        dtype=torch.int64,
+        device=context.device,
+    )
+    dist.all_reduce(  # pyright: ignore[reportUnknownMemberType]
+        failure_source,
+        op=dist.ReduceOp.MIN,
+    )
+    source_rank = int(failure_source.item())
+    if source_rank == context.world_size:
+        return
+    local_error = errors[0] if errors else None
+    local_detail = None
+    if context.rank == source_rank and local_error is not None:
+        rendered = " ".join(str(local_error).splitlines())
+        local_detail = f"{type(local_error).__name__}: {rendered}"[:2048]
+    detail = broadcast_text(
+        local_detail,
+        context,
+        source=source_rank,
+    )
+    if context.rank == source_rank and local_error is not None:
+        raise local_error
+    raise RuntimeError(f"{operation} failed on distributed rank {source_rank}: {detail}")
 
 
 def _remove_path(path: Path) -> None:
@@ -901,29 +1157,63 @@ def _write_dcp_completion(
     *,
     step: int,
     world_size: int,
-) -> None:
+) -> _VerifiedDcpPublication:
+    if type(step) is not int or step < 0:
+        raise ValueError("distributed checkpoint step must be a non-negative integer")
+    if type(world_size) is not int or world_size <= 0:
+        raise ValueError("distributed checkpoint world size must be a positive integer")
+    if directory.is_symlink() or not directory.is_dir():
+        raise ValueError(f"distributed checkpoint is not a regular directory: {directory}")
     marker = directory / DCP_COMPLETION_FILENAME
+    if marker.is_symlink():
+        raise ValueError(f"distributed checkpoint completion marker is a symlink: {marker}")
     inventory: list[dict[str, Any]] = []
     for artifact in sorted(directory.rglob("*")):
         if artifact == marker:
             continue
-        if artifact.is_symlink():
+        artifact_stat = artifact.lstat()
+        if stat.S_ISLNK(artifact_stat.st_mode):
             raise ValueError(f"distributed checkpoint contains a symlink: {artifact}")
-        if not artifact.is_file():
+        if stat.S_ISDIR(artifact_stat.st_mode):
             continue
+        if not stat.S_ISREG(artifact_stat.st_mode):
+            raise ValueError(f"distributed checkpoint contains a non-regular file: {artifact}")
+        artifact_sha256 = _sha256_file(artifact)
+        _fsync_file(artifact)
+        final_stat = artifact.lstat()
+        initial_identity = (
+            artifact_stat.st_mode,
+            artifact_stat.st_size,
+            artifact_stat.st_mtime_ns,
+            artifact_stat.st_ctime_ns,
+            artifact_stat.st_dev,
+            artifact_stat.st_ino,
+        )
+        final_identity = (
+            final_stat.st_mode,
+            final_stat.st_size,
+            final_stat.st_mtime_ns,
+            final_stat.st_ctime_ns,
+            final_stat.st_dev,
+            final_stat.st_ino,
+        )
+        if initial_identity != final_identity:
+            raise ValueError(f"distributed checkpoint artifact changed while hashing: {artifact}")
         inventory.append(
             {
                 "path": artifact.relative_to(directory).as_posix(),
-                "size": artifact.stat().st_size,
-                "sha256": _sha256_file(artifact),
+                "size": final_stat.st_size,
+                "sha256": artifact_sha256,
             }
         )
+    _fsync_directory_tree(directory)
     payload = {
         "schema": DCP_COMPLETION_SCHEMA,
         "step": int(step),
         "world_size": int(world_size),
         "files": inventory,
     }
+    _validated_dcp_v2_inventory(payload, world_size=world_size)
     descriptor, temporary_name = tempfile.mkstemp(
         dir=directory,
         prefix=f".{DCP_COMPLETION_FILENAME}.",
@@ -937,9 +1227,19 @@ def _write_dcp_completion(
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, marker)
+        _fsync_directory(directory)
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
+    stored_payload, marker_sha256 = _read_dcp_completion_payload(marker)
+    if stored_payload != payload:
+        raise ValueError("distributed checkpoint completion marker changed while being written")
+    _validated_dcp_v2_inventory(stored_payload, world_size=world_size)
+    return _VerifiedDcpPublication(
+        source=_canonical_checkpoint_path(directory),
+        world_size=world_size,
+        marker_sha256=marker_sha256,
+    )
 
 
 def _publish_dcp_staging(
@@ -947,35 +1247,39 @@ def _publish_dcp_staging(
     destination: Path,
     *,
     world_size: int,
-    staging_verified: bool = False,
+    verified: object,
 ) -> None:
     """Publish a complete DCP directory while retaining one recoverable version.
 
-    ``staging_verified`` is reserved for the immediate caller that just built
-    the hashed completion marker; it avoids reading every large shard a second
-    time before the atomic rename.
+    ``verified`` is the path-bound capability returned by the immediately
+    preceding ``_write_dcp_completion`` call. The private staging namespace is
+    protected by the run-wide training lock; an uncooperative external writer
+    remains outside the guarantees of PyTorch's path-based DCP API.
     """
 
     previous = _dcp_sibling(destination, "previous")
-    staging_is_valid = (
-        (staging / DCP_COMPLETION_FILENAME).is_file()
-        if staging_verified
-        else _dcp_completion_status(staging, world_size=world_size) == "valid"
-    )
-    if not staging_is_valid:
-        raise ValueError(f"refusing to publish an incomplete DCP staging directory: {staging}")
+    if not isinstance(verified, _VerifiedDcpPublication):
+        raise TypeError("distributed checkpoint publication requires a verified capability")
+    if verified.source != _canonical_checkpoint_path(staging):
+        raise ValueError("distributed checkpoint publication capability source does not match")
+    if verified.world_size != world_size:
+        raise ValueError("distributed checkpoint publication capability world size does not match")
+    marker = staging / DCP_COMPLETION_FILENAME
+    if marker.is_symlink() or not marker.is_file():
+        raise ValueError("distributed checkpoint staging marker is not a regular file")
+    marker_payload, marker_sha256 = _read_dcp_completion_payload(marker)
+    if marker_sha256 != verified.marker_sha256:
+        raise ValueError("distributed checkpoint staging marker changed before publication")
+    _validated_dcp_v2_inventory(marker_payload, world_size=world_size)
     destination_status = _dcp_completion_status(destination, world_size=world_size)
     previous_status = _dcp_completion_status(previous, world_size=world_size)
-    destination_recoverable = destination_status in {"valid", "legacy"} or (
-        destination_status == "absent" and (destination / ".metadata").is_file()
-    )
-    previous_recoverable = previous_status in {"valid", "legacy"} or (
-        previous_status == "absent" and (previous / ".metadata").is_file()
-    )
+    destination_recoverable = destination_status == "valid"
+    previous_recoverable = previous_status == "valid"
     moved_previous = False
     if destination_recoverable:
         _remove_path(previous)
         os.replace(destination, previous)
+        _fsync_directory(destination.parent)
         moved_previous = True
     else:
         # A corrupt current publication must never replace the last valid
@@ -986,108 +1290,333 @@ def _publish_dcp_staging(
             _remove_path(previous)
     try:
         os.replace(staging, destination)
+        _fsync_directory(destination.parent)
     except BaseException:
         if moved_previous and not destination.exists():
             os.replace(previous, destination)
+        _fsync_directory(destination.parent)
         raise
 
 
-def _dcp_completion_status(path: Path, *, world_size: int) -> str:
-    marker = path / DCP_COMPLETION_FILENAME
-    if not marker.is_file():
-        return "absent"
+def _read_dcp_completion_payload(marker: Path) -> tuple[dict[str, Any], str]:
     try:
-        payload = json.loads(marker.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        encoded = marker.read_bytes()
+        raw_payload: object = json.loads(encoded.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(
+            f"distributed checkpoint completion marker is invalid: {marker}"
+        ) from error
+    if not isinstance(raw_payload, dict):
+        raise ValueError("distributed checkpoint completion marker must be an object")
+    return cast(dict[str, Any], raw_payload), _sha256_bytes(encoded)
+
+
+def _validated_dcp_v2_inventory(
+    marker_payload: Mapping[str, Any],
+    *,
+    world_size: int,
+) -> list[dict[str, Any]]:
+    if type(world_size) is not int or world_size <= 0:
+        raise ValueError("distributed checkpoint world size must be a positive integer")
+    if marker_payload.get("schema") != DCP_COMPLETION_SCHEMA:
+        raise ValueError("distributed checkpoint completion marker is not v2")
+    if set(marker_payload) != {"schema", "step", "world_size", "files"}:
+        raise ValueError("distributed checkpoint completion marker fields are invalid")
+    if isinstance(marker_payload.get("step"), bool) or not isinstance(
+        marker_payload.get("step"), int
+    ):
+        raise ValueError("distributed checkpoint completion step must be an integer")
+    marker_world_size = marker_payload.get("world_size")
+    if (
+        isinstance(marker_world_size, bool)
+        or not isinstance(marker_world_size, int)
+        or marker_world_size != world_size
+    ):
+        raise ValueError(
+            "distributed checkpoint completion world size does not match "
+            f"({marker_world_size!r} != {world_size})"
+        )
+    raw_inventory = marker_payload.get("files")
+    if not isinstance(raw_inventory, list):
+        raise ValueError("distributed checkpoint completion inventory must be a list")
+    inventory: list[dict[str, Any]] = []
+    inventory_paths: set[str] = set()
+    for raw_entry in cast(list[object], raw_inventory):
+        if not isinstance(raw_entry, Mapping):
+            raise ValueError("distributed checkpoint completion inventory entry is invalid")
+        entry_mapping = cast(Mapping[object, object], raw_entry)
+        if set(entry_mapping) != {"path", "size", "sha256"}:
+            raise ValueError("distributed checkpoint completion inventory entry is invalid")
+        raw_path = entry_mapping.get("path")
+        raw_size = entry_mapping.get("size")
+        raw_sha256 = entry_mapping.get("sha256")
+        if not isinstance(raw_path, str):
+            raise ValueError("distributed checkpoint completion inventory path is invalid")
+        normalized_path = PurePosixPath(raw_path)
+        if (
+            not raw_path
+            or not normalized_path.parts
+            or "\\" in raw_path
+            or normalized_path.is_absolute()
+            or normalized_path.as_posix() != raw_path
+            or ".." in normalized_path.parts
+            or raw_path == DCP_COMPLETION_FILENAME
+            or raw_path in inventory_paths
+        ):
+            raise ValueError(
+                f"distributed checkpoint completion inventory path is unsafe: {raw_path!r}"
+            )
+        if isinstance(raw_size, bool) or not isinstance(raw_size, int) or raw_size < 0:
+            raise ValueError(
+                f"distributed checkpoint completion inventory size is invalid: {raw_path!r}"
+            )
+        if (
+            not isinstance(raw_sha256, str)
+            or len(raw_sha256) != 64
+            or raw_sha256 != raw_sha256.lower()
+            or any(character not in "0123456789abcdef" for character in raw_sha256)
+        ):
+            raise ValueError(
+                f"distributed checkpoint completion inventory digest is invalid: {raw_path!r}"
+            )
+        entry = {"path": raw_path, "size": raw_size, "sha256": raw_sha256}
+        inventory.append(entry)
+        inventory_paths.add(raw_path)
+    required_paths = {".metadata"} | {f"rng-rank-{rank:05d}.pt" for rank in range(world_size)}
+    missing = sorted(required_paths - inventory_paths)
+    if missing:
+        raise ValueError(
+            "distributed checkpoint completion inventory is missing required files: "
+            + ", ".join(missing)
+        )
+    expected_rng_paths = required_paths - {".metadata"}
+    stored_rng_paths = {
+        artifact_path
+        for artifact_path in inventory_paths
+        if artifact_path.startswith("rng-rank-") and artifact_path.endswith(".pt")
+    }
+    if stored_rng_paths != expected_rng_paths:
+        raise ValueError("distributed checkpoint completion inventory has unexpected RNG files")
+    return inventory
+
+
+def _dcp_completion_status(
+    path: Path,
+    *,
+    world_size: int,
+    expected_marker_sha256: str | None = None,
+) -> str:
+    marker = path / DCP_COMPLETION_FILENAME
+    if not marker.exists() and not marker.is_symlink():
+        return "absent"
+    if marker.is_symlink() or not marker.is_file():
         return "invalid"
-    if not isinstance(payload, Mapping):
+    try:
+        marker_payload, marker_sha256 = _read_dcp_completion_payload(marker)
+    except ValueError:
         return "invalid"
-    marker_payload = cast(Mapping[object, object], payload)
-    if type(marker_payload.get("step")) is not int:
+    if expected_marker_sha256 is not None and marker_sha256 != expected_marker_sha256:
         return "invalid"
-    if marker_payload.get("world_size") != world_size:
+    if isinstance(marker_payload.get("step"), bool) or not isinstance(
+        marker_payload.get("step"), int
+    ):
+        return "invalid"
+    marker_world_size = marker_payload.get("world_size")
+    if (
+        isinstance(marker_world_size, bool)
+        or not isinstance(marker_world_size, int)
+        or marker_world_size != world_size
+    ):
         return "invalid"
     schema = marker_payload.get("schema")
     if schema == CHECKPOINT_SCHEMA:
+        if set(marker_payload) != {"schema", "step", "world_size"}:
+            return "invalid"
         required = [path / ".metadata"] + [
             path / f"rng-rank-{rank:05d}.pt" for rank in range(world_size)
         ]
-        return "legacy" if all(item.is_file() for item in required) else "invalid"
-    if schema != DCP_COMPLETION_SCHEMA:
-        return "invalid"
-    stored_inventory = marker_payload.get("files")
-    if not isinstance(stored_inventory, list):
+        return (
+            "legacy"
+            if all(item.is_file() and not item.is_symlink() for item in required)
+            else "invalid"
+        )
+    try:
+        stored_inventory = _validated_dcp_v2_inventory(
+            marker_payload,
+            world_size=world_size,
+        )
+    except ValueError:
         return "invalid"
     try:
         current_inventory: list[dict[str, Any]] = []
         for artifact in sorted(path.rglob("*")):
             if artifact == marker:
                 continue
-            if artifact.is_symlink():
+            before = artifact.lstat()
+            if stat.S_ISLNK(before.st_mode):
                 return "invalid"
-            if not artifact.is_file():
+            if stat.S_ISDIR(before.st_mode):
                 continue
+            if not stat.S_ISREG(before.st_mode):
+                return "invalid"
+            artifact_sha256 = _sha256_file(artifact)
+            after = artifact.lstat()
+            before_identity = (
+                before.st_mode,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+                before.st_dev,
+                before.st_ino,
+            )
+            after_identity = (
+                after.st_mode,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+                after.st_dev,
+                after.st_ino,
+            )
+            if before_identity != after_identity:
+                return "invalid"
             current_inventory.append(
                 {
                     "path": artifact.relative_to(path).as_posix(),
-                    "size": artifact.stat().st_size,
-                    "sha256": _sha256_file(artifact),
+                    "size": after.st_size,
+                    "sha256": artifact_sha256,
                 }
             )
     except OSError:
         return "invalid"
     if stored_inventory != current_inventory:
         return "invalid"
-    inventory_paths = {item.get("path") for item in current_inventory}
-    required_paths = {".metadata"} | {f"rng-rank-{rank:05d}.pt" for rank in range(world_size)}
-    return "valid" if required_paths <= inventory_paths else "invalid"
+    try:
+        _, final_marker_sha256 = _read_dcp_completion_payload(marker)
+    except ValueError:
+        return "invalid"
+    return "valid" if final_marker_sha256 == marker_sha256 else "invalid"
 
 
 def _resolve_dcp_checkpoint(path: Path, *, world_size: int) -> Path:
     """Resolve a complete current DCP checkpoint, or its retained predecessor."""
 
     current_status = _dcp_completion_status(path, world_size=world_size)
-    if current_status in {"valid", "legacy"}:
-        if current_status == "legacy":
-            warnings.warn(
-                f"{path} uses a legacy checkpoint completion marker without file hashes",
-                RuntimeWarning,
-                stacklevel=3,
-            )
+    if current_status == "valid":
         return path
     previous = _dcp_sibling(path, "previous")
     previous_status = _dcp_completion_status(previous, world_size=world_size)
-    if previous_status in {"valid", "legacy"}:
+    if previous_status == "valid":
         warnings.warn(
             f"{path} is incomplete; resuming from retained checkpoint {previous}",
             RuntimeWarning,
             stacklevel=3,
         )
         return previous
-    # Accept pre-v2 DCP directories once for backward compatibility. New saves
-    # always carry a completion marker and never overwrite this directory in place.
-    if current_status == "absent" and (path / ".metadata").is_file():
-        warnings.warn(
-            "legacy distributed checkpoint has no Sion completion marker; "
-            "loading it without atomic-publication verification",
-            RuntimeWarning,
-            stacklevel=3,
-        )
-        return path
     raise FileNotFoundError(
-        f"no complete distributed checkpoint found at {path} "
+        f"no authenticated v2 distributed checkpoint found at {path} "
         f"(current={current_status}, previous={previous_status})"
     )
 
 
-def checkpoint_path_exists(path: str | Path) -> bool:
-    """Return whether a local or distributed checkpoint can be resumed."""
+def _logical_checkpoint_current(path: Path) -> Path:
+    previous_suffix = ".previous"
+    if path.name.startswith(".") and path.name.endswith(previous_suffix):
+        current_name = path.name[1 : -len(previous_suffix)]
+        if current_name:
+            return path.with_name(current_name)
+    return path
 
-    path = Path(path)
+
+def _is_lightweight_dcp_candidate(path: Path, *, world_size: int) -> bool:
+    """Check only cheap v2 structure; this does not authenticate shard bytes."""
+
+    marker = path / DCP_COMPLETION_FILENAME
+    try:
+        if path.is_symlink() or marker.is_symlink() or not marker.is_file():
+            return False
+        marker_payload, _ = _read_dcp_completion_payload(marker)
+        _validated_dcp_v2_inventory(
+            marker_payload,
+            world_size=world_size,
+        )
+        return all(
+            required.is_file() and not required.is_symlink()
+            for required in _required_dcp_files(path, world_size=world_size)
+        )
+    except (OSError, ValueError):
+        return False
+
+
+def checkpoint_generation_candidates(
+    path: str | Path,
+    context: DistributedContext,
+) -> tuple[Path, ...]:
+    """Return current/previous v2 DCP candidates without hashing large shards.
+
+    This is an ordering helper, not an authentication result. Rank 0 may use it
+    to enumerate current then retained previous, broadcast each exact path and
+    small marker digest, and have every rank attempt
+    ``verified_checkpoint_source_lease``. A candidate must never be loaded merely
+    because it appears in this tuple.
+    """
+
+    if not context.distributed:
+        raise ValueError("distributed checkpoint candidates require DCP topology")
+    if context.world_size <= 0:
+        raise ValueError("distributed checkpoint world size must be positive")
+    current = _logical_checkpoint_current(Path(path))
+    _reject_mixed_checkpoint_formats(current)
+    previous = _dcp_sibling(current, "previous")
+    return tuple(
+        candidate
+        for candidate in (current, previous)
+        if _is_lightweight_dcp_candidate(candidate, world_size=context.world_size)
+    )
+
+
+def checkpoint_generation_candidate_metadata(
+    path: str | Path,
+    context: DistributedContext,
+) -> tuple[str, int]:
+    """Return a candidate's small marker digest and declared step.
+
+    This helper validates only the v2 marker structure and required-file
+    presence. The returned values are rank-zero control-plane hints, not proof
+    that shard contents are authentic. Broadcast them and pass the digest to
+    ``verified_checkpoint_source_lease`` before preflight or load.
+    """
+
+    candidate = Path(path)
+    if not context.distributed:
+        raise ValueError("distributed checkpoint candidate metadata requires DCP topology")
+    if context.world_size <= 0:
+        raise ValueError("distributed checkpoint world size must be positive")
+    if not _is_lightweight_dcp_candidate(candidate, world_size=context.world_size):
+        raise ValueError(f"checkpoint is not a structurally valid v2 DCP candidate: {candidate}")
+    marker_payload, marker_sha256 = _read_dcp_completion_payload(
+        candidate / DCP_COMPLETION_FILENAME
+    )
+    _validated_dcp_v2_inventory(marker_payload, world_size=context.world_size)
+    marker_step = marker_payload.get("step")
+    if isinstance(marker_step, bool) or not isinstance(marker_step, int) or marker_step < 0:
+        raise ValueError("distributed checkpoint completion marker step is invalid")
+    return marker_sha256, marker_step
+
+
+def checkpoint_path_exists(path: str | Path) -> bool:
+    """Return whether checkpoint-like artifacts exist, without authenticating them.
+
+    This is discovery only. Callers deciding whether to resume or preserve best
+    state must use ``verified_checkpoint_generation_lease`` (DCP) or an exact
+    local preflight before trusting the candidate.
+    """
+
+    path = _logical_checkpoint_current(Path(path))
     previous = _dcp_sibling(path, "previous")
     return any(
         (
             (path / "checkpoint.pt").is_file(),
+            (previous / "checkpoint.pt").is_file(),
             (path / ".metadata").is_file(),
             (previous / ".metadata").is_file(),
         )
@@ -1101,11 +1630,549 @@ def resolve_checkpoint_source(
     """Resolve the exact authenticated checkpoint generation a load will use."""
 
     path = Path(path)
+    _reject_mixed_checkpoint_formats(path)
     if context.distributed:
-        return _resolve_dcp_checkpoint(path, world_size=context.world_size)
+        leased = _resolve_active_checkpoint_lease(path, context)
+        if leased is not None:
+            return leased
+        resolved = _resolve_dcp_checkpoint(path, world_size=context.world_size)
+        _reject_mixed_checkpoint_formats(resolved)
+        return resolved
     if (path / "checkpoint.pt").is_file():
         return path
     raise FileNotFoundError(f"no local checkpoint payload found at {path}")
+
+
+def _reject_mixed_checkpoint_formats(path: Path) -> None:
+    """Reject a logical current/previous pair with topology-dependent formats."""
+
+    current = _logical_checkpoint_current(path)
+    previous = _dcp_sibling(current, "previous")
+    generations = (current, previous)
+    has_local_payload = any((generation / "checkpoint.pt").is_file() for generation in generations)
+    has_distributed_payload = any(
+        (generation / filename).is_file()
+        for generation in generations
+        for filename in (".metadata", DCP_COMPLETION_FILENAME)
+    )
+    if has_local_payload and has_distributed_payload:
+        raise ValueError(
+            "checkpoint generation pair mixes local checkpoint.pt and distributed "
+            f"checkpoint artifacts: current={current}, previous={previous}"
+        )
+
+
+def _validate_sha256_digest(value: str, *, label: str) -> None:
+    if (
+        len(value) != 64
+        or value != value.lower()
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{label} must be a lowercase SHA-256 digest")
+
+
+def _required_dcp_files(path: Path, *, world_size: int) -> list[Path]:
+    return [path / ".metadata"] + [path / f"rng-rank-{rank:05d}.pt" for rank in range(world_size)]
+
+
+def register_verified_checkpoint_source(
+    path: str | Path,
+    context: DistributedContext,
+    expected_artifact_sha256: str,
+) -> Path:
+    """Authenticate one rank-consistent v2 DCP source against rank 0's marker.
+
+    Every rank hashes its complete visible inventory. A marker digest alone, or
+    mutable file-stat metadata, cannot authenticate a non-shared filesystem.
+    In distributed execution every rank must call this function together; short
+    heartbeats keep the full hashes outside any single collective's timeout.
+    """
+
+    path = Path(path)
+    if context.world_size <= 0 or context.rank < 0 or context.rank >= context.world_size:
+        raise ValueError("distributed checkpoint context rank/world size is invalid")
+    _validate_sha256_digest(
+        expected_artifact_sha256,
+        label="expected distributed checkpoint artifact digest",
+    )
+
+    def authenticate_visible_inventory() -> None:
+        _reject_mixed_checkpoint_formats(path)
+        marker = path / DCP_COMPLETION_FILENAME
+        if marker.is_symlink() or not marker.is_file():
+            raise ValueError("verified checkpoint registration requires a regular v2 marker")
+        marker_payload, marker_sha256 = _read_dcp_completion_payload(marker)
+        if marker_sha256 != expected_artifact_sha256:
+            raise ValueError(
+                "distributed checkpoint completion marker digest does not match "
+                f"rank 0 ({marker_sha256} != {expected_artifact_sha256})"
+            )
+        _validated_dcp_v2_inventory(
+            marker_payload,
+            world_size=context.world_size,
+        )
+        if (
+            _dcp_completion_status(
+                path,
+                world_size=context.world_size,
+                expected_marker_sha256=expected_artifact_sha256,
+            )
+            != "valid"
+        ):
+            raise ValueError(f"distributed checkpoint inventory verification failed: {path}")
+
+    _run_checkpoint_io_action(
+        authenticate_visible_inventory,
+        context,
+        operation="distributed checkpoint inventory authentication",
+        rank_zero_only=False,
+    )
+    return path
+
+
+def _active_checkpoint_lease() -> _VerifiedCheckpointLease | None:
+    return _VERIFIED_CHECKPOINT_LEASE.active
+
+
+def _revoke_checkpoint_lease() -> None:
+    _VERIFIED_CHECKPOINT_LEASE.active = None
+
+
+def _resolve_active_checkpoint_lease(
+    path: Path,
+    context: DistributedContext,
+) -> Path | None:
+    lease = _active_checkpoint_lease()
+    if lease is None:
+        return None
+    if not context.distributed:
+        _revoke_checkpoint_lease()
+        raise ValueError("distributed checkpoint verification lease used with local topology")
+    if lease.world_size != context.world_size:
+        _revoke_checkpoint_lease()
+        raise ValueError("distributed checkpoint verification lease world size does not match")
+    if lease.source != _canonical_checkpoint_path(path):
+        _revoke_checkpoint_lease()
+        raise ValueError("distributed checkpoint verification lease source does not match")
+    marker = path / DCP_COMPLETION_FILENAME
+    try:
+        if marker.is_symlink() or not marker.is_file():
+            raise ValueError("leased distributed checkpoint marker is not a regular file")
+        marker_payload, marker_sha256 = _read_dcp_completion_payload(marker)
+        if marker_sha256 != lease.marker_sha256:
+            raise ValueError("leased distributed checkpoint marker digest changed")
+        _validated_dcp_v2_inventory(
+            marker_payload,
+            world_size=context.world_size,
+        )
+    except ValueError:
+        _revoke_checkpoint_lease()
+        raise
+    return path
+
+
+@contextmanager
+def verified_checkpoint_source_lease(
+    path: str | Path,
+    context: DistributedContext,
+    expected_artifact_sha256: str,
+) -> Generator[Path, None, None]:
+    """Fully authenticate DCP once for one locked resume call-chain.
+
+    The caller must hold the run-wide ``training_run_lock`` for the entire
+    context so cooperating code cannot mutate the checkpoint namespace. Within
+    that contract, existing path APIs recheck the exact canonical source, world
+    size, v2 marker structure, and marker digest but avoid repeated shard hashes.
+    PyTorch DCP exposes paths rather than immutable file handles, so this lease
+    cannot prevent an uncooperative external writer from creating a TOCTOU race.
+
+    In distributed execution every rank must enter and leave this context in the
+    same control-flow order. The lease is process- and thread-local, opaque to
+    callers, non-nestable, and unconditionally discarded on exit or mismatch.
+    """
+
+    if not context.distributed:
+        raise ValueError("checkpoint verification leases require distributed DCP topology")
+    if _active_checkpoint_lease() is not None:
+        raise RuntimeError("checkpoint verification leases cannot be nested")
+    source = register_verified_checkpoint_source(
+        path,
+        context,
+        expected_artifact_sha256,
+    )
+    lease = _VerifiedCheckpointLease(
+        source=_canonical_checkpoint_path(source),
+        world_size=context.world_size,
+        marker_sha256=expected_artifact_sha256,
+    )
+    _VERIFIED_CHECKPOINT_LEASE.active = lease
+    try:
+        yield source
+    finally:
+        if _active_checkpoint_lease() == lease:
+            _revoke_checkpoint_lease()
+
+
+def _coordinated_checkpoint_generation_bindings(
+    path: Path,
+    context: DistributedContext,
+    *,
+    expected_artifact_sha256: str | None,
+) -> tuple[tuple[Path, str, int], ...]:
+    """Rank 0 orders cheap candidate hints and broadcasts the exact bindings."""
+
+    prepared: list[dict[str, object]] = []
+
+    def prepare_candidates() -> None:
+        for candidate in checkpoint_generation_candidates(path, context):
+            artifact_sha256, marker_step = checkpoint_generation_candidate_metadata(
+                candidate,
+                context,
+            )
+            if expected_artifact_sha256 is not None and artifact_sha256 != expected_artifact_sha256:
+                continue
+            prepared.append(
+                {
+                    "source": str(candidate.resolve()),
+                    "artifact_sha256": artifact_sha256,
+                    "step": marker_step,
+                }
+            )
+
+    _run_checkpoint_io_action(
+        prepare_candidates,
+        context,
+        operation="distributed checkpoint candidate discovery",
+        rank_zero_only=True,
+    )
+    encoded_here = json.dumps(prepared, ensure_ascii=True, separators=(",", ":"))
+    encoded = (
+        encoded_here
+        if context.world_size == 1
+        else broadcast_text(encoded_here if context.is_main else None, context)
+    )
+    try:
+        raw_bindings: object = json.loads(encoded)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(
+            "distributed checkpoint candidate broadcast is not valid JSON"
+        ) from error
+    if not isinstance(raw_bindings, list):
+        raise RuntimeError("distributed checkpoint candidate broadcast is malformed")
+    typed_bindings = cast(list[object], raw_bindings)
+    if len(typed_bindings) > 2:
+        raise RuntimeError("distributed checkpoint candidate broadcast is malformed")
+
+    current = _logical_checkpoint_current(path)
+    allowed_sources = {
+        _canonical_checkpoint_path(current),
+        _canonical_checkpoint_path(_dcp_sibling(current, "previous")),
+    }
+    bindings: list[tuple[Path, str, int]] = []
+    seen_sources: set[str] = set()
+    for raw_binding in typed_bindings:
+        if not isinstance(raw_binding, dict):
+            raise RuntimeError("distributed checkpoint candidate binding is malformed")
+        typed_binding = cast(dict[str, object], raw_binding)
+        if set(typed_binding) != {
+            "source",
+            "artifact_sha256",
+            "step",
+        }:
+            raise RuntimeError("distributed checkpoint candidate binding is malformed")
+        source_value = typed_binding.get("source")
+        artifact_sha256 = typed_binding.get("artifact_sha256")
+        marker_step = typed_binding.get("step")
+        if not isinstance(source_value, str) or not source_value:
+            raise RuntimeError("distributed checkpoint candidate source is malformed")
+        if not isinstance(artifact_sha256, str):
+            raise RuntimeError("distributed checkpoint candidate digest is malformed")
+        _validate_sha256_digest(
+            artifact_sha256,
+            label="distributed checkpoint candidate marker digest",
+        )
+        if isinstance(marker_step, bool) or not isinstance(marker_step, int) or marker_step < 0:
+            raise RuntimeError("distributed checkpoint candidate step is malformed")
+        source = Path(source_value)
+        canonical_source = _canonical_checkpoint_path(source)
+        if canonical_source not in allowed_sources or canonical_source in seen_sources:
+            raise RuntimeError(
+                "distributed checkpoint candidate source is outside the logical pair"
+            )
+        if expected_artifact_sha256 is not None and artifact_sha256 != expected_artifact_sha256:
+            raise RuntimeError("distributed checkpoint candidate does not match the bound marker")
+        seen_sources.add(canonical_source)
+        bindings.append((source, artifact_sha256, marker_step))
+    return tuple(bindings)
+
+
+def _preflight_verified_checkpoint_candidate(
+    source: Path,
+    context: DistributedContext,
+    expected_identity: Mapping[str, Any] | None,
+    marker_step: int,
+    expected_step: int | None,
+    observed_steps: list[int],
+    lease: _VerifiedCheckpointLease,
+) -> None:
+    worker_lease = _active_checkpoint_lease()
+    if worker_lease is not None and worker_lease != lease:
+        raise RuntimeError("checkpoint preflight worker already has an active lease")
+    installed_here = worker_lease is None
+    if installed_here:
+        _VERIFIED_CHECKPOINT_LEASE.active = lease
+    try:
+        actual_step = preflight_checkpoint_identity(source, context, expected_identity)
+        if actual_step is None:
+            raise ValueError("distributed checkpoint has no recorded resume step")
+        if actual_step != marker_step:
+            raise ValueError(
+                "distributed checkpoint payload step does not match its completion marker "
+                f"({actual_step} != {marker_step})"
+            )
+        if expected_step is not None and actual_step != expected_step:
+            raise ValueError(
+                "distributed checkpoint step does not match the bound step "
+                f"({actual_step} != {expected_step})"
+            )
+        observed_steps.append(actual_step)
+    finally:
+        if installed_here and _active_checkpoint_lease() == lease:
+            _revoke_checkpoint_lease()
+
+
+@contextmanager
+def verified_checkpoint_generation_lease(
+    path: str | Path,
+    context: DistributedContext,
+    expected_identity: Mapping[str, Any] | None = None,
+    *,
+    expected_artifact_sha256: str | None = None,
+    expected_step: int | None = None,
+) -> Generator[VerifiedCheckpointGeneration, None, None]:
+    """Select, authenticate, and preflight one exact checkpoint generation.
+
+    For DCP, rank 0 broadcasts ordered current/previous marker bindings. Every
+    rank then authenticates the full inventory and preflights identity plus the
+    marker-declared step inside one verification lease. A corrupt or incompatible
+    current generation is rejected consistently before trying retained previous.
+    Markerless/legacy DCP is never a candidate. If ``expected_artifact_sha256``
+    is supplied, only the generation bound to that marker digest may be selected.
+
+    Keep any load inside this context. A successful or failed full checkpoint
+    load consumes the opaque lease immediately; lexical context exit remains safe.
+    Callers must hold ``training_run_lock`` for this complete operation.
+    """
+
+    logical_path = Path(path)
+    if expected_step is not None and (type(expected_step) is not int or expected_step < 0):
+        raise ValueError("expected checkpoint step must be a non-negative integer")
+    if expected_artifact_sha256 is not None:
+        _validate_sha256_digest(
+            expected_artifact_sha256,
+            label="expected checkpoint artifact digest",
+        )
+
+    if not context.distributed:
+        current = _logical_checkpoint_current(logical_path)
+        _reject_mixed_checkpoint_formats(current)
+        last_local_error: Exception | None = None
+        for candidate in (current, _dcp_sibling(current, "previous")):
+            try:
+                source = resolve_checkpoint_source(candidate, context)
+                actual_digest = _sha256_file(source / "checkpoint.pt")
+                if (
+                    expected_artifact_sha256 is not None
+                    and actual_digest != expected_artifact_sha256
+                ):
+                    raise ValueError(
+                        "local checkpoint payload digest does not match the bound artifact "
+                        f"({actual_digest} != {expected_artifact_sha256})"
+                    )
+                actual_step = preflight_checkpoint_identity(source, context, expected_identity)
+                if actual_step is None:
+                    raise ValueError("checkpoint has no recorded resume step")
+                if expected_step is not None and actual_step != expected_step:
+                    raise ValueError(
+                        "checkpoint step does not match the bound step "
+                        f"({actual_step} != {expected_step})"
+                    )
+            except Exception as error:
+                last_local_error = error
+                continue
+            yield VerifiedCheckpointGeneration(source, actual_step, actual_digest)
+            return
+        failure = FileNotFoundError(f"no local checkpoint generation matched {logical_path}")
+        if last_local_error is not None:
+            raise failure from last_local_error
+        raise failure
+
+    bindings = _coordinated_checkpoint_generation_bindings(
+        logical_path,
+        context,
+        expected_artifact_sha256=expected_artifact_sha256,
+    )
+    last_error: Exception | None = None
+    selected_stack: ExitStack | None = None
+    selected_source: Path | None = None
+    selected_step: int | None = None
+    for candidate, artifact_sha256, marker_step in bindings:
+        candidate_stack = ExitStack()
+        try:
+            source = candidate_stack.enter_context(
+                verified_checkpoint_source_lease(
+                    candidate,
+                    context,
+                    artifact_sha256,
+                )
+            )
+            observed_steps: list[int] = []
+            active_lease = _active_checkpoint_lease()
+            if active_lease is None:
+                raise RuntimeError("distributed checkpoint candidate lease was not activated")
+            _run_checkpoint_io_action(
+                partial(
+                    _preflight_verified_checkpoint_candidate,
+                    source,
+                    context,
+                    expected_identity,
+                    marker_step,
+                    expected_step,
+                    observed_steps,
+                    active_lease,
+                ),
+                context,
+                operation="distributed checkpoint generation preflight",
+                rank_zero_only=False,
+            )
+            if len(observed_steps) != 1:
+                raise RuntimeError("distributed checkpoint preflight did not return one local step")
+        except Exception as error:
+            last_error = error
+            candidate_stack.close()
+            continue
+        selected_stack = candidate_stack
+        selected_source = source
+        selected_step = observed_steps[0]
+        break
+
+    if selected_stack is None or selected_source is None or selected_step is None:
+        failure = FileNotFoundError(
+            f"no rank-consistent authenticated v2 checkpoint generation matched {logical_path}"
+        )
+        if last_error is not None:
+            raise failure from last_error
+        raise failure
+    try:
+        selected_binding = next(binding for binding in bindings if binding[0] == selected_source)
+        yield VerifiedCheckpointGeneration(
+            selected_source,
+            selected_step,
+            selected_binding[1],
+        )
+    finally:
+        selected_stack.close()
+
+
+def _validate_legacy_dcp_layout(path: Path, *, world_size: int) -> None:
+    if path.is_symlink() or not path.is_dir():
+        raise ValueError(f"legacy distributed checkpoint is not a directory: {path}")
+    expected_rng_names = {f"rng-rank-{rank:05d}.pt" for rank in range(world_size)}
+    actual_rng_names = {candidate.name for candidate in path.glob("rng-rank-*.pt")}
+    if actual_rng_names != expected_rng_names:
+        raise ValueError(
+            "legacy distributed checkpoint RNG files do not match world size "
+            f"(expected={sorted(expected_rng_names)}, actual={sorted(actual_rng_names)})"
+        )
+    missing_or_unsafe = [
+        required.name
+        for required in _required_dcp_files(path, world_size=world_size)
+        if not required.is_file() or required.is_symlink()
+    ]
+    if missing_or_unsafe:
+        raise ValueError(
+            "legacy distributed checkpoint is missing required regular files: "
+            + ", ".join(missing_or_unsafe)
+        )
+
+
+def upgrade_legacy_dcp_completion(
+    path: str | Path,
+    world_size: int,
+    step: int,
+) -> str:
+    """Atomically upgrade one pre-v2 DCP marker and return its v2 marker digest.
+
+    This is an explicit rank-zero recovery operation, not an automatic resume
+    path. It seals the bytes currently present; it cannot prove that a legacy,
+    digest-less checkpoint was not corrupted before this call. It validates the
+    DCP step and exact per-rank RNG layout before hashing the complete directory.
+    Existing valid v2 markers are verified and left byte-for-byte unchanged.
+    """
+
+    path = Path(path)
+    _reject_mixed_checkpoint_formats(path)
+    if type(world_size) is not int or world_size <= 0:
+        raise ValueError("distributed checkpoint world size must be a positive integer")
+    if type(step) is not int or step < 0:
+        raise ValueError("distributed checkpoint step must be a non-negative integer")
+    marker = path / DCP_COMPLETION_FILENAME
+    marker_payload: dict[str, Any] | None = None
+    marker_sha256: str | None = None
+    if marker.exists() or marker.is_symlink():
+        if not marker.is_file() or marker.is_symlink():
+            raise ValueError(
+                f"distributed checkpoint completion marker is not a regular file: {marker}"
+            )
+        marker_payload, marker_sha256 = _read_dcp_completion_payload(marker)
+        schema = marker_payload.get("schema")
+        if schema == DCP_COMPLETION_SCHEMA:
+            _validated_dcp_v2_inventory(marker_payload, world_size=world_size)
+            if marker_payload.get("step") != step:
+                raise ValueError(
+                    "distributed checkpoint completion step does not match requested step "
+                    f"({marker_payload.get('step')!r} != {step})"
+                )
+            if _dcp_completion_status(path, world_size=world_size) != "valid":
+                raise ValueError(f"distributed checkpoint inventory is invalid: {path}")
+            actual_step = _preflight_dcp_identity(path, None)
+            if actual_step != step:
+                raise ValueError(
+                    "distributed checkpoint payload step does not match requested step "
+                    f"({actual_step} != {step})"
+                )
+            assert marker_sha256 is not None
+            return marker_sha256
+        if schema != CHECKPOINT_SCHEMA or set(marker_payload) != {
+            "schema",
+            "step",
+            "world_size",
+        }:
+            raise ValueError("distributed checkpoint has an invalid legacy completion marker")
+        if isinstance(marker_payload.get("step"), bool) or marker_payload.get("step") != step:
+            raise ValueError(
+                "legacy distributed checkpoint completion step does not match requested step"
+            )
+        if (
+            isinstance(marker_payload.get("world_size"), bool)
+            or marker_payload.get("world_size") != world_size
+        ):
+            raise ValueError("legacy distributed checkpoint completion world size does not match")
+
+    _validate_legacy_dcp_layout(path, world_size=world_size)
+    actual_step = _preflight_dcp_identity(path, None)
+    if actual_step != step:
+        raise ValueError(
+            "legacy distributed checkpoint payload step does not match requested step "
+            f"({actual_step} != {step})"
+        )
+    _write_dcp_completion(path, step=step, world_size=world_size)
+    upgraded_payload, upgraded_sha256 = _read_dcp_completion_payload(marker)
+    _validated_dcp_v2_inventory(
+        upgraded_payload,
+        world_size=world_size,
+    )
+    return upgraded_sha256
 
 
 def _validate_loaded_state(state: Any) -> Mapping[str, Any]:
@@ -1147,10 +2214,9 @@ def save_checkpoint(
     분산 학습에서는 모든 rank 가 함께 호출해야 합니다(집단 통신 발생).
     """
     path = Path(path)
-    if context.is_main:
+    if context.is_main and not context.distributed:
         path.parent.mkdir(parents=True, exist_ok=True)
-        if not context.distributed:
-            path.mkdir(parents=True, exist_ok=True)
+        path.mkdir(parents=True, exist_ok=True)
     state: dict[str, Any] = {
         "schema": CHECKPOINT_SCHEMA,
         "scheduler": scheduler.state_dict(),
@@ -1171,10 +2237,18 @@ def save_checkpoint(
         from torch.distributed.checkpoint.state_dict import get_state_dict
 
         staging = _dcp_sibling(path, "staging")
-        if context.is_main:
+
+        def prepare_staging() -> None:
+            path.parent.mkdir(parents=True, exist_ok=True)
             _remove_path(staging)
             staging.mkdir(parents=True)
-        barrier(context)
+
+        _run_checkpoint_io_action(
+            prepare_staging,
+            context,
+            operation="distributed checkpoint staging preparation",
+            rank_zero_only=True,
+        )
         checkpoint_model = _unwrap_compiled_model(model)
         model_state, optimizer_state = get_state_dict(checkpoint_model, optimizer)
         state["model"] = model_state
@@ -1182,19 +2256,43 @@ def save_checkpoint(
         dcp.save(  # pyright: ignore[reportUnknownMemberType, reportPrivateImportUsage]
             state, checkpoint_id=staging
         )
-        _atomic_torch_save(
-            {"schema": CHECKPOINT_SCHEMA, "rng_state": _capture_rng_state()},
-            staging / f"rng-rank-{context.rank:05d}.pt",
+        rng_payload = {
+            "schema": CHECKPOINT_SCHEMA,
+            "rng_state": _capture_rng_state(),
+        }
+
+        def write_rank_rng() -> None:
+            _atomic_torch_save(
+                rng_payload,
+                staging / f"rng-rank-{context.rank:05d}.pt",
+            )
+
+        _run_checkpoint_io_action(
+            write_rank_rng,
+            context,
+            operation="distributed checkpoint RNG persistence",
+            rank_zero_only=False,
         )
-        barrier(context)
-        if context.is_main:
-            _write_dcp_completion(staging, step=step, world_size=context.world_size)
+
+        def publish_checkpoint() -> None:
+            verified = _write_dcp_completion(
+                staging,
+                step=step,
+                world_size=context.world_size,
+            )
             _publish_dcp_staging(
                 staging,
                 path,
                 world_size=context.world_size,
-                staging_verified=True,
+                verified=verified,
             )
+
+        _run_checkpoint_io_action(
+            publish_checkpoint,
+            context,
+            operation="distributed checkpoint completion publication",
+            rank_zero_only=True,
+        )
     elif context.is_main:
         # 단일 프로세스: 파일 하나로 충분합니다.
         state["model"] = _unwrap_compiled_model(model).state_dict()
@@ -1203,11 +2301,9 @@ def save_checkpoint(
         # NumPy, torch의 확률적 연산도 중단 전 상태에서 이어집니다.
         state["rng_state"] = _capture_rng_state()
         _atomic_torch_save(state, path / "checkpoint.pt")
-    # 저장이 완전히 끝난 뒤에만 모든 rank 가 다음 단계로 진행합니다.
-    barrier(context)
 
 
-def initialize_model_from_checkpoint(
+def _initialize_model_from_checkpoint_impl(
     path: str | Path,
     model: nn.Module,
     context: DistributedContext,
@@ -1251,9 +2347,14 @@ def initialize_model_from_checkpoint(
         # optimizer/scheduler는 등록하지 않고, EMA는 초기 파라미터 선택용으로만
         # 읽습니다. 새 단계가 EMA history 자체를 이어받는 것은 아닙니다.
         state: dict[str, Any] = {"model": get_model_state_dict(checkpoint_model), "step": 0}
-        metadata = dcp.FileSystemReader(  # pyright: ignore[reportPrivateImportUsage]
-            resolved
-        ).read_metadata()
+        try:
+            metadata = dcp.FileSystemReader(  # pyright: ignore[reportPrivateImportUsage]
+                resolved
+            ).read_metadata()
+        except dcp.CheckpointException as error:  # pyright: ignore[reportPrivateImportUsage]
+            raise ValueError(
+                f"distributed stage-transfer metadata could not be loaded: {resolved}"
+            ) from error
         _validate_dcp_tensor_group_metadata(
             metadata,
             prefix="model",
@@ -1279,9 +2380,14 @@ def initialize_model_from_checkpoint(
             state["ema"] = ema_template
         if expected_identity is not None:
             state["identity"] = _json_compatible(expected_identity)
-        dcp.load(  # pyright: ignore[reportUnknownMemberType, reportPrivateImportUsage]
-            state, checkpoint_id=resolved
-        )
+        try:
+            dcp.load(  # pyright: ignore[reportUnknownMemberType, reportPrivateImportUsage]
+                state, checkpoint_id=resolved
+            )
+        except dcp.CheckpointException as error:  # pyright: ignore[reportPrivateImportUsage]
+            raise ValueError(
+                f"distributed stage-transfer payload could not be loaded: {resolved}"
+            ) from error
         _validate_stage_transfer(state, expected_identity, source=resolved)
         selected_ema_state = _validate_stage_transfer_ema(model, state.get("ema"))
         set_model_state_dict(checkpoint_model, state["model"])
@@ -1338,6 +2444,28 @@ def initialize_model_from_checkpoint(
     }
 
 
+def initialize_model_from_checkpoint(
+    path: str | Path,
+    model: nn.Module,
+    context: DistributedContext,
+    *,
+    expected_identity: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Load stage-transfer weights and consume any active verification lease."""
+
+    lease = _active_checkpoint_lease()
+    try:
+        return _initialize_model_from_checkpoint_impl(
+            path,
+            model,
+            context,
+            expected_identity=expected_identity,
+        )
+    finally:
+        if lease is not None and _active_checkpoint_lease() == lease:
+            _revoke_checkpoint_lease()
+
+
 def _validate_stage_transfer(
     state: Mapping[str, Any],
     expected_identity: Mapping[str, Any] | None,
@@ -1379,7 +2507,7 @@ def _validate_stage_transfer(
         )
 
 
-def load_checkpoint(
+def _load_checkpoint_impl(
     path: str | Path,
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -1396,12 +2524,11 @@ def load_checkpoint(
     ``training_state`` dict 를 넘기면 best loss / early-stopping 카운터 /
     epoch 같은 진행 상태가 그 안에 채워집니다.
     """
-    path = Path(path)
+    path = resolve_checkpoint_source(path, context)
     if context.distributed:
         import torch.distributed.checkpoint as dcp
         from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
 
-        path = _resolve_dcp_checkpoint(path, world_size=context.world_size)
         _preflight_dcp_identity(path, expected_identity)
         checkpoint_model = _unwrap_compiled_model(model)
         model_state, optimizer_state = get_state_dict(checkpoint_model, optimizer)
@@ -1412,12 +2539,34 @@ def load_checkpoint(
             "step": 0,
             "training_state": dict(training_state or {}),
         }
-        if scaler is not None:
-            state["scaler"] = scaler.state_dict()
-        if ema is not None:
+        try:
             metadata = dcp.FileSystemReader(  # pyright: ignore[reportPrivateImportUsage]
                 path
             ).read_metadata()
+        except dcp.CheckpointException as error:  # pyright: ignore[reportPrivateImportUsage]
+            raise ValueError(
+                f"distributed checkpoint metadata could not be loaded: {path}"
+            ) from error
+        # DCP only restores keys present in the caller-supplied template. These
+        # fields were added after the original progress schema, so discover
+        # them from authenticated metadata before loading. Do not add absent
+        # keys unconditionally: legacy DCP generations legitimately lack them
+        # and strict loading would otherwise reject those checkpoints.
+        progress_template = cast(dict[str, Any], state["training_state"])
+        stored_flat_keys = {str(key) for key in metadata.state_dict_metadata}
+        for optional_key in (
+            "configured_selection_metric",
+            "best_selection_metric",
+            "best_checkpoint_artifact_sha256",
+        ):
+            if (
+                optional_key not in progress_template
+                and f"training_state.{optional_key}" in stored_flat_keys
+            ):
+                progress_template[optional_key] = None
+        if scaler is not None:
+            state["scaler"] = scaler.state_dict()
+        if ema is not None:
             ema_template = ema.state_dict()
             if not _validate_dcp_tensor_group_metadata(
                 metadata,
@@ -1435,9 +2584,14 @@ def load_checkpoint(
         state["schema"] = CHECKPOINT_SCHEMA
         # 체크포인트가 불완전하거나 구조가 맞지 않으면 여기서 바로 실패합니다.
         # 일부 파라미터가 초기값인 채로 조용히 재개되는 것이 훨씬 위험하기 때문입니다.
-        dcp.load(  # pyright: ignore[reportUnknownMemberType, reportPrivateImportUsage]
-            state, checkpoint_id=path
-        )
+        try:
+            dcp.load(  # pyright: ignore[reportUnknownMemberType, reportPrivateImportUsage]
+                state, checkpoint_id=path
+            )
+        except dcp.CheckpointException as error:  # pyright: ignore[reportPrivateImportUsage]
+            raise ValueError(
+                f"distributed checkpoint payload could not be loaded: {path}"
+            ) from error
         _validate_loaded_state(state)
         _validate_identity(state, expected_identity)
         if ema is not None:
@@ -1522,3 +2676,35 @@ def load_checkpoint(
     if rng_state is not None:
         _restore_rng_state(cast(Mapping[str, Any], rng_state))
     return int(loaded_state["step"])
+
+
+def load_checkpoint(
+    path: str | Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    context: DistributedContext,
+    *,
+    scaler: Any | None = None,
+    training_state: dict[str, Any] | None = None,
+    ema: Any | None = None,
+    expected_identity: Mapping[str, Any] | None = None,
+) -> int:
+    """Restore a full training checkpoint and consume its verification lease."""
+
+    lease = _active_checkpoint_lease()
+    try:
+        return _load_checkpoint_impl(
+            path,
+            model,
+            optimizer,
+            scheduler,
+            context,
+            scaler=scaler,
+            training_state=training_state,
+            ema=ema,
+            expected_identity=expected_identity,
+        )
+    finally:
+        if lease is not None and _active_checkpoint_lease() == lease:
+            _revoke_checkpoint_lease()
