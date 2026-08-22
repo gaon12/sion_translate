@@ -2061,6 +2061,9 @@ def test_custom_sion_gguf_is_real_mixed_k_quant(tmp_path: Path) -> None:
     assert entry["tensor_counts"]["q5_k"] > 0
     reader = gguf.GGUFReader(tmp_path / entry["file"])
     assert json.loads(reader.fields["sion.pipeline"].contents()) == pipeline
+    assert json.loads(reader.fields["sion.model_config"].contents()) == asdict(config)
+    assert manifest["model_config"] == asdict(config)
+    assert manifest["pad_id"] == 0
     assert json.loads(reader.fields["sion.languages"].contents()) == ["ko", "ja"]
     assert json.loads(reader.fields["sion.language_pairs"].contents()) == [["ko", "ja"]]
     assert json.loads(reader.fields["sion.translation_directions"].contents()) == [
@@ -2237,6 +2240,43 @@ def test_gguf_inspection_is_cross_checked_with_manifest_language_contract(
     assert not validation["valid"]
     assert any(
         "GGUF language pairs do not match the manifest" in error["message"]
+        for error in validation["errors"]
+    )
+
+
+def test_gguf_inspection_is_cross_checked_with_manifest_model_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = export_config()
+    model = SionForConditionalGeneration(config)
+    export_state_dict_formats(
+        tmp_path,
+        model.state_dict(),
+        config,
+        0,
+        formats=("gguf_q4_k_m",),
+        metadata=build_export_metadata(
+            config,
+            language_pairs=(("ko", "ja"),),
+            pipeline_identity=translation_pipeline_identity(),
+        ),
+    )
+    real_inspect = export_module._inspect_sion_gguf
+
+    def tampered_inspection(path: Path, **kwargs: Any) -> dict[str, Any]:
+        inspection = real_inspect(path, **kwargs)
+        inspection["model_config"] = dict(inspection["model_config"])
+        inspection["model_config"]["num_heads"] += 1
+        return inspection
+
+    monkeypatch.setattr(export_module, "_inspect_sion_gguf", tampered_inspection)
+
+    validation = validate_export_directory(tmp_path)
+
+    assert not validation["valid"]
+    assert any(
+        "GGUF model_config does not match the manifest" in error["message"]
         for error in validation["errors"]
     )
 

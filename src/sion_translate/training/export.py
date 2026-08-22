@@ -1732,6 +1732,8 @@ def _write_sion_gguf(
             translation_capable=metadata.get("translation_capable"),
         )
         _validated_pipeline_identity_contract(metadata)
+        model_config.validate()
+        canonical_model_config = asdict(model_config)
         writer = gguf.GGUFWriter(temporary, "sion")
         writer.add_name(release_name)
         writer.add_description(
@@ -1749,6 +1751,16 @@ def _write_sion_gguf(
         writer.add_uint32("sion.decoder.block_count", int(model_config.decoder_layers))
         writer.add_uint32("sion.context_length", int(model_config.max_seq_len))
         writer.add_uint32("sion.pad_token_id", int(pad_id))
+        writer.add_string(
+            "sion.model_config",
+            json.dumps(
+                canonical_model_config,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ),
+        )
         languages = _metadata_languages(metadata)
         if languages is not None:
             writer.add_string(
@@ -1936,6 +1948,8 @@ def _inspect_sion_gguf(
         legacy_fields = legacy_identity is not None and not any(
             name in reader_fields for name in modern_identity_fields
         )
+        model_config_payload: dict[str, Any] | None = None
+        pad_token_id: int | None = None
         if legacy_fields:
             assert legacy_identity is not None
             release_name = str(legacy_identity["release_name"])
@@ -1950,6 +1964,37 @@ def _inspect_sion_gguf(
                 raise RuntimeError("GGUF sion.translation_capable must be a boolean")
             release_name = string_field("sion.release_name")
             release_version = string_field("sion.release_version")
+            model_config_field = reader_fields.get("sion.model_config")
+            raw_model_config = (
+                model_config_field.contents() if model_config_field is not None else None
+            )
+            if not isinstance(raw_model_config, str):
+                raise RuntimeError("GGUF sion.model_config must be a JSON string")
+            try:
+                decoded_model_config: object = json.loads(raw_model_config)
+            except json.JSONDecodeError as error:
+                raise RuntimeError("GGUF sion.model_config is not valid JSON") from error
+            if not isinstance(decoded_model_config, dict):
+                raise RuntimeError("GGUF sion.model_config must contain a JSON object")
+            try:
+                parsed_model_config = _model_config_from_dict(
+                    cast(dict[str, Any], decoded_model_config)
+                )
+                parsed_model_config.validate()
+            except (TypeError, ValueError) as error:
+                raise RuntimeError(f"GGUF sion.model_config is invalid: {error}") from error
+            model_config_payload = asdict(parsed_model_config)
+            if decoded_model_config != model_config_payload:
+                raise RuntimeError("GGUF sion.model_config is incomplete or non-canonical")
+            pad_token_field = reader_fields.get("sion.pad_token_id")
+            raw_pad_token_id = pad_token_field.contents() if pad_token_field is not None else None
+            if isinstance(raw_pad_token_id, bool) or not isinstance(
+                raw_pad_token_id, (int, np.integer)
+            ):
+                raise RuntimeError("GGUF sion.pad_token_id must be an integer")
+            pad_token_id = int(raw_pad_token_id)
+            if pad_token_id < 0 or pad_token_id >= parsed_model_config.vocab_size:
+                raise RuntimeError("GGUF sion.pad_token_id is outside the vocabulary")
         if general_name != release_name:
             raise RuntimeError("GGUF general.name and sion.release_name disagree")
         gguf_identity: dict[str, Any] = {
@@ -1984,6 +2029,8 @@ def _inspect_sion_gguf(
             "translation_directions": translation_directions,
             "tokenizer_sha256": tokenizer_sha256,
             "pipeline": pipeline_identity,
+            "model_config": model_config_payload,
+            "pad_id": pad_token_id,
             "identity_source": "legacy-manifest" if legacy_fields else "fields",
         }
     finally:
@@ -2467,6 +2514,8 @@ def _export_state_dict_formats_unlocked(
         ),
         "state_sha256": state_hash,
         "artifact_set_id": artifact_id,
+        "model_config": asdict(model_config),
+        "pad_id": int(pad_id),
         "metadata_compatibility_id": metadata_compatibility_id,
         "requested_formats": requested_union,
         "last_requested_formats": list(requested),
@@ -2970,6 +3019,49 @@ def validate_export_directory(
                 "message": str(error),
             }
         )
+    manifest_model_config: ModelConfig | None = None
+    manifest_pad_id: int | None = None
+    raw_manifest_model_config = manifest.get("model_config")
+    raw_manifest_pad_id = manifest.get("pad_id")
+    if raw_manifest_model_config is None and raw_manifest_pad_id is None:
+        if legacy_release_identity is None:
+            report["errors"].append(
+                {
+                    "error_type": "InvalidManifest",
+                    "message": "current manifest requires model_config and pad_id",
+                }
+            )
+    else:
+        try:
+            if not isinstance(raw_manifest_model_config, Mapping):
+                raise ValueError("manifest.model_config must be an object")
+            manifest_model_config = _model_config_from_dict(
+                cast(Mapping[str, Any], raw_manifest_model_config)
+            )
+            manifest_model_config.validate()
+            if dict(raw_manifest_model_config) != asdict(manifest_model_config):
+                raise ValueError("manifest.model_config is incomplete or non-canonical")
+            if isinstance(raw_manifest_pad_id, bool) or not isinstance(raw_manifest_pad_id, int):
+                raise ValueError("manifest.pad_id must be an integer")
+            manifest_pad_id = raw_manifest_pad_id
+            if manifest_pad_id < 0 or manifest_pad_id >= manifest_model_config.vocab_size:
+                raise ValueError("manifest.pad_id is outside the vocabulary")
+            expected_artifact_set_id = _artifact_set_id(
+                str(manifest.get("state_sha256")),
+                manifest_model_config,
+                manifest_pad_id,
+            )
+            if expected_artifact_set_id != manifest.get("artifact_set_id"):
+                raise ValueError(
+                    "manifest artifact_set_id does not match state, model_config, and pad_id"
+                )
+        except (TypeError, ValueError) as error:
+            report["errors"].append(
+                {
+                    "error_type": "InvalidModelConfig",
+                    "message": str(error),
+                }
+            )
     try:
         report["pipeline"] = _validated_pipeline_identity_contract(manifest_metadata)
     except (TypeError, ValueError) as error:
@@ -3147,6 +3239,15 @@ def validate_export_directory(
                     manifest_metadata
                 ):
                     raise RuntimeError("GGUF translation capability does not match the manifest")
+                if inspection["identity_source"] != "legacy-manifest":
+                    if manifest_model_config is None or manifest_pad_id is None:
+                        raise RuntimeError(
+                            "manifest has no validated model reconstruction contract"
+                        )
+                    if inspection["model_config"] != asdict(manifest_model_config):
+                        raise RuntimeError("GGUF model_config does not match the manifest")
+                    if inspection["pad_id"] != manifest_pad_id:
+                        raise RuntimeError("GGUF pad_id does not match the manifest")
                 expected_gguf_pairs = _metadata_language_pairs(manifest_metadata)
                 if inspection["language_pairs"] != (expected_gguf_pairs or None):
                     raise RuntimeError("GGUF language pairs do not match the manifest")
