@@ -47,6 +47,14 @@ def test_qe_length_score_penalises_omission_and_runaway() -> None:
     assert qe_components(source, complete)["length"] > (qe_components(source, truncated)["length"])
 
 
+def test_qe_omits_an_uncheckable_language_instead_of_awarding_full_credit() -> None:
+    unprofiled = qe_components("source", "target text", target_language="qaa")
+    explicit_latin = qe_components("source", "target text", target_language="qaa-Latn")
+
+    assert "language" not in unprofiled
+    assert explicit_latin["language"] == 1.0
+
+
 def test_mbr_prefers_the_consensus_candidate() -> None:
     # 세 후보가 서로 비슷하고 하나가 동떨어져 있으면 다수 쪽이 뽑혀야 한다.
     candidates = [

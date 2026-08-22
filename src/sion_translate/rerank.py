@@ -103,18 +103,22 @@ def qe_components(
 ) -> dict[str, float]:
     """참조 없이 원문만으로 계산한 QE 세부 항목 (각 0~1)."""
     letters = sum(char.isalpha() for char in hypothesis)
-    return {
+    components = {
         # 원문의 숫자가 번역문에 그대로 남아야 합니다. 값이 바뀌면 여기서 떨어집니다.
         "number": multiset_f1(numeric_tokens(source), numeric_tokens(hypothesis)),
         "structured": multiset_f1(structured_tokens(source), structured_tokens(hypothesis)),
-        # 짧은 문장에서는 문자 종류만으로 언어를 판정하기 어려워 건너뜁니다.
-        "language": (
-            language_fraction(hypothesis, target_language)
-            if target_language is not None and letters >= 4
-            else 1.0
-        ),
         "length": _length_score(source, hypothesis),
     }
+    # 짧은 문장이나 script profile이 없는 임의 언어는 이 성분 자체를
+    # 제외합니다. 1.0을 넣으면 검사하지 않은 결과가 만점으로 기록됩니다.
+    language = (
+        language_fraction(hypothesis, target_language)
+        if target_language is not None and letters >= 4
+        else None
+    )
+    if language is not None:
+        components["language"] = language
+    return components
 
 
 def qe_score(
@@ -127,10 +131,11 @@ def qe_score(
     """(QE 점수, 세부 항목). 점수는 0~1 로 자릅니다."""
     weights = weights or DEFAULT_QE_WEIGHTS
     components = qe_components(source, hypothesis, target_language=target_language)
-    total = sum(weights.values())
+    active_weights = {name: weight for name, weight in weights.items() if name in components}
+    total = sum(active_weights.values())
     if total <= 0:
         raise ValueError("QE 가중치의 합이 0보다 커야 합니다")
-    score = sum(weights.get(name, 0.0) * value for name, value in components.items()) / total
+    score = sum(active_weights[name] * components[name] for name in active_weights) / total
     if not hypothesis.strip():
         return 0.0, components
     if has_excessive_repetition(hypothesis):

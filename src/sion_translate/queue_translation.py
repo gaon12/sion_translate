@@ -35,6 +35,7 @@ from sion_translate.data.quality import (
     language_fraction,
 )
 from sion_translate.evaluation import multiset_f1, numeric_tokens
+from sion_translate.scripts_registry import primary_language
 from sion_translate.structured import structured_similarity
 
 
@@ -666,7 +667,7 @@ def _forward_quality(
         "critical_structured_mismatch": critical_mismatch,
         "target_language_fraction": target_fraction,
         "target_japanese_kana_chars": (
-            japanese_kana_count(translation) if target_language == "ja" else None
+            japanese_kana_count(translation) if primary_language(target_language) == "ja" else None
         ),
     }
     reasons = list(assessment.rejection_reasons)
@@ -1174,10 +1175,15 @@ def _translate_queue_unlocked(
                         or quality["structured"] < options.min_structured_similarity
                     ):
                         reasons.append("structured_mismatch")
-                    if quality["target_language_fraction"] < options.min_target_language_fraction:
+                    target_fraction = quality["target_language_fraction"]
+                    if (
+                        isinstance(target_fraction, (int, float))
+                        and target_fraction < options.min_target_language_fraction
+                    ):
                         reasons.append("target_language")
                     if (
-                        target_language == "ja"
+                        primary_language(target_language) == "ja"
+                        and isinstance(quality["target_japanese_kana_chars"], int)
                         and quality["target_japanese_kana_chars"] < options.min_japanese_kana_chars
                     ):
                         reasons.append("target_japanese_kana")

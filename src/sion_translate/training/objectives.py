@@ -162,7 +162,7 @@ class CompositeTranslationReward:
         language = (
             language_fraction(hypothesis, target_language)
             if target_language is not None and letter_count >= 4
-            else 1.0
+            else None
         )
         reference_length = sum(not char.isspace() for char in reference_text)
         hypothesis_length = sum(not char.isspace() for char in hypothesis)
@@ -173,10 +173,13 @@ class CompositeTranslationReward:
             "number": number,
             "structured": structured,
             "slot": slot,
-            "language": language,
             "length": length,
         }
         active_weights = dict(self.weights)
+        if language is None:
+            active_weights.pop("language", None)
+        else:
+            components["language"] = language
         if "roundtrip" in self.weights:
             roundtrip = 0.0
             if roundtrip_ids is None:

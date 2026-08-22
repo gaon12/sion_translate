@@ -23,6 +23,30 @@ class FakeTokenizer:
         return [character for character in text if not character.isspace()]
 
 
+def test_queue_quality_marks_unprofiled_languages_as_unchecked() -> None:
+    quality, reasons = queue_translation_module._forward_quality(
+        "source language sentence",
+        "target language sentence",
+        source_language="qaa",
+        target_language="qab",
+    )
+
+    assert quality["target_language_fraction"] is None
+    assert not {"ko_script_mismatch", "ja_script_mismatch"} & set(reasons)
+
+
+def test_queue_quality_inherits_japanese_kana_policy_for_variants() -> None:
+    quality, _reasons = queue_translation_module._forward_quality(
+        "한국어 원문 문장입니다.",
+        "人工知能研究社会文化交流発展",
+        source_language="ko-KR",
+        target_language="ja-JP",
+    )
+
+    assert quality["target_japanese_kana_chars"] == 0
+    assert "ja_no_kana" in quality["pair_warnings"]
+
+
 def _hold_queue_lock(path: str, ready, release) -> None:
     with _queue_run_lock(Path(path)):
         ready.set()

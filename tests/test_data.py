@@ -22,6 +22,7 @@ from sion_translate.data.quality import (
     QualityPolicy,
     apply_record_quality_profile,
     assess_pair,
+    language_fraction,
 )
 from sion_translate.data.prepare import infer_register, protect_shared_spans
 from sion_translate.glossary import restore_targets
@@ -679,6 +680,38 @@ def test_pair_quality_rejects_obvious_damage() -> None:
     )
     assert not repeated.accepted
     assert "excessive_repetition" in repeated.rejection_reasons
+
+
+def test_quality_profiles_apply_to_bcp47_variants_and_both_pair_orientations() -> None:
+    wrong_scripts = assess_pair(
+        "This is not Korean",
+        "이것은 일본어가 아니다",
+        languages=("ko-KR", "ja-JP"),
+    )
+    assert not wrong_scripts.accepted
+    assert {"ko_script_mismatch", "ja_script_mismatch"} <= set(wrong_scripts.rejection_reasons)
+
+    reverse = assess_pair(
+        "人工知能技術発展研究社会文化交流",
+        "한국어 문장입니다.",
+        languages=("ja-JP", "ko-KR"),
+    )
+    assert "ja_no_kana" in reverse.warning_reasons
+
+
+def test_unprofiled_languages_are_unchecked_instead_of_scored_as_perfect() -> None:
+    assessment = assess_pair(
+        "same-script source text",
+        "same-script target text",
+        languages=("qaa", "qab"),
+    )
+
+    assert assessment.ko_language_fraction is None
+    assert assessment.ja_language_fraction is None
+    assert "ko_script_mismatch" not in assessment.rejection_reasons
+    assert "ja_script_mismatch" not in assessment.rejection_reasons
+    assert language_fraction("Latin text", "qaa") is None
+    assert language_fraction("Latin text", "qaa-Latn") == 1.0
 
 
 def test_expressive_quality_profile_only_waives_short_and_repeated_reactions() -> None:

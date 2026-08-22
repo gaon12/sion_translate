@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass, replace
 import re
 import unicodedata
 
+from sion_translate.scripts_registry import primary_language, script_of, scripts_for_language
 from sion_translate.splitting import normalized_split_key
 from sion_translate.structured import structured_similarity
 
@@ -72,8 +73,8 @@ class PairAssessment:
     ko_chars: int
     ja_chars: int
     length_ratio: float
-    ko_language_fraction: float
-    ja_language_fraction: float
+    ko_language_fraction: float | None
+    ja_language_fraction: float | None
 
 
 def apply_record_quality_profile(
@@ -126,15 +127,6 @@ def _visible_length(text: str) -> int:
     return sum(not char.isspace() for char in text)
 
 
-def _is_hangul(char: str) -> bool:
-    codepoint = ord(char)
-    return (
-        0x1100 <= codepoint <= 0x11FF
-        or 0x3130 <= codepoint <= 0x318F
-        or 0xAC00 <= codepoint <= 0xD7A3
-    )
-
-
 def _is_han(char: str) -> bool:
     codepoint = ord(char)
     return (
@@ -160,19 +152,22 @@ def japanese_kana_count(text: str) -> int:
     return sum(_is_kana(char) for char in text)
 
 
-def language_fraction(text: str, language: str) -> float:
-    """해당 언어 문자가 차지하는 비율. 문자 기반 판별이 가능한 언어(ko/ja)만
-    실제로 검사하고, 그 외 언어는 1.0 을 돌려 검사를 통과시킵니다
-    (라틴 문자 언어끼리는 문자만으로 언어를 구분할 수 없기 때문)."""
+def language_fraction(text: str, language: str) -> float | None:
+    """Return the share of letters in the tag's checkable writing systems.
+
+    ``None`` means the tag has no known script profile, so callers must omit
+    the check instead of recording a fictitious perfect score. Arbitrary
+    languages can opt in without code changes by using an explicit supported
+    ISO 15924 script subtag such as ``sr-Latn`` or ``az-Arab``.
+    """
+
+    scripts = scripts_for_language(language)
+    if scripts is None:
+        return None
     letters = [char for char in text if char.isalpha()]
     if not letters:
         return 0.0
-    if language == "ko":
-        signal = sum(_is_hangul(char) for char in letters)
-    elif language == "ja":
-        signal = sum(_is_kana(char) or _is_han(char) for char in letters)
-    else:
-        return 1.0
+    signal = sum(script_of(char) in scripts for char in letters)
     return signal / len(letters)
 
 
@@ -240,20 +235,28 @@ def assess_pair(
     if (
         policy.reject_script_mismatch
         and ko_letters >= policy.min_language_check_chars
+        and ko_fraction is not None
         and ko_fraction < policy.min_language_fraction
     ):
         rejections.append("ko_script_mismatch")
     if (
         policy.reject_script_mismatch
         and ja_letters >= policy.min_language_check_chars
+        and ja_fraction is not None
         and ja_fraction < policy.min_language_fraction
     ):
         rejections.append("ja_script_mismatch")
-    # 일본어 특화 경고: 긴 문장에 가나가 전혀 없으면 중국어 혼입 의심.
-    if language_b == "ja":
-        ja_kana = japanese_kana_count(ja)
-        ja_han = sum(_is_han(char) for char in ja)
-        if ja_letters >= policy.long_ja_kana_warning_chars and ja_kana == 0 and ja_han >= 4:
+    # 일본어 특화 경고: 어느 물리 방향에 있든 긴 문장에 가나가 전혀 없으면
+    # 중국어 혼입을 의심합니다. 지역/스크립트 변형 태그도 primary를 상속합니다.
+    for text, language, letter_count in (
+        (ko, language_a, ko_letters),
+        (ja, language_b, ja_letters),
+    ):
+        if primary_language(language) != "ja":
+            continue
+        kana = japanese_kana_count(text)
+        han = sum(_is_han(char) for char in text)
+        if letter_count >= policy.long_ja_kana_warning_chars and kana == 0 and han >= 4:
             warnings.append("ja_no_kana")
 
     if policy.reject_controls and (_has_control_characters(ko) or _has_control_characters(ja)):
