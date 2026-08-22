@@ -34,9 +34,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
-# 단어 경계가 없는(띄어쓰기로 단어를 나누지 않는) 언어.
-# 이 언어들은 부분 문자열 매칭을, 그 외(라틴 문자 등)는 단어 경계 매칭을 씁니다.
-NON_WORD_BOUNDARY_LANGUAGES = {"ko", "ja", "zh"}
+from sion_translate.language_tags import (
+    canonicalize_language_pair,
+    canonicalize_language_tag,
+)
+from sion_translate.scripts_registry import uses_substring_term_matching
 
 # ---------------------------------------------------------------------------
 # Soft hint format
@@ -193,6 +195,26 @@ class Glossary:
 
     entries: tuple[dict[str, str], ...]
 
+    def __post_init__(self) -> None:
+        normalized_entries: list[dict[str, str]] = []
+        for entry_index, entry in enumerate(self.entries):
+            normalized: dict[str, str] = {}
+            original_keys: dict[str, str] = {}
+            for raw_language, surface in entry.items():
+                language = canonicalize_language_tag(
+                    raw_language,
+                    field=f"glossary entry[{entry_index}] language",
+                )
+                if language in normalized:
+                    raise ValueError(
+                        "glossary entry contains duplicate language aliases after BCP 47 "
+                        f"canonicalization: {original_keys[language]!r}, {raw_language!r}"
+                    )
+                original_keys[language] = raw_language
+                normalized[language] = surface
+            normalized_entries.append(normalized)
+        object.__setattr__(self, "entries", tuple(normalized_entries))
+
     def __len__(self) -> int:
         return len(self.entries)
 
@@ -202,6 +224,10 @@ class Glossary:
         긴 용어를 먼저 치환해야 짧은 용어가 긴 용어의 일부를 먼저 가로채는
         일을 막을 수 있습니다 (예: "인공지능학회" vs "인공지능").
         """
+        source_language, target_language = canonicalize_language_pair(
+            (source_language, target_language),
+            field="glossary direction",
+        )
         pairs: list[tuple[str, str]] = []
         for entry in self.entries:
             source = entry.get(source_language)
@@ -254,12 +280,13 @@ def _match_positions(text: str, term: str, language: str) -> list[tuple[int, int
     """
     if not term:
         return []
-    if language in NON_WORD_BOUNDARY_LANGUAGES:
+    substring_matching = uses_substring_term_matching(language)
+    if substring_matching:
         pattern = re.escape(term)
     else:
         # 앞뒤가 글자/숫자가 아닌 경계에서만 매칭 (대소문자 무시).
         pattern = rf"(?<!\w){re.escape(term)}(?!\w)"
-    flags = 0 if language in NON_WORD_BOUNDARY_LANGUAGES else re.IGNORECASE
+    flags = 0 if substring_matching else re.IGNORECASE
     return [(match.start(), match.end()) for match in re.finditer(pattern, text, flags)]
 
 

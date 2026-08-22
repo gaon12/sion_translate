@@ -36,6 +36,18 @@ def test_directional_pairs_sorted_longest_first() -> None:
     assert ("人工知能", "인공지능") in reverse
 
 
+def test_glossary_canonicalizes_bcp47_entry_and_lookup_aliases() -> None:
+    glossary = Glossary(({"pt-br": "gato", "EN": "cat"},))
+
+    assert glossary.entries == ({"pt-BR": "gato", "en": "cat"},)
+    assert glossary.for_direction("PT-br", "en") == [("gato", "cat")]
+
+
+def test_glossary_rejects_duplicate_canonical_language_aliases() -> None:
+    with pytest.raises(ValueError, match="duplicate language aliases"):
+        Glossary(({"pt-br": "gato", "pt-BR": "felino", "en": "cat"},))
+
+
 def test_placeholder_and_restore_round_trip() -> None:
     glossary = make_glossary()
     text = "오늘 인공지능 강의를 들었다."
@@ -116,6 +128,33 @@ def test_word_boundary_for_latin_languages() -> None:
         slot_symbols=SLOT_SYMBOLS,
     )
     assert slot_map2 == {"<slot_0>": "Katze"}
+
+
+@pytest.mark.parametrize(
+    ("source_language", "text", "term"),
+    [
+        ("ko-KR", "인공지능학회", "인공지능"),
+        ("ja-JP", "人工知能学会", "人工知能"),
+        ("zh-Hant", "人工智慧學會", "人工智慧"),
+        ("th-TH", "แมวกำลังนอน", "แมว"),
+    ],
+)
+def test_glossary_substring_boundaries_follow_script_profiles(
+    source_language: str,
+    text: str,
+    term: str,
+) -> None:
+    glossary = Glossary(({source_language: term, "en": "term"},))
+    masked, slot_map = apply_source_placeholders(
+        text,
+        glossary,
+        source_language=source_language,
+        target_language="en",
+        slot_symbols=SLOT_SYMBOLS,
+    )
+
+    assert "<slot_0>" in masked
+    assert slot_map == {"<slot_0>": "term"}
 
 
 def test_slot_budget_is_respected() -> None:
