@@ -430,7 +430,9 @@ def export_final_model(
             if config.model.experimental.morphoscript_enabled
             else None
         ),
-        language_pairs=config.data.configured_language_pairs(),
+        language_pairs=(
+            config.data.configured_language_pairs() if translation_capable else None
+        ),
         languages=languages,
         translation_directions=translation_directions,
         bidirectional=config.data.bidirectional,

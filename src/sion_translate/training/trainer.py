@@ -724,7 +724,9 @@ def train(
             if config.model.experimental.morphoscript_enabled
             else None
         ),
-        language_pairs=config.data.configured_language_pairs(),
+        language_pairs=(
+            config.data.configured_language_pairs() if export_translation_capable else None
+        ),
         languages=export_languages,
         translation_directions=(
             config.data.configured_translation_directions() if export_translation_capable else None
@@ -984,7 +986,9 @@ def train(
             ema=ema,
             tokenizer_path=config.data.tokenizer_model,
             token_features_path=token_features_path,
-            language_pairs=config.data.configured_language_pairs(),
+            language_pairs=(
+                config.data.configured_language_pairs() if export_translation_capable else None
+            ),
             languages=export_languages,
             translation_directions=(
                 config.data.configured_translation_directions()
