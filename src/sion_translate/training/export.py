@@ -28,6 +28,7 @@ import math
 import os
 import re
 import shutil
+import subprocess
 import sys
 import time
 import types
@@ -90,6 +91,8 @@ _PRECISION_DTYPES = {
 }
 _INT4_GROUP_SIZE = 128
 _EXPORT_LOCK_TIMEOUT_SECONDS = 60.0
+_TRANSFORMERS_INSPECTION_PREFIX = "SION_TRANSFORMERS_INSPECTION="
+_TRANSFORMERS_INSPECTION_TIMEOUT_SECONDS = 600.0
 
 
 @contextmanager
@@ -793,7 +796,9 @@ def _atomic_json_dump(payload: Mapping[str, Any], path: Path) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def _inspect_transformers_checkpoint(path: Path) -> dict[str, Any]:
+def _inspect_transformers_checkpoint_in_process(  # pyright: ignore[reportUnusedFunction]
+    path: Path,
+) -> dict[str, Any]:
     try:
         from safetensors import safe_open
     except ImportError as error:
@@ -964,6 +969,80 @@ def _inspect_transformers_checkpoint(path: Path) -> dict[str, Any]:
         "translation_capable": config_translation_capable,
         "revision_trained": config.revision_trained,
     }
+
+
+def _inspect_transformers_checkpoint(path: Path) -> dict[str, Any]:
+    """Validate remote code in a short-lived process so Windows releases its files."""
+
+    script = f"""
+import json
+import sys
+from pathlib import Path
+from sion_translate.training.export import _inspect_transformers_checkpoint_in_process
+
+try:
+    inspection = _inspect_transformers_checkpoint_in_process(Path(sys.argv[1]))
+except BaseException as error:
+    payload = {{
+        "ok": False,
+        "error_type": type(error).__name__,
+        "message": str(error),
+    }}
+else:
+    payload = {{"ok": True, "inspection": inspection}}
+print({_TRANSFORMERS_INSPECTION_PREFIX!r} + json.dumps(payload, ensure_ascii=False))
+"""
+    environment = {
+        **os.environ,
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+        "PYTHONIOENCODING": "utf-8",
+    }
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(path.resolve())],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=environment,
+            check=False,
+            timeout=_TRANSFORMERS_INSPECTION_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(
+            "Transformers checkpoint inspection timed out after "
+            f"{_TRANSFORMERS_INSPECTION_TIMEOUT_SECONDS:g} seconds"
+        ) from error
+    encoded_payload = next(
+        (
+            line.removeprefix(_TRANSFORMERS_INSPECTION_PREFIX)
+            for line in reversed(result.stdout.splitlines())
+            if line.startswith(_TRANSFORMERS_INSPECTION_PREFIX)
+        ),
+        None,
+    )
+    if result.returncode != 0 or encoded_payload is None:
+        diagnostic = (result.stderr or result.stdout).strip()[-4000:]
+        raise RuntimeError(
+            "Transformers checkpoint inspection subprocess failed"
+            + (f": {diagnostic}" if diagnostic else "")
+        )
+    try:
+        raw_payload: object = json.loads(encoded_payload)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("Transformers inspection returned invalid JSON") from error
+    if not isinstance(raw_payload, dict):
+        raise RuntimeError("Transformers inspection returned a non-object payload")
+    payload = cast(dict[str, Any], raw_payload)
+    if payload.get("ok") is not True:
+        error_type = payload.get("error_type", "RuntimeError")
+        message = payload.get("message", "unknown inspection failure")
+        raise RuntimeError(f"{error_type}: {message}")
+    inspection = payload.get("inspection")
+    if not isinstance(inspection, dict):
+        raise RuntimeError("Transformers inspection result is missing its inspection object")
+    return cast(dict[str, Any], inspection)
 
 
 def _write_transformers_checkpoint(

@@ -19,6 +19,7 @@ from transformers import (
     DataCollatorForSeq2Seq,
 )
 
+import sion_translate.training.export as export_module
 from sion_translate.config import ModelConfig
 from sion_translate.hf import (
     SionConfig,
@@ -653,6 +654,20 @@ def test_transformers_inspection_rejects_internal_release_disagreement(
     export_path.write_text(json.dumps(payload), encoding="utf-8")
 
     with pytest.raises(RuntimeError, match="disagree about release_version"):
+        _inspect_transformers_checkpoint(tmp_path)
+
+
+def test_transformers_inspection_subprocess_has_a_finite_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def time_out(*_args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert kwargs["timeout"] == export_module._TRANSFORMERS_INSPECTION_TIMEOUT_SECONDS
+        raise subprocess.TimeoutExpired(cmd="inspection", timeout=float(kwargs["timeout"]))
+
+    monkeypatch.setattr(export_module.subprocess, "run", time_out)
+
+    with pytest.raises(RuntimeError, match="inspection timed out"):
         _inspect_transformers_checkpoint(tmp_path)
 
 
