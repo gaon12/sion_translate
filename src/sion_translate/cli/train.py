@@ -30,9 +30,9 @@ import importlib.util
 import json
 import math
 import random
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
-from contextlib import ExitStack
-from typing import Any, Sequence, cast
+from typing import Any, Iterator, Sequence, cast
 
 import numpy as np
 import torch
@@ -63,7 +63,7 @@ from sion_translate.artifacts import (
 )
 from sion_translate.data.collate import load_morphoscript_token_features
 from sion_translate.data.reasoning import is_reasoning_jsonl
-from sion_translate.locking import artifact_lock
+from sion_translate.locking import artifact_lock, training_run_lock
 from sion_translate.foundation import (
     FoundationOutcome,
     build_foundation_config,
@@ -82,6 +82,7 @@ from sion_translate.tokenizer import (
 from sion_translate.training.distributed import (
     DistributedContext,
     barrier,
+    broadcast_bool,
     cleanup_distributed,
     initialize_distributed,
     parallelize_model,
@@ -107,6 +108,36 @@ FINAL_EXPORT_DEPENDENCIES = {
     "int8": ("torchao", "torchao"),
     "gguf_q4_k_m": ("gguf", "gguf-python"),
 }
+
+
+@contextmanager  # pyright: ignore[reportDeprecated]
+def coordinated_training_run_lock(
+    output_dir: str | Path,
+    context: DistributedContext,
+) -> Iterator[Path | None]:
+    """Let rank 0 own the run lock and make every peer follow its decision."""
+
+    scope = ExitStack()
+    lock_path: Path | None = None
+    acquisition_error: Exception | None = None
+    if context.is_main:
+        try:
+            lock_path = scope.enter_context(training_run_lock(output_dir))
+        except Exception as error:
+            acquisition_error = error
+
+    try:
+        acquisition_failed = broadcast_bool(acquisition_error is not None, context)
+        if acquisition_failed:
+            if acquisition_error is not None:
+                raise acquisition_error
+            raise RuntimeError(
+                "rank 0이 training.output_dir run lock을 획득하지 못했습니다. "
+                "rank 0의 오류에서 현재 보유자와 output_dir를 확인하십시오."
+            )
+        yield lock_path
+    finally:
+        scope.close()
 
 
 def missing_final_export_dependencies(formats: list[str] | tuple[str, ...]) -> dict[str, str]:
@@ -1275,6 +1306,7 @@ def main() -> None:
     configure_stdio()
     args = build_parser().parse_args()
     context = initialize_distributed()
+    run_scope = ExitStack()
     try:
         # ── 단계 ①: 환경 자동 인식 ──────────────────────────────────────
         env = probe_environment()
@@ -1283,6 +1315,7 @@ def main() -> None:
 
         # ── 단계 ②: 설정 로드 ───────────────────────────────────────────
         config, raw, source = resolve_config(args)
+        run_scope.enter_context(coordinated_training_run_lock(config.training.output_dir, context))
         announce(f"준비 ②: 설정 로드 — {source}", context)
         if not args.prepare_only:
             # The built-in collator has no dense alignment-label provider.
@@ -1674,7 +1707,10 @@ def main() -> None:
         )
         announce(f"최종 모델 내보내기 검증 완료: {final_export_dir}", context)
     finally:
-        cleanup_distributed(context)
+        try:
+            cleanup_distributed(context)
+        finally:
+            run_scope.close()
 
 
 if __name__ == "__main__":

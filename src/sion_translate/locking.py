@@ -19,9 +19,10 @@ import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import IO, Iterator
+from typing import IO, Callable, Iterator
 
 LOCK_FILENAME = ".sion_artifacts.lock"
+TRAINING_RUN_LOCK_FILENAME = ".sion_training_run.lock"
 
 # 보유자 정보를 적는 영역과 겹치지 않도록, 락은 파일 내용 **바깥**의 고정
 # 바이트에 겁니다. Windows 의 byte-range 락은 잠긴 구간에 대한 쓰기를 막기
@@ -73,9 +74,11 @@ def _describe_holder(path: Path) -> str:
 
 
 @contextmanager  # pyright: ignore[reportDeprecated]
-def artifact_lock(
+def _exclusive_lock(
     root: str | Path,
     *,
+    filename: str,
+    conflict_message: Callable[[Path, str], str],
     timeout: float = 0.0,
     poll_interval: float = 1.0,
 ) -> Iterator[Path]:
@@ -91,7 +94,7 @@ def artifact_lock(
 
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
-    lock_path = root / LOCK_FILENAME
+    lock_path = root / filename
     deadline = time.monotonic() + max(0.0, timeout)
     handle = open(lock_path, "r+", encoding="utf-8") if lock_path.exists() else None
     if handle is None:
@@ -102,13 +105,7 @@ def artifact_lock(
             if _try_acquire(handle):
                 break
             if time.monotonic() >= deadline:
-                raise RuntimeError(
-                    f"artifact 루트가 다른 프로세스에 잠겨 있습니다: {root}\n"
-                    f"  현재 보유자: {_describe_holder(lock_path)}\n"
-                    "  같은 artifacts/ 를 쓰는 작업을 동시에 두 개 실행하면 서로 다른 "
-                    "세대의 토크나이저와 데이터셋이 섞입니다. 앞선 작업이 끝나기를 "
-                    "기다리거나, 이 작업에 별도의 artifact 경로를 주십시오."
-                )
+                raise RuntimeError(conflict_message(root, _describe_holder(lock_path)))
             time.sleep(poll_interval)
         handle.seek(0)
         handle.truncate()
@@ -120,4 +117,67 @@ def artifact_lock(
         handle.close()
 
 
-__all__ = ["LOCK_FILENAME", "artifact_lock"]
+def _artifact_conflict_message(root: Path, holder: str) -> str:
+    return (
+        f"artifact 루트가 다른 프로세스에 잠겨 있습니다: {root}\n"
+        f"  현재 보유자: {holder}\n"
+        "  같은 artifacts/ 를 쓰는 작업을 동시에 두 개 실행하면 서로 다른 "
+        "세대의 토크나이저와 데이터셋이 섞입니다. 앞선 작업이 끝나기를 "
+        "기다리거나, 이 작업에 별도의 artifact 경로를 주십시오."
+    )
+
+
+def _training_run_conflict_message(root: Path, holder: str) -> str:
+    return (
+        f"학습 output_dir가 다른 프로세스에 잠겨 있습니다: {root}\n"
+        f"  현재 보유자: {holder}\n"
+        "  같은 training.output_dir에서 동시에 두 run을 실행하면 체크포인트·"
+        "로그·내보내기 산출물이 섞입니다. 앞선 run이 끝나기를 기다리거나 "
+        "이 run에 별도의 training.output_dir를 주십시오."
+    )
+
+
+@contextmanager  # pyright: ignore[reportDeprecated]
+def artifact_lock(
+    root: str | Path,
+    *,
+    timeout: float = 0.0,
+    poll_interval: float = 1.0,
+) -> Iterator[Path]:
+    """Artifact 생성 전체가 ``root`` 를 독점하도록 잠그다."""
+
+    with _exclusive_lock(
+        root,
+        filename=LOCK_FILENAME,
+        conflict_message=_artifact_conflict_message,
+        timeout=timeout,
+        poll_interval=poll_interval,
+    ) as lock_path:
+        yield lock_path
+
+
+@contextmanager  # pyright: ignore[reportDeprecated]
+def training_run_lock(
+    root: str | Path,
+    *,
+    timeout: float = 0.0,
+    poll_interval: float = 1.0,
+) -> Iterator[Path]:
+    """학습 run 전체가 ``training.output_dir`` 를 독점하도록 잠그다."""
+
+    with _exclusive_lock(
+        root,
+        filename=TRAINING_RUN_LOCK_FILENAME,
+        conflict_message=_training_run_conflict_message,
+        timeout=timeout,
+        poll_interval=poll_interval,
+    ) as lock_path:
+        yield lock_path
+
+
+__all__ = [
+    "LOCK_FILENAME",
+    "TRAINING_RUN_LOCK_FILENAME",
+    "artifact_lock",
+    "training_run_lock",
+]

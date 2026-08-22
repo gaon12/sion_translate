@@ -13,7 +13,16 @@ import subprocess
 import sys
 import textwrap
 
-from sion_translate.locking import LOCK_FILENAME, artifact_lock
+import pytest
+import torch
+
+from sion_translate.locking import (
+    LOCK_FILENAME,
+    TRAINING_RUN_LOCK_FILENAME,
+    artifact_lock,
+    training_run_lock,
+)
+from sion_translate.training.distributed import DistributedContext
 
 
 def test_the_lock_creates_the_root_if_it_is_missing(tmp_path) -> None:
@@ -35,6 +44,78 @@ def test_the_lock_is_reentrant_across_sequential_uses(tmp_path) -> None:
     for _ in range(3):
         with artifact_lock(tmp_path):
             pass
+
+
+def test_training_run_lock_uses_a_separate_lock_file(tmp_path) -> None:
+    with artifact_lock(tmp_path) as artifact_path:
+        with training_run_lock(tmp_path) as run_path:
+            assert artifact_path.name == LOCK_FILENAME
+            assert run_path.name == TRAINING_RUN_LOCK_FILENAME
+
+
+def test_a_second_training_process_is_refused_for_the_same_output_dir(tmp_path) -> None:
+    script = textwrap.dedent(
+        f"""
+        import sys
+        from sion_translate.locking import training_run_lock
+        try:
+            with training_run_lock({str(tmp_path)!r}):
+                sys.exit(0)
+        except RuntimeError as error:
+            print(error)
+            sys.exit(3)
+        """
+    )
+
+    with training_run_lock(tmp_path):
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+            cwd=os.getcwd(),
+        )
+
+    assert result.returncode == 3, result.stderr
+    assert "학습 output_dir가 다른 프로세스에 잠겨" in result.stdout
+    assert "training.output_dir" in result.stdout
+    assert f"pid={os.getpid()}" in result.stdout
+
+
+def test_training_run_lock_is_released_after_the_scope(tmp_path) -> None:
+    with training_run_lock(tmp_path):
+        pass
+    with training_run_lock(tmp_path):
+        pass
+
+
+def test_coordinated_run_lock_is_owned_only_by_rank_zero(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import sion_translate.cli.train as train_module
+
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+    monkeypatch.setattr(train_module, "broadcast_bool", lambda value, _context: value)
+
+    with train_module.coordinated_training_run_lock(tmp_path, context) as lock_path:
+        assert lock_path == tmp_path / TRAINING_RUN_LOCK_FILENAME
+        assert lock_path.is_file()
+
+
+def test_coordinated_peer_follows_rank_zero_lock_failure(tmp_path, monkeypatch) -> None:
+    import sion_translate.cli.train as train_module
+
+    context = DistributedContext(1, 1, 2, torch.device("cpu"), True, "gloo")
+    monkeypatch.setattr(train_module, "broadcast_bool", lambda _value, _context: True)
+
+    with pytest.raises(RuntimeError, match="rank 0.*run lock"):
+        with train_module.coordinated_training_run_lock(tmp_path, context):
+            raise AssertionError("a peer must not enter after rank 0 failed")
+
+    assert not (tmp_path / TRAINING_RUN_LOCK_FILENAME).exists()
 
 
 def test_a_second_process_is_refused_while_the_lock_is_held(tmp_path) -> None:
