@@ -87,8 +87,21 @@ class SionTokenizer(PreTrainedTokenizer):
         self.denoise_tags: dict[str, int] = {}
         language_pattern = re.compile(r"^<2([A-Za-z0-9]+)>$")
         denoise_pattern = re.compile(r"^<denoise_([A-Za-z0-9]+)>$")
-        for token_id in range(min(self.sp_model.vocab_size(), 256)):
+        byte_fallback_pattern = re.compile(r"^<0x[0-9A-Fa-f]{2}>$")
+        base_special_tokens = {"<pad>", "<unk>", "<s>", "</s>"}
+        reserved_control_pieces: list[str] = []
+        # SentencePiece orders meta pieces, user-defined symbols, byte fallback,
+        # and learned pieces in that order.  The first byte piece is therefore
+        # the structural end of the control-symbol region.  A numeric ID cap is
+        # not safe: sufficiently many configured languages push valid tags past
+        # any fixed boundary, while scanning learned pieces can misclassify an
+        # ordinary vocabulary item that merely looks like ``<2xx>``.
+        for token_id in range(self.sp_model.vocab_size()):
             piece = self.sp_model.id_to_piece(token_id)
+            if byte_fallback_pattern.fullmatch(piece):
+                break
+            if piece.startswith("<") and piece.endswith(">") and piece not in base_special_tokens:
+                reserved_control_pieces.append(piece)
             if match := language_pattern.fullmatch(piece):
                 self.language_tags[match.group(1)] = token_id
             elif match := denoise_pattern.fullmatch(piece):
@@ -196,16 +209,7 @@ class SionTokenizer(PreTrainedTokenizer):
             self.token_features = self._load_token_features(feature_path)
         self._token_features_path = feature_path
 
-        base_special_tokens = {"<pad>", "<unk>", "<s>", "</s>"}
-        byte_fallback_pattern = re.compile(r"^<0x[0-9A-F]{2}>$")
-        additional = [
-            piece
-            for token_id in range(self.sp_model.vocab_size())
-            if (piece := self.sp_model.id_to_piece(token_id)).startswith("<")
-            and piece.endswith(">")
-            and piece not in base_special_tokens
-            and not byte_fallback_pattern.fullmatch(piece)
-        ]
+        additional = reserved_control_pieces
         kwargs.setdefault("pad_token", "<pad>")
         kwargs.setdefault("unk_token", "<unk>")
         kwargs.setdefault("bos_token", "<s>")

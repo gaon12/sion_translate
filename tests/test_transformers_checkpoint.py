@@ -25,6 +25,7 @@ from sion_translate.config import ModelConfig
 from sion_translate.hf import (
     SionConfig,
     SionForConditionalGeneration,
+    SionTokenizer as HFSionTokenizer,
     register_sion_auto_classes,
     save_transformers_checkpoint,
 )
@@ -95,6 +96,72 @@ def train_tiny_tokenizer(
         num_workers=1,
         num_threads=1,
     )
+
+
+class _LargeControlVocabulary:
+    """SentencePiece layout with language controls beyond token ID 256."""
+
+    def __init__(self, languages: list[str]) -> None:
+        from sion_translate.tokenizer import (
+            OPTIONAL_CONTROL_SYMBOLS,
+            SHARED_CONTROL_SYMBOLS,
+            SLOT_SYMBOLS,
+        )
+
+        self._pieces = ["<pad>", "<unk>", "<s>", "</s>"]
+        self._pieces += [f"<2{language}>" for language in languages]
+        self._pieces += [f"<denoise_{language}>" for language in languages]
+        self._pieces += SHARED_CONTROL_SYMBOLS + OPTIONAL_CONTROL_SYMBOLS + SLOT_SYMBOLS
+        self._pieces += [f"<0x{value:02X}>" for value in range(256)]
+        # This is a learned piece, not a reserved language control, despite its
+        # surface form.  The byte-fallback boundary must keep it out.
+        self._pieces += ["▁alpha", "<2learned>", "▁omega"]
+        self._index = {piece: token_id for token_id, piece in enumerate(self._pieces)}
+
+    def vocab_size(self) -> int:
+        return len(self._pieces)
+
+    def id_to_piece(self, token_id: int) -> str:
+        return self._pieces[token_id]
+
+    def piece_to_id(self, piece: str) -> int:
+        return self._index.get(piece, 1)
+
+    def encode(self, _text: str, *, out_type: type[str]) -> list[str]:
+        assert out_type is str
+        return ["▁alpha"]
+
+    def decode(self, pieces: list[str]) -> str:
+        return "".join(pieces)
+
+
+def test_hf_tokenizer_discovers_every_reserved_language_past_id_256(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import sion_translate.hf.tokenization_sion as tokenizer_module
+
+    languages = [f"l{index:03d}" for index in range(150)]
+    processor = _LargeControlVocabulary(languages)
+    assert processor.piece_to_id(f"<denoise_{languages[-1]}>") > 256
+
+    def processor_factory(**_kwargs: object) -> _LargeControlVocabulary:
+        return processor
+
+    monkeypatch.setattr(
+        tokenizer_module.spm,
+        "SentencePieceProcessor",
+        processor_factory,
+    )
+    tokenizer_path = tmp_path / "tokenizer.model"
+    tokenizer_path.write_bytes(b"stub")
+
+    tokenizer = HFSionTokenizer(str(tokenizer_path), translation_capable=False)
+
+    assert set(tokenizer.language_tags) == set(languages)
+    assert set(tokenizer.denoise_tags) == set(languages)
+    assert "learned" not in tokenizer.language_tags
+    assert "<2learned>" not in tokenizer.all_special_tokens
 
 
 def test_transformers_wrapper_matches_native_forward_and_config() -> None:
