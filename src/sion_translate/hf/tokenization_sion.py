@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 import hashlib
 import re
 import shutil
@@ -66,6 +67,8 @@ class SionTokenizer(PreTrainedTokenizer):
         slot_token_ids: list[int] | tuple[int, ...] | None = None,
         language_pairs: list[list[str]] | tuple[tuple[str, str], ...] | None = None,
         translation_directions: list[list[str]] | tuple[tuple[str, str], ...] | None = None,
+        release_name: str | None = None,
+        release_version: str | None = None,
         translation_capable: bool = True,
         script_classes: int = 9,
         tetm_type_id: int = 8,
@@ -125,6 +128,10 @@ class SionTokenizer(PreTrainedTokenizer):
         self.language_pairs: list[list[str]] = []
         seen_pairs: set[frozenset[str]] = set()
         for raw_pair in language_pairs or ():
+            if isinstance(raw_pair, (str, bytes)) or not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
+                raw_pair, Sequence
+            ):
+                raise ValueError("each tokenizer language pair must be a two-item sequence")
             pair = [str(language) for language in raw_pair]
             edge = frozenset(pair)
             if (
@@ -137,6 +144,19 @@ class SionTokenizer(PreTrainedTokenizer):
                 seen_pairs.add(edge)
                 self.language_pairs.append(pair)
         self._language_pair_edges = seen_pairs
+        current_direction_contract = bool(
+            kwargs.get("pipeline") is not None
+            or (
+                isinstance(release_version, str)
+                and re.fullmatch(r"[0-9]+\.[0-9]+(?:\.[0-9]+)?", release_version)
+                and tuple(int(part) for part in release_version.split("."))[:2] >= (1, 5)
+            )
+        )
+        if translation_directions is None and self.language_pairs and current_direction_contract:
+            raise ValueError(
+                "current translation tokenizers with language pairs require explicit "
+                "translation_directions"
+            )
         raw_directions = (
             translation_directions
             if translation_directions is not None
@@ -153,6 +173,10 @@ class SionTokenizer(PreTrainedTokenizer):
                 "translation_directions cannot be empty when language pairs are configured"
             )
         for raw_direction in raw_directions:
+            if isinstance(raw_direction, (str, bytes)) or not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
+                raw_direction, Sequence
+            ):
+                raise ValueError("each tokenizer translation direction must be a two-item sequence")
             direction = [str(language) for language in raw_direction]
             key = tuple(direction)
             if (
@@ -164,6 +188,15 @@ class SionTokenizer(PreTrainedTokenizer):
             if key not in seen_directions:
                 seen_directions.add(key)
                 self.translation_directions.append(direction)
+        covered_edges = {frozenset(direction) for direction in seen_directions}
+        missing_pairs = [
+            pair for pair in self.language_pairs if frozenset(pair) not in covered_edges
+        ]
+        if missing_pairs:
+            raise ValueError(
+                "every tokenizer language pair must have at least one translation direction: "
+                f"missing={missing_pairs!r}"
+            )
         self._translation_direction_edges = seen_directions
         if not isinstance(translation_capable, bool):  # pyright: ignore[reportUnnecessaryIsInstance]
             raise ValueError("translation_capable must be a boolean")
@@ -243,6 +276,8 @@ class SionTokenizer(PreTrainedTokenizer):
         kwargs.setdefault("slot_token_ids", self.slot_token_ids)
         kwargs.setdefault("language_pairs", self.language_pairs)
         kwargs.setdefault("translation_directions", self.translation_directions)
+        kwargs.setdefault("release_name", release_name)
+        kwargs.setdefault("release_version", release_version)
         kwargs.setdefault("translation_capable", self.translation_capable)
         kwargs.setdefault("script_classes", self.script_classes)
         kwargs.setdefault("tetm_type_id", self.tetm_type_id)

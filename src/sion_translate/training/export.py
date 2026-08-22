@@ -363,7 +363,9 @@ def _normalize_language_pairs(
     normalized: list[list[str]] = []
     seen: set[tuple[str, str]] = set()
     for raw_pair in raw_pairs:
-        if isinstance(raw_pair, (str, bytes)) or not isinstance(raw_pair, Sequence):
+        if isinstance(raw_pair, (str, bytes)) or not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
+            raw_pair, Sequence
+        ):
             raise ValueError("each language pair must be a two-item language sequence")
         pair = [str(language).strip() for language in raw_pair]
         if len(pair) != 2 or not all(pair) or pair[0] == pair[1]:
@@ -1218,6 +1220,34 @@ def _inspect_transformers_checkpoint_in_process(  # pyright: ignore[reportUnused
                 f"config={config_translation_capable!r}, "
                 f"tokenizer={tokenizer_translation_capable!r}"
             )
+        tokenizer_pairs = [list(pair) for pair in remote_tokenizer.language_pairs]
+        tokenizer_directions = [
+            list(direction) for direction in remote_tokenizer.translation_directions
+        ]
+        if tokenizer_pairs != config_language_pairs:
+            raise RuntimeError("Transformers config/tokenizer disagree about language_pairs")
+        if tokenizer_directions != config_translation_directions:
+            raise RuntimeError(
+                "Transformers config/tokenizer disagree about translation_directions"
+            )
+        tokenizer_metadata_path = path / "tokenizer_metadata.json"
+        if tokenizer_metadata_path.is_file():
+            tokenizer_metadata_payload = json.loads(
+                tokenizer_metadata_path.read_text(encoding="utf-8")
+            )
+            if not isinstance(tokenizer_metadata_payload, dict):
+                raise RuntimeError("Transformers tokenizer metadata must contain an object")
+            if tokenizer_metadata_payload.get("language_pairs") != config_language_pairs:
+                raise RuntimeError(
+                    "Transformers config/tokenizer metadata disagree about language_pairs"
+                )
+            if (
+                tokenizer_metadata_payload.get("translation_directions")
+                != config_translation_directions
+            ):
+                raise RuntimeError(
+                    "Transformers config/tokenizer metadata disagree about translation_directions"
+                )
         del remote_tokenizer
 
     # Import the exact bundled remote code and materialize its architecture on
@@ -1400,6 +1430,7 @@ def _write_transformers_checkpoint(
             release_name=release_name,
             release_version=release_version,
             allow_language_subset=not bool(language_pairs),
+            _atomic_publish=False,
         )
         for sidecar_name in ("config.json", "sion_export.json"):
             sidecar_path = temporary / sidecar_name
@@ -2802,7 +2833,7 @@ def convert_export(
             "translation_directions or an explicit bidirectional policy"
         )
     inherited_directions = _metadata_translation_directions(inherited) if inherited_pairs else []
-    inherited_graph_authenticated = "translation_directions" in inherited
+    inherited_graph_authenticated = inherited.get("translation_directions") is not None
     resolved_directions = inherited_directions
     if translation_directions is not None and bidirectional is not None:
         raise ValueError("use translation_directions or bidirectional, not both")

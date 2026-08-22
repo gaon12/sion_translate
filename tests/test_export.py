@@ -936,6 +936,11 @@ def test_legacy_conversion_requires_and_accepts_an_explicit_direction_policy(
     with pytest.raises(ValueError, match="no authenticated direction graph"):
         convert_export(source, tmp_path / "ambiguous", formats=("fp16",))
 
+    payload["metadata"]["translation_directions"] = None
+    torch.save(payload, source)
+    with pytest.raises(ValueError, match="no authenticated direction graph"):
+        convert_export(source, tmp_path / "null-graph", formats=("fp16",))
+
     converted = convert_export(
         source,
         tmp_path / "unidirectional",

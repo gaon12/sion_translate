@@ -21,6 +21,7 @@ from transformers import (
 )
 
 import sion_translate.training.export as export_module
+import sion_translate.hf.conversion as hf_conversion
 from sion_translate.config import ModelConfig
 from sion_translate.hf import (
     SionConfig,
@@ -186,6 +187,27 @@ def test_hf_multilingual_tokenizer_requires_an_explicit_pair_graph(
     with pytest.raises(ValueError, match="require language_pairs metadata"):
         HFSionTokenizer(str(tokenizer_path))
 
+    with pytest.raises(ValueError, match="require explicit translation_directions"):
+        HFSionTokenizer(
+            str(tokenizer_path),
+            language_pairs=[["de", "fr"], ["sw", "ar"]],
+            release_name="sion_translate",
+            release_version="1.5",
+        )
+
+    legacy = HFSionTokenizer(
+        str(tokenizer_path),
+        language_pairs=[["de", "fr"], ["sw", "ar"]],
+        release_name="sion_translate",
+        release_version="1.4",
+    )
+    assert legacy.translation_directions == [
+        ["de", "fr"],
+        ["fr", "de"],
+        ["sw", "ar"],
+        ["ar", "sw"],
+    ]
+
 
 def test_transformers_wrapper_matches_native_forward_and_config() -> None:
     torch.manual_seed(17)
@@ -228,6 +250,64 @@ def test_transformers_wrapper_matches_native_forward_and_config() -> None:
     assert model.model.config.gradient_checkpointing
     model.gradient_checkpointing_disable()
     assert not model.config.gradient_checkpointing
+
+
+def test_transformers_config_rejects_an_uncovered_language_pair() -> None:
+    with pytest.raises(ValueError, match="every language pair"):
+        SionConfig.from_model_config(
+            tiny_model_config(),
+            languages=["de", "fr", "sw", "ar"],
+            language_pairs=[["de", "fr"], ["sw", "ar"]],
+            translation_directions=[["de", "fr"]],
+        )
+
+
+def test_current_transformers_config_rejects_a_missing_direction_graph() -> None:
+    with pytest.raises(ValueError, match="require explicit translation_directions"):
+        SionConfig.from_model_config(
+            tiny_model_config(),
+            languages=["de", "fr"],
+            language_pairs=[["de", "fr"]],
+            release_name="sion_translate",
+            release_version="1.5",
+        )
+
+
+@pytest.mark.parametrize(
+    "language_pairs",
+    [
+        ("de",),
+        ({"source": "de", "target": "fr"},),
+    ],
+)
+def test_transformers_config_rejects_non_sequence_pair_entries(
+    language_pairs: object,
+) -> None:
+    with pytest.raises(ValueError, match="two-item language sequence"):
+        SionConfig.from_model_config(
+            tiny_model_config(),
+            language_pairs=language_pairs,  # type: ignore[arg-type]
+        )
+
+
+def test_transformers_conversion_rejects_an_uncovered_pair_before_writing(
+    tmp_path: Path,
+) -> None:
+    config = tiny_model_config()
+    native = NativeSionForConditionalGeneration(config, pad_id=0)
+    output_dir = tmp_path / "invalid-transformers"
+
+    with pytest.raises(ValueError, match="every language pair"):
+        save_transformers_checkpoint(
+            output_dir,
+            native.state_dict(),
+            config,
+            languages=["de", "fr", "sw", "ar"],
+            language_pairs=[["de", "fr"], ["sw", "ar"]],
+            translation_directions=[["de", "fr"]],
+        )
+
+    assert not output_dir.exists()
 
 
 def test_hf_multi_return_beam_keeps_positive_penalty_future_winner_alive() -> None:
@@ -1014,6 +1094,69 @@ def test_transformers_tokenizer_enforces_trained_direction(tmp_path: Path) -> No
             src_lang="ja",
             tgt_lang="ko",
         )
+    tokenizer_metadata = json.loads(
+        (output_dir / "tokenizer_metadata.json").read_text(encoding="utf-8")
+    )
+    assert tokenizer_metadata["language_pairs"] == [["ko", "ja"]]
+    assert tokenizer_metadata["translation_directions"] == [["ko", "ja"]]
+    for sidecar_name in ("config.json", "sion_export.json"):
+        sidecar_path = output_dir / sidecar_name
+        sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        sidecar["pipeline"] = TRANSLATION_PIPELINE_IDENTITY
+        sidecar_path.write_text(json.dumps(sidecar), encoding="utf-8")
+    assert _inspect_transformers_checkpoint(output_dir)["translation_directions"] == [["ko", "ja"]]
+
+    tokenizer_metadata["translation_directions"].append(["ja", "ko"])
+    (output_dir / "tokenizer_metadata.json").write_text(
+        json.dumps(tokenizer_metadata),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="tokenizer metadata disagree"):
+        _inspect_transformers_checkpoint(output_dir)
+
+
+def test_transformers_export_failure_leaves_no_partial_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tokenizer_path = train_tiny_tokenizer(tmp_path)
+    tokenizer = NativeSionTokenizer(tokenizer_path)
+    config = tiny_model_config(len(tokenizer))
+    native = NativeSionForConditionalGeneration(config, pad_id=tokenizer.pad_id)
+    output_dir = tmp_path / "failed-transformers"
+
+    def fail_runtime_copy(_output_dir: Path) -> list[str]:
+        raise RuntimeError("runtime copy failed")
+
+    monkeypatch.setattr(hf_conversion, "_copy_self_contained_runtime", fail_runtime_copy)
+
+    with pytest.raises(RuntimeError, match="runtime copy failed"):
+        save_transformers_checkpoint(
+            output_dir,
+            native.state_dict(),
+            config,
+            pad_id=tokenizer.pad_id,
+            tokenizer_path=tokenizer_path,
+            language_pairs=[["ko", "ja"]],
+        )
+
+    assert not output_dir.exists()
+    assert not list(tmp_path.glob(f".{output_dir.name}.staging-*"))
+
+    output_dir.mkdir()
+    marker = output_dir / "complete.marker"
+    marker.write_text("previous generation", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="runtime copy failed"):
+        save_transformers_checkpoint(
+            output_dir,
+            native.state_dict(),
+            config,
+            pad_id=tokenizer.pad_id,
+            tokenizer_path=tokenizer_path,
+            language_pairs=[["ko", "ja"]],
+        )
+    assert marker.read_text(encoding="utf-8") == "previous generation"
+    assert {path.name for path in output_dir.iterdir()} == {"complete.marker"}
 
 
 def test_hf_tokenizer_caps_protected_slot_occurrences_and_checks_feature_hash(

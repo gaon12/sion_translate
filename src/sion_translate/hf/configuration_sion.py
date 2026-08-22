@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import asdict
 import re
 from typing import Any
@@ -111,22 +112,48 @@ class SionConfig(PretrainedConfig):
             else ExperimentalConfig(**dict(experimental or {}))
         )
         self.experimental = experimental_config
-        self.language_pairs = [list(pair) for pair in (language_pairs or [])]
+        self.language_pairs: list[list[str]] = []
+        for raw_pair in language_pairs or ():
+            if isinstance(raw_pair, (str, bytes)) or not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
+                raw_pair, Sequence
+            ):
+                raise ValueError("each language pair must be a two-item language sequence")
+            self.language_pairs.append([str(language) for language in raw_pair])
         self.languages = list(
             languages
             or dict.fromkeys(language for pair in self.language_pairs for language in pair)
         )
-        self.translation_directions = (
-            [list(direction) for direction in translation_directions]
-            if translation_directions is not None
-            else [
+        self.release_name = release_name
+        self.release_version = release_version
+        current_direction_contract = bool(
+            kwargs.get("pipeline") is not None
+            or (
+                isinstance(release_version, str)
+                and re.fullmatch(r"[0-9]+\.[0-9]+(?:\.[0-9]+)?", release_version)
+                and tuple(int(part) for part in release_version.split("."))[:2] >= (1, 5)
+            )
+        )
+        if translation_directions is None and self.language_pairs and current_direction_contract:
+            raise ValueError(
+                "current translation configs with language pairs require explicit "
+                "translation_directions"
+            )
+        if translation_directions is None:
+            self.translation_directions = [
                 list(direction)
                 for pair in self.language_pairs
                 for direction in (pair, list(reversed(pair)))
             ]
-        )
-        self.release_name = release_name
-        self.release_version = release_version
+        else:
+            self.translation_directions = []
+            for raw_direction in translation_directions:
+                if isinstance(raw_direction, (str, bytes)) or not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
+                    raw_direction, Sequence
+                ):
+                    raise ValueError(
+                        "each translation direction must be a two-item language sequence"
+                    )
+                self.translation_directions.append([str(language) for language in raw_direction])
         if not isinstance(translation_capable, bool):  # pyright: ignore[reportUnnecessaryIsInstance]
             raise ValueError("translation_capable must be a boolean")
         self.translation_capable = translation_capable
@@ -242,6 +269,15 @@ class SionConfig(PretrainedConfig):
             if key in seen_directions:
                 raise ValueError(f"duplicate translation direction: {direction!r}")
             seen_directions.add(key)
+        covered_edges = {frozenset(direction) for direction in seen_directions}
+        missing_pairs = [
+            pair for pair in self.language_pairs if frozenset(pair) not in covered_edges
+        ]
+        if missing_pairs:
+            raise ValueError(
+                "every language pair must have at least one translation direction: "
+                f"missing={missing_pairs!r}"
+            )
 
     def to_model_config(self) -> ModelConfig:
         return ModelConfig(

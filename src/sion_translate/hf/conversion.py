@@ -9,6 +9,7 @@ import hashlib
 import json
 from pathlib import Path
 import shutil
+import tempfile
 from typing import Sequence
 
 import numpy as np
@@ -23,6 +24,7 @@ from sion_translate.tokenizer import (
     OPTIONAL_CONTROL_SYMBOLS,
     SHARED_CONTROL_SYMBOLS,
     SionTokenizer as NativeSionTokenizer,
+    load_tokenizer_metadata,
 )
 
 from .configuration_sion import SionConfig
@@ -160,6 +162,10 @@ def _validate_language_contract(
         )
     pairs: list[list[str]] = []
     for raw_pair in language_pairs or ():
+        if isinstance(raw_pair, (str, bytes)) or not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
+            raw_pair, Sequence
+        ):
+            raise ValueError("each language pair must be a two-item language sequence")
         pair = list(map(str, raw_pair))
         if len(pair) != 2 or pair[0] == pair[1]:
             raise ValueError(f"invalid language pair: {raw_pair!r}")
@@ -192,11 +198,12 @@ def _translation_directions(
 ) -> list[list[str]]:
     pairs = [list(map(str, pair)) for pair in language_pairs]
     allowed_edges = {frozenset(pair) for pair in pairs}
-    raw_directions = (
-        configured
-        if configured is not None
-        else [direction for pair in pairs for direction in (pair, list(reversed(pair)))]
-    )
+    if pairs and configured is None:
+        raise ValueError(
+            "language pairs require authenticated translation_directions; pass them "
+            "explicitly or provide tokenizer_metadata.json"
+        )
+    raw_directions = configured or ()
     directions: list[list[str]] = []
     seen: set[tuple[str, str]] = set()
     if pairs and not raw_directions:
@@ -204,6 +211,10 @@ def _translation_directions(
             "translation_directions cannot be empty when language pairs are configured"
         )
     for raw_direction in raw_directions:
+        if isinstance(raw_direction, (str, bytes)) or not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
+            raw_direction, Sequence
+        ):
+            raise ValueError("each translation direction must be a two-item language sequence")
         direction = list(map(str, raw_direction))
         key = tuple(direction)
         if (
@@ -215,7 +226,86 @@ def _translation_directions(
         if key not in seen:
             seen.add(key)
             directions.append(direction)
+    covered_edges = {frozenset(direction) for direction in directions}
+    missing_pairs = [pair for pair in pairs if frozenset(pair) not in covered_edges]
+    if missing_pairs:
+        raise ValueError(
+            "every language pair must have at least one translation direction: "
+            f"missing={missing_pairs!r}"
+        )
     return directions
+
+
+def _tokenizer_metadata_contract(
+    tokenizer_path: Path,
+    requested_pairs: Sequence[Sequence[str]] | None,
+    *,
+    translation_capable: bool,
+) -> tuple[Sequence[Sequence[str]] | None, Sequence[Sequence[str]] | None]:
+    """Return only an explicit, validated graph recorded beside the tokenizer."""
+
+    metadata = load_tokenizer_metadata(tokenizer_path)
+    if metadata is None or not translation_capable:
+        return requested_pairs, None
+    raw_pairs = metadata.get("language_pairs")
+    if raw_pairs is None and metadata.get("language_pair") is not None:
+        raw_pairs = [metadata["language_pair"]]
+    if raw_pairs is None:
+        return requested_pairs, None
+    if not isinstance(raw_pairs, Sequence) or isinstance(raw_pairs, (str, bytes)):
+        raise ValueError("tokenizer metadata language_pairs must be a sequence")
+    metadata_pairs: list[list[str]] = []
+    metadata_edges_seen: set[frozenset[str]] = set()
+    for raw_pair in raw_pairs:
+        if isinstance(raw_pair, (str, bytes)) or not isinstance(raw_pair, Sequence):
+            raise ValueError("each tokenizer metadata language pair must be a two-item sequence")
+        pair = list(map(str, raw_pair))
+        if len(pair) != 2 or pair[0] == pair[1]:
+            raise ValueError(f"invalid tokenizer metadata language pair: {raw_pair!r}")
+        edge = frozenset(pair)
+        if edge in metadata_edges_seen:
+            raise ValueError(
+                f"duplicate or reversed tokenizer metadata language pair: {raw_pair!r}"
+            )
+        metadata_edges_seen.add(edge)
+        metadata_pairs.append(pair)
+    effective_pairs = metadata_pairs if requested_pairs is None else requested_pairs
+    normalized_requested = [list(map(str, pair)) for pair in effective_pairs]
+    metadata_edges = {frozenset(pair) for pair in metadata_pairs}
+    missing_pairs = [pair for pair in normalized_requested if frozenset(pair) not in metadata_edges]
+    if missing_pairs:
+        raise ValueError(
+            f"requested language pairs are absent from tokenizer metadata: {missing_pairs!r}"
+        )
+    raw_directions = metadata.get("translation_directions")
+    if raw_directions is None:
+        return effective_pairs, None
+    if not isinstance(raw_directions, Sequence) or isinstance(raw_directions, (str, bytes)):
+        raise ValueError("tokenizer metadata translation_directions must be a sequence")
+    requested_edges = {frozenset(pair) for pair in normalized_requested}
+    selected_directions: list[list[str]] = []
+    seen_directions: set[tuple[str, str]] = set()
+    for raw_direction in raw_directions:
+        if isinstance(raw_direction, (str, bytes)) or not isinstance(raw_direction, Sequence):
+            raise ValueError(
+                "each tokenizer metadata translation direction must be a two-item sequence"
+            )
+        direction = list(map(str, raw_direction))
+        key = tuple(direction)
+        if (
+            len(direction) != 2
+            or direction[0] == direction[1]
+            or frozenset(direction) not in metadata_edges
+        ):
+            raise ValueError(f"invalid tokenizer metadata translation direction: {raw_direction!r}")
+        if key in seen_directions:
+            raise ValueError(
+                f"duplicate tokenizer metadata translation direction: {raw_direction!r}"
+            )
+        seen_directions.add(key)
+        if frozenset(direction) in requested_edges:
+            selected_directions.append(direction)
+    return effective_pairs, selected_directions
 
 
 def _generation_suppress_tokens(
@@ -246,7 +336,7 @@ def _generation_suppress_tokens(
     return sorted(suppressed)
 
 
-def save_transformers_checkpoint(
+def _save_transformers_checkpoint_unpublished(
     output_dir: str | Path,
     state_dict: dict[str, torch.Tensor],
     model_config: ModelConfig,
@@ -268,21 +358,26 @@ def save_transformers_checkpoint(
 
     export_dtype = _state_dict_float_dtype(state_dict)
     output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
     bos_id = 2
     eos_id = 3
     tokenizer: NativeSionTokenizer | None = None
+    tokenizer_metadata_directions: Sequence[Sequence[str]] | None = None
     tokenizer_sha256: str | None = None
     slot_token_ids: list[int] = []
     if tokenizer_path is not None:
         tokenizer_path = Path(tokenizer_path)
         tokenizer = NativeSionTokenizer(tokenizer_path)
+        effective_pairs, tokenizer_metadata_directions = _tokenizer_metadata_contract(
+            tokenizer_path,
+            language_pairs,
+            translation_capable=translation_capable,
+        )
         languages, pairs = _validate_language_contract(
             tokenizer,
             model_config=model_config,
             pad_id=pad_id,
             languages=languages,
-            language_pairs=language_pairs,
+            language_pairs=effective_pairs,
             allow_language_subset=allow_language_subset,
         )
         bos_id = tokenizer.bos_id
@@ -290,8 +385,21 @@ def save_transformers_checkpoint(
         tokenizer_sha256 = _file_sha256(tokenizer_path)
         slot_token_ids = list(tokenizer.slot_ids)
     else:
-        pairs = [list(map(str, pair)) for pair in (language_pairs or [])]
-    directions = _translation_directions(pairs, translation_directions)
+        pairs = []
+        for raw_pair in language_pairs or ():
+            if isinstance(raw_pair, (str, bytes)) or not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
+                raw_pair, Sequence
+            ):
+                raise ValueError("each language pair must be a two-item language sequence")
+            pairs.append(list(map(str, raw_pair)))
+    directions = _translation_directions(
+        pairs,
+        (
+            translation_directions
+            if translation_directions is not None
+            else tokenizer_metadata_directions
+        ),
+    )
 
     if token_features_path is None and tokenizer_path is not None:
         sibling_features = tokenizer_path.parent / "token_features.npz"
@@ -361,6 +469,7 @@ def save_transformers_checkpoint(
         bos_id=bos_id,
         eos_id=eos_id,
     )
+    output_dir.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(
         output_dir,
         safe_serialization=True,
@@ -392,6 +501,8 @@ def save_transformers_checkpoint(
             slot_token_ids=slot_token_ids,
             language_pairs=pairs,
             translation_directions=directions,
+            release_name=release_name,
+            release_version=release_version,
             translation_capable=translation_capable,
             script_classes=model_config.experimental.script_classes,
             tetm_type_id=min(8, model_config.experimental.tetm_types - 1),
@@ -401,8 +512,28 @@ def save_transformers_checkpoint(
         tokenizer_metadata = tokenizer_path.parent / "tokenizer_metadata.json"
         if tokenizer_metadata.is_file():
             metadata_destination = output_dir / tokenizer_metadata.name
-            if tokenizer_metadata.resolve() != metadata_destination.resolve():
-                shutil.copyfile(tokenizer_metadata, metadata_destination)
+            tokenizer_metadata_payload = load_tokenizer_metadata(tokenizer_metadata)
+            if tokenizer_metadata_payload is None:
+                raise RuntimeError("tokenizer metadata disappeared during export")
+            tokenizer_metadata_payload = dict(tokenizer_metadata_payload)
+            tokenizer_metadata_payload["model_file"] = "tokenizer.model"
+            tokenizer_metadata_payload["model_sha256"] = tokenizer_sha256
+            tokenizer_metadata_payload["translation_capable"] = translation_capable
+            if pairs:
+                tokenizer_metadata_payload["language_pairs"] = pairs
+                tokenizer_metadata_payload["translation_directions"] = directions
+                if len(pairs) == 1:
+                    tokenizer_metadata_payload["language_pair"] = pairs[0]
+                else:
+                    tokenizer_metadata_payload.pop("language_pair", None)
+            else:
+                tokenizer_metadata_payload.pop("language_pair", None)
+                tokenizer_metadata_payload["language_pairs"] = []
+                tokenizer_metadata_payload["translation_directions"] = []
+            metadata_destination.write_text(
+                json.dumps(tokenizer_metadata_payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
 
     module_dir = Path(__file__).parent
     for filename in (
@@ -501,3 +632,84 @@ def save_transformers_checkpoint(
         encoding="utf-8",
     )
     return output_dir
+
+
+def save_transformers_checkpoint(
+    output_dir: str | Path,
+    state_dict: dict[str, torch.Tensor],
+    model_config: ModelConfig,
+    *,
+    pad_id: int = 0,
+    tokenizer_path: str | Path | None = None,
+    token_features_path: str | Path | None = None,
+    languages: Sequence[str] | None = None,
+    language_pairs: Sequence[Sequence[str]] | None = None,
+    translation_directions: Sequence[Sequence[str]] | None = None,
+    release_name: str = TRANSLATION_RELEASE_NAME,
+    release_version: str = MODEL_RELEASE_VERSION,
+    translation_capable: bool = True,
+    revision_trained: bool | None = None,
+    allow_language_subset: bool = False,
+    max_shard_size: str = "5GB",
+    _atomic_publish: bool = True,
+) -> Path:
+    """Build a complete checkpoint privately, then publish it atomically."""
+
+    destination = Path(output_dir)
+    if not _atomic_publish:
+        return _save_transformers_checkpoint_unpublished(
+            destination,
+            state_dict,
+            model_config,
+            pad_id=pad_id,
+            tokenizer_path=tokenizer_path,
+            token_features_path=token_features_path,
+            languages=languages,
+            language_pairs=language_pairs,
+            translation_directions=translation_directions,
+            release_name=release_name,
+            release_version=release_version,
+            translation_capable=translation_capable,
+            revision_trained=revision_trained,
+            allow_language_subset=allow_language_subset,
+            max_shard_size=max_shard_size,
+        )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(
+        tempfile.mkdtemp(
+            dir=destination.parent,
+            prefix=f".{destination.name}.staging-",
+        )
+    )
+    try:
+        _save_transformers_checkpoint_unpublished(
+            temporary,
+            state_dict,
+            model_config,
+            pad_id=pad_id,
+            tokenizer_path=tokenizer_path,
+            token_features_path=token_features_path,
+            languages=languages,
+            language_pairs=language_pairs,
+            translation_directions=translation_directions,
+            release_name=release_name,
+            release_version=release_version,
+            translation_capable=translation_capable,
+            revision_trained=revision_trained,
+            allow_language_subset=allow_language_subset,
+            max_shard_size=max_shard_size,
+        )
+        # Import lazily to keep the self-contained HF conversion module free of
+        # a module-import cycle. The publisher preserves an existing complete
+        # destination if installation fails on Windows or POSIX.
+        from sion_translate.training.export import (
+            _atomic_replace_directory,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        _atomic_replace_directory(  # pyright: ignore[reportPrivateUsage]
+            temporary, destination
+        )
+        return destination
+    finally:
+        if temporary.exists():
+            shutil.rmtree(temporary, ignore_errors=True)
