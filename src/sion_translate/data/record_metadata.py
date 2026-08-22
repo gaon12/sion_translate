@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
-from typing import Mapping, cast
+from typing import AbstractSet, Mapping, Sequence, cast
 
 import numpy as np
+
+from sion_translate.language_tags import canonicalize_language_pair
 
 
 RECORD_METADATA_FIELDS = (
@@ -56,6 +58,38 @@ def inherit_record_metadata(
         if field in record:
             result[field] = deepcopy(record[field])
     return result
+
+
+def resolve_record_training_direction(
+    metadata: Mapping[str, object],
+    language_pair: tuple[str, str],
+    trained_directions: AbstractSet[tuple[str, str]],
+) -> tuple[str, str] | None:
+    """Canonicalize and authenticate an optional row-scoped training edge."""
+
+    raw_direction = metadata.get("training_direction")
+    if raw_direction is None:
+        return None
+    if not isinstance(raw_direction, Sequence) or isinstance(raw_direction, (str, bytes)):
+        raise ValueError("record training_direction must be a two-item language sequence")
+    direction = canonicalize_language_pair(
+        cast(Sequence[object], raw_direction),
+        field="record training_direction",
+    )
+    physical_pair = canonicalize_language_pair(
+        language_pair,
+        field="record physical language pair",
+    )
+    if frozenset(direction) != frozenset(physical_pair):
+        raise ValueError(
+            "record training_direction must belong to its physical language pair: "
+            f"direction={direction!r}, pair={physical_pair!r}"
+        )
+    if direction not in trained_directions:
+        raise ValueError(
+            f"record training_direction is absent from the configured training graph: {direction!r}"
+        )
+    return direction
 
 
 def encode_record_metadata(metadata: Mapping[str, object] | None) -> bytes:

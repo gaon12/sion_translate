@@ -56,6 +56,14 @@ def _pair_for_split(split: str) -> tuple[str, str]:
     raise AssertionError(f"Could not find text assigned to {split}")
 
 
+def _text_for_language_split(language: str, split: str, template: str) -> str:
+    for index in range(100_000):
+        text = template.format(index=index)
+        if choose_split_for_key(endpoint_split_key(language, text)) == split:
+            return text
+    raise AssertionError(f"Could not find {language} text assigned to {split}")
+
+
 def _damaged_pair_in_train_split() -> tuple[str, str]:
     for index in range(100_000):
         text = f"OpenAI identical text {index}"
@@ -100,6 +108,46 @@ def test_iter_parallel_text_excludes_holdouts_and_invalid_rows(tmp_path: Path) -
         *validation_pair,
         *test_pair,
     ]
+
+
+def test_row_scoped_reverse_direction_controls_tokenizer_split_ownership(
+    tmp_path: Path,
+) -> None:
+    korean_train = _text_for_language_split(
+        "ko",
+        "train",
+        "행별 방향 분할을 검증하는 한국어 문장 {index}입니다.",
+    )
+    japanese_validation = _text_for_language_split(
+        "ja",
+        "validation",
+        "行単位の方向分割を検証する日本語文{index}です。",
+    )
+    source = tmp_path / "reverse-direction.jsonl"
+    source.write_text(
+        json.dumps(
+            {
+                "ko": korean_train,
+                "ja": japanese_validation,
+                "training_direction": ["ja", "ko"],
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert (
+        list(
+            iter_parallel_text(
+                [source],
+                language_pairs=(("ko", "ja"),),
+                translation_directions=(("ko", "ja"), ("ja", "ko")),
+                num_workers=1,
+            )
+        )
+        == []
+    )
 
 
 def test_kj_tokenizer_rejects_models_without_required_symbols(
@@ -203,6 +251,49 @@ def test_train_tokenizer_splits_digits_by_default(tmp_path: Path) -> None:
     assert metadata["required_character_count"] > 0
     assert len(metadata["required_characters_sha256"]) == 64
     assert tokenizer_split_digits_policy(model_path) is True
+
+
+def test_tokenizer_round_trips_arbitrary_canonical_bcp47_controls(tmp_path: Path) -> None:
+    source = tmp_path / "bcp47-parallel.jsonl"
+    rows = [
+        {
+            "PT-br": f"Esta é uma frase de treinamento em português número {index}.",
+            "zh-hant": f"這是第 {index} 個繁體中文訓練句子。",
+        }
+        for index in range(40)
+    ]
+    source.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    model_path = train_tokenizer(
+        [str(source)],
+        tmp_path / "bcp47-tokenizer",
+        vocab_size=512,
+        input_sentence_size=1000,
+        seed_sentencepiece_size=1000,
+        required_character_min_occurrences=0,
+        validation_fraction=0.0,
+        test_fraction=0.0,
+        language_pairs=(("PT-br", "zh-hant"),),
+        translation_directions=(("PT-br", "zh-hant"),),
+        foundation_languages=("sr-latn-rs",),
+        reasoning_languages=("ZH-hant",),
+        num_workers=1,
+        num_threads=1,
+    )
+
+    tokenizer = SionTokenizer(model_path)
+    metadata = load_tokenizer_metadata(model_path)
+    assert tuple(tokenizer.languages) == ("pt-BR", "zh-Hant")
+    assert set(tokenizer.denoise_tags) == {"pt-BR", "zh-Hant", "sr-Latn-RS"}
+    assert set(tokenizer.reasoning_tags) == {"zh-Hant"}
+    assert metadata is not None
+    assert metadata["language_pairs"] == [["pt-BR", "zh-Hant"]]
+    assert metadata["translation_directions"] == [["pt-BR", "zh-Hant"]]
+    assert metadata["denoise_languages"] == ["pt-BR", "zh-Hant", "sr-Latn-RS"]
+    assert metadata["reasoning_languages"] == ["zh-Hant"]
 
 
 def test_train_tokenizer_can_disable_digit_splitting(tmp_path: Path) -> None:
@@ -313,7 +404,7 @@ def test_control_tokens_are_found_past_the_first_256_ids(monkeypatch) -> None:
     """
     import sion_translate.tokenizer as tokenizer_module
 
-    languages = [f"l{index:03d}" for index in range(150)]
+    languages = [f"qaa-x-l{index:03d}" for index in range(150)]
     stub = _StubProcessor(languages)
     # 제어 토큰 **자체**가 256 ID 를 넘어가야 회귀를 잡는다.
     assert stub.piece_to_id(f"<denoise_{languages[-1]}>") > 256

@@ -17,6 +17,7 @@ from sion_translate.data.record_metadata import (
     RECORD_METADATA_FORMAT,
     decode_record_metadata,
     encode_record_metadata,
+    resolve_record_training_direction,
 )
 from sion_translate.data.records import expand_parallel_record
 
@@ -287,6 +288,71 @@ def test_row_scoped_training_direction_prevents_synthetic_reverse_labels(
     assert (sample["src_language"], sample["target_language"]) == ("sw", "ar")
     assert sample["reverse_direction_trained"] is False
     assert sample["training_direction"] == ["sw", "ar"]
+
+
+def test_row_scoped_direction_is_canonicalized_before_dataset_persistence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepare_module = importlib.import_module("sion_translate.data.prepare")
+
+    class StubTokenizer:
+        languages = ("pt-BR", "en")
+
+        def __init__(self, _model_path: str | Path):
+            pass
+
+        @staticmethod
+        def encode(text: str) -> list[int]:
+            return [ord(character) for character in text]
+
+    monkeypatch.setattr(prepare_module, "SionTokenizer", StubTokenizer)
+    tokenizer_path = tmp_path / "tokenizer.model"
+    tokenizer_path.write_bytes(b"stub tokenizer")
+    source_path = tmp_path / "canonical-direction.jsonl"
+    source_path.write_text(
+        json.dumps(
+            {
+                "PT-br": "Esta é uma frase paralela em português.",
+                "EN": "This is a parallel sentence in English.",
+                "training_direction": ["PT-br", "EN"],
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    dataset_root = tmp_path / "dataset"
+
+    stats = prepare_dataset(
+        [str(source_path)],
+        tokenizer_path,
+        dataset_root,
+        language_pairs=(("pt-br", "EN"),),
+        translation_directions=(("PT-br", "en"),),
+        validation_fraction=0.0,
+        test_fraction=0.0,
+        filter_quality=False,
+        dedup_backend="memory",
+        num_workers=1,
+    )
+    dataset = IndexedParallelDataset(
+        dataset_root,
+        "train",
+        bidirectional=True,
+        include_metadata=True,
+    )
+
+    assert stats.valid_pairs == 1
+    assert len(dataset) == 1
+    sample = dataset[0]
+    assert (sample["src_language"], sample["target_language"]) == ("pt-BR", "en")
+    assert sample["training_direction"] == ["pt-BR", "en"]
+    assert resolve_record_training_direction(
+        {"training_direction": ["PT-br", "EN"]},
+        ("pt-BR", "en"),
+        frozenset({("pt-BR", "en")}),
+    ) == ("pt-BR", "en")
 
 
 def test_real_duplicate_precedes_a_row_scoped_synthetic_copy(

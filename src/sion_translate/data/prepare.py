@@ -15,7 +15,7 @@ from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import AbstractSet, Any, BinaryIO, Sequence, TypeAlias, cast
+from typing import Any, BinaryIO, Sequence, TypeAlias, cast
 
 import numpy as np
 
@@ -61,6 +61,7 @@ from .record_metadata import (
     RECORD_METADATA_INDEX_SUFFIX,
     decode_record_metadata,
     encode_record_metadata,
+    resolve_record_training_direction,
 )
 from .records import (
     expand_parallel_record,
@@ -301,40 +302,6 @@ _PrepareBatchInput: TypeAlias = tuple[
 _PrepareEvent: TypeAlias = tuple[str, tuple[Any, ...]]
 
 _PREPARE_WORKER_TOKENIZER: SionTokenizer | None = None
-
-
-def _record_training_direction(
-    metadata: Mapping[str, object],
-    language_pair: tuple[str, str],
-    trained_directions: AbstractSet[tuple[str, str]],
-) -> tuple[str, str] | None:
-    """Validate an optional row-scoped edge against the dataset graph."""
-
-    raw_direction = metadata.get("training_direction")
-    if raw_direction is None:
-        return None
-    direction_items = (
-        cast(Sequence[object], raw_direction)
-        if isinstance(raw_direction, Sequence) and not isinstance(raw_direction, (str, bytes))
-        else None
-    )
-    if (
-        direction_items is None
-        or len(direction_items) != 2
-        or not all(isinstance(language, str) and language for language in direction_items)
-    ):
-        raise ValueError("record training_direction must contain two non-empty language strings")
-    direction = (cast(str, direction_items[0]), cast(str, direction_items[1]))
-    if frozenset(direction) != frozenset(language_pair):
-        raise ValueError(
-            "record training_direction must belong to its physical language pair: "
-            f"direction={direction!r}, pair={language_pair!r}"
-        )
-    if direction not in trained_directions:
-        raise ValueError(
-            f"record training_direction is absent from the configured training graph: {direction!r}"
-        )
-    return direction
 
 
 def _initialize_prepare_worker(tokenizer_model: str) -> None:
@@ -1799,11 +1766,14 @@ def prepare_dataset(
                 # synthetic source -> real target example is never virtualized
                 # into a pseudo-label reverse example, even when the global pair
                 # is bidirectional.
-                row_direction = _record_training_direction(
+                row_direction = resolve_record_training_direction(
                     metadata,
                     (language_a, language_b),
                     direction_set,
                 )
+                if row_direction is not None:
+                    metadata = dict(metadata)
+                    metadata["training_direction"] = list(row_direction)
                 storage_direction = row_direction or (
                     (language_a, language_b)
                     if (language_a, language_b) in direction_set

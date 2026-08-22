@@ -31,7 +31,13 @@ from sion_translate.data.monolingual import (
     sample_monolingual_sentences,
 )
 from sion_translate.data.quality import QualityPolicy, assess_pair, canonical_text
+from sion_translate.data.record_metadata import resolve_record_training_direction
 from sion_translate.fingerprint import file_sha256
+from sion_translate.language_tags import (
+    LanguageTagError,
+    canonicalize_language_tag,
+    canonicalize_language_tags,
+)
 from sion_translate.performance import bounded_ordered_map, build_cpu_plan
 from sion_translate.splitting import (
     TargetSplitGuard,
@@ -90,11 +96,21 @@ def control_symbols(
 ) -> list[str]:
     """언어 목록에 맞는 전체 제어 토큰 목록 (토크나이저 학습 시 예약)."""
 
-    unique_languages = tuple(dict.fromkeys(languages))
-    unique_denoise_languages = tuple(
-        dict.fromkeys(unique_languages if denoise_languages is None else denoise_languages)
+    unique_languages = canonicalize_language_tags(
+        list(languages),
+        field="translation control languages",
+        reject_duplicates=False,
     )
-    unique_reasoning_languages = tuple(dict.fromkeys(reasoning_languages))
+    unique_denoise_languages = canonicalize_language_tags(
+        list(unique_languages if denoise_languages is None else denoise_languages),
+        field="denoising control languages",
+        reject_duplicates=False,
+    )
+    unique_reasoning_languages = canonicalize_language_tags(
+        list(reasoning_languages),
+        field="reasoning control languages",
+        reject_duplicates=False,
+    )
     return (
         [f"<2{language}>" for language in unique_languages]
         + [f"<denoise_{language}>" for language in unique_denoise_languages]
@@ -189,9 +205,19 @@ def write_tokenizer_metadata(
     )
     translation_languages = languages_from_pairs(normalized_pairs)
     normalized_denoise_languages = list(
-        dict.fromkeys(translation_languages if denoise_languages is None else denoise_languages)
+        canonicalize_language_tags(
+            list(translation_languages if denoise_languages is None else denoise_languages),
+            field="tokenizer metadata denoise_languages",
+            reject_duplicates=False,
+        )
     )
-    normalized_reasoning_languages = list(dict.fromkeys(reasoning_languages))
+    normalized_reasoning_languages = list(
+        canonicalize_language_tags(
+            list(reasoning_languages),
+            field="tokenizer metadata reasoning_languages",
+            reject_duplicates=False,
+        )
+    )
     processor = spm.SentencePieceProcessor(model_file=str(model_path))
     metadata = {
         "version": TOKENIZER_METADATA_VERSION,
@@ -317,7 +343,17 @@ def _filter_text_batch(
             languages = (language_a, language_b)
             if not assess_pair(text_a, text_b, policy, languages=languages).accepted:
                 continue
-            if (language_a, language_b) not in translation_directions:
+            row_direction = resolve_record_training_direction(
+                pair.metadata,
+                (language_a, language_b),
+                translation_directions,
+            )
+            storage_direction = row_direction or (
+                (language_a, language_b)
+                if (language_a, language_b) in translation_directions
+                else (language_b, language_a)
+            )
+            if (language_a, language_b) != storage_direction:
                 language_a, language_b = language_b, language_a
                 text_a, text_b = text_b, text_a
             if source_is_synthetic or synthetic_record(row):
@@ -430,7 +466,13 @@ def iter_parallel_text_with_languages(
         source_only_languages=source_only_languages,
     )
     languages = frozenset(languages_from_pairs(normalized_pairs))
-    source_only = frozenset(str(language) for language in source_only_languages)
+    source_only = frozenset(
+        canonicalize_language_tags(
+            list(source_only_languages),
+            field="source_only_languages",
+            reject_duplicates=False,
+        )
+    )
     unknown_source_only = sorted(source_only - languages)
     if unknown_source_only:
         raise ValueError(
@@ -508,9 +550,9 @@ class SionTokenizer:
         self.language_tags: dict[str, int] = {}  # {"ja": <2ja> 토큰 id, ...}
         self.denoise_tags: dict[str, int] = {}  # {"ko": <denoise_ko> 토큰 id, ...}
         self.reasoning_tags: dict[str, int] = {}  # {"en": <reason_en> 토큰 id, ...}
-        lang_pattern = re.compile(r"^<2([A-Za-z0-9]+)>$")
-        denoise_pattern = re.compile(r"^<denoise_([A-Za-z0-9]+)>$")
-        reasoning_pattern = re.compile(r"^<reason_([A-Za-z0-9]+)>$")
+        lang_pattern = re.compile(r"^<2([^<>\s]+)>$")
+        denoise_pattern = re.compile(r"^<denoise_([^<>\s]+)>$")
+        reasoning_pattern = re.compile(r"^<reason_([^<>\s]+)>$")
         byte_pattern = re.compile(r"^<0x[0-9A-Fa-f]{2}>$")
         # 예약 구간의 끝은 첫 byte fallback 조각입니다. SentencePiece 는
         # pad/unk/bos/eos → user_defined_symbols → byte 조각 → 학습된 조각
@@ -523,12 +565,40 @@ class SionTokenizer:
             piece = self.processor.id_to_piece(token_id)
             if byte_pattern.match(piece):
                 break
-            if match := lang_pattern.match(piece):
-                self.language_tags[match.group(1)] = token_id
-            elif match := denoise_pattern.match(piece):
-                self.denoise_tags[match.group(1)] = token_id
-            elif match := reasoning_pattern.match(piece):
-                self.reasoning_tags[match.group(1)] = token_id
+            destination: dict[str, int] | None = None
+            kind = ""
+            match = lang_pattern.fullmatch(piece)
+            if match is not None:
+                destination = self.language_tags
+                kind = "translation"
+            else:
+                match = denoise_pattern.fullmatch(piece)
+                if match is not None:
+                    destination = self.denoise_tags
+                    kind = "denoising"
+                else:
+                    match = reasoning_pattern.fullmatch(piece)
+                    if match is not None:
+                        destination = self.reasoning_tags
+                        kind = "reasoning"
+            if destination is None or match is None:
+                continue
+            raw_language = match.group(1)
+            try:
+                language = canonicalize_language_tag(
+                    raw_language,
+                    field=f"tokenizer {kind} control symbol",
+                )
+            except LanguageTagError as error:
+                raise ValueError(f"invalid tokenizer control symbol {piece!r}: {error}") from error
+            if language != raw_language:
+                raise ValueError(
+                    f"non-canonical tokenizer control symbol {piece!r}; "
+                    f"expected language identity {language!r}"
+                )
+            if language in destination:
+                raise ValueError(f"duplicate tokenizer {kind} control language {language!r}")
+            destination[language] = token_id
         if len(self.language_tags) < 2 or not set(self.language_tags).issubset(self.denoise_tags):
             raise ValueError(
                 "Tokenizer must reserve at least two <2xx> tags and a matching "
@@ -1004,8 +1074,16 @@ def train_tokenizer(
         source_only_languages=source_only_languages,
     )
     languages = languages_from_pairs(normalized_pairs)
-    denoise_languages = tuple(dict.fromkeys((*languages, *map(str, foundation_languages))))
-    reasoning_languages = tuple(dict.fromkeys(map(str, reasoning_languages)))
+    denoise_languages = canonicalize_language_tags(
+        [*languages, *foundation_languages],
+        field="tokenizer denoise_languages",
+        reject_duplicates=False,
+    )
+    reasoning_languages = canonicalize_language_tags(
+        list(reasoning_languages),
+        field="tokenizer reasoning_languages",
+        reject_duplicates=False,
+    )
     unknown_reasoning_languages = sorted(set(reasoning_languages) - set(denoise_languages))
     if unknown_reasoning_languages:
         raise ValueError(
