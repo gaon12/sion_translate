@@ -107,7 +107,7 @@ def test_manifest_records_the_source_only_languages(prepared: Path) -> None:
     manifest = json.loads((prepared / "manifest.json").read_text(encoding="utf-8"))
 
     assert manifest["source_only_languages"] == ["kj"]
-    assert manifest["format"] == "sion-indexed-parallel-v5"
+    assert manifest["format"] == "sion-indexed-parallel-v6"
 
 
 def test_kj_is_never_a_target_language(prepared: Path) -> None:

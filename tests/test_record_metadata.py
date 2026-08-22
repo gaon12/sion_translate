@@ -152,7 +152,7 @@ def test_prepare_round_trips_optional_metadata_sidecars(
 
     assert stats.valid_pairs == 4
     manifest = json.loads((dataset_root / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["format"] == "sion-indexed-parallel-v5"
+    assert manifest["format"] == "sion-indexed-parallel-v6"
     assert manifest["record_metadata"] == {
         "format": RECORD_METADATA_FORMAT,
         "fields": list(RECORD_METADATA_FIELDS),
@@ -259,7 +259,12 @@ def test_legacy_v2_index_without_metadata_sidecars_still_loads(tmp_path: Path) -
         encoding="utf-8",
     )
 
-    dataset = IndexedParallelDataset(dataset_root, "train", bidirectional=True)
+    dataset = IndexedParallelDataset(
+        dataset_root,
+        "train",
+        bidirectional=True,
+        allow_unverified_legacy=True,
+    )
 
     assert not dataset.has_record_metadata
     assert dataset.metadata_at(0) == {}
@@ -273,5 +278,6 @@ def test_legacy_v2_index_without_metadata_sidecars_still_loads(tmp_path: Path) -
         "train",
         bidirectional=True,
         include_metadata=True,
+        allow_unverified_legacy=True,
     )
     assert with_metadata[0]["metadata"] == {}

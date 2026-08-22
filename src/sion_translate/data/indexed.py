@@ -11,6 +11,7 @@ from torch.utils.data import Dataset, Sampler
 
 from sion_translate.synthetic import DEFAULT_SYNTHETIC_SAMPLING_WEIGHT
 
+from .integrity import validate_dataset_artifact_inventory
 from .record_metadata import (
     RECORD_METADATA_DATA_SUFFIX,
     RECORD_METADATA_INDEX_DTYPE,
@@ -27,11 +28,20 @@ class IndexedParallelDataset(Dataset[dict[str, object]]):
         *,
         bidirectional: bool = True,
         include_metadata: bool = False,
+        verify_integrity: bool = True,
+        allow_unverified_legacy: bool = False,
     ):
         self.root = Path(root) / split
         self.dataset_root = Path(root)
         self.bidirectional = bidirectional
         self.include_metadata = include_metadata
+        self.verify_integrity = verify_integrity
+        self.allow_unverified_legacy = allow_unverified_legacy
+        if verify_integrity:
+            validate_dataset_artifact_inventory(
+                self.dataset_root,
+                require_manifest=not allow_unverified_legacy,
+            )
         self.index_paths = sorted(self.root.glob("*.idx.npy"))
         if not self.index_paths:
             raise FileNotFoundError(f"No index shards found under {self.root}")
@@ -173,6 +183,8 @@ class IndexedParallelDataset(Dataset[dict[str, object]]):
         self.__dict__.update(state)
         # Pickles created before row sidecars predate the opt-in flag.
         self.include_metadata = bool(getattr(self, "include_metadata", False))
+        self.verify_integrity = bool(getattr(self, "verify_integrity", True))
+        self.allow_unverified_legacy = bool(getattr(self, "allow_unverified_legacy", False))
         self.indices = self._open_indices()
         self.record_metadata_indices = self._open_record_metadata_indices()
         self._token_cache = {}

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import multiprocessing
 import re
 import shutil
 import sqlite3
@@ -39,6 +40,7 @@ from .quality import (
     canonical_text,
     dedup_key,
 )
+from .integrity import build_dataset_artifact_inventory
 from .record_metadata import (
     RECORD_METADATA_DATA_SUFFIX,
     RECORD_METADATA_FIELDS,
@@ -53,7 +55,7 @@ from .records import (
     normalize_language_pairs,
 )
 
-INDEX_FORMAT = "sion-indexed-parallel-v5"
+INDEX_FORMAT = "sion-indexed-parallel-v6"
 
 INDEX_DTYPE = np.dtype(
     [
@@ -591,19 +593,33 @@ def prepare_dataset(
         filter_quality,
         normalized_pairs,
     )
-    if workers <= 1:
-        _initialize_prepare_worker(str(tokenizer_model))
-        processed_batches = map(_process_prepare_batch, inputs)
-        executor = None
-    else:
-        executor = ProcessPoolExecutor(
-            max_workers=workers,
-            initializer=_initialize_prepare_worker,
-            initargs=(str(tokenizer_model),),
-        )
-        processed_batches = bounded_ordered_map(
-            executor, _process_prepare_batch, inputs, max_pending=workers * 2
-        )
+    try:
+        if workers <= 1:
+            _initialize_prepare_worker(str(tokenizer_model))
+            processed_batches = map(_process_prepare_batch, inputs)
+            executor = None
+        else:
+            executor = ProcessPoolExecutor(
+                max_workers=workers,
+                mp_context=multiprocessing.get_context("spawn"),
+                initializer=_initialize_prepare_worker,
+                initargs=(str(tokenizer_model),),
+            )
+            processed_batches = bounded_ordered_map(
+                executor, _process_prepare_batch, inputs, max_pending=workers * 2
+            )
+    except BaseException:
+        for writer in writers.values():
+            try:
+                writer.close()
+            except Exception:
+                pass
+        try:
+            digest_store.close()
+        except Exception:
+            pass
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        raise
 
     try:
         for batch in processed_batches:
@@ -854,6 +870,7 @@ def prepare_dataset(
         "split_key": split_key_schema,
         "dedup_backend": dedup_backend,
         "atomic_build": True,
+        "artifact_inventory": build_dataset_artifact_inventory(staging_dir),
     }
     try:
         with (staging_dir / "manifest.json").open("w", encoding="utf-8") as handle:

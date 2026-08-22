@@ -6,6 +6,7 @@ from __future__ import annotations
 import glob
 import hashlib
 import json
+import multiprocessing
 import re
 import tempfile
 import unicodedata
@@ -440,7 +441,10 @@ def iter_parallel_text_with_languages(
         results = map(_filter_text_batch, inputs)
         executor = None
     else:
-        executor = ProcessPoolExecutor(max_workers=workers)
+        executor = ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=multiprocessing.get_context("spawn"),
+        )
         results = bounded_ordered_map(executor, _filter_text_batch, inputs, max_pending=workers * 2)
     try:
         for candidates in results:
