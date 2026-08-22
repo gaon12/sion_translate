@@ -1402,6 +1402,103 @@ def test_local_checkpoint_generation_bindings_preserve_digest_order(tmp_path: Pa
     ]
 
 
+@pytest.mark.parametrize("malformed_field", ["optimizer", "model"])
+def test_local_load_structure_preflight_reaches_previous_without_mutating_model(
+    tmp_path: Path,
+    malformed_field: str,
+) -> None:
+    current = tmp_path / "latest"
+    previous = current.with_name(".latest.previous")
+    source, source_optimizer, source_scheduler, context = _components()
+    save_checkpoint(current, source, source_optimizer, source_scheduler, 5, context)
+    save_checkpoint(previous, source, source_optimizer, source_scheduler, 4, context)
+    current_payload = torch.load(current / "checkpoint.pt", weights_only=True)
+    if malformed_field == "optimizer":
+        current_payload["optimizer"] = {}
+    else:
+        model_state = current_payload["model"]
+        first_name = next(iter(model_state))
+        model_state[first_name] = model_state[first_name][:1]
+    torch.save(current_payload, current / "checkpoint.pt")
+
+    target, _, _, _ = _components()
+    before = _clone_model_state(target)
+    selected: Path | None = None
+    for binding in checkpoint_module.checkpoint_generation_bindings(current, context):
+        try:
+            with checkpoint_module.verified_checkpoint_generation_lease(
+                current,
+                context,
+                expected_artifact_sha256=binding.artifact_sha256,
+            ) as generation:
+                checkpoint_module.preflight_checkpoint_load_structure(
+                    generation.source,
+                    target,
+                    context,
+                )
+                selected = generation.source
+        except (RuntimeError, ValueError):
+            continue
+        break
+
+    assert selected == previous
+    _assert_model_state_unchanged(target, before)
+
+
+def test_dcp_load_structure_preflight_reaches_previous_after_model_shape_mismatch(
+    tmp_path: Path,
+) -> None:
+    from torch.distributed.checkpoint.state_dict import get_state_dict
+
+    current = tmp_path / "latest"
+    previous = current.with_name(".latest.previous")
+    source, source_optimizer, source_scheduler, _ = _components()
+    model_state, optimizer_state = get_state_dict(source, source_optimizer)
+    malformed_model_state = dict(model_state)
+    first_name = next(iter(malformed_model_state))
+    malformed_model_state[first_name] = malformed_model_state[first_name][:1]
+    shared_state = {
+        "schema": CHECKPOINT_SCHEMA,
+        "optimizer": optimizer_state,
+        "scheduler": source_scheduler.state_dict(),
+        "training_state": {"epoch": 0, "batch_in_epoch": 0},
+    }
+    _write_test_dcp_generation(
+        current,
+        {**shared_state, "model": malformed_model_state, "step": 5},
+        marker_step=5,
+    )
+    _write_test_dcp_generation(
+        previous,
+        {**shared_state, "model": model_state, "step": 4},
+        marker_step=4,
+    )
+    target, _, _, _ = _components()
+    before = _clone_model_state(target)
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), True, "gloo")
+    selected: Path | None = None
+
+    for binding in checkpoint_module.checkpoint_generation_bindings(current, context):
+        try:
+            with checkpoint_module.verified_checkpoint_generation_lease(
+                current,
+                context,
+                expected_artifact_sha256=binding.artifact_sha256,
+            ) as generation:
+                checkpoint_module.preflight_checkpoint_load_structure(
+                    generation.source,
+                    target,
+                    context,
+                )
+                selected = generation.source
+        except (RuntimeError, ValueError):
+            continue
+        break
+
+    assert selected == previous
+    _assert_model_state_unchanged(target, before)
+
+
 def test_dcp_checkpoint_generation_bindings_preserve_marker_order(tmp_path: Path) -> None:
     current = tmp_path / "latest"
     previous = current.with_name(".latest.previous")

@@ -1012,18 +1012,15 @@ def _capture_rng_state() -> dict[str, Any]:
 
 
 def _restore_rng_state(state: Mapping[str, Any]) -> None:
+    _validate_rng_state(state)
     python_state = state.get("python")
     numpy_state = state.get("numpy")
     torch_cpu_state = state.get("torch_cpu")
-    if not isinstance(python_state, tuple):
-        raise ValueError("checkpoint Python RNG state is invalid")
-    if not isinstance(numpy_state, Mapping):
-        raise ValueError("checkpoint NumPy RNG state is invalid")
+    assert isinstance(python_state, tuple)
+    assert isinstance(numpy_state, Mapping)
     typed_numpy_state = cast(Mapping[str, Any], numpy_state)
-    if not isinstance(typed_numpy_state.get("keys"), torch.Tensor):
-        raise ValueError("checkpoint NumPy RNG state is invalid")
-    if not isinstance(torch_cpu_state, torch.Tensor):
-        raise ValueError("checkpoint torch RNG state is invalid")
+    assert isinstance(typed_numpy_state.get("keys"), torch.Tensor)
+    assert isinstance(torch_cpu_state, torch.Tensor)
 
     random.setstate(cast(Any, python_state))
     numpy_keys = cast(torch.Tensor, typed_numpy_state["keys"])
@@ -1057,6 +1054,60 @@ def _restore_rng_state(state: Mapping[str, Any]) -> None:
         else:
             raise ValueError("checkpoint CUDA RNG state is invalid")
         torch.cuda.set_rng_state(selected_cuda_state.detach().cpu())
+
+
+def _validate_rng_state(state: Mapping[str, Any]) -> None:
+    """Validate a complete RNG snapshot without changing process-global RNGs."""
+
+    python_state = state.get("python")
+    numpy_state = state.get("numpy")
+    torch_cpu_state = state.get("torch_cpu")
+    if not isinstance(python_state, tuple):
+        raise ValueError("checkpoint Python RNG state is invalid")
+    try:
+        random.Random().setstate(cast(Any, python_state))
+    except (TypeError, ValueError) as error:
+        raise ValueError("checkpoint Python RNG state is invalid") from error
+    if not isinstance(numpy_state, Mapping):
+        raise ValueError("checkpoint NumPy RNG state is invalid")
+    typed_numpy_state = cast(Mapping[str, Any], numpy_state)
+    numpy_keys = typed_numpy_state.get("keys")
+    if not isinstance(numpy_keys, torch.Tensor):
+        raise ValueError("checkpoint NumPy RNG state is invalid")
+    try:
+        numpy_probe = np.random.RandomState()
+        numpy_probe.set_state(
+            (
+                str(typed_numpy_state["algorithm"]),
+                numpy_keys.detach().cpu().numpy().astype(np.uint32, copy=False),
+                int(typed_numpy_state["position"]),
+                int(typed_numpy_state["has_gauss"]),
+                float(typed_numpy_state["cached_gaussian"]),
+            )
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("checkpoint NumPy RNG state is invalid") from error
+    if not isinstance(torch_cpu_state, torch.Tensor):
+        raise ValueError("checkpoint torch RNG state is invalid")
+    try:
+        torch.Generator(device="cpu").set_state(torch_cpu_state.detach().cpu())
+    except (RuntimeError, TypeError) as error:
+        raise ValueError("checkpoint torch RNG state is invalid") from error
+    cuda_state = state.get("torch_cuda")
+    if cuda_state is None:
+        return
+    cuda_states = (
+        [cuda_state]
+        if isinstance(cuda_state, torch.Tensor)
+        else cast(list[object], cuda_state)
+        if isinstance(cuda_state, list)
+        else []
+    )
+    if not cuda_states or not all(
+        isinstance(item, torch.Tensor) and item.ndim == 1 and item.dtype == torch.uint8
+        for item in cuda_states
+    ):
+        raise ValueError("checkpoint CUDA RNG state is invalid")
 
 
 def _atomic_torch_save(payload: Mapping[str, Any], destination: Path) -> None:
@@ -2313,6 +2364,229 @@ def _validate_loaded_state(state: Any) -> Mapping[str, Any]:
     return typed_state
 
 
+def _validate_local_optimizer_structure(model: nn.Module, state: object) -> int:
+    """Validate AdamW's serialized topology without constructing live optimizer state."""
+
+    if not isinstance(state, Mapping):
+        raise ValueError("checkpoint optimizer state must be an object")
+    typed_state = cast(Mapping[object, object], state)
+    raw_slots = typed_state.get("state")
+    raw_groups = typed_state.get("param_groups")
+    if not isinstance(raw_slots, Mapping) or not isinstance(raw_groups, list) or not raw_groups:
+        raise ValueError("checkpoint optimizer state is missing state/param_groups")
+    typed_groups = cast(list[object], raw_groups)
+
+    parameter_ids: list[int] = []
+    for raw_group in typed_groups:
+        if not isinstance(raw_group, Mapping):
+            raise ValueError("checkpoint optimizer parameter group is malformed")
+        raw_parameters = cast(Mapping[object, object], raw_group).get("params")
+        if not isinstance(raw_parameters, list):
+            raise ValueError("checkpoint optimizer parameter group has no parameter list")
+        for raw_parameter_id in cast(list[object], raw_parameters):
+            if (
+                isinstance(raw_parameter_id, bool)
+                or not isinstance(raw_parameter_id, int)
+                or raw_parameter_id < 0
+            ):
+                raise ValueError("checkpoint optimizer parameter id is invalid")
+            parameter_ids.append(raw_parameter_id)
+
+    expected_parameter_count = sum(
+        1 for parameter in _unwrap_compiled_model(model).parameters() if parameter.requires_grad
+    )
+    if len(parameter_ids) != expected_parameter_count or len(set(parameter_ids)) != len(
+        parameter_ids
+    ):
+        raise ValueError(
+            "checkpoint optimizer parameter topology does not match the model "
+            f"({len(parameter_ids)} serialized != {expected_parameter_count} trainable)"
+        )
+    known_parameters = set(parameter_ids)
+    for raw_parameter_id, raw_slot in cast(Mapping[object, object], raw_slots).items():
+        if (
+            isinstance(raw_parameter_id, bool)
+            or not isinstance(raw_parameter_id, int)
+            or raw_parameter_id not in known_parameters
+            or not isinstance(raw_slot, Mapping)
+        ):
+            raise ValueError("checkpoint optimizer slot state is malformed")
+    return len(typed_groups)
+
+
+def _validate_local_scheduler_structure(state: object, *, optimizer_group_count: int) -> None:
+    if not isinstance(state, Mapping):
+        raise ValueError("checkpoint scheduler state must be an object")
+    typed_state = cast(Mapping[object, object], state)
+    last_epoch = typed_state.get("last_epoch")
+    if isinstance(last_epoch, bool) or not isinstance(last_epoch, int):
+        raise ValueError("checkpoint scheduler last_epoch is invalid")
+    for key in ("base_lrs", "_last_lr"):
+        values = typed_state.get(key)
+        if not isinstance(values, list):
+            raise ValueError(
+                f"checkpoint scheduler {key} does not match optimizer parameter groups"
+            )
+        typed_values = cast(list[object], values)
+        if len(typed_values) != optimizer_group_count:
+            raise ValueError(
+                f"checkpoint scheduler {key} does not match optimizer parameter groups"
+            )
+
+
+def _validate_dcp_resume_metadata(
+    metadata: Any,
+    model: nn.Module,
+    *,
+    require_scaler: bool,
+    require_ema: bool,
+) -> None:
+    expected_model = _unwrap_compiled_model(model).state_dict()
+    if not _validate_dcp_tensor_group_metadata(
+        metadata,
+        prefix="model",
+        expected=expected_model,
+    ):
+        raise ValueError("distributed checkpoint model state is missing")
+    flat_keys = {str(key) for key in metadata.state_dict_metadata}
+    required_exact = {
+        "schema",
+        "step",
+        "scheduler.base_lrs",
+        "scheduler.last_epoch",
+        "scheduler._last_lr",
+    }
+    missing_exact = sorted(required_exact - flat_keys)
+    if missing_exact:
+        raise ValueError(
+            "distributed checkpoint resume metadata is incomplete: " + ", ".join(missing_exact)
+        )
+    if not any(
+        key.startswith("optimizer.param_groups.") and key.endswith(".params") for key in flat_keys
+    ):
+        raise ValueError("distributed checkpoint optimizer parameter groups are missing")
+    if require_scaler and not any(key.startswith("scaler.") for key in flat_keys):
+        raise ValueError(
+            "checkpoint resume has a scaler enabled but the checkpoint scaler state is missing"
+        )
+    expected_ema = {
+        name: parameter.detach()
+        for name, parameter in _unwrap_compiled_model(model).named_parameters()
+        if parameter.requires_grad
+    }
+    if require_ema and not _validate_dcp_tensor_group_metadata(
+        metadata,
+        prefix="ema",
+        expected=expected_ema,
+    ):
+        raise ValueError(
+            "checkpoint resume has EMA enabled but the checkpoint EMA state is missing"
+        )
+
+
+def preflight_checkpoint_load_structure(
+    path: str | Path,
+    model: nn.Module,
+    context: DistributedContext,
+    *,
+    require_scaler: bool = False,
+    require_ema: bool = False,
+) -> int:
+    """Prove that a generation is structurally loadable without mutating live state.
+
+    Call this while holding the exact generation lease that will later authorize
+    ``load_checkpoint``. It closes the gap between identity-only preflight and
+    PyTorch's state restoration, where malformed model tensors or optimizer
+    containers would otherwise make a bad current generation mask recoverable
+    retained previous state.
+    """
+
+    source = resolve_checkpoint_source(path, context)
+    if context.distributed:
+        import torch.distributed.checkpoint as dcp
+
+        try:
+            metadata = dcp.FileSystemReader(  # pyright: ignore[reportPrivateImportUsage]
+                source
+            ).read_metadata()
+        except dcp.CheckpointException as error:  # pyright: ignore[reportPrivateImportUsage]
+            raise ValueError(
+                f"distributed checkpoint metadata could not be loaded: {source}"
+            ) from error
+        _validate_dcp_resume_metadata(
+            metadata,
+            model,
+            require_scaler=require_scaler,
+            require_ema=require_ema,
+        )
+        rng_file = source / f"rng-rank-{context.rank:05d}.pt"
+        if rng_file.is_symlink() or not rng_file.is_file():
+            raise ValueError(f"distributed checkpoint RNG payload is missing: {rng_file}")
+        try:
+            rng_payload = torch.load(
+                rng_file,
+                map_location="cpu",
+                weights_only=True,
+                mmap=True,
+            )
+        except Exception as error:
+            raise ValueError(
+                f"distributed checkpoint RNG payload could not be loaded: {rng_file}"
+            ) from error
+        if not isinstance(rng_payload, Mapping):
+            raise ValueError("distributed checkpoint RNG payload is invalid")
+        raw_rng_state = cast(Mapping[str, Any], rng_payload).get("rng_state")
+        if not isinstance(raw_rng_state, Mapping):
+            raise ValueError("distributed checkpoint RNG payload is invalid")
+        _validate_rng_state(cast(Mapping[str, Any], raw_rng_state))
+        return _preflight_dcp_identity(source, None)
+
+    try:
+        loaded = torch.load(
+            source / "checkpoint.pt",
+            map_location="cpu",
+            weights_only=True,
+            mmap=True,
+        )
+    except Exception as error:
+        raise RuntimeError(
+            "checkpoint structure could not be loaded with PyTorch's safe weights-only loader"
+        ) from error
+    loaded_state = _validate_loaded_state(loaded)
+    _validate_stage_transfer_model_state(model, loaded_state["model"])
+    optimizer_group_count = _validate_local_optimizer_structure(
+        model,
+        loaded_state["optimizer"],
+    )
+    _validate_local_scheduler_structure(
+        loaded_state["scheduler"],
+        optimizer_group_count=optimizer_group_count,
+    )
+    current_schema = loaded_state.get("schema") == CHECKPOINT_SCHEMA
+    scaler_state = loaded_state.get("scaler")
+    if require_scaler and scaler_state is None and current_schema:
+        raise ValueError(
+            "checkpoint resume has a scaler enabled but the checkpoint scaler state is missing"
+        )
+    if scaler_state is not None and not isinstance(scaler_state, Mapping):
+        raise ValueError("checkpoint scaler state must be an object")
+    ema_state = loaded_state.get("ema")
+    if require_ema:
+        if ema_state is None:
+            raise ValueError(
+                "checkpoint resume has EMA enabled but the checkpoint EMA state is missing"
+            )
+        _validate_stage_transfer_ema(model, ema_state)
+    rng_state = loaded_state.get("rng_state")
+    if rng_state is None and current_schema:
+        raise ValueError("checkpoint RNG state is missing")
+    if rng_state is not None:
+        if not isinstance(rng_state, Mapping):
+            raise ValueError("checkpoint RNG state must be an object")
+        _validate_rng_state(cast(Mapping[str, Any], rng_state))
+    return int(loaded_state["step"])
+
+
 def save_checkpoint(
     path: str | Path,
     model: nn.Module,
@@ -2664,6 +2938,12 @@ def _load_checkpoint_impl(
             raise ValueError(
                 f"distributed checkpoint metadata could not be loaded: {path}"
             ) from error
+        _validate_dcp_resume_metadata(
+            metadata,
+            model,
+            require_scaler=scaler is not None,
+            require_ema=ema is not None,
+        )
         # DCP only restores keys present in the caller-supplied template. These
         # fields were added after the original progress schema, so discover
         # them from authenticated metadata before loading. Do not add absent
@@ -2699,6 +2979,27 @@ def _load_checkpoint_impl(
         if expected_identity is not None:
             state["identity"] = _json_compatible(expected_identity)
         state["schema"] = CHECKPOINT_SCHEMA
+        rng_file = path / f"rng-rank-{context.rank:05d}.pt"
+        if rng_file.is_symlink() or not rng_file.is_file():
+            raise ValueError(f"distributed checkpoint RNG payload is missing: {rng_file}")
+        try:
+            rng_payload = torch.load(
+                rng_file,
+                map_location="cpu",
+                weights_only=True,
+                mmap=True,
+            )
+        except Exception as error:
+            raise ValueError(
+                f"distributed checkpoint RNG payload could not be loaded: {rng_file}"
+            ) from error
+        if not isinstance(rng_payload, Mapping):
+            raise ValueError("distributed checkpoint RNG payload is invalid")
+        typed_rng_payload = cast(Mapping[str, Any], rng_payload)
+        if not isinstance(typed_rng_payload.get("rng_state"), Mapping):
+            raise ValueError("distributed checkpoint RNG payload is invalid")
+        validated_rng_state = cast(Mapping[str, Any], typed_rng_payload["rng_state"])
+        _validate_rng_state(validated_rng_state)
         # 체크포인트가 불완전하거나 구조가 맞지 않으면 여기서 바로 실패합니다.
         # 일부 파라미터가 초기값인 채로 조용히 재개되는 것이 훨씬 위험하기 때문입니다.
         try:
@@ -2713,21 +3014,6 @@ def _load_checkpoint_impl(
         _validate_identity(state, expected_identity)
         if ema is not None:
             ema.validate_state_dict(state.get("ema"))
-        rng_file = path / f"rng-rank-{context.rank:05d}.pt"
-        if not rng_file.is_file():
-            raise ValueError(f"distributed checkpoint RNG payload is missing: {rng_file}")
-        rng_payload = torch.load(
-            rng_file,
-            map_location="cpu",
-            weights_only=True,
-            mmap=True,
-        )
-        if not isinstance(rng_payload, Mapping):
-            raise ValueError("distributed checkpoint RNG payload is invalid")
-        typed_rng_payload = cast(Mapping[str, Any], rng_payload)
-        if not isinstance(typed_rng_payload.get("rng_state"), Mapping):
-            raise ValueError("distributed checkpoint RNG payload is invalid")
-        validated_rng_state = cast(Mapping[str, Any], typed_rng_payload["rng_state"])
         set_state_dict(
             checkpoint_model,
             optimizer,
@@ -2760,6 +3046,15 @@ def _load_checkpoint_impl(
     loaded_state = _validate_loaded_state(loaded)
     # 모델/optimizer를 변경하기 전에 현재 실행과 체크포인트의 정체성을 비교합니다.
     _validate_identity(loaded_state, expected_identity)
+    _validate_stage_transfer_model_state(model, loaded_state["model"])
+    optimizer_group_count = _validate_local_optimizer_structure(
+        model,
+        loaded_state["optimizer"],
+    )
+    _validate_local_scheduler_structure(
+        loaded_state["scheduler"],
+        optimizer_group_count=optimizer_group_count,
+    )
     current_schema = loaded_state.get("schema") == CHECKPOINT_SCHEMA
     scaler_state = loaded_state.get("scaler")
     if scaler is not None:
@@ -2781,6 +3076,8 @@ def _load_checkpoint_impl(
         raise ValueError("checkpoint RNG state is missing")
     if rng_state is not None and not isinstance(rng_state, Mapping):
         raise ValueError("checkpoint RNG state must be an object")
+    if isinstance(rng_state, Mapping):
+        _validate_rng_state(cast(Mapping[str, Any], rng_state))
     _unwrap_compiled_model(model).load_state_dict(loaded_state["model"])
     optimizer.load_state_dict(loaded_state["optimizer"])
     scheduler.load_state_dict(loaded_state["scheduler"])
