@@ -676,8 +676,8 @@ def _validate_identity(
         )
 
 
-def _dcp_identity_probe(metadata: Any) -> dict[str, Any]:
-    """Build an identity-only DCP target from keys actually in the checkpoint."""
+def _dcp_mapping_probe(metadata: Any, root: str) -> dict[str, Any]:
+    """Build a DCP target for one nested mapping from keys actually stored."""
 
     from torch.distributed.checkpoint._nested_dict import (  # pyright: ignore[reportPrivateImportUsage, reportUnknownVariableType]
         unflatten_state_dict,  # pyright: ignore[reportUnknownVariableType]
@@ -693,7 +693,7 @@ def _dcp_identity_probe(metadata: Any) -> dict[str, Any]:
     paths: dict[str, tuple[str | int, ...]] = {}
     for raw_key in metadata.state_dict_metadata:
         flat_key = str(raw_key)
-        if flat_key != "identity" and not flat_key.startswith("identity."):
+        if flat_key != root and not flat_key.startswith(f"{root}."):
             continue
         raw_path = planner_data.get(raw_key)
         if raw_path is None:
@@ -707,21 +707,27 @@ def _dcp_identity_probe(metadata: Any) -> dict[str, Any]:
         if raw_path is not None:
             if not raw_parts or not all(type(part) in (str, int) for part in raw_parts):
                 raise ValueError(
-                    f"distributed checkpoint has an invalid identity metadata path: {flat_key}"
+                    f"distributed checkpoint has an invalid {root} metadata path: {flat_key}"
                 )
             path = tuple(cast(str | int, part) for part in raw_parts)
         else:
             path = tuple(flat_key.split("."))
-        if not path or path[0] != "identity":
+        if not path or path[0] != root:
             raise ValueError(
-                f"distributed checkpoint has an invalid identity metadata path: {flat_key}"
+                f"distributed checkpoint has an invalid {root} metadata path: {flat_key}"
             )
         flattened[flat_key] = None
         paths[flat_key] = path
     try:
         return cast(dict[str, Any], unflatten_state_dict(flattened, paths))
     except (IndexError, KeyError, TypeError, ValueError) as error:
-        raise ValueError("distributed checkpoint identity metadata is malformed") from error
+        raise ValueError(f"distributed checkpoint {root} metadata is malformed") from error
+
+
+def _dcp_identity_probe(metadata: Any) -> dict[str, Any]:
+    """Build an identity-only DCP target from keys actually in the checkpoint."""
+
+    return _dcp_mapping_probe(metadata, "identity")
 
 
 def _restore_expected_empty_mappings(
@@ -910,6 +916,63 @@ def inspect_checkpoint_identity(
     if not isinstance(normalized, dict):
         raise ValueError("checkpoint identity must normalize to an object")
     return cast(dict[str, Any], normalized)
+
+
+def inspect_checkpoint_training_state(
+    path: str | Path,
+    context: DistributedContext,
+) -> dict[str, Any]:
+    """Read authenticated scalar progress metadata without loading live tensors.
+
+    Distributed callers should keep this inspection inside the same verified
+    generation lease that will later authorize the full resume load.
+    """
+
+    source = resolve_checkpoint_source(path, context)
+    if context.distributed:
+        import torch.distributed.checkpoint as dcp
+
+        try:
+            metadata = dcp.FileSystemReader(  # pyright: ignore[reportPrivateImportUsage]
+                source
+            ).read_metadata()
+        except dcp.CheckpointException as error:  # pyright: ignore[reportPrivateImportUsage]
+            raise ValueError(
+                f"distributed checkpoint metadata could not be inspected: {source}"
+            ) from error
+        probe = _dcp_mapping_probe(metadata, "training_state")
+        if not probe:
+            return {}
+        try:
+            dcp.load(  # pyright: ignore[reportUnknownMemberType, reportPrivateImportUsage]
+                probe,
+                checkpoint_id=source,
+                no_dist=True,
+            )
+        except dcp.CheckpointException as error:  # pyright: ignore[reportPrivateImportUsage]
+            raise ValueError(
+                f"distributed checkpoint training state could not be inspected: {source}"
+            ) from error
+        raw_training_state = probe.get("training_state")
+    else:
+        try:
+            loaded = torch.load(
+                source / "checkpoint.pt",
+                map_location="cpu",
+                weights_only=True,
+                mmap=True,
+            )
+        except Exception as error:
+            raise RuntimeError(
+                "checkpoint training state could not be inspected with PyTorch's safe loader"
+            ) from error
+        loaded_state = _validate_loaded_state(loaded)
+        raw_training_state = loaded_state.get("training_state")
+    if not isinstance(raw_training_state, Mapping):
+        raise ValueError("checkpoint has no recorded training_state object")
+    return {
+        str(key): value for key, value in cast(Mapping[object, Any], raw_training_state).items()
+    }
 
 
 def _capture_rng_state() -> dict[str, Any]:

@@ -553,6 +553,10 @@ def test_dcp_resume_restores_optional_best_generation_binding_fields(tmp_path: P
 
     assert step == 3
     assert restored_progress == expected_progress
+    assert (
+        checkpoint_module.inspect_checkpoint_training_state(checkpoint, context)
+        == expected_progress
+    )
 
 
 def test_dcp_stage_transfer_rejects_a_non_integer_step_before_model_mutation(
