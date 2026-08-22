@@ -2,11 +2,34 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+import hashlib
 import json
 import random
 from pathlib import Path
+import sys
+from types import SimpleNamespace
 
-from sion_translate.cli.augment import synthetic_budget
+import pytest
+
+import sion_translate.cli.augment as augment_cli
+from sion_translate.augmentation import (
+    AugmentationRegistry,
+    DirectionCount,
+    FileSnapshot,
+    JobProgress,
+    JobRunResult,
+    build_job_identity,
+    snapshot_file,
+    synthetic_budget,
+)
+from sion_translate.cli.augment import (
+    generator_identity,
+    preflight_backtranslation_directions,
+    resolve_augmentation_destination,
+    resolve_augmentation_pair,
+)
+from sion_translate.config import AppConfig, DataConfig
 from sion_translate.data import IndexedParallelDataset, SionBatchCollator
 from sion_translate.data.prepare import prepare_dataset
 from sion_translate.data.quality import assess_pair
@@ -184,6 +207,354 @@ def test_synthetic_budget_caps_generation() -> None:
     assert synthetic_budget(1000, 800, 1.0) == 200
     assert synthetic_budget(1000, 1200, 1.0) == 0  # 이미 초과 → 추가 생성 금지
     assert synthetic_budget(1000, 0, 0.5) == 500
+
+
+def test_augmentation_pair_is_resolved_from_the_model_artifact() -> None:
+    trained_pairs = (("de", "fr"), ("sw", "ar"))
+
+    assert resolve_augmentation_pair(("ar", "sw"), trained_pairs) == ("sw", "ar")
+    with pytest.raises(SystemExit, match="모델에 없는"):
+        resolve_augmentation_pair(("ko", "ja"), trained_pairs)
+    with pytest.raises(SystemExit, match="--language-pair"):
+        resolve_augmentation_pair(None, trained_pairs)
+
+
+def test_augmentation_destination_requires_the_same_physical_pair() -> None:
+    assert resolve_augmentation_destination(("ar", "sw"), (("de", "fr"), ("sw", "ar"))) == (
+        "sw",
+        "ar",
+    )
+    with pytest.raises(SystemExit, match="현재 학습 설정"):
+        resolve_augmentation_destination(("ar", "sw"), (("de", "fr"),))
+
+
+def test_augment_preflight_checks_generation_and_destination_edges(
+    tmp_path: Path,
+) -> None:
+    mono_files = [(tmp_path / "news.ar.txt", "ar")]
+
+    with pytest.raises(SystemExit, match="모델 생성 방향 누락: ar→sw"):
+        preflight_backtranslation_directions(
+            ("sw", "ar"),
+            mono_files,
+            (("sw", "ar"),),
+            (("sw", "ar"),),
+        )
+    with pytest.raises(SystemExit, match="목적 학습 방향 누락: sw→ar"):
+        preflight_backtranslation_directions(
+            ("sw", "ar"),
+            mono_files,
+            (("ar", "sw"),),
+            (("ar", "sw"),),
+        )
+
+    preflight_backtranslation_directions(
+        ("sw", "ar"),
+        mono_files,
+        (("ar", "sw"),),
+        (("sw", "ar"),),
+    )
+
+
+def test_augment_locks_before_loading_the_model_and_pair_mismatch_is_nonmutating(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    raw_dir = tmp_path / "raw"
+    config = AppConfig(
+        data=DataConfig(
+            raw_dir=str(raw_dir),
+            dataset_dir=str(tmp_path / "artifacts" / "dataset"),
+            tokenizer_model=str(tmp_path / "tokenizer.model"),
+            language_pair=["de", "fr"],
+            translation_directions=[["de", "fr"]],
+        )
+    )
+    events: list[str] = []
+    (tmp_path / "model.pt").write_bytes(b"model artifact")
+
+    @contextmanager
+    def fake_locks(roots):  # type: ignore[no-untyped-def]
+        assert {Path(root).resolve() for root in roots} == {
+            raw_dir.resolve(),
+            (tmp_path / "artifacts").resolve(),
+        }
+        events.append("lock-enter")
+        try:
+            yield
+        finally:
+            events.append("lock-exit")
+
+    class PairMismatchTranslator:
+        language_pairs = (("sw", "ar"),)
+        translation_directions = (("ar", "sw"),)
+
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            assert events == ["lock-enter"]
+            events.append("model-load")
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(augment_cli, "config_from_raw", lambda _raw: config)
+    monkeypatch.setattr(
+        augment_cli,
+        "validate_prepared_raw_contract",
+        lambda *_args, **_kwargs: type("Fingerprint", (), {"files": ()})(),
+    )
+    monkeypatch.setattr(
+        augment_cli,
+        "load_augmentation_registry",
+        lambda *_args, **_kwargs: AugmentationRegistry({}, frozenset()),
+    )
+    monkeypatch.setattr(augment_cli, "artifact_locks", fake_locks)
+    monkeypatch.setattr(augment_cli, "Translator", PairMismatchTranslator)
+    monkeypatch.setattr(sys, "argv", ["sion-augment", "--model", "model.pt"])
+
+    with pytest.raises(SystemExit, match="현재 학습 설정"):
+        augment_cli.main()
+
+    assert events == ["lock-enter", "model-load", "lock-exit"]
+    assert not raw_dir.exists()
+
+
+def test_augment_rejects_excess_generation_length_before_creating_a_ledger(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    raw_dir = tmp_path / "raw"
+    config = AppConfig(
+        data=DataConfig(
+            raw_dir=str(raw_dir),
+            dataset_dir=str(tmp_path / "artifacts" / "dataset"),
+            tokenizer_model=str(tmp_path / "tokenizer.model"),
+            language_pair=["sw", "ar"],
+            translation_directions=[["sw", "ar"]],
+        )
+    )
+    (tmp_path / "model.pt").write_bytes(b"model artifact")
+
+    class TranslatorWithShortContext:
+        language_pairs = (("sw", "ar"),)
+        translation_directions = (("ar", "sw"),)
+
+        class model_config:
+            max_seq_len = 64
+
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+    @contextmanager
+    def fake_locks(_roots):  # type: ignore[no-untyped-def]
+        yield
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(augment_cli, "config_from_raw", lambda _raw: config)
+    monkeypatch.setattr(
+        augment_cli,
+        "validate_prepared_raw_contract",
+        lambda *_args, **_kwargs: type("Fingerprint", (), {"files": ()})(),
+    )
+    monkeypatch.setattr(
+        augment_cli,
+        "load_augmentation_registry",
+        lambda *_args, **_kwargs: AugmentationRegistry({}, frozenset()),
+    )
+    monkeypatch.setattr(augment_cli, "artifact_locks", fake_locks)
+    monkeypatch.setattr(augment_cli, "Translator", TranslatorWithShortContext)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["sion-augment", "--model", "model.pt", "--max-new-tokens", "65"],
+    )
+
+    with pytest.raises(SystemExit, match="모델 최대 길이"):
+        augment_cli.main()
+
+    assert not raw_dir.exists()
+
+
+def test_generator_identity_binds_loaded_artifact_and_generation_contract() -> None:
+    metadata = {
+        "source": {"sha256": "1" * 64},
+        "tokenizer": {"sha256": "2" * 64},
+        "release_name": "sion_translate",
+        "release_version": "1.5",
+        "step": 42,
+        "pipeline": {"stage": "translation"},
+        "feature_flags": {"revision": True},
+        "capabilities": {"translation": True},
+        "quantization": {"format": "fp32"},
+        "generation_defaults": {"reasoning_level": 0},
+    }
+    translator = SimpleNamespace(
+        export_metadata=metadata,
+        tokenizer_metadata=None,
+        language_pairs=(("en", "de"),),
+        translation_directions=(("de", "en"),),
+    )
+    artifact = FileSnapshot("model.pt", 100, "3" * 64)
+    base, tokenizer_sha = generator_identity(translator, artifact)  # type: ignore[arg-type]
+
+    quantized = SimpleNamespace(**translator.__dict__)
+    quantized.export_metadata = {**metadata, "quantization": {"format": "int8"}}
+    quantized_identity, _ = generator_identity(quantized, artifact)  # type: ignore[arg-type]
+    other_artifact_identity, _ = generator_identity(  # type: ignore[arg-type]
+        translator,
+        FileSnapshot("renamed.pt", 101, "4" * 64),
+    )
+
+    assert tokenizer_sha == "2" * 64
+    assert len({base, quantized_identity, other_artifact_identity}) == 3
+
+
+def test_source_progress_rejects_impossible_cursor_and_eof_state(tmp_path: Path) -> None:
+    mono_path = tmp_path / "news.de.txt"
+    mono_path.write_text("Ein echter deutscher Satz.\n\n", encoding="utf-8")
+    identity = build_job_identity(
+        synthetic_prefix="bt_",
+        pair=("en", "de"),
+        mono_language="de",
+        input_snapshot=snapshot_file(mono_path),
+        model_identity="1" * 64,
+        generator_tokenizer_sha256="2" * 64,
+        num_beams=1,
+        max_new_tokens=32,
+    )
+
+    with pytest.raises(ValueError, match="cursor"):
+        augment_cli._source_has_remaining_text(  # noqa: SLF001 - CLI regression contract
+            mono_path,
+            JobProgress(identity, cursor_line=100),
+        )
+    with pytest.raises(ValueError, match="eof"):
+        augment_cli._source_has_remaining_text(  # noqa: SLF001 - CLI regression contract
+            mono_path,
+            JobProgress(identity, cursor_line=0, eof=True),
+        )
+
+    assert not augment_cli._source_has_remaining_text(  # noqa: SLF001 - CLI regression contract
+        mono_path,
+        JobProgress(identity, cursor_line=1),
+    )
+
+
+def test_model_upgrade_preflights_only_unseen_asymmetric_jobs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    mono_dir = tmp_path / "mono"
+    mono_dir.mkdir()
+    old_path = mono_dir / "old.ar.txt"
+    old_text = "هذه جملة عربية منشورة من قبل."
+    old_path.write_text(old_text + "\n", encoding="utf-8")
+    new_path = mono_dir / "new.sw.txt"
+    new_path.write_text("Hii ni sentensi mpya ya Kiswahili.\n", encoding="utf-8")
+    model_path = tmp_path / "model.pt"
+    model_path.write_bytes(b"model-b")
+    old_identity = build_job_identity(
+        synthetic_prefix="bt_",
+        pair=("sw", "ar"),
+        mono_language="ar",
+        input_snapshot=snapshot_file(old_path),
+        model_identity="1" * 64,
+        generator_tokenizer_sha256="2" * 64,
+        num_beams=1,
+        max_new_tokens=32,
+    )
+    old_hash = hashlib.sha256(old_text.encode("utf-8")).hexdigest()
+    registry = AugmentationRegistry(
+        {
+            old_identity.job_id: JobProgress(
+                old_identity,
+                cursor_line=1,
+                eof=True,
+                mono_text_hashes=frozenset({old_hash}),
+            )
+        },
+        frozenset(),
+    )
+    config = AppConfig(
+        data=DataConfig(
+            raw_dir=str(raw_dir),
+            dataset_dir=str(tmp_path / "dataset"),
+            tokenizer_model=str(tmp_path / "tokenizer.model"),
+            language_pair=["sw", "ar"],
+            translation_directions=[["ar", "sw"]],
+        )
+    )
+
+    class FakeTokenizer:
+        @staticmethod
+        def encode(text: str) -> list[int]:
+            return list(range(len(text)))
+
+    class ModelBTranslator:
+        language_pairs = (("sw", "ar"),)
+        translation_directions = (("sw", "ar"),)
+        export_metadata = {
+            "source": {"sha256": "3" * 64},
+            "tokenizer": {"sha256": "2" * 64},
+            "release_name": "sion_translate",
+            "release_version": "1.5",
+            "step": 2,
+        }
+        tokenizer_metadata = None
+        tokenizer = FakeTokenizer()
+
+        class model_config:
+            max_seq_len = 128
+
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+    calls: list[str] = []
+
+    def fake_run(_translator, *, mono_path: Path, progress: JobProgress, **_kwargs):
+        calls.append(mono_path.name)
+        written = int(mono_path == new_path)
+        return JobRunResult(
+            JobProgress(
+                progress.identity,
+                cursor_line=1,
+                eof=True,
+                mono_text_hashes=progress.mono_text_hashes,
+            ),
+            written,
+            0,
+            int(mono_path == old_path),
+            0,
+        )
+
+    monkeypatch.setattr(
+        augment_cli,
+        "validate_prepared_raw_contract",
+        lambda *_args, **_kwargs: type("Fingerprint", (), {"files": ()})(),
+    )
+    monkeypatch.setattr(augment_cli, "load_augmentation_registry", lambda *_args: registry)
+    monkeypatch.setattr(augment_cli, "Translator", ModelBTranslator)
+    monkeypatch.setattr(
+        augment_cli,
+        "count_prepared_direction_pairs",
+        lambda _dataset, directions: {
+            direction: DirectionCount(real=10) for direction in directions
+        },
+    )
+    monkeypatch.setattr(augment_cli, "run_augmentation_job", fake_run)
+    args = SimpleNamespace(
+        model=str(model_path),
+        tokenizer=None,
+        language_pair=None,
+        mono_dir=str(mono_dir),
+        num_beams=1,
+        max_new_tokens=32,
+        max_ratio=1.0,
+        batch_size=2,
+    )
+
+    augment_cli._run_locked(args, config)  # noqa: SLF001 - CLI integration regression
+
+    assert calls == ["old.ar.txt", "new.sw.txt"]
 
 
 def test_source_token_dropout_keeps_slots_and_length(tmp_path: Path) -> None:
