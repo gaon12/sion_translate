@@ -106,6 +106,31 @@ def test_collator_pipeline_passes_configured_source_only_languages() -> None:
     assert args["source_only_languages"] == ("kj", "kd", "jd")
 
 
+def test_configured_raw_scan_uses_the_complete_prepare_contract(tmp_path: Path) -> None:
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    (raw_dir / "pairs.jsonl").write_text('{"ko":"가","ja":"あ"}\n', encoding="utf-8")
+    tokenizer = tmp_path / "sion.model"
+    tokenizer.write_bytes(b"tokenizer")
+    config = AppConfig()
+    config.data.approximate_split = True
+    config.data.source_only_languages = ["ko"]
+    config.data.synthetic_prefixes = ["generated_"]
+    config.data.synthetic_prefix = "legacy_"
+    config.data.synthetic_sampling_weight = 0.125
+
+    fingerprint = train_module.scan_configured_raw_data(config, raw_dir, tokenizer)
+    expected_options = train_module.prepare_preprocessing_options(
+        approximate_split=True,
+        source_only_languages=("ko",),
+        train_only_prefixes=config.data.configured_synthetic_prefixes(),
+        synthetic_sampling_weight=0.125,
+        language_pair_count=1,
+    )
+
+    assert fingerprint.preprocessing_options == expected_options
+
+
 def test_artifact_preparation_locks_every_independent_mutation_root(tmp_path: Path) -> None:
     config = AppConfig()
     config.data.tokenizer_model = str(tmp_path / "tokenizer-root" / "sion.model")

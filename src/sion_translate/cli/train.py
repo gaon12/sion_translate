@@ -56,7 +56,6 @@ from sion_translate.auto import (
     scan_raw_data,
     stored_fingerprint,
     synchronize_environment,
-    write_fingerprint,
 )
 from sion_translate.config import AppConfig, config_from_raw, load_raw_config
 from sion_translate.console import configure_stdio
@@ -75,6 +74,7 @@ from sion_translate.data.integrity import (
     dataset_artifact_problem,
     validate_dataset_artifact_inventory,
 )
+from sion_translate.data.prepare import prepare_preprocessing_options
 from sion_translate.data.reasoning import is_reasoning_jsonl
 from sion_translate.locking import artifact_lock, training_run_lock
 from sion_translate.foundation import (
@@ -251,16 +251,19 @@ def scan_configured_raw_data(
 ) -> DatasetFingerprint:
     """Fingerprint every input that can change the prepared dataset."""
 
+    language_pairs = config.data.configured_language_pairs()
+    preprocessing_options = prepare_preprocessing_options(
+        approximate_split=config.data.approximate_split,
+        source_only_languages=config.data.configured_source_only_languages(),
+        train_only_prefixes=config.data.configured_synthetic_prefixes(),
+        synthetic_sampling_weight=config.data.synthetic_sampling_weight,
+        language_pair_count=len(language_pairs),
+    )
     return scan_raw_data(
         data_dir,
-        language_pairs=config.data.configured_language_pairs(),
+        language_pairs=language_pairs,
         tokenizer_model=tokenizer_path,
-        preprocessing_options={
-            "approximate_split": config.data.approximate_split,
-            "source_only_languages": list(config.data.configured_source_only_languages()),
-            "synthetic_sampling_weight": config.data.synthetic_sampling_weight,
-            "train_only_prefixes": list(config.data.configured_synthetic_prefixes()),
-        },
+        preprocessing_options=preprocessing_options,
     )
 
 
@@ -1245,9 +1248,8 @@ def _ensure_artifacts_on_main(
                         train_only_prefixes=config.data.configured_synthetic_prefixes(),
                         synthetic_sampling_weight=config.data.synthetic_sampling_weight,
                         num_workers=cpu_plan.dataset_workers,
+                        expected_fingerprint=files,
                     )
-                    files = scan_configured_raw_data(config, data_dir, tokenizer_path)
-                    write_fingerprint(dataset_dir, files)
                     announce("데이터셋 준비 완료.", context)
                 else:
                     announce("데이터셋 최신 상태 확인 (원천 데이터 변경 없음).", context)
