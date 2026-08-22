@@ -32,11 +32,9 @@ from sion_translate.data.records import (
     normalize_language_pairs,
     normalize_translation_directions,
 )
+from sion_translate.scripts_registry import uses_character_tokenization
 from sion_translate.structured import structured_signature
 from sion_translate.tokenizer import SionTokenizer
-
-# 문자 단위 BLEU 를 쓰는 언어 (공백 기반 토큰화가 무의미한 언어)
-CHARACTER_LEVEL_LANGUAGES = {"ko", "ja", "zh"}
 
 # 금액/용량/날짜/버전 등 "값" 으로 취급할 숫자열. 사후학습 보상과 같은 정의를
 # 써야 학습이 최적화하는 대상과 평가가 재는 대상이 어긋나지 않습니다.
@@ -226,7 +224,7 @@ def score_translations(
     from sacrebleu.metrics.bleu import BLEU
     from sacrebleu.metrics.chrf import CHRF
 
-    tokenize = "char" if target_language in CHARACTER_LEVEL_LANGUAGES else "13a"
+    tokenize = "char" if uses_character_tokenization(target_language) else "13a"
     chrf = CHRF().corpus_score(list(hypotheses), [list(references)]).score
     bleu = BLEU(tokenize=tokenize).corpus_score(list(hypotheses), [list(references)]).score
     return chrf, bleu, tokenize

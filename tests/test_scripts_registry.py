@@ -20,10 +20,14 @@ from sion_translate.scripts_registry import (
     is_spaceless,
     known_languages,
     known_scripts,
+    primary_language,
     resolve_scripts,
-    spurious_space_count,
     script_of,
+    scripts_for_language,
     scripts_in,
+    spurious_space_count,
+    uses_character_tokenization,
+    uses_substring_term_matching,
 )
 
 
@@ -69,6 +73,28 @@ def test_language_shorthands_resolve_to_script_sets() -> None:
     assert resolve_scripts(["kana", "han"]) == resolve_scripts(["ja"])
     assert resolve_scripts(["kj"]) == frozenset({"hangul", "kana", "han"})
     assert resolve_scripts(["ko", "ja"]) == frozenset({"hangul", "kana", "han"})
+
+
+def test_bcp47_variants_and_explicit_script_tags_resolve_without_pair_hardcoding() -> None:
+    assert primary_language("JA-jp") == "ja"
+    assert scripts_for_language("ja-JP") == frozenset({"kana", "han"})
+    assert scripts_for_language("zh-Hant") == frozenset({"han"})
+    assert scripts_for_language("sr-Latn-RS") == frozenset({"latin"})
+    assert scripts_for_language("az-Arab") == frozenset({"arabic"})
+    assert scripts_for_language("qaa-x-unseen") is None
+    assert resolve_scripts(["SR-latn-rs"]) == frozenset({"latin"})
+
+
+def test_metric_and_glossary_boundaries_follow_writing_system_profiles() -> None:
+    assert uses_character_tokenization("ko-KR")
+    assert uses_character_tokenization("ja-JP")
+    assert uses_character_tokenization("zh-Hant")
+    assert uses_character_tokenization("th-TH")
+    assert not uses_character_tokenization("en-US")
+    assert not uses_character_tokenization("sr-Latn")
+    assert uses_substring_term_matching("ko-KR")
+    assert uses_substring_term_matching("zh-Hant")
+    assert not uses_substring_term_matching("pt-Latn-BR")
 
 
 def test_any_resolves_to_every_script() -> None:

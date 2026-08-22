@@ -48,6 +48,29 @@ def test_score_translations_identity_is_perfect() -> None:
     assert chrf_bad < 30.0
 
 
+@pytest.mark.parametrize("target_language", ["ja-JP", "zh-Hant", "ko-KR", "th-TH"])
+def test_score_translations_uses_script_profiles_for_bcp47_variants(
+    target_language: str,
+) -> None:
+    _chrf, _bleu, tokenize = score_translations(
+        ["同じ翻訳です"],
+        ["同じ翻訳です"],
+        target_language=target_language,
+    )
+
+    assert tokenize == "char"
+
+
+def test_score_translations_honors_an_explicit_latin_script_subtag() -> None:
+    _chrf, _bleu, tokenize = score_translations(
+        ["isti prevod"],
+        ["isti prevod"],
+        target_language="sr-Latn-RS",
+    )
+
+    assert tokenize == "13a"
+
+
 def test_load_benchmark_pairs_builds_both_directions(tmp_path: Path) -> None:
     benchmark = tmp_path / "bench.jsonl"
     rows = [{"ko": f"한국어 {i}", "ja": f"日本語 {i}"} for i in range(5)]

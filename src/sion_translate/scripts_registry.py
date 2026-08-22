@@ -15,6 +15,8 @@ from __future__ import annotations
 from collections.abc import Iterable, Sequence
 import re
 
+from sion_translate.language_tags import parse_language_tag
+
 # Unicode ranges per script. Kept explicit rather than pulled from
 # unicodedata.name lookups, which are far slower per character.
 SCRIPT_RANGES: dict[str, tuple[tuple[int, int], ...]] = {
@@ -83,6 +85,34 @@ LANGUAGE_SCRIPTS: dict[str, tuple[str, ...]] = {
 # listed: Korean does use inter-word spaces, and collapsing them changes meaning.
 SPACELESS_SCRIPTS: frozenset[str] = frozenset({"han", "kana", "thai"})
 
+# ISO 15924 script subtags that can be checked with the Unicode ranges above.
+# This is script metadata rather than a closed language list: an arbitrary tag
+# such as ``az-Arab`` or ``sr-Latn`` works without adding its primary language.
+SCRIPT_SUBTAG_SCRIPTS: dict[str, tuple[str, ...]] = {
+    "Arab": ("arabic",),
+    "Cyrl": ("cyrillic",),
+    "Deva": ("devanagari",),
+    "Grek": ("greek",),
+    "Hang": ("hangul",),
+    "Hani": ("han",),
+    "Hans": ("han",),
+    "Hant": ("han",),
+    "Hebr": ("hebrew",),
+    "Hira": ("kana",),
+    "Jpan": ("kana", "han"),
+    "Kana": ("kana",),
+    "Kore": ("hangul", "han"),
+    "Latn": ("latin",),
+    "Thai": ("thai",),
+}
+
+# Character-tokenized metrics and substring glossary matching are properties
+# of writing systems, not of one hard-coded language pair. Hangul uses spaces,
+# but its productive particles attach directly to terms, so a Python ``\w``
+# boundary would still miss legitimate glossary occurrences.
+CHARACTER_TOKENIZATION_SCRIPTS: frozenset[str] = SPACELESS_SCRIPTS | {"hangul"}
+SUBSTRING_MATCH_SCRIPTS: frozenset[str] = SPACELESS_SCRIPTS | {"hangul"}
+
 _WHITESPACE_RUN = re.compile(r"\s+")
 
 
@@ -92,6 +122,44 @@ def known_scripts() -> tuple[str, ...]:
 
 def known_languages() -> tuple[str, ...]:
     return tuple(sorted(LANGUAGE_SCRIPTS))
+
+
+def primary_language(language: str) -> str:
+    """Return the canonical primary subtag for any well-formed BCP 47 tag."""
+
+    return parse_language_tag(language, field="language").language
+
+
+def scripts_for_language(language: str) -> frozenset[str] | None:
+    """Resolve a BCP 47 tag to checkable scripts, or ``None`` if unknown.
+
+    Explicit script subtags take precedence over convenience defaults. This
+    keeps the operation open-ended: new primary languages work immediately when
+    their tag carries a supported ISO 15924 script subtag.
+    """
+
+    parsed = parse_language_tag(language, field="language")
+    if parsed.script is not None:
+        scripts = SCRIPT_SUBTAG_SCRIPTS.get(parsed.script)
+        return frozenset(scripts) if scripts is not None else None
+    scripts = LANGUAGE_SCRIPTS.get(parsed.canonical.casefold())
+    if scripts is None:
+        scripts = LANGUAGE_SCRIPTS.get(parsed.language)
+    return frozenset(scripts) if scripts is not None else None
+
+
+def uses_character_tokenization(language: str) -> bool:
+    """Whether a tag's writing system should use character-level BLEU."""
+
+    scripts = scripts_for_language(language)
+    return bool(scripts and scripts & CHARACTER_TOKENIZATION_SCRIPTS)
+
+
+def uses_substring_term_matching(language: str) -> bool:
+    """Whether glossary terms may attach without a Unicode word boundary."""
+
+    scripts = scripts_for_language(language)
+    return bool(scripts and scripts & SUBSTRING_MATCH_SCRIPTS)
 
 
 def resolve_scripts(names: Iterable[str]) -> frozenset[str]:
@@ -113,10 +181,13 @@ def resolve_scripts(names: Iterable[str]) -> frozenset[str]:
         elif name in LANGUAGE_SCRIPTS:
             resolved.update(LANGUAGE_SCRIPTS[name])
         else:
-            raise ValueError(
-                f"unknown script or language {raw!r}; "
-                f"scripts={known_scripts()} languages={known_languages()}"
-            )
+            scripts = scripts_for_language(str(raw))
+            if scripts is None:
+                raise ValueError(
+                    f"unknown script or language {raw!r}; "
+                    f"scripts={known_scripts()} languages={known_languages()}"
+                )
+            resolved.update(scripts)
     return frozenset(resolved)
 
 
@@ -235,9 +306,12 @@ def is_monolingual(text: str, allowed: Sequence[str]) -> bool:
 
 
 __all__ = [
+    "CHARACTER_TOKENIZATION_SCRIPTS",
     "LANGUAGE_SCRIPTS",
     "SCRIPT_RANGES",
+    "SCRIPT_SUBTAG_SCRIPTS",
     "SPACELESS_SCRIPTS",
+    "SUBSTRING_MATCH_SCRIPTS",
     "collapse_spurious_spaces",
     "foreign_scripts",
     "has_foreign_script",
@@ -245,8 +319,12 @@ __all__ = [
     "is_spaceless",
     "known_languages",
     "known_scripts",
+    "primary_language",
     "resolve_scripts",
     "script_of",
+    "scripts_for_language",
     "scripts_in",
     "spurious_space_count",
+    "uses_character_tokenization",
+    "uses_substring_term_matching",
 ]
