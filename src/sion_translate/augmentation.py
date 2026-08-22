@@ -760,7 +760,9 @@ def _load_job_progress(
         raise ValueError(f"augmentation ledger filename과 job_id가 다릅니다: {ledger_path}")
     pattern = _shard_pattern(identity)
     discovered: list[tuple[int, Path]] = []
-    for path in data_dir.glob(f"{identity.synthetic_prefix}*.jsonl"):
+    for path in data_dir.iterdir():
+        if not path.is_file() or not path.name.startswith(identity.synthetic_prefix):
+            continue
         match = pattern.fullmatch(path.name)
         if match is not None:
             discovered.append((int(match.group(1)), path))
@@ -769,19 +771,31 @@ def _load_job_progress(
         raise ValueError(f"augmentation shard sequence에 빈 구간이 있습니다: {identity.job_id}")
 
     summaries: list[ShardSummary] = []
-    mono_hashes: set[str] = set(declared_hashes)
+    mono_hashes: set[str] = set()
+    declared_shard_hashes: set[str] = set()
     previous_input_line = -1
-    for _, path in discovered:
+    for shard_index, (_, path) in enumerate(discovered):
         summary, shard_hashes = _validate_shard(
             path,
             identity,
             previous_input_line=previous_input_line,
         )
+        overlap = mono_hashes & shard_hashes
+        if overlap:
+            raise ValueError(
+                f"augmentation shard들에 같은 mono text hash가 중복됩니다: {identity.job_id}"
+            )
         summaries.append(summary)
         mono_hashes.update(shard_hashes)
+        if shard_index < len(declared):
+            declared_shard_hashes.update(shard_hashes)
         previous_input_line = summary.last_input_line
     if len(declared) > len(summaries) or tuple(summaries[: len(declared)]) != declared:
         raise ValueError(f"augmentation ledger와 shard inventory가 다릅니다: {identity.job_id}")
+    if declared_hashes != frozenset(declared_shard_hashes):
+        raise ValueError(
+            f"augmentation ledger mono hash inventory가 선언된 shard와 다릅니다: {identity.job_id}"
+        )
     recovered = len(summaries) > len(declared)
     minimum_cursor = previous_input_line + 1
     if cursor < (declared[-1].last_input_line + 1 if declared else 0):
@@ -835,9 +849,10 @@ def load_augmentation_registry(
     known_prefixes.update(progress.identity.synthetic_prefix for progress in jobs.values())
     actual = {
         path.name
-        for prefix in known_prefixes
-        for path in data_dir.glob(f"{prefix}*.jsonl")
+        for path in data_dir.iterdir()
         if path.is_file()
+        and path.name.endswith(".jsonl")
+        and path.name.startswith(tuple(known_prefixes))
     }
     if actual != owned:
         raise ValueError(

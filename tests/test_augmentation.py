@@ -186,6 +186,54 @@ def test_registry_rejects_unowned_legacy_or_corrupt_outputs(tmp_path: Path) -> N
         load_augmentation_registry(data_dir, "bt_", ())
 
 
+def test_registry_rejects_accepted_hashes_without_declared_shards(tmp_path: Path) -> None:
+    data_dir = tmp_path / "raw"
+    data_dir.mkdir()
+    mono_path = tmp_path / "news.de.txt"
+    mono_path.write_text("Ein echter deutscher Satz.\n", encoding="utf-8")
+    identity = _job_identity(mono_path)
+    write_job_progress(
+        data_dir,
+        JobProgress(identity, mono_text_hashes=frozenset({"a" * 64})),
+    )
+
+    with pytest.raises(ValueError, match="선언된 shard"):
+        load_augmentation_registry(data_dir, "bt_", ())
+
+
+def test_registry_rejects_the_same_mono_hash_across_shards(tmp_path: Path) -> None:
+    data_dir = tmp_path / "raw"
+    data_dir.mkdir()
+    mono_path = tmp_path / "news.de.txt"
+    mono_text = "Ein wiederholter echter deutscher Satz."
+    mono_path.write_text(f"{mono_text}\n{mono_text}\n", encoding="utf-8")
+    identity = _job_identity(mono_path)
+
+    class Translator:
+        @staticmethod
+        def translate(texts: list[str], **_kwargs: object) -> list[str]:
+            return ["A valid generated source sentence." for _ in texts]
+
+    first = run_augmentation_job(
+        Translator(),
+        mono_path=mono_path,
+        data_dir=data_dir,
+        synthetic_prefix="bt_",
+        progress=JobProgress(identity),
+        accepted_budget=1,
+        batch_size=1,
+        seen_mono_hashes=set(),
+    )
+    first_path = data_dir / first.progress.shards[0].name
+    duplicate_row = json.loads(first_path.read_text(encoding="utf-8"))
+    duplicate_row["_sion_augment"]["input_line"] = 1
+    second_path = augmentation_shard_path(data_dir, identity, 1)
+    second_path.write_text(json.dumps(duplicate_row) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="중복"):
+        load_augmentation_registry(data_dir, "bt_", ())
+
+
 def test_training_raw_scan_rejects_unowned_bidirectional_synthetic_rows(
     tmp_path: Path,
 ) -> None:
@@ -829,6 +877,34 @@ def test_registry_keeps_old_prefix_jobs_and_unrelated_partial_files(tmp_path: Pa
 
     assert identity.job_id in registry.jobs
     assert notes.read_text(encoding="utf-8") == "user-owned"
+
+
+def test_glob_metacharacters_in_a_safe_prefix_round_trip_literally(tmp_path: Path) -> None:
+    data_dir = tmp_path / "raw"
+    data_dir.mkdir()
+    mono_path = tmp_path / "news.de.txt"
+    mono_path.write_text("Ein echter deutscher Zielsatz.\n", encoding="utf-8")
+    identity = _job_identity(mono_path, synthetic_prefix="bt[1]_")
+
+    class Translator:
+        @staticmethod
+        def translate(texts: list[str], **_kwargs: object) -> list[str]:
+            return ["A valid generated source sentence." for _ in texts]
+
+    result = run_augmentation_job(
+        Translator(),
+        mono_path=mono_path,
+        data_dir=data_dir,
+        synthetic_prefix="bt[1]_",
+        progress=JobProgress(identity),
+        accepted_budget=1,
+        batch_size=1,
+        seen_mono_hashes=set(),
+    )
+    registry = load_augmentation_registry(data_dir, "bt[1]_", ())
+
+    assert result.written == 1
+    assert registry.jobs[identity.job_id].accepted_rows == 1
 
 
 def test_synthetic_budget_accepts_huge_finite_ratios_without_overflow() -> None:
