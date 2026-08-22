@@ -72,13 +72,28 @@ def test_pipeline_identity_tracks_model_ancestry_not_the_skip_reason(tmp_path) -
     enabled = plan_foundation_stage(_config(tmp_path))
 
     assert build_translation_pipeline_identity(missing) == {
-        "schema": "sion-translation-pipeline-v1",
+        "schema": "sion-translation-pipeline-v2",
         "branch": "translation-only",
     }
     assert build_translation_pipeline_identity(disabled) == build_translation_pipeline_identity(
         missing
     )
-    assert build_translation_pipeline_identity(enabled)["branch"] == "foundation-then-translation"
+    lineage = {
+        "schema": "sion-foundation-lineage-v1",
+        "release_name": "sion",
+        "release_version": "1.5",
+        "languages": list(enabled.languages),
+        "selected_step": 7,
+        "foundation_manifest_sha256": "a" * 64,
+        "tokenizer_sha256": "b" * 64,
+        "checkpoint_identity_sha256": "c" * 64,
+        "checkpoint_artifact_sha256": "d" * 64,
+    }
+    identity = build_translation_pipeline_identity(enabled, foundation_lineage=lineage)
+    assert identity["branch"] == "foundation-then-translation"
+    assert identity["foundation"] == lineage
+    with pytest.raises(ValueError, match="requires resolved lineage"):
+        build_translation_pipeline_identity(enabled)
 
 
 def test_source_only_languages_never_reach_the_plan(tmp_path) -> None:

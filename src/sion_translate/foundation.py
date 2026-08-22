@@ -9,10 +9,12 @@ CLI 밖에 두는 이유는 두 가지입니다. 이 단계를 **돌릴지 말�
 from __future__ import annotations
 
 import copy
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, cast
 
-from sion_translate.artifacts import FOUNDATION_STAGE_DIRECTORY
+from sion_translate.artifacts import FOUNDATION_STAGE_DIRECTORY, MODEL_RELEASE_VERSION
 from sion_translate.config import AppConfig
 from sion_translate.data.monolingual import (
     MonolingualDiscovery,
@@ -22,7 +24,8 @@ from sion_translate.data.monolingual import (
 )
 
 
-PIPELINE_IDENTITY_SCHEMA = "sion-translation-pipeline-v1"
+PIPELINE_IDENTITY_SCHEMA = "sion-translation-pipeline-v2"
+FOUNDATION_LINEAGE_SCHEMA = "sion-foundation-lineage-v1"
 
 
 @dataclass(frozen=True)
@@ -40,7 +43,11 @@ class FoundationPlan:
         return self.enabled
 
 
-def build_translation_pipeline_identity(plan: FoundationPlan) -> dict[str, str]:
+def build_translation_pipeline_identity(
+    plan: FoundationPlan,
+    *,
+    foundation_lineage: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """Return the stable ancestry branch required for translation-stage resume.
 
     ``ran`` is deliberately not part of this identity: a completed foundation
@@ -49,10 +56,72 @@ def build_translation_pipeline_identity(plan: FoundationPlan) -> dict[str, str]:
     are likewise runtime details rather than compatibility inputs.
     """
 
-    return {
+    identity: dict[str, Any] = {
         "schema": PIPELINE_IDENTITY_SCHEMA,
         "branch": "foundation-then-translation" if plan.enabled else "translation-only",
     }
+    if not plan.enabled:
+        if foundation_lineage is not None:
+            raise ValueError("translation-only pipeline cannot carry foundation lineage")
+        return identity
+    if foundation_lineage is None:
+        raise ValueError("foundation-enabled translation pipeline requires resolved lineage")
+    lineage = dict(foundation_lineage)
+    expected_fields = {
+        "schema",
+        "release_name",
+        "release_version",
+        "languages",
+        "selected_step",
+        "foundation_manifest_sha256",
+        "tokenizer_sha256",
+        "checkpoint_identity_sha256",
+        "checkpoint_artifact_sha256",
+    }
+    if set(lineage) != expected_fields:
+        raise ValueError("foundation lineage fields do not match the v1 contract")
+    if lineage.get("schema") != FOUNDATION_LINEAGE_SCHEMA:
+        raise ValueError("foundation lineage has an unsupported schema")
+    release_name = lineage.get("release_name")
+    if (
+        not isinstance(release_name, str)
+        or not release_name
+        or release_name != release_name.strip()
+        or not release_name.isascii()
+    ):
+        raise ValueError("foundation lineage release_name must be non-empty ASCII")
+    if lineage.get("release_version") != MODEL_RELEASE_VERSION:
+        raise ValueError("foundation lineage release_version does not match this package")
+    if (
+        isinstance(lineage.get("selected_step"), bool)
+        or not isinstance(lineage.get("selected_step"), int)
+        or cast(int, lineage.get("selected_step")) < 0
+    ):
+        raise ValueError("foundation lineage selected_step must be a non-negative integer")
+    languages = lineage.get("languages")
+    if not isinstance(languages, list):
+        raise ValueError("foundation lineage languages do not match the current plan")
+    language_values = cast(list[object], languages)
+    if not all(isinstance(value, str) for value in language_values) or language_values != list(
+        plan.languages
+    ):
+        raise ValueError("foundation lineage languages do not match the current plan")
+    for field_name in (
+        "foundation_manifest_sha256",
+        "tokenizer_sha256",
+        "checkpoint_identity_sha256",
+        "checkpoint_artifact_sha256",
+    ):
+        value = lineage.get(field_name)
+        if (
+            not isinstance(value, str)
+            or len(value) != 64
+            or value != value.lower()
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise ValueError(f"foundation lineage {field_name} must be a SHA-256 digest")
+    identity["foundation"] = lineage
+    return identity
 
 
 def plan_foundation_stage(config: AppConfig) -> FoundationPlan:

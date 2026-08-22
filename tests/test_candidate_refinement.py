@@ -11,7 +11,11 @@ from sion_translate.config import ExperimentalConfig, ModelConfig
 from sion_translate.hf import SionConfig
 from sion_translate.hf import SionForConditionalGeneration as HFSionForConditionalGeneration
 from sion_translate.model import SionForConditionalGeneration
-from sion_translate.training.export import export_state_dict_formats, load_exported_model
+from sion_translate.training.export import (
+    build_export_metadata,
+    export_state_dict_formats,
+    load_exported_model,
+)
 
 
 def _config(
@@ -341,12 +345,20 @@ def test_disabled_state_is_strictly_compatible_but_cannot_fake_trained_refinemen
 
 def test_native_export_strictly_round_trips_trained_refinement(tmp_path) -> None:
     model = SionForConditionalGeneration(_config()).eval()
+    metadata = build_export_metadata(
+        model.config,
+        pipeline_identity={
+            "schema": "sion-translation-pipeline-v2",
+            "branch": "translation-only",
+        },
+    )
     export_state_dict_formats(
         tmp_path,
         model.state_dict(),
         model.config,
         0,
         formats=("fp32",),
+        metadata=metadata,
     )
 
     restored, restored_config, _ = load_exported_model(tmp_path / "model.pt")
