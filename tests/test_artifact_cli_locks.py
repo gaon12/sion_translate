@@ -21,6 +21,7 @@ def test_prepare_cli_holds_tokenizer_and_dataset_parent_locks(
     tokenizer = tmp_path / "tokenizer" / "sion.model"
     output = tmp_path / "prepared" / "dataset"
     expected_roots = {
+        tmp_path.resolve(),
         tokenizer.resolve().parent,
         output.resolve().parent,
     }
@@ -36,8 +37,9 @@ def test_prepare_cli_holds_tokenizer_and_dataset_parent_locks(
         finally:
             locked = False
 
-    def fake_prepare(*_args, **_kwargs) -> _Stats:
+    def fake_prepare(*_args, **kwargs) -> _Stats:
         assert locked
+        assert kwargs["managed_augmentation_prefix"] == "bt_"
         return _Stats()
 
     monkeypatch.setattr(prepare_cli, "configure_stdio", lambda: None)

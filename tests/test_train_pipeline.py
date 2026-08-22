@@ -113,6 +113,7 @@ def test_configured_raw_scan_uses_the_complete_prepare_contract(tmp_path: Path) 
     tokenizer = tmp_path / "sion.model"
     tokenizer.write_bytes(b"tokenizer")
     config = AppConfig()
+    config.data.raw_dir = str(tmp_path / "raw")
     config.data.approximate_split = True
     config.data.source_only_languages = ["ko"]
     config.data.synthetic_prefixes = ["generated_"]
@@ -125,6 +126,7 @@ def test_configured_raw_scan_uses_the_complete_prepare_contract(tmp_path: Path) 
         source_only_languages=("ko",),
         translation_directions=(("ko", "ja"),),
         train_only_prefixes=config.data.configured_synthetic_prefixes(),
+        managed_augmentation_prefix=config.data.synthetic_prefix,
         synthetic_sampling_weight=0.125,
         language_pair_count=1,
     )
@@ -164,6 +166,7 @@ def test_preflight_rejects_a_prepared_direction_graph_from_another_run() -> None
 
 def test_artifact_preparation_locks_every_independent_mutation_root(tmp_path: Path) -> None:
     config = AppConfig()
+    config.data.raw_dir = str(tmp_path / "raw")
     config.data.tokenizer_model = str(tmp_path / "tokenizer-root" / "sion.model")
     config.data.dataset_dir = str(tmp_path / "translation-root" / "dataset")
     config.foundation.dataset_dir = str(tmp_path / "foundation-root" / "dataset")
@@ -176,6 +179,7 @@ def test_artifact_preparation_locks_every_independent_mutation_root(tmp_path: Pa
     )
 
     assert set(roots) == {
+        (tmp_path / "raw").resolve(),
         (tmp_path / "tokenizer-root").resolve(),
         (tmp_path / "translation-root").resolve(),
         (tmp_path / "foundation-root").resolve(),
@@ -192,6 +196,7 @@ def test_configured_foundation_root_is_leased_while_raw_corpus_is_offline(
     tmp_path: Path,
 ) -> None:
     config = AppConfig()
+    config.data.raw_dir = str(tmp_path / "raw")
     config.data.tokenizer_model = str(tmp_path / "tokenizer-root" / "sion.model")
     config.data.dataset_dir = str(tmp_path / "translation-root" / "dataset")
     config.foundation.dataset_dir = str(tmp_path / "foundation-root" / "dataset")
@@ -211,6 +216,7 @@ def test_artifact_run_leases_remain_held_until_the_run_scope_exits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = AppConfig()
+    config.data.raw_dir = str(tmp_path / "raw")
     config.data.tokenizer_model = str(tmp_path / "tokenizer" / "sion.model")
     config.data.dataset_dir = str(tmp_path / "translation" / "dataset")
     config.foundation.dataset_dir = str(tmp_path / "foundation" / "dataset")

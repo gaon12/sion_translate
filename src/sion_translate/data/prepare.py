@@ -695,6 +695,7 @@ def prepare_preprocessing_options(
     source_only_languages: Sequence[str] = (),
     translation_directions: Sequence[Sequence[str]] = (),
     train_only_prefixes: Sequence[str] = DEFAULT_TRAIN_ONLY_PREFIXES,
+    managed_augmentation_prefix: str | None = None,
     synthetic_sampling_weight: float = DEFAULT_SYNTHETIC_SAMPLING_WEIGHT,
     language_pair_count: int = 1,
 ) -> dict[str, Any]:
@@ -727,6 +728,8 @@ def prepare_preprocessing_options(
         "train_only_prefixes": list(train_only_prefixes),
         "validation_fraction": validation_fraction,
     }
+    if managed_augmentation_prefix is not None:
+        options["managed_augmentation_prefix"] = managed_augmentation_prefix
     # Normalize tuples and NumPy dtype descriptors through the same JSON
     # representation persisted by both the fingerprint sidecar and manifest.
     normalized: object = json.loads(_canonical_json(options))
@@ -1540,6 +1543,7 @@ def prepare_dataset(
     language_pairs: Sequence[Sequence[str]] | None = None,
     translation_directions: Sequence[Sequence[str]] | None = None,
     train_only_prefixes: Sequence[str] = DEFAULT_TRAIN_ONLY_PREFIXES,
+    managed_augmentation_prefix: str | None = None,
     synthetic_sampling_weight: float = DEFAULT_SYNTHETIC_SAMPLING_WEIGHT,
     num_workers: int | None = None,
     expected_fingerprint: DatasetFingerprint | None = None,
@@ -1564,6 +1568,12 @@ def prepare_dataset(
         raise ValueError("at least one language pair is required")
     primary_pair = next(iter(normalized_pairs))
     train_only_prefixes = normalize_synthetic_prefixes(train_only_prefixes)
+    if managed_augmentation_prefix is not None:
+        managed_augmentation_prefix = str(managed_augmentation_prefix)
+        if managed_augmentation_prefix not in train_only_prefixes:
+            raise ValueError(
+                "managed_augmentation_prefix must also be a train-only synthetic prefix"
+            )
     languages = languages_from_pairs(normalized_pairs)
     language_to_id = {language: index for index, language in enumerate(languages)}
     source_only = tuple(dict.fromkeys(str(language) for language in source_only_languages))
@@ -1599,12 +1609,21 @@ def prepare_dataset(
         source_only_languages=source_only,
         translation_directions=normalized_directions,
         train_only_prefixes=train_only_prefixes,
+        managed_augmentation_prefix=managed_augmentation_prefix,
         synthetic_sampling_weight=synthetic_sampling_weight,
         language_pair_count=len(normalized_pairs),
     )
     endpoint_key_schema = cast(str, preprocessing_options["endpoint_leakage_key"])
     split_key_schema = cast(str, preprocessing_options["split_key"])
     paths, source_snapshots = _capture_input_snapshots(input_patterns)
+    if managed_augmentation_prefix is not None:
+        # Imported lazily because augmentation accounting reuses this module's
+        # preprocessing contract. Official train/prepare callers hold the raw
+        # directory lease while this validates and crash-recovers the ledger.
+        from sion_translate.augmentation import load_augmentation_registry
+
+        for parent in sorted({path.parent for path in paths}, key=str):
+            load_augmentation_registry(parent, managed_augmentation_prefix, ())
     if len(paths) > np.iinfo(np.uint16).max:
         raise ValueError("Too many input files for the uint16 source_id field")
     tokenizer_path = _absolute_path(Path(tokenizer_model))

@@ -56,6 +56,38 @@ def test_multiple_artifact_locks_are_deduplicated_and_canonically_ordered(tmp_pa
         assert all((root / LOCK_FILENAME).is_file() for root in roots)
 
 
+def test_shared_raw_root_serializes_jobs_with_different_dataset_roots(tmp_path) -> None:
+    raw_root = tmp_path / "raw"
+    first_dataset_root = tmp_path / "dataset-a"
+    second_dataset_root = tmp_path / "dataset-b"
+    script = textwrap.dedent(
+        f"""
+        import sys
+        from sion_translate.locking import artifact_locks
+        try:
+            with artifact_locks(({str(raw_root)!r}, {str(second_dataset_root)!r})):
+                sys.exit(0)
+        except RuntimeError as error:
+            print(error)
+            sys.exit(3)
+        """
+    )
+
+    with artifact_locks((raw_root, first_dataset_root)):
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+            cwd=os.getcwd(),
+        )
+
+    assert result.returncode == 3, result.stderr
+    assert str(raw_root) in result.stdout
+
+
 def test_training_run_lock_uses_a_separate_lock_file(tmp_path) -> None:
     with artifact_lock(tmp_path) as artifact_path:
         with training_run_lock(tmp_path) as run_path:

@@ -253,12 +253,16 @@ def scan_configured_raw_data(
 ) -> DatasetFingerprint:
     """Fingerprint every input that can change the prepared dataset."""
 
+    from sion_translate.augmentation import load_augmentation_registry
+
+    load_augmentation_registry(data_dir, config.data.synthetic_prefix, ())
     language_pairs = config.data.configured_language_pairs()
     preprocessing_options = prepare_preprocessing_options(
         approximate_split=config.data.approximate_split,
         source_only_languages=config.data.configured_source_only_languages(),
         translation_directions=config.data.configured_translation_directions(),
         train_only_prefixes=config.data.configured_synthetic_prefixes(),
+        managed_augmentation_prefix=config.data.synthetic_prefix,
         synthetic_sampling_weight=config.data.synthetic_sampling_weight,
         language_pair_count=len(language_pairs),
     )
@@ -1001,6 +1005,7 @@ def _artifact_mutation_roots(
     """Return every sibling namespace that artifact preparation may mutate."""
 
     mutation_roots = {
+        Path(config.data.raw_dir).resolve(),
         Path(config.data.tokenizer_model).resolve().parent,
         Path(config.data.dataset_dir).resolve().parent,
     }
@@ -1348,6 +1353,7 @@ def _ensure_artifacts_on_main(
                         source_only_languages=config.data.configured_source_only_languages(),
                         approximate_split=config.data.approximate_split,
                         train_only_prefixes=config.data.configured_synthetic_prefixes(),
+                        managed_augmentation_prefix=config.data.synthetic_prefix,
                         synthetic_sampling_weight=config.data.synthetic_sampling_weight,
                         num_workers=cpu_plan.dataset_workers,
                         expected_fingerprint=files,

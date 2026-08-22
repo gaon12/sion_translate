@@ -11,6 +11,19 @@ from sion_translate.data.quality import QualityPolicy
 from sion_translate.locking import artifact_locks
 
 
+def _input_lock_roots(inputs: list[str]) -> tuple[Path, ...]:
+    roots: set[Path] = set()
+    for raw_input in inputs:
+        path = Path(raw_input)
+        if any(character in raw_input for character in "*?[]"):
+            roots.add(path.resolve().parent)
+        elif path.is_dir():
+            roots.add(path.resolve())
+        else:
+            roots.add(path.resolve().parent)
+    return tuple(roots)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Build indexed sion_translate training shards")
     parser.add_argument("--input", nargs="+", required=True)
@@ -97,6 +110,14 @@ def build_parser() -> argparse.ArgumentParser:
             "holdout 점수가 올라가는 것을 막습니다"
         ),
     )
+    parser.add_argument(
+        "--managed-augmentation-prefix",
+        default="bt_",
+        help=(
+            "이 접두사의 JSONL은 sion-augment ledger가 소유한 shard만 허용합니다 "
+            "(빈 문자열이면 검증 비활성)"
+        ),
+    )
     return parser
 
 
@@ -105,6 +126,7 @@ def main() -> None:
     args = build_parser().parse_args()
     with artifact_locks(
         (
+            *_input_lock_roots(args.input),
             Path(args.tokenizer).resolve().parent,
             Path(args.output_dir).resolve().parent,
         )
@@ -131,6 +153,7 @@ def main() -> None:
             translation_directions=args.translation_direction,
             source_only_languages=args.source_only_language,
             train_only_prefixes=args.train_only_prefix,
+            managed_augmentation_prefix=args.managed_augmentation_prefix or None,
             num_workers=args.workers,
         )
     print(json.dumps(asdict(stats), ensure_ascii=False, indent=2))
