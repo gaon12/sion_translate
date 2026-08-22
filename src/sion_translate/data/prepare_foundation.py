@@ -25,10 +25,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import os
+import shutil
+import tempfile
 import unicodedata
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, cast
+
+import numpy as np
 
 from sion_translate.artifacts import FOUNDATION_RELEASE_NAME
 from sion_translate.data.monolingual import (
@@ -36,10 +42,15 @@ from sion_translate.data.monolingual import (
     MonolingualDiscovery,
     ReadStats,
     assess_language_balance,
+    discover_monolingual_sources,
     iter_monolingual_lines,
     segment_text,
 )
 from sion_translate.data.prepare import INDEX_DTYPE, ShardWriter, infer_register
+from sion_translate.data.integrity import (
+    build_dataset_artifact_inventory,
+    dataset_artifact_problem,
+)
 from sion_translate.data.reasoning import (
     ReasoningReadStats,
     ReasoningRecord,
@@ -51,8 +62,8 @@ from sion_translate.fingerprint import file_sha256
 from sion_translate.splitting import choose_split_for_key
 from sion_translate.tokenizer import SionTokenizer, normalize_text
 
-FOUNDATION_INDEX_FORMAT = "sion-foundation-indexed-v1"
-FOUNDATION_PREPROCESSING_SCHEMA = "foundation-mixed-objectives-v2"
+FOUNDATION_INDEX_FORMAT = "sion-foundation-indexed-v2"
+FOUNDATION_PREPROCESSING_SCHEMA = "foundation-mixed-objectives-v4"
 
 
 @dataclass
@@ -104,6 +115,18 @@ class FoundationPrepareStats:
         return {language: stats.accepted for language, stats in self.languages.items()}
 
 
+@dataclass(frozen=True)
+class _FileSnapshot:
+    """Identity of one input before it is allowed to influence an artifact."""
+
+    resolved_path: str
+    size_bytes: int
+    sha256: str
+    modified_ns: int
+    device: int
+    inode: int
+
+
 def _text_digest(language: str, text: str) -> bytes:
     return hashlib.blake2b(f"{language}\0{text}".encode("utf-8"), digest_size=16).digest()
 
@@ -119,6 +142,255 @@ def _is_usable(text: str) -> bool:
     return any(not unicodedata.category(char).startswith("C") for char in text)
 
 
+def _source_sha256(path: Path) -> str:
+    """Hash one raw source while preserving the path in read failures."""
+
+    try:
+        return file_sha256(path)
+    except OSError as error:
+        raise OSError(f"foundation 원천 파일 hash를 읽을 수 없습니다: {path}: {error}") from error
+
+
+def _file_snapshot(path: Path, *, role: str) -> _FileSnapshot:
+    """Capture a stable path/size/hash snapshot, rejecting a hash-time mutation."""
+
+    try:
+        resolved_before = path.resolve(strict=True)
+        stat_before = path.stat()
+        content_hash = file_sha256(path)
+        stat_after = path.stat()
+        resolved_after = path.resolve(strict=True)
+    except OSError as error:
+        raise OSError(f"foundation {role} snapshot을 읽을 수 없습니다: {path}: {error}") from error
+
+    identity_before = (
+        str(resolved_before),
+        stat_before.st_size,
+        stat_before.st_mtime_ns,
+        stat_before.st_dev,
+        stat_before.st_ino,
+    )
+    identity_after = (
+        str(resolved_after),
+        stat_after.st_size,
+        stat_after.st_mtime_ns,
+        stat_after.st_dev,
+        stat_after.st_ino,
+    )
+    if identity_before != identity_after:
+        raise RuntimeError(f"foundation {role}이 snapshot 생성 중 변경되었습니다: {path}")
+    return _FileSnapshot(
+        resolved_path=str(resolved_after),
+        size_bytes=stat_after.st_size,
+        sha256=content_hash,
+        modified_ns=stat_after.st_mtime_ns,
+        device=stat_after.st_dev,
+        inode=stat_after.st_ino,
+    )
+
+
+def _source_snapshot(path: Path) -> _FileSnapshot:
+    return _file_snapshot(path, role="원천 파일")
+
+
+def _tokenizer_snapshot(path: Path) -> _FileSnapshot:
+    return _file_snapshot(path, role="tokenizer")
+
+
+def _capture_source_snapshots(
+    discovery: MonolingualDiscovery,
+) -> tuple[_FileSnapshot, ...]:
+    snapshots: list[_FileSnapshot] = []
+    for source in discovery.sources:
+        snapshot = _source_snapshot(source.path)
+        if snapshot.size_bytes != source.size_bytes:
+            raise RuntimeError(
+                "foundation 원천 파일 크기가 탐색 이후 변경되었습니다: "
+                f"{source.path} ({source.size_bytes} -> {snapshot.size_bytes} bytes)"
+            )
+        snapshots.append(snapshot)
+    return tuple(snapshots)
+
+
+def _verify_source_metadata(
+    discovery: MonolingualDiscovery,
+    expected: tuple[_FileSnapshot, ...],
+) -> None:
+    configured_languages = tuple(
+        dict.fromkeys((*discovery.languages, *discovery.languages_without_data))
+    )
+    rediscovered = discover_monolingual_sources(discovery.root, configured_languages)
+    if len(expected) != len(rediscovered.sources):
+        raise RuntimeError(
+            "foundation 원천 파일 목록이 준비 중 변경되었습니다: "
+            f"{len(expected)} -> {len(rediscovered.sources)} files"
+        )
+    if len(expected) != len(discovery.sources):
+        raise RuntimeError("foundation 원천 파일 snapshot 개수가 일치하지 않습니다")
+    expected_by_path: dict[str, tuple[str, _FileSnapshot]] = {}
+    for source, snapshot in zip(discovery.sources, expected, strict=True):
+        if snapshot.resolved_path in expected_by_path:
+            raise RuntimeError("foundation 원천 파일 경로가 중복되었습니다")
+        expected_by_path[snapshot.resolved_path] = (source.language, snapshot)
+    for source in rediscovered.sources:
+        try:
+            resolved_path = source.path.resolve(strict=True)
+            source_stat = source.path.stat()
+        except OSError as error:
+            raise RuntimeError(
+                f"foundation 원천 파일이 준비 중 변경되었습니다: {source.path}"
+            ) from error
+        expected_source = expected_by_path.get(str(resolved_path))
+        if expected_source is None or expected_source[0] != source.language:
+            raise RuntimeError("foundation 원천 파일 경로/언어 목록이 준비 중 변경되었습니다")
+        expected_snapshot = expected_source[1]
+        actual_metadata = (
+            str(resolved_path),
+            source_stat.st_size,
+            source_stat.st_mtime_ns,
+            source_stat.st_dev,
+            source_stat.st_ino,
+        )
+        expected_metadata = (
+            expected_snapshot.resolved_path,
+            expected_snapshot.size_bytes,
+            expected_snapshot.modified_ns,
+            expected_snapshot.device,
+            expected_snapshot.inode,
+        )
+        if actual_metadata != expected_metadata:
+            raise RuntimeError(f"foundation 원천 파일이 준비 중 변경되었습니다: {source.path}")
+
+
+def _verify_source_snapshots(
+    discovery: MonolingualDiscovery,
+    expected: tuple[_FileSnapshot, ...],
+) -> None:
+    _verify_source_metadata(discovery, expected)
+    for source, expected_snapshot in zip(discovery.sources, expected, strict=True):
+        try:
+            actual_snapshot = _source_snapshot(source.path)
+        except (OSError, RuntimeError) as error:
+            raise RuntimeError(
+                f"foundation 원천 파일이 준비 중 변경되었습니다: {source.path}"
+            ) from error
+        if actual_snapshot != expected_snapshot:
+            raise RuntimeError(f"foundation 원천 파일이 준비 중 변경되었습니다: {source.path}")
+
+
+def _verify_tokenizer_snapshot(path: Path, expected: _FileSnapshot) -> None:
+    try:
+        actual = _tokenizer_snapshot(path)
+    except (OSError, RuntimeError) as error:
+        raise RuntimeError(f"foundation tokenizer가 준비 중 변경되었습니다: {path}") from error
+    if actual != expected:
+        raise RuntimeError(f"foundation tokenizer가 준비 중 변경되었습니다: {path}")
+
+
+def _path_exists(path: Path) -> bool:
+    """Like ``Path.exists``, but also protect a dangling destination symlink."""
+
+    return os.path.lexists(path)
+
+
+def _refuse_existing_output(output_dir: Path) -> None:
+    if _path_exists(output_dir):
+        raise FileExistsError(
+            "Output directory must not exist (an existing path is treated as not empty): "
+            f"{output_dir}. Move it aside or choose another foundation.dataset_dir."
+        )
+
+
+def _remove_staging_path(path: Path) -> None:
+    if not _path_exists(path):
+        return
+    if path.is_symlink() or not path.is_dir():
+        path.unlink()
+        return
+    shutil.rmtree(path)
+
+
+def _fsync_file(path: Path) -> None:
+    # Windows delegates fsync to _commit, which requires a writable handle.
+    with path.open("r+b") as handle:
+        os.fsync(handle.fileno())
+
+
+def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_directory_tree(root: Path) -> None:
+    directories = [root]
+    for artifact in root.rglob("*"):
+        if artifact.is_symlink():
+            raise RuntimeError(f"foundation staging에는 symlink를 게시할 수 없습니다: {artifact}")
+        if artifact.is_dir():
+            directories.append(artifact)
+        elif artifact.is_file():
+            _fsync_file(artifact)
+        else:
+            raise RuntimeError(
+                f"foundation staging에는 일반 파일/폴더만 게시할 수 있습니다: {artifact}"
+            )
+    for directory in sorted(directories, key=lambda item: len(item.parts), reverse=True):
+        _fsync_directory(directory)
+
+
+def _close_shard_writers(
+    writers: dict[str, ShardWriter],
+    *,
+    suppress_errors: bool,
+) -> None:
+    first_error: BaseException | None = None
+    for writer in writers.values():
+        try:
+            writer.close()
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+    if first_error is not None and not suppress_errors:
+        raise first_error
+
+
+def _publish_staged_directory(staging_dir: Path, output_dir: Path) -> None:
+    """Atomically publish on the same filesystem without replacing a destination."""
+
+    _refuse_existing_output(output_dir)
+    _fsync_directory_tree(staging_dir)
+    _fsync_directory(output_dir.parent)
+    renamed = False
+    try:
+        # ``os.rename`` is atomic within this sibling directory and, unlike
+        # ``os.replace``, refuses an existing destination directory on Windows.
+        os.rename(staging_dir, output_dir)
+        renamed = True
+        _fsync_directory(output_dir.parent)
+    except OSError as error:
+        if renamed:
+            try:
+                os.rename(output_dir, staging_dir)
+                _fsync_directory(output_dir.parent)
+            except OSError as rollback_error:
+                raise RuntimeError(
+                    "foundation 게시 durability 실패 후 staging rollback도 실패했습니다: "
+                    f"{output_dir}"
+                ) from rollback_error
+            raise
+        _fsync_directory(output_dir.parent)
+        if not renamed and _path_exists(output_dir):
+            raise FileExistsError(
+                f"Foundation output appeared while publishing: {output_dir}"
+            ) from error
+        raise
+
+
 def foundation_dataset_problem(
     output_dir: str | Path,
     discovery: MonolingualDiscovery,
@@ -131,6 +403,8 @@ def foundation_dataset_problem(
     deduplicate: bool,
     shard_size: int,
     validation_fraction: float,
+    language_sampling_alpha: float,
+    minimum_language_share: float,
     reasoning_sample_share: float,
     release_name: str,
 ) -> str | None:
@@ -144,6 +418,10 @@ def foundation_dataset_problem(
     if not isinstance(raw_manifest, dict):
         return "manifest가 JSON object가 아닙니다"
     manifest = cast(dict[str, Any], raw_manifest)
+    if manifest.get("format") != FOUNDATION_INDEX_FORMAT:
+        return "foundation indexed format이 바뀌었습니다"
+    if manifest.get("stage") != "foundation":
+        return "foundation stage identity가 잘못되었습니다"
     if manifest.get("preprocessing_schema") != FOUNDATION_PREPROCESSING_SCHEMA:
         return "foundation 전처리 schema가 바뀌었습니다"
     if manifest.get("release_name") != release_name:
@@ -170,41 +448,513 @@ def foundation_dataset_problem(
     if any(options.get(name) != value for name, value in expected_options.items()):
         return "foundation 전처리 옵션이 바뀌었습니다"
 
+    raw_sampling: object = manifest.get("language_sampling")
+    if not isinstance(raw_sampling, dict):
+        return "foundation language sampling 계약이 없습니다"
+    sampling = cast(dict[str, Any], raw_sampling)
+    if sampling.get("alpha") != language_sampling_alpha:
+        return "foundation language sampling alpha가 바뀌었습니다"
+    if sampling.get("minimum_share") != minimum_language_share:
+        return "foundation minimum language share가 바뀌었습니다"
+
     raw_sources: object = manifest.get("sources")
     if not isinstance(raw_sources, list):
         return "foundation source 목록이 없습니다"
     source_values = cast(list[object], raw_sources)
-    actual_sources: set[tuple[str, str, int, str]] = set()
+    actual_sources: set[tuple[str, str, int, str, str]] = set()
     for raw_source in source_values:
         if not isinstance(raw_source, dict):
             continue
         source = cast(dict[str, Any], raw_source)
         try:
+            source_hash = source.get("sha256")
+            if (
+                not isinstance(source_hash, str)
+                or len(source_hash) != 64
+                or any(character not in "0123456789abcdef" for character in source_hash)
+            ):
+                return "foundation source 항목의 SHA-256이 잘못되었습니다"
             actual_sources.add(
                 (
                     str(source.get("language", "")),
                     str(Path(str(source.get("path", ""))).resolve()),
                     int(source.get("size_bytes", -1)),
                     str(source.get("task", "")),
+                    source_hash,
                 )
             )
         except (TypeError, ValueError):
             return "foundation source 항목이 잘못되었습니다"
-    expected_sources = {
-        (
-            source.language,
-            str(source.path.resolve()),
-            source.size_bytes,
-            "reasoning" if is_reasoning_jsonl(source.path) else "denoising",
+    # Preserve a path-specific diagnostic when a source from the caller's
+    # discovery vanished; rediscovery alone would only report a set mismatch.
+    for source in discovery.sources:
+        if not source.path.is_file():
+            try:
+                _source_sha256(source.path)
+            except OSError as error:
+                return str(error)
+    configured_languages = tuple(
+        dict.fromkeys((*discovery.languages, *discovery.languages_without_data))
+    )
+    rediscovered = discover_monolingual_sources(discovery.root, configured_languages)
+    expected_sources: set[tuple[str, str, int, str, str]] = set()
+    for source in rediscovered.sources:
+        try:
+            source_hash = _source_sha256(source.path)
+        except OSError as error:
+            return str(error)
+        expected_sources.add(
+            (
+                source.language,
+                str(source.path.resolve()),
+                source.size_bytes,
+                "reasoning" if is_reasoning_jsonl(source.path) else "denoising",
+                source_hash,
+            )
         )
-        for source in discovery.sources
-    }
     if actual_sources != expected_sources or len(actual_sources) != len(source_values):
-        return "foundation 원천 파일 목록/크기가 바뀌었습니다"
+        return "foundation 원천 파일 목록/크기/내용이 바뀌었습니다"
+    artifact_problem = dataset_artifact_problem(output_dir)
+    if artifact_problem is not None:
+        return f"foundation indexed payload가 손상됐습니다: {artifact_problem}"
+    semantic_problem = _foundation_manifest_semantic_problem(
+        Path(output_dir),
+        manifest,
+        discovery,
+        language_sampling_alpha=language_sampling_alpha,
+        minimum_language_share=minimum_language_share,
+        reasoning_sample_share=reasoning_sample_share,
+    )
+    if semantic_problem is not None:
+        return semantic_problem
     return None
 
 
-def prepare_foundation_dataset(
+_LANGUAGE_STAT_INTEGER_FIELDS = (
+    "lines_read",
+    "accepted",
+    "too_short",
+    "too_long",
+    "segmented_documents",
+    "segments",
+    "duplicate",
+    "empty_after_tokenization",
+    "reasoning_records",
+    "reasoning_rejected",
+    "reasoning_prompt_truncated",
+    "reasoning_think_truncated",
+    "reasoning_answer_truncated",
+)
+
+
+def _nonnegative_manifest_integer(payload: dict[str, Any], name: str) -> int:
+    value = payload.get(name)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"foundation staging stats.{name} must be a non-negative integer")
+    return value
+
+
+def _stats_from_manifest(manifest: dict[str, Any]) -> FoundationPrepareStats:
+    raw_stats: object = manifest.get("stats")
+    if not isinstance(raw_stats, dict):
+        raise ValueError("foundation staging stats가 없습니다")
+    stats_payload = cast(dict[str, Any], raw_stats)
+    raw_languages: object = stats_payload.get("languages")
+    if not isinstance(raw_languages, dict):
+        raise ValueError("foundation staging language stats가 없습니다")
+
+    language_stats: dict[str, LanguageStats] = {}
+    for raw_language, raw_payload in cast(dict[object, object], raw_languages).items():
+        if not isinstance(raw_language, str) or not isinstance(raw_payload, dict):
+            raise ValueError("foundation staging language stats 항목이 잘못되었습니다")
+        payload = cast(dict[str, Any], raw_payload)
+        required_fields = {*_LANGUAGE_STAT_INTEGER_FIELDS, "read_rejects"}
+        if set(payload) != required_fields:
+            raise ValueError("foundation staging language stats schema가 잘못되었습니다")
+        integers = {
+            name: _nonnegative_manifest_integer(payload, name)
+            for name in _LANGUAGE_STAT_INTEGER_FIELDS
+        }
+        raw_rejects: object = payload.get("read_rejects")
+        if not isinstance(raw_rejects, dict):
+            raise ValueError("foundation staging read_rejects가 잘못되었습니다")
+        rejects: dict[str, int] = {}
+        for reason, count in cast(dict[object, object], raw_rejects).items():
+            if (
+                not isinstance(reason, str)
+                or isinstance(count, bool)
+                or not isinstance(count, int)
+                or count < 0
+            ):
+                raise ValueError("foundation staging read_rejects 항목이 잘못되었습니다")
+            rejects[reason] = count
+        language_stats[raw_language] = LanguageStats(
+            lines_read=integers["lines_read"],
+            accepted=integers["accepted"],
+            too_short=integers["too_short"],
+            too_long=integers["too_long"],
+            segmented_documents=integers["segmented_documents"],
+            segments=integers["segments"],
+            duplicate=integers["duplicate"],
+            empty_after_tokenization=integers["empty_after_tokenization"],
+            reasoning_records=integers["reasoning_records"],
+            reasoning_rejected=integers["reasoning_rejected"],
+            reasoning_prompt_truncated=integers["reasoning_prompt_truncated"],
+            reasoning_think_truncated=integers["reasoning_think_truncated"],
+            reasoning_answer_truncated=integers["reasoning_answer_truncated"],
+            read_rejects=rejects,
+        )
+
+    train_records = _nonnegative_manifest_integer(stats_payload, "train_records")
+    validation_records = _nonnegative_manifest_integer(
+        stats_payload,
+        "validation_records",
+    )
+    if sum(item.accepted for item in language_stats.values()) != (
+        train_records + validation_records
+    ):
+        raise ValueError("foundation staging stats totals가 일치하지 않습니다")
+    raw_manifest_languages: object = manifest.get("languages")
+    if not isinstance(raw_manifest_languages, list) or not all(
+        isinstance(language, str) for language in raw_manifest_languages
+    ):
+        raise ValueError("foundation staging language identity가 일치하지 않습니다")
+    manifest_languages = cast(list[str], raw_manifest_languages)
+    if len(manifest_languages) != len(set(manifest_languages)) or set(manifest_languages) != set(
+        language_stats
+    ):
+        raise ValueError("foundation staging language identity가 일치하지 않습니다")
+    ordered_language_stats = {language: language_stats[language] for language in manifest_languages}
+    return FoundationPrepareStats(
+        languages=ordered_language_stats,
+        train_records=train_records,
+        validation_records=validation_records,
+    )
+
+
+def _read_staging_stats(staging_dir: Path) -> FoundationPrepareStats:
+    try:
+        raw_manifest: object = json.loads(
+            (staging_dir / "manifest.json").read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("foundation staging manifest를 읽을 수 없습니다") from error
+    if not isinstance(raw_manifest, dict):
+        raise ValueError("foundation staging manifest must be an object")
+    return _stats_from_manifest(cast(dict[str, Any], raw_manifest))
+
+
+def _foundation_manifest_semantic_problem(
+    output_dir: Path,
+    manifest: dict[str, Any],
+    discovery: MonolingualDiscovery,
+    *,
+    language_sampling_alpha: float,
+    minimum_language_share: float,
+    reasoning_sample_share: float,
+) -> str | None:
+    """Validate every manifest field consumed after dataset preparation."""
+
+    try:
+        stats = _stats_from_manifest(manifest)
+    except (TypeError, ValueError) as error:
+        return f"foundation manifest stats가 잘못되었습니다: {error}"
+
+    expected_languages = list(discovery.languages)
+    if list(stats.languages) != expected_languages:
+        return "foundation manifest languages 순서/목록이 원천 파일과 다릅니다"
+    expected_language_to_id = {language: index for index, language in enumerate(expected_languages)}
+    raw_language_to_id: object = manifest.get("language_to_id")
+    if not isinstance(raw_language_to_id, dict):
+        return "foundation manifest language_to_id가 잘못되었습니다"
+    language_to_id = cast(dict[object, object], raw_language_to_id)
+    if set(language_to_id) != set(expected_language_to_id) or any(
+        isinstance(language_to_id[language], bool)
+        or not isinstance(language_to_id[language], int)
+        or language_to_id[language] != expected_id
+        for language, expected_id in expected_language_to_id.items()
+    ):
+        return "foundation manifest language_to_id가 잘못되었습니다"
+    if manifest.get("language_pairs") != [[language, language] for language in expected_languages]:
+        return "foundation manifest language_pairs가 잘못되었습니다"
+    if manifest.get("source_only_languages") != []:
+        return "foundation manifest source_only_languages가 잘못되었습니다"
+    if manifest.get("storage_sides") != ["src", "tgt"]:
+        return "foundation manifest storage_sides가 잘못되었습니다"
+    expected_index_dtype = json.loads(json.dumps(INDEX_DTYPE.descr))
+    if manifest.get("index_dtype") != expected_index_dtype:
+        return "foundation manifest index_dtype이 잘못되었습니다"
+
+    raw_sampling: object = manifest.get("language_sampling")
+    if not isinstance(raw_sampling, dict):
+        return "foundation manifest language_sampling이 잘못되었습니다"
+    sampling = cast(dict[str, Any], raw_sampling)
+    for name, expected_value in (
+        ("alpha", language_sampling_alpha),
+        ("minimum_share", minimum_language_share),
+    ):
+        value = sampling.get(name)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) != expected_value
+        ):
+            return f"foundation manifest sampling {name}가 잘못되었습니다"
+    raw_counts: object = sampling.get("counts")
+    raw_weights: object = sampling.get("weights")
+    if not isinstance(raw_counts, dict) or not isinstance(raw_weights, dict):
+        return "foundation manifest sampling counts/weights가 잘못되었습니다"
+    counts = cast(dict[object, object], raw_counts)
+    weights = cast(dict[object, object], raw_weights)
+    expected_language_keys = set(expected_languages)
+    if set(counts) != expected_language_keys or set(weights) != expected_language_keys:
+        return "foundation manifest sampling 언어 키가 잘못되었습니다"
+
+    normalized_counts: dict[str, int] = {}
+    normalized_weights: dict[str, float] = {}
+    for language in expected_languages:
+        count = counts[language]
+        weight = weights[language]
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            return f"foundation manifest sampling count가 잘못되었습니다: {language}"
+        if (
+            isinstance(weight, bool)
+            or not isinstance(weight, (int, float))
+            or not math.isfinite(float(weight))
+            or float(weight) < 0.0
+        ):
+            return f"foundation manifest sampling weight가 잘못되었습니다: {language}"
+        if count != stats.languages[language].accepted:
+            return f"foundation manifest sampling count가 stats와 다릅니다: {language}"
+        normalized_counts[language] = count
+        normalized_weights[language] = float(weight)
+
+    expected_balance = assess_language_balance(
+        normalized_counts,
+        alpha=language_sampling_alpha,
+        minimum_share=minimum_language_share,
+    )
+    for language in expected_languages:
+        if not math.isclose(
+            normalized_weights[language],
+            expected_balance.weights[language],
+            rel_tol=1e-12,
+            abs_tol=1e-15,
+        ):
+            return f"foundation manifest sampling weight가 계산 결과와 다릅니다: {language}"
+    if sampling.get("warnings") != list(expected_balance.warnings):
+        return "foundation manifest sampling warnings가 계산 결과와 다릅니다"
+
+    raw_reasoning: object = manifest.get("reasoning")
+    if not isinstance(raw_reasoning, dict):
+        return "foundation manifest reasoning 계약이 잘못되었습니다"
+    reasoning = cast(dict[str, Any], raw_reasoning)
+    if reasoning.get("sample_share") != reasoning_sample_share:
+        return "foundation manifest reasoning sample_share가 잘못되었습니다"
+
+    raw_sources: object = manifest.get("sources")
+    if not isinstance(raw_sources, list):
+        return "foundation manifest source 개수가 잘못되었습니다"
+    source_values = cast(list[object], raw_sources)
+    if len(source_values) != len(discovery.sources):
+        return "foundation manifest source 개수가 잘못되었습니다"
+    source_records: list[int] = []
+    source_language_ids: list[int] = []
+    for source_id, (raw_source, expected_source) in enumerate(
+        zip(source_values, discovery.sources, strict=True)
+    ):
+        if not isinstance(raw_source, dict):
+            return f"foundation manifest source {source_id}가 object가 아닙니다"
+        source = cast(dict[str, Any], raw_source)
+        raw_source_id = source.get("id")
+        if (
+            isinstance(raw_source_id, bool)
+            or not isinstance(raw_source_id, int)
+            or raw_source_id != source_id
+        ):
+            return f"foundation manifest source id가 연속적이지 않습니다: {source_id}"
+        name = source.get("name")
+        if not isinstance(name, str) or not name or name != expected_source.path.name:
+            return f"foundation manifest source name이 잘못되었습니다: {source_id}"
+        if source.get("language") != expected_source.language:
+            return f"foundation manifest source language가 잘못되었습니다: {source_id}"
+        try:
+            source_path = Path(str(source.get("path", ""))).resolve()
+            expected_path = expected_source.path.resolve(strict=True)
+        except OSError as error:
+            return f"foundation manifest source path를 확인할 수 없습니다: {error}"
+        if source_path != expected_path:
+            return f"foundation manifest source path가 잘못되었습니다: {source_id}"
+        expected_task = "reasoning" if is_reasoning_jsonl(expected_source.path) else "denoising"
+        if source.get("task") != expected_task:
+            return f"foundation manifest source task가 잘못되었습니다: {source_id}"
+        records = source.get("records")
+        if isinstance(records, bool) or not isinstance(records, int) or records < 0:
+            return f"foundation manifest source records가 잘못되었습니다: {source_id}"
+        source_records.append(records)
+        source_language_ids.append(expected_language_to_id[expected_source.language])
+
+    indexed_counts = np.zeros(len(source_records), dtype=np.int64)
+    split_totals: dict[str, int] = {}
+    for split in ("train", "validation"):
+        split_total = 0
+        for index_path in sorted((output_dir / split).glob("*.idx.npy")):
+            try:
+                index = np.load(index_path, mmap_mode="r", allow_pickle=False)
+            except (OSError, ValueError) as error:
+                return f"foundation index metadata를 읽을 수 없습니다: {index_path}: {error}"
+            names = index.dtype.names
+            required_fields = {
+                "source_id",
+                "src_language_id",
+                "tgt_language_id",
+                "forward_only",
+            }
+            if names is None or not required_fields.issubset(names):
+                return f"foundation index metadata schema가 잘못되었습니다: {index_path}"
+            if index.dtype != INDEX_DTYPE:
+                return f"foundation index dtype이 잘못되었습니다: {index_path}"
+            source_ids = np.asarray(index["source_id"], dtype=np.int64)
+            if source_ids.size and (
+                int(source_ids.min()) < 0 or int(source_ids.max()) >= len(source_records)
+            ):
+                return f"foundation index source_id 범위가 잘못되었습니다: {index_path}"
+            indexed_counts += np.bincount(
+                source_ids,
+                minlength=len(source_records),
+            )[: len(source_records)]
+            expected_ids = np.asarray(source_language_ids, dtype=np.int64)[source_ids]
+            if not np.array_equal(
+                np.asarray(index["src_language_id"], dtype=np.int64),
+                expected_ids,
+            ) or not np.array_equal(
+                np.asarray(index["tgt_language_id"], dtype=np.int64),
+                expected_ids,
+            ):
+                return f"foundation index language/source mapping이 잘못되었습니다: {index_path}"
+            if not bool((np.asarray(index["forward_only"], dtype=np.uint8) == 1).all()):
+                return f"foundation index forward_only 계약이 잘못되었습니다: {index_path}"
+            split_total += len(index)
+        split_totals[split] = split_total
+
+    if indexed_counts.tolist() != source_records:
+        return "foundation manifest source records가 index metadata와 다릅니다"
+    if split_totals.get("train") != stats.train_records:
+        return "foundation manifest train_records가 index metadata와 다릅니다"
+    if split_totals.get("validation") != stats.validation_records:
+        return "foundation manifest validation_records가 index metadata와 다릅니다"
+    return None
+
+
+def _staging_candidates(output_dir: Path) -> list[Path]:
+    parent = output_dir.parent
+    if not parent.is_dir():
+        return []
+    return sorted(parent.glob(f".{output_dir.name}.staging-*"))
+
+
+def _clean_orphan_staging(output_dir: Path) -> None:
+    for candidate in _staging_candidates(output_dir):
+        _remove_staging_path(candidate)
+
+
+def _recover_or_clean_staging(
+    output_dir: Path,
+    discovery: MonolingualDiscovery,
+    tokenizer_model: str | Path,
+    *,
+    source_snapshots: tuple[_FileSnapshot, ...],
+    tokenizer_snapshot: _FileSnapshot,
+    minimum_characters: int,
+    maximum_characters: int,
+    max_tokens: int,
+    max_target_tokens: int,
+    deduplicate: bool,
+    shard_size: int,
+    validation_fraction: float,
+    language_sampling_alpha: float,
+    minimum_language_share: float,
+    reasoning_sample_share: float,
+    release_name: str,
+) -> FoundationPrepareStats | None:
+    valid: list[tuple[Path, FoundationPrepareStats]] = []
+    for candidate in _staging_candidates(output_dir):
+        if candidate.is_symlink() or not candidate.is_dir():
+            _remove_staging_path(candidate)
+            continue
+        try:
+            manifest_before = _file_snapshot(
+                candidate / "manifest.json",
+                role="staging manifest",
+            )
+            problem = foundation_dataset_problem(
+                candidate,
+                discovery,
+                tokenizer_model,
+                minimum_characters=minimum_characters,
+                maximum_characters=maximum_characters,
+                max_tokens=max_tokens,
+                max_target_tokens=max_target_tokens,
+                deduplicate=deduplicate,
+                shard_size=shard_size,
+                validation_fraction=validation_fraction,
+                language_sampling_alpha=language_sampling_alpha,
+                minimum_language_share=minimum_language_share,
+                reasoning_sample_share=reasoning_sample_share,
+                release_name=release_name,
+            )
+            if problem is not None:
+                raise ValueError(problem)
+            raw_recovery_manifest: object = json.loads(
+                (candidate / "manifest.json").read_text(encoding="utf-8")
+            )
+            if not isinstance(raw_recovery_manifest, dict):
+                raise ValueError("foundation staging manifest must be an object")
+            manifest_payload = cast(dict[str, Any], raw_recovery_manifest)
+            raw_sampling: object = manifest_payload.get("language_sampling")
+            if not isinstance(raw_sampling, dict):
+                raise ValueError("foundation staging language_sampling이 없습니다")
+            sampling = cast(dict[str, Any], raw_sampling)
+            if sampling.get("alpha") != language_sampling_alpha:
+                raise ValueError("foundation staging language sampling alpha가 다릅니다")
+            if sampling.get("minimum_share") != minimum_language_share:
+                raise ValueError("foundation staging minimum language share가 다릅니다")
+            recovered_stats = _read_staging_stats(candidate)
+            manifest_after = _file_snapshot(
+                candidate / "manifest.json",
+                role="staging manifest",
+            )
+            if manifest_after != manifest_before:
+                raise ValueError("foundation staging manifest가 인증 중 변경되었습니다")
+        except (OSError, RuntimeError, ValueError, json.JSONDecodeError, TypeError):
+            _remove_staging_path(candidate)
+            continue
+        valid.append((candidate, recovered_stats))
+
+    if not valid:
+        return None
+    selected, recovered_stats = max(
+        valid,
+        key=lambda item: (item[0].stat().st_mtime_ns, item[0].name),
+    )
+    # Leave only the selected recoverable generation before the atomic rename;
+    # a crash immediately after publication must not strand other large trees.
+    for candidate, _stats in valid:
+        if candidate != selected:
+            _remove_staging_path(candidate)
+    try:
+        _verify_source_snapshots(discovery, source_snapshots)
+        _verify_tokenizer_snapshot(Path(tokenizer_model), tokenizer_snapshot)
+        _publish_staged_directory(selected, output_dir)
+    except Exception:
+        for candidate, _stats in valid:
+            _remove_staging_path(candidate)
+        raise
+    return recovered_stats
+
+
+def _prepare_foundation_dataset_in_staging(
     discovery: MonolingualDiscovery,
     tokenizer_model: str | Path,
     output_dir: str | Path,
@@ -220,8 +970,10 @@ def prepare_foundation_dataset(
     minimum_language_share: float = 0.05,
     reasoning_sample_share: float = 0.05,
     release_name: str = FOUNDATION_RELEASE_NAME,
+    source_snapshots: tuple[_FileSnapshot, ...],
+    tokenizer_snapshot: _FileSnapshot,
 ) -> FoundationPrepareStats:
-    """단일어 파일들을 ``output_dir`` 아래 train/validation shard 로 쓴다."""
+    """Build a complete dataset inside a private, unpublished directory."""
 
     if not discovery.sources:
         raise ValueError(
@@ -248,11 +1000,6 @@ def prepare_foundation_dataset(
         raise ValueError("reasoning_sample_share must be in [0, 0.10]")
 
     output_dir = Path(output_dir)
-    if output_dir.exists() and any(output_dir.iterdir()):
-        raise FileExistsError(
-            f"Output directory is not empty: {output_dir}. "
-            "Remove it or choose another foundation.dataset_dir."
-        )
     output_dir.mkdir(parents=True, exist_ok=True)
 
     tokenizer = SionTokenizer(tokenizer_model)
@@ -276,10 +1023,13 @@ def prepare_foundation_dataset(
         )
     language_to_id = {language: index for index, language in enumerate(languages)}
 
-    writers = {
-        split: ShardWriter(output_dir, split, shard_size, language_to_id)
-        for split in ("train", "validation")
-    }
+    writers: dict[str, ShardWriter] = {}
+    try:
+        for split in ("train", "validation"):
+            writers[split] = ShardWriter(output_dir, split, shard_size, language_to_id)
+    except BaseException:
+        _close_shard_writers(writers, suppress_errors=True)
+        raise
     stats = FoundationPrepareStats(languages={language: LanguageStats() for language in languages})
     seen: set[bytes] = set()
     source_ids = {source.path: index for index, source in enumerate(discovery.sources)}
@@ -385,63 +1135,72 @@ def prepare_foundation_dataset(
             stats.validation_records += 1
         source_record_counts[source_id] += 1
 
-    for source in discovery.sources:
-        language = source.language
-        language_stats = stats.languages[language]
-        if is_reasoning_jsonl(source.path):
-            reasoning_read_stats = ReasoningReadStats()
-            for record in iter_reasoning_records(
-                source.path,
-                expected_language=language,
-                stats=reasoning_read_stats,
-            ):
-                record_reasoning(
-                    record,
-                    language=language,
-                    language_stats=language_stats,
-                    source_id=source_ids[source.path],
-                )
-            language_stats.lines_read += reasoning_read_stats.physical_lines
-            language_stats.merge_reasoning_read(reasoning_read_stats)
-            continue
-        read_stats = ReadStats()
-        for raw_text in iter_monolingual_lines(source.path, stats=read_stats):
-            language_stats.lines_read += 1
-            document = normalize_text(raw_text)
-            if not _is_usable(document):
-                language_stats.too_short += 1
+    try:
+        for source in discovery.sources:
+            language = source.language
+            language_stats = stats.languages[language]
+            if is_reasoning_jsonl(source.path):
+                reasoning_read_stats = ReasoningReadStats()
+                for record in iter_reasoning_records(
+                    source.path,
+                    expected_language=language,
+                    stats=reasoning_read_stats,
+                ):
+                    record_reasoning(
+                        record,
+                        language=language,
+                        language_stats=language_stats,
+                        source_id=source_ids[source.path],
+                    )
+                language_stats.lines_read += reasoning_read_stats.physical_lines
+                language_stats.merge_reasoning_read(reasoning_read_stats)
                 continue
-            # 긴 문서는 버리지 않고 나눕니다. 자르지도 않습니다. 실측으로
-            # e_gov 는 문자의 97.3%, aozora 는 92.8%, kowiki 는 68.0% 가
-            # "상한 초과" 한 줄이라 통째로 폐기됐고, 전체로는 25.8% 였습니다.
-            segments = segment_text(
-                document,
-                maximum_characters=maximum_characters,
-                minimum_characters=minimum_characters,
-            )
-            if not segments:
-                language_stats.too_short += 1
-                continue
-            if len(segments) > 1:
-                language_stats.segmented_documents += 1
-            language_stats.segments += len(segments)
-            for text in segments:
-                record_segment(
-                    text,
-                    language=language,
-                    language_stats=language_stats,
-                    source_id=source_ids[source.path],
+            read_stats = ReadStats()
+            for raw_text in iter_monolingual_lines(source.path, stats=read_stats):
+                language_stats.lines_read += 1
+                document = normalize_text(raw_text)
+                if not _is_usable(document):
+                    language_stats.too_short += 1
+                    continue
+                # 긴 문서는 버리지 않고 나눕니다. 자르지도 않습니다. 실측으로
+                # e_gov 는 문자의 97.3%, aozora 는 92.8%, kowiki 는 68.0% 가
+                # "상한 초과" 한 줄이라 통째로 폐기됐고, 전체로는 25.8% 였습니다.
+                segments = segment_text(
+                    document,
+                    maximum_characters=maximum_characters,
+                    minimum_characters=minimum_characters,
                 )
-        language_stats.merge_read(read_stats)
-
-    for writer in writers.values():
-        writer.close()
+                if not segments:
+                    language_stats.too_short += 1
+                    continue
+                if len(segments) > 1:
+                    language_stats.segmented_documents += 1
+                language_stats.segments += len(segments)
+                for text in segments:
+                    record_segment(
+                        text,
+                        language=language,
+                        language_stats=language_stats,
+                        source_id=source_ids[source.path],
+                    )
+            language_stats.merge_read(read_stats)
+    except BaseException:
+        _close_shard_writers(writers, suppress_errors=True)
+        raise
+    else:
+        _close_shard_writers(writers, suppress_errors=False)
 
     if stats.total_records == 0:
         raise ValueError(
             "단일어 코퍼스에서 학습 가능한 문장이 하나도 나오지 않았습니다. "
             "minimum_characters/maximum_characters 와 파일 형식을 확인하십시오."
         )
+
+    # Do not derive an inventory or manifest from bytes read across two source
+    # generations.  The final snapshot includes the resolved path, size, hash,
+    # timestamp, and file identity captured before source iteration began.
+    _verify_source_snapshots(discovery, source_snapshots)
+    _verify_tokenizer_snapshot(Path(tokenizer_model), tokenizer_snapshot)
 
     balance = assess_language_balance(
         stats.accepted_per_language(),
@@ -466,8 +1225,8 @@ def prepare_foundation_dataset(
         "source_only_languages": [],
         "storage_sides": ["src", "tgt"],
         "index_dtype": INDEX_DTYPE.descr,
-        "tokenizer_model": str(Path(tokenizer_model).resolve()),
-        "tokenizer_sha256": file_sha256(tokenizer_model),
+        "tokenizer_model": tokenizer_snapshot.resolved_path,
+        "tokenizer_sha256": tokenizer_snapshot.sha256,
         "preprocessing_schema": FOUNDATION_PREPROCESSING_SCHEMA,
         "preprocessing_options": {
             "deduplicate": deduplicate,
@@ -481,6 +1240,7 @@ def prepare_foundation_dataset(
         },
         "language_sampling": {
             "alpha": language_sampling_alpha,
+            "minimum_share": minimum_language_share,
             "weights": balance.weights,
             "counts": balance.counts,
             "warnings": list(balance.warnings),
@@ -491,11 +1251,12 @@ def prepare_foundation_dataset(
                 "language": source.language,
                 "name": source.path.name,
                 "path": str(source.path),
-                "size_bytes": source.size_bytes,
+                "size_bytes": source_snapshots[index].size_bytes,
+                "sha256": source_snapshots[index].sha256,
                 "task": "reasoning" if is_reasoning_jsonl(source.path) else "denoising",
                 "records": source_record_counts[source_ids[source.path]],
             }
-            for source in discovery.sources
+            for index, source in enumerate(discovery.sources)
         ],
         "skipped": [
             {"path": str(entry.path), "reason": entry.reason} for entry in discovery.skipped
@@ -515,12 +1276,103 @@ def prepare_foundation_dataset(
             "sample_share": reasoning_sample_share,
             "trace_symbols": ["<think>", "</think>", "<answer>", "</answer>"],
         },
+        "artifact_inventory": build_dataset_artifact_inventory(output_dir),
     }
     (output_dir / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     return stats
+
+
+def prepare_foundation_dataset(
+    discovery: MonolingualDiscovery,
+    tokenizer_model: str | Path,
+    output_dir: str | Path,
+    *,
+    minimum_characters: int = 8,
+    maximum_characters: int = 4000,
+    max_tokens: int = 510,
+    max_target_tokens: int | None = None,
+    deduplicate: bool = True,
+    shard_size: int = 200_000,
+    validation_fraction: float = 0.002,
+    language_sampling_alpha: float = DEFAULT_LANGUAGE_SAMPLING_ALPHA,
+    minimum_language_share: float = 0.05,
+    reasoning_sample_share: float = 0.05,
+    release_name: str = FOUNDATION_RELEASE_NAME,
+) -> FoundationPrepareStats:
+    """Transactionally prepare foundation shards and publish one complete generation."""
+
+    final_output = Path(output_dir)
+    if _path_exists(final_output):
+        _clean_orphan_staging(final_output)
+        _refuse_existing_output(final_output)
+    if max_target_tokens is None:
+        max_target_tokens = max_tokens
+    final_output.parent.mkdir(parents=True, exist_ok=True)
+    source_snapshots = _capture_source_snapshots(discovery)
+    tokenizer_snapshot = _tokenizer_snapshot(Path(tokenizer_model))
+    # This immediate rediscovery also rejects a plan whose source list changed
+    # before preparation acquired its artifact lock.
+    _verify_source_metadata(discovery, source_snapshots)
+    recovered = _recover_or_clean_staging(
+        final_output,
+        discovery,
+        tokenizer_model,
+        source_snapshots=source_snapshots,
+        tokenizer_snapshot=tokenizer_snapshot,
+        minimum_characters=minimum_characters,
+        maximum_characters=maximum_characters,
+        max_tokens=max_tokens,
+        max_target_tokens=max_target_tokens,
+        deduplicate=deduplicate,
+        shard_size=shard_size,
+        validation_fraction=validation_fraction,
+        language_sampling_alpha=language_sampling_alpha,
+        minimum_language_share=minimum_language_share,
+        reasoning_sample_share=reasoning_sample_share,
+        release_name=release_name,
+    )
+    if recovered is not None:
+        return recovered
+    _refuse_existing_output(final_output)
+    staging_dir = Path(
+        tempfile.mkdtemp(
+            prefix=f".{final_output.name}.staging-",
+            dir=final_output.parent,
+        )
+    )
+    published = False
+    try:
+        stats = _prepare_foundation_dataset_in_staging(
+            discovery,
+            tokenizer_model,
+            staging_dir,
+            minimum_characters=minimum_characters,
+            maximum_characters=maximum_characters,
+            max_tokens=max_tokens,
+            max_target_tokens=max_target_tokens,
+            deduplicate=deduplicate,
+            shard_size=shard_size,
+            validation_fraction=validation_fraction,
+            language_sampling_alpha=language_sampling_alpha,
+            minimum_language_share=minimum_language_share,
+            reasoning_sample_share=reasoning_sample_share,
+            release_name=release_name,
+            source_snapshots=source_snapshots,
+            tokenizer_snapshot=tokenizer_snapshot,
+        )
+        # Close the small post-verification window occupied by inventory and
+        # manifest construction before the durable rename.
+        _verify_source_snapshots(discovery, source_snapshots)
+        _verify_tokenizer_snapshot(Path(tokenizer_model), tokenizer_snapshot)
+        _publish_staged_directory(staging_dir, final_output)
+        published = True
+        return stats
+    finally:
+        if not published and _path_exists(staging_dir):
+            _remove_staging_path(staging_dir)
 
 
 def render_prepare_report(stats: FoundationPrepareStats) -> list[str]:

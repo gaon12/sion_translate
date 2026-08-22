@@ -8,14 +8,18 @@ collator 까지 갔을 때 ``<denoise_xx>`` 배치가 나오고, 문장이 두 �
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 
 import pytest
 
+import sion_translate.data.prepare_foundation as foundation_prepare
 from sion_translate.data.collate import SionBatchCollator
 from sion_translate.data.indexed import IndexedParallelDataset
-from sion_translate.data.monolingual import discover_monolingual_sources
+from sion_translate.data.monolingual import MonolingualDiscovery, discover_monolingual_sources
 from sion_translate.data.prepare_foundation import (
+    foundation_dataset_problem,
     prepare_foundation_dataset,
     render_prepare_report,
 )
@@ -80,6 +84,32 @@ def _prepare(tmp_path, tokenizer_model, **kwargs):
     )
 
 
+def _dataset_problem(
+    tmp_path,
+    discovery,
+    tokenizer_model,
+    *,
+    language_sampling_alpha=0.7,
+    minimum_language_share=0.05,
+) -> str | None:
+    return foundation_dataset_problem(
+        tmp_path / "dataset",
+        discovery,
+        tokenizer_model,
+        minimum_characters=8,
+        maximum_characters=4000,
+        max_tokens=510,
+        max_target_tokens=510,
+        deduplicate=True,
+        shard_size=32,
+        validation_fraction=0.002,
+        language_sampling_alpha=language_sampling_alpha,
+        minimum_language_share=minimum_language_share,
+        reasoning_sample_share=0.05,
+        release_name="sion",
+    )
+
+
 def test_every_language_reaches_the_shards(tmp_path, tokenizer_model) -> None:
     _, stats = _prepare(tmp_path, tokenizer_model)
     assert stats.total_records == 100
@@ -90,7 +120,7 @@ def test_every_language_reaches_the_shards(tmp_path, tokenizer_model) -> None:
 
 
 def test_the_manifest_records_the_stage_identity(tmp_path, tokenizer_model) -> None:
-    _prepare(tmp_path, tokenizer_model)
+    discovery, _ = _prepare(tmp_path, tokenizer_model)
     manifest = json.loads((tmp_path / "dataset" / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["stage"] == "foundation"
     assert manifest["release_name"] == "sion"
@@ -100,6 +130,116 @@ def test_the_manifest_records_the_stage_identity(tmp_path, tokenizer_model) -> N
     assert all(pair[0] == pair[1] for pair in manifest["language_pairs"])
     assert manifest["source_only_languages"] == []
     assert set(manifest["language_sampling"]["weights"]) == {"ko", "ja"}
+    for source in manifest["sources"]:
+        path = next(item.path for item in discovery.sources if str(item.path) == source["path"])
+        assert source["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_same_size_source_mutation_invalidates_the_prepared_dataset(
+    tmp_path,
+    tokenizer_model,
+) -> None:
+    discovery, _ = _prepare(tmp_path, tokenizer_model)
+    assert _dataset_problem(tmp_path, discovery, tokenizer_model) is None
+
+    source_path = discovery.sources[0].path
+    original = source_path.read_bytes()
+    mutated = original.replace(b"0", b"9", 1)
+    assert mutated != original
+    assert len(mutated) == len(original)
+    source_path.write_bytes(mutated)
+
+    problem = _dataset_problem(tmp_path, discovery, tokenizer_model)
+    assert problem is not None
+    assert "내용" in problem
+
+
+def test_corrupt_source_id_invalidates_manifest_before_dataset_loading(
+    tmp_path,
+    tokenizer_model,
+) -> None:
+    discovery, _ = _prepare(tmp_path, tokenizer_model)
+    manifest_path = tmp_path / "dataset" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    del manifest["sources"][0]["id"]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    problem = _dataset_problem(tmp_path, discovery, tokenizer_model)
+
+    assert problem is not None
+    assert "source id" in problem
+
+
+def test_corrupt_sampling_weight_invalidates_manifest_before_training(
+    tmp_path,
+    tokenizer_model,
+) -> None:
+    discovery, _ = _prepare(tmp_path, tokenizer_model)
+    manifest_path = tmp_path / "dataset" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["language_sampling"]["weights"]["ko"] = -0.25
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    problem = _dataset_problem(tmp_path, discovery, tokenizer_model)
+
+    assert problem is not None
+    assert "sampling weight" in problem
+
+
+@pytest.mark.parametrize(
+    ("option", "value", "message"),
+    [
+        ("language_sampling_alpha", 0.6, "sampling alpha"),
+        ("minimum_language_share", 0.08, "minimum language share"),
+    ],
+)
+def test_sampling_contract_changes_invalidate_the_prepared_dataset(
+    tmp_path,
+    tokenizer_model,
+    option,
+    value,
+    message,
+) -> None:
+    discovery, _ = _prepare(tmp_path, tokenizer_model)
+
+    problem = _dataset_problem(
+        tmp_path,
+        discovery,
+        tokenizer_model,
+        **{option: value},
+    )
+
+    assert problem is not None
+    assert message in problem
+
+
+def test_same_size_indexed_payload_mutation_invalidates_the_prepared_dataset(
+    tmp_path,
+    tokenizer_model,
+) -> None:
+    discovery, _ = _prepare(tmp_path, tokenizer_model)
+    assert _dataset_problem(tmp_path, discovery, tokenizer_model) is None
+    payload = tmp_path / "dataset" / "train" / "00000.src.bin"
+    original = payload.read_bytes()
+    assert original
+    payload.write_bytes(bytes([original[0] ^ 1]) + original[1:])
+
+    problem = _dataset_problem(tmp_path, discovery, tokenizer_model)
+
+    assert problem is not None
+    assert "indexed payload" in problem
+    assert "SHA-256 mismatch" in problem
+
+
+def test_unreadable_source_reports_the_failing_path(tmp_path, tokenizer_model) -> None:
+    discovery, _ = _prepare(tmp_path, tokenizer_model)
+    source_path = discovery.sources[0].path
+    source_path.unlink()
+
+    problem = _dataset_problem(tmp_path, discovery, tokenizer_model)
+    assert problem is not None
+    assert "hash를 읽을 수 없습니다" in problem
+    assert str(source_path) in problem
 
 
 def test_the_manifest_carries_the_skipped_paths_forward(tmp_path, tokenizer_model) -> None:
@@ -155,6 +295,298 @@ def test_an_existing_non_empty_output_directory_is_refused(tmp_path, tokenizer_m
     (tmp_path / "dataset" / "stale.bin").write_bytes(b"x")
     with pytest.raises(FileExistsError, match="not empty"):
         prepare_foundation_dataset(discovery, tokenizer_model, tmp_path / "dataset")
+
+
+def test_an_existing_empty_output_directory_is_also_refused(tmp_path, tokenizer_model) -> None:
+    discovery = discover_monolingual_sources(_corpus(tmp_path / "corpus"), ["ko", "ja"])
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+
+    with pytest.raises(FileExistsError, match="must not exist"):
+        prepare_foundation_dataset(discovery, tokenizer_model, dataset)
+
+    assert dataset.is_dir()
+    assert not any(dataset.iterdir())
+
+
+def test_source_mutation_aborts_publication_and_removes_staging(
+    tmp_path,
+    tokenizer_model,
+    monkeypatch,
+) -> None:
+    discovery = discover_monolingual_sources(_corpus(tmp_path / "corpus"), ["ko", "ja"])
+    source_path = discovery.sources[0].path
+    original_iterator = foundation_prepare.iter_monolingual_lines
+    inventory_called = False
+
+    def iter_then_mutate(path, *, stats=None):
+        yield from original_iterator(path, stats=stats)
+        if path == source_path:
+            original = source_path.read_bytes()
+            mutated = original.replace(b"0", b"9", 1)
+            assert mutated != original
+            assert len(mutated) == len(original)
+            source_path.write_bytes(mutated)
+
+    def record_inventory_call(_output_dir):
+        nonlocal inventory_called
+        inventory_called = True
+        return []
+
+    monkeypatch.setattr(foundation_prepare, "iter_monolingual_lines", iter_then_mutate)
+    monkeypatch.setattr(
+        foundation_prepare,
+        "build_dataset_artifact_inventory",
+        record_inventory_call,
+    )
+
+    with pytest.raises(RuntimeError, match="준비 중 변경"):
+        prepare_foundation_dataset(discovery, tokenizer_model, tmp_path / "dataset")
+
+    assert not inventory_called
+    assert not (tmp_path / "dataset").exists()
+    assert not list(tmp_path.glob(".dataset.staging-*"))
+
+
+def test_tokenizer_mutation_aborts_publication_and_removes_staging(
+    tmp_path,
+    tokenizer_model,
+    monkeypatch,
+) -> None:
+    discovery = discover_monolingual_sources(_corpus(tmp_path / "corpus"), ["ko", "ja"])
+    local_tokenizer = tmp_path / "tokenizer.model"
+    local_tokenizer.write_bytes(tokenizer_model.read_bytes())
+    source_path = discovery.sources[0].path
+    original_iterator = foundation_prepare.iter_monolingual_lines
+    mutated = False
+
+    def iter_then_mutate_tokenizer(path, *, stats=None):
+        nonlocal mutated
+        yield from original_iterator(path, stats=stats)
+        if path == source_path and not mutated:
+            encoded = bytearray(local_tokenizer.read_bytes())
+            encoded[-1] ^= 1
+            local_tokenizer.write_bytes(encoded)
+            mutated = True
+
+    monkeypatch.setattr(
+        foundation_prepare,
+        "iter_monolingual_lines",
+        iter_then_mutate_tokenizer,
+    )
+
+    with pytest.raises(RuntimeError, match="tokenizer가 준비 중 변경"):
+        prepare_foundation_dataset(discovery, local_tokenizer, tmp_path / "dataset")
+
+    assert mutated
+    assert not (tmp_path / "dataset").exists()
+    assert not list(tmp_path.glob(".dataset.staging-*"))
+
+
+def test_new_source_added_during_build_aborts_publication(
+    tmp_path,
+    tokenizer_model,
+    monkeypatch,
+) -> None:
+    corpus = _corpus(tmp_path / "corpus")
+    discovery = discover_monolingual_sources(corpus, ["ko", "ja"])
+    source_path = discovery.sources[0].path
+    original_iterator = foundation_prepare.iter_monolingual_lines
+    added_source = corpus / "ko" / "added-during-build.txt"
+
+    def iter_then_add_source(path, *, stats=None):
+        yield from original_iterator(path, stats=stats)
+        if path == source_path:
+            added_source.write_text(
+                "준비 도중 추가된 충분히 긴 한국어 문장입니다\n",
+                encoding="utf-8",
+            )
+
+    monkeypatch.setattr(
+        foundation_prepare,
+        "iter_monolingual_lines",
+        iter_then_add_source,
+    )
+
+    with pytest.raises(RuntimeError, match="원천 파일 목록이 준비 중 변경"):
+        prepare_foundation_dataset(discovery, tokenizer_model, tmp_path / "dataset")
+
+    assert added_source.is_file()
+    assert not (tmp_path / "dataset").exists()
+    assert not list(tmp_path.glob(".dataset.staging-*"))
+
+
+def test_source_mutation_during_inventory_is_caught_even_with_restored_metadata(
+    tmp_path,
+    tokenizer_model,
+    monkeypatch,
+) -> None:
+    discovery = discover_monolingual_sources(_corpus(tmp_path / "corpus"), ["ko", "ja"])
+    source_path = discovery.sources[0].path
+    original_inventory = foundation_prepare.build_dataset_artifact_inventory
+
+    def inventory_then_mutate(output_dir):
+        inventory = original_inventory(output_dir)
+        source_stat = source_path.stat()
+        original = source_path.read_bytes()
+        mutated = original.replace(b"0", b"9", 1)
+        assert mutated != original
+        assert len(mutated) == len(original)
+        source_path.write_bytes(mutated)
+        os.utime(
+            source_path,
+            ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns),
+        )
+        restored_stat = source_path.stat()
+        assert restored_stat.st_size == source_stat.st_size
+        assert restored_stat.st_mtime_ns == source_stat.st_mtime_ns
+        return inventory
+
+    monkeypatch.setattr(
+        foundation_prepare,
+        "build_dataset_artifact_inventory",
+        inventory_then_mutate,
+    )
+
+    with pytest.raises(RuntimeError, match="준비 중 변경"):
+        prepare_foundation_dataset(discovery, tokenizer_model, tmp_path / "dataset")
+
+    assert not (tmp_path / "dataset").exists()
+    assert not list(tmp_path.glob(".dataset.staging-*"))
+
+
+def test_manifest_failure_aborts_publication_and_removes_staging(
+    tmp_path,
+    tokenizer_model,
+    monkeypatch,
+) -> None:
+    discovery = discover_monolingual_sources(_corpus(tmp_path / "corpus"), ["ko", "ja"])
+
+    def fail_inventory(_output_dir):
+        raise RuntimeError("inventory failed")
+
+    monkeypatch.setattr(
+        foundation_prepare,
+        "build_dataset_artifact_inventory",
+        fail_inventory,
+    )
+
+    with pytest.raises(RuntimeError, match="inventory failed"):
+        prepare_foundation_dataset(discovery, tokenizer_model, tmp_path / "dataset")
+
+    assert not (tmp_path / "dataset").exists()
+    assert not list(tmp_path.glob(".dataset.staging-*"))
+
+
+def test_publish_collision_preserves_destination_and_removes_staging(
+    tmp_path,
+    tokenizer_model,
+    monkeypatch,
+) -> None:
+    discovery = discover_monolingual_sources(_corpus(tmp_path / "corpus"), ["ko", "ja"])
+    dataset = tmp_path / "dataset"
+    original_publish = foundation_prepare._publish_staged_directory
+
+    def publish_after_destination_appears(staging_dir, output_dir):
+        dataset.mkdir()
+        (dataset / "owner.txt").write_text("other publisher\n", encoding="utf-8")
+        original_publish(staging_dir, output_dir)
+
+    monkeypatch.setattr(
+        foundation_prepare,
+        "_publish_staged_directory",
+        publish_after_destination_appears,
+    )
+
+    with pytest.raises(FileExistsError, match="must not exist"):
+        prepare_foundation_dataset(discovery, tokenizer_model, dataset)
+
+    assert (dataset / "owner.txt").read_text(encoding="utf-8") == "other publisher\n"
+    assert not list(tmp_path.glob(".dataset.staging-*"))
+
+
+def test_incomplete_orphan_staging_is_removed_before_rebuild(
+    tmp_path,
+    tokenizer_model,
+) -> None:
+    discovery = discover_monolingual_sources(_corpus(tmp_path / "corpus"), ["ko", "ja"])
+    orphan = tmp_path / ".dataset.staging-interrupted"
+    (orphan / "train").mkdir(parents=True)
+    (orphan / "train" / "partial.bin").write_bytes(b"partial")
+
+    stats = prepare_foundation_dataset(discovery, tokenizer_model, tmp_path / "dataset")
+
+    assert stats.total_records == 100
+    assert (tmp_path / "dataset" / "manifest.json").is_file()
+    assert not orphan.exists()
+    assert not list(tmp_path.glob(".dataset.staging-*"))
+
+
+def test_complete_exact_contract_orphan_staging_is_recovered(
+    tmp_path,
+    tokenizer_model,
+    monkeypatch,
+) -> None:
+    discovered = discover_monolingual_sources(_corpus(tmp_path / "corpus"), ["ko", "ja"])
+    discovery = MonolingualDiscovery(
+        root=discovered.root,
+        sources=tuple(
+            sorted(discovered.sources, key=lambda source: 0 if source.language == "ko" else 1)
+        ),
+        skipped=discovered.skipped,
+        languages_without_data=discovered.languages_without_data,
+        unconfigured_languages=discovered.unconfigured_languages,
+    )
+    assert discovery.languages == ("ko", "ja")
+    dataset = tmp_path / "dataset"
+    original_stats = prepare_foundation_dataset(discovery, tokenizer_model, dataset)
+    orphan = tmp_path / ".dataset.staging-recoverable"
+    dataset.rename(orphan)
+
+    def forbid_rebuild(*_args, **_kwargs):
+        raise AssertionError("a complete authenticated staging generation should be recovered")
+
+    monkeypatch.setattr(
+        foundation_prepare,
+        "_prepare_foundation_dataset_in_staging",
+        forbid_rebuild,
+    )
+
+    recovered_stats = prepare_foundation_dataset(discovery, tokenizer_model, dataset)
+
+    assert recovered_stats == original_stats
+    assert (dataset / "manifest.json").is_file()
+    assert not orphan.exists()
+    assert not list(tmp_path.glob(".dataset.staging-*"))
+
+
+def test_publication_fsyncs_artifacts_and_namespace(
+    tmp_path,
+    tokenizer_model,
+    monkeypatch,
+) -> None:
+    discovery = discover_monolingual_sources(_corpus(tmp_path / "corpus"), ["ko", "ja"])
+    synced_files = []
+    synced_directories = []
+    original_file_sync = foundation_prepare._fsync_file
+    original_directory_sync = foundation_prepare._fsync_directory
+
+    def record_file_sync(path):
+        synced_files.append(path.name)
+        original_file_sync(path)
+
+    def record_directory_sync(path):
+        synced_directories.append(path)
+        original_directory_sync(path)
+
+    monkeypatch.setattr(foundation_prepare, "_fsync_file", record_file_sync)
+    monkeypatch.setattr(foundation_prepare, "_fsync_directory", record_directory_sync)
+
+    prepare_foundation_dataset(discovery, tokenizer_model, tmp_path / "dataset")
+
+    assert "manifest.json" in synced_files
+    assert any(name.endswith(".src.bin") for name in synced_files)
+    assert tmp_path in synced_directories
 
 
 def test_a_tokenizer_without_the_language_tags_is_refused(tmp_path, tokenizer_model) -> None:

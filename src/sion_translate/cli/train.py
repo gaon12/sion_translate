@@ -819,6 +819,8 @@ def ensure_artifacts(
                         shard_size=config.foundation.shard_size,
                         validation_fraction=config.foundation.validation_fraction,
                         reasoning_sample_share=config.foundation.reasoning_sample_share,
+                        language_sampling_alpha=config.foundation.language_sampling_alpha,
+                        minimum_language_share=config.foundation.minimum_language_share,
                         release_name=config.foundation.release_name,
                     )
                     if foundation_problem is None:
