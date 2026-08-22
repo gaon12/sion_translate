@@ -26,13 +26,21 @@ from __future__ import annotations
 import argparse
 import copy
 import gc
+import hashlib
 import importlib.util
 import json
 import math
+import os
 import random
+import re
+import secrets
+import tempfile
+import threading
+import time
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
-from typing import Any, Iterator, Sequence, cast
+from types import SimpleNamespace
+from typing import Any, BinaryIO, Callable, Iterator, Sequence, TypeVar, cast
 
 import numpy as np
 import torch
@@ -59,19 +67,27 @@ from sion_translate.data import (
 )
 from sion_translate.artifacts import (
     FOUNDATION_STAGE_DIRECTORY,
+    MODEL_RELEASE_VERSION,
     TRANSLATION_RELEASE_NAME,
 )
 from sion_translate.data.collate import load_morphoscript_token_features
+from sion_translate.data.integrity import (
+    dataset_artifact_problem,
+    validate_dataset_artifact_inventory,
+)
 from sion_translate.data.reasoning import is_reasoning_jsonl
 from sion_translate.locking import artifact_lock, training_run_lock
 from sion_translate.foundation import (
+    FOUNDATION_LINEAGE_SCHEMA,
     FoundationOutcome,
+    FoundationPlan,
     build_foundation_config,
     build_translation_pipeline_identity,
     foundation_run_directory,
     plan_foundation_stage,
 )
 from sion_translate.fingerprint import DatasetFingerprint, file_sha256
+from sion_translate.data.prepare_foundation import foundation_dataset_problem
 from sion_translate.model import SionForConditionalGeneration
 from sion_translate.tokenizer import (
     SionTokenizer,
@@ -83,18 +99,27 @@ from sion_translate.training.distributed import (
     DistributedContext,
     barrier,
     broadcast_bool,
+    broadcast_int,
+    broadcast_text,
     cleanup_distributed,
+    distributed_failure_scope,
     initialize_distributed,
     parallelize_model,
     resolve_parallel_strategy,
 )
 from sion_translate.training.checkpoint import (
-    build_checkpoint_identity,
+    DCP_COMPLETION_FILENAME,
+    DCP_COMPLETION_SCHEMA,
+    checkpoint_generation_candidates,
     checkpoint_path_exists,
     initialize_model_from_checkpoint,
+    inspect_checkpoint_identity,
+    inspect_checkpoint_training_state,
     preflight_checkpoint_identity,
+    resolve_checkpoint_source,
+    verified_checkpoint_generation_lease,
 )
-from sion_translate.training.export import export_inference_models
+from sion_translate.training.export import export_inference_models, validate_export_directory
 from sion_translate.training.objectives import MinimumRiskObjective
 from sion_translate.training.trainer import (
     announce,
@@ -108,6 +133,12 @@ FINAL_EXPORT_DEPENDENCIES = {
     "int8": ("torchao", "torchao"),
     "gguf_q4_k_m": ("gguf", "gguf-python"),
 }
+FINAL_EXPORT_STATUS_SCHEMA = "sion-final-export-status-v1"
+RANK_ZERO_ACTION_STATUS_SCHEMA = "sion-rank-zero-action-status-v1"
+FINAL_EXPORT_STATUS_TIMEOUT_SECONDS = 24 * 60 * 60
+RANK_ZERO_ACTION_STALE_TIMEOUT_SECONDS = 15 * 60
+RANK_ZERO_ACTION_HEARTBEAT_SECONDS = 30.0
+RANK_ZERO_STATUS_FILE_BYTES = 16 * 1024
 
 
 @contextmanager  # pyright: ignore[reportDeprecated]
@@ -396,6 +427,182 @@ def construct_training_model(
     return model, parameter_count, capacity, materialize_meta
 
 
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    """Durably replace a JSON control file without publishing partial bytes."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        if os.name != "nt":
+            directory_descriptor = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _control_status_paths(status_path: Path) -> tuple[Path, Path]:
+    return status_path, status_path.with_name(f"{status_path.name}.backup")
+
+
+def _bounded_status_text(value: object, *, max_bytes: int = 6000) -> str:
+    """Fit diagnostic text in a status envelope using a UTF-8 byte budget."""
+
+    normalized = "".join(character if ord(character) >= 32 else " " for character in str(value))
+    encoded = normalized.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return normalized
+    marker = "…"
+    tail_budget = max(0, max_bytes - len(marker.encode("utf-8")))
+    tail = encoded[-tail_budget:].decode("utf-8", errors="ignore") if tail_budget else ""
+    return marker + tail
+
+
+def _encode_control_status(payload: dict[str, Any]) -> bytes:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    if len(encoded) + 1 > RANK_ZERO_STATUS_FILE_BYTES:
+        raise ValueError("rank-zero status payload exceeds its preallocated file size")
+    return encoded + b" " * (RANK_ZERO_STATUS_FILE_BYTES - len(encoded) - 1) + b"\n"
+
+
+def _overwrite_control_status(handle: BinaryIO, payload: dict[str, Any]) -> None:
+    encoded = _encode_control_status(payload)
+    handle.seek(0)
+    written = handle.write(encoded)
+    if written != len(encoded):
+        raise OSError(f"short rank-zero status write: {written}/{len(encoded)} bytes")
+    handle.flush()
+    os.fsync(handle.fileno())
+
+
+def _initialize_control_status(
+    status_path: Path,
+    payload: dict[str, Any],
+) -> tuple[BinaryIO, BinaryIO]:
+    """Preallocate two writable status channels before a long rank-zero action."""
+
+    handles: list[BinaryIO] = []
+    try:
+        for path in _control_status_paths(status_path):
+            _atomic_write_json(path, payload)
+            handle = path.open("r+b", buffering=0)
+            _overwrite_control_status(handle, payload)
+            handles.append(handle)
+    except BaseException:
+        for handle in handles:
+            handle.close()
+        raise
+    return handles[0], handles[1]
+
+
+def _publish_control_status(
+    handles: tuple[BinaryIO, BinaryIO],
+    payload: dict[str, Any],
+) -> None:
+    failures: list[BaseException] = []
+    successes = 0
+    for handle in handles:
+        try:
+            _overwrite_control_status(handle, payload)
+            successes += 1
+        except BaseException as error:
+            failures.append(error)
+    if successes == 0:
+        raise RuntimeError("both preallocated rank-zero status channels failed") from failures[0]
+
+
+def _close_control_status(handles: tuple[BinaryIO, BinaryIO] | None) -> None:
+    if handles is None:
+        return
+    for handle in handles:
+        try:
+            handle.close()
+        except OSError:
+            pass
+
+
+def _read_control_status(status_path: Path) -> list[dict[str, Any]]:
+    statuses: list[dict[str, Any]] = []
+    for candidate in _control_status_paths(status_path):
+        try:
+            raw_status: object = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if isinstance(raw_status, dict):
+            statuses.append(cast(dict[str, Any], raw_status))
+    return statuses
+
+
+def _control_status_is_visible(
+    status_path: Path,
+    *,
+    schema: str,
+    invocation: str,
+) -> bool:
+    return any(
+        status.get("schema") == schema
+        and status.get("invocation") == invocation
+        and status.get("state") == "running"
+        for status in _read_control_status(status_path)
+    )
+
+
+def _wait_for_final_export_status(
+    status_path: Path,
+    *,
+    step: int,
+    release_name: str,
+    invocation: str,
+) -> None:
+    """Wait without a process-group timeout while rank 0 performs strict conversion."""
+
+    deadline = time.monotonic() + FINAL_EXPORT_STATUS_TIMEOUT_SECONDS
+    while True:
+        for status in _read_control_status(status_path):
+            matches_run = (
+                status.get("schema") == FINAL_EXPORT_STATUS_SCHEMA
+                and status.get("step") == step
+                and status.get("release_name") == release_name
+                and status.get("invocation") == invocation
+            )
+            if matches_run and status.get("state") == "complete":
+                return
+            if matches_run and status.get("state") == "failed":
+                error_type = status.get("error_type", "RuntimeError")
+                message = status.get("message", "unknown rank-0 export failure")
+                raise RuntimeError(f"rank 0 final export failed: {error_type}: {message}")
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                "timed out waiting for rank 0 final export after "
+                f"{FINAL_EXPORT_STATUS_TIMEOUT_SECONDS:g} seconds: {status_path}"
+            )
+        time.sleep(0.25)
+
+
 def export_final_model(
     model: torch.nn.Module,
     config: AppConfig,
@@ -409,36 +616,123 @@ def export_final_model(
     translation_capable: bool = True,
     languages: Sequence[str] | None = None,
     translation_directions: Sequence[Sequence[str]] | None = None,
+    pipeline_identity: dict[str, Any] | None = None,
 ) -> Path:
     """Create the required final format set from the restored best weights."""
 
     export_dir = run_root / stage / "exports" / "best"
+    status_path = export_dir.parent / f".{export_dir.name}.strict-export-status.json"
+    requested_formats = tuple(
+        formats if formats is not None else config.training.final_export_formats
+    )
     if translation_capable and translation_directions is None:
         translation_directions = config.data.configured_translation_directions()
-    export_inference_models(
-        export_dir,
-        model,
-        config.model,
-        context,
-        step=step,
-        formats=tuple(formats if formats is not None else config.training.final_export_formats),
-        release_name=release_name,
-        translation_capable=translation_capable,
-        tokenizer_path=config.data.tokenizer_model,
-        token_features_path=(
-            config.data.tokenizer_features
-            if config.model.experimental.morphoscript_enabled
-            else None
-        ),
-        language_pairs=(
-            config.data.configured_language_pairs() if translation_capable else None
-        ),
-        languages=languages,
-        translation_directions=translation_directions,
-        bidirectional=config.data.bidirectional,
-        revision_trained=config.data.revision_examples,
-        strict=True,
-    )
+    status_handles: tuple[BinaryIO, BinaryIO] | None = None
+    invocation = "single-process"
+    if context.distributed:
+        invocation = broadcast_text(
+            secrets.token_hex(16) if context.is_main else None,
+            context,
+        )
+        initialized_handles = _run_rank_zero_action(
+            context,
+            lambda: _initialize_control_status(
+                status_path,
+                {
+                    "schema": FINAL_EXPORT_STATUS_SCHEMA,
+                    "state": "running",
+                    "invocation": invocation,
+                    "step": step,
+                    "release_name": release_name,
+                    "formats": list(requested_formats),
+                },
+            ),
+            description="publishing final export start state",
+        )
+        if context.is_main:
+            assert initialized_handles is not None
+            status_handles = initialized_handles
+        visibility_scope = distributed_failure_scope(
+            not _control_status_is_visible(
+                status_path,
+                schema=FINAL_EXPORT_STATUS_SCHEMA,
+                invocation=invocation,
+            ),
+            context,
+        )
+        if visibility_scope != "none":
+            _close_control_status(status_handles)
+            raise RuntimeError(
+                "final export status is not coherently visible to every distributed rank"
+            )
+    try:
+        export_inference_models(
+            export_dir,
+            model,
+            config.model,
+            context,
+            step=step,
+            formats=requested_formats,
+            release_name=release_name,
+            translation_capable=translation_capable,
+            pipeline_identity=pipeline_identity,
+            tokenizer_path=config.data.tokenizer_model,
+            token_features_path=(
+                config.data.tokenizer_features
+                if config.model.experimental.morphoscript_enabled
+                else None
+            ),
+            language_pairs=(
+                config.data.configured_language_pairs() if translation_capable else None
+            ),
+            languages=languages,
+            translation_directions=translation_directions,
+            bidirectional=config.data.bidirectional,
+            revision_trained=config.data.revision_examples,
+            strict=True,
+        )
+    except BaseException as error:
+        if context.distributed and context.is_main and status_handles is not None:
+            try:
+                _publish_control_status(
+                    status_handles,
+                    {
+                        "schema": FINAL_EXPORT_STATUS_SCHEMA,
+                        "state": "failed",
+                        "invocation": invocation,
+                        "step": step,
+                        "release_name": release_name,
+                        "error_type": type(error).__name__,
+                        "message": _bounded_status_text(error),
+                    },
+                )
+            finally:
+                _close_control_status(status_handles)
+        raise
+    if context.distributed:
+        if context.is_main:
+            assert status_handles is not None
+            try:
+                _publish_control_status(
+                    status_handles,
+                    {
+                        "schema": FINAL_EXPORT_STATUS_SCHEMA,
+                        "state": "complete",
+                        "invocation": invocation,
+                        "step": step,
+                        "release_name": release_name,
+                        "formats": list(requested_formats),
+                    },
+                )
+            finally:
+                _close_control_status(status_handles)
+        else:
+            _wait_for_final_export_status(
+                status_path,
+                step=step,
+                release_name=release_name,
+                invocation=invocation,
+            )
     return export_dir
 
 
@@ -601,12 +895,160 @@ def resolve_config(args: argparse.Namespace) -> tuple[AppConfig, dict[str, Any],
     return config_from_raw(raw), raw, source
 
 
-def ensure_artifacts(
+def _artifact_mutation_roots(
+    config: AppConfig,
+    foundation_plan: Any,
+    *,
+    prepare_foundation: bool,
+) -> tuple[Path, ...]:
+    """Return every sibling namespace that artifact preparation may mutate."""
+
+    mutation_roots = {
+        Path(config.data.tokenizer_model).resolve().parent,
+        Path(config.data.dataset_dir).resolve().parent,
+    }
+    if foundation_plan.enabled and prepare_foundation:
+        mutation_roots.add(Path(config.foundation.dataset_dir).resolve().parent)
+    return tuple(
+        sorted(
+            mutation_roots,
+            key=lambda path: os.path.normcase(str(path)),
+        )
+    )
+
+
+@contextmanager  # pyright: ignore[reportDeprecated]
+def coordinated_artifact_run_locks(
+    config: AppConfig,
+    foundation_plan: Any,
+    context: DistributedContext,
+) -> Iterator[tuple[Path, ...]]:
+    """Hold an exclusive read/write lease on every artifact root for the run."""
+
+    roots = _artifact_mutation_roots(
+        config,
+        foundation_plan,
+        # A foundation-enabled run may open this dataset well after initial
+        # preparation, so its lease is needed even when SFT resume initially
+        # defers foundation preparation.
+        prepare_foundation=bool(foundation_plan.enabled),
+    )
+    scope = ExitStack()
+    acquisition_error: Exception | None = None
+    if context.is_main:
+        try:
+            for root in roots:
+                scope.enter_context(artifact_lock(root))
+        except Exception as error:
+            acquisition_error = error
+    try:
+        acquisition_failed = broadcast_bool(acquisition_error is not None, context)
+        if acquisition_failed:
+            if acquisition_error is not None:
+                raise acquisition_error
+            raise RuntimeError("rank 0 could not acquire the artifact run leases")
+        yield roots
+    finally:
+        scope.close()
+
+
+def _prepared_artifact_identity(
+    config: AppConfig,
+    foundation_plan: Any,
+    *,
+    prepare_foundation: bool,
+) -> dict[str, Any]:
+    """Hash the small files that bind every rank to one prepared generation."""
+
+    def required_file(path: Path) -> dict[str, Any]:
+        if not path.is_file():
+            raise FileNotFoundError(f"required prepared artifact is missing: {path}")
+        return {
+            "filename": path.name,
+            "size": path.stat().st_size,
+            "sha256": file_sha256(path),
+        }
+
+    def optional_file(path: Path) -> dict[str, Any]:
+        if not path.exists():
+            return {"filename": path.name, "status": "missing"}
+        return required_file(path)
+
+    tokenizer_path = Path(config.data.tokenizer_model)
+    dataset_dir = Path(config.data.dataset_dir)
+    translation_inventory_sha256 = validate_dataset_artifact_inventory(dataset_dir)
+    identity: dict[str, Any] = {
+        "tokenizer": required_file(tokenizer_path),
+        "tokenizer_metadata": optional_file(tokenizer_path.parent / "tokenizer_metadata.json"),
+        "translation_manifest": required_file(dataset_dir / "manifest.json"),
+        "translation_raw_fingerprint": required_file(dataset_dir / "raw_fingerprint.json"),
+        "translation_artifact_inventory_sha256": translation_inventory_sha256,
+    }
+    if config.model.experimental.morphoscript_enabled:
+        identity["token_features"] = required_file(Path(config.data.tokenizer_features))
+    else:
+        identity["token_features"] = {"status": "not-configured"}
+    if foundation_plan.enabled and prepare_foundation:
+        foundation_inventory_sha256 = validate_dataset_artifact_inventory(
+            config.foundation.dataset_dir
+        )
+        identity["foundation_manifest"] = required_file(
+            Path(config.foundation.dataset_dir) / "manifest.json"
+        )
+        identity["foundation_artifact_inventory_sha256"] = foundation_inventory_sha256
+    else:
+        identity["foundation_manifest"] = {"status": "not-prepared"}
+        identity["foundation_artifact_inventory_sha256"] = {"status": "not-prepared"}
+    return identity
+
+
+def _verify_prepared_artifact_consensus(
+    config: AppConfig,
+    foundation_plan: Any,
+    context: DistributedContext,
+    *,
+    prepare_foundation: bool,
+) -> dict[str, Any]:
+    """Require every rank to observe byte-identical prepared control artifacts."""
+
+    identity: dict[str, Any] | None = None
+    identity_error: Exception | None = None
+    try:
+        identity = _prepared_artifact_identity(
+            config,
+            foundation_plan,
+            prepare_foundation=prepare_foundation,
+        )
+    except Exception as error:
+        identity_error = error
+    failure_scope = distributed_failure_scope(identity_error is not None, context)
+    if failure_scope != "none":
+        failure = RuntimeError(
+            "prepared artifact visibility or readability differs across distributed ranks"
+            if failure_scope == "partial"
+            else "prepared artifacts are incomplete or unreadable"
+        )
+        if identity_error is not None:
+            raise failure from identity_error
+        raise failure
+    assert identity is not None
+    if not context.distributed:
+        return identity
+    local_digest = _mapping_sha256(identity)
+    expected_digest = broadcast_text(local_digest if context.is_main else None, context)
+    mismatch_scope = distributed_failure_scope(local_digest != expected_digest, context)
+    if mismatch_scope != "none":
+        raise RuntimeError("prepared tokenizer/dataset generation differs across distributed ranks")
+    return identity
+
+
+def _ensure_artifacts_on_main(
     config: AppConfig,
     context: DistributedContext,
     foundation_plan: Any | None = None,
     *,
     prepare_foundation: bool = True,
+    locks_held: bool = False,
 ) -> None:
     """토크나이저와 준비된 데이터셋이 없거나 낡았으면 자동으로 만듭니다.
 
@@ -616,9 +1058,8 @@ def ensure_artifacts(
     - 데이터셋: ``data/`` 의 파일 이름+크기 지문을 기록해 두고, 지문이
       달라지면(파일 추가/변경) 기존 데이터셋을 옆으로 보관한 뒤 다시 만듭니다.
 
-    무거운 작업이므로 rank 0 만 수행하고 나머지 rank 는 barrier 에서
-    기다립니다. 다중 GPU 로 처음 실행하기 전에 단일 프로세스로 한 번
-    실행해 준비를 끝내 두는 편이 통신 타임아웃 걱정이 없습니다.
+    이 내부 구현은 rank 0에서만 호출됩니다. 분산 peer 대기는 process-group
+    collective가 아니라 ``ensure_artifacts``의 durable status channel이 맡습니다.
     """
 
     if foundation_plan is None:
@@ -638,8 +1079,16 @@ def ensure_artifacts(
     # 서로 다른 세대의 토크나이저와 데이터셋이 같은 경로에 섞입니다. 실패가
     # 아니라 **섞인 상태**라 지문 검사는 그 조합을 처음 보는 것으로만 인식합니다.
     with ExitStack() as artifact_scope:
-        if context.is_main:
-            artifact_scope.enter_context(artifact_lock(Path(config.data.dataset_dir).parent))
+        if context.is_main and not locks_held:
+            # Every run acquires the same target-root locks in the same order.
+            # A tokenizer or foundation dataset may live outside the translation
+            # dataset parent, and therefore cannot be protected by that one lock.
+            for mutation_root in _artifact_mutation_roots(
+                config,
+                foundation_plan,
+                prepare_foundation=prepare_foundation,
+            ):
+                artifact_scope.enter_context(artifact_lock(mutation_root))
         if context.is_main:
             data_dir = Path(config.data.raw_dir)
             tokenizer_path = Path(config.data.tokenizer_model)
@@ -657,6 +1106,13 @@ def ensure_artifacts(
                     f"준비된 데이터셋은 있지만 대응하는 토크나이저가 없습니다: {tokenizer_path}. "
                     "원천 데이터와 새 출력 경로를 지정해 새 run을 시작하세요."
                 )
+            if not files and dataset_ready:
+                integrity_problem = dataset_artifact_problem(dataset_dir)
+                if integrity_problem is not None:
+                    raise RuntimeError(
+                        "준비된 번역 데이터셋 payload가 손상됐지만 다시 만들 원천 "
+                        f"데이터가 없습니다: {integrity_problem}"
+                    )
 
             if files:
                 cpu_plan = build_cpu_plan(input_files=len(files))
@@ -752,15 +1208,24 @@ def ensure_artifacts(
                             "별도 백업으로 옮기고 split_digits=True로 다시 준비하십시오."
                         )
                 stored = stored_fingerprint(dataset_dir) if dataset_ready else None
-                if not dataset_ready or stored != files:
+                integrity_problem = (
+                    dataset_artifact_problem(dataset_dir)
+                    if dataset_ready and stored == files
+                    else None
+                )
+                if not dataset_ready or stored != files or integrity_problem is not None:
                     from sion_translate.data.prepare import prepare_dataset
 
                     if dataset_ready:
                         backup = backup_stale_dataset(dataset_dir)
                         reason = (
-                            "호환 가능한 지문 없음"
-                            if stored is None
-                            else "원천/토크나이저/전처리 변경"
+                            f"indexed payload 무결성 실패 ({integrity_problem})"
+                            if integrity_problem is not None
+                            else (
+                                "호환 가능한 지문 없음"
+                                if stored is None
+                                else "원천/토크나이저/전처리 변경"
+                            )
                         )
                         announce(
                             f"{reason} 감지 → 기존 데이터셋을 {backup.name}/ 으로 보관합니다.",
@@ -826,7 +1291,7 @@ def ensure_artifacts(
                     if foundation_problem is None:
                         announce("foundation 데이터셋 최신 상태 확인.", context)
                     else:
-                        if foundation_dataset.exists() and any(foundation_dataset.iterdir()):
+                        if foundation_dataset.exists() or foundation_dataset.is_symlink():
                             backup = backup_stale_dataset(foundation_dataset)
                             announce(
                                 f"{foundation_problem} → 기존 foundation 데이터셋을 "
@@ -857,11 +1322,750 @@ def ensure_artifacts(
                         )
                         for line in render_prepare_report(foundation_stats):
                             announce(f"  {line}", context)
-    # 준비가 끝날 때까지 다른 rank 들이 기다립니다.
-    barrier(context)
+
+
+def ensure_artifacts(
+    config: AppConfig,
+    context: DistributedContext,
+    foundation_plan: Any | None = None,
+    *,
+    prepare_foundation: bool = True,
+    locks_held: bool = False,
+) -> None:
+    """Prepare artifacts on rank 0 without timing out the training process group."""
+
+    if foundation_plan is None:
+        foundation_plan = plan_foundation_stage(config)
+    if not locks_held:
+        with coordinated_artifact_run_locks(config, foundation_plan, context):
+            ensure_artifacts(
+                config,
+                context,
+                foundation_plan,
+                prepare_foundation=prepare_foundation,
+                locks_held=True,
+            )
+        return
+    _run_long_rank_zero_action(
+        context,
+        Path(config.training.output_dir) / ".artifact-preparation-status.json",
+        operation="artifact preparation",
+        action=lambda: _ensure_artifacts_on_main(
+            config,
+            context,
+            foundation_plan,
+            prepare_foundation=prepare_foundation,
+            locks_held=locks_held,
+        ),
+    )
+    _verify_prepared_artifact_consensus(
+        config,
+        foundation_plan,
+        context,
+        prepare_foundation=prepare_foundation,
+    )
 
 
 FOUNDATION_COMPLETION_FILENAME = "stage_complete.json"
+FOUNDATION_COMPLETION_SCHEMA = "sion-foundation-completion-v2"
+_RankZeroActionT = TypeVar("_RankZeroActionT")
+
+
+def _read_foundation_completion(completion: Path) -> dict[str, Any] | None:
+    try:
+        raw_marker: object = json.loads(completion.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw_marker, dict):
+        return None
+    return cast(dict[str, Any], raw_marker)
+
+
+def _atomic_write_foundation_completion(
+    completion: Path,
+    marker: dict[str, Any],
+) -> None:
+    """Durably publish a completion marker without exposing partial JSON."""
+
+    _atomic_write_json(completion, marker)
+
+
+def _foundation_untrusted_derivatives(
+    run_root: Path,
+    *,
+    trusted_best_artifact_sha256: str | None,
+) -> tuple[Path, ...]:
+    """Return completion/export and best generations not bound by latest."""
+
+    untrusted = [
+        run_root / FOUNDATION_COMPLETION_FILENAME,
+        run_root / "exports" / "best",
+    ]
+    for best_generation in (
+        run_root / "checkpoints" / "best",
+        run_root / "checkpoints" / ".best.previous",
+    ):
+        if not (best_generation.exists() or best_generation.is_symlink()):
+            continue
+        try:
+            matches_latest = (
+                trusted_best_artifact_sha256 is not None
+                and _checkpoint_artifact_sha256(best_generation) == trusted_best_artifact_sha256
+            )
+        except (OSError, RuntimeError, ValueError):
+            matches_latest = False
+        if not matches_latest:
+            untrusted.append(best_generation)
+    return tuple(untrusted)
+
+
+def _quarantine_untrusted_foundation_derivatives(
+    run_root: Path,
+    *,
+    trusted_best_artifact_sha256: str | None,
+) -> Path | None:
+    """Move only derivatives not content-bound by the resumable latest state."""
+
+    sources = tuple(
+        path
+        for path in _foundation_untrusted_derivatives(
+            run_root,
+            trusted_best_artifact_sha256=trusted_best_artifact_sha256,
+        )
+        if path.exists() or path.is_symlink()
+    )
+    if not sources:
+        return None
+    quarantine = run_root.with_name(
+        f"{run_root.name}.untrusted-derived-{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(4)}"
+    )
+    quarantine.mkdir(parents=False, exist_ok=False)
+    moved: list[tuple[Path, Path]] = []
+    try:
+        for source in sources:
+            destination = quarantine / source.relative_to(run_root)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(source, destination)
+            moved.append((source, destination))
+    except BaseException as quarantine_error:
+        rollback_errors: list[BaseException] = []
+        for source, destination in reversed(moved):
+            try:
+                source.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(destination, source)
+            except BaseException as error:
+                rollback_errors.append(error)
+        if rollback_errors:
+            failure = RuntimeError(
+                "failed to restore foundation derivatives after quarantine failed; "
+                f"recoverable artifacts remain at {quarantine}"
+            )
+            for error in rollback_errors:
+                failure.add_note(f"rollback error: {type(error).__name__}: {error}")
+            raise failure from quarantine_error
+        raise
+    return quarantine
+
+
+def _run_rank_zero_action(
+    context: DistributedContext,
+    action: Callable[[], _RankZeroActionT],
+    *,
+    description: str,
+) -> _RankZeroActionT | None:
+    """Run a rank-zero action and fail every rank at the same collective."""
+
+    result: _RankZeroActionT | None = None
+    failure: BaseException | None = None
+    if context.is_main:
+        try:
+            result = action()
+        except BaseException as error:
+            failure = error
+    failed = broadcast_bool(failure is not None, context)
+    if failed:
+        if failure is not None:
+            raise failure
+        raise RuntimeError(f"rank 0 failed while {description}")
+    return result
+
+
+def _wait_for_rank_zero_action(
+    status_path: Path,
+    *,
+    operation: str,
+    invocation: str,
+    stale_timeout_seconds: float,
+) -> Any:
+    """Wait for and return the exact terminal status for one invocation."""
+
+    last_progress = time.monotonic()
+    heartbeat_sequence: int | None = None
+    while True:
+        for status in _read_control_status(status_path):
+            matches_operation = (
+                status.get("schema") == RANK_ZERO_ACTION_STATUS_SCHEMA
+                and status.get("operation") == operation
+                and status.get("invocation") == invocation
+            )
+            if matches_operation and status.get("state") == "complete":
+                return status
+            if matches_operation and status.get("state") == "failed":
+                return status
+            if matches_operation and status.get("state") == "running":
+                raw_sequence = status.get("heartbeat_sequence")
+                if isinstance(raw_sequence, int) and not isinstance(raw_sequence, bool):
+                    if heartbeat_sequence != raw_sequence:
+                        heartbeat_sequence = raw_sequence
+                        last_progress = time.monotonic()
+        if time.monotonic() - last_progress >= stale_timeout_seconds:
+            raise TimeoutError(
+                f"rank 0 {operation} stopped publishing heartbeats for "
+                f"{stale_timeout_seconds:g} seconds: {status_path}"
+            )
+        time.sleep(0.25)
+
+
+def _rank_zero_action_ack_path(
+    status_path: Path,
+    *,
+    invocation: str,
+    rank: int,
+) -> Path:
+    if not re.fullmatch(r"[0-9a-f]{32}", invocation):
+        raise ValueError("rank-zero action invocation must be a 128-bit lowercase hex nonce")
+    if rank < 0:
+        raise ValueError("rank-zero action acknowledgement rank must be non-negative")
+    return status_path.with_name(f".{status_path.name}.{invocation}.ack-{rank:05d}.json")
+
+
+def _wait_for_rank_zero_action_acknowledgements(
+    status_path: Path,
+    *,
+    operation: str,
+    invocation: str,
+    expected_terminal_state: str | None,
+    world_size: int,
+    timeout_seconds: float,
+) -> None:
+    """Wait until every peer confirms it no longer depends on terminal status."""
+
+    pending = set(range(1, world_size))
+    deadline = time.monotonic() + timeout_seconds
+    peer_errors: list[str] = []
+    while pending:
+        for rank in tuple(pending):
+            ack_path = _rank_zero_action_ack_path(
+                status_path,
+                invocation=invocation,
+                rank=rank,
+            )
+            try:
+                raw_ack: object = json.loads(ack_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(raw_ack, dict):
+                continue
+            ack = cast(dict[str, Any], raw_ack)
+            if (
+                ack.get("schema") != RANK_ZERO_ACTION_STATUS_SCHEMA
+                or ack.get("operation") != operation
+                or ack.get("invocation") != invocation
+                or ack.get("rank") != rank
+                or ack.get("state") not in {"observed", "observer_error"}
+            ):
+                continue
+            if ack["state"] == "observer_error":
+                peer_errors.append(
+                    f"rank {rank}: {ack.get('message', 'unknown terminal observation error')}"
+                )
+            elif ack.get("terminal_state") != expected_terminal_state:
+                peer_errors.append(
+                    f"rank {rank}: observed terminal state {ack.get('terminal_state')!r}, "
+                    f"expected {expected_terminal_state!r}"
+                )
+            pending.remove(rank)
+        if pending and time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"rank-zero {operation} terminal acknowledgement timed out for ranks "
+                f"{sorted(pending)}"
+            )
+        if pending:
+            time.sleep(0.05)
+    if peer_errors:
+        raise RuntimeError(
+            f"rank-zero {operation} terminal status was not observed cleanly: "
+            + "; ".join(peer_errors)
+        )
+
+
+def _run_long_rank_zero_action(
+    context: DistributedContext,
+    status_path: Path,
+    *,
+    operation: str,
+    action: Callable[[], _RankZeroActionT],
+    stale_timeout_seconds: float = RANK_ZERO_ACTION_STALE_TIMEOUT_SECONDS,
+    heartbeat_interval_seconds: float = RANK_ZERO_ACTION_HEARTBEAT_SECONDS,
+) -> _RankZeroActionT:
+    """Run long rank-zero I/O without parking peers in a timed collective."""
+
+    if stale_timeout_seconds <= 0.0:
+        raise ValueError("rank-zero action stale timeout must be positive")
+    if heartbeat_interval_seconds <= 0.0:
+        raise ValueError("rank-zero action heartbeat interval must be positive")
+    if heartbeat_interval_seconds >= stale_timeout_seconds:
+        raise ValueError("rank-zero action heartbeat interval must be shorter than stale timeout")
+    if not context.distributed:
+        return action()
+    invocation = broadcast_text(
+        secrets.token_hex(16) if context.is_main else None,
+        context,
+    )
+    running = {
+        "schema": RANK_ZERO_ACTION_STATUS_SCHEMA,
+        "operation": operation,
+        "state": "running",
+        "invocation": invocation,
+        "heartbeat_sequence": 0,
+    }
+    initialized_handles = _run_rank_zero_action(
+        context,
+        lambda: _initialize_control_status(status_path, running),
+        description=f"publishing {operation} start state",
+    )
+    visibility_scope = distributed_failure_scope(
+        not _control_status_is_visible(
+            status_path,
+            schema=RANK_ZERO_ACTION_STATUS_SCHEMA,
+            invocation=invocation,
+        ),
+        context,
+    )
+    if visibility_scope != "none":
+        if context.is_main:
+            _close_control_status(initialized_handles)
+        raise RuntimeError(f"rank-zero {operation} status is not visible to every rank")
+    if not context.is_main:
+        ack_path = _rank_zero_action_ack_path(
+            status_path,
+            invocation=invocation,
+            rank=context.rank,
+        )
+        try:
+            terminal = _wait_for_rank_zero_action(
+                status_path,
+                operation=operation,
+                invocation=invocation,
+                stale_timeout_seconds=stale_timeout_seconds,
+            )
+        except BaseException as error:
+            _atomic_write_json(
+                ack_path,
+                {
+                    "schema": RANK_ZERO_ACTION_STATUS_SCHEMA,
+                    "operation": operation,
+                    "invocation": invocation,
+                    "rank": context.rank,
+                    "state": "observer_error",
+                    "message": _bounded_status_text(error),
+                },
+            )
+            raise
+        _atomic_write_json(
+            ack_path,
+            {
+                "schema": RANK_ZERO_ACTION_STATUS_SCHEMA,
+                "operation": operation,
+                "invocation": invocation,
+                "rank": context.rank,
+                "state": "observed",
+                "terminal_state": terminal.get("state"),
+            },
+        )
+        if terminal.get("state") == "failed":
+            error_type = terminal.get("error_type", "RuntimeError")
+            message = terminal.get("message", "unknown rank-0 action failure")
+            raise RuntimeError(f"rank 0 {operation} failed: {error_type}: {message}")
+        return cast(_RankZeroActionT, terminal.get("result"))
+
+    assert initialized_handles is not None
+    status_lock = threading.Lock()
+    heartbeat_stop = threading.Event()
+    heartbeat_errors: list[BaseException] = []
+
+    def publish_status(status: dict[str, Any]) -> None:
+        with status_lock:
+            _publish_control_status(initialized_handles, status)
+
+    def publish_heartbeats() -> None:
+        sequence = 0
+        while not heartbeat_stop.wait(heartbeat_interval_seconds):
+            sequence += 1
+            try:
+                publish_status(
+                    {
+                        "schema": RANK_ZERO_ACTION_STATUS_SCHEMA,
+                        "operation": operation,
+                        "state": "running",
+                        "invocation": invocation,
+                        "heartbeat_sequence": sequence,
+                    }
+                )
+            except BaseException as error:
+                heartbeat_errors.append(error)
+                return
+
+    heartbeat_thread = threading.Thread(
+        target=publish_heartbeats,
+        name=f"sion-{operation}-heartbeat",
+        daemon=True,
+    )
+    heartbeat_thread.start()
+
+    def stop_heartbeat() -> None:
+        heartbeat_stop.set()
+        heartbeat_thread.join()
+
+    result: Any = None
+    terminal_error: BaseException | None = None
+    published_terminal_state: str | None = None
+    try:
+        try:
+            result = action()
+            # The terminal state must be the final write. Otherwise a heartbeat
+            # that wakes immediately after ``complete`` can overwrite it with
+            # ``running`` and strand every peer until the stale timeout.
+            stop_heartbeat()
+            if heartbeat_errors:
+                raise RuntimeError(
+                    f"failed to publish rank-zero {operation} heartbeat"
+                ) from heartbeat_errors[0]
+        except BaseException as error:
+            stop_heartbeat()
+            try:
+                publish_status(
+                    {
+                        "schema": RANK_ZERO_ACTION_STATUS_SCHEMA,
+                        "operation": operation,
+                        "state": "failed",
+                        "invocation": invocation,
+                        "error_type": type(error).__name__,
+                        "message": _bounded_status_text(error),
+                    },
+                )
+            except BaseException as publication_error:
+                terminal_error = publication_error
+            else:
+                terminal_error = error
+                published_terminal_state = "failed"
+        else:
+            try:
+                publish_status(
+                    {
+                        "schema": RANK_ZERO_ACTION_STATUS_SCHEMA,
+                        "operation": operation,
+                        "state": "complete",
+                        "invocation": invocation,
+                        "result": result,
+                    },
+                )
+            except BaseException as error:
+                terminal_error = error
+            else:
+                published_terminal_state = "complete"
+        try:
+            _wait_for_rank_zero_action_acknowledgements(
+                status_path,
+                operation=operation,
+                invocation=invocation,
+                expected_terminal_state=published_terminal_state,
+                world_size=context.world_size,
+                timeout_seconds=stale_timeout_seconds,
+            )
+        except BaseException as acknowledgement_error:
+            if terminal_error is None:
+                terminal_error = acknowledgement_error
+            else:
+                terminal_error.add_note(
+                    "terminal acknowledgement error: "
+                    f"{type(acknowledgement_error).__name__}: {acknowledgement_error}"
+                )
+    finally:
+        stop_heartbeat()
+        _close_control_status(initialized_handles)
+        for rank in range(1, context.world_size):
+            _rank_zero_action_ack_path(
+                status_path,
+                invocation=invocation,
+                rank=rank,
+            ).unlink(missing_ok=True)
+    if terminal_error is not None:
+        raise terminal_error
+    return cast(_RankZeroActionT, result)
+
+
+def _mapping_sha256(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _foundation_checkpoint_identity(
+    foundation_config: AppConfig,
+    context: DistributedContext,
+) -> dict[str, Any]:
+    """Rebuild the exact identity used by the foundation trainer."""
+
+    effective_bucket_size = max(
+        foundation_config.data.bucket_size,
+        foundation_config.training.batch_size_per_gpu * context.world_size,
+    )
+    sampler_contract = SimpleNamespace(
+        seed=foundation_config.training.seed,
+        batch_size=foundation_config.training.batch_size_per_gpu,
+        drop_last=True,
+        bucket_size=effective_bucket_size,
+    )
+    return build_training_checkpoint_identity(
+        foundation_config,
+        batch_sampler=sampler_contract,
+        context=context,
+        stage_name="foundation/denoising",
+        include_posttraining=False,
+    )
+
+
+def _checkpoint_artifact_sha256(checkpoint: Path) -> str:
+    """Digest the local payload, DCP inventory marker, or legacy metadata binding."""
+
+    local_payload = checkpoint / "checkpoint.pt"
+    dcp_marker = checkpoint / DCP_COMPLETION_FILENAME
+    dcp_metadata = checkpoint / ".metadata"
+    has_distributed_payload = dcp_marker.is_file() or dcp_metadata.is_file()
+    if local_payload.is_file() and has_distributed_payload:
+        raise ValueError(f"checkpoint mixes local and distributed payload formats: {checkpoint}")
+    if local_payload.is_file():
+        return file_sha256(local_payload)
+    if dcp_marker.is_file():
+        return file_sha256(dcp_marker)
+    if dcp_metadata.is_file():
+        # This digest is diagnostic only. Pre-v2 DCP has no historical shard
+        # inventory and coordinated resume deliberately refuses to trust it.
+        return file_sha256(dcp_metadata)
+    raise FileNotFoundError(f"checkpoint has no authenticated payload: {checkpoint}")
+
+
+def _foundation_checkpoint_artifact_sha256(checkpoint: Path) -> str:
+    """Backward-compatible foundation name for the generic artifact binding."""
+
+    return _checkpoint_artifact_sha256(checkpoint)
+
+
+def _resolve_bound_foundation_checkpoint(
+    checkpoint: Path,
+    marker: dict[str, Any],
+    context: DistributedContext,
+) -> Path:
+    """Find the current/previous generation named by the completion marker.
+
+    Distributed shard bytes are authenticated later by a generation lease (or,
+    for lineage-only rank-zero inspection, by checkpoint preflight). This helper
+    intentionally reads only the small v2 marker while choosing a candidate.
+    """
+
+    expected_digest = marker.get("checkpoint_artifact_sha256")
+    if not isinstance(expected_digest, str):
+        raise ValueError("foundation completion marker has no checkpoint artifact digest")
+    previous = checkpoint.with_name(f".{checkpoint.name}.previous")
+    failures: list[str] = []
+    candidates = (
+        checkpoint_generation_candidates(checkpoint, context)
+        if context.distributed
+        else (checkpoint, previous)
+    )
+    for candidate in candidates:
+        try:
+            if not context.distributed:
+                resolved = resolve_checkpoint_source(candidate, context)
+                if resolved != candidate:
+                    failures.append(f"{candidate.name}: resolved to {resolved.name}")
+                    continue
+            actual_digest = _foundation_checkpoint_artifact_sha256(candidate)
+        except (FileNotFoundError, OSError, RuntimeError, ValueError) as error:
+            failures.append(f"{candidate.name}: {error}")
+            continue
+        if actual_digest == expected_digest:
+            return candidate
+        failures.append(f"{candidate.name}: digest mismatch")
+    raise ValueError(
+        "no authenticated foundation checkpoint generation matches the completion marker "
+        f"({'; '.join(failures)})"
+    )
+
+
+def _has_unverifiable_legacy_dcp_generation(checkpoint: Path) -> bool:
+    """Whether current/previous contains DCP bytes without historical hashes."""
+
+    previous = checkpoint.with_name(f".{checkpoint.name}.previous")
+    for generation in (checkpoint, previous):
+        if not (generation / ".metadata").is_file():
+            continue
+        marker_path = generation / DCP_COMPLETION_FILENAME
+        try:
+            raw_marker: object = json.loads(marker_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return True
+        if not isinstance(raw_marker, dict) or raw_marker.get("schema") != DCP_COMPLETION_SCHEMA:
+            return True
+    return False
+
+
+def _inspect_foundation_resume(
+    foundation_config: AppConfig,
+    context: DistributedContext,
+) -> dict[str, Any]:
+    candidate = find_auto_resume(foundation_config)
+    if candidate is None:
+        return {"state": "absent"}
+    latest = Path(candidate)
+    previous = latest.with_name(f".{latest.name}.previous")
+    try:
+        if context.distributed:
+            candidates = checkpoint_generation_candidates(latest, context)
+            if not candidates:
+                if _has_unverifiable_legacy_dcp_generation(latest):
+                    return {
+                        "state": "untrusted_legacy",
+                        "reason": (
+                            "foundation resume has only markerless/legacy DCP shards with "
+                            "no historical content digests"
+                        ),
+                    }
+                raise FileNotFoundError(
+                    "foundation resume has no structurally complete v2 generation"
+                )
+            source = candidates[0]
+        else:
+            local_errors: list[str] = []
+            source = latest
+            for local_candidate in (latest, previous):
+                try:
+                    source = resolve_checkpoint_source(local_candidate, context)
+                except Exception as error:
+                    local_errors.append(f"{local_candidate.name}: {error}")
+                    continue
+                break
+            else:
+                raise FileNotFoundError(
+                    "foundation resume has no local current/previous generation: "
+                    + "; ".join(local_errors)
+                )
+        digest = _foundation_checkpoint_artifact_sha256(source)
+    except Exception as error:
+        return {"state": "invalid", "reason": _bounded_status_text(error)}
+    return {
+        "state": "available",
+        "generation": "previous" if source == previous else "current",
+        "checkpoint_artifact_sha256": digest,
+    }
+
+
+def _foundation_export_is_complete(
+    export_dir: Path,
+    *,
+    required_formats: Sequence[str],
+    release_name: str,
+) -> bool:
+    """Verify the complete base-model export generation before reusing it."""
+
+    manifest_path = export_dir / "export_manifest.json"
+    try:
+        raw_manifest: object = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(raw_manifest, dict):
+            return False
+        manifest = cast(dict[str, Any], raw_manifest)
+        formats = manifest.get("formats")
+        if not isinstance(formats, dict):
+            return False
+        for format_name in required_formats:
+            entry = formats.get(format_name)
+            if not isinstance(entry, dict) or entry.get("status") != "ok":
+                return False
+        report = validate_export_directory(
+            export_dir,
+            expected_release_name=release_name,
+            expected_release_version=MODEL_RELEASE_VERSION,
+            expected_translation_capable=False,
+        )
+        return bool(report.get("valid"))
+    except (
+        OSError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ):
+        return False
+
+
+def _foundation_completion_marker(
+    *,
+    config: AppConfig,
+    foundation_plan: Any,
+    foundation_config: AppConfig,
+    checkpoint_identity: dict[str, Any],
+    checkpoint_source: Path,
+    selected_step: int,
+    best_validation_loss: float | None,
+    export_dir: Path,
+) -> dict[str, Any]:
+    manifest_path = export_dir / "export_manifest.json"
+    marker: dict[str, Any] = {
+        "schema": FOUNDATION_COMPLETION_SCHEMA,
+        "stage": "foundation",
+        "release_name": config.foundation.release_name,
+        "release_version": MODEL_RELEASE_VERSION,
+        "languages": list(foundation_plan.languages),
+        "selected_step": selected_step,
+        "foundation_manifest_sha256": file_sha256(
+            Path(foundation_config.data.dataset_dir) / "manifest.json"
+        ),
+        "tokenizer_sha256": file_sha256(config.data.tokenizer_model),
+        "checkpoint_identity_sha256": _mapping_sha256(checkpoint_identity),
+        "checkpoint_artifact_sha256": _foundation_checkpoint_artifact_sha256(checkpoint_source),
+        "export_manifest_sha256": file_sha256(manifest_path),
+    }
+    if best_validation_loss is not None and math.isfinite(best_validation_loss):
+        marker["best_validation_loss"] = best_validation_loss
+    return marker
+
+
+def _update_foundation_export_binding(
+    completion: Path,
+    marker: dict[str, Any],
+    *,
+    checkpoint_source: Path,
+    export_dir: Path,
+) -> None:
+    """Update only the export digest while preserving the trusted checkpoint binding."""
+
+    current = _read_foundation_completion(completion)
+    if current != marker:
+        raise RuntimeError("foundation completion marker changed during export repair")
+    if marker.get("checkpoint_artifact_sha256") != _foundation_checkpoint_artifact_sha256(
+        checkpoint_source
+    ):
+        raise RuntimeError("foundation checkpoint changed during export repair")
+    updated = dict(marker)
+    updated["export_manifest_sha256"] = file_sha256(export_dir / "export_manifest.json")
+    _atomic_write_foundation_completion(completion, updated)
 
 
 def _foundation_completion_matches_inputs(
@@ -874,15 +2078,140 @@ def _foundation_completion_matches_inputs(
 
     manifest_path = Path(dataset_dir) / "manifest.json"
     try:
-        raw_marker: object = json.loads(completion.read_text(encoding="utf-8"))
-        if not isinstance(raw_marker, dict):
+        marker = _read_foundation_completion(completion)
+        if marker is None:
             return False
-        marker = cast(dict[str, Any], raw_marker)
         return marker.get("foundation_manifest_sha256") == file_sha256(
             manifest_path
         ) and marker.get("tokenizer_sha256") == file_sha256(tokenizer_path)
-    except (OSError, json.JSONDecodeError):
+    except OSError:
         return False
+
+
+def _foundation_marker_contract_matches(
+    marker: dict[str, Any],
+    *,
+    config: AppConfig,
+    foundation_plan: Any,
+    checkpoint_identity: dict[str, Any],
+) -> bool:
+    return bool(
+        marker.get("schema") == FOUNDATION_COMPLETION_SCHEMA
+        and marker.get("stage") == "foundation"
+        and marker.get("release_name") == config.foundation.release_name
+        and marker.get("release_version") == MODEL_RELEASE_VERSION
+        and marker.get("languages") == list(foundation_plan.languages)
+        and marker.get("checkpoint_identity_sha256") == _mapping_sha256(checkpoint_identity)
+        and all(
+            isinstance(marker.get(field), str) and len(cast(str, marker.get(field))) == 64
+            for field in (
+                "foundation_manifest_sha256",
+                "tokenizer_sha256",
+                "checkpoint_identity_sha256",
+                "checkpoint_artifact_sha256",
+                "export_manifest_sha256",
+            )
+        )
+        and not isinstance(marker.get("selected_step"), bool)
+        and isinstance(marker.get("selected_step"), int)
+    )
+
+
+def _foundation_dataset_problem_for_lineage(
+    config: AppConfig,
+    foundation_plan: Any,
+) -> str | None:
+    return foundation_dataset_problem(
+        config.foundation.dataset_dir,
+        foundation_plan.discovery,
+        config.data.tokenizer_model,
+        minimum_characters=config.foundation.minimum_characters,
+        maximum_characters=config.foundation.maximum_characters,
+        max_tokens=config.data.max_source_length - 2,
+        max_target_tokens=config.data.max_target_length - 1,
+        deduplicate=config.foundation.deduplicate,
+        shard_size=config.foundation.shard_size,
+        validation_fraction=config.foundation.validation_fraction,
+        reasoning_sample_share=config.foundation.reasoning_sample_share,
+        language_sampling_alpha=config.foundation.language_sampling_alpha,
+        minimum_language_share=config.foundation.minimum_language_share,
+        release_name=config.foundation.release_name,
+    )
+
+
+def _inspect_foundation_lineage(
+    config: AppConfig,
+    foundation_plan: Any,
+    context: DistributedContext,
+) -> dict[str, Any]:
+    """Return one verified base generation suitable for translation ancestry."""
+
+    if not foundation_plan.enabled:
+        raise ValueError("translation-only pipeline has no foundation lineage")
+    foundation_problem = _foundation_dataset_problem_for_lineage(config, foundation_plan)
+    if foundation_problem is not None:
+        raise RuntimeError(f"foundation prepared inputs are stale: {foundation_problem}")
+    foundation_config = build_foundation_config(config)
+    checkpoint_identity = _foundation_checkpoint_identity(foundation_config, context)
+    run_root = foundation_run_directory(config)
+    completion = run_root / FOUNDATION_COMPLETION_FILENAME
+    marker = _read_foundation_completion(completion)
+    if marker is None or not _foundation_marker_contract_matches(
+        marker,
+        config=config,
+        foundation_plan=foundation_plan,
+        checkpoint_identity=checkpoint_identity,
+    ):
+        raise RuntimeError("foundation completion marker does not match the current base contract")
+    if not _foundation_completion_matches_inputs(
+        completion,
+        dataset_dir=foundation_config.data.dataset_dir,
+        tokenizer_path=config.data.tokenizer_model,
+    ):
+        raise RuntimeError(
+            "foundation completion marker does not match the current prepared inputs"
+        )
+    source = _resolve_bound_foundation_checkpoint(
+        run_root / "checkpoints" / "best",
+        marker,
+        context,
+    )
+    checkpoint_step = preflight_checkpoint_identity(
+        source,
+        context,
+        checkpoint_identity,
+    )
+    if checkpoint_step != marker["selected_step"]:
+        raise RuntimeError(
+            "foundation completion marker selected_step does not match its checkpoint"
+        )
+    return {
+        "schema": FOUNDATION_LINEAGE_SCHEMA,
+        "release_name": marker["release_name"],
+        "release_version": marker["release_version"],
+        "languages": list(marker["languages"]),
+        "selected_step": int(marker["selected_step"]),
+        "foundation_manifest_sha256": marker["foundation_manifest_sha256"],
+        "tokenizer_sha256": marker["tokenizer_sha256"],
+        "checkpoint_identity_sha256": marker["checkpoint_identity_sha256"],
+        "checkpoint_artifact_sha256": marker["checkpoint_artifact_sha256"],
+    }
+
+
+def resolve_foundation_lineage(
+    config: AppConfig,
+    foundation_plan: Any,
+    context: DistributedContext,
+) -> dict[str, Any]:
+    """Resolve base ancestry on rank 0 and publish the exact mapping to peers."""
+
+    raw_lineage = _run_long_rank_zero_action(
+        context,
+        foundation_run_directory(config) / ".foundation-lineage-status.json",
+        operation="foundation lineage validation",
+        action=lambda: _inspect_foundation_lineage(config, foundation_plan, context),
+    )
+    return raw_lineage
 
 
 def _foundation_source_sampling_weights(
@@ -1047,6 +2376,9 @@ def run_foundation_stage(
     model: torch.nn.Module,
     tokenizer: SionTokenizer,
     context: DistributedContext,
+    *,
+    artifacts_verified: bool = False,
+    _resume_lease_scope: ExitStack | None = None,
 ) -> FoundationOutcome:
     """번역 학습 전에 복원과 선택적 reasoning으로 encoder-decoder를 만든다.
 
@@ -1058,75 +2390,392 @@ def run_foundation_stage(
 
     if not foundation_plan.enabled:
         return FoundationOutcome(ran=False, reason=foundation_plan.reason)
+    if _resume_lease_scope is None:
+        with ExitStack() as resume_lease_scope:
+            return run_foundation_stage(
+                config,
+                foundation_plan,
+                model,
+                tokenizer,
+                context,
+                artifacts_verified=artifacts_verified,
+                _resume_lease_scope=resume_lease_scope,
+            )
 
     foundation_config = build_foundation_config(config)
     run_root = foundation_run_directory(config)
     completion = run_root / FOUNDATION_COMPLETION_FILENAME
     best_checkpoint = run_root / "checkpoints" / "best"
+    final_export_dir = run_root / "exports" / "best"
+    checkpoint_identity = _foundation_checkpoint_identity(foundation_config, context)
+    marker = _read_foundation_completion(completion) if context.is_main else None
+    marker_is_current_here = bool(
+        context.is_main
+        and marker is not None
+        and marker.get("schema") == FOUNDATION_COMPLETION_SCHEMA
+    )
+    completed_inputs_match_here = bool(
+        context.is_main
+        and marker is not None
+        and _foundation_completion_matches_inputs(
+            completion,
+            dataset_dir=foundation_config.data.dataset_dir,
+            tokenizer_path=config.data.tokenizer_model,
+        )
+    )
+    marker_contract_matches_here = bool(
+        marker_is_current_here
+        and marker is not None
+        and _foundation_marker_contract_matches(
+            marker,
+            config=config,
+            foundation_plan=foundation_plan,
+            checkpoint_identity=checkpoint_identity,
+        )
+    )
+    stale_completed_run_here = bool(
+        marker_is_current_here
+        and (not marker_contract_matches_here or not completed_inputs_match_here)
+    )
+    stale_completed_run = broadcast_bool(stale_completed_run_here, context)
 
-    completed_inputs_match = completion.is_file() and _foundation_completion_matches_inputs(
-        completion,
-        dataset_dir=foundation_config.data.dataset_dir,
-        tokenizer_path=config.data.tokenizer_model,
-    )
-    stale_completed_run = (
-        completion.is_file()
-        and checkpoint_path_exists(best_checkpoint)
-        and not completed_inputs_match
-    )
-    if stale_completed_run:
+    def archive_completed_run(reason: str) -> None:
+        backup = _run_rank_zero_action(
+            context,
+            lambda: backup_stale_dataset(run_root),
+            description="archiving an invalid foundation run",
+        )
         if context.is_main:
-            backup = backup_stale_dataset(run_root)
+            assert isinstance(backup, Path)
+            announce(f"{reason} → 이전 실행을 {backup.name}/ 으로 보관합니다.", context)
+        archive_visibility_scope = distributed_failure_scope(run_root.exists(), context)
+        if archive_visibility_scope != "none":
+            raise RuntimeError(
+                "archived foundation run remains visible on at least one distributed rank"
+            )
+
+    if stale_completed_run:
+        archive_completed_run(
+            "foundation 완료 세대의 입력·설정·checkpoint 구성이 현재 실행과 다릅니다"
+        )
+        marker = None
+        marker_is_current_here = False
+        completed_inputs_match_here = False
+
+    reusable_completion_here = bool(
+        context.is_main and marker_is_current_here and completed_inputs_match_here
+    )
+    reusable_completion = broadcast_bool(reusable_completion_here, context)
+    export_complete = False
+    if reusable_completion:
+        export_complete = bool(
+            _run_long_rank_zero_action(
+                context,
+                run_root / ".foundation-export-validation-status.json",
+                operation="foundation export validation",
+                action=lambda: _foundation_export_is_complete(
+                    final_export_dir,
+                    required_formats=config.foundation.final_export_formats,
+                    release_name=config.foundation.release_name,
+                ),
+            )
+        )
+    checkpoint_source = best_checkpoint
+    expected_checkpoint_step = 0
+
+    if reusable_completion:
+        expected_checkpoint_digest = broadcast_text(
+            cast(str, marker.get("checkpoint_artifact_sha256"))
+            if context.is_main and marker is not None
+            else None,
+            context,
+        )
+        expected_checkpoint_step = broadcast_int(
+            cast(int, marker.get("selected_step"))
+            if context.is_main and marker is not None
+            else None,
+            context,
+        )
+        try:
+            checkpoint_source = Path(
+                _coordinated_resume_preflight(
+                    best_checkpoint,
+                    checkpoint_identity,
+                    context,
+                    stage="completed foundation",
+                    lease_scope=_resume_lease_scope,
+                    expected_artifact_sha256=expected_checkpoint_digest,
+                    expected_step=expected_checkpoint_step,
+                )
+            )
+        except Exception as error:
+            if context.distributed and _has_unverifiable_legacy_dcp_generation(best_checkpoint):
+                raise RuntimeError(
+                    "foundation 완료 checkpoint가 historical shard digest 없는 legacy "
+                    "DCP입니다. 자동 archive/retrain 또는 현재 bytes의 자동 승격을 "
+                    "거부합니다. 원본 백업을 확인한 뒤 명시적 offline recovery를 "
+                    f"수행하세요: {error}"
+                ) from error
+            archive_completed_run(
+                "foundation 완료 marker와 일치하는 exact checkpoint 세대를 모든 "
+                f"rank에서 인증하지 못해 새로 학습합니다: {error}"
+            )
+            reusable_completion = False
+
+    if reusable_completion:
+        provenance: dict[str, Any] | None = None
+        load_error: Exception | None = None
+        try:
+            provenance = initialize_model_from_checkpoint(
+                checkpoint_source,
+                model,
+                context,
+                expected_identity=checkpoint_identity,
+            )
+        except Exception as error:
+            load_error = error
+        load_failure_scope = distributed_failure_scope(
+            load_error is not None,
+            context,
+        )
+        if load_failure_scope != "none":
+            detail = load_error or RuntimeError(
+                "at least one distributed rank could not load foundation weights"
+            )
+            raise RuntimeError(
+                "foundation checkpoint load failed after successful immutable preflight; "
+                f"refusing to continue with partially mutated ranks: {detail}"
+            ) from load_error
+        assert provenance is not None
+        export_binding_matches_here = False
+        if (
+            context.is_main
+            and export_complete
+            and completed_inputs_match_here
+            and marker is not None
+        ):
+            try:
+                export_binding_matches_here = all(
+                    (
+                        marker.get("schema") == FOUNDATION_COMPLETION_SCHEMA,
+                        marker.get("selected_step") == int(provenance["step"]),
+                        marker.get("checkpoint_identity_sha256")
+                        == _mapping_sha256(checkpoint_identity),
+                        marker.get("export_manifest_sha256")
+                        == file_sha256(final_export_dir / "export_manifest.json"),
+                    )
+                )
+            except OSError:
+                export_binding_matches_here = False
+        export_binding_matches = broadcast_bool(export_binding_matches_here, context)
+        repaired_export = False
+        if not export_binding_matches:
             announce(
-                "foundation 데이터/토크나이저 변경을 감지해 완료된 이전 실행을 "
-                f"{backup.name}/ 으로 보관합니다.",
+                "foundation 완료 checkpoint는 유효하지만 최종 base export가 없거나 "
+                "손상됐거나 같은 가중치 세대로 증명되지 않아 재학습 없이 다시 내보냅니다.",
                 context,
             )
-        barrier(context)
-
-    identity_for_transfer = build_checkpoint_identity(
-        model_config=config.model,
-        tokenizer_path=config.data.tokenizer_model,
-        token_features_path=config.data.tokenizer_features,
-        dataset_dir=config.data.dataset_dir,
-        stage_name="pretrain",
-    )
-
-    if completed_inputs_match and checkpoint_path_exists(best_checkpoint):
-        provenance = initialize_model_from_checkpoint(
-            best_checkpoint,
-            model,
-            context,
-            expected_identity=identity_for_transfer,
-        )
+            final_export_dir = export_final_model(
+                model,
+                foundation_config,
+                context,
+                Path(config.training.output_dir),
+                stage=FOUNDATION_STAGE_DIRECTORY,
+                step=int(provenance["step"]),
+                formats=config.foundation.final_export_formats,
+                release_name=config.foundation.release_name,
+                translation_capable=False,
+                languages=foundation_plan.languages,
+            )
+            repaired_export = True
+        if repaired_export:
+            if context.is_main:
+                assert marker is not None
+            marker_for_update = marker if marker is not None else {}
+            _run_rank_zero_action(
+                context,
+                lambda: _update_foundation_export_binding(
+                    completion,
+                    marker_for_update,
+                    checkpoint_source=Path(str(provenance["source"])),
+                    export_dir=final_export_dir,
+                ),
+                description="publishing the repaired foundation export binding",
+            )
         announce(
-            f"foundation 단계는 이미 완료됐습니다 → {best_checkpoint} 의 가중치를 "
+            f"foundation 단계는 이미 완료됐습니다 → {checkpoint_source} 의 가중치를 "
             f"물려받습니다 (step {provenance['step']:,}).",
             context,
         )
         return FoundationOutcome(
             ran=False,
             reason="이미 완료된 foundation 단계의 가중치를 재사용했습니다.",
-            best_checkpoint=str(best_checkpoint),
+            best_checkpoint=str(checkpoint_source),
             selected_step=provenance["step"],
             languages=foundation_plan.languages,
             warnings=foundation_plan.warnings,
         )
 
-    resume = find_auto_resume(foundation_config)
-    if resume:
-        foundation_config.training.resume_from = resume
-        announce(f"foundation: 이전 실행 발견 → {resume} 에서 재개합니다.", context)
+    resume_plan = _run_long_rank_zero_action(
+        context,
+        run_root / ".foundation-resume-resolution-status.json",
+        operation="foundation resume resolution",
+        action=lambda: _inspect_foundation_resume(foundation_config, context),
+    )
+    resume_state = resume_plan.get("state")
+    if resume_state not in {"absent", "available", "invalid", "untrusted_legacy"}:
+        raise RuntimeError(f"foundation resume resolution returned invalid state: {resume_state!r}")
+    if resume_state == "untrusted_legacy":
+        raise RuntimeError(
+            "foundation resume checkpoint는 historical shard digest가 없는 legacy DCP라 "
+            "자동 archive/retrain 또는 현재 bytes의 자동 승격을 거부합니다. 원본 "
+            "백업을 확인하고 명시적 offline recovery를 수행하세요: "
+            f"{resume_plan.get('reason', 'unverifiable legacy generation')}"
+        )
+    has_resume = resume_state == "available"
+    if resume_state == "invalid":
+        archive_completed_run(
+            "foundation 재개 checkpoint를 인증하지 못해 새로 학습합니다: "
+            f"{resume_plan.get('reason', 'unknown resolution failure')}"
+        )
+
+    resume_source: Path | None = None
+    trusted_best_artifact_sha256: str | None = None
+    if has_resume:
+        latest_checkpoint = run_root / "checkpoints" / "latest"
+        previous_latest = latest_checkpoint.with_name(f".{latest_checkpoint.name}.previous")
+        resume_generation = resume_plan.get("generation")
+        if resume_generation not in {"current", "previous"}:
+            raise RuntimeError(
+                f"foundation resume resolution returned invalid generation: {resume_generation!r}"
+            )
+        resume_source = previous_latest if resume_generation == "previous" else latest_checkpoint
+        try:
+            resume_artifact_sha256 = resume_plan.get("checkpoint_artifact_sha256")
+            if not isinstance(resume_artifact_sha256, str):
+                raise ValueError("foundation resume resolution omitted its artifact digest")
+            resume_source = Path(
+                _coordinated_resume_preflight(
+                    resume_source,
+                    checkpoint_identity,
+                    context,
+                    stage="foundation",
+                    lease_scope=_resume_lease_scope,
+                    expected_artifact_sha256=resume_artifact_sha256,
+                )
+            )
+            resume_training_state: dict[str, Any] | None = None
+            training_state_error: Exception | None = None
+            try:
+                resume_training_state = inspect_checkpoint_training_state(
+                    resume_source,
+                    context,
+                )
+            except Exception as error:
+                training_state_error = error
+            training_state_failure_scope = distributed_failure_scope(
+                training_state_error is not None,
+                context,
+            )
+            if training_state_failure_scope != "none":
+                failure = RuntimeError(
+                    "foundation resume training state could not be inspected on every rank"
+                )
+                if training_state_error is not None:
+                    raise failure from training_state_error
+                raise failure
+            assert resume_training_state is not None
+            raw_best_digest = resume_training_state.get("best_checkpoint_artifact_sha256")
+            if (
+                isinstance(raw_best_digest, str)
+                and len(raw_best_digest) == 64
+                and all(character in "0123456789abcdef" for character in raw_best_digest)
+            ):
+                trusted_best_artifact_sha256 = raw_best_digest
+            consensus_best_digest = broadcast_text(
+                (trusted_best_artifact_sha256 or "") if context.is_main else None,
+                context,
+            )
+            mismatch_scope = distributed_failure_scope(
+                (trusted_best_artifact_sha256 or "") != consensus_best_digest,
+                context,
+            )
+            if mismatch_scope != "none":
+                raise RuntimeError("foundation latest best-artifact binding differs across ranks")
+            trusted_best_artifact_sha256 = consensus_best_digest or None
+        except Exception as error:
+            archive_completed_run(
+                "foundation 재개 checkpoint의 세대·v2 inventory·identity를 인증하지 "
+                f"못해 새로 학습합니다: {error}"
+            )
+            has_resume = False
+            resume_source = None
+
+    if has_resume:
+        assert resume_source is not None
+        quarantine = _run_rank_zero_action(
+            context,
+            lambda: _quarantine_untrusted_foundation_derivatives(
+                run_root,
+                trusted_best_artifact_sha256=trusted_best_artifact_sha256,
+            ),
+            description="quarantining unbound foundation best and export artifacts",
+        )
+        if context.is_main and quarantine is not None:
+            announce(
+                "foundation latest가 content-bind하지 않은 completion/best/export를 "
+                "재개 checkpoint와 분리해 "
+                f"{quarantine.name}/ 에 보관합니다.",
+                context,
+            )
+        derivative_visibility_scope = distributed_failure_scope(
+            any(
+                path.exists() or path.is_symlink()
+                for path in _foundation_untrusted_derivatives(
+                    run_root,
+                    trusted_best_artifact_sha256=trusted_best_artifact_sha256,
+                )
+            ),
+            context,
+        )
+        if derivative_visibility_scope != "none":
+            raise RuntimeError(
+                "untrusted foundation best/export artifacts remain visible on at least one "
+                "distributed rank"
+            )
+        foundation_config.training.resume_from = str(resume_source)
+        announce(f"foundation: 이전 실행 발견 → {resume_source} 에서 재개합니다.", context)
+    else:
+        untrusted_partial_run_here = bool(
+            context.is_main
+            and run_root.exists()
+            and any(
+                (
+                    completion.exists(),
+                    best_checkpoint.exists(),
+                    final_export_dir.exists(),
+                    (run_root / "checkpoints" / "latest").exists(),
+                )
+            )
+        )
+        untrusted_partial_run = broadcast_bool(untrusted_partial_run_here, context)
+        if untrusted_partial_run:
+            archive_completed_run(
+                "인증할 완료 marker나 재개 checkpoint가 없는 foundation 부분 실행을 "
+                "새 학습과 분리합니다"
+            )
 
     train_dataset = IndexedParallelDataset(
         foundation_config.data.dataset_dir,
         foundation_config.data.train_split,
         bidirectional=foundation_config.data.bidirectional,
+        verify_integrity=not artifacts_verified,
     )
     validation_dataset = IndexedParallelDataset(
         foundation_config.data.dataset_dir,
         foundation_config.data.validation_split,
         bidirectional=foundation_config.data.bidirectional,
+        verify_integrity=not artifacts_verified,
     )
     announce(
         f"foundation 데이터 규모: 학습 {len(train_dataset):,}개 / "
@@ -1201,12 +2850,35 @@ def run_foundation_stage(
         export_translation_capable=False,
         export_languages=foundation_plan.languages,
     )
+    selected_checkpoint = Path(str(result["selected_checkpoint_source"]))
+    selected_checkpoint_digest = str(result["selected_checkpoint_artifact_sha256"])
+    selected_checkpoint_error: Exception | None = None
+    try:
+        actual_selected_digest = _foundation_checkpoint_artifact_sha256(selected_checkpoint)
+        if actual_selected_digest != selected_checkpoint_digest:
+            raise RuntimeError(
+                "trainer selected checkpoint digest changed before foundation completion "
+                f"({actual_selected_digest} != {selected_checkpoint_digest})"
+            )
+    except Exception as error:
+        selected_checkpoint_error = error
+    selected_checkpoint_failure_scope = distributed_failure_scope(
+        selected_checkpoint_error is not None,
+        context,
+    )
+    if selected_checkpoint_failure_scope != "none":
+        failure = RuntimeError(
+            "foundation selected checkpoint could not be rebound on every distributed rank"
+        )
+        if selected_checkpoint_error is not None:
+            raise failure from selected_checkpoint_error
+        raise failure
     barrier(context)
     release_stage_resources(context, train_loader, validation_loader)
     del train_loader, validation_loader, train_sampler, validation_sampler
     del train_collator, validation_collator, train_dataset, validation_dataset
 
-    export_final_model(
+    final_export_dir = export_final_model(
         model,
         foundation_config,
         context,
@@ -1221,32 +2893,27 @@ def run_foundation_stage(
         translation_capable=False,
         languages=foundation_plan.languages,
     )
-    if context.is_main:
-        run_root.mkdir(parents=True, exist_ok=True)
-        completion.write_text(
-            json.dumps(
-                {
-                    "stage": "foundation",
-                    "release_name": config.foundation.release_name,
-                    "languages": list(foundation_plan.languages),
-                    "selected_step": int(result["selected_step"]),
-                    "best_validation_loss": float(result["best_validation_loss"]),
-                    "foundation_manifest_sha256": file_sha256(
-                        Path(foundation_config.data.dataset_dir) / "manifest.json"
-                    ),
-                    "tokenizer_sha256": file_sha256(config.data.tokenizer_model),
-                },
-                ensure_ascii=False,
-                indent=2,
-                sort_keys=True,
+    _run_rank_zero_action(
+        context,
+        lambda: _atomic_write_foundation_completion(
+            completion,
+            _foundation_completion_marker(
+                config=config,
+                foundation_plan=foundation_plan,
+                foundation_config=foundation_config,
+                checkpoint_identity=checkpoint_identity,
+                checkpoint_source=selected_checkpoint,
+                selected_step=int(result["selected_step"]),
+                best_validation_loss=float(result["best_validation_loss"]),
+                export_dir=final_export_dir,
             ),
-            encoding="utf-8",
-        )
-    barrier(context)
+        ),
+        description="publishing the foundation completion marker",
+    )
     return FoundationOutcome(
         ran=True,
         reason=foundation_plan.reason,
-        best_checkpoint=str(best_checkpoint),
+        best_checkpoint=str(selected_checkpoint),
         selected_step=int(result["selected_step"]),
         languages=foundation_plan.languages,
         warnings=foundation_plan.warnings,
@@ -1261,6 +2928,223 @@ def find_auto_resume(config: AppConfig) -> str | None:
     return None
 
 
+def _find_distributed_auto_resume(
+    *,
+    explicit: str | None,
+    automatic: Path,
+    context: DistributedContext,
+    stage: str,
+) -> str | None:
+    """Choose one resume branch without allowing rank-local filesystem control flow."""
+
+    selected_explicit = broadcast_text(
+        str(explicit or "") if context.is_main else None,
+        context,
+    )
+    mismatch_scope = distributed_failure_scope(str(explicit or "") != selected_explicit, context)
+    if mismatch_scope != "none":
+        raise RuntimeError(f"{stage} explicit resume path differs across distributed ranks")
+    if selected_explicit:
+        return selected_explicit
+
+    present_here = checkpoint_path_exists(automatic)
+    absence_scope = distributed_failure_scope(not present_here, context)
+    if absence_scope == "partial":
+        raise RuntimeError(
+            f"{stage} auto-resume checkpoint visibility differs across distributed ranks: "
+            f"{automatic}"
+        )
+    if absence_scope == "all":
+        return None
+    return str(automatic)
+
+
+def _archive_invalid_automatic_resume(
+    stage_root: Path,
+    context: DistributedContext,
+    *,
+    stage: str,
+    error: BaseException,
+) -> None:
+    """Move an invalid automatically discovered stage aside before a fresh run."""
+
+    backup = _run_rank_zero_action(
+        context,
+        lambda: backup_stale_dataset(stage_root),
+        description=f"archiving invalid automatic {stage} resume",
+    )
+    if context.is_main:
+        assert isinstance(backup, Path)
+        announce(
+            f"{stage} 자동 재개 후보를 인증하지 못해 {backup.name}/ 으로 보관하고 "
+            f"fresh 경로로 돌아갑니다: {_bounded_status_text(error)}",
+            context,
+        )
+    visibility_scope = distributed_failure_scope(
+        stage_root.exists() or stage_root.is_symlink(),
+        context,
+    )
+    if visibility_scope != "none":
+        raise RuntimeError(
+            f"archived automatic {stage} resume remains visible on at least one rank"
+        )
+
+
+def _checkpoint_pipeline_identity(
+    source: str | Path,
+    config: AppConfig,
+    foundation_plan: Any,
+    context: DistributedContext,
+) -> dict[str, Any]:
+    """Recover and validate ancestry already authenticated by an SFT checkpoint."""
+
+    recorded_identity = inspect_checkpoint_identity(source, context)
+    raw_pipeline = recorded_identity.get("pipeline")
+    if not isinstance(raw_pipeline, dict):
+        raise ValueError("SFT checkpoint has no recorded pipeline identity")
+    branch = raw_pipeline.get("branch")
+    if branch == "foundation-then-translation":
+        if not config.foundation.enabled:
+            raise ValueError(
+                "checkpoint has foundation ancestry but foundation is explicitly disabled"
+            )
+        raw_foundation = raw_pipeline.get("foundation")
+        if not isinstance(raw_foundation, dict):
+            raise ValueError("foundation checkpoint branch has no recorded lineage")
+        # A self-contained translation/posttraining checkpoint remains valid
+        # when the raw monolingual corpus is temporarily offline. Reconstruct
+        # the configured branch from its authenticated lineage instead of from
+        # whether this machine can launch a fresh foundation run today.
+        lineage_plan = cast(
+            FoundationPlan,
+            SimpleNamespace(
+                enabled=True,
+                languages=config.foundation_languages(),
+            ),
+        )
+        pipeline = build_translation_pipeline_identity(
+            lineage_plan,
+            foundation_lineage=raw_foundation,
+        )
+        if raw_foundation.get("release_name") != config.foundation.release_name:
+            raise ValueError(
+                "checkpoint foundation release does not match the current configured base"
+            )
+        tokenizer = recorded_identity.get("tokenizer")
+        tokenizer_model = tokenizer.get("model") if isinstance(tokenizer, dict) else None
+        tokenizer_sha256 = (
+            tokenizer_model.get("sha256") if isinstance(tokenizer_model, dict) else None
+        )
+        if tokenizer_sha256 != raw_foundation.get("tokenizer_sha256"):
+            raise ValueError(
+                "checkpoint foundation lineage tokenizer does not match its tokenizer identity"
+            )
+    elif branch == "translation-only":
+        if foundation_plan.enabled:
+            raise ValueError(
+                "translation-only checkpoint conflicts with the currently runnable "
+                "foundation-first branch"
+            )
+        pipeline = build_translation_pipeline_identity(foundation_plan)
+    else:
+        raise ValueError("checkpoint pipeline identity has an unsupported branch")
+    if raw_pipeline != pipeline:
+        raise ValueError("checkpoint pipeline identity does not match the current branch")
+    return pipeline
+
+
+def _coordinated_checkpoint_pipeline_identity(
+    source: str | Path,
+    config: AppConfig,
+    foundation_plan: Any,
+    context: DistributedContext,
+) -> dict[str, Any]:
+    pipeline: dict[str, Any] | None = None
+    pipeline_error: Exception | None = None
+    try:
+        pipeline = _checkpoint_pipeline_identity(
+            source,
+            config,
+            foundation_plan,
+            context,
+        )
+    except Exception as error:
+        pipeline_error = error
+    failure_scope = distributed_failure_scope(pipeline_error is not None, context)
+    if failure_scope != "none":
+        failure = RuntimeError(
+            "SFT checkpoint pipeline identity could not be validated on every rank"
+        )
+        if pipeline_error is not None:
+            raise failure from pipeline_error
+        raise failure
+    assert pipeline is not None
+    return pipeline
+
+
+def _coordinated_exact_checkpoint_identity_preflight(
+    source: str | Path,
+    expected_identity: dict[str, Any],
+    context: DistributedContext,
+    *,
+    stage: str,
+) -> int:
+    checkpoint_step: int | None = None
+    identity_error: Exception | None = None
+    try:
+        checkpoint_step = preflight_checkpoint_identity(
+            source,
+            context,
+            expected_identity,
+        )
+        if checkpoint_step is None:
+            raise ValueError(f"{stage} checkpoint has no recorded step")
+    except Exception as error:
+        identity_error = error
+    failure_scope = distributed_failure_scope(identity_error is not None, context)
+    if failure_scope != "none":
+        failure = RuntimeError(f"{stage} checkpoint identity could not be validated on every rank")
+        if identity_error is not None:
+            raise failure from identity_error
+        raise failure
+    assert checkpoint_step is not None
+    consensus_step = broadcast_int(checkpoint_step if context.is_main else None, context)
+    mismatch_scope = distributed_failure_scope(checkpoint_step != consensus_step, context)
+    if mismatch_scope != "none":
+        raise RuntimeError(f"{stage} checkpoint step differs across distributed ranks")
+    return checkpoint_step
+
+
+def _coordinated_resume_preflight(
+    candidate: str | Path,
+    expected_identity: dict[str, Any] | None,
+    context: DistributedContext,
+    *,
+    stage: str,
+    lease_scope: ExitStack | None = None,
+    expected_artifact_sha256: str | None = None,
+    expected_step: int | None = None,
+) -> str:
+    """Authenticate one exact generation and retain its one-shot load lease."""
+
+    if context.distributed and lease_scope is None:
+        raise ValueError(
+            f"{stage} distributed resume requires a lease scope that survives until load"
+        )
+    generation_context = verified_checkpoint_generation_lease(
+        candidate,
+        context,
+        expected_identity,
+        expected_artifact_sha256=expected_artifact_sha256,
+        expected_step=expected_step,
+    )
+    if lease_scope is not None:
+        generation = lease_scope.enter_context(generation_context)
+        return str(generation.source)
+    with generation_context as generation:
+        return str(generation.source)
+
+
 def run_foundation_before_translation(
     config: AppConfig,
     foundation_plan: Any,
@@ -1269,6 +3153,7 @@ def run_foundation_before_translation(
     context: DistributedContext,
     *,
     validated_pretrain_resume: str | None,
+    artifacts_verified: bool = False,
 ) -> FoundationOutcome:
     """Run foundation only when no validated SFT state will supersede it."""
 
@@ -1277,7 +3162,14 @@ def run_foundation_before_translation(
             ran=False,
             reason="검증된 SFT resume가 foundation 실행/로드보다 우선합니다.",
         )
-    return run_foundation_stage(config, foundation_plan, model, tokenizer, context)
+    return run_foundation_stage(
+        config,
+        foundation_plan,
+        model,
+        tokenizer,
+        context,
+        artifacts_verified=artifacts_verified,
+    )
 
 
 def translation_initialization_message(
@@ -1320,6 +3212,8 @@ def main() -> None:
         # ── 단계 ②: 설정 로드 ───────────────────────────────────────────
         config, raw, source = resolve_config(args)
         run_scope.enter_context(coordinated_training_run_lock(config.training.output_dir, context))
+        checkpoint_lease_scope = ExitStack()
+        run_scope.enter_context(checkpoint_lease_scope)
         announce(f"준비 ②: 설정 로드 — {source}", context)
         if not args.prepare_only:
             # The built-in collator has no dense alignment-label provider.
@@ -1328,22 +3222,39 @@ def main() -> None:
             config.validate_training_supervision(alignment_targets_available=False)
 
         # ── 단계 ③: 원천 데이터 인식 + 토크나이저/데이터셋 자동 준비 ──
-        if not args.prepare_only:
-            preflight_final_export_dependencies(config.training.final_export_formats)
         announce("준비 ③: 원천 데이터를 확인합니다.", context)
         foundation_plan = plan_foundation_stage(config)
-        pipeline_identity = build_translation_pipeline_identity(foundation_plan)
+        if not args.prepare_only:
+            required_final_formats = list(config.training.final_export_formats)
+            if foundation_plan.enabled:
+                required_final_formats.extend(config.foundation.final_export_formats)
+            preflight_final_export_dependencies(required_final_formats)
+        run_scope.enter_context(
+            coordinated_artifact_run_locks(
+                config,
+                foundation_plan,
+                context,
+            )
+        )
+        pipeline_identity: dict[str, Any] | None = None
         initial_run_root = Path(config.training.output_dir)
-        pretrain_resume_candidate = config.training.resume_from
-        if not pretrain_resume_candidate:
-            latest_pretrain = initial_run_root / "pretrain" / "checkpoints" / "latest"
-            if checkpoint_path_exists(latest_pretrain):
-                pretrain_resume_candidate = str(latest_pretrain)
+        explicit_pretrain_resume = bool(config.training.resume_from)
+        pretrain_resume_candidate = _find_distributed_auto_resume(
+            explicit=config.training.resume_from,
+            automatic=initial_run_root / "pretrain" / "checkpoints" / "latest",
+            context=context,
+            stage="SFT",
+        )
         ensure_artifacts(
             config,
             context,
             foundation_plan,
-            prepare_foundation=args.prepare_only or not bool(pretrain_resume_candidate),
+            # Effective auto-sized training identity and the exact SFT resume
+            # generation must be known before deciding whether base preparation
+            # can safely be skipped. A coarse `.metadata` presence check is not
+            # authority to bypass the foundation path.
+            prepare_foundation=args.prepare_only,
+            locks_held=True,
         )
         tokenizer = SionTokenizer(config.data.tokenizer_model)
         config.model.vocab_size = len(tokenizer)
@@ -1360,11 +3271,13 @@ def main() -> None:
             config.data.dataset_dir,
             config.data.train_split,
             bidirectional=config.data.bidirectional,
+            verify_integrity=False,
         )
         validation_dataset = IndexedParallelDataset(
             config.data.dataset_dir,
             config.data.validation_split,
             bidirectional=config.data.bidirectional,
+            verify_integrity=False,
         )
         revision_sources = [
             source
@@ -1399,6 +3312,9 @@ def main() -> None:
             for line in decisions:
                 announce(f"  · {line}", context)
         config.validate()
+
+        if not foundation_plan.enabled:
+            pipeline_identity = build_translation_pipeline_identity(foundation_plan)
 
         # 실행 루트 아래에 사전학습/사후학습 산출물을 서로 분리합니다.
         run_root = Path(config.training.output_dir)
@@ -1443,28 +3359,81 @@ def main() -> None:
             source_sampling_weights=config.data.source_sampling_weights,
             max_source_upsampling=config.data.max_source_upsampling,
         )
+        validated_pretrain_resume = False
         if pretrain_config.training.resume_from:
-            announce(
-                "준비 ⑤: SFT resume identity를 foundation 단계보다 먼저 검증합니다.",
+            resume_error: BaseException | None = None
+            resume_attempt_scope = ExitStack()
+            try:
+                # Auto sizing changes the effective model and sampler identity,
+                # so the exact generation is authenticated first, then its own
+                # content-addressed ancestry is checked against final settings.
+                announce(
+                    "준비 ⑤: SFT resume identity를 foundation 단계보다 먼저 검증합니다.",
+                    context,
+                )
+                pretrain_config.training.resume_from = _coordinated_resume_preflight(
+                    pretrain_config.training.resume_from,
+                    None,
+                    context,
+                    stage="SFT",
+                    lease_scope=resume_attempt_scope,
+                )
+                pipeline_identity = _coordinated_checkpoint_pipeline_identity(
+                    pretrain_config.training.resume_from,
+                    config,
+                    foundation_plan,
+                    context,
+                )
+                expected_pretrain_identity = build_training_checkpoint_identity(
+                    pretrain_config,
+                    batch_sampler=train_sampler,
+                    context=context,
+                    stage_name="pretrain/SFT",
+                    include_posttraining=False,
+                    pipeline_identity=pipeline_identity,
+                )
+                _coordinated_exact_checkpoint_identity_preflight(
+                    pretrain_config.training.resume_from,
+                    expected_pretrain_identity,
+                    context,
+                    stage="SFT",
+                )
+            except BaseException as error:
+                resume_error = error
+
+            if resume_error is not None:
+                resume_attempt_scope.close()
+                if explicit_pretrain_resume:
+                    raise RuntimeError(
+                        "explicit SFT resume authentication failed"
+                    ) from resume_error
+                _archive_invalid_automatic_resume(
+                    run_root / "pretrain",
+                    context,
+                    stage="SFT",
+                    error=resume_error,
+                )
+                pretrain_config.training.resume_from = None
+                pretrain_resume_candidate = None
+            else:
+                checkpoint_lease_scope.enter_context(resume_attempt_scope.pop_all())
+                validated_pretrain_resume = True
+                announce(
+                    "준비 ⑤: SFT resume identity 검증 완료 — 이 체크포인트가 foundation "
+                    "실행/로드보다 우선합니다.",
+                    context,
+                )
+
+        if foundation_plan.enabled and not validated_pretrain_resume:
+            # The first pass intentionally deferred potentially multi-hour base
+            # preparation until the exact SFT generation was checked. No valid
+            # SFT state supersedes it now, so prepare/verify every base artifact.
+            ensure_artifacts(
+                config,
                 context,
-            )
-            expected_pretrain_identity = build_training_checkpoint_identity(
-                pretrain_config,
-                batch_sampler=train_sampler,
-                context=context,
-                stage_name="pretrain/SFT",
-                include_posttraining=False,
-                pipeline_identity=pipeline_identity,
-            )
-            preflight_checkpoint_identity(
-                pretrain_config.training.resume_from,
-                context,
-                expected_pretrain_identity,
-            )
-            announce(
-                "준비 ⑤: SFT resume identity 검증 완료 — 이 체크포인트가 foundation "
-                "실행/로드보다 우선합니다.",
-                context,
+                foundation_plan,
+                prepare_foundation=True,
+                locks_held=True,
             )
         validation_sampler = DistributedBucketBatchSampler(
             validation_dataset,
@@ -1556,7 +3525,20 @@ def main() -> None:
             tokenizer,
             context,
             validated_pretrain_resume=pretrain_config.training.resume_from,
+            artifacts_verified=True,
         )
+        if pipeline_identity is None:
+            if not foundation_plan.enabled:
+                raise RuntimeError("translation pipeline identity was not initialized")
+            foundation_lineage = resolve_foundation_lineage(
+                config,
+                foundation_plan,
+                context,
+            )
+            pipeline_identity = build_translation_pipeline_identity(
+                foundation_plan,
+                foundation_lineage=foundation_lineage,
+            )
         announce(
             translation_initialization_message(
                 foundation_outcome,
@@ -1611,10 +3593,17 @@ def main() -> None:
             post_config.training.early_stopping_patience = post.early_stopping_patience
             post_config.training.resume_from = None
             post_config.training.tensorboard_dir = None
-            resume = find_auto_resume(post_config)
-            if resume:
-                post_config.training.resume_from = resume
-                announce(f"이전 사후학습 발견 → {resume} 에서 자동 재개합니다.", context)
+            post_config.training.resume_from = _find_distributed_auto_resume(
+                explicit=None,
+                automatic=Path(post_config.training.output_dir) / "checkpoints" / "latest",
+                context=context,
+                stage="posttraining",
+            )
+            if post_config.training.resume_from:
+                announce(
+                    f"이전 사후학습 발견 → {post_config.training.resume_from} 에서 자동 재개합니다.",
+                    context,
+                )
 
             # 보상 계산은 깨끗한 원문/정답을 기준으로 해야 하므로 증강을 끕니다.
             post_collator = SionBatchCollator(
@@ -1642,6 +3631,31 @@ def main() -> None:
                 bucket_size=config.data.bucket_size,
                 seed=config.training.seed + 3,
             )
+            if post_config.training.resume_from:
+                expected_posttrain_identity = build_training_checkpoint_identity(
+                    post_config,
+                    batch_sampler=post_sampler,
+                    context=context,
+                    stage_name="posttrain/composite-MRT+preference",
+                    include_posttraining=True,
+                    pipeline_identity=pipeline_identity,
+                )
+                try:
+                    post_config.training.resume_from = _coordinated_resume_preflight(
+                        post_config.training.resume_from,
+                        expected_posttrain_identity,
+                        context,
+                        stage="posttraining",
+                        lease_scope=checkpoint_lease_scope,
+                    )
+                except BaseException as error:
+                    _archive_invalid_automatic_resume(
+                        run_root / "posttrain",
+                        context,
+                        stage="posttraining",
+                        error=error,
+                    )
+                    post_config.training.resume_from = None
             post_loader = DataLoader(
                 train_dataset,
                 batch_sampler=post_sampler,
@@ -1708,6 +3722,7 @@ def main() -> None:
             run_root,
             stage=final_stage,
             step=final_step,
+            pipeline_identity=pipeline_identity,
         )
         announce(f"최종 모델 내보내기 검증 완료: {final_export_dir}", context)
     finally:

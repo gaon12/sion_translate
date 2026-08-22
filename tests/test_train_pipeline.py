@@ -1,5 +1,13 @@
 from __future__ import annotations
 
+import json
+import os
+import socket
+import subprocess
+import sys
+import textwrap
+import time
+from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -29,6 +37,7 @@ from sion_translate.config import (
     ModelConfig,
     config_from_raw,
 )
+from sion_translate.data.integrity import build_dataset_artifact_inventory
 from sion_translate.fingerprint import file_sha256
 from sion_translate.model.transformer import SionForConditionalGeneration
 from sion_translate.training.distributed import DistributedContext
@@ -95,6 +104,189 @@ def test_collator_pipeline_passes_configured_source_only_languages() -> None:
     args = build_collator_args(config, tokenizer)  # type: ignore[arg-type]
 
     assert args["source_only_languages"] == ("kj", "kd", "jd")
+
+
+def test_artifact_preparation_locks_every_independent_mutation_root(tmp_path: Path) -> None:
+    config = AppConfig()
+    config.data.tokenizer_model = str(tmp_path / "tokenizer-root" / "sion.model")
+    config.data.dataset_dir = str(tmp_path / "translation-root" / "dataset")
+    config.foundation.dataset_dir = str(tmp_path / "foundation-root" / "dataset")
+    plan = SimpleNamespace(enabled=True)
+
+    roots = train_module._artifact_mutation_roots(
+        config,
+        plan,
+        prepare_foundation=True,
+    )
+
+    assert set(roots) == {
+        (tmp_path / "tokenizer-root").resolve(),
+        (tmp_path / "translation-root").resolve(),
+        (tmp_path / "foundation-root").resolve(),
+    }
+    assert list(roots) == sorted(roots, key=lambda path: os.path.normcase(str(path)))
+    assert train_module._artifact_mutation_roots(
+        config,
+        plan,
+        prepare_foundation=False,
+    ) == tuple(root for root in roots if root.name != "foundation-root")
+
+
+def test_artifact_run_leases_remain_held_until_the_run_scope_exits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = AppConfig()
+    config.data.tokenizer_model = str(tmp_path / "tokenizer" / "sion.model")
+    config.data.dataset_dir = str(tmp_path / "translation" / "dataset")
+    config.foundation.dataset_dir = str(tmp_path / "foundation" / "dataset")
+    plan = SimpleNamespace(enabled=True)
+    active: set[Path] = set()
+
+    class Lease:
+        def __init__(self, root: Path) -> None:
+            self.root = root
+
+        def __enter__(self) -> Path:
+            active.add(self.root)
+            return self.root / ".sion_artifacts.lock"
+
+        def __exit__(self, *_args: object) -> None:
+            active.remove(self.root)
+
+    monkeypatch.setattr(train_module, "artifact_lock", lambda root: Lease(Path(root)))
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+    expected = set(
+        train_module._artifact_mutation_roots(
+            config,
+            plan,
+            prepare_foundation=True,
+        )
+    )
+
+    with train_module.coordinated_artifact_run_locks(config, plan, context) as roots:
+        assert set(roots) == expected
+        assert active == expected
+    assert not active
+
+
+def test_prepared_artifact_identity_binds_control_file_contents(tmp_path: Path) -> None:
+    config = AppConfig()
+    tokenizer = tmp_path / "tokenizer" / "sion.model"
+    dataset = tmp_path / "translation" / "dataset"
+    foundation_dataset = tmp_path / "foundation" / "dataset"
+    tokenizer.parent.mkdir(parents=True)
+    tokenizer.write_bytes(b"tokenizer-generation-a")
+    (tokenizer.parent / "tokenizer_metadata.json").write_text("{}\n", encoding="utf-8")
+
+    for root, format_name in (
+        (dataset, "sion-indexed-parallel-v6"),
+        (foundation_dataset, "sion-foundation-indexed-v2"),
+    ):
+        payload = root / "train" / "00000.bin"
+        payload.parent.mkdir(parents=True)
+        payload.write_bytes(b"authenticated-indexed-payload")
+        manifest = {
+            "format": format_name,
+            "generation": 1,
+            "artifact_inventory": build_dataset_artifact_inventory(root),
+        }
+        (root / "manifest.json").write_text(
+            json.dumps(manifest, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    (dataset / "raw_fingerprint.json").write_text('{"generation": 1}\n', encoding="utf-8")
+    config.data.tokenizer_model = str(tokenizer)
+    config.data.dataset_dir = str(dataset)
+    config.foundation.dataset_dir = str(foundation_dataset)
+    plan = SimpleNamespace(enabled=True)
+
+    first = train_module._prepared_artifact_identity(
+        config,
+        plan,
+        prepare_foundation=True,
+    )
+    manifest_path = dataset / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["generation"] = 2
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8")
+    second = train_module._prepared_artifact_identity(
+        config,
+        plan,
+        prepare_foundation=True,
+    )
+
+    assert first["translation_manifest"]["sha256"] != second["translation_manifest"]["sha256"]
+    assert len(first["foundation_manifest"]["sha256"]) == 64
+    with pytest.raises(FileNotFoundError, match="raw_fingerprint"):
+        (dataset / "raw_fingerprint.json").unlink()
+        train_module._prepared_artifact_identity(
+            config,
+            plan,
+            prepare_foundation=True,
+        )
+
+
+def test_foundation_preparation_backs_up_a_file_at_the_dataset_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sion_translate.data.prepare_foundation as foundation_prepare
+
+    config = AppConfig()
+    tokenizer = tmp_path / "tokenizer" / "sion.model"
+    tokenizer.parent.mkdir(parents=True)
+    tokenizer.write_bytes(b"tokenizer")
+    dataset = tmp_path / "translation"
+    dataset.mkdir()
+    (dataset / "manifest.json").write_text("{}", encoding="utf-8")
+    foundation_dataset = tmp_path / "foundation"
+    foundation_dataset.write_bytes(b"not-a-directory")
+    config.data.raw_dir = str(tmp_path / "raw")
+    config.data.tokenizer_model = str(tokenizer)
+    config.data.dataset_dir = str(dataset)
+    config.foundation.dataset_dir = str(foundation_dataset)
+    raw_identity = {"parallel.jsonl": 128}
+    plan = SimpleNamespace(
+        enabled=True,
+        discovery=SimpleNamespace(sources=()),
+        languages=(),
+        report=(),
+        warnings=(),
+    )
+    prepared: list[Path] = []
+
+    monkeypatch.setattr(train_module, "scan_configured_raw_data", lambda *_args: raw_identity)
+    monkeypatch.setattr(train_module, "find_existing_checkpoint", lambda *_args: None)
+    monkeypatch.setattr(train_module, "tokenizer_policy_problem", lambda *_args: None)
+    monkeypatch.setattr(train_module, "stored_fingerprint", lambda *_args: raw_identity)
+    monkeypatch.setattr(train_module, "dataset_artifact_problem", lambda *_args: None)
+    monkeypatch.setattr(
+        foundation_prepare,
+        "foundation_dataset_problem",
+        lambda *_args, **_kwargs: "foundation dataset path is not a directory",
+    )
+
+    def prepare(*_args: object, **_kwargs: object) -> object:
+        prepared.append(foundation_dataset)
+        foundation_dataset.mkdir()
+        return SimpleNamespace()
+
+    monkeypatch.setattr(foundation_prepare, "prepare_foundation_dataset", prepare)
+    monkeypatch.setattr(foundation_prepare, "render_prepare_report", lambda _stats: ())
+
+    train_module._ensure_artifacts_on_main(
+        config,
+        DistributedContext(0, 0, 1, torch.device("cpu"), False),
+        plan,
+        locks_held=True,
+    )
+
+    assert prepared == [foundation_dataset]
+    assert foundation_dataset.is_dir()
+    backups = list(tmp_path.glob("foundation.stale-*"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == b"not-a-directory"
 
 
 def test_final_export_dependency_preflight_fails_before_training(
@@ -167,6 +359,10 @@ def test_final_export_wires_all_formats_and_model_sidecars(
         tmp_path / "run",
         stage="posttrain",
         step=17,
+        pipeline_identity={
+            "schema": "sion-translation-pipeline-v2",
+            "branch": "translation-only",
+        },
     )
 
     assert destination == tmp_path / "run" / "posttrain" / "exports" / "best"
@@ -179,7 +375,780 @@ def test_final_export_wires_all_formats_and_model_sidecars(
     assert kwargs["language_pairs"] == (("ko", "ja"), ("en", "ru"))
     assert kwargs["bidirectional"] is False
     assert kwargs["revision_trained"] is True
+    assert kwargs["pipeline_identity"] == {
+        "schema": "sion-translation-pipeline-v2",
+        "branch": "translation-only",
+    }
     assert kwargs["strict"] is True
+
+
+def test_distributed_final_export_publishes_rank_zero_failure_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = AppConfig()
+    context = DistributedContext(0, 0, 2, torch.device("cpu"), True, "gloo")
+
+    def run_locally(_context, action, *, description: str):
+        assert description == "publishing final export start state"
+        return action()
+
+    monkeypatch.setattr(train_module, "_run_rank_zero_action", run_locally)
+    monkeypatch.setattr(
+        train_module,
+        "broadcast_text",
+        lambda value, _context: value or "missing-invocation",
+    )
+    monkeypatch.setattr(
+        train_module,
+        "distributed_failure_scope",
+        lambda _failed, _context: "none",
+    )
+    monkeypatch.setattr(
+        train_module,
+        "export_inference_models",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ValueError("injected strict export failure")
+        ),
+    )
+
+    with pytest.raises(ValueError, match="injected strict export failure"):
+        export_final_model(
+            torch.nn.Linear(1, 1),
+            config,
+            context,
+            tmp_path / "run",
+            stage="foundation",
+            step=11,
+            release_name="sion",
+            translation_capable=False,
+        )
+
+    status_path = tmp_path / "run" / "foundation" / "exports" / ".best.strict-export-status.json"
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    assert status["state"] == "failed"
+    assert status["step"] == 11
+    assert status["error_type"] == "ValueError"
+    assert status["message"] == "injected strict export failure"
+
+
+def test_distributed_final_export_peer_surfaces_rank_zero_failure_without_collective(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = AppConfig()
+    context = DistributedContext(1, 1, 2, torch.device("cpu"), True, "gloo")
+    run_root = tmp_path / "run"
+    status_path = run_root / "foundation" / "exports" / ".best.strict-export-status.json"
+    invocation = "peer-export-invocation"
+    train_module._atomic_write_json(
+        status_path,
+        {
+            "schema": train_module.FINAL_EXPORT_STATUS_SCHEMA,
+            "state": "running",
+            "invocation": invocation,
+            "step": 11,
+            "release_name": "sion",
+        },
+    )
+
+    def peer_does_not_run(_context, _action, *, description: str):
+        assert description == "publishing final export start state"
+        return None
+
+    monkeypatch.setattr(train_module, "_run_rank_zero_action", peer_does_not_run)
+    monkeypatch.setattr(train_module, "broadcast_text", lambda _value, _context: invocation)
+    monkeypatch.setattr(
+        train_module,
+        "distributed_failure_scope",
+        lambda _failed, _context: "none",
+    )
+
+    def publish_failure(*_args, **_kwargs) -> None:
+        train_module._atomic_write_json(
+            status_path,
+            {
+                "schema": train_module.FINAL_EXPORT_STATUS_SCHEMA,
+                "state": "failed",
+                "invocation": invocation,
+                "step": 11,
+                "release_name": "sion",
+                "error_type": "ValueError",
+                "message": "injected strict export failure",
+            },
+        )
+
+    monkeypatch.setattr(train_module, "export_inference_models", publish_failure)
+
+    with pytest.raises(RuntimeError, match="rank 0 final export failed.*injected"):
+        export_final_model(
+            torch.nn.Linear(1, 1),
+            config,
+            context,
+            run_root,
+            stage="foundation",
+            step=11,
+            release_name="sion",
+            translation_capable=False,
+        )
+
+
+@pytest.mark.parametrize("terminal_state", ("complete", "failed"))
+def test_preallocated_backup_status_survives_one_terminal_write_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_state: str,
+) -> None:
+    status_path = tmp_path / "strict-export-status.json"
+    invocation = f"terminal-{terminal_state}"
+    running = {
+        "schema": train_module.FINAL_EXPORT_STATUS_SCHEMA,
+        "state": "running",
+        "invocation": invocation,
+        "step": 17,
+        "release_name": "sion",
+    }
+    handles = train_module._initialize_control_status(status_path, running)
+    original_overwrite = train_module._overwrite_control_status
+    injected = False
+
+    def fail_one_channel(handle, payload) -> None:
+        nonlocal injected
+        if payload.get("state") == terminal_state and not injected:
+            injected = True
+            raise PermissionError("injected primary status failure")
+        original_overwrite(handle, payload)
+
+    monkeypatch.setattr(train_module, "_overwrite_control_status", fail_one_channel)
+    terminal = {
+        **running,
+        "state": terminal_state,
+        "error_type": "ValueError",
+        "message": "injected export failure",
+    }
+    try:
+        train_module._publish_control_status(handles, terminal)
+    finally:
+        train_module._close_control_status(handles)
+
+    if terminal_state == "complete":
+        train_module._wait_for_final_export_status(
+            status_path,
+            step=17,
+            release_name="sion",
+            invocation=invocation,
+        )
+    else:
+        with pytest.raises(RuntimeError, match="injected export failure"):
+            train_module._wait_for_final_export_status(
+                status_path,
+                step=17,
+                release_name="sion",
+                invocation=invocation,
+            )
+    assert injected
+
+
+def test_control_status_bounds_multibyte_and_control_character_diagnostics() -> None:
+    diagnostic = ("오류🔥\x00\n" * 20_000) + "tail"
+    bounded = train_module._bounded_status_text(diagnostic)
+    encoded = train_module._encode_control_status(
+        {
+            "schema": train_module.FINAL_EXPORT_STATUS_SCHEMA,
+            "state": "failed",
+            "message": bounded,
+        }
+    )
+
+    assert len(encoded) == train_module.RANK_ZERO_STATUS_FILE_BYTES
+    assert len(bounded.encode("utf-8")) <= 6000
+    assert "\x00" not in bounded
+    assert "\n" not in bounded
+    assert json.loads(encoded.decode("utf-8"))["message"].endswith("tail")
+
+
+def test_long_rank_zero_action_rejects_a_stale_completion_nonce(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = DistributedContext(1, 1, 2, torch.device("cpu"), True, "gloo")
+    status_path = tmp_path / "long-action.json"
+    train_module._atomic_write_json(
+        status_path,
+        {
+            "schema": train_module.RANK_ZERO_ACTION_STATUS_SCHEMA,
+            "operation": "test validation",
+            "state": "complete",
+            "invocation": "old-invocation",
+            "result": True,
+        },
+    )
+    monkeypatch.setattr(
+        train_module,
+        "broadcast_text",
+        lambda _value, _context: "new-invocation",
+    )
+    monkeypatch.setattr(
+        train_module,
+        "_run_rank_zero_action",
+        lambda _context, _action, *, description: None,
+    )
+    monkeypatch.setattr(
+        train_module,
+        "distributed_failure_scope",
+        lambda failed, _context: "partial" if failed else "none",
+    )
+
+    with pytest.raises(RuntimeError, match="not visible to every rank"):
+        train_module._run_long_rank_zero_action(
+            context,
+            status_path,
+            operation="test validation",
+            action=lambda: (_ for _ in ()).throw(AssertionError("peer action must not run")),
+        )
+
+
+def test_long_rank_zero_action_terminal_status_cannot_be_overwritten_by_heartbeat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = DistributedContext(0, 0, 2, torch.device("cpu"), True, "gloo")
+    status_path = tmp_path / "long-action.json"
+    monkeypatch.setattr(
+        train_module,
+        "broadcast_text",
+        lambda value, _context: value or "a" * 32,
+    )
+    monkeypatch.setattr(
+        train_module,
+        "_run_rank_zero_action",
+        lambda _context, action, *, description: action(),
+    )
+    monkeypatch.setattr(
+        train_module,
+        "distributed_failure_scope",
+        lambda _failed, _context: "none",
+    )
+    acknowledged_states: list[set[str]] = []
+
+    def acknowledge_terminal(*_args, **_kwargs) -> None:
+        acknowledged_states.append(
+            {str(status["state"]) for status in train_module._read_control_status(status_path)}
+        )
+
+    monkeypatch.setattr(
+        train_module,
+        "_wait_for_rank_zero_action_acknowledgements",
+        acknowledge_terminal,
+    )
+
+    result = train_module._run_long_rank_zero_action(
+        context,
+        status_path,
+        operation="heartbeat race test",
+        action=lambda: (time.sleep(0.03), {"ok": True})[1],
+        stale_timeout_seconds=0.2,
+        heartbeat_interval_seconds=0.001,
+    )
+
+    assert result == {"ok": True}
+    statuses = train_module._read_control_status(status_path)
+    assert statuses
+    assert {status["state"] for status in statuses} == {"complete"}
+    assert acknowledged_states == [{"complete"}]
+
+
+def test_long_rank_zero_action_peer_acknowledges_terminal_without_collective(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = DistributedContext(1, 1, 2, torch.device("cpu"), True, "gloo")
+    status_path = tmp_path / "long-action.json"
+    invocation = "a" * 32
+    monkeypatch.setattr(train_module, "broadcast_text", lambda _value, _context: invocation)
+    monkeypatch.setattr(
+        train_module,
+        "_run_rank_zero_action",
+        lambda _context, _action, *, description: None,
+    )
+    monkeypatch.setattr(
+        train_module,
+        "distributed_failure_scope",
+        lambda _failed, _context: "none",
+    )
+    monkeypatch.setattr(train_module, "_control_status_is_visible", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        train_module,
+        "_wait_for_rank_zero_action",
+        lambda *_args, **_kwargs: {"state": "complete", "result": {"ok": True}},
+    )
+    monkeypatch.setattr(
+        train_module,
+        "barrier",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("terminal acknowledgement must not use a collective")
+        ),
+    )
+
+    result = train_module._run_long_rank_zero_action(
+        context,
+        status_path,
+        operation="peer acknowledgement test",
+        action=lambda: (_ for _ in ()).throw(AssertionError("peer action must not run")),
+    )
+
+    assert result == {"ok": True}
+    ack_path = train_module._rank_zero_action_ack_path(
+        status_path,
+        invocation=invocation,
+        rank=1,
+    )
+    ack = json.loads(ack_path.read_text(encoding="utf-8"))
+    assert ack["state"] == "observed"
+    assert ack["terminal_state"] == "complete"
+
+
+def test_long_rank_zero_action_peer_reports_observer_error_without_collective(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = DistributedContext(1, 1, 2, torch.device("cpu"), True, "gloo")
+    status_path = tmp_path / "long-action.json"
+    invocation = "b" * 32
+    monkeypatch.setattr(train_module, "broadcast_text", lambda _value, _context: invocation)
+    monkeypatch.setattr(
+        train_module,
+        "_run_rank_zero_action",
+        lambda _context, _action, *, description: None,
+    )
+    monkeypatch.setattr(
+        train_module,
+        "distributed_failure_scope",
+        lambda _failed, _context: "none",
+    )
+    monkeypatch.setattr(train_module, "_control_status_is_visible", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        train_module,
+        "_wait_for_rank_zero_action",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(TimeoutError("lost heartbeat")),
+    )
+    monkeypatch.setattr(
+        train_module,
+        "barrier",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("observer errors must not enter a collective")
+        ),
+    )
+
+    with pytest.raises(TimeoutError, match="lost heartbeat"):
+        train_module._run_long_rank_zero_action(
+            context,
+            status_path,
+            operation="peer error acknowledgement test",
+            action=lambda: (_ for _ in ()).throw(AssertionError("peer action must not run")),
+        )
+
+    ack_path = train_module._rank_zero_action_ack_path(
+        status_path,
+        invocation=invocation,
+        rank=1,
+    )
+    ack = json.loads(ack_path.read_text(encoding="utf-8"))
+    assert ack["state"] == "observer_error"
+    assert "lost heartbeat" in ack["message"]
+
+
+def test_rank_zero_action_rejects_acknowledgement_for_a_different_terminal_state(
+    tmp_path: Path,
+) -> None:
+    status_path = tmp_path / "long-action.json"
+    invocation = "c" * 32
+    ack_path = train_module._rank_zero_action_ack_path(
+        status_path,
+        invocation=invocation,
+        rank=1,
+    )
+    ack_path.write_text(
+        json.dumps(
+            {
+                "schema": train_module.RANK_ZERO_ACTION_STATUS_SCHEMA,
+                "operation": "terminal binding test",
+                "invocation": invocation,
+                "rank": 1,
+                "state": "observed",
+                "terminal_state": "failed",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="observed terminal state 'failed', expected 'complete'"):
+        train_module._wait_for_rank_zero_action_acknowledgements(
+            status_path,
+            operation="terminal binding test",
+            invocation=invocation,
+            expected_terminal_state="complete",
+            world_size=2,
+            timeout_seconds=0.1,
+        )
+
+
+def test_two_gloo_ranks_reject_rank_local_resume_selection(
+    tmp_path: Path,
+) -> None:
+    if not torch.distributed.is_available() or not torch.distributed.is_gloo_available():
+        pytest.skip("distributed resume consensus test requires Gloo")
+
+    script = tmp_path / "resume_consensus_worker.py"
+    results = tmp_path / "results"
+    results.mkdir()
+    script.write_text(
+        textwrap.dedent(
+            """
+            import json
+            import sys
+            from pathlib import Path
+
+            import sion_translate.cli.train as train_module
+            from sion_translate.training.distributed import (
+                cleanup_distributed,
+                initialize_distributed,
+            )
+
+            result_dir = Path(sys.argv[1])
+            context = initialize_distributed()
+            errors = []
+            try:
+                train_module.checkpoint_path_exists = lambda _path: context.rank == 0
+                try:
+                    train_module._find_distributed_auto_resume(
+                        explicit=None,
+                        automatic=Path("auto-latest"),
+                        context=context,
+                        stage="SFT",
+                    )
+                except BaseException as error:
+                    errors.append(f"{type(error).__name__}:{error}")
+                else:
+                    raise SystemExit("rank-local auto resume unexpectedly succeeded")
+
+                try:
+                    train_module._find_distributed_auto_resume(
+                        explicit=f"rank-{context.rank}",
+                        automatic=Path("unused"),
+                        context=context,
+                        stage="SFT",
+                    )
+                except BaseException as error:
+                    errors.append(f"{type(error).__name__}:{error}")
+                else:
+                    raise SystemExit("rank-local explicit resume unexpectedly succeeded")
+
+                (result_dir / f"rank-{context.rank}.json").write_text(
+                    json.dumps({"errors": errors}, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+            finally:
+                cleanup_distributed(context)
+            """
+        ),
+        encoding="utf-8",
+    )
+    environment = {
+        **os.environ,
+        "CUDA_VISIBLE_DEVICES": "",
+        "PYTHONUTF8": "1",
+        "USE_LIBUV": "0",
+    }
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as port_probe:
+        port_probe.bind(("127.0.0.1", 0))
+        rendezvous_port = int(port_probe.getsockname()[1])
+
+    processes: list[subprocess.Popen[str]] = []
+    for rank in range(2):
+        worker_environment = {
+            **environment,
+            "MASTER_ADDR": "127.0.0.1",
+            "MASTER_PORT": str(rendezvous_port),
+            "WORLD_SIZE": "2",
+            "RANK": str(rank),
+            "LOCAL_RANK": str(rank),
+        }
+        processes.append(
+            subprocess.Popen(
+                [sys.executable, str(script), str(results)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=worker_environment,
+            )
+        )
+    outputs: list[tuple[str, str]] = []
+    try:
+        for process in processes:
+            outputs.append(process.communicate(timeout=60))
+    except subprocess.TimeoutExpired:
+        for process in processes:
+            process.kill()
+        for process in processes:
+            process.communicate()
+        raise
+
+    for process, (stdout, stderr) in zip(processes, outputs, strict=True):
+        assert process.returncode == 0, stderr or stdout
+    for rank in range(2):
+        payload = json.loads((results / f"rank-{rank}.json").read_text(encoding="utf-8"))
+        assert len(payload["errors"]) == 2
+        assert "auto-resume checkpoint visibility differs" in payload["errors"][0]
+        assert "explicit resume path differs" in payload["errors"][1]
+
+
+def test_resume_preflight_retains_the_exact_generation_until_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    active = False
+    source = tmp_path / "checkpoints" / "latest"
+
+    class GenerationLease:
+        def __enter__(self) -> SimpleNamespace:
+            nonlocal active
+            active = True
+            return SimpleNamespace(source=source, step=7, artifact_sha256="a" * 64)
+
+        def __exit__(self, *_args: object) -> None:
+            nonlocal active
+            active = False
+
+    monkeypatch.setattr(
+        train_module,
+        "verified_checkpoint_generation_lease",
+        lambda *_args, **_kwargs: GenerationLease(),
+    )
+    context = DistributedContext(0, 0, 2, torch.device("cpu"), True, "gloo")
+
+    with pytest.raises(ValueError, match="lease scope"):
+        train_module._coordinated_resume_preflight(source, {}, context, stage="SFT")
+
+    scope = ExitStack()
+    bound = train_module._coordinated_resume_preflight(
+        source,
+        {},
+        context,
+        stage="SFT",
+        lease_scope=scope,
+    )
+
+    assert bound == str(source)
+    assert active
+    scope.close()
+    assert not active
+
+
+def test_sft_resume_uses_its_authenticated_lineage_without_base_artifacts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = AppConfig()
+    config.foundation.release_name = "my_base"
+    plan = SimpleNamespace(enabled=True, languages=("ko", "ja"))
+    pipeline = {
+        "schema": "sion-translation-pipeline-v2",
+        "branch": "foundation-then-translation",
+        "foundation": {
+            "schema": "sion-foundation-lineage-v1",
+            "release_name": "my_base",
+            "release_version": "1.5",
+            "languages": ["ko", "ja"],
+            "selected_step": 7,
+            "foundation_manifest_sha256": "a" * 64,
+            "tokenizer_sha256": "b" * 64,
+            "checkpoint_identity_sha256": "c" * 64,
+            "checkpoint_artifact_sha256": "d" * 64,
+        },
+    }
+    monkeypatch.setattr(
+        train_module,
+        "inspect_checkpoint_identity",
+        lambda _source, _context: {
+            "pipeline": pipeline,
+            "tokenizer": {"model": {"sha256": "b" * 64}},
+        },
+    )
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+
+    recovered = train_module._checkpoint_pipeline_identity(
+        "authenticated-sft",
+        config,
+        plan,
+        context,
+    )
+
+    assert recovered == pipeline
+
+
+def test_sft_resume_keeps_foundation_lineage_when_raw_base_corpus_is_offline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = AppConfig()
+    config.foundation.release_name = "my_base"
+    offline_plan = SimpleNamespace(enabled=False, languages=("ko", "ja"))
+    pipeline = {
+        "schema": "sion-translation-pipeline-v2",
+        "branch": "foundation-then-translation",
+        "foundation": {
+            "schema": "sion-foundation-lineage-v1",
+            "release_name": "my_base",
+            "release_version": "1.5",
+            "languages": list(config.foundation_languages()),
+            "selected_step": 7,
+            "foundation_manifest_sha256": "a" * 64,
+            "tokenizer_sha256": "b" * 64,
+            "checkpoint_identity_sha256": "c" * 64,
+            "checkpoint_artifact_sha256": "d" * 64,
+        },
+    }
+    monkeypatch.setattr(
+        train_module,
+        "inspect_checkpoint_identity",
+        lambda _source, _context: {
+            "pipeline": pipeline,
+            "tokenizer": {"model": {"sha256": "b" * 64}},
+        },
+    )
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+
+    recovered = train_module._checkpoint_pipeline_identity(
+        "authenticated-sft",
+        config,
+        offline_plan,
+        context,
+    )
+
+    assert recovered == pipeline
+
+
+def test_two_gloo_ranks_wait_for_one_artifact_preparation_and_verify_contents(
+    tmp_path: Path,
+) -> None:
+    if not torch.distributed.is_available() or not torch.distributed.is_gloo_available():
+        pytest.skip("distributed artifact preparation test requires Gloo")
+
+    script = tmp_path / "artifact_worker.py"
+    results = tmp_path / "artifact-results"
+    artifacts = tmp_path / "artifacts"
+    results.mkdir()
+    script.write_text(
+        textwrap.dedent(
+            """
+            import json
+            import sys
+            import time
+            from pathlib import Path
+            from types import SimpleNamespace
+
+            import sion_translate.cli.train as train_module
+            from sion_translate.config import AppConfig
+            from sion_translate.data.integrity import build_dataset_artifact_inventory
+            from sion_translate.training.distributed import cleanup_distributed, initialize_distributed
+
+            result_dir = Path(sys.argv[1])
+            artifact_root = Path(sys.argv[2])
+            context = initialize_distributed()
+            config = AppConfig()
+            config.data.tokenizer_model = str(artifact_root / "tokenizer" / "sion.model")
+            config.data.dataset_dir = str(artifact_root / "translation")
+            config.training.output_dir = str(artifact_root / "run")
+            plan = SimpleNamespace(enabled=False)
+            calls = 0
+
+            def prepare_on_main(*_args, **_kwargs):
+                global calls
+                if not context.is_main:
+                    raise AssertionError("peer executed rank-zero artifact preparation")
+                calls += 1
+                time.sleep(0.25)
+                tokenizer = Path(config.data.tokenizer_model)
+                tokenizer.parent.mkdir(parents=True, exist_ok=True)
+                tokenizer.write_bytes(b"shared-tokenizer")
+                dataset = Path(config.data.dataset_dir)
+                train = dataset / "train"
+                train.mkdir(parents=True, exist_ok=True)
+                (train / "00000.src.bin").write_bytes(b"source")
+                (train / "00000.tgt.bin").write_bytes(b"target")
+                manifest = {
+                    "format": "sion-indexed-parallel-v6",
+                    "artifact_inventory": build_dataset_artifact_inventory(dataset),
+                }
+                (dataset / "manifest.json").write_text(
+                    json.dumps(manifest), encoding="utf-8"
+                )
+                (dataset / "raw_fingerprint.json").write_text("{}", encoding="utf-8")
+
+            train_module._ensure_artifacts_on_main = prepare_on_main
+            try:
+                train_module.ensure_artifacts(
+                    config,
+                    context,
+                    plan,
+                    prepare_foundation=False,
+                )
+                (result_dir / f"rank-{context.rank}.json").write_text(
+                    json.dumps({"calls": calls}), encoding="utf-8"
+                )
+            finally:
+                cleanup_distributed(context)
+            """
+        ),
+        encoding="utf-8",
+    )
+    environment = {
+        **os.environ,
+        "CUDA_VISIBLE_DEVICES": "",
+        "PYTHONUTF8": "1",
+        "USE_LIBUV": "0",
+    }
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as port_probe:
+        port_probe.bind(("127.0.0.1", 0))
+        rendezvous_port = int(port_probe.getsockname()[1])
+
+    processes: list[subprocess.Popen[str]] = []
+    for rank in range(2):
+        worker_environment = {
+            **environment,
+            "MASTER_ADDR": "127.0.0.1",
+            "MASTER_PORT": str(rendezvous_port),
+            "WORLD_SIZE": "2",
+            "RANK": str(rank),
+            "LOCAL_RANK": str(rank),
+        }
+        processes.append(
+            subprocess.Popen(
+                [sys.executable, str(script), str(results), str(artifacts)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=worker_environment,
+            )
+        )
+    outputs: list[tuple[str, str]] = []
+    try:
+        for process in processes:
+            outputs.append(process.communicate(timeout=60))
+    except subprocess.TimeoutExpired:
+        for process in processes:
+            process.kill()
+        for process in processes:
+            process.communicate()
+        raise
+
+    for process, (stdout, stderr) in zip(processes, outputs, strict=True):
+        assert process.returncode == 0, stderr or stdout
+    assert json.loads((results / "rank-0.json").read_text(encoding="utf-8")) == {"calls": 1}
+    assert json.loads((results / "rank-1.json").read_text(encoding="utf-8")) == {"calls": 0}
 
 
 def test_final_export_advertises_only_the_eight_trained_directions(
