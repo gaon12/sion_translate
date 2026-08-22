@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import json
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -16,6 +18,7 @@ from transformers import PreTrainedModel
 from transformers.generation import GenerationConfig, GenerationMixin
 from transformers.generation.utils import GenerateEncoderDecoderOutput
 from transformers.modeling_outputs import Seq2SeqLMOutput
+from transformers.utils import cached_file
 
 try:
     from sion_translate.model import (
@@ -31,6 +34,9 @@ except ImportError:
     ).SionForConditionalGeneration
 
 from .configuration_sion import SionConfig
+
+
+_MISSING_REASONING_LEVEL = object()
 
 
 def shift_tokens_right(
@@ -64,6 +70,98 @@ class SionForConditionalGeneration(PreTrainedModel, GenerationMixin):
         # device maps and gradient-checkpointing compatibility. The native model
         # has already performed its architecture-specific initialization.
         self.post_init()
+        self._synchronize_reasoning_level_default()
+
+    @staticmethod
+    def _validate_reasoning_level(reasoning_level: object) -> int:
+        if isinstance(reasoning_level, bool) or not isinstance(reasoning_level, int):
+            raise TypeError("reasoning_level must be an integer from 0 to 9")
+        if not 0 <= reasoning_level <= 9:
+            raise ValueError("reasoning_level must be between 0 and 9")
+        return reasoning_level
+
+    def _synchronize_reasoning_level_default(self) -> None:
+        """Bind the transient HF generation config to Sion's durable default."""
+
+        config_default = self._validate_reasoning_level(self.config.default_reasoning_level)
+        generation_default = getattr(self.generation_config, "reasoning_level", None)
+        if generation_default is None:
+            self.generation_config.reasoning_level = config_default
+            return
+        generation_default = self._validate_reasoning_level(generation_default)
+        if generation_default != config_default:
+            raise ValueError(
+                "config.default_reasoning_level and "
+                "generation_config.reasoning_level disagree: "
+                f"{config_default} != {generation_default}"
+            )
+
+    @staticmethod
+    def _raw_generation_reasoning_level(
+        pretrained_model_name_or_path: str | Path | None,
+        **kwargs: Any,
+    ) -> object:
+        """Read the raw sidecar because Transformers drops unknown fields."""
+
+        if pretrained_model_name_or_path is None:
+            return _MISSING_REASONING_LEVEL
+        subfolder = str(kwargs.get("subfolder", ""))
+        local_root = Path(pretrained_model_name_or_path)
+        if local_root.exists():
+            resolved_path: str | None = str(local_root / subfolder / "generation_config.json")
+            if not Path(resolved_path).is_file():
+                return _MISSING_REASONING_LEVEL
+        else:
+            resolved_path = cached_file(
+                pretrained_model_name_or_path,
+                "generation_config.json",
+                cache_dir=kwargs.get("cache_dir"),
+                force_download=bool(kwargs.get("force_download", False)),
+                proxies=kwargs.get("proxies"),
+                local_files_only=bool(kwargs.get("local_files_only", False)),
+                token=kwargs.get("token"),
+                revision=kwargs.get("revision"),
+                subfolder=subfolder,
+                _raise_exceptions_for_gated_repo=False,
+                _raise_exceptions_for_missing_entries=False,
+                _raise_exceptions_for_connection_errors=False,
+            )
+            if resolved_path is None:
+                return _MISSING_REASONING_LEVEL
+        payload = json.loads(Path(resolved_path).read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("generation_config.json must contain a JSON object")
+        return payload.get("reasoning_level", _MISSING_REASONING_LEVEL)
+
+    def adjust_generation_fn(self, *args: Any, **kwargs: Any) -> None:
+        """Load Transformers generation files, then authenticate Sion defaults."""
+
+        explicit_generation_config = args[0] if args else kwargs.get("generation_config")
+        if explicit_generation_config is not None:
+            raw_reasoning_level = getattr(
+                explicit_generation_config,
+                "reasoning_level",
+                _MISSING_REASONING_LEVEL,
+            )
+        else:
+            pretrained_model_name_or_path = (
+                args[3] if len(args) >= 4 else kwargs.get("pretrained_model_name_or_path")
+            )
+            raw_reasoning_level = self._raw_generation_reasoning_level(
+                pretrained_model_name_or_path,
+                **kwargs,
+            )
+        super().adjust_generation_fn(*args, **kwargs)
+        if raw_reasoning_level is not _MISSING_REASONING_LEVEL:
+            sidecar_default = self._validate_reasoning_level(raw_reasoning_level)
+            config_default = self._validate_reasoning_level(self.config.default_reasoning_level)
+            if sidecar_default != config_default:
+                raise ValueError(
+                    "config.default_reasoning_level and raw "
+                    "generation_config.json reasoning_level disagree: "
+                    f"{config_default} != {sidecar_default}"
+                )
+        self._synchronize_reasoning_level_default()
 
     def _init_weights(self, module: nn.Module) -> None:
         del module
@@ -422,6 +520,12 @@ class SionForConditionalGeneration(PreTrainedModel, GenerationMixin):
             raise ValueError("inputs or input_ids must be provided")
         if attention_mask is None:
             attention_mask = input_ids.ne(int(self.config.pad_token_id))
+        if generation_config is None:
+            # ``from_pretrained`` may replace this object after ``__init__``.
+            # Re-authenticate it at the public inference boundary as well as in
+            # ``adjust_generation_fn`` so a contradictory sidecar never drives
+            # generation silently across Transformers versions.
+            self._synchronize_reasoning_level_default()
         active_generation_config = generation_config or self.generation_config
         explicit_temperature = temperature is not None
         explicit_top_k = top_k is not None
@@ -486,11 +590,9 @@ class SionForConditionalGeneration(PreTrainedModel, GenerationMixin):
         configured_reasoning_level = configured(
             reasoning_level,
             "reasoning_level",
-            None,
+            self.config.default_reasoning_level,
         )
-        reasoning_level = (
-            None if configured_reasoning_level is None else int(configured_reasoning_level)
-        )
+        reasoning_level = self._validate_reasoning_level(configured_reasoning_level)
         explicit_num_beams = num_beams is not None
         explicit_do_sample = do_sample is not None
         num_beams = int(configured(num_beams, "num_beams", 1))

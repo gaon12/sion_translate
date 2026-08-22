@@ -317,6 +317,12 @@ def save_transformers_checkpoint(
     SionConfig.register_for_auto_class()
     SionForConditionalGeneration.register_for_auto_class("AutoModelForSeq2SeqLM")
     SionTokenizer.register_for_auto_class()
+    default_reasoning_level = (
+        9
+        if model_config.experimental.evidence_repair_enabled
+        or model_config.experimental.candidate_refinement_enabled
+        else 0
+    )
     config = SionConfig.from_model_config(
         model_config,
         pad_token_id=pad_id,
@@ -329,6 +335,7 @@ def save_transformers_checkpoint(
         release_version=release_version,
         translation_capable=translation_capable,
         revision_trained=revision_trained,
+        default_reasoning_level=default_reasoning_level,
         slot_token_ids=slot_token_ids,
         tokenizer_sha256=tokenizer_sha256,
         token_features_sha256=token_features_sha256,
@@ -345,12 +352,6 @@ def save_transformers_checkpoint(
     model.generation_config.length_penalty = 1.0
     model.generation_config.max_new_tokens = min(256, model_config.max_seq_len)
     model.generation_config.no_repeat_ngram_size = 4
-    default_reasoning_level = (
-        9
-        if model_config.experimental.evidence_repair_enabled
-        or model_config.experimental.candidate_refinement_enabled
-        else 0
-    )
     model.generation_config.reasoning_level = (  # pyright: ignore[reportAttributeAccessIssue]
         default_reasoning_level
     )

@@ -1081,6 +1081,17 @@ def _inspect_transformers_checkpoint_in_process(  # pyright: ignore[reportUnused
                 "Transformers generation_config.json and sion_export.json disagree "
                 "about reasoning_level"
             )
+        config_reasoning_level = getattr(config, "default_reasoning_level", None)
+        if isinstance(config_reasoning_level, bool) or not isinstance(config_reasoning_level, int):
+            raise RuntimeError("Transformers config default_reasoning_level must be an integer")
+        if not 0 <= config_reasoning_level <= 9:
+            raise RuntimeError(
+                "Transformers config default_reasoning_level must be between 0 and 9"
+            )
+        if config_reasoning_level != transformers_reasoning_level:
+            raise RuntimeError(
+                "Transformers config and generation sidecars disagree about reasoning_level"
+            )
         generation_reasoning_level = raw_generation_reasoning_level
     config_translation_capable = getattr(config, "translation_capable", True)
     if not isinstance(config_translation_capable, bool):

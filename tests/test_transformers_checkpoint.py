@@ -4,6 +4,7 @@ import copy
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -543,6 +544,7 @@ def test_transformers_checkpoint_preserves_source_precision(tmp_path: Path) -> N
 
 def test_candidate_refinement_transformers_checkpoint_is_self_contained(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     native_config = tiny_model_config()
     native_config.experimental.candidate_refinement_enabled = True
@@ -552,11 +554,15 @@ def test_candidate_refinement_transformers_checkpoint_is_self_contained(
     save_transformers_checkpoint(tmp_path, native.state_dict(), native_config)
 
     generation = json.loads((tmp_path / "generation_config.json").read_text(encoding="utf-8"))
+    serialized_config = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
     metadata = json.loads((tmp_path / "sion_export.json").read_text(encoding="utf-8"))
     assert generation["reasoning_level"] == 9
+    assert serialized_config["default_reasoning_level"] == 9
     assert metadata["generation_defaults"]["reasoning_level"] == 9
     restored = AutoModelForSeq2SeqLM.from_pretrained(tmp_path, trust_remote_code=True).eval()
     assert restored.model.candidate_refinement is not None
+    assert restored.config.default_reasoning_level == 9
+    assert restored.generation_config.reasoning_level == 9
     input_ids = torch.tensor([[4, 5, 3]])
     output = restored(
         input_ids=input_ids,
@@ -564,6 +570,79 @@ def test_candidate_refinement_transformers_checkpoint_is_self_contained(
         decoder_input_ids=torch.tensor([[2, 6]]),
     )
     assert output.logits.shape == (1, 2, native_config.vocab_size)
+
+    captured_generate: dict[str, object] = {}
+    native_generate = restored.model.generate
+
+    def capture_generate(*args, **kwargs):
+        captured_generate.update(kwargs)
+        return native_generate(*args, **kwargs)
+
+    monkeypatch.setattr(restored.model, "generate", capture_generate)
+    encoded = {"input_ids": input_ids, "attention_mask": input_ids.ne(0)}
+    restored.generate(**encoded, max_new_tokens=1)
+    assert captured_generate["reasoning_level"] == 9
+    captured_generate.clear()
+    restored.generate(**encoded, max_new_tokens=1, reasoning_level=0)
+    assert captured_generate["reasoning_level"] == 0
+    captured_generate.clear()
+
+    for invalid_type in (True, 1.0, "1"):
+        with pytest.raises(TypeError, match="integer from 0 to 9"):
+            restored.generate(
+                **encoded,
+                max_new_tokens=1,
+                reasoning_level=invalid_type,
+            )
+        assert not captured_generate
+    for out_of_range in (-1, 10):
+        with pytest.raises(ValueError, match="between 0 and 9"):
+            restored.generate(
+                **encoded,
+                max_new_tokens=1,
+                reasoning_level=out_of_range,
+            )
+        assert not captured_generate
+
+    round_trip = tmp_path / "round-trip"
+    restored.save_pretrained(round_trip)
+    reloaded = AutoModelForSeq2SeqLM.from_pretrained(round_trip, trust_remote_code=True).eval()
+    assert reloaded.config.default_reasoning_level == 9
+    assert reloaded.generation_config.reasoning_level == 9
+
+    contradictory_checkpoint = tmp_path / "contradictory"
+    shutil.copytree(round_trip, contradictory_checkpoint)
+    round_trip_generation = json.loads(
+        (contradictory_checkpoint / "generation_config.json").read_text(encoding="utf-8")
+    )
+    round_trip_generation["reasoning_level"] = 0
+    (contradictory_checkpoint / "generation_config.json").write_text(
+        json.dumps(round_trip_generation),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="default_reasoning_level.*disagree"):
+        AutoModelForSeq2SeqLM.from_pretrained(
+            contradictory_checkpoint,
+            trust_remote_code=True,
+        )
+
+
+@pytest.mark.parametrize("default_reasoning_level", [True, 1.0, "1"])
+def test_transformers_config_rejects_non_integer_reasoning_default(
+    default_reasoning_level: object,
+) -> None:
+    with pytest.raises(TypeError, match="integer from 0 to 9"):
+        SionConfig(  # pyright: ignore[reportArgumentType]
+            default_reasoning_level=default_reasoning_level,
+        )
+
+
+@pytest.mark.parametrize("default_reasoning_level", [-1, 10])
+def test_transformers_config_rejects_out_of_range_reasoning_default(
+    default_reasoning_level: int,
+) -> None:
+    with pytest.raises(ValueError, match="between 0 and 9"):
+        SionConfig(default_reasoning_level=default_reasoning_level)
 
 
 def test_transformers_config_rejects_non_boolean_revision_capability() -> None:
@@ -711,6 +790,22 @@ def test_transformers_inspection_rejects_tampered_generation_reasoning_endpoint(
     generation_path.write_text(json.dumps(payload), encoding="utf-8")
 
     with pytest.raises(RuntimeError, match="disagree about reasoning_level"):
+        _inspect_transformers_checkpoint(tmp_path)
+
+
+def test_transformers_inspection_binds_reasoning_sidecars_to_config_default(
+    tmp_path: Path,
+) -> None:
+    config = tiny_model_config()
+    config.experimental.candidate_refinement_enabled = True
+    native = NativeSionForConditionalGeneration(config, pad_id=0)
+    save_transformers_checkpoint(tmp_path, native.state_dict(), config)
+    config_path = tmp_path / "config.json"
+    config_payload = json.loads(config_path.read_text(encoding="utf-8"))
+    config_payload["default_reasoning_level"] = 8
+    config_path.write_text(json.dumps(config_payload), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="config and generation sidecars disagree"):
         _inspect_transformers_checkpoint(tmp_path)
 
 

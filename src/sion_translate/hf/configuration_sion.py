@@ -64,6 +64,7 @@ class SionConfig(PretrainedConfig):
         release_version: str | None = None,
         translation_capable: bool = True,
         revision_trained: bool | None = None,
+        default_reasoning_level: int | None = None,
         slot_token_ids: list[int] | tuple[int, ...] | None = None,
         tokenizer_sha256: str | None = None,
         token_features_sha256: str | None = None,
@@ -104,10 +105,12 @@ class SionConfig(PretrainedConfig):
         self.z_loss_weight = z_loss_weight
         self.gradient_checkpointing = gradient_checkpointing
         self.init_std = init_std
-        if isinstance(experimental, ExperimentalConfig):
-            self.experimental = experimental
-        else:
-            self.experimental = ExperimentalConfig(**dict(experimental or {}))
+        experimental_config: ExperimentalConfig = (
+            experimental
+            if isinstance(experimental, ExperimentalConfig)
+            else ExperimentalConfig(**dict(experimental or {}))
+        )
+        self.experimental = experimental_config
         self.language_pairs = [list(pair) for pair in (language_pairs or [])]
         self.languages = list(
             languages
@@ -132,6 +135,14 @@ class SionConfig(PretrainedConfig):
         ):
             raise ValueError("revision_trained must be a boolean or null")
         self.revision_trained = revision_trained
+        if default_reasoning_level is None:
+            default_reasoning_level = (
+                9
+                if self.experimental.evidence_repair_enabled
+                or self.experimental.candidate_refinement_enabled
+                else 0
+            )
+        self.default_reasoning_level = default_reasoning_level
         self.slot_token_ids = [int(token_id) for token_id in (slot_token_ids or [])]
         self.tokenizer_sha256 = tokenizer_sha256
         self.token_features_sha256 = token_features_sha256
@@ -173,6 +184,13 @@ class SionConfig(PretrainedConfig):
             raise ValueError("the sion foundation release cannot be translation-capable")
         if self.release_name == "sion_translate" and not self.translation_capable:
             raise ValueError("the sion_translate release must be translation-capable")
+        if isinstance(self.default_reasoning_level, bool) or not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
+            self.default_reasoning_level,
+            int,
+        ):
+            raise TypeError("default_reasoning_level must be an integer from 0 to 9")
+        if not 0 <= self.default_reasoning_level <= 9:
+            raise ValueError("default_reasoning_level must be between 0 and 9")
         if self.pad_token_id is None or self.pad_token_id < 0:
             raise ValueError("pad_token_id must be a non-negative integer")
         for name in ("bos_token_id", "eos_token_id", "decoder_start_token_id"):
@@ -262,6 +280,7 @@ class SionConfig(PretrainedConfig):
         release_version: str | None = None,
         translation_capable: bool = True,
         revision_trained: bool | None = None,
+        default_reasoning_level: int | None = None,
         slot_token_ids: list[int] | tuple[int, ...] | None = None,
         tokenizer_sha256: str | None = None,
         token_features_sha256: str | None = None,
@@ -281,6 +300,7 @@ class SionConfig(PretrainedConfig):
             release_version=release_version,
             translation_capable=translation_capable,
             revision_trained=revision_trained,
+            default_reasoning_level=default_reasoning_level,
             slot_token_ids=slot_token_ids,
             tokenizer_sha256=tokenizer_sha256,
             token_features_sha256=token_features_sha256,
