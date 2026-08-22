@@ -4,6 +4,7 @@ import pytest
 
 from sion_translate.language_tags import (
     LanguageTagError,
+    canonicalize_language_pair,
     canonicalize_language_tag,
     canonicalize_language_tags,
     is_well_formed_language_tag,
@@ -20,6 +21,7 @@ from sion_translate.language_tags import (
         ("sr-latn-rs", "sr-Latn-RS"),
         ("de-CH-1901", "de-CH-1901"),
         ("en-u-ca-gregory", "en-u-ca-gregory"),
+        ("en-b-ccc-bbb-a-aaa", "en-a-aaa-b-ccc-bbb"),
         ("x-Sion-Mixed", "x-sion-mixed"),
         ("en-GB-OED", "en-GB-oed"),
     ],
@@ -65,3 +67,16 @@ def test_language_lists_reject_duplicates_after_canonicalization() -> None:
         canonicalize_language_tags(["pt-BR", "pt-br"])
 
     assert canonicalize_language_tags(["pt-BR", "pt-br"], reject_duplicates=False) == ("pt-BR",)
+
+
+def test_language_pair_requires_two_distinct_canonical_identities() -> None:
+    assert canonicalize_language_pair(["PT-br", "zh-hant"]) == ("pt-BR", "zh-Hant")
+    with pytest.raises(LanguageTagError, match="after canonicalization"):
+        canonicalize_language_pair(["PT-br", "pt-BR"])
+    with pytest.raises(LanguageTagError, match="two-item language sequence"):
+        canonicalize_language_pair(["en"])
+
+
+def test_extension_order_variants_collapse_to_one_language_identity() -> None:
+    with pytest.raises(LanguageTagError, match="after canonicalization"):
+        canonicalize_language_pair(["en-b-ccc-bbb-a-aaa", "en-a-aaa-b-ccc-bbb"])

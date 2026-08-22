@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
-from typing import Sequence
+from typing import Sequence, cast
 
 
 _ALPHA = re.compile(r"^[A-Za-z]+$")
@@ -197,6 +197,10 @@ def parse_language_tag(value: object, *, field: str = "language") -> LanguageTag
     if index != len(raw):
         raise _error(value, field, f"unexpected subtag {raw[index]!r}")
 
+    # RFC 5646 canonical form orders extension sequences by singleton.  Without
+    # this step, tags that differ only in extension order become two model
+    # identities even though they denote the same language tag.
+    extensions.sort(key=lambda item: item[0])
     canonical_parts = [language, *extlangs]
     if script is not None:
         canonical_parts.append(script)
@@ -252,6 +256,26 @@ def canonicalize_language_tags(
     return tuple(normalized)
 
 
+def canonicalize_language_pair(
+    value: object,
+    *,
+    field: str = "language pair",
+) -> tuple[str, str]:
+    """Canonicalize one ordered pair and require two distinct identities."""
+
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise LanguageTagError(f"{field} must be a two-item language sequence of BCP 47 tags")
+    items = cast(Sequence[object], value)
+    if len(items) != 2:
+        raise LanguageTagError(f"{field} must be a two-item language sequence of BCP 47 tags")
+    languages = canonicalize_language_tags(
+        items,
+        field=field,
+        reject_duplicates=True,
+    )
+    return languages[0], languages[1]
+
+
 def is_well_formed_language_tag(value: object) -> bool:
     """Whether *value* has well-formed offline BCP 47 syntax."""
 
@@ -265,6 +289,7 @@ def is_well_formed_language_tag(value: object) -> bool:
 __all__ = [
     "LanguageTag",
     "LanguageTagError",
+    "canonicalize_language_pair",
     "canonicalize_language_tag",
     "canonicalize_language_tags",
     "is_well_formed_language_tag",
