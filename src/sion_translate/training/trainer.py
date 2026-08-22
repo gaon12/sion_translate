@@ -46,16 +46,18 @@ from .checkpoint import (
     load_checkpoint,
     preflight_checkpoint_identity,
     save_checkpoint,
+    verified_checkpoint_generation_lease,
 )
 from .distributed import (
     DistributedContext,
     broadcast_bool,
+    distributed_failure_scope,
     maybe_no_sync,
     reduce_max,
     reduce_sum,
 )
 from .ema import EMAWeights
-from .export import export_inference_models
+from .export import build_export_metadata, export_inference_models
 from .objectives import ObjectiveOutput
 
 
@@ -107,6 +109,14 @@ def _atomic_write_resolved_config(path: Path, payload: Mapping[str, Any]) -> Non
             pass
         temporary.unlink(missing_ok=True)
         raise
+
+
+def _is_sha256_digest(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
 
 
 def _publish_resolved_config(
@@ -703,6 +713,28 @@ def train(
 ) -> dict[str, float | int | bool | str]:
     """sion_translate 학습의 본체. 반환값은 진행 상태와 best 선택 지표 요약입니다."""
     config.validate()
+    # Export role/ancestry is part of the training contract, not a late
+    # serialization detail. Reject a missing or malformed 1.5 pipeline before
+    # optimizer allocation or the first expensive training step.
+    build_export_metadata(
+        config.model,
+        tokenizer_path=config.data.tokenizer_model,
+        token_features_path=(
+            config.data.tokenizer_features
+            if config.model.experimental.morphoscript_enabled
+            else None
+        ),
+        language_pairs=config.data.configured_language_pairs(),
+        languages=export_languages,
+        translation_directions=(
+            config.data.configured_translation_directions() if export_translation_capable else None
+        ),
+        bidirectional=config.data.bidirectional,
+        revision_trained=config.data.revision_examples,
+        release_name=export_release_name,
+        translation_capable=export_translation_capable,
+        pipeline_identity=pipeline_identity,
+    )
     _fail_if_known_empty(train_loader, "training")
     _fail_if_known_empty(validation_loader, "validation")
 
@@ -726,11 +758,26 @@ def train(
     if training.resume_from:
         # Incompatible or corrupt retries must fail before mutating the live
         # model/optimizer or replacing the prior run's configuration evidence.
-        preflight_checkpoint_identity(
-            training.resume_from,
+        preflight_error: Exception | None = None
+        try:
+            preflight_checkpoint_identity(
+                training.resume_from,
+                context,
+                checkpoint_identity,
+            )
+        except Exception as error:
+            preflight_error = error
+        preflight_failure_scope = distributed_failure_scope(
+            preflight_error is not None,
             context,
-            checkpoint_identity,
         )
+        if preflight_failure_scope != "none":
+            failure = RuntimeError(
+                "checkpoint resume preflight failed on at least one distributed rank"
+            )
+            if preflight_error is not None:
+                raise failure from preflight_error
+            raise failure
 
     # ── 단계 1/4: optimizer · scheduler · AMP scaler 준비 ─────────────────
     announce("단계 1/4: optimizer(AdamW)와 학습률 스케줄러를 준비합니다.", context)
@@ -802,6 +849,44 @@ def train(
                     "best_step": -1,
                     "early_stopping_bad_evals": 0,
                     "best_selection_metric": None,
+                    "best_checkpoint_artifact_sha256": None,
+                }
+            )
+        recorded_best_step = int(training_state.get("best_step", -1))
+        recorded_best_value = float(training_state.get("best_validation_loss", float("inf")))
+        recorded_best_artifact_sha256 = training_state.get("best_checkpoint_artifact_sha256")
+        has_compatible_recorded_best = recorded_best_step >= 0 or math.isfinite(recorded_best_value)
+        recorded_best_invalid = has_compatible_recorded_best and (
+            recorded_best_step < 0 or not _is_sha256_digest(recorded_best_artifact_sha256)
+        )
+        if has_compatible_recorded_best and not recorded_best_invalid:
+            try:
+                # DCP candidate order and its small completion-marker binding are
+                # chosen by rank 0. Every rank then authenticates the exact visible
+                # inventory and preflights identity + recorded step inside one lease.
+                with verified_checkpoint_generation_lease(
+                    output_dir / "checkpoints" / "best",
+                    context,
+                    checkpoint_identity,
+                    expected_artifact_sha256=recorded_best_artifact_sha256,
+                    expected_step=recorded_best_step,
+                ):
+                    pass
+            except Exception:
+                recorded_best_invalid = True
+        if recorded_best_invalid:
+            announce(
+                "재개 checkpoint의 best 선택 기록에 대응하는 exact best artifact를 "
+                "모든 rank에서 인증할 수 없어 다음 검증에서 안전하게 다시 선택합니다.",
+                context,
+            )
+            training_state.update(
+                {
+                    "best_validation_loss": float("inf"),
+                    "best_step": -1,
+                    "early_stopping_bad_evals": 0,
+                    "best_selection_metric": None,
+                    "best_checkpoint_artifact_sha256": None,
                 }
             )
     else:
@@ -819,6 +904,14 @@ def train(
         raise ValueError("checkpoint batch_in_epoch must be non-negative")
     best_validation_loss = float(training_state.get("best_validation_loss", float("inf")))
     best_step = int(training_state.get("best_step", -1))
+    raw_best_checkpoint_artifact_sha256 = training_state.get("best_checkpoint_artifact_sha256")
+    best_checkpoint_artifact_sha256 = (
+        raw_best_checkpoint_artifact_sha256
+        if _is_sha256_digest(raw_best_checkpoint_artifact_sha256)
+        else None
+    )
+    selected_checkpoint_source: str | None = None
+    selected_checkpoint_artifact_sha256: str | None = None
     bad_evals = int(training_state.get("early_stopping_bad_evals", 0))
     loaded_best_selection_metric = training_state.get("best_selection_metric")
     best_selection_metric = (
@@ -849,6 +942,7 @@ def train(
             "early_stopping_bad_evals": bad_evals,
             "configured_selection_metric": configured_selection_metric,
             "best_selection_metric": best_selection_metric,
+            "best_checkpoint_artifact_sha256": best_checkpoint_artifact_sha256,
             "epoch": epoch,
             "batch_in_epoch": batch_in_epoch,
         }
@@ -901,6 +995,7 @@ def train(
             revision_trained=config.data.revision_examples,
             release_name=export_release_name,
             translation_capable=export_translation_capable,
+            pipeline_identity=pipeline_identity,
         )
         if context.is_main and manifest is not None:
             successful = [
@@ -930,7 +1025,7 @@ def train(
         반환값이 True 면 '더 이상 개선이 없어 학습을 멈춰야 한다'는 뜻입니다.
         """
         nonlocal best_validation_loss, best_step, bad_evals, last_eval_step
-        nonlocal best_selection_metric
+        nonlocal best_checkpoint_artifact_sha256, best_selection_metric
         announce(f"검증 시작 (step {step})", context)
         metrics = evaluate(
             model,
@@ -1032,6 +1127,7 @@ def train(
             best_validation_loss = float("inf")
             best_step = -1
             bad_evals = 0
+            best_checkpoint_artifact_sha256 = None
             best_selection_metric = None
         improved_here = candidate < best_validation_loss - training.early_stopping_min_delta
         improved = broadcast_bool(improved_here if context.is_main else False, context)
@@ -1044,7 +1140,24 @@ def train(
                 f"{selection_name} 최고 기록 갱신 ({selection_value:.4f}) → best 저장",
                 context,
             )
-            save(output_dir / "checkpoints" / "best")
+            best_checkpoint = output_dir / "checkpoints" / "best"
+            best_checkpoint_artifact_sha256 = None
+            save(best_checkpoint)
+            with verified_checkpoint_generation_lease(
+                best_checkpoint,
+                context,
+                checkpoint_identity,
+                expected_step=best_step,
+            ) as authenticated_best:
+                if authenticated_best.source.resolve() != best_checkpoint.resolve():
+                    raise RuntimeError(
+                        "newly saved best checkpoint did not publish as the current generation"
+                    )
+                best_checkpoint_artifact_sha256 = authenticated_best.artifact_sha256
+            # Persist the exact best-generation binding before any fallible
+            # inference export. A failed export can then restart from latest
+            # without repeating completed optimizer/evaluation work.
+            save(output_dir / "checkpoints" / "latest")
             export_models("best")
         else:
             bad_evals += 1
@@ -1385,19 +1498,27 @@ def train(
         save(output_dir / "checkpoints" / "latest")
         export_models("latest")
         best_checkpoint = output_dir / "checkpoints" / "best"
-        best_file_exists_here = (best_checkpoint / "checkpoint.pt").is_file() or (
-            best_checkpoint / ".metadata"
-        ).exists()
-        best_exists_here = (
-            best_step >= 0 and best_selection_metric is not None and best_file_exists_here
-        )
-        best_exists = broadcast_bool(
-            best_exists_here if context.is_main else False,
+        if (
+            best_step < 0
+            or best_selection_metric is None
+            or best_checkpoint_artifact_sha256 is None
+        ):
+            raise RuntimeError(
+                "training produced no finite validation selection metric or authenticated "
+                "best checkpoint; refusing to publish unbound final weights"
+            )
+        # Do not infer safety from rank 0's `.metadata` existence. Rank 0 binds
+        # an exact current/previous generation, every rank verifies its own bytes,
+        # and the full load remains inside that one-shot lease.
+        with verified_checkpoint_generation_lease(
+            best_checkpoint,
             context,
-        )
-        if best_exists:
+            checkpoint_identity,
+            expected_artifact_sha256=best_checkpoint_artifact_sha256,
+            expected_step=best_step,
+        ) as authenticated_best:
             best_step = load_checkpoint(
-                best_checkpoint,
+                authenticated_best.source,
                 model,
                 optimizer,
                 scheduler,
@@ -1406,18 +1527,18 @@ def train(
                 ema=ema,
                 expected_identity=checkpoint_identity,
             )
-            selected_weights = "EMA" if ema is not None else "raw"
-            if ema is not None:
-                ema.copy_to(model)
-            announce(
-                f"다음 단계용으로 best checkpoint(step {best_step}, "
-                f"{selected_weights} weights)를 복원했습니다.",
-                context,
-            )
-        else:
-            # A non-finite validation metric can prevent a best checkpoint.
-            # In that exceptional case the live final weights are selected.
-            best_step = step
+            if best_step != authenticated_best.step:
+                raise RuntimeError("best checkpoint step changed after authenticated preflight")
+            selected_checkpoint_source = str(authenticated_best.source)
+            selected_checkpoint_artifact_sha256 = authenticated_best.artifact_sha256
+        selected_weights = "EMA" if ema is not None else "raw"
+        if ema is not None:
+            ema.copy_to(model)
+        announce(
+            f"다음 단계용으로 best checkpoint(step {best_step}, "
+            f"{selected_weights} weights)를 복원했습니다.",
+            context,
+        )
         if objective is not None:
             final_selection_name = "생성 복합 reward"
             final_selection_value = -best_validation_loss
@@ -1450,6 +1571,8 @@ def train(
         ),
         "early_stopping_bad_evals": bad_evals,
         "stopped_early": stopped_early,
+        "selected_checkpoint_source": selected_checkpoint_source,
+        "selected_checkpoint_artifact_sha256": selected_checkpoint_artifact_sha256,
     }
     if objective is not None:
         result["best_validation_reward"] = -best_validation_loss

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
+import shutil
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -28,8 +30,20 @@ from sion_translate.training.trainer import (
     cosine_scheduler,
     evaluate,
     resolve_training_budget,
-    train,
+    train as _train,
 )
+
+TRANSLATION_PIPELINE_IDENTITY = {
+    "schema": "sion-translation-pipeline-v2",
+    "branch": "translation-only",
+}
+
+
+def train(*args, **kwargs):
+    """Run translation tests under the exact public 1.5 ancestry contract."""
+
+    kwargs.setdefault("pipeline_identity", TRANSLATION_PIPELINE_IDENTITY)
+    return _train(*args, **kwargs)
 
 
 def tiny_model_config() -> ModelConfig:
@@ -147,14 +161,45 @@ def tiny_app_config(tmp_path: Path, **training_overrides) -> AppConfig:
     )
 
 
+@pytest.mark.parametrize(
+    "pipeline_identity",
+    [
+        None,
+        {"schema": "sion-translation-pipeline-v1", "branch": "translation-only"},
+    ],
+)
+def test_translation_training_rejects_invalid_ancestry_before_optimizer_allocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pipeline_identity: dict[str, str] | None,
+) -> None:
+    config = tiny_app_config(tmp_path)
+    model = SionForConditionalGeneration(config.model)
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+    monkeypatch.setattr(
+        trainer_module.torch.optim,
+        "AdamW",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("optimizer must not be allocated")
+        ),
+    )
+
+    with pytest.raises(ValueError, match="pipeline"):
+        _train(
+            model,
+            [tiny_batch()],
+            [tiny_batch()],
+            config,
+            context,
+            pipeline_identity=pipeline_identity,
+        )
+
+
 def test_single_step_training_loop(tmp_path: Path) -> None:
     config = tiny_app_config(tmp_path)
     model = SionForConditionalGeneration(config.model)
     context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
-    pipeline_identity = {
-        "schema": "sion-translation-pipeline-v1",
-        "branch": "translation-only",
-    }
+    pipeline_identity = TRANSLATION_PIPELINE_IDENTITY
     result = train(
         model,
         [tiny_batch()],
@@ -687,6 +732,251 @@ def test_resume_resets_an_incompatible_best_selection_metric(
     assert result["best_selection_metric"] == "validation_nll"
     assert result["best_step"] == 2
     assert result["early_stopping_bad_evals"] == 0
+
+
+def test_resume_reselects_best_when_recorded_artifact_is_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "sion_translate.training.trainer.export_inference_models",
+        lambda *args, **kwargs: None,
+    )
+    config = tiny_app_config(tmp_path, max_steps=1, ema_decay=0.0)
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+    train(
+        SionForConditionalGeneration(config.model),
+        [tiny_batch()],
+        [tiny_batch()],
+        config,
+        context,
+    )
+    checkpoint_root = tmp_path / "run" / "checkpoints"
+    latest = checkpoint_root / "latest"
+    latest_file = latest / "checkpoint.pt"
+    payload = torch.load(latest_file, map_location="cpu", weights_only=True)
+    payload["training_state"]["best_validation_loss"] = -100.0
+    payload["training_state"]["best_step"] = 1
+    payload["training_state"]["best_selection_metric"] = "validation_nll"
+    torch.save(payload, latest_file)
+    shutil.rmtree(checkpoint_root / "best")
+
+    config.training.resume_from = str(latest)
+    result = train(
+        SionForConditionalGeneration(config.model),
+        [tiny_batch()],
+        [tiny_batch()],
+        config,
+        context,
+    )
+
+    assert (checkpoint_root / "best" / "checkpoint.pt").is_file()
+    assert result["best_step"] == 1
+    assert math.isfinite(float(result["best_validation_loss"]))
+    assert float(result["best_validation_loss"]) > -100.0
+
+
+def test_resume_reselects_best_when_recorded_artifact_step_is_not_authentic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "sion_translate.training.trainer.export_inference_models",
+        lambda *args, **kwargs: None,
+    )
+    config = tiny_app_config(tmp_path, max_steps=1, ema_decay=0.0)
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+    train(
+        SionForConditionalGeneration(config.model),
+        [tiny_batch()],
+        [tiny_batch()],
+        config,
+        context,
+    )
+    checkpoint_root = tmp_path / "run" / "checkpoints"
+    latest_file = checkpoint_root / "latest" / "checkpoint.pt"
+    latest_payload = torch.load(latest_file, map_location="cpu", weights_only=True)
+    latest_payload["training_state"]["best_validation_loss"] = -100.0
+    latest_payload["training_state"]["best_step"] = 1
+    latest_payload["training_state"]["best_selection_metric"] = "validation_nll"
+    torch.save(latest_payload, latest_file)
+    best_file = checkpoint_root / "best" / "checkpoint.pt"
+    best_payload = torch.load(best_file, map_location="cpu", weights_only=True)
+    best_payload["step"] = 999
+    torch.save(best_payload, best_file)
+
+    config.training.max_steps = 2
+    config.training.resume_from = str(checkpoint_root / "latest")
+    result = train(
+        SionForConditionalGeneration(config.model),
+        [tiny_batch()],
+        [tiny_batch()],
+        config,
+        context,
+    )
+
+    selected_source = Path(str(result["selected_checkpoint_source"]))
+    assert selected_source == checkpoint_root / "best"
+    assert result["best_step"] == 2
+    assert float(result["best_validation_loss"]) > -100.0
+    assert (
+        result["selected_checkpoint_artifact_sha256"]
+        == hashlib.sha256((selected_source / "checkpoint.pt").read_bytes()).hexdigest()
+    )
+
+
+def test_resume_reselects_best_when_same_step_artifact_digest_changed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "sion_translate.training.trainer.export_inference_models",
+        lambda *args, **kwargs: None,
+    )
+    config = tiny_app_config(tmp_path, max_steps=1, ema_decay=0.0)
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+    train(
+        SionForConditionalGeneration(config.model),
+        [tiny_batch()],
+        [tiny_batch()],
+        config,
+        context,
+    )
+    checkpoint_root = tmp_path / "run" / "checkpoints"
+    best_file = checkpoint_root / "best" / "checkpoint.pt"
+    best_payload = torch.load(best_file, map_location="cpu", weights_only=True)
+    first_parameter = next(iter(best_payload["model"]))
+    best_payload["model"][first_parameter] = best_payload["model"][first_parameter].clone() + 1
+    torch.save(best_payload, best_file)
+
+    latest_file = checkpoint_root / "latest" / "checkpoint.pt"
+    latest_payload = torch.load(latest_file, map_location="cpu", weights_only=True)
+    latest_payload["training_state"]["best_validation_loss"] = -100.0
+    torch.save(latest_payload, latest_file)
+
+    config.training.max_steps = 2
+    config.training.resume_from = str(checkpoint_root / "latest")
+    result = train(
+        SionForConditionalGeneration(config.model),
+        [tiny_batch()],
+        [tiny_batch()],
+        config,
+        context,
+    )
+
+    selected_source = Path(str(result["selected_checkpoint_source"]))
+    assert result["best_step"] == 2
+    assert float(result["best_validation_loss"]) > -100.0
+    assert (
+        result["selected_checkpoint_artifact_sha256"]
+        == hashlib.sha256((selected_source / "checkpoint.pt").read_bytes()).hexdigest()
+    )
+
+
+def test_resume_reselects_legacy_best_without_an_artifact_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "sion_translate.training.trainer.export_inference_models",
+        lambda *args, **kwargs: None,
+    )
+    config = tiny_app_config(tmp_path, max_steps=1, ema_decay=0.0)
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+    train(
+        SionForConditionalGeneration(config.model),
+        [tiny_batch()],
+        [tiny_batch()],
+        config,
+        context,
+    )
+    checkpoint_root = tmp_path / "run" / "checkpoints"
+    latest_file = checkpoint_root / "latest" / "checkpoint.pt"
+    latest_payload = torch.load(latest_file, map_location="cpu", weights_only=True)
+    latest_payload["training_state"].pop("best_checkpoint_artifact_sha256")
+    latest_payload["training_state"]["best_validation_loss"] = -100.0
+    torch.save(latest_payload, latest_file)
+
+    config.training.max_steps = 2
+    config.training.resume_from = str(checkpoint_root / "latest")
+    result = train(
+        SionForConditionalGeneration(config.model),
+        [tiny_batch()],
+        [tiny_batch()],
+        config,
+        context,
+    )
+
+    assert result["best_step"] == 2
+    assert float(result["best_validation_loss"]) > -100.0
+
+
+def test_best_checkpoint_binding_is_resumable_before_fallible_export(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_export(*args, **kwargs):
+        raise RuntimeError("simulated export failure")
+
+    monkeypatch.setattr(
+        "sion_translate.training.trainer.export_inference_models",
+        fail_export,
+    )
+    config = tiny_app_config(tmp_path, max_steps=1, ema_decay=0.0)
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+
+    with pytest.raises(RuntimeError, match="simulated export failure"):
+        train(
+            SionForConditionalGeneration(config.model),
+            [tiny_batch()],
+            [tiny_batch()],
+            config,
+            context,
+        )
+
+    checkpoint_root = tmp_path / "run" / "checkpoints"
+    best_file = checkpoint_root / "best" / "checkpoint.pt"
+    latest_file = checkpoint_root / "latest" / "checkpoint.pt"
+    latest_payload = torch.load(latest_file, map_location="cpu", weights_only=True)
+    assert latest_payload["step"] == 1
+    assert (
+        latest_payload["training_state"]["best_checkpoint_artifact_sha256"]
+        == hashlib.sha256(best_file.read_bytes()).hexdigest()
+    )
+
+
+def test_nonfinite_validation_cannot_be_published_as_best(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "sion_translate.training.trainer.export_inference_models",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        trainer_module,
+        "evaluate",
+        lambda *args, **kwargs: {
+            "validation_loss": float("nan"),
+            "validation_nll": float("nan"),
+            "validation_perplexity": float("nan"),
+            "validation_auxiliary_loss": 0.0,
+            "validation_tokens": 1.0,
+        },
+    )
+    config = tiny_app_config(tmp_path, max_steps=1, ema_decay=0.0)
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+
+    with pytest.raises(RuntimeError, match="no finite validation selection metric"):
+        train(
+            SionForConditionalGeneration(config.model),
+            [tiny_batch()],
+            [tiny_batch()],
+            config,
+            context,
+        )
+
+    assert not (tmp_path / "run" / "checkpoints" / "best").exists()
 
 
 def test_mid_epoch_resume_uses_saved_batch_cursor(
