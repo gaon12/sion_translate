@@ -135,6 +135,23 @@ def test_auto_settings_fill_unspecified_fields() -> None:
     config.validate()
 
 
+def test_auto_sizing_uses_physical_pairs_for_a_mixed_direction_graph() -> None:
+    config = AppConfig()
+
+    apply_auto_settings(
+        config,
+        raw={},
+        env=cpu_environment(),
+        train_examples=20_000_000,
+        validation_examples=100_000,
+        physical_train_pairs=2_000_000,
+    )
+
+    # 2M physical pairs select the medium preset. Inferring pair count from the
+    # 20M virtual directions would incorrectly select the larger base preset.
+    assert config.model.d_model == 640
+
+
 def test_auto_settings_respect_user_values() -> None:
     config = AppConfig()
     config.training.max_steps = 777

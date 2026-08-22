@@ -63,6 +63,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="여러 언어쌍을 학습할 때 반복 지정",
     )
     parser.add_argument(
+        "--translation-direction",
+        nargs=2,
+        action="append",
+        metavar=("SOURCE", "TARGET"),
+        help="실제로 학습할 방향을 반복 지정 (생략하면 기존 양방향/source-only 정책)",
+    )
+    parser.add_argument(
         "--approximate-split",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -116,6 +123,7 @@ def main() -> None:
             test_fraction=args.test_fraction,
             language_pair=args.language_pair,
             language_pairs=args.language_pairs,
+            translation_directions=args.translation_direction,
             approximate_split=args.approximate_split,
             source_only_languages=args.source_only_language,
             train_only_prefixes=args.train_only_prefix,

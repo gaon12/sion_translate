@@ -10,8 +10,14 @@ import numpy as np
 from torch.utils.data import Dataset, Sampler
 
 from sion_translate.synthetic import DEFAULT_SYNTHETIC_SAMPLING_WEIGHT
+from sion_translate.fingerprint import PREPROCESSING_SCHEMA
 
 from .integrity import validate_dataset_artifact_inventory
+from .records import (
+    languages_from_pairs,
+    normalize_language_pairs,
+    normalize_translation_directions,
+)
 from .record_metadata import (
     RECORD_METADATA_DATA_SUFFIX,
     RECORD_METADATA_INDEX_DTYPE,
@@ -27,6 +33,7 @@ class IndexedParallelDataset(Dataset[dict[str, object]]):
         split: str,
         *,
         bidirectional: bool = True,
+        legacy_bidirectional: bool | None = None,
         include_metadata: bool = False,
         verify_integrity: bool = True,
         allow_unverified_legacy: bool = False,
@@ -42,6 +49,11 @@ class IndexedParallelDataset(Dataset[dict[str, object]]):
                 self.dataset_root,
                 require_manifest=not allow_unverified_legacy,
             )
+        self._manifest = self._read_dataset_manifest()
+        self._current_translation_schema = self._detect_current_translation_schema()
+        self.legacy_bidirectional = legacy_bidirectional
+        if not self._current_translation_schema and legacy_bidirectional is not None:
+            self.bidirectional = legacy_bidirectional
         self.index_paths = sorted(self.root.glob("*.idx.npy"))
         if not self.index_paths:
             raise FileNotFoundError(f"No index shards found under {self.root}")
@@ -96,12 +108,60 @@ class IndexedParallelDataset(Dataset[dict[str, object]]):
         self.synthetic_sampling_weight = self._load_synthetic_sampling_weight()
         self.language_pairs, self.languages = self._load_language_metadata()
         self.language_pair = self.language_pairs[0]
+        self.observed_language_pairs = self._find_observed_language_pairs()
         self.source_only_languages = self._load_source_only_languages()
+        self.translation_directions = self._load_translation_directions()
+        self._validate_translation_direction_rows()
         self._token_cache: dict[tuple[int, str], np.memmap] = {}
         self._record_metadata_cache: dict[int, np.memmap] = {}
         self._bidirectional_pairs: np.ndarray | None = None
         self._forward_only_pairs: np.ndarray | None = None
         self._build_direction_maps()
+
+    def _read_dataset_manifest(self) -> dict[str, Any]:
+        manifest_path = self.dataset_root / "manifest.json"
+        if not manifest_path.exists():
+            return {}
+        try:
+            raw: object = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError(f"dataset manifest cannot be read: {manifest_path}") from error
+        if not isinstance(raw, dict):
+            raise ValueError("dataset manifest must be a JSON object")
+        return cast(dict[str, Any], raw)
+
+    def _detect_current_translation_schema(self) -> bool:
+        """Refuse downgrading a current dataset by deleting one mutable marker."""
+
+        top_level = self._manifest.get("preprocessing_schema")
+        raw_nested: object = self._manifest.get("fingerprint")
+        nested = (
+            cast(dict[object, object], raw_nested).get("preprocessing_schema")
+            if isinstance(raw_nested, dict)
+            else None
+        )
+        raw_fingerprint_path = self.dataset_root / "raw_fingerprint.json"
+        raw_fingerprint_schema: object = None
+        if raw_fingerprint_path.exists():
+            try:
+                raw_fingerprint: object = json.loads(
+                    raw_fingerprint_path.read_text(encoding="utf-8")
+                )
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise ValueError(
+                    f"dataset raw fingerprint cannot be read: {raw_fingerprint_path}"
+                ) from error
+            if not isinstance(raw_fingerprint, dict):
+                raise ValueError("dataset raw fingerprint must be a JSON object")
+            raw_fingerprint_schema = cast(dict[object, object], raw_fingerprint).get(
+                "preprocessing_schema"
+            )
+        markers = (top_level, nested, raw_fingerprint_schema)
+        if PREPROCESSING_SCHEMA not in markers:
+            return False
+        if any(marker != PREPROCESSING_SCHEMA for marker in markers):
+            raise ValueError("current dataset preprocessing schema markers disagree")
+        return True
 
     def _open_indices(self) -> list[np.ndarray]:
         return [np.load(path, mmap_mode="r", allow_pickle=False) for path in self.index_paths]
@@ -185,6 +245,7 @@ class IndexedParallelDataset(Dataset[dict[str, object]]):
         self.include_metadata = bool(getattr(self, "include_metadata", False))
         self.verify_integrity = bool(getattr(self, "verify_integrity", True))
         self.allow_unverified_legacy = bool(getattr(self, "allow_unverified_legacy", False))
+        self.legacy_bidirectional = getattr(self, "legacy_bidirectional", None)
         self.indices = self._open_indices()
         self.record_metadata_indices = self._open_record_metadata_indices()
         self._token_cache = {}
@@ -196,11 +257,35 @@ class IndexedParallelDataset(Dataset[dict[str, object]]):
     def _load_language_metadata(
         self,
     ) -> tuple[tuple[tuple[str, str], ...], tuple[str, ...]]:
-        manifest_path = self.dataset_root / "manifest.json"
-        if manifest_path.exists():
-            with manifest_path.open("r", encoding="utf-8") as handle:
-                manifest = cast(dict[str, Any], json.load(handle))
+        if self._manifest:
+            manifest = self._manifest
             raw_pairs: object = manifest.get("language_pairs")
+            if self._current_translation_schema:
+                if not isinstance(raw_pairs, list) or not raw_pairs:
+                    raise ValueError("current dataset manifest language_pairs are missing")
+                pair_values = cast(list[object], raw_pairs)
+                try:
+                    pairs = normalize_language_pairs(
+                        language_pairs=cast(list[list[str]], pair_values)
+                    )
+                except (TypeError, ValueError) as error:
+                    raise ValueError(
+                        "current dataset manifest language_pairs are invalid"
+                    ) from error
+                if len(pairs) != len(pair_values):
+                    raise ValueError("current dataset manifest language_pairs contain duplicates")
+                raw_languages: object = manifest.get("languages")
+                expected_languages = languages_from_pairs(pairs)
+                language_values = (
+                    cast(list[object], raw_languages) if isinstance(raw_languages, list) else []
+                )
+                if (
+                    not isinstance(raw_languages, list)
+                    or not all(isinstance(language, str) for language in language_values)
+                    or tuple(cast(list[str], language_values)) != expected_languages
+                ):
+                    raise ValueError("current dataset manifest languages are invalid")
+                return pairs, expected_languages
             if isinstance(raw_pairs, list) and raw_pairs:
                 pair_values = cast(list[object], raw_pairs)
                 pairs = tuple(
@@ -226,14 +311,12 @@ class IndexedParallelDataset(Dataset[dict[str, object]]):
         return (("ko", "ja"),), ("ko", "ja")
 
     def _load_source_names(self) -> list[str]:
-        manifest_path = self.dataset_root / "manifest.json"
-        if not manifest_path.exists():
+        if not self._manifest:
             if self.pair_source_ids is None:
                 return ["source-0"]
             maximum = int(self.pair_source_ids.max(initial=0))
             return [f"source-{source_id}" for source_id in range(maximum + 1)]
-        with manifest_path.open("r", encoding="utf-8") as handle:
-            manifest = cast(dict[str, Any], json.load(handle))
+        manifest = self._manifest
         raw_sources: object = manifest.get("sources")
         sources = cast(list[object], raw_sources) if isinstance(raw_sources, list) else []
         if not sources:
@@ -250,22 +333,123 @@ class IndexedParallelDataset(Dataset[dict[str, object]]):
         return names
 
     def _load_source_only_languages(self) -> tuple[str, ...]:
-        manifest_path = self.dataset_root / "manifest.json"
-        if not manifest_path.exists():
+        if not self._manifest:
             return ()
-        with manifest_path.open("r", encoding="utf-8") as handle:
-            manifest = cast(dict[str, Any], json.load(handle))
+        manifest = self._manifest
         raw: object = manifest.get("source_only_languages")
         if not isinstance(raw, list):
+            if self._current_translation_schema:
+                raise ValueError("current dataset manifest source_only_languages are invalid")
             return ()
-        return tuple(str(language) for language in cast(list[object], raw))
+        raw_languages = cast(list[object], raw)
+        if self._current_translation_schema and not all(
+            isinstance(language, str) for language in raw_languages
+        ):
+            raise ValueError("current dataset manifest source_only_languages are invalid")
+        return tuple(str(language) for language in raw_languages)
+
+    def _find_observed_language_pairs(self) -> tuple[tuple[str, str], ...]:
+        """Return configured physical pairs that have at least one row in this split."""
+
+        return self.observed_language_pairs_for_physical_mask(
+            np.ones(self.pair_count, dtype=np.bool_)
+        )
+
+    def observed_language_pairs_for_physical_mask(
+        self,
+        mask: np.ndarray,
+    ) -> tuple[tuple[str, str], ...]:
+        """Return configured pairs represented by selected physical rows."""
+
+        selected = np.asarray(mask, dtype=np.bool_)
+        if selected.ndim != 1 or len(selected) != self.pair_count:
+            raise ValueError("physical pair mask must match the dataset pair count")
+        if not self.is_v3:
+            return (self.language_pair,) if bool(selected.any()) else ()
+        observed_edges: set[frozenset[str]] = set()
+        offset = 0
+        for index in self.indices:
+            local_mask = selected[offset : offset + len(index)]
+            offset += len(index)
+            if not bool(local_mask.any()):
+                continue
+            source_ids = np.asarray(index["src_language_id"], dtype=np.int64)[local_mask]
+            target_ids = np.asarray(index["tgt_language_id"], dtype=np.int64)[local_mask]
+            packed = source_ids * len(self.languages) + target_ids
+            for packed_pair in np.unique(packed):
+                source_id, target_id = divmod(int(packed_pair), len(self.languages))
+                observed_edges.add(
+                    frozenset((self.languages[source_id], self.languages[target_id]))
+                )
+        return tuple(pair for pair in self.language_pairs if frozenset(pair) in observed_edges)
+
+    def _load_translation_directions(self) -> tuple[tuple[str, str], ...]:
+        if self._manifest:
+            manifest = self._manifest
+            if manifest.get("stage") == "foundation":
+                if any(source != target for source, target in self.language_pairs):
+                    raise ValueError("foundation datasets must contain only self-restoration pairs")
+                return self.language_pairs
+            raw: object = manifest.get("translation_directions")
+            if isinstance(raw, list):
+                return normalize_translation_directions(
+                    self.language_pairs,
+                    cast(list[list[str]], raw),
+                    source_only_languages=self.source_only_languages,
+                )
+            if self._current_translation_schema:
+                raise ValueError("current dataset manifest translation_directions are invalid")
+        # Old manifests did not authenticate the runtime policy. Preserve the
+        # caller's explicit legacy choice instead of silently upgrading every
+        # old dataset to a bidirectional graph.
+        return normalize_translation_directions(
+            self.language_pairs,
+            bidirectional=self.bidirectional,
+            source_only_languages=self.source_only_languages,
+        )
+
+    def _validate_translation_direction_rows(self) -> None:
+        """Cross-check physical row orientation and flags against the manifest graph."""
+
+        if self._manifest.get("stage") == "foundation":
+            return
+        if not self._current_translation_schema:
+            return
+        if not self.is_v3:
+            return
+
+        required_fields = {"src_language_id", "tgt_language_id", "forward_only"}
+        expected: dict[tuple[int, int], bool] = {}
+        language_to_id = {language: index for index, language in enumerate(self.languages)}
+        direction_set = set(self.translation_directions)
+        for left, right in self.language_pairs:
+            storage = (left, right) if (left, right) in direction_set else (right, left)
+            expected[(language_to_id[storage[0]], language_to_id[storage[1]])] = (
+                storage[1],
+                storage[0],
+            ) not in direction_set
+
+        language_count = len(self.languages)
+        for index in self.indices:
+            names = set(index.dtype.names or ())
+            if not required_fields <= names:
+                raise ValueError("current dataset index lacks translation direction fields")
+            source_ids = np.asarray(index["src_language_id"], dtype=np.int64)
+            target_ids = np.asarray(index["tgt_language_id"], dtype=np.int64)
+            forward_only = np.asarray(index["forward_only"], dtype=np.int64)
+            packed = (source_ids * language_count + target_ids) * 2 + forward_only
+            for packed_row in np.unique(packed):
+                pair_value, forward_flag = divmod(int(packed_row), 2)
+                source_id, target_id = divmod(pair_value, language_count)
+                if expected.get((source_id, target_id)) != bool(forward_flag):
+                    raise ValueError(
+                        "dataset index direction rows disagree with the manifest graph"
+                    )
 
     def _load_synthetic_sampling_weight(self) -> float:
-        manifest_path = self.dataset_root / "manifest.json"
-        if not manifest_path.exists():
+        if not self._manifest:
             return DEFAULT_SYNTHETIC_SAMPLING_WEIGHT
-        with manifest_path.open("r", encoding="utf-8") as handle:
-            manifest = cast(dict[str, Any], json.load(handle))
+        manifest = self._manifest
         raw_policy: object = manifest.get("synthetic_policy")
         policy = cast(dict[object, object], raw_policy) if isinstance(raw_policy, dict) else {}
         return float(str(policy.get("sampling_weight", DEFAULT_SYNTHETIC_SAMPLING_WEIGHT)))
@@ -280,13 +464,9 @@ class IndexedParallelDataset(Dataset[dict[str, object]]):
     def direction_count(self) -> int:
         """Number of distinct (source, target) directions this split can yield."""
 
-        forbidden = set(self.source_only_languages)
-        return sum(
-            1
-            for pair in self.language_pairs
-            for direction in (pair, (pair[1], pair[0]))
-            if direction[1] not in forbidden
-        )
+        if not self.bidirectional:
+            return len(self.language_pairs)
+        return len(self.translation_directions)
 
     def _resolve_virtual(self, index: int) -> tuple[int, int]:
         """Map a virtual index to ``(pair_index, direction)``."""
@@ -626,6 +806,7 @@ class DistributedBucketBatchSampler(Sampler[list[int]]):
                 "re-run sion-prepare-data"
             )
         self._group_pair_indices: dict[int, np.ndarray] | None = None
+        self._group_pair_probabilities: dict[int, np.ndarray] | None = None
         self._group_codes: np.ndarray | None = None
         self._group_probabilities: np.ndarray | None = None
         self.epoch = 0
@@ -678,56 +859,13 @@ class DistributedBucketBatchSampler(Sampler[list[int]]):
     def _balanced_indices(self, rng: np.random.Generator, sample_count: int) -> np.ndarray:
         if self.dataset.pair_source_ids is None:
             raise RuntimeError("Source metadata is unavailable for balanced sampling")
-        if self._group_codes is None or self._group_probabilities is None:
-            source_ids_for_pairs = self.dataset.pair_source_ids.astype(np.uint32, copy=False)
-            pair_synthetic_flags = getattr(self.dataset, "pair_synthetic_flags", None)
-            if pair_synthetic_flags is None:
-                pair_synthetic_flags = np.zeros(len(source_ids_for_pairs), dtype=np.bool_)
-            synthetic_flags = np.asarray(pair_synthetic_flags, dtype=np.uint32)
-            pair_group_codes = source_ids_for_pairs * np.uint32(2) + synthetic_flags
-            source_counts = np.bincount(source_ids_for_pairs)
-            synthetic_counts_by_source = np.bincount(
-                source_ids_for_pairs,
-                weights=synthetic_flags,
-            )
-            counts_all = np.bincount(pair_group_codes)
-            group_codes = np.flatnonzero(counts_all).astype(np.uint32, copy=False)
-            counts = counts_all[group_codes].astype(np.float64)
-            natural = counts / counts.sum()
-            raw = np.power(counts, self.source_sampling_alpha)
-            for position, group_code in enumerate(group_codes):
-                source_id = int(group_code) // 2
-                group_is_synthetic = bool(int(group_code) % 2)
-                name = (
-                    self.dataset.source_names[source_id]
-                    if source_id < len(self.dataset.source_names)
-                    else f"source-{source_id}"
-                )
-                raw[position] *= self.source_sampling_weights.get(name, 1.0)
-                raw[position] *= self.source_sampling_weights_by_id.get(source_id, 1.0)
-                if group_is_synthetic:
-                    source_is_all_synthetic = (
-                        synthetic_counts_by_source[source_id] == source_counts[source_id]
-                    )
-                    has_explicit_source_weight = (
-                        name in self.source_sampling_weights
-                        or source_id in self.source_sampling_weights_by_id
-                    )
-                    if not (source_is_all_synthetic and has_explicit_source_weight):
-                        raw[position] *= self.synthetic_sampling_weight
-            self._group_codes = group_codes
-            self._group_probabilities = self._cap_source_probabilities(
-                raw, natural, self.max_source_upsampling
-            )
-            self._group_pair_indices = {
-                int(group_code): np.flatnonzero(pair_group_codes == group_code).astype(
-                    np.uint32, copy=False
-                )
-                for group_code in group_codes
-            }
+        self._initialize_balanced_groups()
         group_codes = self._group_codes
         probabilities = self._group_probabilities
+        assert group_codes is not None
+        assert probabilities is not None
         assert self._group_pair_indices is not None
+        assert self._group_pair_probabilities is not None
         sampled_groups = rng.choice(
             group_codes,
             size=sample_count,
@@ -738,13 +876,99 @@ class DistributedBucketBatchSampler(Sampler[list[int]]):
         for group_code in group_codes:
             positions = np.flatnonzero(sampled_groups == group_code)
             candidates = self._group_pair_indices[int(group_code)]
-            sampled_pairs[positions] = rng.choice(candidates, size=len(positions), replace=True)
+            sampled_pairs[positions] = rng.choice(
+                candidates,
+                size=len(positions),
+                replace=True,
+                p=self._group_pair_probabilities[int(group_code)],
+            )
         if not self.dataset.bidirectional:
             return sampled_pairs
         directions = rng.integers(0, 2, size=sample_count, dtype=np.uint32)
         return self.dataset._virtual_indices_for_pairs(  # pyright: ignore[reportPrivateUsage]
             sampled_pairs, directions
         )
+
+    def _initialize_balanced_groups(self) -> None:
+        if self._group_codes is not None and self._group_probabilities is not None:
+            return
+        if self.dataset.pair_source_ids is None:
+            raise RuntimeError("Source metadata is unavailable for balanced sampling")
+        source_ids_for_pairs = self.dataset.pair_source_ids.astype(np.uint32, copy=False)
+        pair_synthetic_flags = getattr(self.dataset, "pair_synthetic_flags", None)
+        if pair_synthetic_flags is None:
+            pair_synthetic_flags = np.zeros(len(source_ids_for_pairs), dtype=np.bool_)
+        synthetic_flags = np.asarray(pair_synthetic_flags, dtype=np.uint32)
+        pair_group_codes = source_ids_for_pairs * np.uint32(2) + synthetic_flags
+        direction_multiplicity = np.ones(len(source_ids_for_pairs), dtype=np.float64)
+        if self.dataset.bidirectional:
+            direction_multiplicity.fill(2.0)
+            forward_only_pairs = getattr(self.dataset, "_forward_only_pairs", None)
+            if forward_only_pairs is not None:
+                direction_multiplicity[np.asarray(forward_only_pairs, dtype=np.int64)] = 1.0
+        source_counts = np.bincount(source_ids_for_pairs)
+        synthetic_counts_by_source = np.bincount(
+            source_ids_for_pairs,
+            weights=synthetic_flags,
+        )
+        counts_all = np.bincount(pair_group_codes, weights=direction_multiplicity)
+        group_codes = np.flatnonzero(counts_all).astype(np.uint32, copy=False)
+        counts = counts_all[group_codes].astype(np.float64)
+        natural = counts / counts.sum()
+        raw = np.power(counts, self.source_sampling_alpha)
+        for position, group_code in enumerate(group_codes):
+            source_id = int(group_code) // 2
+            group_is_synthetic = bool(int(group_code) % 2)
+            name = (
+                self.dataset.source_names[source_id]
+                if source_id < len(self.dataset.source_names)
+                else f"source-{source_id}"
+            )
+            raw[position] *= self.source_sampling_weights.get(name, 1.0)
+            raw[position] *= self.source_sampling_weights_by_id.get(source_id, 1.0)
+            if group_is_synthetic:
+                source_is_all_synthetic = (
+                    synthetic_counts_by_source[source_id] == source_counts[source_id]
+                )
+                has_explicit_source_weight = (
+                    name in self.source_sampling_weights
+                    or source_id in self.source_sampling_weights_by_id
+                )
+                if not (source_is_all_synthetic and has_explicit_source_weight):
+                    raw[position] *= self.synthetic_sampling_weight
+        self._group_codes = group_codes
+        self._group_probabilities = self._cap_source_probabilities(
+            raw, natural, self.max_source_upsampling
+        )
+        self._group_pair_indices = {
+            int(group_code): np.flatnonzero(pair_group_codes == group_code).astype(
+                np.uint32, copy=False
+            )
+            for group_code in group_codes
+        }
+        self._group_pair_probabilities = {}
+        for group_code, candidates in self._group_pair_indices.items():
+            weights = direction_multiplicity[candidates]
+            self._group_pair_probabilities[group_code] = weights / weights.sum()
+
+    def positive_sampling_pair_mask(self) -> np.ndarray:
+        """Return physical rows with non-zero probability under this sampler."""
+
+        if not self._balance_sources:
+            return np.ones(self.dataset.pair_count, dtype=np.bool_)
+        self._initialize_balanced_groups()
+        assert self._group_codes is not None
+        assert self._group_probabilities is not None
+        assert self._group_pair_indices is not None
+        result = np.zeros(self.dataset.pair_count, dtype=np.bool_)
+        for group_code, probability in zip(
+            self._group_codes,
+            self._group_probabilities,
+            strict=True,
+        ):
+            if probability > 0:
+                result[self._group_pair_indices[int(group_code)]] = True
+        return result
 
     def __iter__(self) -> Iterator[list[int]]:
         if self._balance_sources:

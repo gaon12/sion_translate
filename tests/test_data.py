@@ -97,6 +97,7 @@ def _atomic_prepare_fingerprint(source: Path, tokenizer: Path) -> DatasetFingerp
         approximate_split=False,
         dedup_backend="memory",
         source_only_languages=(),
+        translation_directions=(("ko", "ja"), ("ja", "ko")),
         train_only_prefixes=prepare_module.DEFAULT_TRAIN_ONLY_PREFIXES,
         synthetic_sampling_weight=0.25,
         language_pair_count=1,
@@ -129,6 +130,45 @@ def _prepare_atomic_dataset(
         num_workers=1,
         expected_fingerprint=expected_fingerprint,
     )
+
+
+def test_legacy_unidirectional_runtime_does_not_require_current_forward_flags(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "parallel.jsonl"
+    tokenizer = tmp_path / "sion.model"
+    output = tmp_path / "dataset"
+    _write_atomic_prepare_source(source)
+    tokenizer.write_bytes(b"tokenizer")
+    monkeypatch.setattr(prepare_module, "SionTokenizer", _FakePrepareTokenizer)
+    _prepare_atomic_dataset(
+        str(source),
+        tokenizer,
+        output,
+        expected_fingerprint=_atomic_prepare_fingerprint(source, tokenizer),
+    )
+    manifest_path = output / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["preprocessing_schema"] = "sion-prepare-v8"
+    manifest["fingerprint"]["preprocessing_schema"] = "sion-prepare-v8"
+    manifest.pop("translation_directions")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    raw_fingerprint_path = output / "raw_fingerprint.json"
+    raw_fingerprint = json.loads(raw_fingerprint_path.read_text(encoding="utf-8"))
+    raw_fingerprint["preprocessing_schema"] = "sion-prepare-v8"
+    raw_fingerprint_path.write_text(json.dumps(raw_fingerprint), encoding="utf-8")
+
+    dataset = IndexedParallelDataset(
+        output,
+        "train",
+        bidirectional=True,
+        legacy_bidirectional=False,
+        verify_integrity=False,
+    )
+
+    assert dataset.translation_directions == (("ko", "ja"),)
+    assert len(dataset) == dataset.pair_count == 1
 
 
 def test_tokenizer_prepare_dataset_and_collate(tmp_path: Path) -> None:

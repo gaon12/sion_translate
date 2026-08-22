@@ -188,6 +188,7 @@ def test_train_tokenizer_splits_digits_by_default(tmp_path: Path) -> None:
     assert metadata["split_digits"] is True
     assert metadata["language_pair"] == ["ko", "ja"]
     assert metadata["language_pairs"] == [["ko", "ja"]]
+    assert metadata["translation_directions"] == [["ko", "ja"], ["ja", "ko"]]
     assert metadata["vocab_size"] == len(tokenizer)
     assert metadata["model_file"] == model_path.name
     assert metadata["model_sha256"] == file_sha256(model_path)

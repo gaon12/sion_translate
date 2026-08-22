@@ -65,6 +65,7 @@ from .records import (
     expand_parallel_record,
     languages_from_pairs,
     normalize_language_pairs,
+    normalize_translation_directions,
 )
 
 INDEX_FORMAT = "sion-indexed-parallel-v6"
@@ -639,6 +640,7 @@ def prepare_preprocessing_options(
     approximate_split: bool = False,
     dedup_backend: str = "sqlite",
     source_only_languages: Sequence[str] = (),
+    translation_directions: Sequence[Sequence[str]] = (),
     train_only_prefixes: Sequence[str] = DEFAULT_TRAIN_ONLY_PREFIXES,
     synthetic_sampling_weight: float = DEFAULT_SYNTHETIC_SAMPLING_WEIGHT,
     language_pair_count: int = 1,
@@ -665,6 +667,7 @@ def prepare_preprocessing_options(
         "record_metadata_index_dtype": RECORD_METADATA_INDEX_DTYPE.descr,
         "shard_size": shard_size,
         "source_only_languages": list(source_only_languages),
+        "translation_directions": [list(direction) for direction in translation_directions],
         "split_key": split_key_schema,
         "synthetic_sampling_weight": synthetic_sampling_weight,
         "test_fraction": test_fraction,
@@ -939,6 +942,7 @@ def _validate_indexed_payload_semantics(
     source_stats: tuple[PrepareStats, ...],
     languages: tuple[str, ...],
     normalized_pairs: tuple[tuple[str, str], ...],
+    translation_directions: tuple[tuple[str, str], ...],
     source_only: tuple[str, ...],
 ) -> None:
     """Validate every field consumed later by the indexed dataset loader."""
@@ -947,14 +951,15 @@ def _validate_indexed_payload_semantics(
     source_only_set = set(source_only)
     allowed_language_pairs: set[tuple[int, int]] = set()
     language_to_id = {language: index for index, language in enumerate(languages)}
+    direction_set = set(translation_directions)
     for left, right in normalized_pairs:
-        if left in source_only_set:
-            allowed_language_pairs.add((language_to_id[left], language_to_id[right]))
-        elif right in source_only_set:
-            allowed_language_pairs.add((language_to_id[right], language_to_id[left]))
-        else:
-            allowed_language_pairs.add((language_to_id[left], language_to_id[right]))
-            allowed_language_pairs.add((language_to_id[right], language_to_id[left]))
+        storage_direction = (left, right) if (left, right) in direction_set else (right, left)
+        allowed_language_pairs.add(
+            (
+                language_to_id[storage_direction[0]],
+                language_to_id[storage_direction[1]],
+            )
+        )
 
     source_rows = np.zeros(source_count, dtype=np.int64)
     source_synthetic = np.zeros(source_count, dtype=np.int64)
@@ -1048,13 +1053,16 @@ def _validate_indexed_payload_semantics(
                     raise ValueError(f"Dataset index language pair is not configured: {index_path}")
                 source_language = languages[pair[0]]
                 target_language = languages[pair[1]]
-                expected_forward_only = source_language in source_only_set
+                expected_forward_only = (
+                    target_language,
+                    source_language,
+                ) not in direction_set
                 if (
                     bool(forward_flag) != expected_forward_only
                     or target_language in source_only_set
                 ):
                     raise ValueError(
-                        f"Dataset index source-only direction is invalid: {index_path}"
+                        f"Dataset index translation direction is invalid: {index_path}"
                     )
 
             row_count = len(index)
@@ -1177,6 +1185,7 @@ def _validate_complete_staging(
     source_snapshots: tuple[_FileSnapshot, ...],
     tokenizer_snapshot: _FileSnapshot,
     normalized_pairs: tuple[tuple[str, str], ...],
+    translation_directions: tuple[tuple[str, str], ...],
     languages: tuple[str, ...],
     source_only: tuple[str, ...],
     train_only_prefixes: tuple[str, ...],
@@ -1211,6 +1220,10 @@ def _validate_complete_staging(
         raise ValueError("Dataset manifest language pairs differ from the expected contract")
     if manifest.get("language_pair") != list(normalized_pairs[0]):
         raise ValueError("Dataset manifest primary language pair differs from the contract")
+    if manifest.get("translation_directions") != [
+        list(direction) for direction in translation_directions
+    ]:
+        raise ValueError("Dataset manifest translation directions differ from the contract")
     if manifest.get("languages") != list(languages):
         raise ValueError("Dataset manifest language ordering differs from the expected contract")
     if manifest.get("language_to_id") != {
@@ -1292,6 +1305,7 @@ def _validate_complete_staging(
         source_stats=source_stats,
         languages=languages,
         normalized_pairs=normalized_pairs,
+        translation_directions=translation_directions,
         source_only=source_only,
     )
     validate_dataset_artifact_inventory(staging_dir, manifest)
@@ -1362,6 +1376,7 @@ def _recover_or_clean_staging(
     tokenizer_snapshot: _FileSnapshot,
     expected_fingerprint: DatasetFingerprint,
     normalized_pairs: tuple[tuple[str, str], ...],
+    translation_directions: tuple[tuple[str, str], ...],
     languages: tuple[str, ...],
     source_only: tuple[str, ...],
     train_only_prefixes: tuple[str, ...],
@@ -1384,6 +1399,7 @@ def _recover_or_clean_staging(
                 source_snapshots=source_snapshots,
                 tokenizer_snapshot=tokenizer_snapshot,
                 normalized_pairs=normalized_pairs,
+                translation_directions=translation_directions,
                 languages=languages,
                 source_only=source_only,
                 train_only_prefixes=train_only_prefixes,
@@ -1412,6 +1428,7 @@ def _recover_or_clean_staging(
         source_snapshots=source_snapshots,
         tokenizer_snapshot=tokenizer_snapshot,
         normalized_pairs=normalized_pairs,
+        translation_directions=translation_directions,
         languages=languages,
         source_only=source_only,
         train_only_prefixes=train_only_prefixes,
@@ -1448,6 +1465,7 @@ def prepare_dataset(
     language_pair: Sequence[str] = ("ko", "ja"),
     source_only_languages: Sequence[str] = (),
     language_pairs: Sequence[Sequence[str]] | None = None,
+    translation_directions: Sequence[Sequence[str]] | None = None,
     train_only_prefixes: Sequence[str] = DEFAULT_TRAIN_ONLY_PREFIXES,
     synthetic_sampling_weight: float = DEFAULT_SYNTHETIC_SAMPLING_WEIGHT,
     num_workers: int | None = None,
@@ -1488,7 +1506,12 @@ def prepare_dataset(
                 "at most one side of a language pair may be source-only; both sides "
                 f"of {list(pair)!r} are source-only"
             )
-    source_only_set = frozenset(source_only)
+    normalized_directions = normalize_translation_directions(
+        normalized_pairs,
+        translation_directions,
+        source_only_languages=source_only,
+    )
+    direction_set = frozenset(normalized_directions)
 
     preprocessing_options = prepare_preprocessing_options(
         shard_size=shard_size,
@@ -1501,6 +1524,7 @@ def prepare_dataset(
         approximate_split=approximate_split,
         dedup_backend=dedup_backend,
         source_only_languages=source_only,
+        translation_directions=normalized_directions,
         train_only_prefixes=train_only_prefixes,
         synthetic_sampling_weight=synthetic_sampling_weight,
         language_pair_count=len(normalized_pairs),
@@ -1546,6 +1570,7 @@ def prepare_dataset(
         tokenizer_snapshot=tokenizer_snapshot,
         expected_fingerprint=dataset_fingerprint,
         normalized_pairs=normalized_pairs,
+        translation_directions=normalized_directions,
         languages=languages,
         source_only=source_only,
         train_only_prefixes=train_only_prefixes,
@@ -1674,18 +1699,17 @@ def prepare_dataset(
                     for target in targets:
                         _increment(target, "ja_no_kana_warnings")
 
-                # A source-only language must sit on side A so that direction 0
-                # translates out of it. Swapping here, before dedup and split
-                # keying, keeps every downstream key consistent with what is
-                # actually written to the shard.
-                forward_only = False
-                if source_only_set:
-                    if language_b in source_only_set:
-                        language_a, language_b = language_b, language_a
-                        text_a, text_b = text_b, text_a
-                        ids_a, ids_b = ids_b, ids_a
-                        register_a, register_b = register_b, register_a
-                    forward_only = language_a in source_only_set
+                # Side A is the physical direction exposed as virtual direction
+                # zero.  For a reverse-only configured edge, swap every aligned
+                # field before split/dedup so tokenizer and dataset partitioning
+                # use the same source endpoint.  ``forward_only`` then suppresses
+                # only the untrained reverse edge; bidirectional pairs keep both.
+                if (language_a, language_b) not in direction_set:
+                    language_a, language_b = language_b, language_a
+                    text_a, text_b = text_b, text_a
+                    ids_a, ids_b = ids_b, ids_a
+                    register_a, register_b = register_b, register_a
+                forward_only = (language_b, language_a) not in direction_set
 
                 # A row that can never be written must not reserve endpoint
                 # ownership and suppress a usable row encountered later.
@@ -1828,6 +1852,7 @@ def prepare_dataset(
             "format": INDEX_FORMAT,
             "language_pair": list(primary_pair),
             "language_pairs": [list(pair) for pair in normalized_pairs],
+            "translation_directions": [list(direction) for direction in normalized_directions],
             "languages": list(languages),
             "language_to_id": language_to_id,
             "source_only_languages": list(source_only),
@@ -1894,6 +1919,7 @@ def prepare_dataset(
             source_snapshots=source_snapshots,
             tokenizer_snapshot=tokenizer_snapshot,
             normalized_pairs=normalized_pairs,
+            translation_directions=normalized_directions,
             languages=languages,
             source_only=source_only,
             train_only_prefixes=train_only_prefixes,

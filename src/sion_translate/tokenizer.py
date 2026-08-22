@@ -23,6 +23,7 @@ from sion_translate.data.records import (
     expand_parallel_record,
     languages_from_pairs,
     normalize_language_pairs,
+    normalize_translation_directions,
 )
 from sion_translate.data.monolingual import (
     MonolingualDiscovery,
@@ -169,6 +170,7 @@ def write_tokenizer_metadata(
     *,
     split_digits: bool,
     language_pairs: Sequence[Sequence[str]],
+    translation_directions: Sequence[Sequence[str]] | None = None,
     denoise_languages: Sequence[str] | None = None,
     reasoning_languages: Sequence[str] = (),
     monolingual_sentences: dict[str, int] | None = None,
@@ -181,6 +183,10 @@ def write_tokenizer_metadata(
     vocab_path = model_path.with_suffix(".vocab")
     features_path = model_path.parent / "token_features.npz"
     normalized_pairs = normalize_language_pairs(language_pairs=language_pairs)
+    normalized_directions = normalize_translation_directions(
+        normalized_pairs,
+        translation_directions,
+    )
     translation_languages = languages_from_pairs(normalized_pairs)
     normalized_denoise_languages = list(
         dict.fromkeys(translation_languages if denoise_languages is None else denoise_languages)
@@ -192,6 +198,7 @@ def write_tokenizer_metadata(
         "split_digits": bool(split_digits),
         "language_pair": list(normalized_pairs[0]),
         "language_pairs": [list(pair) for pair in normalized_pairs],
+        "translation_directions": [list(direction) for direction in normalized_directions],
         "denoise_languages": normalized_denoise_languages,
         "reasoning_languages": normalized_reasoning_languages,
         "vocab_size": int(processor.vocab_size()),
@@ -282,7 +289,7 @@ def _filter_text_batch(
         float,
         float,
         bool,
-        frozenset[str],
+        frozenset[tuple[str, str]],
         bool,
     ],
 ) -> list[tuple[str, str, str, str, str, bytes, bytes]]:
@@ -292,7 +299,7 @@ def _filter_text_batch(
         validation_fraction,
         test_fraction,
         approximate_split,
-        source_only_languages,
+        translation_directions,
         source_is_synthetic,
     ) = batch
     policy = QualityPolicy()
@@ -310,7 +317,7 @@ def _filter_text_batch(
             languages = (language_a, language_b)
             if not assess_pair(text_a, text_b, policy, languages=languages).accepted:
                 continue
-            if language_b in source_only_languages:
+            if (language_a, language_b) not in translation_directions:
                 language_a, language_b = language_b, language_a
                 text_a, text_b = text_b, text_a
             if source_is_synthetic or synthetic_record(row):
@@ -369,6 +376,7 @@ def iter_parallel_text(
     test_fraction: float = 0.005,
     language_pair: Sequence[str] = DEFAULT_LANGUAGE_PAIR,
     language_pairs: Sequence[Sequence[str]] | None = None,
+    translation_directions: Sequence[Sequence[str]] | None = None,
     approximate_split: bool = False,
     source_only_languages: Sequence[str] = (),
     train_only_prefixes: Sequence[str] = DEFAULT_SYNTHETIC_PREFIXES,
@@ -382,6 +390,7 @@ def iter_parallel_text(
         test_fraction=test_fraction,
         language_pair=language_pair,
         language_pairs=language_pairs,
+        translation_directions=translation_directions,
         approximate_split=approximate_split,
         source_only_languages=source_only_languages,
         train_only_prefixes=train_only_prefixes,
@@ -397,6 +406,7 @@ def iter_parallel_text_with_languages(
     test_fraction: float = 0.005,
     language_pair: Sequence[str] = DEFAULT_LANGUAGE_PAIR,
     language_pairs: Sequence[Sequence[str]] | None = None,
+    translation_directions: Sequence[Sequence[str]] | None = None,
     approximate_split: bool = False,
     source_only_languages: Sequence[str] = (),
     train_only_prefixes: Sequence[str] = DEFAULT_SYNTHETIC_PREFIXES,
@@ -414,6 +424,11 @@ def iter_parallel_text_with_languages(
     target_split_guard = TargetSplitGuard(estimated_pairs, validation_fraction, test_fraction)
     workers = num_workers or build_cpu_plan(input_files=len(paths)).preprocess_workers
     normalized_pairs = normalize_language_pairs(language_pair, language_pairs)
+    normalized_directions = normalize_translation_directions(
+        normalized_pairs,
+        translation_directions,
+        source_only_languages=source_only_languages,
+    )
     languages = frozenset(languages_from_pairs(normalized_pairs))
     source_only = frozenset(str(language) for language in source_only_languages)
     unknown_source_only = sorted(source_only - languages)
@@ -432,7 +447,7 @@ def iter_parallel_text_with_languages(
             validation_fraction,
             test_fraction,
             approximate_split,
-            source_only,
+            frozenset(normalized_directions),
             synthetic_path(path, synthetic_prefixes),
         )
         for path, batch in _raw_batches(paths)
@@ -617,6 +632,7 @@ def iter_tokenizer_sentences(
     monolingual: MonolingualDiscovery | None = None,
     monolingual_sample_ratio: float = 0.0,
     language_pairs: Sequence[Sequence[str]],
+    translation_directions: Sequence[Sequence[str]] | None = None,
     validation_fraction: float = 0.005,
     test_fraction: float = 0.005,
     approximate_split: bool = False,
@@ -643,6 +659,7 @@ def iter_tokenizer_sentences(
         validation_fraction=validation_fraction,
         test_fraction=test_fraction,
         language_pairs=language_pairs,
+        translation_directions=translation_directions,
         approximate_split=approximate_split,
         source_only_languages=source_only_languages,
         train_only_prefixes=train_only_prefixes,
@@ -739,6 +756,7 @@ def corpus_character_counts(
     paths: Sequence[Path],
     *,
     language_pairs: Sequence[Sequence[str]],
+    translation_directions: Sequence[Sequence[str]] | None = None,
     monolingual: MonolingualDiscovery | None = None,
     monolingual_sample_ratio: float = 0.0,
     validation_fraction: float = 0.005,
@@ -759,6 +777,7 @@ def corpus_character_counts(
         validation_fraction=validation_fraction,
         test_fraction=test_fraction,
         language_pairs=language_pairs,
+        translation_directions=translation_directions,
         approximate_split=approximate_split,
         source_only_languages=source_only_languages,
         train_only_prefixes=train_only_prefixes,
@@ -933,6 +952,7 @@ def train_tokenizer(
     test_fraction: float = 0.005,
     language_pair: Sequence[str] = DEFAULT_LANGUAGE_PAIR,
     language_pairs: Sequence[Sequence[str]] | None = None,
+    translation_directions: Sequence[Sequence[str]] | None = None,
     approximate_split: bool = False,
     source_only_languages: Sequence[str] = (),
     train_only_prefixes: Sequence[str] = DEFAULT_SYNTHETIC_PREFIXES,
@@ -978,6 +998,11 @@ def train_tokenizer(
     output_dir.mkdir(parents=True, exist_ok=True)
     model_prefix = output_dir / "sion"
     normalized_pairs = normalize_language_pairs(language_pair, language_pairs)
+    normalized_directions = normalize_translation_directions(
+        normalized_pairs,
+        translation_directions,
+        source_only_languages=source_only_languages,
+    )
     languages = languages_from_pairs(normalized_pairs)
     denoise_languages = tuple(dict.fromkeys((*languages, *map(str, foundation_languages))))
     reasoning_languages = tuple(dict.fromkeys(map(str, reasoning_languages)))
@@ -1011,6 +1036,7 @@ def train_tokenizer(
         counts = corpus_character_counts(
             paths,
             language_pairs=normalized_pairs,
+            translation_directions=normalized_directions,
             monolingual=monolingual,
             monolingual_sample_ratio=monolingual_sample_ratio,
             validation_fraction=validation_fraction,
@@ -1066,6 +1092,7 @@ def train_tokenizer(
             validation_fraction=validation_fraction,
             test_fraction=test_fraction,
             language_pairs=normalized_pairs,
+            translation_directions=normalized_directions,
             approximate_split=approximate_split,
             source_only_languages=source_only_languages,
             train_only_prefixes=train_only_prefixes,
@@ -1097,6 +1124,7 @@ def train_tokenizer(
         model_path,
         split_digits=split_digits,
         language_pairs=normalized_pairs,
+        translation_directions=normalized_directions,
         denoise_languages=denoise_languages,
         reasoning_languages=reasoning_languages,
         monolingual_sentences=monolingual_counts or None,

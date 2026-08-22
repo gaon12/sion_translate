@@ -405,6 +405,7 @@ def apply_auto_settings(
     *,
     train_examples: int,
     validation_examples: int,
+    physical_train_pairs: int | None = None,
     source_names: list[str] | None = None,
 ) -> list[str]:
     """사용자가 sion_translate.yaml 에 적지 않은 항목을 자동값으로 채웁니다.
@@ -422,7 +423,11 @@ def apply_auto_settings(
         """해당 키를 사용자가 적지 않았으면 True (= 자동 결정 대상)."""
         return key not in section
 
-    pair_count = train_examples // (2 if config.data.bidirectional else 1)
+    pair_count = (
+        physical_train_pairs
+        if physical_train_pairs is not None
+        else train_examples // (2 if config.data.bidirectional else 1)
+    )
 
     # ── 모델 크기: 데이터 양 기준 프리셋 ────────────────────────────────
     size_keys = ("d_model", "encoder_layers", "decoder_layers", "num_heads", "num_kv_heads", "d_ff")

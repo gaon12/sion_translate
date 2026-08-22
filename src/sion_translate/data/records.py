@@ -54,7 +54,7 @@ def normalize_language_pairs(
     normalized: list[tuple[str, str]] = []
     seen: set[frozenset[str]] = set()
     for raw_pair in raw_pairs:
-        if len(raw_pair) != 2:
+        if isinstance(raw_pair, (str, bytes)) or len(raw_pair) != 2:
             raise ValueError(f"each language pair must contain two keys; got {raw_pair!r}")
         language_a = _validate_language(raw_pair[0])
         language_b = _validate_language(raw_pair[1])
@@ -72,6 +72,90 @@ def languages_from_pairs(language_pairs: Sequence[Sequence[str]]) -> tuple[str, 
     """Return languages in first-appearance order."""
 
     return tuple(dict.fromkeys(language for pair in language_pairs for language in pair))
+
+
+def normalize_translation_directions(
+    language_pairs: Sequence[Sequence[str]],
+    translation_directions: Sequence[Sequence[str]] | None = None,
+    *,
+    bidirectional: bool = True,
+    source_only_languages: Sequence[str] = (),
+) -> tuple[tuple[str, str], ...]:
+    """Resolve the directed training graph over configured storage pairs.
+
+    ``language_pairs`` identifies which two texts coexist in each physical
+    parallel record.  It does not imply that both decoder directions were
+    trained.  An explicit direction list can therefore mix bidirectional and
+    one-way edges in one dataset; the legacy global policy is used only when
+    that list is absent.
+    """
+
+    pairs = normalize_language_pairs(language_pairs=language_pairs)
+    if not isinstance(bidirectional, bool):  # pyright: ignore[reportUnnecessaryIsInstance]
+        raise ValueError("bidirectional must be a boolean")
+    source_only = tuple(dict.fromkeys(_validate_language(item) for item in source_only_languages))
+    known_languages = set(languages_from_pairs(pairs))
+    unknown_source_only = sorted(set(source_only) - known_languages)
+    if unknown_source_only:
+        raise ValueError(
+            "source_only_languages must appear in the configured language pairs; "
+            f"{unknown_source_only} do not"
+        )
+    for pair in pairs:
+        if pair[0] in source_only and pair[1] in source_only:
+            raise ValueError(
+                "at most one side of a language pair may be source-only; both sides "
+                f"of {list(pair)!r} are source-only"
+            )
+
+    if translation_directions is None:
+        directions: list[tuple[str, str]] = []
+        source_only_set = set(source_only)
+        for left, right in pairs:
+            if left in source_only_set:
+                directions.append((left, right))
+            elif right in source_only_set:
+                directions.append((right, left))
+            else:
+                directions.append((left, right))
+                if bidirectional:
+                    directions.append((right, left))
+        return tuple(directions)
+
+    allowed_edges = {frozenset(pair) for pair in pairs}
+    directions = []
+    seen: set[tuple[str, str]] = set()
+    covered_edges: set[frozenset[str]] = set()
+    source_only_set = set(source_only)
+    for raw_direction in translation_directions:
+        if isinstance(raw_direction, (str, bytes)) or len(raw_direction) != 2:
+            raise ValueError(
+                "each translation direction must contain source and target language keys; "
+                f"got {raw_direction!r}"
+            )
+        source = _validate_language(raw_direction[0])
+        target = _validate_language(raw_direction[1])
+        direction = (source, target)
+        edge = frozenset(direction)
+        if source == target or edge not in allowed_edges:
+            raise ValueError(
+                "translation directions must belong to configured language pairs; "
+                f"got {raw_direction!r}"
+            )
+        if direction in seen:
+            raise ValueError(f"duplicate translation direction: {raw_direction!r}")
+        if target in source_only_set:
+            raise ValueError(f"source-only language {target!r} cannot be a translation target")
+        seen.add(direction)
+        covered_edges.add(edge)
+        directions.append(direction)
+    missing_edges = [pair for pair in pairs if frozenset(pair) not in covered_edges]
+    if missing_edges:
+        raise ValueError(
+            "every configured language pair needs at least one translation direction; "
+            f"missing={missing_edges!r}"
+        )
+    return tuple(directions)
 
 
 def _pair_labels(language_a: str, language_b: str) -> tuple[str, ...]:

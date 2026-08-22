@@ -123,12 +123,43 @@ def test_configured_raw_scan_uses_the_complete_prepare_contract(tmp_path: Path) 
     expected_options = train_module.prepare_preprocessing_options(
         approximate_split=True,
         source_only_languages=("ko",),
+        translation_directions=(("ko", "ja"),),
         train_only_prefixes=config.data.configured_synthetic_prefixes(),
         synthetic_sampling_weight=0.125,
         language_pair_count=1,
     )
 
     assert fingerprint.preprocessing_options == expected_options
+
+
+def test_preflight_rejects_a_prepared_direction_graph_from_another_run() -> None:
+    config = AppConfig()
+    config.data.language_pairs = [["de", "fr"], ["sw", "ar"]]
+    config.data.translation_directions = [["de", "fr"], ["fr", "de"], ["sw", "ar"]]
+    matching = SimpleNamespace(
+        language_pairs=(("de", "fr"), ("sw", "ar")),
+        translation_directions=(("de", "fr"), ("fr", "de"), ("sw", "ar")),
+    )
+    stale = SimpleNamespace(
+        language_pairs=(("de", "fr"), ("sw", "ar")),
+        translation_directions=(("de", "fr"), ("fr", "de"), ("sw", "ar"), ("ar", "sw")),
+    )
+
+    train_module.preflight_dataset_direction_contract(config, matching)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="differ from the training config"):
+        train_module.preflight_dataset_direction_contract(config, stale)  # type: ignore[arg-type]
+
+    incomplete = SimpleNamespace(
+        language_pairs=(("de", "fr"), ("sw", "ar")),
+        translation_directions=(("de", "fr"), ("fr", "de"), ("sw", "ar")),
+        observed_language_pairs=(("de", "fr"),),
+    )
+    with pytest.raises(ValueError, match="no accepted rows"):
+        train_module.preflight_dataset_direction_contract(  # type: ignore[arg-type]
+            config,
+            incomplete,
+            require_all_pairs=True,
+        )
 
 
 def test_artifact_preparation_locks_every_independent_mutation_root(tmp_path: Path) -> None:
@@ -301,7 +332,11 @@ def test_foundation_preparation_backs_up_a_file_at_the_dataset_path(
 
     monkeypatch.setattr(train_module, "scan_configured_raw_data", lambda *_args: raw_identity)
     monkeypatch.setattr(train_module, "find_existing_checkpoint", lambda *_args: None)
-    monkeypatch.setattr(train_module, "tokenizer_policy_problem", lambda *_args: None)
+    monkeypatch.setattr(
+        train_module,
+        "tokenizer_policy_problem",
+        lambda *_args, **_kwargs: None,
+    )
     monkeypatch.setattr(train_module, "stored_fingerprint", lambda *_args: raw_identity)
     monkeypatch.setattr(train_module, "dataset_artifact_problem", lambda *_args: None)
     monkeypatch.setattr(
@@ -1950,6 +1985,26 @@ def test_tokenizer_policy_requires_digit_splitting_and_matching_identity(
         lambda _: True,
     )
     assert tokenizer_policy_problem(model_path, pairs) is None
+    assert "명시적 translation_directions" in str(
+        tokenizer_policy_problem(
+            model_path,
+            pairs,
+            translation_directions=(("ko", "ja"),),
+            require_recorded_directions=True,
+        )
+    )
+    metadata["translation_directions"] = "ko-ja"
+    assert "형식이 잘못" in str(tokenizer_policy_problem(model_path, pairs))
+    metadata["translation_directions"] = [["ko", "ja"]]
+    assert (
+        tokenizer_policy_problem(
+            model_path,
+            pairs,
+            translation_directions=(("ko", "ja"),),
+            require_recorded_directions=True,
+        )
+        is None
+    )
     assert "복원 태그" in str(tokenizer_policy_problem(model_path, pairs, ("ko", "ja", "en")))
     assert "reasoning 태그" in str(
         tokenizer_policy_problem(model_path, pairs, ("ko", "ja"), ("ja",))
@@ -1973,3 +2028,53 @@ def test_tokenizer_policy_requires_digit_splitting_and_matching_identity(
         lambda _: WrongLanguageTokenizer(),
     )
     assert "언어 집합" in str(tokenizer_policy_problem(model_path, pairs))
+
+
+def test_explicit_direction_graph_cannot_be_backfilled_onto_a_legacy_tokenizer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = AppConfig()
+    config.data.raw_dir = str(tmp_path / "raw")
+    config.data.tokenizer_model = str(tmp_path / "tokenizer" / "sion.model")
+    config.data.dataset_dir = str(tmp_path / "dataset")
+    config.data.translation_directions = [["ja", "ko"]]
+    tokenizer_path = Path(config.data.tokenizer_model)
+    tokenizer_path.parent.mkdir(parents=True)
+    tokenizer_path.write_bytes(b"legacy-tokenizer")
+    plan = SimpleNamespace(enabled=False)
+    metadata_writes: list[Path] = []
+
+    monkeypatch.setattr(
+        train_module,
+        "scan_configured_raw_data",
+        lambda *_args: {"parallel.jsonl": 128},
+    )
+    monkeypatch.setattr(train_module, "find_existing_checkpoint", lambda *_args: None)
+    monkeypatch.setattr(
+        train_module,
+        "tokenizer_policy_problem",
+        lambda *_args, **_kwargs: "명시적 translation_directions를 인증할 metadata가 없습니다",
+    )
+    monkeypatch.setattr(
+        train_module,
+        "SionTokenizer",
+        lambda *_args: SimpleNamespace(splits_digits=True),
+    )
+    monkeypatch.setattr(train_module, "load_tokenizer_metadata", lambda *_args: None)
+    monkeypatch.setattr(
+        train_module,
+        "write_tokenizer_metadata",
+        lambda path, **_kwargs: metadata_writes.append(Path(path)),
+    )
+
+    with pytest.raises(RuntimeError, match="명시적 translation_directions"):
+        train_module._ensure_artifacts_on_main(
+            config,
+            DistributedContext(0, 0, 1, torch.device("cpu"), False),
+            plan,
+            prepare_foundation=False,
+            locks_held=True,
+        )
+
+    assert metadata_writes == []

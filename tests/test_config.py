@@ -343,6 +343,67 @@ def test_reversed_multilingual_pair_is_rejected() -> None:
         config.validate()
 
 
+def test_explicit_directions_support_a_mixed_arbitrary_language_graph() -> None:
+    config = AppConfig(
+        data=DataConfig(
+            language_pairs=[["de", "fr"], ["sw", "ar"]],
+            translation_directions=[["de", "fr"], ["fr", "de"], ["sw", "ar"]],
+            # The explicit graph is authoritative over this legacy fallback.
+            bidirectional=True,
+        )
+    )
+
+    config.validate()
+
+    assert config.data.configured_translation_directions() == (
+        ("de", "fr"),
+        ("fr", "de"),
+        ("sw", "ar"),
+    )
+
+
+def test_explicit_directions_must_cover_and_belong_to_configured_pairs() -> None:
+    missing = AppConfig(
+        data=DataConfig(
+            language_pairs=[["de", "fr"], ["sw", "ar"]],
+            translation_directions=[["de", "fr"]],
+        )
+    )
+    with pytest.raises(ValueError, match="every configured language pair"):
+        missing.validate()
+
+    disconnected = AppConfig(
+        data=DataConfig(
+            language_pairs=[["de", "fr"]],
+            translation_directions=[["de", "sw"]],
+        )
+    )
+    with pytest.raises(ValueError, match="belong to configured language pairs"):
+        disconnected.validate()
+
+
+def test_explicit_directions_cannot_target_a_source_only_language() -> None:
+    config = AppConfig(
+        data=DataConfig(
+            language_pairs=[["mixed", "de"]],
+            translation_directions=[["de", "mixed"]],
+            source_only_languages=["mixed"],
+        )
+    )
+
+    with pytest.raises(ValueError, match="cannot be a translation target"):
+        config.validate()
+
+
+def test_language_identifier_length_is_rejected_during_config_preflight() -> None:
+    config = AppConfig(
+        data=DataConfig(language_pair=["languageidentifier", "de"]),
+    )
+
+    with pytest.raises(ValueError, match="1-16 ASCII"):
+        config.validate()
+
+
 @pytest.mark.parametrize(
     "field",
     ("candidate_micro_batch", "eval_batch_size_per_gpu"),

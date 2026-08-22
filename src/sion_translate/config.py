@@ -27,6 +27,7 @@ from sion_translate.data.monolingual import (
     DEFAULT_LANGUAGE_SAMPLING_ALPHA,
     foundation_languages,
 )
+from sion_translate.data.records import normalize_translation_directions
 from sion_translate.synthetic import (
     DEFAULT_SYNTHETIC_PREFIXES,
     DEFAULT_SYNTHETIC_SAMPLING_WEIGHT,
@@ -263,6 +264,10 @@ class DataConfig:
     # 여러 언어쌍을 한 모델에서 학습할 때 사용합니다. 비어 있으면 위의
     # language_pair 한 쌍만 사용합니다. YAML에서는 둘 중 하나만 적습니다.
     language_pairs: list[list[str]] = field(default_factory=list)
+    # 실제로 학습할 directed edge 목록입니다. 예를 들어 de↔fr와 sw→ar를
+    # 함께 학습하려면 [[de, fr], [fr, de], [sw, ar]]로 둡니다. 비어 있으면
+    # 기존 bidirectional/source_only_languages 정책에서 자동으로 계산합니다.
+    translation_directions: list[list[str]] = field(default_factory=list)
     # 원문으로만 등장하고 번역 결과로는 절대 나오면 안 되는 언어입니다.
     # 한본어(kj)처럼 "한국어와 일본어가 섞인 입력"을 받아 각각 단일어로
     # 번역하는 경우에 씁니다. 여기 등재된 언어가 포함된 쌍은 단방향으로만
@@ -343,20 +348,12 @@ class DataConfig:
     def configured_translation_directions(self) -> tuple[tuple[str, str], ...]:
         """Return the directed edges the indexed dataset can actually train."""
 
-        source_only = set(self.configured_source_only_languages())
-        directions: list[tuple[str, str]] = []
-        for source, target in self.configured_language_pairs():
-            if source in source_only:
-                # Source-only varieties are always normalized onto the source
-                # side, even when the configured pair lists them second.
-                directions.append((source, target))
-            elif target in source_only:
-                directions.append((target, source))
-            else:
-                directions.append((source, target))
-                if self.bidirectional:
-                    directions.append((target, source))
-        return tuple(dict.fromkeys(directions))
+        return normalize_translation_directions(
+            self.configured_language_pairs(),
+            self.translation_directions or None,
+            bidirectional=self.bidirectional,
+            source_only_languages=self.configured_source_only_languages(),
+        )
 
     @property
     def languages(self) -> tuple[str, ...]:
@@ -745,6 +742,9 @@ class AppConfig:
                         f"both sides of {list(pair)!r} are listed in "
                         "data.source_only_languages"
                     )
+        # This also verifies explicit directions are connected to configured
+        # pairs, cover every pair, and never target a source-only language.
+        self.data.configured_translation_directions()
         if not 0.0 <= self.data.source_token_dropout < 0.5:
             raise ValueError("source_token_dropout must be in [0, 0.5)")
         if not 0.0 <= self.data.decoder_input_noise < 0.5:

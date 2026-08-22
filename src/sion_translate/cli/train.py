@@ -257,6 +257,7 @@ def scan_configured_raw_data(
     preprocessing_options = prepare_preprocessing_options(
         approximate_split=config.data.approximate_split,
         source_only_languages=config.data.configured_source_only_languages(),
+        translation_directions=config.data.configured_translation_directions(),
         train_only_prefixes=config.data.configured_synthetic_prefixes(),
         synthetic_sampling_weight=config.data.synthetic_sampling_weight,
         language_pair_count=len(language_pairs),
@@ -267,6 +268,68 @@ def scan_configured_raw_data(
         tokenizer_model=tokenizer_path,
         preprocessing_options=preprocessing_options,
     )
+
+
+def preflight_dataset_direction_contract(
+    config: AppConfig,
+    *datasets: IndexedParallelDataset,
+    require_all_pairs: bool = False,
+) -> None:
+    """Refuse shards whose materialized graph differs from the run config."""
+
+    expected = config.data.configured_translation_directions()
+    expected_pairs = config.data.configured_language_pairs()
+    for dataset in datasets:
+        if dataset.language_pairs != expected_pairs:
+            raise ValueError(
+                "prepared dataset language pairs differ from the training config: "
+                f"dataset={dataset.language_pairs}, config={expected_pairs}"
+            )
+        if dataset.translation_directions != expected:
+            raise ValueError(
+                "prepared dataset translation directions differ from the training config: "
+                f"dataset={dataset.translation_directions}, config={expected}"
+            )
+        if require_all_pairs:
+            observed = set(dataset.observed_language_pairs)
+            missing = [pair for pair in expected_pairs if pair not in observed]
+            if missing:
+                raise ValueError(
+                    "prepared training split has no accepted rows for configured language "
+                    f"pairs: missing={missing!r}"
+                )
+
+
+def preflight_effective_translation_training(
+    config: AppConfig,
+    sampler: DistributedBucketBatchSampler,
+) -> None:
+    """Refuse advertised edges that have zero effective translation probability."""
+
+    dataset = sampler.dataset
+    positive_mask = sampler.positive_sampling_pair_mask()
+    observed = set(dataset.observed_language_pairs_for_physical_mask(positive_mask))
+    missing_pairs = [
+        pair for pair in config.data.configured_language_pairs() if pair not in observed
+    ]
+    if missing_pairs:
+        raise ValueError(
+            "sampling policy assigns zero probability to every training row for configured "
+            f"language pairs: missing={missing_pairs!r}"
+        )
+
+    if config.data.denoise_probability >= 1.0:
+        source_only = set(config.data.configured_source_only_languages())
+        zero_translation_edges = [
+            direction
+            for direction in config.data.configured_translation_directions()
+            if direction[0] not in source_only
+        ]
+        if zero_translation_edges:
+            raise ValueError(
+                "denoise_probability=1.0 leaves no translation objective for configured "
+                f"directions: {zero_translation_edges!r}"
+            )
 
 
 def dataloader_runtime_kwargs(
@@ -769,6 +832,9 @@ def tokenizer_policy_problem(
     language_pairs: tuple[tuple[str, str], ...],
     foundation_languages: tuple[str, ...] | None = None,
     reasoning_languages: tuple[str, ...] = (),
+    *,
+    translation_directions: tuple[tuple[str, str], ...] | None = None,
+    require_recorded_directions: bool = False,
 ) -> str | None:
     """Return a concrete compatibility problem for a tokenizer, if any."""
 
@@ -804,6 +870,32 @@ def tokenizer_policy_problem(
         return (
             "tokenizer_metadata.json의 language_pairs가 현재 설정과 다릅니다 "
             f"(metadata={recorded_pairs}, config={language_pairs})"
+        )
+    raw_directions = metadata.get("translation_directions")
+    if raw_directions is not None and (
+        not isinstance(raw_directions, list)
+        or not raw_directions
+        or not all(
+            isinstance(direction, list) and len(direction) == 2 for direction in raw_directions
+        )
+    ):
+        return "tokenizer_metadata.json의 translation_directions 형식이 잘못되었습니다"
+    recorded_directions = (
+        tuple((str(direction[0]), str(direction[1])) for direction in raw_directions)
+        if isinstance(raw_directions, list)
+        and all(isinstance(direction, list) and len(direction) == 2 for direction in raw_directions)
+        else ()
+    )
+    expected_directions = translation_directions or ()
+    if require_recorded_directions and not recorded_directions:
+        return (
+            "명시적 translation_directions를 인증할 tokenizer metadata가 없습니다; "
+            "기존 tokenizer에 사후 표기하지 말고 같은 방향 정책으로 다시 학습해야 합니다"
+        )
+    if recorded_directions and expected_directions and recorded_directions != expected_directions:
+        return (
+            "tokenizer_metadata.json의 translation_directions가 현재 설정과 다릅니다 "
+            f"(metadata={recorded_directions}, config={expected_directions})"
         )
     expected_languages = {language for pair in language_pairs for language in pair}
     if set(tokenizer.languages) != expected_languages:
@@ -1156,6 +1248,7 @@ def _ensure_artifacts_on_main(
                         tokenizer_path.parent,
                         vocab_size=vocab_size,
                         language_pairs=config.data.configured_language_pairs(),
+                        translation_directions=config.data.configured_translation_directions(),
                         # foundation 단계가 자기 코퍼스에 없는 어휘로 학습하지 않도록
                         # 단일어 코퍼스도 넣습니다. 언어별 상한이 없으면 분량이 큰
                         # 언어가 vocab 을 독식합니다.
@@ -1179,6 +1272,8 @@ def _ensure_artifacts_on_main(
                     config.data.configured_language_pairs(),
                     config.foundation_languages(),
                     reasoning_languages,
+                    translation_directions=config.data.configured_translation_directions(),
+                    require_recorded_directions=bool(config.data.translation_directions),
                 )
                 if policy_problem is not None:
                     existing_tokenizer = SionTokenizer(tokenizer_path)
@@ -1186,11 +1281,13 @@ def _ensure_artifacts_on_main(
                         existing_checkpoint is None
                         and existing_tokenizer.splits_digits
                         and load_tokenizer_metadata(tokenizer_path) is None
+                        and not config.data.translation_directions
                     ):
                         write_tokenizer_metadata(
                             tokenizer_path,
                             split_digits=True,
                             language_pairs=config.data.configured_language_pairs(),
+                            translation_directions=config.data.configured_translation_directions(),
                         )
                         files = scan_configured_raw_data(config, data_dir, tokenizer_path)
                         policy_problem = tokenizer_policy_problem(
@@ -1198,6 +1295,8 @@ def _ensure_artifacts_on_main(
                             config.data.configured_language_pairs(),
                             config.foundation_languages(),
                             reasoning_languages,
+                            translation_directions=config.data.configured_translation_directions(),
+                            require_recorded_directions=bool(config.data.translation_directions),
                         )
                     if policy_problem is not None:
                         checkpoint_detail = (
@@ -1245,6 +1344,7 @@ def _ensure_artifacts_on_main(
                         tokenizer_path,
                         dataset_dir,
                         language_pairs=config.data.configured_language_pairs(),
+                        translation_directions=config.data.configured_translation_directions(),
                         source_only_languages=config.data.configured_source_only_languages(),
                         approximate_split=config.data.approximate_split,
                         train_only_prefixes=config.data.configured_synthetic_prefixes(),
@@ -3448,15 +3548,19 @@ def main() -> None:
         train_dataset = IndexedParallelDataset(
             config.data.dataset_dir,
             config.data.train_split,
-            bidirectional=config.data.bidirectional,
+            bidirectional=True,
+            legacy_bidirectional=config.data.bidirectional,
             verify_integrity=False,
         )
         validation_dataset = IndexedParallelDataset(
             config.data.dataset_dir,
             config.data.validation_split,
-            bidirectional=config.data.bidirectional,
+            bidirectional=True,
+            legacy_bidirectional=config.data.bidirectional,
             verify_integrity=False,
         )
+        preflight_dataset_direction_contract(config, train_dataset, require_all_pairs=True)
+        preflight_dataset_direction_contract(config, validation_dataset)
         revision_sources = [
             source
             for source in train_dataset.source_names
@@ -3472,7 +3576,7 @@ def main() -> None:
             )
         announce(
             f"데이터 규모: 학습 {len(train_dataset):,}개 / 검증 {len(validation_dataset):,}개 "
-            f"(양방향 포함)",
+            f"(설정된 번역 방향 포함)",
             context,
         )
 
@@ -3483,6 +3587,7 @@ def main() -> None:
             env,
             train_examples=len(train_dataset),
             validation_examples=len(validation_dataset),
+            physical_train_pairs=train_dataset.pair_count,
             source_names=train_dataset.source_names,
         )
         if decisions:
@@ -3545,6 +3650,7 @@ def main() -> None:
             source_sampling_weights=config.data.source_sampling_weights,
             max_source_upsampling=config.data.max_source_upsampling,
         )
+        preflight_effective_translation_training(config, train_sampler)
         post_sampler: DistributedBucketBatchSampler | None = None
         post_validation_sampler: DistributedBucketBatchSampler | None = None
         if post_config is not None:
