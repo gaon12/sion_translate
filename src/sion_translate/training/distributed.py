@@ -78,6 +78,21 @@ def reduce_max(tensor: torch.Tensor, context: DistributedContext) -> torch.Tenso
     return tensor
 
 
+def distributed_failure_scope(
+    failed_here: bool,
+    context: DistributedContext,
+) -> str:
+    """Classify a local check as successful, uniformly failed, or rank-divergent."""
+
+    failure = torch.tensor(int(failed_here), device=context.device, dtype=torch.int32)
+    success = torch.tensor(int(not failed_here), device=context.device, dtype=torch.int32)
+    any_failure = bool(reduce_max(failure, context).item())
+    any_success = bool(reduce_max(success, context).item())
+    if not any_failure:
+        return "none"
+    return "partial" if any_success else "all"
+
+
 def broadcast_bool(value: bool, context: DistributedContext, *, source: int = 0) -> bool:
     """Broadcast a control-flow decision so every rank exits at the same point."""
 
@@ -90,6 +105,46 @@ def broadcast_bool(value: bool, context: DistributedContext, *, source: int = 0)
     )
     dist.broadcast(decision, src=source)
     return bool(decision.item())
+
+
+def broadcast_int(
+    value: int | None,
+    context: DistributedContext,
+    *,
+    source: int = 0,
+) -> int:
+    """Broadcast a control-plane integer from one trusted source rank."""
+
+    if not context.distributed:
+        if value is None:
+            raise ValueError("source integer is required outside distributed execution")
+        return value
+    payload = torch.tensor(
+        int(value) if context.rank == source and value is not None else 0,
+        device=context.device,
+        dtype=torch.int64,
+    )
+    dist.broadcast(payload, src=source)
+    return int(payload.item())
+
+
+def broadcast_text(
+    value: str | None,
+    context: DistributedContext,
+    *,
+    source: int = 0,
+) -> str:
+    """Broadcast a short control-plane string from one trusted source rank."""
+
+    if not context.distributed:
+        if value is None:
+            raise ValueError("source text is required outside distributed execution")
+        return value
+    payload: list[str | None] = [value if context.rank == source else None]
+    dist.broadcast_object_list(payload, src=source, device=context.device)
+    if not isinstance(payload[0], str):
+        raise RuntimeError("distributed source rank did not broadcast text")
+    return payload[0]
 
 
 def precision_dtype(name: str, device: torch.device) -> torch.dtype:
