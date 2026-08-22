@@ -15,6 +15,25 @@ DEFAULT_SYNTHETIC_PREFIXES: tuple[str, ...] = (
     "synthetic_",
 )
 DEFAULT_SYNTHETIC_SAMPLING_WEIGHT = 0.5
+_UNSAFE_PREFIX_CHARACTERS = frozenset('/\\<>:"|?*')
+
+
+def _validate_synthetic_prefix(prefix: object) -> str:
+    value = str(prefix)
+    if not value:
+        raise ValueError("synthetic prefixes must be non-empty")
+    if (
+        value in {".", ".."}
+        or value != value.strip()
+        or value.endswith(".")
+        or any(character in _UNSAFE_PREFIX_CHARACTERS for character in value)
+        or any(ord(character) < 32 for character in value)
+    ):
+        raise ValueError(
+            "synthetic prefixes must be safe filename prefixes without path "
+            f"separators or reserved characters; got {value!r}"
+        )
+    return value
 
 
 def normalize_synthetic_prefixes(
@@ -31,9 +50,7 @@ def normalize_synthetic_prefixes(
     normalized: list[str] = []
     seen: set[str] = set()
     for prefix in values:
-        value = str(prefix)
-        if not value:
-            raise ValueError("synthetic prefixes must be non-empty")
+        value = _validate_synthetic_prefix(prefix)
         if value not in seen:
             seen.add(value)
             normalized.append(value)

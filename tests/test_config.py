@@ -33,6 +33,17 @@ def test_default_paths_use_the_stable_public_layout() -> None:
     assert TrainingConfig().output_dir == "runs/auto"
 
 
+@pytest.mark.parametrize(
+    "prefix",
+    ("../bt_", "..\\bt_", "/bt_", "C:\\bt_", "bad:name", "bad*name", "trailing "),
+)
+def test_synthetic_prefixes_cannot_escape_the_raw_directory(prefix: str) -> None:
+    config = AppConfig(data=DataConfig(synthetic_prefix=prefix))
+
+    with pytest.raises(ValueError, match="safe filename prefixes"):
+        config.validate()
+
+
 def test_shipped_configs_keep_canonical_paths_without_release_namespaces() -> None:
     config_root = Path(__file__).resolve().parents[1] / "configs"
     root_data = load_config(config_root.parent / "sion_translate.yaml").data
