@@ -4,13 +4,15 @@ These are the defects chrF does not see. Scoring is against the source rather
 than a reference, so this runs without gold translations and can gate
 machine-translated data before it enters a corpus.
 
-Input is JSONL with one object per line. Keys are configurable; the defaults
-match both the translation-queue result format and a plain parallel shard::
+Input is JSONL with one object per line. Source and target keys are explicit so
+arbitrary language-keyed shards cannot be interpreted as another language pair::
 
-    sion-check-preservation --target-scripts ja translated.jsonl
+    sion-check-preservation --source-key source --target-key translation \
+        --target-scripts ja translated.jsonl
     sion-check-preservation --source-key kj --target-key ko \\
         --target-scripts ko data/synthetic_hanboneo.jsonl
-    sion-check-preservation --json report.json --max-violation-rate 0.02 out.jsonl
+    sion-check-preservation --source-key source --target-key translation \
+        --json report.json --max-violation-rate 0.02 out.jsonl
 
 ``--write-passing`` turns the report into a gate that also produces the cleaned
 file, which is what recovering a shard needs: data23 renders ``원`` as ``銭``, an
@@ -37,9 +39,6 @@ import sys
 from sion_translate.console import configure_stdio
 from sion_translate.preservation import check_corpus, check_pair, format_report
 from sion_translate.scripts_registry import resolve_scripts
-
-DEFAULT_SOURCE_KEYS = ("source", "ko", "src")
-DEFAULT_TARGET_KEYS = ("translation", "hypothesis", "ja", "tgt")
 
 # The per-pair verdicts ``check_pair`` reports, in the order the summary prints.
 CHECK_NAMES = ("number", "sign", "unit", "script")
@@ -95,6 +94,16 @@ def write_rows(path: Path, rows: list[dict[str, object]]) -> None:
     temporary.replace(path)
 
 
+def write_json(path: Path, payload: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".part")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
 def read_rows(path: Path) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     with path.open("rb") as handle:
@@ -120,22 +129,31 @@ def pick(row: dict[str, object], keys: tuple[str, ...], *, line: int, role: str)
     raise ValueError(f"line {line} has no usable {role} field; tried {list(keys)}")
 
 
+def validated_keys(values: list[str], *, role: str) -> tuple[str, ...]:
+    keys = tuple(value.strip() for value in values)
+    if any(not key for key in keys):
+        raise ValueError(f"{role} keys must be non-empty")
+    if len(set(keys)) != len(keys):
+        raise ValueError(f"{role} keys must not contain duplicates")
+    return keys
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("paths", nargs="+", help="JSONL files to check")
     parser.add_argument(
         "--source-key",
         action="append",
-        default=None,
+        required=True,
         metavar="KEY",
-        help=f"source field, repeatable in priority order (default: {' '.join(DEFAULT_SOURCE_KEYS)})",
+        help="source field, repeatable in priority order",
     )
     parser.add_argument(
         "--target-key",
         action="append",
-        default=None,
+        required=True,
         metavar="KEY",
-        help=f"target field, repeatable (default: {' '.join(DEFAULT_TARGET_KEYS)})",
+        help="target field, repeatable in priority order",
     )
     parser.add_argument(
         "--target-scripts",
@@ -189,8 +207,19 @@ def main(argv: list[str] | None = None) -> int:
         print("--write-passing takes exactly one input path", file=sys.stderr)
         return 2
 
-    source_keys = tuple(args.source_key or DEFAULT_SOURCE_KEYS)
-    target_keys = tuple(args.target_key or DEFAULT_TARGET_KEYS)
+    try:
+        source_keys = validated_keys(args.source_key, role="source")
+        target_keys = validated_keys(args.target_key, role="target")
+    except ValueError as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    overlapping_keys = sorted(set(source_keys) & set(target_keys))
+    if overlapping_keys:
+        print(
+            f"source and target keys must be disjoint; overlapping keys: {overlapping_keys}",
+            file=sys.stderr,
+        )
+        return 2
 
     reports: list[dict[str, object]] = []
     failed = False
@@ -254,10 +283,7 @@ def main(argv: list[str] | None = None) -> int:
                     failed = True
 
     if args.json_out:
-        Path(args.json_out).write_text(
-            json.dumps(reports, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        write_json(Path(args.json_out), reports)
     return 1 if failed else 0
 
 

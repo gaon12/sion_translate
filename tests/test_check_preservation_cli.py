@@ -10,7 +10,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from sion_translate.cli.check_preservation import CHECK_NAMES, check_list, main, pair_passes
+from sion_translate.cli.check_preservation import (
+    CHECK_NAMES,
+    build_parser,
+    check_list,
+    main,
+    pair_passes,
+)
 import pytest
 
 
@@ -33,6 +39,53 @@ def read_shard(path: Path) -> list[dict[str, object]]:
 
 def run(argv: list[str]) -> int:
     return main(argv)
+
+
+def test_source_and_target_fields_are_explicit() -> None:
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["translated.jsonl"])
+
+    args = parser.parse_args(
+        [
+            "translated.jsonl",
+            "--source-key",
+            "sw",
+            "--target-key",
+            "ar",
+        ]
+    )
+    assert args.source_key == ["sw"]
+    assert args.target_key == ["ar"]
+
+
+def test_source_and_target_fields_cannot_alias(tmp_path: Path) -> None:
+    source = write_shard(tmp_path / "self.jsonl", [{"text": "same"}])
+
+    assert run([str(source), "--source-key", "text", "--target-key", "text"]) == 2
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--source-key", "", "--target-key", "translation"],
+        [
+            "--source-key",
+            "source",
+            "--source-key",
+            "source",
+            "--target-key",
+            "translation",
+        ],
+    ],
+)
+def test_source_and_target_fields_reject_empty_or_duplicate_keys(
+    tmp_path: Path,
+    arguments: list[str],
+) -> None:
+    source = write_shard(tmp_path / "invalid-keys.jsonl", [GOOD_UNIT])
+
+    assert run([str(source), *arguments]) == 2
 
 
 def test_a_wrong_currency_unit_is_removed(tmp_path: Path) -> None:
@@ -143,7 +196,21 @@ def test_unrelated_fields_survive_the_filter(tmp_path: Path) -> None:
 def test_writing_refuses_more_than_one_input(tmp_path: Path) -> None:
     first = write_shard(tmp_path / "a.jsonl", [GOOD_UNIT])
     second = write_shard(tmp_path / "b.jsonl", [GOOD_UNIT])
-    assert run([str(first), str(second), "--write-passing", str(tmp_path / "clean.jsonl")]) == 2
+    assert (
+        run(
+            [
+                str(first),
+                str(second),
+                "--source-key",
+                "ko",
+                "--target-key",
+                "ja",
+                "--write-passing",
+                str(tmp_path / "clean.jsonl"),
+            ]
+        )
+        == 2
+    )
 
 
 def test_unknown_check_names_are_rejected() -> None:

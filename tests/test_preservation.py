@@ -253,6 +253,9 @@ def write_jsonl(path: Path, rows: list[dict[str, str]]) -> Path:
     return path
 
 
+GENERIC_KEYS = ["--source-key", "source", "--target-key", "translation"]
+
+
 def test_cli_reports_and_writes_json(tmp_path: Path, capsys) -> None:
     path = write_jsonl(
         tmp_path / "out.jsonl",
@@ -264,7 +267,16 @@ def test_cli_reports_and_writes_json(tmp_path: Path, capsys) -> None:
     report = tmp_path / "report.json"
 
     assert (
-        check_preservation.main(["--target-scripts", "ja,latin", "--json", str(report), str(path)])
+        check_preservation.main(
+            [
+                *GENERIC_KEYS,
+                "--target-scripts",
+                "ja,latin",
+                "--json",
+                str(report),
+                str(path),
+            ]
+        )
         == 0
     )
 
@@ -281,8 +293,8 @@ def test_cli_fails_when_a_threshold_is_exceeded(tmp_path: Path) -> None:
         [{"source": "오차는 ±0.05mm", "translation": "誤差は0.05mm"}],
     )
 
-    assert check_preservation.main(["--max-violation-rate", "0.5", str(path)]) == 1
-    assert check_preservation.main(["--max-violation-rate", "1.0", str(path)]) == 0
+    assert check_preservation.main([*GENERIC_KEYS, "--max-violation-rate", "0.5", str(path)]) == 1
+    assert check_preservation.main([*GENERIC_KEYS, "--max-violation-rate", "1.0", str(path)]) == 0
 
 
 def test_cli_accepts_custom_keys(tmp_path: Path) -> None:
@@ -305,8 +317,8 @@ def test_cli_rejects_bad_input(tmp_path: Path) -> None:
     broken.write_text("not json\n", encoding="utf-8")
     missing_field = write_jsonl(tmp_path / "c.jsonl", [{"other": "가"}])
 
-    assert check_preservation.main([str(broken)]) == 2
-    assert check_preservation.main([str(missing_field)]) == 2
-    assert check_preservation.main(["--examples", "-1", str(good)]) == 2
-    assert check_preservation.main(["--max-violation-rate", "2", str(good)]) == 2
-    assert check_preservation.main([str(tmp_path / "missing.jsonl")]) == 2
+    assert check_preservation.main([*GENERIC_KEYS, str(broken)]) == 2
+    assert check_preservation.main([*GENERIC_KEYS, str(missing_field)]) == 2
+    assert check_preservation.main([*GENERIC_KEYS, "--examples", "-1", str(good)]) == 2
+    assert check_preservation.main([*GENERIC_KEYS, "--max-violation-rate", "2", str(good)]) == 2
+    assert check_preservation.main([*GENERIC_KEYS, str(tmp_path / "missing.jsonl")]) == 2
