@@ -16,6 +16,26 @@ sys.modules[SPEC.name] = AUDIT
 SPEC.loader.exec_module(AUDIT)
 
 
+def audit_shard(
+    path: Path,
+    *args: object,
+    source_key: str = "ko",
+    target_key: str = "ja",
+    **kwargs: object,
+):
+    return AUDIT.audit_shard(
+        path,
+        *args,
+        source_key=source_key,
+        target_key=target_key,
+        **kwargs,
+    )
+
+
+def audit_main(args: list[str]) -> int:
+    return AUDIT.main(["--source-key", "ko", "--target-key", "ja", *args])
+
+
 def write_shard(path: Path, rows: list[tuple[str, str]]) -> Path:
     with path.open("w", encoding="utf-8", newline="\n") as handle:
         for source, target in rows:
@@ -54,7 +74,7 @@ def test_skeleton_blanks_quoted_spans_and_digits() -> None:
 
 
 def test_diverse_shard_passes(tmp_path: Path) -> None:
-    report = AUDIT.audit_shard(write_shard(tmp_path / "good.jsonl", distinct_rows(400)))
+    report = audit_shard(write_shard(tmp_path / "good.jsonl", distinct_rows(400)))
 
     assert report.rows == 400
     assert report.unreadable_rows == 0
@@ -68,7 +88,7 @@ def test_template_collapse_is_rejected(tmp_path: Path) -> None:
         (f'이 표현은 "관용구{index % 3}"로 옮긴다.', f"この表現は「慣用句{index % 3}」と訳す。")
         for index in range(300)
     ]
-    report = AUDIT.audit_shard(write_shard(tmp_path / "template.jsonl", rows))
+    report = audit_shard(write_shard(tmp_path / "template.jsonl", rows))
 
     assert not report.passed
     assert any(name.startswith("skeleton_ttr") for name in report.violations)
@@ -77,7 +97,7 @@ def test_template_collapse_is_rejected(tmp_path: Path) -> None:
 
 def test_one_to_many_targets_are_rejected(tmp_path: Path) -> None:
     rows = [("같은 원문이 계속 반복된다.", f"別の訳{index}です。") for index in range(300)]
-    report = AUDIT.audit_shard(write_shard(tmp_path / "many.jsonl", rows))
+    report = audit_shard(write_shard(tmp_path / "many.jsonl", rows))
 
     assert report.max_targets_per_source == 300
     assert report.conflicting_source == pytest.approx(1.0)
@@ -90,7 +110,7 @@ def test_hangul_in_japanese_target_is_rejected(tmp_path: Path) -> None:
         (source, f"{_word(index, _JA_SYLLABLES)}村の 문장 は違う。")
         for index, (source, _) in enumerate(distinct_rows(300))
     ]
-    report = AUDIT.audit_shard(write_shard(tmp_path / "leak.jsonl", rows), target_scripts=("ja",))
+    report = audit_shard(write_shard(tmp_path / "leak.jsonl", rows), target_scripts=("ja",))
 
     assert report.foreign_script_target == pytest.approx(1.0)
     assert report.foreign_target_scripts == ["hangul"]
@@ -112,9 +132,9 @@ def test_korean_target_is_not_reported_as_foreign(tmp_path: Path) -> None:
         for source, target in rows:
             handle.write(json.dumps({"kj": source, "ko": target}, ensure_ascii=False) + "\n")
 
-    japanese = AUDIT.audit_shard(path, source_key="kj", target_key="ko", target_scripts=("ja",))
-    korean = AUDIT.audit_shard(path, source_key="kj", target_key="ko", target_scripts=("ko",))
-    ignored = AUDIT.audit_shard(path, source_key="kj", target_key="ko")
+    japanese = audit_shard(path, source_key="kj", target_key="ko", target_scripts=("ja",))
+    korean = audit_shard(path, source_key="kj", target_key="ko", target_scripts=("ko",))
+    ignored = audit_shard(path, source_key="kj", target_key="ko")
 
     assert japanese.foreign_script_target == pytest.approx(1.0)
     assert korean.foreign_script_target == pytest.approx(0.0)
@@ -129,7 +149,7 @@ def test_kana_in_a_korean_target_is_gated(tmp_path: Path) -> None:
     ]
     path = write_shard(tmp_path / "kanaleak.jsonl", rows)
 
-    report = AUDIT.audit_shard(path, target_scripts=("ko",))
+    report = audit_shard(path, target_scripts=("ko",))
 
     assert report.foreign_script_target == pytest.approx(1.0)
     assert report.foreign_target_scripts == ["kana"]
@@ -140,7 +160,7 @@ def test_unknown_script_name_is_rejected(tmp_path: Path) -> None:
     path = write_shard(tmp_path / "x.jsonl", distinct_rows(10))
 
     with pytest.raises(ValueError, match="unknown script or language"):
-        AUDIT.audit_shard(path, target_scripts=("klingon",))
+        audit_shard(path, target_scripts=("klingon",))
 
 
 def test_script_list_parses_a_comma_separated_value() -> None:
@@ -154,7 +174,7 @@ def test_script_list_parses_a_comma_separated_value() -> None:
 def test_scripts_present_are_reported_for_both_sides(tmp_path: Path) -> None:
     path = write_shard(tmp_path / "scripts.jsonl", distinct_rows(300))
 
-    report = AUDIT.audit_shard(path)
+    report = audit_shard(path)
 
     assert report.source_scripts == ["hangul"]
     assert report.target_scripts == ["han", "kana"]
@@ -172,9 +192,9 @@ def test_kana_in_korean_source_is_measured_but_not_gated(tmp_path: Path) -> None
     path = write_shard(tmp_path / "mixed.jsonl", rows)
 
     # Declaring the source as Korean measures the kana but never gates on it.
-    measured = AUDIT.audit_shard(path, source_scripts=("ko",))
+    measured = audit_shard(path, source_scripts=("ko",))
     # Declaring it as 한본어 says the mixture is expected, so nothing is foreign.
-    expected = AUDIT.audit_shard(path, source_scripts=("kj",))
+    expected = audit_shard(path, source_scripts=("kj",))
 
     assert measured.foreign_script_source == pytest.approx(1.0)
     assert measured.foreign_source_scripts == ["kana"]
@@ -192,7 +212,7 @@ def test_near_duplicate_leak_is_detected(tmp_path: Path) -> None:
         )
         for index in range(4000)
     ]
-    report = AUDIT.audit_shard(write_shard(tmp_path / "leaky.jsonl", rows))
+    report = audit_shard(write_shard(tmp_path / "leaky.jsonl", rows))
 
     assert report.held_out_rows > 0
     assert report.near_duplicate_leak == pytest.approx(1.0)
@@ -208,7 +228,7 @@ def test_unreadable_rows_are_counted_not_fatal(tmp_path: Path) -> None:
         handle.write(json.dumps(["array", "not", "object"]) + "\n")
         handle.write(json.dumps({"ko": 5, "ja": "あ"}) + "\n")
 
-    report = AUDIT.audit_shard(path)
+    report = audit_shard(path)
 
     assert report.rows == 303
     assert report.unreadable_rows == 3
@@ -219,7 +239,7 @@ def test_shard_without_usable_rows_fails(tmp_path: Path) -> None:
     path = tmp_path / "empty.jsonl"
     path.write_text("not json\n", encoding="utf-8")
 
-    report = AUDIT.audit_shard(path)
+    report = audit_shard(path)
 
     assert not report.passed
     assert report.violations == ["usable_rows 0 < 1"]
@@ -231,16 +251,54 @@ def test_custom_keys_are_honoured(tmp_path: Path) -> None:
         for index in range(300):
             handle.write(
                 json.dumps(
-                    {"kj": f"{index}번째 ぶんしょう 이다.", "ko": f"{index}번째 문장이다."},
+                    {
+                        "pt-BR": f"Frase de origem número {index}.",
+                        "zh-Hant": f"第 {index} 個目標句子。",
+                    },
                     ensure_ascii=False,
                 )
                 + "\n"
             )
 
-    report = AUDIT.audit_shard(path, source_key="kj", target_key="ko")
+    report = audit_shard(path, source_key="pt-BR", target_key="zh-Hant")
 
     assert report.rows == 300
     assert report.unreadable_rows == 0
+
+
+def test_audit_api_requires_explicit_distinct_nonempty_keys_before_reading(
+    tmp_path: Path,
+) -> None:
+    missing = tmp_path / "missing.jsonl"
+
+    with pytest.raises(TypeError, match="source_key.*target_key"):
+        AUDIT.audit_shard(missing)
+    with pytest.raises(ValueError, match="source_key must be a non-empty"):
+        AUDIT.audit_shard(missing, source_key="", target_key="fr")
+    with pytest.raises(ValueError, match="target_key must be a non-empty"):
+        AUDIT.audit_shard(missing, source_key="de", target_key=" ")
+    with pytest.raises(ValueError, match="must be distinct"):
+        AUDIT.audit_shard(missing, source_key="de", target_key="de")
+
+
+def test_audit_split_configuration_fails_before_reading(tmp_path: Path) -> None:
+    missing = tmp_path / "missing.jsonl"
+
+    with pytest.raises(ValueError, match="split fractions must be non-negative"):
+        AUDIT.audit_shard(
+            missing,
+            source_key="de",
+            target_key="fr",
+            validation_fraction=-0.1,
+        )
+    with pytest.raises(ValueError, match="must be below 0.5"):
+        AUDIT.audit_shard(
+            missing,
+            source_key="de",
+            target_key="fr",
+            validation_fraction=0.3,
+            test_fraction=0.2,
+        )
 
 
 def test_thresholds_reject_out_of_range_values() -> None:
@@ -250,7 +308,10 @@ def test_thresholds_reject_out_of_range_values() -> None:
         AUDIT.Thresholds(max_near_duplicate_leak=-0.1).validate()
 
 
-def test_main_returns_one_when_a_shard_fails(tmp_path: Path, capsys) -> None:
+def test_main_returns_one_when_a_shard_fails(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     good = write_shard(tmp_path / "good.jsonl", distinct_rows(300))
     bad = write_shard(
         tmp_path / "bad.jsonl",
@@ -258,7 +319,7 @@ def test_main_returns_one_when_a_shard_fails(tmp_path: Path, capsys) -> None:
     )
     report_path = tmp_path / "report.json"
 
-    assert AUDIT.main(["--json", str(report_path), str(good), str(bad)]) == 1
+    assert audit_main(["--json", str(report_path), str(good), str(bad)]) == 1
 
     printed = capsys.readouterr().out
     assert "good.jsonl" in printed and "PASS" in printed
@@ -270,16 +331,51 @@ def test_main_returns_one_when_a_shard_fails(tmp_path: Path, capsys) -> None:
 def test_main_returns_zero_when_every_shard_passes(tmp_path: Path) -> None:
     good = write_shard(tmp_path / "good.jsonl", distinct_rows(300))
 
-    assert AUDIT.main([str(good)]) == 0
+    assert audit_main([str(good)]) == 0
+
+
+def test_audit_cli_requires_explicit_keys(tmp_path: Path) -> None:
+    good = write_shard(tmp_path / "good.jsonl", distinct_rows(10))
+
+    with pytest.raises(SystemExit) as error:
+        AUDIT.main([str(good)])
+
+    assert error.value.code == 2
+
+
+def test_audit_cli_preflights_inputs_and_report_without_mutation(tmp_path: Path) -> None:
+    good = write_shard(tmp_path / "good.jsonl", distinct_rows(10))
+    original = good.read_bytes()
+    missing = tmp_path / "missing.jsonl"
+    report = tmp_path / "report.json"
+    report.write_text("sentinel\n", encoding="utf-8")
+
+    assert audit_main(["--json", str(report), str(good), str(missing)]) == 2
+    assert report.read_text(encoding="utf-8") == "sentinel\n"
+    assert audit_main(["--json", str(good), str(good)]) == 2
+    assert good.read_bytes() == original
+    assert audit_main([str(good), str(good)]) == 2
+
+
+def test_audit_json_report_atomically_replaces_an_existing_file(tmp_path: Path) -> None:
+    good = write_shard(tmp_path / "good.jsonl", distinct_rows(300))
+    report = tmp_path / "nested" / "report.json"
+    report.parent.mkdir()
+    report.write_text("old report\n", encoding="utf-8")
+
+    assert audit_main(["--json", str(report), str(good)]) == 0
+
+    assert json.loads(report.read_text(encoding="utf-8"))[0]["rows"] == 300
+    assert not list(report.parent.glob(f".{report.name}.*.tmp"))
 
 
 def test_main_reports_bad_input_with_exit_code_two(tmp_path: Path) -> None:
     missing = tmp_path / "missing.jsonl"
     good = write_shard(tmp_path / "good.jsonl", distinct_rows(10))
 
-    assert AUDIT.main([str(missing)]) == 2
-    assert AUDIT.main(["--min-skeleton-ttr", "1.5", str(good)]) == 2
-    assert AUDIT.main(["--examples", "-1", str(good)]) == 2
+    assert audit_main([str(missing)]) == 2
+    assert audit_main(["--min-skeleton-ttr", "1.5", str(good)]) == 2
+    assert audit_main(["--examples", "-1", str(good)]) == 2
 
 
 def test_relaxed_threshold_lets_a_known_shard_through(tmp_path: Path) -> None:
@@ -293,9 +389,9 @@ def test_relaxed_threshold_lets_a_known_shard_through(tmp_path: Path) -> None:
     ]
     path = write_shard(tmp_path / "frames.jsonl", rows)
 
-    assert AUDIT.main([str(path)]) == 1
+    assert audit_main([str(path)]) == 1
     assert (
-        AUDIT.main(
+        audit_main(
             [
                 "--min-skeleton-ttr",
                 "0.2",

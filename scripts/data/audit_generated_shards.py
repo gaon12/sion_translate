@@ -17,9 +17,13 @@ threshold is violated, so it can run in front of ``sion-prepare-data``.
 
 Usage::
 
-    python scripts/data/audit_generated_shards.py data/data4*.jsonl
-    python scripts/data/audit_generated_shards.py --json report.json data/data51.jsonl
-    python scripts/data/audit_generated_shards.py --min-skeleton-ttr 0.3 data/data44.jsonl
+    python scripts/data/audit_generated_shards.py \
+        --source-key de --target-key fr data/generated_de_fr*.jsonl
+    python scripts/data/audit_generated_shards.py \
+        --source-key sr-Latn --target-key ar --json report.json data/generated.jsonl
+    python scripts/data/audit_generated_shards.py \
+        --source-key x-source --target-key x-target \
+        --min-skeleton-ttr 0.3 data/private_use.jsonl
 
 Exit codes: 0 every shard passed, 1 a threshold was violated, 2 bad input.
 """
@@ -33,7 +37,8 @@ import json
 from pathlib import Path
 import re
 import sys
-from typing import Iterator, Sequence
+from typing import Iterator, Sequence, cast
+import uuid
 
 from sion_translate.data.quality import canonical_text
 from sion_translate.scripts_registry import (
@@ -48,6 +53,45 @@ from sion_translate.splitting import choose_split_for_key, normalized_split_key
 # fixed, so it has to be blanked out before frames can be compared.
 _QUOTED = re.compile(r"[\"“‘'][^\"”’']{1,120}[\"”’']")
 _DIGITS = re.compile(r"\d")
+
+
+def validate_record_keys(source_key: str, target_key: str) -> None:
+    """Require two explicit, distinct JSON object keys."""
+
+    for option, key in (("source_key", source_key), ("target_key", target_key)):
+        if (
+            not isinstance(key, str)  # pyright: ignore[reportUnnecessaryIsInstance]
+            or not key
+            or key != key.strip()
+        ):
+            raise ValueError(f"{option} must be a non-empty key without surrounding whitespace")
+    if source_key == target_key:
+        raise ValueError("source_key and target_key must be distinct")
+
+
+def _path_identity(path: Path) -> str:
+    resolved = str(path.resolve(strict=False))
+    return resolved.casefold() if sys.platform == "win32" else resolved
+
+
+def _validate_output_path(path: Path) -> None:
+    if path.exists() and not path.is_file():
+        raise ValueError(f"output path is not a regular file: {path}")
+    parent = path.parent
+    if parent.exists() and not parent.is_dir():
+        raise ValueError(f"output parent is not a directory: {parent}")
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Replace one report only after its complete sibling temp file is written."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(text, encoding="utf-8", newline="\n")
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 @dataclass(frozen=True)
@@ -87,13 +131,13 @@ class ShardReport:
     foreign_script_source: float = 0.0
     held_out_rows: int = 0
     near_duplicate_leak: float = 0.0
-    source_scripts: list[str] = field(default_factory=list)
-    target_scripts: list[str] = field(default_factory=list)
-    foreign_source_scripts: list[str] = field(default_factory=list)
-    foreign_target_scripts: list[str] = field(default_factory=list)
-    top_skeletons: list[tuple[str, int]] = field(default_factory=list)
-    top_quoted: list[tuple[str, int]] = field(default_factory=list)
-    violations: list[str] = field(default_factory=list)
+    source_scripts: list[str] = field(default_factory=list[str])
+    target_scripts: list[str] = field(default_factory=list[str])
+    foreign_source_scripts: list[str] = field(default_factory=list[str])
+    foreign_target_scripts: list[str] = field(default_factory=list[str])
+    top_skeletons: list[tuple[str, int]] = field(default_factory=list[tuple[str, int]])
+    top_quoted: list[tuple[str, int]] = field(default_factory=list[tuple[str, int]])
+    violations: list[str] = field(default_factory=list[str])
 
     @property
     def passed(self) -> bool:
@@ -127,13 +171,14 @@ def iter_rows(path: Path, *, source_key: str, target_key: str) -> Iterator[tuple
             if not raw_line:
                 continue
             try:
-                row = json.loads(raw_line.decode("utf-8-sig"))
+                raw_row: object = json.loads(raw_line.decode("utf-8-sig"))
             except (UnicodeDecodeError, json.JSONDecodeError):
                 yield "", ""
                 continue
-            if not isinstance(row, dict):
+            if not isinstance(raw_row, dict):
                 yield "", ""
                 continue
+            row = cast(dict[object, object], raw_row)
             source = row.get(source_key)
             target = row.get(target_key)
             if not isinstance(source, str) or not isinstance(target, str):
@@ -146,8 +191,8 @@ def audit_shard(
     path: Path,
     thresholds: Thresholds | None = None,
     *,
-    source_key: str = "ko",
-    target_key: str = "ja",
+    source_key: str,
+    target_key: str,
     target_scripts: Sequence[str] = (),
     source_scripts: Sequence[str] = (),
     validation_fraction: float = 0.005,
@@ -156,10 +201,15 @@ def audit_shard(
 ) -> ShardReport:
     """Measure one JSONL shard and record which thresholds it violates."""
 
+    validate_record_keys(source_key, target_key)
     thresholds = thresholds or Thresholds()
     thresholds.validate()
     if examples < 0:
         raise ValueError("examples must be non-negative")
+    if validation_fraction < 0 or test_fraction < 0:
+        raise ValueError("split fractions must be non-negative")
+    if validation_fraction + test_fraction >= 0.5:
+        raise ValueError("validation_fraction + test_fraction must be below 0.5")
     # Resolve eagerly so an unknown script name fails before the file is read.
     permitted_target = resolve_scripts(target_scripts)
     permitted_source = resolve_scripts(source_scripts)
@@ -278,14 +328,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("paths", nargs="+", help="JSONL shards to audit")
     parser.add_argument("--json", dest="json_out", help="write the full report to this path")
-    parser.add_argument("--source-key", default="ko", help="JSON key holding the source text")
-    parser.add_argument("--target-key", default="ja", help="JSON key holding the target text")
+    parser.add_argument(
+        "--source-key",
+        required=True,
+        help="JSON key holding the source text (required; no language default)",
+    )
+    parser.add_argument(
+        "--target-key",
+        required=True,
+        help="JSON key holding the target text (required; no language default)",
+    )
     parser.add_argument(
         "--target-scripts",
         type=script_list,
         default=(),
         metavar="LIST",
-        help="writing systems the target may use: script names or language shorthands, comma separated (ko / ja / kana,han). 'any' or omitting the flag disables the check",
+        help="writing systems the target may use: script names or language shorthands, comma separated (de / ar / latin,cyrillic). 'any' or omitting the flag disables the check",
     )
     parser.add_argument(
         "--source-scripts",
@@ -315,20 +373,42 @@ def main(argv: list[str] | None = None) -> int:
         max_near_duplicate_leak=args.max_near_duplicate_leak,
     )
     try:
+        validate_record_keys(args.source_key, args.target_key)
         thresholds.validate()
+        resolve_scripts(args.target_scripts)
+        resolve_scripts(args.source_scripts)
     except ValueError as error:
-        print(f"invalid threshold: {error}", file=sys.stderr)
+        print(f"invalid audit configuration: {error}", file=sys.stderr)
         return 2
     if args.examples < 0:
         print("--examples must be non-negative", file=sys.stderr)
         return 2
 
+    try:
+        paths = [Path(raw_path) for raw_path in args.paths]
+        identities: set[str] = set()
+        for path in paths:
+            if not path.is_file():
+                raise FileNotFoundError(path)
+            identity = _path_identity(path)
+            if identity in identities:
+                raise ValueError(f"duplicate input shard: {path}")
+            identities.add(identity)
+        report_path = Path(args.json_out) if args.json_out else None
+        if report_path is not None:
+            _validate_output_path(report_path)
+            if _path_identity(report_path) in identities:
+                raise ValueError(f"JSON report collides with an input shard: {report_path}")
+    except (FileNotFoundError, OSError, ValueError) as error:
+        print(f"cannot audit ({error})", file=sys.stderr)
+        return 2
+
     reports: list[ShardReport] = []
-    for raw_path in args.paths:
+    for path in paths:
         try:
             reports.append(
                 audit_shard(
-                    Path(raw_path),
+                    path,
                     thresholds,
                     source_key=args.source_key,
                     target_key=args.target_key,
@@ -338,7 +418,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
         except (FileNotFoundError, OSError, ValueError) as error:
-            print(f"{raw_path}: cannot audit ({error})", file=sys.stderr)
+            print(f"{path}: cannot audit ({error})", file=sys.stderr)
             return 2
 
     for report in reports:
@@ -358,12 +438,16 @@ def main(argv: list[str] | None = None) -> int:
             if count > 1:
                 print(f"      quoted   x{count:<6,} {text!r}")
 
-    if args.json_out:
+    if report_path is not None:
         payload = [asdict(report) for report in reports]
-        Path(args.json_out).write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        try:
+            _atomic_write_text(
+                report_path,
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            )
+        except OSError as error:
+            print(f"cannot write JSON report ({error})", file=sys.stderr)
+            return 2
 
     return 0 if all(report.passed for report in reports) else 1
 
