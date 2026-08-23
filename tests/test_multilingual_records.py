@@ -125,6 +125,13 @@ def test_language_pair_normalization_removes_reverse_duplicates() -> None:
     assert languages_from_pairs(pairs) == ("ko", "ja", "en", "ru")
 
 
+def test_language_pair_normalization_requires_one_explicit_shape() -> None:
+    with pytest.raises(ValueError, match="explicit language_pair"):
+        normalize_language_pairs()
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        normalize_language_pairs(("sw", "ar"), (("sw", "ar"),))
+
+
 def test_language_pair_normalization_canonicalizes_script_and_region_tags() -> None:
     assert normalize_language_pairs(
         language_pairs=(("pt-br", "ZH-hant"), ("sr-latn-rs", "de"))
@@ -230,6 +237,48 @@ def test_multilingual_inference_requires_and_validates_source_language() -> None
         raise AssertionError("multilingual source omission must fail")
 
 
+def test_prepare_canonicalizes_source_only_languages_before_direction_gating(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StubTokenizer:
+        languages = ("pt-BR", "zh-Hant")
+
+        def __init__(self, _model_path: str | Path):
+            pass
+
+        @staticmethod
+        def encode(text: str) -> list[int]:
+            return [ord(character) for character in text]
+
+    monkeypatch.setattr("sion_translate.data.prepare.SionTokenizer", StubTokenizer)
+    tokenizer_path = tmp_path / "tokenizer.model"
+    tokenizer_path.write_bytes(b"stub tokenizer")
+    source = tmp_path / "parallel.jsonl"
+    source.write_text(
+        json.dumps({"PT-br": "Olá.", "zh-hant": "您好。"}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    dataset_dir = tmp_path / "dataset"
+
+    prepare_dataset(
+        [str(source)],
+        tokenizer_path,
+        dataset_dir,
+        language_pairs=(("pt-br", "zh-hant"),),
+        source_only_languages=("PT-br",),
+        validation_fraction=0.0,
+        test_fraction=0.0,
+        filter_quality=False,
+        dedup_backend="memory",
+        num_workers=1,
+    )
+
+    manifest = json.loads((dataset_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["source_only_languages"] == ["pt-BR"]
+    assert manifest["translation_directions"] == [["pt-BR", "zh-Hant"]]
+
+
 def test_multilingual_tokenizer_reads_heterogeneous_rows(tmp_path: Path) -> None:
     source = tmp_path / "mixed.jsonl"
     rows = []
@@ -321,6 +370,7 @@ def test_prepare_rejects_tokenizer_missing_configured_languages(tmp_path: Path) 
         vocab_size=512,
         input_sentence_size=1000,
         seed_sentencepiece_size=1000,
+        language_pair=("ko", "ja"),
         num_workers=1,
         num_threads=1,
     )

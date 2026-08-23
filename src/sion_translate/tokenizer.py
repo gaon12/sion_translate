@@ -53,7 +53,7 @@ from sion_translate.synthetic import (
 )
 
 
-DEFAULT_LANGUAGE_PAIR = ("ko", "ja")
+LEGACY_LANGUAGE_PAIR = ("ko", "ja")
 TOKENIZER_METADATA_FILENAME = "tokenizer_metadata.json"
 TOKENIZER_METADATA_VERSION = 2
 SENTENCEPIECE_MULTITHREADED_TRAINING_REGRESSION = "0.2.2"
@@ -89,7 +89,7 @@ REASONING_TRACE_SYMBOLS = [
 
 
 def control_symbols(
-    languages: Sequence[str] = DEFAULT_LANGUAGE_PAIR,
+    languages: Sequence[str],
     *,
     denoise_languages: Sequence[str] | None = None,
     reasoning_languages: Sequence[str] = (),
@@ -122,7 +122,7 @@ def control_symbols(
 
 
 # 하위 호환용 별칭 (기존 ko-ja 토크나이저 검증 경로에서 사용)
-BASE_CONTROL_SYMBOLS = control_symbols(DEFAULT_LANGUAGE_PAIR)
+BASE_CONTROL_SYMBOLS = control_symbols(LEGACY_LANGUAGE_PAIR)
 
 SCRIPT_SPECIAL = 0
 SCRIPT_HANGUL = 1
@@ -410,7 +410,7 @@ def iter_parallel_text(
     *,
     validation_fraction: float = 0.005,
     test_fraction: float = 0.005,
-    language_pair: Sequence[str] = DEFAULT_LANGUAGE_PAIR,
+    language_pair: Sequence[str] | None = None,
     language_pairs: Sequence[Sequence[str]] | None = None,
     translation_directions: Sequence[Sequence[str]] | None = None,
     approximate_split: bool = False,
@@ -440,7 +440,7 @@ def iter_parallel_text_with_languages(
     *,
     validation_fraction: float = 0.005,
     test_fraction: float = 0.005,
-    language_pair: Sequence[str] = DEFAULT_LANGUAGE_PAIR,
+    language_pair: Sequence[str] | None = None,
     language_pairs: Sequence[Sequence[str]] | None = None,
     translation_directions: Sequence[Sequence[str]] | None = None,
     approximate_split: bool = False,
@@ -1020,7 +1020,7 @@ def train_tokenizer(
     required_character_min_occurrences: int = 25,
     validation_fraction: float = 0.005,
     test_fraction: float = 0.005,
-    language_pair: Sequence[str] = DEFAULT_LANGUAGE_PAIR,
+    language_pair: Sequence[str] | None = None,
     language_pairs: Sequence[Sequence[str]] | None = None,
     translation_directions: Sequence[Sequence[str]] | None = None,
     approximate_split: bool = False,
@@ -1064,9 +1064,6 @@ def train_tokenizer(
             "required_character_min_occurrences=0 to opt out of the frequency floor."
         )
 
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    model_prefix = output_dir / "sion"
     normalized_pairs = normalize_language_pairs(language_pair, language_pairs)
     normalized_directions = normalize_translation_directions(
         normalized_pairs,
@@ -1090,6 +1087,10 @@ def train_tokenizer(
             "reasoning_languages must also be foundation/translation languages; "
             f"unknown {unknown_reasoning_languages}"
         )
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    model_prefix = output_dir / "sion"
     symbols = (
         control_symbols(
             languages,

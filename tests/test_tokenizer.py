@@ -102,8 +102,15 @@ def test_iter_parallel_text_excludes_holdouts_and_invalid_rows(tmp_path: Path) -
         encoding="utf-8",
     )
 
-    assert list(iter_parallel_text([source])) == list(train_pair)
-    assert list(iter_parallel_text([source], validation_fraction=0.0, test_fraction=0.0)) == [
+    assert list(iter_parallel_text([source], language_pair=("ko", "ja"))) == list(train_pair)
+    assert list(
+        iter_parallel_text(
+            [source],
+            validation_fraction=0.0,
+            test_fraction=0.0,
+            language_pair=("ko", "ja"),
+        )
+    ) == [
         *train_pair,
         *validation_pair,
         *test_pair,
@@ -196,6 +203,19 @@ def test_corpus_counts_report_both_dimensions_from_one_pass() -> None:
     assert counts.sentences == 1
 
 
+def test_train_tokenizer_rejects_missing_language_graph_without_output_state(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "parallel.jsonl"
+    source.write_text('{"de": "Hallo", "fr": "Bonjour"}\n', encoding="utf-8")
+    output_dir = tmp_path / "tokenizer"
+
+    with pytest.raises(ValueError, match="explicit language_pair or language_pairs graph"):
+        train_tokenizer([str(source)], output_dir)
+
+    assert not output_dir.exists()
+
+
 def test_the_block_elements_are_reserved_and_never_required() -> None:
     """SentencePiece 는 블록 문자가 든 **문장을 통째로 버립니다.**
 
@@ -220,6 +240,7 @@ def test_train_tokenizer_splits_digits_by_default(tmp_path: Path) -> None:
         vocab_size=600,
         validation_fraction=0.0,
         test_fraction=0.0,
+        language_pair=("ko", "ja"),
         num_workers=1,
         num_threads=1,
     )
@@ -304,6 +325,7 @@ def test_train_tokenizer_can_disable_digit_splitting(tmp_path: Path) -> None:
         vocab_size=600,
         validation_fraction=0.0,
         test_fraction=0.0,
+        language_pair=("ko", "ja"),
         num_workers=1,
         num_threads=1,
         split_digits=False,
@@ -348,7 +370,7 @@ def test_tokenizer_guard_excludes_target_owned_by_holdout(tmp_path: Path) -> Non
         encoding="utf-8",
     )
 
-    assert list(iter_parallel_text([source])) == []
+    assert list(iter_parallel_text([source], language_pair=("ko", "ja"))) == []
 
 
 class _StubProcessor:

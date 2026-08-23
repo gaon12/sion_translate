@@ -36,14 +36,19 @@ def _validate_language(language: object) -> str:
 
 
 def normalize_language_pairs(
-    language_pair: Sequence[str] = ("ko", "ja"),
+    language_pair: Sequence[str] | None = None,
     language_pairs: Sequence[Sequence[str]] | None = None,
 ) -> tuple[tuple[str, str], ...]:
     """Validate configured pairs and remove duplicate reverse edges."""
 
-    raw_pairs: Sequence[Sequence[str]] = (
-        language_pairs if language_pairs is not None else (language_pair,)
-    )
+    if language_pair is not None and language_pairs is not None:
+        raise ValueError("language_pair and language_pairs are mutually exclusive")
+    if language_pairs is None:
+        if language_pair is None:
+            raise ValueError("an explicit language_pair or language_pairs graph is required")
+        raw_pairs: Sequence[Sequence[str]] = (language_pair,)
+    else:
+        raw_pairs = language_pairs
     if not raw_pairs:
         raise ValueError("at least one language pair is required")
     normalized: list[tuple[str, str]] = []

@@ -152,6 +152,7 @@ def test_the_vocab_floor_is_reported_before_the_corpus_scan(tmp_path, monkeypatc
             tmp_path / "out",
             vocab_size=300,
             required_character_min_occurrences=1,
+            language_pair=("ko", "ja"),
         )
     assert not trained, "training must not start once the floor is known to fail"
 
@@ -193,6 +194,7 @@ def test_sentencepiece_022_multithreaded_regression_is_refused_before_scanning(
             [str(_tiny_shard(tmp_path))],
             tmp_path / "out",
             vocab_size=600,
+            language_pair=("ko", "ja"),
             num_threads=4,
         )
     assert not scanned
@@ -233,6 +235,7 @@ def test_full_coverage_is_rejected_because_it_disables_the_other_two_mechanisms(
             tmp_path / "out",
             vocab_size=300,
             character_coverage=1.0,
+            language_pair=("ko", "ja"),
         )
     assert not trained, "training must not start on a self-defeating coverage setting"
 
@@ -259,6 +262,7 @@ def test_full_coverage_is_allowed_when_the_frequency_floor_is_opted_out(
         vocab_size=300,
         character_coverage=1.0,
         required_character_min_occurrences=0,
+        language_pair=("ko", "ja"),
     )
     assert trained and trained[0]["character_coverage"] == 1.0
     assert trained[0]["required_chars"] == ""
@@ -283,6 +287,7 @@ def test_the_default_coverage_leaves_a_tail_for_byte_fallback(
         [str(_tiny_shard(tmp_path))],
         tmp_path / "out",
         vocab_size=600,
+        language_pair=("ko", "ja"),
     )
     assert trained
     assert trained[0]["character_coverage"] < 1.0
@@ -299,4 +304,5 @@ def test_coverage_outside_the_unit_interval_is_rejected(tmp_path, coverage) -> N
             tmp_path / "out",
             vocab_size=300,
             character_coverage=coverage,
+            language_pair=("ko", "ja"),
         )

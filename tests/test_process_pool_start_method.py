@@ -44,6 +44,7 @@ def test_tokenizer_preprocessing_pool_uses_spawn(
                 [source],
                 validation_fraction=0.0,
                 test_fraction=0.0,
+                language_pair=("ko", "ja"),
                 num_workers=2,
             )
         )
@@ -81,6 +82,7 @@ def test_dataset_preparation_pool_uses_spawn_and_cleans_failed_staging(
             [str(source)],
             tokenizer,
             output,
+            language_pair=("ko", "ja"),
             num_workers=2,
         )
 

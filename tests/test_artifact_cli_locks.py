@@ -56,6 +56,9 @@ def test_prepare_cli_holds_tokenizer_and_dataset_parent_locks(
             str(tokenizer),
             "--output-dir",
             str(output),
+            "--language-pair",
+            "ko",
+            "ja",
         ],
     )
 
@@ -97,6 +100,9 @@ def test_tokenizer_cli_holds_the_canonical_output_lock(
             str(tmp_path / "raw.jsonl"),
             "--output-dir",
             str(output),
+            "--language-pair",
+            "ko",
+            "ja",
         ],
     )
 

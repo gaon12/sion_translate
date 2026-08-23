@@ -48,19 +48,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--validation-fraction", type=float, default=0.005)
     parser.add_argument("--test-fraction", type=float, default=0.005)
-    parser.add_argument(
+    language_group = parser.add_mutually_exclusive_group(required=True)
+    language_group.add_argument(
         "--language-pair",
         nargs=2,
-        default=["ko", "ja"],
         metavar=("LANG_A", "LANG_B"),
-        help="JSONL 키 이름 (기본: ko ja)",
+        help="하나의 물리적 병렬 언어쌍",
     )
-    parser.add_argument(
+    language_group.add_argument(
         "--language-pairs",
         nargs=2,
         action="append",
         metavar=("LANG_A", "LANG_B"),
-        help="여러 언어쌍을 학습할 때 반복 지정",
+        help="여러 물리적 병렬 언어쌍을 학습할 때 반복 지정",
     )
     parser.add_argument(
         "--translation-direction",

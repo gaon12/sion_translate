@@ -149,6 +149,7 @@ def test_prepare_round_trips_optional_metadata_sidecars(
         test_fraction=0.0,
         filter_quality=False,
         dedup_backend="memory",
+        language_pair=("ko", "ja"),
         num_workers=1,
     )
 

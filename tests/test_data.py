@@ -142,6 +142,7 @@ def _prepare_atomic_dataset(
         test_fraction=0.0,
         filter_quality=False,
         dedup_backend="memory",
+        language_pair=("ko", "ja"),
         synthetic_sampling_weight=0.25,
         num_workers=1,
         expected_fingerprint=expected_fingerprint,
@@ -198,6 +199,7 @@ def test_tokenizer_prepare_dataset_and_collate(tmp_path: Path) -> None:
         vocab_size=512,
         input_sentence_size=1000,
         seed_sentencepiece_size=1000,
+        language_pair=("ko", "ja"),
     )
     tokenizer = SionTokenizer(model_path)
     assert len(tokenizer) >= 300
@@ -211,6 +213,7 @@ def test_tokenizer_prepare_dataset_and_collate(tmp_path: Path) -> None:
         shard_size=17,
         validation_fraction=0.1,
         test_fraction=0.1,
+        language_pair=("ko", "ja"),
     )
     assert stats.valid_pairs == 80
     assert stats.duplicates == 1
@@ -264,6 +267,7 @@ def test_tokenizer_prepare_dataset_and_collate(tmp_path: Path) -> None:
             dataset_dir,
             validation_fraction=0.1,
             test_fraction=0.1,
+            language_pair=("ko", "ja"),
         )
 
 
@@ -276,6 +280,7 @@ def test_parallel_preparation_matches_single_worker(tmp_path: Path) -> None:
         vocab_size=512,
         input_sentence_size=1000,
         seed_sentencepiece_size=1000,
+        language_pair=("ko", "ja"),
         num_workers=1,
         num_threads=1,
     )
@@ -285,6 +290,7 @@ def test_parallel_preparation_matches_single_worker(tmp_path: Path) -> None:
         tmp_path / "single",
         validation_fraction=0.1,
         test_fraction=0.1,
+        language_pair=("ko", "ja"),
         num_workers=1,
     )
     parallel = prepare_dataset(
@@ -293,6 +299,7 @@ def test_parallel_preparation_matches_single_worker(tmp_path: Path) -> None:
         tmp_path / "parallel",
         validation_fraction=0.1,
         test_fraction=0.1,
+        language_pair=("ko", "ja"),
         num_workers=2,
     )
     assert single == parallel
@@ -660,15 +667,25 @@ def test_prepare_refuses_a_file_at_an_orphan_staging_path(
 
 def test_pair_quality_rejects_obvious_damage() -> None:
     policy = QualityPolicy(max_length_ratio=3.0)
-    clean = assess_pair("오늘 날씨가 좋습니다.", "今日は天気が良いです。", policy)
+    clean = assess_pair(
+        "오늘 날씨가 좋습니다.",
+        "今日は天気が良いです。",
+        policy,
+        languages=("ko", "ja"),
+    )
     assert clean.accepted
     assert clean.score == 100
 
-    identical = assess_pair("OpenAI 123", "OpenAI 123", policy)
+    identical = assess_pair("OpenAI 123", "OpenAI 123", policy, languages=("ko", "ja"))
     assert not identical.accepted
     assert "identical_text" in identical.rejection_reasons
 
-    wrong_scripts = assess_pair("This is not Korean", "이것은 일본어가 아니다", policy)
+    wrong_scripts = assess_pair(
+        "This is not Korean",
+        "이것은 일본어가 아니다",
+        policy,
+        languages=("ko", "ja"),
+    )
     assert not wrong_scripts.accepted
     assert "ko_script_mismatch" in wrong_scripts.rejection_reasons
     assert "ja_script_mismatch" in wrong_scripts.rejection_reasons
@@ -677,6 +694,7 @@ def test_pair_quality_rejects_obvious_damage() -> None:
         "오류문자열오류문자열오류문자열오류문자열오류문자열",
         "エラー文字列エラー文字列エラー文字列エラー文字列エラー文字列",
         policy,
+        languages=("ko", "ja"),
     )
     assert not repeated.accepted
     assert "excessive_repetition" in repeated.rejection_reasons
@@ -715,17 +733,17 @@ def test_unprofiled_languages_are_unchecked_instead_of_scored_as_perfect() -> No
 
 
 def test_expressive_quality_profile_only_waives_short_and_repeated_reactions() -> None:
-    short = assess_pair("아", "あ")
+    short = assess_pair("아", "あ", languages=("ko", "ja"))
     assert short.rejection_reasons == ("too_short",)
     profiled_short = apply_record_quality_profile(short, "expressive_v1")
     assert profiled_short.accepted
     assert profiled_short.score == 100
 
-    repeated = assess_pair("아" * 12, "あ" * 12)
+    repeated = assess_pair("아" * 12, "あ" * 12, languages=("ko", "ja"))
     assert repeated.rejection_reasons == ("excessive_repetition",)
     assert apply_record_quality_profile(repeated, "expressive_v1").accepted
 
-    unsafe = assess_pair("아\u0001", "あ")
+    unsafe = assess_pair("아\u0001", "あ", languages=("ko", "ja"))
     profiled_unsafe = apply_record_quality_profile(unsafe, "expressive_v1")
     assert not profiled_unsafe.accepted
     assert profiled_unsafe.rejection_reasons == ("control_characters",)

@@ -25,7 +25,7 @@ from sion_translate.fingerprint import (
     FileFingerprint,
     file_sha256,
 )
-from sion_translate.language_tags import parse_language_tag
+from sion_translate.language_tags import canonicalize_language_tags, parse_language_tag
 from sion_translate.performance import bounded_ordered_map, build_cpu_plan
 from sion_translate.splitting import (
     TargetSplitGuard,
@@ -1507,7 +1507,7 @@ def prepare_dataset(
     prevent_target_leakage: bool = True,
     approximate_split: bool = False,
     dedup_backend: str = "sqlite",
-    language_pair: Sequence[str] = ("ko", "ja"),
+    language_pair: Sequence[str] | None = None,
     source_only_languages: Sequence[str] = (),
     language_pairs: Sequence[Sequence[str]] | None = None,
     translation_directions: Sequence[Sequence[str]] | None = None,
@@ -1545,7 +1545,11 @@ def prepare_dataset(
             )
     languages = languages_from_pairs(normalized_pairs)
     language_to_id = {language: index for index, language in enumerate(languages)}
-    source_only = tuple(dict.fromkeys(str(language) for language in source_only_languages))
+    source_only = canonicalize_language_tags(
+        list(source_only_languages),
+        field="source_only_languages",
+        reject_duplicates=False,
+    )
     unknown_source_only = sorted(set(source_only) - set(languages))
     if unknown_source_only:
         raise ValueError(

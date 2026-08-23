@@ -244,6 +244,7 @@ def test_tokenizer_honors_the_same_approximate_split_policy_as_preparation(
     common = {
         "validation_fraction": VALIDATION_FRACTION,
         "test_fraction": TEST_FRACTION,
+        "language_pair": ("ko", "ja"),
         "num_workers": 1,
     }
     assert list(iter_parallel_text([source], approximate_split=False, **common)) == []
@@ -269,6 +270,7 @@ def test_tokenizer_keeps_configured_synthetic_files_train_only(tmp_path: Path) -
             [source],
             validation_fraction=VALIDATION_FRACTION,
             test_fraction=TEST_FRACTION,
+            language_pair=("ko", "ja"),
             train_only_prefixes=("generated_",),
             num_workers=1,
         )
@@ -314,7 +316,10 @@ def test_tokenizer_applies_source_only_swapping_before_split_assignment(
 
 def test_tokenizer_cli_uses_safe_partition_defaults() -> None:
     parser = tokenizer_argument_parser()
-    required = ["--input", "data/*.jsonl", "--output-dir", "artifacts/tokenizer"]
+    base = ["--input", "data/*.jsonl", "--output-dir", "artifacts/tokenizer"]
+    with pytest.raises(SystemExit):
+        parser.parse_args(base)
+    required = [*base, "--language-pair", "ko", "ja"]
     safe = parser.parse_args(required)
     exact = parser.parse_args([*required, "--exact-split"])
 
