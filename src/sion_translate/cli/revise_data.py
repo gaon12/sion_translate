@@ -20,20 +20,30 @@ import argparse
 import json
 from pathlib import Path
 
-from sion_translate.concat import read_pairs
+from sion_translate.concat import read_records
 from sion_translate.console import configure_stdio
-from sion_translate.data.prepare import DEFAULT_TRAIN_ONLY_PREFIXES, expand_inputs
+from sion_translate.data.prepare import DEFAULT_TRAIN_ONLY_PREFIXES
+from sion_translate.language_tags import canonicalize_language_pair
 from sion_translate.revision import (
     DEFAULT_CORRUPTIONS,
+    RevisionExample,
     RevisionStats,
     build_revision_examples,
     serialize_revision_input,
     write_revision_examples,
 )
+from sion_translate.tokenizer import expand_inputs
 
 
 # 이 비율을 넘으면 손상이 대부분 통하지 않았다는 뜻이므로 경고합니다.
 UNCHANGED_WARNING_RATIO = 0.40
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -42,7 +52,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--input", nargs="+", required=True, help="JSONL 파일 또는 glob 패턴")
     parser.add_argument("--output", required=True, help="산출 JSONL 경로")
-    parser.add_argument("--limit", type=int, default=None, help="사용할 최대 쌍 수 (기본: 전체)")
+    parser.add_argument(
+        "--limit",
+        type=_positive_int,
+        default=None,
+        help="사용할 최대 쌍 수 (기본: 전체)",
+    )
     parser.add_argument(
         "--drafts",
         help=(
@@ -61,9 +76,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--language-pair",
         nargs=2,
-        default=["ko", "ja"],
+        required=True,
         metavar=("LANG_A", "LANG_B"),
-        help="JSONL 키 이름 (기본: ko ja)",
+        help="JSONL 언어 키와 revision 방향 (SOURCE TARGET)",
     )
     parser.add_argument("--seed", type=int, default=20260726)
     return parser
@@ -91,11 +106,27 @@ def main() -> None:
     paths = expand_inputs(args.input)
     if not paths:
         raise SystemExit(f"입력 JSONL 을 찾지 못했습니다: {args.input}")
-    pairs = list(read_pairs(paths, args.language_pair))
+    language_pair = canonicalize_language_pair(
+        args.language_pair,
+        field="revision CLI language_pair",
+    )
+    records = list(read_records(paths, language_pair))
     if args.limit is not None:
-        pairs = pairs[: args.limit]
-    if not pairs:
+        records = records[: args.limit]
+    if not records:
         raise SystemExit("읽을 수 있는 번역쌍이 없습니다")
+    incompatible = [
+        record.source_identifier
+        for record in records
+        if record.metadata.get("training_direction") is not None
+        and record.metadata.get("training_direction") != list(language_pair)
+    ]
+    if incompatible:
+        raise SystemExit(
+            "입력 training_direction이 요청한 revision 방향과 다릅니다: "
+            f"requested={language_pair!r}, first={incompatible[0]}"
+        )
+    pairs = [(record.text_a, record.text_b) for record in records]
 
     if args.drafts:
         drafts = _load_drafts(args.drafts)
@@ -104,20 +135,34 @@ def main() -> None:
                 f"초안 {len(drafts)}개와 번역쌍 {len(pairs)}개의 수가 다릅니다 — "
                 "같은 순서, 같은 개수여야 합니다"
             )
-        examples = [
+        raw_examples = [
             (serialize_revision_input(source, draft), target)
             for (source, target), draft in zip(pairs, drafts, strict=True)
         ]
         unchanged = sum(
             1 for (_, target), draft in zip(pairs, drafts, strict=True) if draft == target
         )
-        stats = RevisionStats(len(examples), {"model_draft": len(examples)}, unchanged)
+        stats = RevisionStats(
+            len(raw_examples),
+            {"model_draft": len(raw_examples)},
+            unchanged,
+        )
     else:
         weights = {kind: getattr(args, f"weight_{kind}") for kind in DEFAULT_CORRUPTIONS}
         weights = {kind: value for kind, value in weights.items() if value > 0}
-        examples, stats = build_revision_examples(pairs, weights=weights, seed=args.seed)
+        raw_examples, stats = build_revision_examples(pairs, weights=weights, seed=args.seed)
 
-    written = write_revision_examples(args.output, examples, args.language_pair)
+    examples = [
+        RevisionExample(
+            serialized_source=serialized,
+            target=target,
+            metadata=record.metadata,
+            source_identifier=record.source_identifier,
+        )
+        for (serialized, target), record in zip(raw_examples, records, strict=True)
+    ]
+
+    written = write_revision_examples(args.output, examples, language_pair)
     output = Path(args.output)
     if not output.name.startswith(DEFAULT_TRAIN_ONLY_PREFIXES):
         print(

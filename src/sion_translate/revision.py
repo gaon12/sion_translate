@@ -28,13 +28,19 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 import json
+import os
 import random
 import re
+import tempfile
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Mapping, Sequence, TypeAlias
+
+from sion_translate.data.record_metadata import RECORD_METADATA_FIELDS
+from sion_translate.language_tags import canonicalize_language_pair
 
 DRAFT_SEPARATOR = "<draft>"
 
@@ -68,6 +74,19 @@ class RevisionStats:
             "unchanged_drafts": self.unchanged,
             "by_corruption": dict(sorted(self.by_corruption.items())),
         }
+
+
+@dataclass(frozen=True, slots=True)
+class RevisionExample:
+    """A revision target with authenticated source-row annotations."""
+
+    serialized_source: str
+    target: str
+    metadata: Mapping[str, object]
+    source_identifier: str | None = None
+
+
+RevisionOutput: TypeAlias = tuple[str, str] | RevisionExample
 
 
 def serialize_revision_input(source: str, draft: str) -> str:
@@ -207,20 +226,82 @@ def build_revision_examples(
 
 def write_revision_examples(
     output_path: str | Path,
-    examples: Iterable[tuple[str, str]],
-    language_pair: Sequence[str] = ("ko", "ja"),
+    examples: Iterable[RevisionOutput],
+    language_pair: Sequence[str],
 ) -> int:
     """``prepare_dataset`` 가 읽는 형식으로 씁니다.
 
     ``원문 <draft> 초안`` 이 그대로 원문 자리에 들어가므로, 데이터 파이프라인은
     이것을 평범한 번역쌍으로 처리합니다.
     """
-    key_a, key_b = language_pair
+    key_a, key_b = canonicalize_language_pair(
+        language_pair,
+        field="revision language_pair",
+    )
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     written = 0
-    with output_path.open("w", encoding="utf-8", newline="\n") as handle:
-        for serialized, target in examples:
-            handle.write(json.dumps({key_a: serialized, key_b: target}, ensure_ascii=False) + "\n")
-            written += 1
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            newline="\n",
+            dir=output_path.parent,
+            prefix=f".{output_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            for example in examples:
+                if isinstance(example, RevisionExample):
+                    serialized, target = example.serialized_source, example.target
+                    metadata = dict(example.metadata)
+                    raw_direction = metadata.get("training_direction")
+                    if raw_direction is not None:
+                        input_direction = canonicalize_language_pair(
+                            raw_direction,
+                            field="revision input training_direction",
+                        )
+                        if input_direction != (key_a, key_b):
+                            location = (
+                                f" at {example.source_identifier}"
+                                if example.source_identifier is not None
+                                else ""
+                            )
+                            raise ValueError(
+                                "revision input training_direction does not match the requested "
+                                f"revision direction{location}: input={input_direction!r}, "
+                                f"requested={(key_a, key_b)!r}"
+                            )
+                else:
+                    serialized, target = example
+                    metadata = {}
+                row: dict[str, object] = {
+                    key_a: serialized,
+                    key_b: target,
+                    "synthetic": True,
+                    "training_direction": [key_a, key_b],
+                }
+                if isinstance(example, RevisionExample):
+                    for field in RECORD_METADATA_FIELDS:
+                        if field not in {"provenance", "training_direction"} and field in metadata:
+                            row[field] = deepcopy(metadata[field])
+                    provenance_input: dict[str, object] = {}
+                    if example.source_identifier is not None:
+                        provenance_input["source"] = example.source_identifier
+                    if "provenance" in metadata:
+                        provenance_input["provenance"] = deepcopy(metadata["provenance"])
+                    if provenance_input:
+                        row["provenance"] = {
+                            "transformation": "revision",
+                            "input": provenance_input,
+                        }
+                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+                written += 1
+        os.replace(temporary_path, output_path)
+    except BaseException:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+        raise
     return written

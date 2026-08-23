@@ -12,6 +12,7 @@ from sion_translate.evaluation import has_excessive_repetition, numeric_tokens
 from sion_translate.revision import (
     DEFAULT_CORRUPTIONS,
     DRAFT_SEPARATOR,
+    RevisionExample,
     build_revision_examples,
     corrupt_target,
     parse_revision_input,
@@ -154,7 +155,86 @@ def test_written_file_is_a_plain_translation_pair(tmp_path: Path) -> None:
     """데이터 파이프라인을 고치지 않고 쓸 수 있어야 한다."""
     examples, _ = build_revision_examples(_pairs(5), seed=5)
     output = tmp_path / "revise_synthetic.jsonl"
-    assert write_revision_examples(output, examples) == 5
+    assert write_revision_examples(output, examples, ("ko", "ja")) == 5
     rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
-    assert all(set(row) == {"ko", "ja"} for row in rows)
+    assert all(set(row) == {"ko", "ja", "synthetic", "training_direction"} for row in rows)
     assert all(DRAFT_SEPARATOR in row["ko"] for row in rows)
+    assert all(row["synthetic"] is True for row in rows)
+    assert all(row["training_direction"] == ["ko", "ja"] for row in rows)
+
+
+def test_written_revision_direction_and_keys_are_canonical_bcp47(tmp_path: Path) -> None:
+    output = tmp_path / "revise_variants.jsonl"
+    assert (
+        write_revision_examples(
+            output,
+            [("fonte <draft> rascunho", "譯文")],
+            ("PT-br", "ZH-hant"),
+        )
+        == 1
+    )
+
+    row = json.loads(output.read_text(encoding="utf-8"))
+    assert row == {
+        "pt-BR": "fonte <draft> rascunho",
+        "zh-Hant": "譯文",
+        "synthetic": True,
+        "training_direction": ["pt-BR", "zh-Hant"],
+    }
+
+
+def test_revision_write_failure_preserves_existing_output(tmp_path: Path) -> None:
+    output = tmp_path / "revise_atomic.jsonl"
+    output.write_text("existing output\n", encoding="utf-8")
+
+    def failing_examples():
+        yield "source <draft> draft", "target"
+        raise RuntimeError("injected failure")
+
+    with pytest.raises(RuntimeError, match="injected failure"):
+        write_revision_examples(output, failing_examples(), ("sw", "ar"))
+
+    assert output.read_text(encoding="utf-8") == "existing output\n"
+    assert list(tmp_path.glob(".revise_atomic.jsonl.*.tmp")) == []
+
+
+def test_revision_rejects_reverse_scoped_input_without_replacing_output(tmp_path: Path) -> None:
+    output = tmp_path / "revise_direction.jsonl"
+    output.write_text("existing output\n", encoding="utf-8")
+    example = RevisionExample(
+        "source <draft> draft",
+        "target",
+        {"training_direction": ["ar", "sw"]},
+        source_identifier="bt_rows.jsonl:7",
+    )
+
+    with pytest.raises(ValueError, match="does not match the requested revision direction"):
+        write_revision_examples(output, [example], ("sw", "ar"))
+
+    assert output.read_text(encoding="utf-8") == "existing output\n"
+
+
+def test_revision_preserves_input_provenance_for_matching_direction(tmp_path: Path) -> None:
+    output = tmp_path / "revise_provenance.jsonl"
+    example = RevisionExample(
+        "source <draft> draft",
+        "target",
+        {
+            "training_direction": ["PT-br", "ZH-hant"],
+            "domain": "literary",
+            "provenance": {"dataset": "fixture", "row": 9},
+        },
+        source_identifier="fixture.jsonl:9",
+    )
+
+    assert write_revision_examples(output, [example], ("pt-BR", "zh-Hant")) == 1
+    row = json.loads(output.read_text(encoding="utf-8"))
+    assert row["training_direction"] == ["pt-BR", "zh-Hant"]
+    assert row["domain"] == "literary"
+    assert row["provenance"] == {
+        "transformation": "revision",
+        "input": {
+            "source": "fixture.jsonl:9",
+            "provenance": {"dataset": "fixture", "row": 9},
+        },
+    }
