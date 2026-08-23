@@ -158,3 +158,61 @@ def test_audit_cli_writes_json_report(tmp_path: Path) -> None:
     assert written["global"]["rows"] == 14
     assert written["parameters"]["sample_size"] == 3
     assert written["parameters"]["max_length_ratio"] == 4.0
+    assert written["parameters"]["language_pair"] == ["ko", "ja"]
+
+
+def test_audit_supports_arbitrary_canonical_language_pairs(tmp_path: Path) -> None:
+    source = tmp_path / "multilingual.jsonl"
+    _write_rows(
+        source,
+        [
+            {"PT-br": "Olá, mundo inteiro.", "zh-hant": "這是一個完整的句子。"},
+            {
+                "pt-BR": "Primeiro valor.",
+                "PT-br": "Segundo valor.",
+                "zh-Hant": "另一個句子。",
+            },
+            {"pt-BR": "Somente a origem."},
+            {"pt-BR": "Texto normal.", "zh-Hant": 123},
+        ],
+    )
+    output = tmp_path / "arbitrary-audit.json"
+
+    audit_main(
+        [
+            "--input",
+            str(source),
+            "--output",
+            str(output),
+            "--language-pair",
+            "PT-br",
+            "zh-hant",
+            "--hll-precision",
+            "8",
+            "--script-min-chars",
+            "2",
+            "--max-issue-examples",
+            "10",
+        ]
+    )
+
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert report["parameters"]["language_pair"] == ["pt-BR", "zh-Hant"]
+    assert report["global"]["rows"] == 4
+    assert report["global"]["valid"] == 1
+    assert report["global"]["invalid"] == 1
+    assert report["global"]["missing"] == 1
+    assert report["global"]["non_string"] == 1
+    assert report["global"]["invalid_breakdown"] == {"duplicate_language_key": 1}
+    assert set(report["global"]["character_lengths"]) == {
+        "pt-BR",
+        "zh-Hant",
+        "pair",
+    }
+    assert "pt-BR_script_mismatch" in report["global"]["signals"]
+    assert "zh-Hant_script_mismatch" in report["global"]["signals"]
+    assert "ko_script_mismatch" not in report["global"]["signals"]
+    examples = report["global"]["issue_examples"]
+    assert examples[0]["issues"] == ["duplicate_language_key"]
+    assert "pt-BR_preview" in examples[0]
+    assert "zh-Hant_preview" in examples[0]

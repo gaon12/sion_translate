@@ -11,10 +11,17 @@ from sion_translate.data.audit import audit_dataset
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Stream raw Korean-Japanese JSONL files and report data quality"
+        description="Stream raw parallel JSONL files and report data quality"
     )
     parser.add_argument("--input", nargs="+", required=True, help="JSONL paths or globs")
     parser.add_argument("--output", help="Write the JSON report to this path")
+    parser.add_argument(
+        "--language-pair",
+        nargs=2,
+        default=["ko", "ja"],
+        metavar=("LANG_A", "LANG_B"),
+        help="JSONL language keys to audit (default: ko ja)",
+    )
     parser.add_argument("--max-ratio", type=float, default=5.0)
     parser.add_argument("--sample-size", type=int, default=100_000)
     parser.add_argument("--seed", type=int, default=20260711)
@@ -32,6 +39,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     report = audit_dataset(
         args.input,
+        language_pair=args.language_pair,
         max_length_ratio=args.max_ratio,
         sample_size=args.sample_size,
         seed=args.seed,

@@ -10,7 +10,10 @@ import math
 import random
 from collections import Counter
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Sequence, cast
+
+from sion_translate.language_tags import LanguageTagError, canonicalize_language_pair
+from sion_translate.language_tags import canonicalize_language_tag
 
 from .quality import QualityPolicy, assess_pair, canonical_text, dedup_key
 
@@ -19,8 +22,6 @@ _QUALITY_REJECTION_REASONS = (
     "control_characters",
     "excessive_repetition",
     "identical_text",
-    "ja_script_mismatch",
-    "ko_script_mismatch",
     "length_ratio",
     "too_short",
 )
@@ -112,9 +113,9 @@ class _LengthReservoir:
         self.seen = 0
         self.values: list[tuple[int, int]] = []
 
-    def add(self, ko_length: int, ja_length: int) -> None:
+    def add(self, first_length: int, second_length: int) -> None:
         self.seen += 1
-        value = (ko_length, ja_length)
+        value = (first_length, second_length)
         if len(self.values) < self.size:
             self.values.append(value)
             return
@@ -158,6 +159,7 @@ class _AuditAccumulator:
         hll_precision: int,
         exact_unique_limit: int,
         max_issue_examples: int,
+        language_pair: tuple[str, str],
     ):
         self.bytes = 0
         self.rows = 0
@@ -169,8 +171,8 @@ class _AuditAccumulator:
         self.signals: Counter[str] = Counter()
         self.warning_signals: Counter[str] = Counter()
         self.quality_pass = 0
-        self.ko_total_chars = 0
-        self.ja_total_chars = 0
+        self.language_pair = language_pair
+        self.total_chars = [0, 0]
         self.lengths = _LengthReservoir(sample_size, seed)
         self.hll = HyperLogLog(hll_precision)
         self.exact_unique = _ExactUniqueTracker(exact_unique_limit)
@@ -199,8 +201,8 @@ class _AuditAccumulator:
 
     def record_valid(
         self,
-        ko: str,
-        ja: str,
+        first_text: str,
+        second_text: str,
         pair_digest: bytes,
         rejection_reasons: list[str],
         warning_reasons: list[str],
@@ -208,9 +210,9 @@ class _AuditAccumulator:
     ) -> None:
         self.rows += 1
         self.valid += 1
-        self.ko_total_chars += len(ko)
-        self.ja_total_chars += len(ja)
-        self.lengths.add(len(ko), len(ja))
+        self.total_chars[0] += len(first_text)
+        self.total_chars[1] += len(second_text)
+        self.lengths.add(len(first_text), len(second_text))
         self.hll.add_digest(pair_digest)
         self.exact_unique.add(pair_digest)
         for issue in rejection_reasons:
@@ -222,15 +224,12 @@ class _AuditAccumulator:
         if not rejection_reasons:
             self.quality_pass += 1
 
-    def _length_report(self, side: str) -> dict[str, Any]:
-        if side == "ko":
-            total = self.ko_total_chars
-            sampled = [value[0] for value in self.lengths.values]
-        elif side == "ja":
-            total = self.ja_total_chars
-            sampled = [value[1] for value in self.lengths.values]
+    def _length_report(self, side: int | None) -> dict[str, Any]:
+        if side is not None:
+            total = self.total_chars[side]
+            sampled = [value[side] for value in self.lengths.values]
         else:
-            total = self.ko_total_chars + self.ja_total_chars
+            total = sum(self.total_chars)
             sampled = [sum(value) for value in self.lengths.values]
         return {
             "count": self.valid,
@@ -246,7 +245,10 @@ class _AuditAccumulator:
 
     def report(self) -> dict[str, Any]:
         estimate = max(0, round(self.hll.estimate()))
-        signal_names = sorted(set(_QUALITY_REJECTION_REASONS) | self.signals.keys())
+        script_signals = {f"{language}_script_mismatch" for language in self.language_pair}
+        signal_names = sorted(
+            set(_QUALITY_REJECTION_REASONS) | script_signals | self.signals.keys()
+        )
         warning_names = sorted(set(_QUALITY_WARNING_REASONS) | self.warning_signals.keys())
         return {
             "bytes": self.bytes,
@@ -257,9 +259,9 @@ class _AuditAccumulator:
             "non_string": self.non_string,
             "invalid_breakdown": dict(sorted(self.invalid_reasons.items())),
             "character_lengths": {
-                "ko": self._length_report("ko"),
-                "ja": self._length_report("ja"),
-                "pair": self._length_report("pair"),
+                self.language_pair[0]: self._length_report(0),
+                self.language_pair[1]: self._length_report(1),
+                "pair": self._length_report(None),
             },
             "unique_pairs": {
                 "exact_count": self.exact_unique.count,
@@ -288,18 +290,63 @@ def _stable_file_seed(seed: int, path: Path) -> int:
 
 
 def _pair_assessment(
-    ko: str,
-    ja: str,
+    first_text: str,
+    second_text: str,
     *,
     policy: QualityPolicy,
+    language_pair: tuple[str, str],
 ) -> tuple[list[str], list[str]]:
-    assessment = assess_pair(ko, ja, policy)
-    return list(assessment.rejection_reasons), list(assessment.warning_reasons)
+    assessment = assess_pair(
+        first_text,
+        second_text,
+        policy,
+        languages=language_pair,
+    )
+    reason_aliases = {
+        "ko_script_mismatch": f"{language_pair[0]}_script_mismatch",
+        "ja_script_mismatch": f"{language_pair[1]}_script_mismatch",
+    }
+    return (
+        [reason_aliases.get(reason, reason) for reason in assessment.rejection_reasons],
+        list(assessment.warning_reasons),
+    )
+
+
+def _record_language_candidates(
+    record: dict[object, object],
+    language_pair: tuple[str, str],
+) -> dict[str, list[object]]:
+    configured = set(language_pair)
+    candidates: dict[str, list[object]] = {language: [] for language in language_pair}
+    for raw_key, value in record.items():
+        if not isinstance(raw_key, str):
+            continue
+        try:
+            language = canonicalize_language_tag(raw_key, field="audit record language key")
+        except LanguageTagError:
+            continue
+        if language in configured:
+            candidates[language].append(value)
+    return candidates
+
+
+def _candidate_previews(
+    candidates: dict[str, list[object]],
+    language_pair: tuple[str, str],
+    limit: int,
+) -> dict[str, str]:
+    previews: dict[str, str] = {}
+    for language in language_pair:
+        values = candidates[language]
+        value: object = values[0] if len(values) == 1 else values or None
+        previews[f"{language}_preview"] = _preview(value, limit)
+    return previews
 
 
 def audit_dataset(
     input_patterns: Sequence[str],
     *,
+    language_pair: Sequence[str] = ("ko", "ja"),
     max_length_ratio: float = 5.0,
     sample_size: int = 100_000,
     seed: int = 20260711,
@@ -324,6 +371,10 @@ def audit_dataset(
         raise ValueError("max_issue_examples must be non-negative")
     if issue_preview_chars <= 0:
         raise ValueError("issue_preview_chars must be positive")
+    normalized_pair = canonicalize_language_pair(
+        language_pair,
+        field="audit language_pair",
+    )
     quality_policy = QualityPolicy(
         min_chars_per_side=min_chars_per_side,
         max_length_ratio=max_length_ratio,
@@ -339,6 +390,7 @@ def audit_dataset(
         hll_precision=hll_precision,
         exact_unique_limit=exact_unique_limit,
         max_issue_examples=max_issue_examples,
+        language_pair=normalized_pair,
     )
     file_reports: list[dict[str, Any]] = []
 
@@ -349,6 +401,7 @@ def audit_dataset(
             hll_precision=hll_precision,
             exact_unique_limit=exact_unique_limit,
             max_issue_examples=max_issue_examples,
+            language_pair=normalized_pair,
         )
         file_bytes = path.stat().st_size
         file_stats.bytes = file_bytes
@@ -393,65 +446,93 @@ def audit_dataset(
                     global_stats.record_invalid("invalid_record_type", example)
                     continue
 
-                if "ko" not in record or "ja" not in record:
+                candidates = _record_language_candidates(
+                    cast(dict[object, object], record),
+                    normalized_pair,
+                )
+                previews = _candidate_previews(
+                    candidates,
+                    normalized_pair,
+                    issue_preview_chars,
+                )
+                if any(len(values) > 1 for values in candidates.values()):
+                    example = {
+                        **base_example,
+                        "issues": ["duplicate_language_key"],
+                        **previews,
+                    }
+                    file_stats.record_invalid("duplicate_language_key", example)
+                    global_stats.record_invalid("duplicate_language_key", example)
+                    continue
+                if any(not values for values in candidates.values()):
                     example = {
                         **base_example,
                         "issues": ["missing_text"],
-                        "ko_preview": _preview(record.get("ko"), issue_preview_chars),
-                        "ja_preview": _preview(record.get("ja"), issue_preview_chars),
+                        **previews,
                     }
                     file_stats.record_missing(example)
                     global_stats.record_missing(example)
                     continue
-                if not isinstance(record["ko"], str) or not isinstance(record["ja"], str):
+
+                raw_first = candidates[normalized_pair[0]][0]
+                raw_second = candidates[normalized_pair[1]][0]
+                if not isinstance(raw_first, str) or not isinstance(raw_second, str):
                     example = {
                         **base_example,
                         "issues": ["non_string_text"],
-                        "ko_preview": _preview(record["ko"], issue_preview_chars),
-                        "ja_preview": _preview(record["ja"], issue_preview_chars),
+                        **previews,
                     }
                     file_stats.record_non_string(example)
                     global_stats.record_non_string(example)
                     continue
 
-                ko = canonical_text(record["ko"])
-                ja = canonical_text(record["ja"])
-                if not ko or not ja:
+                first_text = canonical_text(raw_first)
+                second_text = canonical_text(raw_second)
+                normalized_previews = {
+                    f"{normalized_pair[0]}_preview": _preview(
+                        first_text,
+                        issue_preview_chars,
+                    ),
+                    f"{normalized_pair[1]}_preview": _preview(
+                        second_text,
+                        issue_preview_chars,
+                    ),
+                }
+                if not first_text or not second_text:
                     example = {
                         **base_example,
                         "issues": ["missing_text"],
-                        "ko_preview": _preview(ko, issue_preview_chars),
-                        "ja_preview": _preview(ja, issue_preview_chars),
+                        **normalized_previews,
                     }
                     file_stats.record_missing(example)
                     global_stats.record_missing(example)
                     continue
 
-                pair_key = f"{dedup_key(ko)}\0{dedup_key(ja)}".encode("utf-8")
+                pair_key = f"{dedup_key(first_text)}\0{dedup_key(second_text)}".encode("utf-8")
                 pair_digest = hashlib.sha256(pair_key).digest()[:16]
                 rejection_reasons, warning_reasons = _pair_assessment(
-                    ko,
-                    ja,
+                    first_text,
+                    second_text,
                     policy=quality_policy,
+                    language_pair=normalized_pair,
                 )
                 example = {
                     **base_example,
                     "issues": rejection_reasons,
                     "warnings": warning_reasons,
-                    "ko_preview": _preview(ko, issue_preview_chars),
-                    "ja_preview": _preview(ja, issue_preview_chars),
+                    **normalized_previews,
                 }
                 file_stats.record_valid(
-                    ko,
-                    ja,
+                    first_text,
+                    second_text,
                     pair_digest,
                     rejection_reasons,
                     warning_reasons,
                     example,
                 )
                 global_stats.record_valid(
-                    ko,
-                    ja,
+                    first_text,
+                    second_text,
                     pair_digest,
                     rejection_reasons,
                     warning_reasons,
@@ -472,6 +553,7 @@ def audit_dataset(
     return {
         "schema": "sion-raw-dataset-audit-v1",
         "parameters": {
+            "language_pair": list(normalized_pair),
             "max_length_ratio": max_length_ratio,
             "sample_size": sample_size,
             "seed": seed,
