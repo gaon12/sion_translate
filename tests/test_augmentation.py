@@ -17,6 +17,7 @@ from sion_translate.augmentation import (
     augmentation_shard_path,
     build_job_identity,
     count_prepared_direction_pairs,
+    language_pair_slug,
     load_augmentation_registry,
     reconcile_job_identity,
     run_augmentation_job,
@@ -934,3 +935,41 @@ def test_pair_qualified_shards_do_not_collide_or_escape(tmp_path: Path) -> None:
     assert first != second
     assert first.parent.resolve() == tmp_path.resolve()
     assert second.parent.resolve() == tmp_path.resolve()
+
+
+def test_augmentation_identity_canonicalizes_bcp47_aliases(tmp_path: Path) -> None:
+    mono_path = tmp_path / "news.zh-Hant.txt"
+    mono_path.write_text("這是一個真正的單語句子。\n", encoding="utf-8")
+    common = {
+        "synthetic_prefix": "bt_",
+        "input_snapshot": snapshot_file(mono_path),
+        "model_identity": _MODEL_IDENTITY,
+        "generator_tokenizer_sha256": _TOKENIZER_IDENTITY,
+        "num_beams": 2,
+        "max_new_tokens": 64,
+    }
+
+    canonical = build_job_identity(
+        pair=("pt-BR", "zh-Hant"),
+        mono_language="zh-Hant",
+        **common,
+    )
+    alias = build_job_identity(
+        pair=("ZH-hant", "PT-br"),
+        mono_language="zh-hant",
+        **common,
+    )
+
+    assert alias == canonical
+    assert alias.job_id == canonical.job_id
+    assert alias.pair == ("pt-BR", "zh-Hant")
+    assert alias.generation_direction == ("zh-Hant", "pt-BR")
+    assert alias.training_direction == ("pt-BR", "zh-Hant")
+    assert language_pair_slug(("PT-br", "zh-hant")) == language_pair_slug(("zh-Hant", "pt-BR"))
+
+    serialized_alias = canonical.to_dict()
+    serialized_alias["pair"] = ["ZH-hant", "PT-br"]
+    serialized_alias["mono_language"] = "zh-hant"
+    serialized_alias["generation_direction"] = ["zh-hant", "PT-br"]
+    serialized_alias["training_direction"] = ["PT-br", "zh-hant"]
+    assert AugmentationIdentity.from_dict(serialized_alias) == canonical

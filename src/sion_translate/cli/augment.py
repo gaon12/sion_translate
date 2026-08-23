@@ -34,6 +34,11 @@ from sion_translate.config import AppConfig, config_from_raw, load_raw_config
 from sion_translate.console import configure_stdio
 from sion_translate.data.quality import canonical_text
 from sion_translate.inference import Translator, find_exported_model
+from sion_translate.language_tags import (
+    LanguageTagError,
+    canonicalize_language_pair,
+    canonicalize_language_tag,
+)
 from sion_translate.locking import artifact_locks
 
 DEFAULT_CONFIG_FILE = "sion_translate.yaml"
@@ -82,9 +87,16 @@ def resolve_augmentation_pair(
 ) -> tuple[str, str]:
     """Choose a physical pair from the generator artifact, never local YAML."""
 
-    pairs = [(str(pair[0]), str(pair[1])) for pair in trained_pairs]
+    pairs = [
+        canonicalize_language_pair(pair, field="augmentation model language pair")
+        for pair in trained_pairs
+    ]
     if requested is not None:
-        edge = frozenset(map(str, requested))
+        requested_pair = canonicalize_language_pair(
+            requested,
+            field="--language-pair",
+        )
+        edge = frozenset(requested_pair)
         matches = [pair for pair in pairs if frozenset(pair) == edge]
         if len(matches) != 1:
             raise SystemExit(
@@ -104,17 +116,21 @@ def resolve_augmentation_destination(
 ) -> tuple[str, str]:
     """Bind the generator pair to exactly one destination physical pair."""
 
-    edge = frozenset(map(str, model_pair))
-    matches = [
-        (str(pair[0]), str(pair[1]))
+    normalized_model_pair = canonicalize_language_pair(
+        model_pair,
+        field="augmentation model language pair",
+    )
+    edge = frozenset(normalized_model_pair)
+    normalized_destinations = [
+        canonicalize_language_pair(pair, field="augmentation destination language pair")
         for pair in destination_pairs
-        if frozenset(map(str, pair)) == edge
     ]
+    matches = [pair for pair in normalized_destinations if frozenset(pair) == edge]
     if len(matches) != 1:
-        configured = [tuple(map(str, pair)) for pair in destination_pairs]
+        configured = list(normalized_destinations)
         raise SystemExit(
             "증강 모델의 언어쌍이 현재 학습 설정에 정확히 한 번 존재해야 합니다: "
-            f"model={tuple(model_pair)}, config={configured}"
+            f"model={normalized_model_pair}, config={configured}"
         )
     return matches[0]
 
@@ -127,11 +143,35 @@ def preflight_backtranslation_directions(
 ) -> None:
     """Validate every true-BT generator/destination edge before generation."""
 
-    generated = {tuple(map(str, direction)) for direction in generation_directions}
-    trained = {tuple(map(str, direction)) for direction in training_directions}
+    pair = canonicalize_language_pair(pair, field="augmentation language pair")
+    generated = {
+        canonicalize_language_pair(direction, field="model generation direction")
+        for direction in generation_directions
+    }
+    trained = {
+        canonicalize_language_pair(direction, field="destination training direction")
+        for direction in training_directions
+    }
+    normalized_jobs = [
+        (
+            path,
+            canonicalize_language_tag(
+                mono_language,
+                field="augmentation monolingual language",
+            ),
+        )
+        for path, mono_language in jobs
+    ]
+    unknown_job_languages = sorted(
+        {mono_language for _, mono_language in normalized_jobs} - set(pair)
+    )
+    if unknown_job_languages:
+        raise SystemExit(
+            f"단일어 입력 언어가 증강 언어쌍 밖에 있습니다: {unknown_job_languages} not in {pair}"
+        )
     required_generation = {
         (mono_language, pair[0] if mono_language == pair[1] else pair[1])
-        for _, mono_language in jobs
+        for _, mono_language in normalized_jobs
     }
     required_training = {(target, source) for source, target in required_generation}
     missing_generation = sorted(required_generation - generated)
@@ -199,8 +239,14 @@ def generator_identity(
         "release_name": metadata.get("release_name"),
         "release_version": metadata.get("release_version"),
         "step": metadata.get("step"),
-        "language_pairs": [list(pair) for pair in translator.language_pairs],
-        "translation_directions": [list(edge) for edge in translator.translation_directions],
+        "language_pairs": [
+            list(canonicalize_language_pair(pair, field="generator language pair"))
+            for pair in translator.language_pairs
+        ],
+        "translation_directions": [
+            list(canonicalize_language_pair(edge, field="generator translation direction"))
+            for edge in translator.translation_directions
+        ],
         "pipeline": metadata.get("pipeline"),
         "feature_flags": metadata.get("feature_flags"),
         "capabilities": metadata.get("capabilities"),
@@ -218,11 +264,21 @@ def generator_identity(
 
 
 def _discover_mono_files(mono_dir: Path, pair: tuple[str, str]) -> list[tuple[Path, str]]:
+    pair = canonicalize_language_pair(pair, field="augmentation language pair")
     jobs: list[tuple[Path, str]] = []
     for path in sorted(mono_dir.glob("*.txt")) if mono_dir.exists() else []:
         parts = path.name.split(".")
-        if len(parts) >= 3 and parts[-2] in pair:
-            jobs.append((path, parts[-2]))
+        if len(parts) < 3:
+            continue
+        try:
+            language = canonicalize_language_tag(
+                parts[-2],
+                field=f"monolingual filename {path.name}",
+            )
+        except LanguageTagError:
+            continue
+        if language in pair:
+            jobs.append((path, language))
     if not jobs:
         raise SystemExit(
             f"{mono_dir}/ 에 단일어 파일이 없습니다. '이름.<언어>.txt' 형식으로 "

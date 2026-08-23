@@ -22,12 +22,18 @@ from sion_translate.data.integrity import validate_dataset_artifact_inventory
 from sion_translate.data.prepare import prepare_preprocessing_options
 from sion_translate.data.quality import assess_pair, canonical_text
 from sion_translate.fingerprint import DatasetFingerprint, file_sha256
+from sion_translate.language_tags import canonicalize_language_pair, canonicalize_language_tag
 
 AUGMENT_LEDGER_SCHEMA = "sion-augment-ledger-v2"
 AUGMENT_ROW_SCHEMA = "sion-augment-row-v2"
 AUGMENT_STATE_DIRECTORY = ".sion_augment"
 _JOB_ID = re.compile(r"^[0-9a-f]{24}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _canonical_physical_pair(pair: Sequence[str], *, field: str) -> tuple[str, str]:
+    ordered = sorted(canonicalize_language_pair(pair, field=field))
+    return ordered[0], ordered[1]
 
 
 class TranslationBackend(Protocol):
@@ -99,6 +105,31 @@ class AugmentationIdentity:
     num_beams: int
     max_new_tokens: int
 
+    def __post_init__(self) -> None:
+        canonical_pair = _canonical_physical_pair(
+            self.pair,
+            field="augmentation identity pair",
+        )
+        canonical_mono = canonicalize_language_tag(
+            self.mono_language,
+            field="augmentation identity mono_language",
+        )
+        canonical_generation = canonicalize_language_pair(
+            self.generation_direction,
+            field="augmentation identity generation_direction",
+        )
+        canonical_training = canonicalize_language_pair(
+            self.training_direction,
+            field="augmentation identity training_direction",
+        )
+        if (
+            self.pair != canonical_pair
+            or self.mono_language != canonical_mono
+            or self.generation_direction != canonical_generation
+            or self.training_direction != canonical_training
+        ):
+            raise ValueError("augmentation identity languages must use canonical BCP 47 tags")
+
     def to_dict(self) -> dict[str, object]:
         return {
             "job_id": self.job_id,
@@ -130,7 +161,10 @@ class AugmentationIdentity:
             ):
                 raise ValueError(f"augmentation ledger {name} must contain two languages")
             values = cast(list[str], raw_values)
-            return values[0], values[1]
+            return canonicalize_language_pair(
+                values,
+                field=f"augmentation ledger {name}",
+            )
 
         job_id = fields.get("job_id")
         synthetic_prefix = fields.get("synthetic_prefix")
@@ -149,6 +183,10 @@ class AugmentationIdentity:
             raise ValueError("augmentation ledger synthetic_prefix is invalid")
         if not isinstance(mono_language, str) or not mono_language:
             raise ValueError("augmentation ledger mono_language is invalid")
+        mono_language = canonicalize_language_tag(
+            mono_language,
+            field="augmentation ledger mono_language",
+        )
         if not isinstance(model_identity, str) or _SHA256.fullmatch(model_identity) is None:
             raise ValueError("augmentation ledger model_identity is invalid")
         if not isinstance(tokenizer_sha, str) or _SHA256.fullmatch(tokenizer_sha) is None:
@@ -162,7 +200,10 @@ class AugmentationIdentity:
             or max_new_tokens < 1
         ):
             raise ValueError("augmentation ledger generation parameters are invalid")
-        pair = pair_field("pair")
+        pair = _canonical_physical_pair(
+            pair_field("pair"),
+            field="augmentation ledger pair",
+        )
         generation_direction = pair_field("generation_direction")
         training_direction = pair_field("training_direction")
         if (
@@ -323,7 +364,10 @@ def snapshot_file(path: str | Path) -> FileSnapshot:
 
 
 def language_pair_slug(pair: Sequence[str]) -> str:
-    canonical_pair = tuple(sorted(map(str, pair)))
+    canonical_pair = _canonical_physical_pair(
+        pair,
+        field="augmentation slug language pair",
+    )
     readable = "__".join(
         re.sub(r"[^A-Za-z0-9_.-]+", "_", language).strip("._-") or "language"
         for language in canonical_pair
@@ -353,19 +397,30 @@ def _job_identity_payload(
     num_beams: int,
     max_new_tokens: int,
 ) -> dict[str, object]:
-    normalized_pair = tuple(map(str, pair))
+    normalized_pair = _canonical_physical_pair(
+        pair,
+        field="augmentation job language pair",
+    )
+    normalized_mono_language = canonicalize_language_tag(
+        mono_language,
+        field="augmentation job mono_language",
+    )
+    if normalized_mono_language not in normalized_pair:
+        raise ValueError(
+            f"monolingual language {normalized_mono_language!r} is outside pair {normalized_pair!r}"
+        )
     other_language = (
-        normalized_pair[0] if mono_language == normalized_pair[1] else normalized_pair[1]
+        normalized_pair[0] if normalized_mono_language == normalized_pair[1] else normalized_pair[1]
     )
     return {
         "synthetic_prefix": synthetic_prefix,
         "pair": list(normalized_pair),
-        "mono_language": mono_language,
+        "mono_language": normalized_mono_language,
         "input": input_snapshot.to_dict(),
         "model_identity": model_identity,
         "generator_tokenizer_sha256": generator_tokenizer_sha256,
-        "generation_direction": [mono_language, other_language],
-        "training_direction": [other_language, mono_language],
+        "generation_direction": [normalized_mono_language, other_language],
+        "training_direction": [other_language, normalized_mono_language],
         "num_beams": num_beams,
         "max_new_tokens": max_new_tokens,
     }
@@ -432,6 +487,11 @@ def build_job_identity(
     num_beams: int,
     max_new_tokens: int,
 ) -> AugmentationIdentity:
+    pair = _canonical_physical_pair(pair, field="augmentation job language pair")
+    mono_language = canonicalize_language_tag(
+        mono_language,
+        field="augmentation job mono_language",
+    )
     if mono_language not in pair:
         raise ValueError(f"monolingual language {mono_language!r} is outside pair {pair!r}")
     other_language = pair[0] if mono_language == pair[1] else pair[1]

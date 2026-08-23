@@ -218,6 +218,11 @@ def test_augmentation_pair_is_resolved_from_the_model_artifact() -> None:
     with pytest.raises(SystemExit, match="--language-pair"):
         resolve_augmentation_pair(None, trained_pairs)
 
+    assert resolve_augmentation_pair(
+        ("PT-br", "zh-hant"),
+        (("pt-BR", "zh-Hant"),),
+    ) == ("pt-BR", "zh-Hant")
+
 
 def test_augmentation_destination_requires_the_same_physical_pair() -> None:
     assert resolve_augmentation_destination(("ar", "sw"), (("de", "fr"), ("sw", "ar"))) == (
@@ -226,6 +231,28 @@ def test_augmentation_destination_requires_the_same_physical_pair() -> None:
     )
     with pytest.raises(SystemExit, match="현재 학습 설정"):
         resolve_augmentation_destination(("ar", "sw"), (("de", "fr"),))
+
+    assert resolve_augmentation_destination(
+        ("PT-br", "zh-hant"),
+        (("zh-Hant", "pt-BR"),),
+    ) == ("zh-Hant", "pt-BR")
+
+
+def test_augmentation_discovers_canonical_language_alias_filenames(tmp_path: Path) -> None:
+    mono_dir = tmp_path / "mono"
+    mono_dir.mkdir()
+    portuguese = mono_dir / "news.PT-br.txt"
+    chinese = mono_dir / "news.zh-hant.txt"
+    ignored = mono_dir / "news.en.txt"
+    for path in (portuguese, chinese, ignored):
+        path.write_text("one sentence\n", encoding="utf-8")
+
+    jobs = augment_cli._discover_mono_files(  # noqa: SLF001 - CLI regression contract
+        mono_dir,
+        ("pt-BR", "zh-Hant"),
+    )
+
+    assert jobs == [(portuguese, "pt-BR"), (chinese, "zh-Hant")]
 
 
 def test_augment_preflight_checks_generation_and_destination_edges(
@@ -253,6 +280,13 @@ def test_augment_preflight_checks_generation_and_destination_edges(
         mono_files,
         (("ar", "sw"),),
         (("sw", "ar"),),
+    )
+
+    preflight_backtranslation_directions(
+        ("PT-br", "zh-hant"),
+        [(tmp_path / "news.zh-hant.txt", "ZH-hant")],
+        (("zh-Hant", "pt-BR"),),
+        (("PT-br", "zh-hant"),),
     )
 
 
