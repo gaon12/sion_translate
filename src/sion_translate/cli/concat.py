@@ -20,11 +20,26 @@ from pathlib import Path
 from sion_translate.concat import (
     SEPARATORS,
     build_concatenations,
-    read_pairs,
+    read_records,
     write_concatenations,
 )
 from sion_translate.console import configure_stdio
-from sion_translate.data.prepare import DEFAULT_TRAIN_ONLY_PREFIXES, expand_inputs
+from sion_translate.data.prepare import DEFAULT_TRAIN_ONLY_PREFIXES
+from sion_translate.tokenizer import expand_inputs
+
+
+def _nonnegative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be zero or greater")
+    return parsed
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -33,9 +48,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--input", nargs="+", required=True, help="JSONL 파일 또는 glob 패턴")
     parser.add_argument("--output", required=True, help="산출 JSONL 경로")
-    parser.add_argument("--count", type=int, required=True, help="만들 예제 수")
-    parser.add_argument("--min-sentences", type=int, default=2)
-    parser.add_argument("--max-sentences", type=int, default=4)
+    parser.add_argument("--count", type=_nonnegative_int, required=True, help="만들 예제 수")
+    parser.add_argument("--min-sentences", type=_positive_int, default=2)
+    parser.add_argument("--max-sentences", type=_positive_int, default=4)
     parser.add_argument(
         "--separator",
         default="space",
@@ -44,7 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--max-chars",
-        type=int,
+        type=_positive_int,
         default=480,
         help="한쪽 최대 글자 수 (기본 480). 학습 shard 가 잘라낼 예제를 미리 버립니다",
     )
@@ -54,16 +69,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--max-tokens",
-        type=int,
+        type=_positive_int,
         default=None,
         help="한쪽 최대 토큰 수 (--tokenizer 와 함께 사용; 보통 학습의 max_tokens_per_side)",
     )
     parser.add_argument(
         "--language-pair",
         nargs=2,
-        default=["ko", "ja"],
+        required=True,
         metavar=("LANG_A", "LANG_B"),
-        help="JSONL 키 이름 (기본: ko ja)",
+        help="JSONL 언어 키 (LANG_A LANG_B)",
     )
     parser.add_argument("--seed", type=int, default=20260726)
     return parser
@@ -91,7 +106,7 @@ def main() -> None:
     if not paths:
         raise SystemExit(f"입력 JSONL 을 찾지 못했습니다: {args.input}")
 
-    pairs = list(read_pairs(paths, args.language_pair))
+    pairs = list(read_records(paths, args.language_pair))
     if not pairs:
         raise SystemExit("읽을 수 있는 번역쌍이 없습니다")
 
