@@ -31,9 +31,8 @@ _JOB_ID = re.compile(r"^[0-9a-f]{24}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
-def _canonical_physical_pair(pair: Sequence[str], *, field: str) -> tuple[str, str]:
-    ordered = sorted(canonicalize_language_pair(pair, field=field))
-    return ordered[0], ordered[1]
+def _canonical_identity_pair(pair: Sequence[str], *, field: str) -> tuple[str, str]:
+    return canonicalize_language_pair(pair, field=field)
 
 
 class TranslationBackend(Protocol):
@@ -106,7 +105,7 @@ class AugmentationIdentity:
     max_new_tokens: int
 
     def __post_init__(self) -> None:
-        canonical_pair = _canonical_physical_pair(
+        canonical_pair = _canonical_identity_pair(
             self.pair,
             field="augmentation identity pair",
         )
@@ -200,7 +199,7 @@ class AugmentationIdentity:
             or max_new_tokens < 1
         ):
             raise ValueError("augmentation ledger generation parameters are invalid")
-        pair = _canonical_physical_pair(
+        pair = _canonical_identity_pair(
             pair_field("pair"),
             field="augmentation ledger pair",
         )
@@ -364,9 +363,13 @@ def snapshot_file(path: str | Path) -> FileSnapshot:
 
 
 def language_pair_slug(pair: Sequence[str]) -> str:
-    canonical_pair = _canonical_physical_pair(
-        pair,
-        field="augmentation slug language pair",
+    canonical_pair = tuple(
+        sorted(
+            _canonical_identity_pair(
+                pair,
+                field="augmentation slug language pair",
+            )
+        )
     )
     readable = "__".join(
         re.sub(r"[^A-Za-z0-9_.-]+", "_", language).strip("._-") or "language"
@@ -397,7 +400,7 @@ def _job_identity_payload(
     num_beams: int,
     max_new_tokens: int,
 ) -> dict[str, object]:
-    normalized_pair = _canonical_physical_pair(
+    normalized_pair = _canonical_identity_pair(
         pair,
         field="augmentation job language pair",
     )
@@ -487,7 +490,7 @@ def build_job_identity(
     num_beams: int,
     max_new_tokens: int,
 ) -> AugmentationIdentity:
-    pair = _canonical_physical_pair(pair, field="augmentation job language pair")
+    pair = _canonical_identity_pair(pair, field="augmentation job language pair")
     mono_language = canonicalize_language_tag(
         mono_language,
         field="augmentation job mono_language",

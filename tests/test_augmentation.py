@@ -955,7 +955,7 @@ def test_augmentation_identity_canonicalizes_bcp47_aliases(tmp_path: Path) -> No
         **common,
     )
     alias = build_job_identity(
-        pair=("ZH-hant", "PT-br"),
+        pair=("PT-br", "ZH-hant"),
         mono_language="zh-hant",
         **common,
     )
@@ -968,8 +968,29 @@ def test_augmentation_identity_canonicalizes_bcp47_aliases(tmp_path: Path) -> No
     assert language_pair_slug(("PT-br", "zh-hant")) == language_pair_slug(("zh-Hant", "pt-BR"))
 
     serialized_alias = canonical.to_dict()
-    serialized_alias["pair"] = ["ZH-hant", "PT-br"]
+    serialized_alias["pair"] = ["PT-br", "ZH-hant"]
     serialized_alias["mono_language"] = "zh-hant"
     serialized_alias["generation_direction"] = ["zh-hant", "PT-br"]
     serialized_alias["training_direction"] = ["PT-br", "zh-hant"]
     assert AugmentationIdentity.from_dict(serialized_alias) == canonical
+
+
+def test_augmentation_identity_preserves_legacy_physical_pair_order(tmp_path: Path) -> None:
+    mono_path = tmp_path / "news.ja.txt"
+    mono_path.write_text("これは単言語の文です。\n", encoding="utf-8")
+    common = {
+        "synthetic_prefix": "bt_",
+        "mono_language": "ja",
+        "input_snapshot": snapshot_file(mono_path),
+        "model_identity": _MODEL_IDENTITY,
+        "generator_tokenizer_sha256": _TOKENIZER_IDENTITY,
+        "num_beams": 2,
+        "max_new_tokens": 64,
+    }
+
+    legacy_order = build_job_identity(pair=("ko", "ja"), **common)
+    reversed_order = build_job_identity(pair=("ja", "ko"), **common)
+
+    assert legacy_order.pair == ("ko", "ja")
+    assert AugmentationIdentity.from_dict(legacy_order.to_dict()) == legacy_order
+    assert legacy_order.job_id != reversed_order.job_id
