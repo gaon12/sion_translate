@@ -18,9 +18,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--language-pair",
         nargs=2,
-        default=["ko", "ja"],
+        action="append",
+        required=True,
         metavar=("LANG_A", "LANG_B"),
-        help="JSONL language keys to audit (default: ko ja)",
+        help="JSONL physical language pair to audit; repeat for multilingual corpora",
     )
     parser.add_argument("--max-ratio", type=float, default=5.0)
     parser.add_argument("--sample-size", type=int, default=100_000)
@@ -39,7 +40,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     report = audit_dataset(
         args.input,
-        language_pair=args.language_pair,
+        language_pairs=args.language_pair,
         max_length_ratio=args.max_ratio,
         sample_size=args.sample_size,
         seed=args.seed,

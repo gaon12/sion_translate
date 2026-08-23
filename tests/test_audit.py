@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from sion_translate.cli.audit_data import main as audit_main
 from sion_translate.data.audit import audit_dataset
 
@@ -50,6 +52,7 @@ def _write_fixture(tmp_path: Path) -> tuple[Path, Path]:
 def test_streaming_audit_reports_deterministic_quality_counters(tmp_path: Path) -> None:
     first, second = _write_fixture(tmp_path)
     options = {
+        "language_pair": ("ko", "ja"),
         "max_length_ratio": 4.0,
         "sample_size": 100,
         "seed": 17,
@@ -62,7 +65,7 @@ def test_streaming_audit_reports_deterministic_quality_counters(tmp_path: Path) 
     repeated = audit_dataset([str(second), str(first)], **options)
 
     assert report == repeated
-    assert report["schema"] == "sion-raw-dataset-audit-v1"
+    assert report["schema"] == "sion-raw-dataset-audit-v2"
     assert report["global"]["file_count"] == 2
     assert report["global"]["bytes"] == first.stat().st_size + second.stat().st_size
     assert report["global"]["rows"] == 14
@@ -117,6 +120,7 @@ def test_audit_bounds_samples_and_marks_exact_count_unavailable(tmp_path: Path) 
     _write_fixture(tmp_path)
     report = audit_dataset(
         [str(tmp_path)],
+        language_pair=("ko", "ja"),
         sample_size=3,
         seed=99,
         hll_precision=8,
@@ -139,6 +143,9 @@ def test_audit_cli_writes_json_report(tmp_path: Path) -> None:
         [
             "--input",
             str(tmp_path / "*.jsonl"),
+            "--language-pair",
+            "ko",
+            "ja",
             "--output",
             str(output),
             "--max-ratio",
@@ -158,7 +165,7 @@ def test_audit_cli_writes_json_report(tmp_path: Path) -> None:
     assert written["global"]["rows"] == 14
     assert written["parameters"]["sample_size"] == 3
     assert written["parameters"]["max_length_ratio"] == 4.0
-    assert written["parameters"]["language_pair"] == ["ko", "ja"]
+    assert written["parameters"]["language_pairs"] == [["ko", "ja"]]
 
 
 def test_audit_supports_arbitrary_canonical_language_pairs(tmp_path: Path) -> None:
@@ -197,7 +204,8 @@ def test_audit_supports_arbitrary_canonical_language_pairs(tmp_path: Path) -> No
     )
 
     report = json.loads(output.read_text(encoding="utf-8"))
-    assert report["parameters"]["language_pair"] == ["pt-BR", "zh-Hant"]
+    assert report["parameters"]["language_pairs"] == [["pt-BR", "zh-Hant"]]
+    assert report["global"]["input_rows"] == 4
     assert report["global"]["rows"] == 4
     assert report["global"]["valid"] == 1
     assert report["global"]["invalid"] == 1
@@ -216,3 +224,40 @@ def test_audit_supports_arbitrary_canonical_language_pairs(tmp_path: Path) -> No
     assert examples[0]["issues"] == ["duplicate_language_key"]
     assert "pt-BR_preview" in examples[0]
     assert "zh-Hant_preview" in examples[0]
+
+
+def test_audit_requires_and_separates_a_multigraph(tmp_path: Path) -> None:
+    source = tmp_path / "multigraph.jsonl"
+    _write_rows(
+        source,
+        [
+            {"EN": "A complete English sentence.", "de": "Ein vollständiger deutscher Satz."},
+            {"sw": "Hii ni sentensi kamili.", "AR": "هذه جملة عربية كاملة."},
+        ],
+    )
+
+    with pytest.raises(ValueError, match="explicit language_pair"):
+        audit_dataset([str(source)], hll_precision=8)
+
+    report = audit_dataset(
+        [str(source)],
+        language_pairs=(("en", "de"), ("sw", "ar")),
+        hll_precision=8,
+        min_language_check_chars=2,
+    )
+
+    assert report["parameters"]["language_pairs"] == [
+        ["en", "de"],
+        ["sw", "ar"],
+    ]
+    assert report["global"]["input_rows"] == 2
+    assert report["global"]["rows"] == 2
+    assert report["global"]["valid"] == 2
+    assert report["global"]["missing"] == 0
+    assert set(report["global"]["character_lengths"]) == {
+        "en",
+        "de",
+        "sw",
+        "ar",
+        "pair",
+    }
