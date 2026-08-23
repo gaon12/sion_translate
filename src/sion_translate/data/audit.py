@@ -16,6 +16,7 @@ from sion_translate.language_tags import LanguageTagError, canonicalize_language
 from sion_translate.language_tags import canonicalize_language_tag
 
 from .quality import QualityPolicy, assess_pair, canonical_text, dedup_key
+from .records import expand_parallel_record
 
 
 _QUALITY_REJECTION_REASONS = (
@@ -489,7 +490,7 @@ def audit_dataset(
                     global_stats.record_invalid("invalid_json", example)
                     continue
 
-                if not isinstance(record, dict):
+                if not isinstance(record, (dict, list)) or not record:
                     example = {
                         **base_example,
                         "issues": ["invalid_record_type"],
@@ -499,71 +500,69 @@ def audit_dataset(
                     global_stats.record_invalid("invalid_record_type", example)
                     continue
 
-                candidates = _record_language_candidates(
-                    cast(dict[object, object], record),
-                    audit_languages,
+                if isinstance(record, dict):
+                    candidates = _record_language_candidates(
+                        cast(dict[object, object], record),
+                        audit_languages,
+                    )
+                    previews = _candidate_previews(
+                        candidates,
+                        audit_languages,
+                        issue_preview_chars,
+                    )
+                else:
+                    previews = {}
+                line_preview = {"line_preview": _preview(record, issue_preview_chars)}
+                expansion = expand_parallel_record(cast(object, record), normalized_pairs)
+                ambiguous_issues = tuple(
+                    issue
+                    for issue in expansion.issues
+                    if issue in {"duplicate_language_key", "duplicate_pair_container"}
                 )
-                previews = _candidate_previews(
-                    candidates,
-                    audit_languages,
-                    issue_preview_chars,
-                )
-                if any(len(values) > 1 for values in candidates.values()):
+                if ambiguous_issues:
                     example = {
                         **base_example,
-                        "issues": ["duplicate_language_key"],
+                        "issues": list(ambiguous_issues),
                         **previews,
+                        **line_preview,
                     }
-                    file_stats.record_invalid("duplicate_language_key", example)
-                    global_stats.record_invalid("duplicate_language_key", example)
+                    reason = ambiguous_issues[0]
+                    file_stats.record_invalid(reason, example)
+                    global_stats.record_invalid(reason, example)
                     continue
-                active_pairs = [
-                    pair for pair in normalized_pairs if candidates[pair[0]] or candidates[pair[1]]
-                ]
-                if not active_pairs:
+
+                for issue in expansion.issues:
+                    example_issue = "non_string_text" if issue == "non_string" else issue
+                    example = {
+                        **base_example,
+                        "issues": [example_issue],
+                        **previews,
+                        **line_preview,
+                    }
+                    if issue == "missing_text":
+                        file_stats.record_missing(example)
+                        global_stats.record_missing(example)
+                    elif issue == "non_string":
+                        file_stats.record_non_string(example)
+                        global_stats.record_non_string(example)
+                    else:
+                        file_stats.record_invalid(issue, example)
+                        global_stats.record_invalid(issue, example)
+
+                if not expansion.pairs and not expansion.issues:
                     example = {
                         **base_example,
                         "issues": ["missing_text"],
                         **previews,
+                        **line_preview,
                     }
                     file_stats.record_missing(example)
                     global_stats.record_missing(example)
-                    continue
 
-                for normalized_pair in active_pairs:
-                    pair_previews = _candidate_previews(
-                        candidates,
-                        normalized_pair,
-                        issue_preview_chars,
-                    )
-                    pair_example = {
-                        **base_example,
-                        "language_pair": list(normalized_pair),
-                    }
-                    if any(not candidates[language] for language in normalized_pair):
-                        example = {
-                            **pair_example,
-                            "issues": ["missing_text"],
-                            **pair_previews,
-                        }
-                        file_stats.record_missing(example)
-                        global_stats.record_missing(example)
-                        continue
-
-                    raw_first = candidates[normalized_pair[0]][0]
-                    raw_second = candidates[normalized_pair[1]][0]
-                    if not isinstance(raw_first, str) or not isinstance(raw_second, str):
-                        example = {
-                            **pair_example,
-                            "issues": ["non_string_text"],
-                            **pair_previews,
-                        }
-                        file_stats.record_non_string(example)
-                        global_stats.record_non_string(example)
-                        continue
-
-                    first_text = canonical_text(raw_first)
-                    second_text = canonical_text(raw_second)
+                for pair in expansion.pairs:
+                    normalized_pair = (pair.language_a, pair.language_b)
+                    first_text = canonical_text(pair.text_a)
+                    second_text = canonical_text(pair.text_b)
                     normalized_previews = {
                         f"{normalized_pair[0]}_preview": _preview(
                             first_text,
@@ -573,6 +572,11 @@ def audit_dataset(
                             second_text,
                             issue_preview_chars,
                         ),
+                    }
+                    pair_example = {
+                        **base_example,
+                        "language_pair": list(normalized_pair),
+                        **normalized_previews,
                     }
                     if not first_text or not second_text:
                         example = {

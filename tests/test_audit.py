@@ -261,3 +261,45 @@ def test_audit_requires_and_separates_a_multigraph(tmp_path: Path) -> None:
         "ar",
         "pair",
     }
+
+
+def test_audit_uses_the_training_record_expansion_contract(tmp_path: Path) -> None:
+    source = tmp_path / "heterogeneous.jsonl"
+    _write_rows(
+        source,
+        [
+            {
+                "source_language": "PT-br",
+                "target_language": "ZH-hant",
+                "source": "Uma frase explícita completa.",
+                "translation": "這是一個完整的明確句子。",
+                "synthetic": True,
+                "training_direction": ["pt-BR", "zh-Hant"],
+            },
+            {
+                "records": [
+                    {"pt-BR": "Primeira frase aninhada.", "zh-Hant": "第一個巢狀句子。"},
+                    {"pt-BR": "Segunda frase aninhada.", "zh-Hant": "第二個巢狀句子。"},
+                ]
+            },
+            {
+                "pt-BR": ["Primeira frase em lista.", "Segunda frase em lista."],
+                "zh-Hant": ["第一個列表句子。", "第二個列表句子。"],
+            },
+        ],
+    )
+
+    report = audit_dataset(
+        [str(source)],
+        language_pair=("pt-br", "ZH-hant"),
+        hll_precision=8,
+        min_language_check_chars=2,
+    )
+
+    assert report["global"]["input_rows"] == 3
+    assert report["global"]["rows"] == 5
+    assert report["global"]["valid"] == 5
+    assert report["global"]["missing"] == 0
+    assert report["global"]["non_string"] == 0
+    assert report["global"]["invalid"] == 0
+    assert report["global"]["unique_pairs"]["exact_count"] == 5
