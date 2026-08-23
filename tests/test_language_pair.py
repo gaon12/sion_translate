@@ -189,6 +189,7 @@ def test_synthetic_files_are_train_only(tmp_path: Path) -> None:
     assert by_name["real.jsonl"]["synthetic_pairs"] == 10
     assert set(manifest["train_only_prefixes"]) >= {
         "bt_",
+        "queue_bt_",
         "concat_",
         "revise_",
         "synthetic_",

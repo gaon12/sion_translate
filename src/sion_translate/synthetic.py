@@ -10,6 +10,7 @@ from typing import Any
 
 DEFAULT_SYNTHETIC_PREFIXES: tuple[str, ...] = (
     "bt_",
+    "queue_bt_",
     "concat_",
     "revise_",
     "synthetic_",
