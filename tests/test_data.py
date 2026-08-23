@@ -700,6 +700,11 @@ def test_pair_quality_rejects_obvious_damage() -> None:
     assert "excessive_repetition" in repeated.rejection_reasons
 
 
+def test_pair_quality_requires_explicit_language_identity() -> None:
+    with pytest.raises(TypeError, match="languages"):
+        assess_pair("source", "target")  # type: ignore[call-arg]
+
+
 def test_quality_profiles_apply_to_bcp47_variants_and_both_pair_orientations() -> None:
     wrong_scripts = assess_pair(
         "This is not Korean",

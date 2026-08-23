@@ -199,7 +199,7 @@ def assess_pair(
     ja: str,
     policy: QualityPolicy | None = None,
     *,
-    languages: tuple[str, str] | list[str] = ("ko", "ja"),
+    languages: tuple[str, str] | list[str],
 ) -> PairAssessment:
     """번역쌍 품질 평가. ``languages`` 로 다른 언어쌍(en-de 등)도 검사할 수
     있으며, 문자 기반 판별이 불가능한 언어는 script 검사만 건너뜁니다.
