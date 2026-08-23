@@ -291,6 +291,20 @@ def test_hf_tokenizer_preserves_an_explicit_metadata_artifact(tmp_path: Path) ->
     assert restored._tokenizer_metadata_path == saved_metadata_path
 
 
+def test_hf_tokenizer_keeps_legacy_single_model_loading(tmp_path: Path) -> None:
+    tokenizer_path = train_tiny_tokenizer(tmp_path)
+
+    restored = HFSionTokenizer.from_pretrained(
+        tokenizer_path,
+        release_version="1.4",
+    )
+    direct = HFSionTokenizer(str(tokenizer_path), release_version="1.4")
+
+    assert set(restored.language_tags) == {"ko", "ja"}
+    assert restored.language_pairs == []
+    assert set(direct.language_tags) == {"ko", "ja"}
+
+
 def test_transformers_wrapper_matches_native_forward_and_config() -> None:
     torch.manual_seed(17)
     native_config = tiny_model_config()

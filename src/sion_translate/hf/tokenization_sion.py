@@ -76,6 +76,34 @@ class SionTokenizer(PreTrainedTokenizer):
         "memory_mode_ids",
     ]
 
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str | os.PathLike[str],
+        *init_inputs: Any,
+        cache_dir: str | os.PathLike[str] | None = None,
+        force_download: bool = False,
+        local_files_only: bool = False,
+        token: str | bool | None = None,
+        revision: str = "main",
+        trust_remote_code: bool = False,
+        **kwargs: Any,
+    ) -> SionTokenizer:
+        candidate = Path(pretrained_model_name_or_path)
+        if candidate.is_file():
+            return cls(str(candidate), *init_inputs, **kwargs)
+        return super().from_pretrained(
+            pretrained_model_name_or_path,
+            *init_inputs,
+            cache_dir=cache_dir,
+            force_download=force_download,
+            local_files_only=local_files_only,
+            token=token,
+            revision=revision,
+            trust_remote_code=trust_remote_code,
+            **kwargs,
+        )
+
     def __init__(
         self,
         vocab_file: str,
@@ -98,6 +126,7 @@ class SionTokenizer(PreTrainedTokenizer):
     ):
         self.vocab_file = str(vocab_file)
         vocab_path = Path(self.vocab_file)
+        self._tokenizer_metadata_explicit = tokenizer_metadata_file is not None
         if tokenizer_metadata_file is None:
             sibling_metadata = vocab_path.parent / "tokenizer_metadata.json"
             self._tokenizer_metadata_path = sibling_metadata if sibling_metadata.is_file() else None
@@ -417,6 +446,8 @@ class SionTokenizer(PreTrainedTokenizer):
             not isinstance(recorded_sha256, str) or recorded_sha256 != actual_tokenizer_sha256
         ):
             raise ValueError("tokenizer metadata model_sha256 does not match tokenizer.model")
+        if not self._tokenizer_metadata_explicit:
+            return
         recorded_capability = loaded.get("translation_capable")
         if recorded_capability is not None and (
             not isinstance(recorded_capability, bool)
