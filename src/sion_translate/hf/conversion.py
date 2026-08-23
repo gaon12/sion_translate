@@ -277,6 +277,120 @@ def _translation_directions(
     return directions
 
 
+def _metadata_language_graph(
+    metadata: dict[str, object],
+    *,
+    source: str,
+) -> tuple[list[list[str]] | None, list[list[str]] | None]:
+    raw_pairs = metadata.get("language_pairs")
+    if raw_pairs is None and metadata.get("language_pair") is not None:
+        raw_pairs = [metadata["language_pair"]]
+    if raw_pairs is None:
+        return None, None
+    if not isinstance(raw_pairs, Sequence) or isinstance(raw_pairs, (str, bytes)):
+        raise ValueError(f"{source} language_pairs must be a sequence")
+    pairs = _canonical_pair_list(raw_pairs, field=f"{source} language pair")
+    raw_directions = metadata.get("translation_directions")
+    if raw_directions is None:
+        return pairs, None
+    if not isinstance(raw_directions, Sequence) or isinstance(raw_directions, (str, bytes)):
+        raise ValueError(f"{source} translation_directions must be a sequence")
+    return pairs, _translation_directions(pairs, raw_directions)
+
+
+def _is_current_tokenizer_contract(metadata: dict[str, object]) -> bool:
+    if metadata.get("pipeline") is not None:
+        return True
+    release_version = metadata.get("release_version")
+    if not isinstance(release_version, str) or not release_version:
+        return False
+    parts = release_version.split(".")
+    if len(parts) not in {2, 3} or any(not part.isdigit() for part in parts):
+        return False
+    return tuple(int(part) for part in parts[:2]) >= (1, 5)
+
+
+def _load_json_object(path: Path, *, source: str) -> dict[str, object]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise ValueError(f"{source} is not valid JSON: {path}") from error
+    if not isinstance(value, dict):
+        raise ValueError(f"{source} must contain a JSON object: {path}")
+    return value
+
+
+def _authenticated_tokenizer_metadata(tokenizer_path: Path) -> dict[str, object] | None:
+    """Reconcile native and Transformers tokenizer identity sidecars."""
+
+    actual_sha256 = _file_sha256(tokenizer_path)
+    native_metadata = load_tokenizer_metadata(tokenizer_path)
+    if native_metadata is not None:
+        native_sha256 = native_metadata.get("model_sha256")
+        if native_sha256 is not None and (
+            not isinstance(native_sha256, str) or native_sha256 != actual_sha256
+        ):
+            raise ValueError("tokenizer metadata model_sha256 does not match tokenizer.model")
+
+    config_path = tokenizer_path.parent / "tokenizer_config.json"
+    if not config_path.is_file():
+        return native_metadata
+    tokenizer_config = _load_json_object(config_path, source="tokenizer_config.json")
+    if not _is_current_tokenizer_contract(tokenizer_config):
+        return native_metadata
+
+    config_sha256 = tokenizer_config.get("tokenizer_sha256")
+    if not isinstance(config_sha256, str) or config_sha256 != actual_sha256:
+        raise ValueError(
+            "current tokenizer_config.json must authenticate tokenizer.model with "
+            "a matching tokenizer_sha256"
+        )
+    config_capable = tokenizer_config.get("translation_capable")
+    if not isinstance(config_capable, bool):
+        raise ValueError("current tokenizer_config.json translation_capable must be a boolean")
+    config_pairs, config_directions = _metadata_language_graph(
+        tokenizer_config,
+        source="tokenizer_config.json",
+    )
+    if config_capable and (not config_pairs or not config_directions):
+        raise ValueError(
+            "current translation-capable tokenizer_config.json requires a non-empty "
+            "language_pairs and translation_directions graph"
+        )
+    if not config_capable and (config_pairs or config_directions):
+        raise ValueError(
+            "translation-incapable tokenizer_config.json cannot advertise language pairs "
+            "or directions"
+        )
+
+    if native_metadata is not None:
+        native_capable = native_metadata.get("translation_capable")
+        if native_capable is not None and (
+            not isinstance(native_capable, bool) or native_capable != config_capable
+        ):
+            raise ValueError(
+                "tokenizer_metadata.json and tokenizer_config.json disagree on translation_capable"
+            )
+        native_pairs, native_directions = _metadata_language_graph(
+            native_metadata,
+            source="tokenizer metadata",
+        )
+        if native_pairs is not None and {frozenset(pair) for pair in native_pairs} != {
+            frozenset(pair) for pair in config_pairs or ()
+        }:
+            raise ValueError(
+                "tokenizer_metadata.json and tokenizer_config.json disagree on language_pairs"
+            )
+        if native_directions is not None and {
+            tuple(direction) for direction in native_directions
+        } != {tuple(direction) for direction in config_directions or ()}:
+            raise ValueError(
+                "tokenizer_metadata.json and tokenizer_config.json disagree on "
+                "translation_directions"
+            )
+    return tokenizer_config
+
+
 def _tokenizer_metadata_contract(
     tokenizer_path: Path,
     requested_pairs: Sequence[Sequence[str]] | None,
@@ -285,20 +399,24 @@ def _tokenizer_metadata_contract(
 ) -> tuple[Sequence[Sequence[str]] | None, Sequence[Sequence[str]] | None]:
     """Return only an explicit, validated graph recorded beside the tokenizer."""
 
-    metadata = load_tokenizer_metadata(tokenizer_path)
-    if metadata is None or not translation_capable:
+    metadata = _authenticated_tokenizer_metadata(tokenizer_path)
+    if metadata is None:
         return requested_pairs, None
-    raw_pairs = metadata.get("language_pairs")
-    if raw_pairs is None and metadata.get("language_pair") is not None:
-        raw_pairs = [metadata["language_pair"]]
-    if raw_pairs is None:
+    recorded_capability = metadata.get("translation_capable")
+    if recorded_capability is not None and (
+        not isinstance(recorded_capability, bool) or recorded_capability != translation_capable
+    ):
+        raise ValueError(
+            "requested translation_capable value disagrees with authenticated tokenizer metadata"
+        )
+    if not translation_capable:
         return requested_pairs, None
-    if not isinstance(raw_pairs, Sequence) or isinstance(raw_pairs, (str, bytes)):
-        raise ValueError("tokenizer metadata language_pairs must be a sequence")
-    metadata_pairs = _canonical_pair_list(
-        raw_pairs,
-        field="tokenizer metadata language pair",
+    metadata_pairs, metadata_directions = _metadata_language_graph(
+        metadata,
+        source="tokenizer metadata",
     )
+    if metadata_pairs is None:
+        return requested_pairs, None
     effective_pairs = metadata_pairs if requested_pairs is None else requested_pairs
     normalized_requested = _canonical_pair_list(
         effective_pairs,
@@ -310,37 +428,11 @@ def _tokenizer_metadata_contract(
         raise ValueError(
             f"requested language pairs are absent from tokenizer metadata: {missing_pairs!r}"
         )
-    raw_directions = metadata.get("translation_directions")
-    if raw_directions is None:
+    if metadata_directions is None:
         return effective_pairs, None
-    if not isinstance(raw_directions, Sequence) or isinstance(raw_directions, (str, bytes)):
-        raise ValueError("tokenizer metadata translation_directions must be a sequence")
     requested_edges = {frozenset(pair) for pair in normalized_requested}
     selected_directions: list[list[str]] = []
-    seen_directions: set[tuple[str, str]] = set()
-    for raw_direction in raw_directions:
-        if isinstance(raw_direction, (str, bytes)) or not isinstance(raw_direction, Sequence):
-            raise ValueError(
-                "each tokenizer metadata translation direction must be a two-item sequence"
-            )
-        direction = list(
-            canonicalize_language_pair(
-                raw_direction,
-                field="tokenizer metadata translation direction",
-            )
-        )
-        key = tuple(direction)
-        if (
-            len(direction) != 2
-            or direction[0] == direction[1]
-            or frozenset(direction) not in metadata_edges
-        ):
-            raise ValueError(f"invalid tokenizer metadata translation direction: {raw_direction!r}")
-        if key in seen_directions:
-            raise ValueError(
-                f"duplicate tokenizer metadata translation direction: {raw_direction!r}"
-            )
-        seen_directions.add(key)
+    for direction in metadata_directions:
         if frozenset(direction) in requested_edges:
             selected_directions.append(direction)
     return effective_pairs, selected_directions

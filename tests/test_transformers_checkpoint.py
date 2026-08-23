@@ -258,6 +258,39 @@ def test_hf_reasoning_tags_require_every_trace_marker(
         HFSionTokenizer(str(tokenizer_path), translation_capable=False)
 
 
+def test_hf_tokenizer_preserves_an_explicit_metadata_artifact(tmp_path: Path) -> None:
+    tokenizer_path = train_tiny_tokenizer(tmp_path)
+    sibling_metadata = tokenizer_path.parent / "tokenizer_metadata.json"
+    metadata = json.loads(sibling_metadata.read_text(encoding="utf-8"))
+    metadata["provenance_marker"] = "non-sibling-source"
+    external_dir = tmp_path / "external-metadata"
+    external_dir.mkdir()
+    external_metadata = external_dir / "tokenizer_metadata.json"
+    external_metadata.write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    sibling_metadata.unlink()
+
+    tokenizer = HFSionTokenizer(
+        str(tokenizer_path),
+        tokenizer_metadata_file=str(external_metadata),
+        language_pairs=metadata["language_pairs"],
+        translation_directions=metadata["translation_directions"],
+        release_name="sion_translate",
+        release_version="1.5",
+    )
+    output_dir = tmp_path / "saved-tokenizer"
+    saved_files = tokenizer.save_pretrained(output_dir)
+
+    saved_metadata_path = output_dir / "tokenizer_metadata.json"
+    assert str(saved_metadata_path) in saved_files
+    saved_metadata = json.loads(saved_metadata_path.read_text(encoding="utf-8"))
+    assert saved_metadata["provenance_marker"] == "non-sibling-source"
+    restored = HFSionTokenizer.from_pretrained(output_dir)
+    assert restored._tokenizer_metadata_path == saved_metadata_path
+
+
 def test_transformers_wrapper_matches_native_forward_and_config() -> None:
     torch.manual_seed(17)
     native_config = tiny_model_config()
@@ -1179,6 +1212,10 @@ def test_transformers_tokenizer_enforces_trained_direction(tmp_path: Path) -> No
         tgt_lang="ja",
     )
     assert encoded.input_ids.shape[0] == 1
+    restored.src_lang = "KO"
+    restored.tgt_lang = "JA"
+    direct = restored("저수준 정방향", return_tensors="pt")
+    assert direct.input_ids[0, 0].item() == restored.language_tags["ja"]
     with pytest.raises(ValueError, match="unsupported translation direction"):
         restored._build_translation_inputs(
             "역방향",
@@ -1186,6 +1223,10 @@ def test_transformers_tokenizer_enforces_trained_direction(tmp_path: Path) -> No
             src_lang="ja",
             tgt_lang="ko",
         )
+    restored.src_lang = "ja"
+    restored.tgt_lang = "ko"
+    with pytest.raises(ValueError, match="unsupported translation direction"):
+        restored("저수준 역방향", return_tensors="pt")
     tokenizer_metadata = json.loads(
         (output_dir / "tokenizer_metadata.json").read_text(encoding="utf-8")
     )
@@ -1257,6 +1298,18 @@ def test_transformers_checkpoint_bundles_bcp47_identity_runtime(
         assert "from sion_translate.language_tags" not in source
         assert "from .sion_language_tags import" in source
 
+    widened_dir = tmp_path / "widened-tokenizer-config"
+    shutil.copytree(output_dir, widened_dir)
+    widened_config_path = widened_dir / "tokenizer_config.json"
+    widened_config = json.loads(widened_config_path.read_text(encoding="utf-8"))
+    widened_config["translation_directions"].append(["zh-Hant", "pt-BR"])
+    widened_config_path.write_text(
+        json.dumps(widened_config, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="metadata disagree.*translation_directions"):
+        AutoTokenizer.from_pretrained(widened_dir, trust_remote_code=True)
+
     clean_process = textwrap.dedent(
         """
         import sys
@@ -1285,6 +1338,10 @@ def test_transformers_checkpoint_bundles_bcp47_identity_runtime(
             tgt_lang="zh-hant",
         )
         assert encoded.input_ids.shape[0] == 1
+        tokenizer.src_lang = "PT-br"
+        tokenizer.tgt_lang = "zh-hant"
+        direct = tokenizer("Outra frase.", return_tensors="pt")
+        assert direct.input_ids[0, 0].item() == tokenizer.language_tags["zh-Hant"]
         """
     )
     subprocess.run(
@@ -1294,6 +1351,36 @@ def test_transformers_checkpoint_bundles_bcp47_identity_runtime(
         capture_output=True,
         text=True,
     )
+
+    tampered = AutoTokenizer.from_pretrained(output_dir, trust_remote_code=True)
+    tampered.translation_directions.append(["zh-Hant", "pt-BR"])
+    tampered_dir = tmp_path / "tampered-tokenizer"
+    with pytest.raises(ValueError, match="authenticated tokenizer contract was mutated"):
+        tampered.save_pretrained(tampered_dir)
+    assert not tampered_dir.exists()
+
+    restored = AutoTokenizer.from_pretrained(output_dir, trust_remote_code=True)
+    roundtrip_dir = tmp_path / "roundtrip-tokenizer"
+    restored.save_pretrained(roundtrip_dir)
+    assert (roundtrip_dir / "tokenizer_metadata.json").is_file()
+    # Existing HF-only copies may predate native-sidecar preservation.  The
+    # authenticated tokenizer_config graph must still prevent direction growth.
+    (roundtrip_dir / "tokenizer_metadata.json").unlink()
+    legacy_copy = AutoTokenizer.from_pretrained(roundtrip_dir, trust_remote_code=True)
+    assert legacy_copy.translation_directions == [["pt-BR", "zh-Hant"]]
+    rejected_roundtrip = tmp_path / "roundtrip-reverse"
+    with pytest.raises(ValueError, match="not authenticated by tokenizer metadata"):
+        save_transformers_checkpoint(
+            rejected_roundtrip,
+            native.state_dict(),
+            config,
+            pad_id=tokenizer.pad_id,
+            tokenizer_path=roundtrip_dir / "tokenizer.model",
+            languages=["zh-hant", "PT-br"],
+            language_pairs=[("zh-hant", "PT-br")],
+            translation_directions=[("zh-hant", "PT-br")],
+        )
+    assert not rejected_roundtrip.exists()
 
 
 def test_transformers_export_rejects_duplicate_canonical_direction_aliases() -> None:
@@ -1510,4 +1597,15 @@ def test_foundation_conversion_preserves_release_and_rejects_translation(
             src_lang="ko",
             tgt_lang="ja",
         )
+    restored.src_lang = "ko"
+    restored.tgt_lang = "ja"
+    with pytest.raises(ValueError, match="foundation model.*not translation-capable"):
+        restored("저수준 번역도 불가", return_tensors="pt")
+    restored.translation_capable = True
+    with pytest.raises(ValueError, match="foundation model.*not translation-capable"):
+        restored("capability 변조 후에도 번역 불가", return_tensors="pt")
+    restored.translation_capable = False
+    restored.src_lang = None
+    restored.tgt_lang = None
+    assert restored("일반 인코딩", return_tensors="pt").input_ids.shape[0] == 1
     assert validate_export_directory(tmp_path / "foundation-transformers")["valid"]

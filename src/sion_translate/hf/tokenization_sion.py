@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 import hashlib
+import json
+import os
 import re
 import shutil
 import unicodedata
@@ -57,7 +59,10 @@ def _file_sha256(path: Path) -> str:
 
 
 class SionTokenizer(PreTrainedTokenizer):
-    vocab_files_names = {"vocab_file": "tokenizer.model"}
+    vocab_files_names = {
+        "vocab_file": "tokenizer.model",
+        "tokenizer_metadata_file": "tokenizer_metadata.json",
+    }
     model_input_names = [
         "input_ids",
         "attention_mask",
@@ -88,10 +93,23 @@ class SionTokenizer(PreTrainedTokenizer):
         script_classes: int = 9,
         tetm_type_id: int = 8,
         tetm_mode_id: int = 4,
+        tokenizer_metadata_file: str | None = None,
         **kwargs: Any,
     ):
         self.vocab_file = str(vocab_file)
         vocab_path = Path(self.vocab_file)
+        if tokenizer_metadata_file is None:
+            sibling_metadata = vocab_path.parent / "tokenizer_metadata.json"
+            self._tokenizer_metadata_path = sibling_metadata if sibling_metadata.is_file() else None
+        else:
+            metadata_candidate = Path(tokenizer_metadata_file)
+            if not metadata_candidate.is_absolute():
+                metadata_candidate = vocab_path.parent / metadata_candidate
+            if not metadata_candidate.is_file():
+                raise FileNotFoundError(
+                    f"tokenizer metadata file does not exist: {metadata_candidate}"
+                )
+            self._tokenizer_metadata_path = metadata_candidate
         actual_tokenizer_sha256 = _file_sha256(vocab_path)
         if tokenizer_sha256 is not None and actual_tokenizer_sha256 != tokenizer_sha256:
             raise ValueError(
@@ -203,7 +221,7 @@ class SionTokenizer(PreTrainedTokenizer):
                 )
             seen_pairs.add(edge)
             self.language_pairs.append(pair)
-        self._language_pair_edges = seen_pairs
+        self._language_pair_edges = frozenset(seen_pairs)
         current_direction_contract = bool(
             kwargs.get("pipeline") is not None
             or (
@@ -266,7 +284,7 @@ class SionTokenizer(PreTrainedTokenizer):
                 "every tokenizer language pair must have at least one translation direction: "
                 f"missing={missing_pairs!r}"
             )
-        self._translation_direction_edges = seen_directions
+        self._translation_direction_edges = frozenset(seen_directions)
         if not isinstance(translation_capable, bool):  # pyright: ignore[reportUnnecessaryIsInstance]
             raise ValueError("translation_capable must be a boolean")
         self.translation_capable = translation_capable
@@ -372,7 +390,90 @@ class SionTokenizer(PreTrainedTokenizer):
         kwargs.setdefault("script_classes", self.script_classes)
         kwargs.setdefault("tetm_type_id", self.tetm_type_id)
         kwargs.setdefault("tetm_mode_id", self.tetm_mode_id)
+        self._authenticated_language_pairs = tuple(tuple(pair) for pair in self.language_pairs)
+        self._authenticated_translation_directions = tuple(
+            tuple(direction) for direction in self.translation_directions
+        )
+        self._authenticated_translation_capable = self.translation_capable
+        self._validate_tokenizer_metadata(actual_tokenizer_sha256)
+        kwargs.setdefault(
+            "tokenizer_metadata_file",
+            (
+                self._tokenizer_metadata_path.name
+                if self._tokenizer_metadata_path is not None
+                else None
+            ),
+        )
         super().__init__(**kwargs)
+
+    def _validate_tokenizer_metadata(self, actual_tokenizer_sha256: str) -> None:
+        if self._tokenizer_metadata_path is None:
+            return
+        loaded = json.loads(self._tokenizer_metadata_path.read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict):
+            raise ValueError("tokenizer_metadata.json must contain a JSON object")
+        recorded_sha256 = loaded.get("model_sha256")
+        if recorded_sha256 is not None and (
+            not isinstance(recorded_sha256, str) or recorded_sha256 != actual_tokenizer_sha256
+        ):
+            raise ValueError("tokenizer metadata model_sha256 does not match tokenizer.model")
+        recorded_capability = loaded.get("translation_capable")
+        if recorded_capability is not None and (
+            not isinstance(recorded_capability, bool)
+            or recorded_capability is not self._authenticated_translation_capable
+        ):
+            raise ValueError(
+                "tokenizer metadata translation_capable disagrees with tokenizer config"
+            )
+
+        raw_pairs = loaded.get("language_pairs")
+        if raw_pairs is None and loaded.get("language_pair") is not None:
+            raw_pairs = [loaded["language_pair"]]
+        if raw_pairs is not None:
+            if isinstance(raw_pairs, (str, bytes)) or not isinstance(raw_pairs, Sequence):
+                raise ValueError("tokenizer metadata language_pairs must be a sequence")
+            metadata_pair_edges: set[frozenset[str]] = set()
+            for index, raw_pair in enumerate(raw_pairs):
+                if isinstance(raw_pair, (str, bytes)) or not isinstance(raw_pair, Sequence):
+                    raise ValueError(
+                        "each tokenizer metadata language pair must be a two-item sequence"
+                    )
+                pair = canonicalize_language_pair(
+                    raw_pair,
+                    field=f"tokenizer metadata language_pairs[{index}]",
+                )
+                edge = frozenset(pair)
+                if edge in metadata_pair_edges:
+                    raise ValueError("duplicate tokenizer metadata language pair")
+                metadata_pair_edges.add(edge)
+            if frozenset(metadata_pair_edges) != self._language_pair_edges:
+                raise ValueError(
+                    "tokenizer metadata disagree with tokenizer config on language_pairs"
+                )
+
+        raw_directions = loaded.get("translation_directions")
+        if raw_directions is not None:
+            if isinstance(raw_directions, (str, bytes)) or not isinstance(raw_directions, Sequence):
+                raise ValueError("tokenizer metadata translation_directions must be a sequence")
+            metadata_directions: set[tuple[str, str]] = set()
+            for index, raw_direction in enumerate(raw_directions):
+                if isinstance(raw_direction, (str, bytes)) or not isinstance(
+                    raw_direction, Sequence
+                ):
+                    raise ValueError(
+                        "each tokenizer metadata translation direction must be a two-item sequence"
+                    )
+                direction = canonicalize_language_pair(
+                    raw_direction,
+                    field=f"tokenizer metadata translation_directions[{index}]",
+                )
+                if direction in metadata_directions:
+                    raise ValueError("duplicate tokenizer metadata translation direction")
+                metadata_directions.add(direction)
+            if frozenset(metadata_directions) != self._translation_direction_edges:
+                raise ValueError(
+                    "tokenizer metadata disagree with tokenizer config on translation_directions"
+                )
 
     def _load_token_features(self, path: Path) -> dict[str, np.ndarray]:
         features: dict[str, np.ndarray] = {}
@@ -604,17 +705,42 @@ class SionTokenizer(PreTrainedTokenizer):
             raise ValueError("Sion tokenizer does not accept paired sentence inputs")
         prefix: list[int] = []
         if self.tgt_lang is not None:
-            self.tgt_lang = canonicalize_language_tag(
+            self.src_lang, self.tgt_lang = self._validated_translation_direction(
+                self.src_lang,
                 self.tgt_lang,
-                field="tokenizer tgt_lang",
             )
-            if self.tgt_lang not in self.language_tags:
-                raise ValueError(
-                    f"unsupported tgt_lang={self.tgt_lang!r}; "
-                    f"available={sorted(self.language_tags)}"
-                )
             prefix.append(self.language_tags[self.tgt_lang])
         return [*prefix, *token_ids_0, int(self.eos_token_id)]
+
+    def _validated_translation_direction(
+        self,
+        src_lang: str | None,
+        tgt_lang: str | None,
+    ) -> tuple[str, str]:
+        """Authenticate a requested direction before adding its target prefix."""
+
+        if not self._authenticated_translation_capable:
+            raise ValueError(
+                "this tokenizer belongs to a foundation model and is not translation-capable"
+            )
+        if src_lang is None or tgt_lang is None:
+            raise ValueError("src_lang and tgt_lang are required for translation")
+        source = canonicalize_language_tag(src_lang, field="src_lang")
+        target = canonicalize_language_tag(tgt_lang, field="tgt_lang")
+        if source not in self.language_tags or target not in self.language_tags:
+            raise ValueError(
+                f"unsupported translation direction {source}-{target}; "
+                f"available={sorted(self.language_tags)}"
+            )
+        if self._translation_direction_edges and (source, target) not in (
+            self._translation_direction_edges
+        ):
+            raise ValueError(
+                f"unsupported translation direction {source}->{target}; "
+                "trained="
+                f"{[list(direction) for direction in self._authenticated_translation_directions]}"
+            )
+        return source, target
 
     def get_special_tokens_mask(
         self,
@@ -627,6 +753,11 @@ class SionTokenizer(PreTrainedTokenizer):
             return [int(token_id in special) for token_id in token_ids_0]
         if token_ids_1 is not None:
             raise ValueError("Sion tokenizer does not accept paired sentence inputs")
+        if self.tgt_lang is not None:
+            self.src_lang, self.tgt_lang = self._validated_translation_direction(
+                self.src_lang,
+                self.tgt_lang,
+            )
         prefix = [1] if self.tgt_lang is not None else []
         return [*prefix, *([0] * len(token_ids_0)), 1]
 
@@ -638,35 +769,52 @@ class SionTokenizer(PreTrainedTokenizer):
         tgt_lang: str | None,
         **kwargs: Any,
     ):
-        if not self.translation_capable:
-            raise ValueError(
-                "this tokenizer belongs to a foundation model and is not translation-capable"
-            )
-        if src_lang is None or tgt_lang is None:
-            raise ValueError("src_lang and tgt_lang are required for translation")
-        src_lang = canonicalize_language_tag(src_lang, field="src_lang")
-        tgt_lang = canonicalize_language_tag(tgt_lang, field="tgt_lang")
-        if src_lang not in self.language_tags or tgt_lang not in self.language_tags:
-            raise ValueError(
-                f"unsupported translation direction {src_lang}-{tgt_lang}; "
-                f"available={sorted(self.language_tags)}"
-            )
-        if self._translation_direction_edges and (src_lang, tgt_lang) not in (
-            self._translation_direction_edges
-        ):
-            raise ValueError(
-                f"unsupported translation direction {src_lang}->{tgt_lang}; "
-                f"trained={self.translation_directions}"
-            )
-        self.src_lang = src_lang
-        self.tgt_lang = tgt_lang
+        self.src_lang, self.tgt_lang = self._validated_translation_direction(
+            src_lang,
+            tgt_lang,
+        )
         return self(raw_inputs, add_special_tokens=True, return_tensors=return_tensors, **kwargs)
+
+    def _assert_authenticated_contract_unchanged(self) -> None:
+        try:
+            current_pairs = tuple(tuple(pair) for pair in self.language_pairs)
+            current_directions = tuple(
+                tuple(direction) for direction in self.translation_directions
+            )
+        except TypeError as error:
+            raise ValueError(
+                "authenticated tokenizer language graph was mutated after loading"
+            ) from error
+        if (
+            current_pairs != self._authenticated_language_pairs
+            or current_directions != self._authenticated_translation_directions
+            or self.translation_capable is not self._authenticated_translation_capable
+        ):
+            raise ValueError("authenticated tokenizer contract was mutated after loading")
+
+    def save_pretrained(
+        self,
+        save_directory: str | os.PathLike[str],
+        legacy_format: bool | None = None,
+        filename_prefix: str | None = None,
+        push_to_hub: bool = False,
+        **kwargs: Any,
+    ) -> tuple[str, ...]:
+        self._assert_authenticated_contract_unchanged()
+        return super().save_pretrained(
+            save_directory,
+            legacy_format=legacy_format,
+            filename_prefix=filename_prefix,
+            push_to_hub=push_to_hub,
+            **kwargs,
+        )
 
     def save_vocabulary(
         self,
         save_directory: str,
         filename_prefix: str | None = None,
-    ) -> tuple[str]:
+    ) -> tuple[str, ...]:
+        self._assert_authenticated_contract_unchanged()
         directory = Path(save_directory)
         directory.mkdir(parents=True, exist_ok=True)
         filename = f"{filename_prefix}-tokenizer.model" if filename_prefix else "tokenizer.model"
@@ -677,4 +825,35 @@ class SionTokenizer(PreTrainedTokenizer):
             feature_destination = directory / self._token_features_path.name
             if self._token_features_path.resolve() != feature_destination.resolve():
                 shutil.copyfile(self._token_features_path, feature_destination)
-        return (str(destination),)
+        metadata: dict[str, Any] = {}
+        if self._tokenizer_metadata_path is not None:
+            loaded_metadata = json.loads(self._tokenizer_metadata_path.read_text(encoding="utf-8"))
+            if not isinstance(loaded_metadata, dict):
+                raise ValueError("tokenizer_metadata.json must contain a JSON object")
+            metadata.update(loaded_metadata)
+        metadata.update(
+            {
+                "model_file": filename,
+                "model_sha256": _file_sha256(destination),
+                "translation_capable": self._authenticated_translation_capable,
+                "language_pairs": [list(pair) for pair in self._authenticated_language_pairs],
+                "translation_directions": [
+                    list(direction) for direction in self._authenticated_translation_directions
+                ],
+            }
+        )
+        if len(self._authenticated_language_pairs) == 1:
+            metadata["language_pair"] = list(self._authenticated_language_pairs[0])
+        else:
+            metadata.pop("language_pair", None)
+        metadata_filename = (
+            f"{filename_prefix}-tokenizer_metadata.json"
+            if filename_prefix
+            else "tokenizer_metadata.json"
+        )
+        metadata_destination = directory / metadata_filename
+        metadata_destination.write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        return str(destination), str(metadata_destination)
