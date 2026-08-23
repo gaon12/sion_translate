@@ -10,14 +10,46 @@ import pytest
 
 from sion_translate.contamination import (
     ContaminationFinding,
-    assess_contamination,
+    ContaminationRepair,
+    assess_contamination as _assess_contamination,
     normalize,
     rank_findings,
-    repair_pair,
+    repair_pair as _repair_pair,
     spaced_normalize,
     supported_direction,
 )
 from sion_translate.data.quality import QualityPolicy, assess_pair
+
+
+def assess_contamination(
+    source: str,
+    target: str,
+    *,
+    source_language: str = "ko",
+    target_language: str = "ja",
+) -> list[ContaminationFinding]:
+    return _assess_contamination(
+        source,
+        target,
+        source_language=source_language,
+        target_language=target_language,
+    )
+
+
+def repair_pair(source: str, target: str) -> ContaminationRepair | None:
+    return _repair_pair(
+        source,
+        target,
+        source_language="ko",
+        target_language="ja",
+    )
+
+
+def test_contamination_apis_require_explicit_language_identity() -> None:
+    with pytest.raises(TypeError, match="source_language"):
+        _assess_contamination("source", "target")  # type: ignore[call-arg]
+    with pytest.raises(TypeError, match="source_language"):
+        _repair_pair("source", "target")  # type: ignore[call-arg]
 
 
 def test_the_documented_contamination_passes_the_quality_filter() -> None:
@@ -25,7 +57,12 @@ def test_the_documented_contamination_passes_the_quality_filter() -> None:
 
     실제 원천에서 확인된 오역이 기존 품질 필터를 만점으로 통과합니다.
     """
-    accepted = assess_pair("씨발 진짜 짜증나네", "種まき 本当にうざい", QualityPolicy())
+    accepted = assess_pair(
+        "씨발 진짜 짜증나네",
+        "種まき 本当にうざい",
+        QualityPolicy(),
+        languages=("ko", "ja"),
+    )
     assert accepted.accepted
 
 
@@ -196,7 +233,9 @@ def test_ranking_picks_the_most_confident_reason() -> None:
         ContaminationFinding("low", "약함", 0.2),
         ContaminationFinding("high", "강함", 0.9),
     ]
-    assert rank_findings(findings).rule == "high"
+    leader = rank_findings(findings)
+    assert leader is not None
+    assert leader.rule == "high"
     assert rank_findings([]) is None
 
 

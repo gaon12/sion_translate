@@ -6,7 +6,8 @@
 삭제가 아니라 재번역에 있습니다.
 
     python scripts/data/build_review_queue.py \
-        --input "data/*.jsonl" --output reports/review_queue.jsonl
+        --input "data/*.jsonl" --output reports/review_queue.jsonl \
+        --language-pair ko ja
 
 출력 한 줄이 검수 대상 하나이고, 원본 파일과 행 번호를 그대로 들고 있어
 고친 뒤 되돌려 넣을 수 있습니다.
@@ -36,8 +37,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--input", nargs="+", required=True, help="JSONL 파일 또는 glob")
     parser.add_argument("--output", required=True, help="검수 queue JSONL 경로")
-    parser.add_argument("--language-pair", nargs=2, default=["ko", "ja"])
-    parser.add_argument("--language-pairs", nargs=2, action="append")
+    language_group = parser.add_mutually_exclusive_group(required=True)
+    language_group.add_argument("--language-pair", nargs=2)
+    language_group.add_argument("--language-pairs", nargs=2, action="append")
     parser.add_argument(
         "--minimum-confidence",
         type=float,
@@ -55,10 +57,12 @@ def main() -> None:
     configure_stdio()
     args = build_parser().parse_args()
     pairs = normalize_language_pairs(args.language_pair, args.language_pairs)
-    if not any(supported_direction(*pair) for pair in pairs):
+    unsupported = [pair for pair in pairs if not supported_direction(*pair)]
+    if unsupported:
+        rendered = ", ".join(f"{source}→{target}" for source, target in unsupported)
         raise SystemExit(
-            "이 도구는 ko→ja 규칙만 가지고 있습니다. 규칙 없는 방향을 "
-            "'오염 없음' 으로 보고하지 않기 위해 여기서 중단합니다."
+            "이 도구는 ko→ja 규칙만 가지고 있습니다. 규칙 없는 방향을 조용히 "
+            f"제외하지 않기 위해 여기서 중단합니다: {rendered}"
         )
 
     paths = expand_inputs(args.input)
@@ -81,12 +85,15 @@ def main() -> None:
                     except (UnicodeDecodeError, json.JSONDecodeError):
                         continue
                     for pair in expand_parallel_record(row, pairs).pairs:
-                        if not supported_direction(pair.language_a, pair.language_b):
-                            continue
                         scanned += 1
                         source = canonical_text(pair.text_a)
                         target = canonical_text(pair.text_b)
-                        findings = assess_contamination(source, target)
+                        findings = assess_contamination(
+                            source,
+                            target,
+                            source_language=pair.language_a,
+                            target_language=pair.language_b,
+                        )
                         leader = rank_findings(findings)
                         if leader is None or leader.confidence < args.minimum_confidence:
                             continue

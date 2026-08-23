@@ -7,10 +7,12 @@
 후자는 `build_review_queue.py` 의 사람 검수 queue 로 남깁니다.
 
     # 무엇이 바뀔지 먼저 봅니다 (아무것도 쓰지 않음)
-    python scripts/data/apply_contamination_repairs.py --input "data/*.jsonl"
+    python scripts/data/apply_contamination_repairs.py --input "data/*.jsonl" \
+        --source-language ko --target-language ja
 
     # 실제로 적용합니다
     python scripts/data/apply_contamination_repairs.py --input "data/*.jsonl" \
+        --source-language ko --target-language ja \
         --apply --report reports/contamination_repairs.json
 
 ``--apply`` 없이는 아무 파일도 쓰지 않습니다. 코퍼스를 제자리에서 고치는
@@ -29,6 +31,7 @@ import shutil
 from collections import Counter
 from datetime import date
 from pathlib import Path
+from typing import cast
 
 from sion_translate.console import configure_stdio
 from sion_translate.contamination import repair_pair, supported_direction
@@ -45,8 +48,8 @@ def build_parser() -> argparse.ArgumentParser:
         description="확정적인 오염만 수정합니다 (기본은 미리보기, 쓰지 않음)"
     )
     parser.add_argument("--input", nargs="+", required=True, help="JSONL 파일 또는 glob")
-    parser.add_argument("--source-language", default="ko")
-    parser.add_argument("--target-language", default="ja")
+    parser.add_argument("--source-language", required=True)
+    parser.add_argument("--target-language", required=True)
     parser.add_argument(
         "--apply",
         action="store_true",
@@ -98,13 +101,14 @@ def main() -> None:
                 rewritten.append(raw_line)
                 continue
             try:
-                row = json.loads(stripped)
+                payload: object = json.loads(stripped)
             except json.JSONDecodeError:
                 rewritten.append(raw_line)
                 continue
-            if not isinstance(row, dict):
+            if not isinstance(payload, dict):
                 rewritten.append(raw_line)
                 continue
+            row = cast(dict[str, object], payload)
 
             source = row.get(source_language)
             target = row.get(target_language)

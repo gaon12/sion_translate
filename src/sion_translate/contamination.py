@@ -243,8 +243,8 @@ def assess_contamination(
     source: str,
     target: str,
     *,
-    source_language: str = "ko",
-    target_language: str = "ja",
+    source_language: str,
+    target_language: str,
 ) -> list[ContaminationFinding]:
     """한 쌍에 대한 의심 근거를 전부 돌려준다 (없으면 빈 목록).
 
@@ -354,8 +354,8 @@ def repair_pair(
     source: str,
     target: str,
     *,
-    source_language: str = "ko",
-    target_language: str = "ja",
+    source_language: str,
+    target_language: str,
 ) -> ContaminationRepair | None:
     """확정적으로 고칠 수 있는 오염만 고친다. 아니면 ``None``.
 
