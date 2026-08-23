@@ -7,16 +7,33 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
 from sion_translate.holdout_audit import (
     HoldoutItem,
-    audit_holdout_leakage,
+    audit_holdout_leakage as audit_with_pairs,
     containment,
-    load_holdout_items,
+    load_holdout_items as load_with_pairs,
     summarize,
 )
+
+
+LANGUAGE_PAIRS = (("ko", "ja"),)
+
+
+def load_holdout_items(paths):
+    return load_with_pairs(paths, language_pairs=LANGUAGE_PAIRS)
+
+
+def audit_holdout_leakage(items, corpus_paths, **kwargs):
+    return audit_with_pairs(
+        items,
+        corpus_paths,
+        language_pairs=LANGUAGE_PAIRS,
+        **kwargs,
+    )
 
 
 def _shard(path, rows):
@@ -50,6 +67,69 @@ def test_both_sides_of_a_challenge_case_are_audited(tmp_path) -> None:
     items = load_holdout_items([path])
     assert {item.identifier for item in items} == {"c1#source", "c1#reference"}
     assert {item.language for item in items} == {"ko", "ja"}
+
+
+def test_arbitrary_bcp47_pair_and_nested_corpus_are_audited(tmp_path) -> None:
+    challenge = _challenge(
+        tmp_path / "cases.jsonl",
+        [
+            {
+                "id": "regional",
+                "source": "Esta é uma frase de auditoria.",
+                "reference": "這是一個稽核句子。",
+                "source_language": "PT-br",
+                "target_language": "zh-hant",
+            }
+        ],
+    )
+    corpus = _shard(
+        tmp_path / "nested.jsonl",
+        [
+            {
+                "records": [
+                    {
+                        "source_language": "pt-BR",
+                        "target_language": "zh-Hant",
+                        "source": "Esta é uma frase de auditoria.",
+                        "target": "這是一個稽核句子。",
+                    }
+                ]
+            }
+        ],
+    )
+    pairs = (("pt-br", "ZH-hant"),)
+
+    items = load_with_pairs([challenge], language_pairs=pairs)
+    findings = audit_with_pairs(items, [corpus], language_pairs=pairs)
+
+    assert {item.language for item in items} == {"pt-BR", "zh-Hant"}
+    assert len([finding for finding in findings if finding.leaked]) == 2
+
+
+def test_holdout_rows_outside_the_configured_graph_are_rejected(tmp_path) -> None:
+    challenge = _challenge(
+        tmp_path / "cases.jsonl",
+        [
+            {
+                "id": "wrong-graph",
+                "source": "This case cannot be silently skipped.",
+                "source_language": "en",
+            }
+        ],
+    )
+
+    with pytest.raises(ValueError, match="outside the configured language_pairs graph"):
+        load_holdout_items([challenge])
+
+
+def test_holdout_text_without_language_identity_is_rejected(tmp_path) -> None:
+    challenge = _challenge(
+        tmp_path / "cases.jsonl",
+        [{"id": "missing-identity", "source": "언어 표지가 없는 문장입니다."}],
+    )
+
+    with pytest.raises(ValueError, match="requires source_language"):
+        load_holdout_items([challenge])
 
 
 def test_an_exact_duplicate_in_the_corpus_is_found(tmp_path) -> None:
@@ -245,6 +325,14 @@ def test_containment_answers_is_the_holdout_inside_the_corpus_line() -> None:
 def test_an_empty_holdout_is_refused(tmp_path) -> None:
     with pytest.raises(ValueError, match="challenge 문장이 없습니다"):
         audit_holdout_leakage([], [])
+
+
+def test_empty_corpus_and_nonpositive_match_cap_are_refused() -> None:
+    item = HoldoutItem("x", "ko", "가나다")
+    with pytest.raises(ValueError, match="학습 코퍼스가 없습니다"):
+        audit_holdout_leakage([item], [])
+    with pytest.raises(ValueError, match="maximum_matches_per_item"):
+        audit_holdout_leakage([item], [Path("unused.jsonl")], maximum_matches_per_item=0)
 
 
 @pytest.mark.parametrize("threshold", [0.0, -0.1, 1.5])

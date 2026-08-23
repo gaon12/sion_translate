@@ -57,6 +57,12 @@ from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
 from sion_translate.data.quality import canonical_text
+from sion_translate.data.records import (
+    expand_parallel_record,
+    languages_from_pairs,
+    normalize_language_pairs,
+)
+from sion_translate.language_tags import canonicalize_language_tag
 from sion_translate.splitting import character_shingles, comparison_key
 
 # challenge 문장의 3-gram 중 코퍼스 행에 들어 있는 비율의 하한. 위 표에서
@@ -107,7 +113,7 @@ class HoldoutFinding:
 def load_holdout_items(
     paths: Sequence[str | Path],
     *,
-    languages: Sequence[str] = ("ko", "ja"),
+    language_pairs: Sequence[Sequence[str]],
 ) -> list[HoldoutItem]:
     """challenge JSONL 에서 원문과 정답을 **양쪽 다** 감사 대상으로 삼는다.
 
@@ -115,8 +121,10 @@ def load_holdout_items(
     본 적이 있는 것이고, 그것도 누출입니다.
     """
 
+    pairs = normalize_language_pairs(language_pairs=language_pairs)
+    allowed = set(languages_from_pairs(pairs))
     items: list[HoldoutItem] = []
-    allowed = set(languages)
+    seen_identifiers: set[str] = set()
     for path in paths:
         path = Path(path)
         if not path.is_file():
@@ -126,6 +134,8 @@ def load_holdout_items(
             if not raw:
                 continue
             row = json.loads(raw)
+            if not isinstance(row, dict):
+                raise ValueError(f"{path}:{line_number} must contain a JSON object")
             identifier = str(row.get("id") or f"{path.name}:{line_number}")
             category = str(row.get("category", ""))
             for field_name, language_field in (
@@ -133,12 +143,27 @@ def load_holdout_items(
                 ("reference", "target_language"),
             ):
                 text = row.get(field_name)
-                language = str(row.get(language_field, ""))
-                if not isinstance(text, str) or not text.strip() or language not in allowed:
+                raw_language = row.get(language_field)
+                if not isinstance(text, str) or not text.strip():
                     continue
+                if not isinstance(raw_language, str) or not raw_language.strip():
+                    raise ValueError(f"{path}:{line_number} {field_name} requires {language_field}")
+                language = canonicalize_language_tag(
+                    raw_language,
+                    field=f"{path}:{line_number} {language_field}",
+                )
+                if language not in allowed:
+                    raise ValueError(
+                        f"{path}:{line_number} {language_field}={language!r} is outside "
+                        f"the configured language_pairs graph {sorted(allowed)}"
+                    )
+                item_identifier = f"{identifier}#{field_name}"
+                if item_identifier in seen_identifiers:
+                    raise ValueError(f"duplicate holdout identifier: {item_identifier!r}")
+                seen_identifiers.add(item_identifier)
                 items.append(
                     HoldoutItem(
-                        identifier=f"{identifier}#{field_name}",
+                        identifier=item_identifier,
                         language=language,
                         text=canonical_text(text),
                         category=category,
@@ -167,11 +192,11 @@ def containment(holdout_text: str, corpus_text: str) -> float:
 def iter_corpus_texts(
     paths: Iterable[Path],
     *,
-    languages: Sequence[str] = ("ko", "ja"),
+    language_pairs: Sequence[Sequence[str]],
 ) -> Iterator[tuple[Path, int, str, str]]:
-    """``(파일, 행 번호, 언어, 텍스트)`` 를 낸다. 언어별 필드만 봅니다."""
+    """Yield endpoints from every supported parallel-record layout."""
 
-    allowed = tuple(languages)
+    pairs = normalize_language_pairs(language_pairs=language_pairs)
     for path in paths:
         with path.open("rb") as handle:
             for line_number, raw_line in enumerate(handle, 1):
@@ -179,11 +204,17 @@ def iter_corpus_texts(
                     row = json.loads(raw_line.decode("utf-8-sig"))
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     continue
-                if not isinstance(row, dict):
-                    continue
-                for language in allowed:
-                    value = row.get(language)
-                    if isinstance(value, str) and value.strip():
+                expansion = expand_parallel_record(row, pairs)
+                seen_endpoints: set[tuple[str, str]] = set()
+                for pair in expansion.pairs:
+                    for language, value in (
+                        (pair.language_a, pair.text_a),
+                        (pair.language_b, pair.text_b),
+                    ):
+                        endpoint = (language, canonical_text(value))
+                        if endpoint in seen_endpoints:
+                            continue
+                        seen_endpoints.add(endpoint)
                         yield path, line_number, language, value
 
 
@@ -193,7 +224,7 @@ def audit_holdout_leakage(
     *,
     similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
     maximum_matches_per_item: int = 5,
-    languages: Sequence[str] = ("ko", "ja"),
+    language_pairs: Sequence[Sequence[str]],
 ) -> list[HoldoutFinding]:
     """challenge 문장이 학습 코퍼스에 있는지 전량 스캔으로 확인한다."""
 
@@ -201,6 +232,27 @@ def audit_holdout_leakage(
         raise ValueError("similarity_threshold must be in (0, 1]")
     if not items:
         raise ValueError("감사할 challenge 문장이 없습니다")
+    if not corpus_paths:
+        raise ValueError("감사할 학습 코퍼스가 없습니다")
+    if maximum_matches_per_item < 1:
+        raise ValueError("maximum_matches_per_item must be positive")
+    pairs = normalize_language_pairs(language_pairs=language_pairs)
+    known_languages = set(languages_from_pairs(pairs))
+    canonical_item_languages = {
+        item.identifier: canonicalize_language_tag(
+            item.language,
+            field=f"holdout item {item.identifier!r} language",
+        )
+        for item in items
+    }
+    unknown_languages = sorted(set(canonical_item_languages.values()) - known_languages)
+    if unknown_languages:
+        raise ValueError(
+            "holdout item languages must appear in language_pairs; "
+            f"unknown languages: {unknown_languages}"
+        )
+    if len({item.identifier for item in items}) != len(items):
+        raise ValueError("holdout item identifiers must be unique")
 
     findings = {item.identifier: HoldoutFinding(item=item) for item in items}
     # challenge 3-gram 역색인. challenge 는 수십 개뿐이라 색인이 작고, 코퍼스
@@ -208,10 +260,13 @@ def audit_holdout_leakage(
     index: dict[tuple[str, str], set[str]] = {}
     for item in items:
         for shingle in shingles(item.text):
-            index.setdefault((item.language, shingle), set()).add(item.identifier)
+            index.setdefault((canonical_item_languages[item.identifier], shingle), set()).add(
+                item.identifier
+            )
 
     for path, line_number, language, raw_text in iter_corpus_texts(
-        corpus_paths, languages=languages
+        corpus_paths,
+        language_pairs=pairs,
     ):
         text = canonical_text(raw_text)
         candidate_ids: set[str] = set()

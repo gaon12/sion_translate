@@ -2,7 +2,8 @@
 
     python scripts/data/audit_holdout_leakage.py \
         --holdout examples/expressive_cultural_cases.jsonl \
-        --corpus "data/*.jsonl" --output reports/holdout_leakage.json
+        --corpus "data/*.jsonl" --language-pair ko ja \
+        --output reports/holdout_leakage.json
 
 누출된 항목이 있으면 종료 코드가 0이 아닙니다. 독립 holdout 이 아닌 것을
 품질 benchmark 로 인용하는 일을 막기 위한 관문입니다.
@@ -28,7 +29,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="challenge 문장의 학습 코퍼스 누출 감사")
     parser.add_argument("--holdout", nargs="+", required=True, help="challenge JSONL")
     parser.add_argument("--corpus", nargs="+", required=True, help="학습 JSONL 또는 glob")
-    parser.add_argument("--language", nargs="+", default=["ko", "ja"])
+    parser.add_argument(
+        "--language-pair",
+        nargs=2,
+        action="append",
+        required=True,
+        metavar=("LANG_A", "LANG_B"),
+    )
     parser.add_argument("--similarity", type=float, default=DEFAULT_SIMILARITY_THRESHOLD)
     parser.add_argument("--max-matches", type=int, default=5)
     parser.add_argument("--output", help="JSON 보고서 경로")
@@ -43,7 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     configure_stdio()
     args = build_parser().parse_args()
-    items = load_holdout_items(args.holdout, languages=args.language)
+    items = load_holdout_items(args.holdout, language_pairs=args.language_pair)
     if not items:
         raise SystemExit(f"challenge 문장을 읽지 못했습니다: {args.holdout}")
     corpus = expand_inputs(args.corpus)
@@ -56,7 +63,7 @@ def main() -> None:
         corpus,
         similarity_threshold=args.similarity,
         maximum_matches_per_item=args.max_matches,
-        languages=args.language,
+        language_pairs=args.language_pair,
     )
     summary = summarize(findings)
     report = {
