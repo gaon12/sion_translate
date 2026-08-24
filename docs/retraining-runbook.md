@@ -309,10 +309,12 @@ Candidate generation uses the same safety policy as deployment:
 - round-trip reward is available only when the required authenticated reverse edge
   exists.
 
-This is not only candidate reranking. At inference time, the deployed T2/M2 path feeds
-the first prediction back through the learned revision edge and returns the refined
-second prediction. Export metadata binds both translation and revision direction graphs,
-so inference fails closed when a requested refinement edge was not trained.
+This is not candidate reranking. At every decoder position, the deployed T2/M2 path
+feeds the first full-vocabulary distribution back into the decoder state and selects the
+token from a newly computed second distribution. A separate sequence-level revision
+path can feed a completed draft back through a trained revision edge. Export metadata
+binds the distribution-refinement feature and the exact translation and revision graphs,
+so inference fails closed instead of advertising an untrained capability.
 
 MRT can use more memory than teacher-forced SFT. If it runs out of memory, reduce
 `posttraining.batch_size_per_gpu`, then candidate micro-batch size, candidates per source,
