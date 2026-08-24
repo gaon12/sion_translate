@@ -1421,6 +1421,10 @@ def _publish_tokenizer_generation(staging: Path, output_dir: Path) -> Path:
     for name in TOKENIZER_ARTIFACT_FILENAMES:
         source = staging / name
         _assert_plain_tokenizer_file(source, role=f"staged tokenizer artifact {name}")
+        with source.open("rb") as handle:
+            os.fsync(handle.fileno())
+    for name in TOKENIZER_ARTIFACT_FILENAMES:
+        source = staging / name
         destination = output_dir / name
         if name == "sion.model" and (destination.exists() or destination.is_symlink()):
             raise FileExistsError(f"refusing to replace an existing tokenizer model: {destination}")
