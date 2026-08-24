@@ -28,10 +28,11 @@ import json
 import math
 import os
 import shutil
+import sqlite3
 import tempfile
 import unicodedata
 from dataclasses import asdict, dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, cast
 
 import numpy as np
@@ -63,7 +64,13 @@ from sion_translate.splitting import choose_split_for_key
 from sion_translate.tokenizer import SionTokenizer, normalize_text
 
 FOUNDATION_INDEX_FORMAT = "sion-foundation-indexed-v2"
-FOUNDATION_PREPROCESSING_SCHEMA = "foundation-mixed-objectives-v4"
+FOUNDATION_PREPROCESSING_SCHEMA = "foundation-mixed-objectives-v5"
+FOUNDATION_SOURCE_IDENTITY_SCHEMA = "corpus-relative-posix-sha256-v1"
+FOUNDATION_TOKENIZER_IDENTITY_SCHEMA = "content-sha256-v1"
+FOUNDATION_DEDUPLICATION_BACKEND = "sqlite-blake2b-128-v1"
+_DEDUPLICATION_DATABASE = ".foundation-dedup.sqlite3"
+_DEDUPLICATION_CACHE_KIB = 8 * 1024
+_DEDUPLICATION_COMMIT_INTERVAL = 100_000
 
 
 @dataclass
@@ -125,6 +132,103 @@ class _FileSnapshot:
     modified_ns: int
     device: int
     inode: int
+
+
+class _DiskDigestIndex:
+    """Bound deduplication memory with a disk-backed unique digest index.
+
+    The index is scratch state inside the unpublished staging directory. SQLite
+    enforces uniqueness deterministically while its negative ``cache_size``
+    value caps the page cache in KiB. Durability is deliberately disabled: a
+    failed preparation discards the complete staging generation, so recovering
+    this private index would provide no value.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._connection = sqlite3.connect(path)
+        self._pending = 0
+        try:
+            self._connection.execute("PRAGMA journal_mode=OFF")
+            self._connection.execute("PRAGMA synchronous=OFF")
+            self._connection.execute("PRAGMA temp_store=FILE")
+            self._connection.execute(f"PRAGMA cache_size=-{_DEDUPLICATION_CACHE_KIB}")
+            self._connection.execute("PRAGMA locking_mode=EXCLUSIVE")
+            self._connection.execute("CREATE TABLE digests (digest BLOB PRIMARY KEY) WITHOUT ROWID")
+            self._connection.execute("BEGIN IMMEDIATE")
+        except BaseException:
+            self._connection.close()
+            raise
+
+    def add(self, digest: bytes) -> bool:
+        """Insert a digest and return ``True`` only for its first occurrence."""
+
+        cursor = self._connection.execute(
+            "INSERT OR IGNORE INTO digests (digest) VALUES (?)",
+            (sqlite3.Binary(digest),),
+        )
+        inserted = cursor.rowcount == 1
+        self._pending += 1
+        if self._pending >= _DEDUPLICATION_COMMIT_INTERVAL:
+            self._connection.commit()
+            self._connection.execute("BEGIN IMMEDIATE")
+            self._pending = 0
+        return inserted
+
+    def close(self) -> None:
+        """Close and remove every private SQLite artifact before publication."""
+
+        try:
+            self._connection.commit()
+        finally:
+            self._connection.close()
+        for suffix in ("", "-journal", "-shm", "-wal"):
+            candidate = Path(f"{self.path}{suffix}")
+            if _path_exists(candidate):
+                candidate.unlink()
+
+
+def _logical_relative_path(root: Path, path: Path, *, role: str) -> str:
+    """Return a portable POSIX path that is confined below ``root``."""
+
+    try:
+        resolved_root = root.resolve(strict=True)
+        resolved_path = path.resolve(strict=True)
+        relative = resolved_path.relative_to(resolved_root)
+    except (OSError, ValueError) as error:
+        raise ValueError(f"foundation {role} must stay below the corpus root: {path}") from error
+    if not relative.parts:
+        return "."
+    logical_path = PurePosixPath(*relative.parts).as_posix()
+    if logical_path.startswith("/") or ".." in PurePosixPath(logical_path).parts:
+        raise ValueError(f"foundation {role} has an unsafe logical path: {path}")
+    return logical_path
+
+
+def _source_logical_path(discovery: MonolingualDiscovery, path: Path) -> str:
+    return _logical_relative_path(discovery.root, path, role="source")
+
+
+def _source_identity_digest(records: list[dict[str, object]]) -> str:
+    """Hash the ordered, path-portable source identity records."""
+
+    identity_records = [
+        {
+            "language": record["language"],
+            "logical_path": record["logical_path"],
+            "sha256": record["sha256"],
+            "size_bytes": record["size_bytes"],
+            "task": record["task"],
+        }
+        for record in records
+    ]
+    payload = json.dumps(
+        identity_records,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _text_digest(language: str, text: str) -> bytes:
@@ -422,19 +526,38 @@ def foundation_dataset_problem(
         return "foundation indexed format이 바뀌었습니다"
     if manifest.get("stage") != "foundation":
         return "foundation stage identity가 잘못되었습니다"
+    if manifest.get("source_identity_schema") != FOUNDATION_SOURCE_IDENTITY_SCHEMA:
+        return (
+            "foundation source identity is obsolete; rebuild the dataset to replace "
+            "machine-specific absolute paths with portable corpus-relative identities"
+        )
     if manifest.get("preprocessing_schema") != FOUNDATION_PREPROCESSING_SCHEMA:
         return "foundation 전처리 schema가 바뀌었습니다"
     if manifest.get("release_name") != release_name:
         return "foundation release_name이 바뀌었습니다"
     try:
-        tokenizer_hash = file_sha256(tokenizer_model)
-    except OSError as error:
+        current_tokenizer = _tokenizer_snapshot(Path(tokenizer_model))
+    except (OSError, RuntimeError) as error:
         return f"tokenizer hash를 읽을 수 없습니다: {error}"
+    tokenizer_hash = current_tokenizer.sha256
     if manifest.get("tokenizer_sha256") != tokenizer_hash:
         return "foundation tokenizer가 바뀌었습니다"
+    if manifest.get("fingerprint") != {"tokenizer_sha256": tokenizer_hash}:
+        return "foundation tokenizer fingerprint가 잘못되었습니다"
+    raw_tokenizer_identity: object = manifest.get("tokenizer_identity")
+    if not isinstance(raw_tokenizer_identity, dict):
+        return "foundation tokenizer identity가 없습니다"
+    tokenizer_identity = cast(dict[str, Any], raw_tokenizer_identity)
+    if tokenizer_identity != {
+        "schema": FOUNDATION_TOKENIZER_IDENTITY_SCHEMA,
+        "size_bytes": current_tokenizer.size_bytes,
+        "sha256": tokenizer_hash,
+    }:
+        return "foundation tokenizer identity가 바뀌었습니다"
 
     expected_options = {
         "deduplicate": deduplicate,
+        "deduplication_backend": (FOUNDATION_DEDUPLICATION_BACKEND if deduplicate else "disabled"),
         "maximum_characters": maximum_characters,
         "max_tokens": max_tokens,
         "max_target_tokens": max_target_tokens,
@@ -461,10 +584,10 @@ def foundation_dataset_problem(
     if not isinstance(raw_sources, list):
         return "foundation source 목록이 없습니다"
     source_values = cast(list[object], raw_sources)
-    actual_sources: set[tuple[str, str, int, str, str]] = set()
+    actual_sources: list[tuple[str, str, int, str, str]] = []
     for raw_source in source_values:
         if not isinstance(raw_source, dict):
-            continue
+            return "foundation source 항목이 잘못되었습니다"
         source = cast(dict[str, Any], raw_source)
         try:
             source_hash = source.get("sha256")
@@ -474,10 +597,19 @@ def foundation_dataset_problem(
                 or any(character not in "0123456789abcdef" for character in source_hash)
             ):
                 return "foundation source 항목의 SHA-256이 잘못되었습니다"
-            actual_sources.add(
+            logical_path = source.get("logical_path")
+            if (
+                not isinstance(logical_path, str)
+                or not logical_path
+                or logical_path.startswith("/")
+                or ".." in PurePosixPath(logical_path).parts
+                or PurePosixPath(logical_path).as_posix() != logical_path
+            ):
+                return "foundation source 항목의 logical_path가 잘못되었습니다"
+            actual_sources.append(
                 (
                     str(source.get("language", "")),
-                    str(Path(str(source.get("path", ""))).resolve()),
+                    logical_path,
                     int(source.get("size_bytes", -1)),
                     str(source.get("task", "")),
                     source_hash,
@@ -497,22 +629,56 @@ def foundation_dataset_problem(
         dict.fromkeys((*discovery.languages, *discovery.languages_without_data))
     )
     rediscovered = discover_monolingual_sources(discovery.root, configured_languages)
-    expected_sources: set[tuple[str, str, int, str, str]] = set()
+    rediscovered_sources: set[tuple[str, str, int, str, str]] = set()
     for source in rediscovered.sources:
         try:
             source_hash = _source_sha256(source.path)
-        except OSError as error:
+            logical_path = _source_logical_path(rediscovered, source.path)
+        except (OSError, ValueError) as error:
             return str(error)
-        expected_sources.add(
+        rediscovered_sources.add(
             (
                 source.language,
-                str(source.path.resolve()),
+                logical_path,
                 source.size_bytes,
                 "reasoning" if is_reasoning_jsonl(source.path) else "denoising",
                 source_hash,
             )
         )
-    if actual_sources != expected_sources or len(actual_sources) != len(source_values):
+    expected_sources: list[tuple[str, str, int, str, str]] = []
+    for source in discovery.sources:
+        try:
+            source_hash = _source_sha256(source.path)
+            logical_path = _source_logical_path(discovery, source.path)
+        except (OSError, ValueError) as error:
+            return str(error)
+        expected_sources.append(
+            (
+                source.language,
+                logical_path,
+                source.size_bytes,
+                "reasoning" if is_reasoning_jsonl(source.path) else "denoising",
+                source_hash,
+            )
+        )
+    identity_payload: list[dict[str, object]] = [
+        {
+            "language": language,
+            "logical_path": logical_path,
+            "size_bytes": size_bytes,
+            "task": task,
+            "sha256": source_hash,
+        }
+        for language, logical_path, size_bytes, task, source_hash in actual_sources
+    ]
+    if manifest.get("sources_sha256") != _source_identity_digest(identity_payload):
+        return "foundation source aggregate fingerprint가 잘못되었습니다"
+    if (
+        len(rediscovered_sources) != len(rediscovered.sources)
+        or rediscovered_sources != set(expected_sources)
+        or actual_sources != expected_sources
+        or len(actual_sources) != len(source_values)
+    ):
         return "foundation 원천 파일 목록/크기/내용이 바뀌었습니다"
     artifact_problem = dataset_artifact_problem(output_dir)
     if artifact_problem is not None:
@@ -774,18 +940,42 @@ def _foundation_manifest_semantic_problem(
             or raw_source_id != source_id
         ):
             return f"foundation manifest source id가 연속적이지 않습니다: {source_id}"
+        if set(source) != {
+            "id",
+            "language",
+            "logical_path",
+            "name",
+            "records",
+            "sha256",
+            "size_bytes",
+            "task",
+        }:
+            return f"foundation manifest source fields가 잘못되었습니다: {source_id}"
         name = source.get("name")
         if not isinstance(name, str) or not name or name != expected_source.path.name:
             return f"foundation manifest source name이 잘못되었습니다: {source_id}"
         if source.get("language") != expected_source.language:
             return f"foundation manifest source language가 잘못되었습니다: {source_id}"
         try:
-            source_path = Path(str(source.get("path", ""))).resolve()
-            expected_path = expected_source.path.resolve(strict=True)
-        except OSError as error:
-            return f"foundation manifest source path를 확인할 수 없습니다: {error}"
-        if source_path != expected_path:
-            return f"foundation manifest source path가 잘못되었습니다: {source_id}"
+            expected_logical_path = _source_logical_path(discovery, expected_source.path)
+        except ValueError as error:
+            return str(error)
+        if source.get("logical_path") != expected_logical_path:
+            return f"foundation manifest source logical_path가 잘못되었습니다: {source_id}"
+        size_bytes = source.get("size_bytes")
+        if (
+            isinstance(size_bytes, bool)
+            or not isinstance(size_bytes, int)
+            or size_bytes != expected_source.size_bytes
+        ):
+            return f"foundation manifest source size_bytes가 잘못되었습니다: {source_id}"
+        source_hash = source.get("sha256")
+        if (
+            not isinstance(source_hash, str)
+            or len(source_hash) != 64
+            or any(character not in "0123456789abcdef" for character in source_hash)
+        ):
+            return f"foundation manifest source sha256가 잘못되었습니다: {source_id}"
         expected_task = "reasoning" if is_reasoning_jsonl(expected_source.path) else "denoising"
         if source.get("task") != expected_task:
             return f"foundation manifest source task가 잘못되었습니다: {source_id}"
@@ -1023,15 +1213,19 @@ def _prepare_foundation_dataset_in_staging(
         )
     language_to_id = {language: index for index, language in enumerate(languages)}
 
+    deduplication_index = (
+        _DiskDigestIndex(output_dir / _DEDUPLICATION_DATABASE) if deduplicate else None
+    )
     writers: dict[str, ShardWriter] = {}
     try:
         for split in ("train", "validation"):
             writers[split] = ShardWriter(output_dir, split, shard_size, language_to_id)
     except BaseException:
         _close_shard_writers(writers, suppress_errors=True)
+        if deduplication_index is not None:
+            deduplication_index.close()
         raise
     stats = FoundationPrepareStats(languages={language: LanguageStats() for language in languages})
-    seen: set[bytes] = set()
     source_ids = {source.path: index for index, source in enumerate(discovery.sources)}
     source_record_counts = {source_id: 0 for source_id in source_ids.values()}
 
@@ -1044,13 +1238,11 @@ def _prepare_foundation_dataset_in_staging(
     ) -> None:
         """조각 하나를 shard 에 넣는다 (중복·빈 토큰은 여기서 걸러냄)."""
 
-        nonlocal seen
-        if deduplicate:
+        if deduplication_index is not None:
             digest = _text_digest(language, text)
-            if digest in seen:
+            if not deduplication_index.add(digest):
                 language_stats.duplicate += 1
                 return
-            seen.add(digest)
         token_ids = tokenizer.encode(text)[:max_tokens]
         if not token_ids:
             language_stats.empty_after_tokenization += 1
@@ -1092,11 +1284,9 @@ def _prepare_foundation_dataset_in_staging(
         """Write one structured prompt-to-trace example without denoising it."""
 
         digest = _reasoning_digest(language, record.prompt, record.think, record.answer)
-        if deduplicate and digest in seen:
+        if deduplication_index is not None and not deduplication_index.add(digest):
             language_stats.duplicate += 1
             return
-        if deduplicate:
-            seen.add(digest)
         encoded = serialize_reasoning_record(
             record,
             tokenizer,
@@ -1186,9 +1376,15 @@ def _prepare_foundation_dataset_in_staging(
             language_stats.merge_read(read_stats)
     except BaseException:
         _close_shard_writers(writers, suppress_errors=True)
+        if deduplication_index is not None:
+            deduplication_index.close()
         raise
     else:
-        _close_shard_writers(writers, suppress_errors=False)
+        try:
+            _close_shard_writers(writers, suppress_errors=False)
+        finally:
+            if deduplication_index is not None:
+                deduplication_index.close()
 
     if stats.total_records == 0:
         raise ValueError(
@@ -1207,6 +1403,19 @@ def _prepare_foundation_dataset_in_staging(
         alpha=language_sampling_alpha,
         minimum_share=minimum_language_share,
     )
+    source_manifest_records: list[dict[str, object]] = [
+        {
+            "id": source_ids[source.path],
+            "language": source.language,
+            "name": source.path.name,
+            "logical_path": _source_logical_path(discovery, source.path),
+            "size_bytes": source_snapshots[index].size_bytes,
+            "sha256": source_snapshots[index].sha256,
+            "task": "reasoning" if is_reasoning_jsonl(source.path) else "denoising",
+            "records": source_record_counts[source_ids[source.path]],
+        }
+        for index, source in enumerate(discovery.sources)
+    ]
     manifest = {
         "format": FOUNDATION_INDEX_FORMAT,
         "stage": "foundation",
@@ -1225,11 +1434,22 @@ def _prepare_foundation_dataset_in_staging(
         "source_only_languages": [],
         "storage_sides": ["src", "tgt"],
         "index_dtype": INDEX_DTYPE.descr,
-        "tokenizer_model": tokenizer_snapshot.resolved_path,
+        # This is a display label, not a filesystem identity. The adjacent
+        # content-addressed object authenticates a tokenizer after relocation.
+        "tokenizer_model": Path(tokenizer_snapshot.resolved_path).name,
         "tokenizer_sha256": tokenizer_snapshot.sha256,
+        "fingerprint": {"tokenizer_sha256": tokenizer_snapshot.sha256},
+        "tokenizer_identity": {
+            "schema": FOUNDATION_TOKENIZER_IDENTITY_SCHEMA,
+            "size_bytes": tokenizer_snapshot.size_bytes,
+            "sha256": tokenizer_snapshot.sha256,
+        },
         "preprocessing_schema": FOUNDATION_PREPROCESSING_SCHEMA,
         "preprocessing_options": {
             "deduplicate": deduplicate,
+            "deduplication_backend": (
+                FOUNDATION_DEDUPLICATION_BACKEND if deduplicate else "disabled"
+            ),
             "maximum_characters": maximum_characters,
             "max_tokens": max_tokens,
             "max_target_tokens": max_target_tokens,
@@ -1245,21 +1465,19 @@ def _prepare_foundation_dataset_in_staging(
             "counts": balance.counts,
             "warnings": list(balance.warnings),
         },
-        "sources": [
-            {
-                "id": source_ids[source.path],
-                "language": source.language,
-                "name": source.path.name,
-                "path": str(source.path),
-                "size_bytes": source_snapshots[index].size_bytes,
-                "sha256": source_snapshots[index].sha256,
-                "task": "reasoning" if is_reasoning_jsonl(source.path) else "denoising",
-                "records": source_record_counts[source_ids[source.path]],
-            }
-            for index, source in enumerate(discovery.sources)
-        ],
+        "source_identity_schema": FOUNDATION_SOURCE_IDENTITY_SCHEMA,
+        "sources_sha256": _source_identity_digest(source_manifest_records),
+        "sources": source_manifest_records,
         "skipped": [
-            {"path": str(entry.path), "reason": entry.reason} for entry in discovery.skipped
+            {
+                "logical_path": _logical_relative_path(
+                    discovery.root,
+                    entry.path,
+                    role="skipped entry",
+                ),
+                "reason": entry.reason,
+            }
+            for entry in discovery.skipped
         ],
         "stats": {
             "train_records": stats.train_records,
@@ -1406,8 +1624,11 @@ def render_prepare_report(stats: FoundationPrepareStats) -> list[str]:
 
 
 __all__ = [
+    "FOUNDATION_DEDUPLICATION_BACKEND",
     "FOUNDATION_INDEX_FORMAT",
     "FOUNDATION_PREPROCESSING_SCHEMA",
+    "FOUNDATION_SOURCE_IDENTITY_SCHEMA",
+    "FOUNDATION_TOKENIZER_IDENTITY_SCHEMA",
     "FoundationPrepareStats",
     "LanguageStats",
     "foundation_dataset_problem",

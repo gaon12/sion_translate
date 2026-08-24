@@ -11,6 +11,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
+from pathlib import PurePosixPath
 
 import pytest
 
@@ -130,9 +132,56 @@ def test_the_manifest_records_the_stage_identity(tmp_path, tokenizer_model) -> N
     assert all(pair[0] == pair[1] for pair in manifest["language_pairs"])
     assert manifest["source_only_languages"] == []
     assert set(manifest["language_sampling"]["weights"]) == {"ko", "ja"}
+    assert manifest["source_identity_schema"] == "corpus-relative-posix-sha256-v1"
+    assert manifest["tokenizer_model"] == tokenizer_model.name
+    assert manifest["tokenizer_identity"] == {
+        "schema": "content-sha256-v1",
+        "size_bytes": tokenizer_model.stat().st_size,
+        "sha256": hashlib.sha256(tokenizer_model.read_bytes()).hexdigest(),
+    }
     for source in manifest["sources"]:
-        path = next(item.path for item in discovery.sources if str(item.path) == source["path"])
+        assert not PurePosixPath(source["logical_path"]).is_absolute()
+        assert "\\" not in source["logical_path"]
+        path = discovery.root.joinpath(*PurePosixPath(source["logical_path"]).parts)
         assert source["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_manifest_source_identities_survive_corpus_relocation(
+    tmp_path,
+    tokenizer_model,
+) -> None:
+    original_root = _corpus(tmp_path / "windows-export" / "corpus")
+    discovery = discover_monolingual_sources(original_root, ["ko", "ja"])
+    prepare_foundation_dataset(
+        discovery,
+        tokenizer_model,
+        tmp_path / "dataset",
+        shard_size=32,
+    )
+
+    relocated_root = tmp_path / "linux-import" / "corpus"
+    shutil.copytree(original_root, relocated_root)
+    relocated = discover_monolingual_sources(relocated_root, ["ko", "ja"])
+
+    assert _dataset_problem(tmp_path, relocated, tokenizer_model) is None
+
+
+def test_absolute_path_manifest_requires_a_clear_portable_identity_migration(
+    tmp_path,
+    tokenizer_model,
+) -> None:
+    discovery, _ = _prepare(tmp_path, tokenizer_model)
+    manifest_path = tmp_path / "dataset" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    del manifest["source_identity_schema"]
+    manifest["sources"][0]["path"] = str(discovery.sources[0].path.resolve())
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    problem = _dataset_problem(tmp_path, discovery, tokenizer_model)
+
+    assert problem is not None
+    assert "obsolete" in problem
+    assert "portable corpus-relative identities" in problem
 
 
 def test_same_size_source_mutation_invalidates_the_prepared_dataset(
@@ -250,7 +299,7 @@ def test_the_manifest_carries_the_skipped_paths_forward(tmp_path, tokenizer_mode
     prepare_foundation_dataset(discovery, tokenizer_model, tmp_path / "dataset", shard_size=32)
 
     manifest = json.loads((tmp_path / "dataset" / "manifest.json").read_text(encoding="utf-8"))
-    skipped = {entry["path"] for entry in manifest["skipped"]}
+    skipped = {entry["logical_path"] for entry in manifest["skipped"]}
     assert any(path.endswith("notes.md") for path in skipped)
 
 
@@ -287,6 +336,22 @@ def test_duplicates_are_removed_within_a_language(tmp_path, tokenizer_model) -> 
     stats = prepare_foundation_dataset(discovery, tokenizer_model, tmp_path / "dataset")
     assert stats.languages["ko"].accepted == 1
     assert stats.languages["ko"].duplicate == 4
+    manifest = json.loads((tmp_path / "dataset" / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["preprocessing_options"]["deduplication_backend"] == "sqlite-blake2b-128-v1"
+    assert not list((tmp_path / "dataset").glob(".foundation-dedup.sqlite3*"))
+
+
+def test_disk_deduplication_uses_a_fixed_cache_and_removes_private_state(tmp_path) -> None:
+    database = tmp_path / "dedup.sqlite3"
+    index = foundation_prepare._DiskDigestIndex(database)
+
+    assert index._connection.execute("PRAGMA cache_size").fetchone() == (-8192,)
+    assert index.add(b"first") is True
+    assert index.add(b"first") is False
+    assert index.add(b"second") is True
+    index.close()
+
+    assert not list(tmp_path.glob("dedup.sqlite3*"))
 
 
 def test_an_existing_non_empty_output_directory_is_refused(tmp_path, tokenizer_model) -> None:
