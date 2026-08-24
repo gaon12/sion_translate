@@ -1,19 +1,18 @@
-"""가중치 지수이동평균(EMA, Exponential Moving Average).
+"""Exponential moving average (EMA) of model weights.
 
-학습 중의 가중치는 step 마다 이리저리 흔들립니다. EMA 는 그 흔들림을
-평균 내어 '가중치의 궤적을 부드럽게 따라가는 그림자(shadow) 복사본'을
-유지합니다.
+Training weights fluctuate from step to step. EMA smooths those fluctuations by
+maintaining a shadow copy that follows the weight trajectory:
 
-    shadow = decay × shadow + (1 - decay) × 현재 가중치   (매 step)
+    shadow = decay × shadow + (1 - decay) × current weights   (each step)
 
-번역 모델에서는 EMA(또는 checkpoint averaging) 가중치로 평가/배포하는 것이
-원본 가중치보다 검증 loss 와 BLEU 를 안정적으로 개선하는 검증된 기법이라
-기본으로 켜 둡니다 (``training.ema_decay``, 0 이면 비활성).
+For translation models, evaluation and deployment with EMA (or checkpoint
+averaging) commonly improves validation loss and BLEU more consistently than
+raw weights. It is therefore enabled by default through training.ema_decay;
+setting that value to 0 disables it.
 
-분산 학습 참고: FSDP2 에서는 파라미터가 DTensor(조각난 텐서)인데,
-shadow 도 같은 방식으로 조각난 복사본으로 만들어지므로 rank 별 추가
-메모리는 자기 조각만큼만 듭니다. lerp_/copy_ 같은 elementwise 연산은
-DTensor 에서도 그대로 동작합니다.
+In FSDP2, parameters are sharded DTensors. Shadow tensors use the same sharding,
+so each rank allocates only its local shard. Elementwise operations such as
+lerp_ and copy_ work directly on DTensors.
 """
 
 from __future__ import annotations
@@ -39,22 +38,22 @@ def _named_parameters_below_compile(model: nn.Module):
 
 
 class EMAWeights:
-    """모델 파라미터의 EMA shadow 복사본을 유지합니다.
+    """Maintain an EMA shadow copy of trainable model parameters.
 
-    사용 흐름:
+    Typical use:
         ema = EMAWeights(model, decay=0.999)
-        ...  # optimizer.step() 성공 후마다
+        ...  # after each successful optimizer.step()
         ema.update(model)
-        ...  # EMA 가중치로 평가/내보내기 할 때
+        ...  # when evaluating or exporting EMA weights
         with ema.swap(model):
-            evaluate(model, ...)   # 이 블록 안에서 model 은 EMA 가중치
+            evaluate(model, ...)   # model uses EMA weights in this block
     """
 
     def __init__(self, model: nn.Module, decay: float):
         if not 0.0 < decay < 1.0:
             raise ValueError("EMA decay must be in (0, 1)")
         self.decay = decay
-        # 학습 대상 파라미터만 따라갑니다 (버퍼는 이 모델에 학습 상태가 없음).
+        # Track trainable parameters only; this model has no learned-state buffers.
         self.shadow: dict[str, torch.Tensor] = {
             name: parameter.detach().clone()
             for name, parameter in _named_parameters_below_compile(model)
@@ -63,7 +62,7 @@ class EMAWeights:
 
     @torch.no_grad()
     def update(self, model: nn.Module) -> None:
-        """shadow ← decay·shadow + (1-decay)·param. optimizer step 뒤에 호출합니다."""
+        """Update each shadow after a successful optimizer step."""
         one_minus_decay = 1.0 - self.decay
         for name, parameter in _named_parameters_below_compile(model):
             shadow = self.shadow.get(name)
@@ -81,11 +80,12 @@ class EMAWeights:
 
     @contextmanager  # pyright: ignore[reportDeprecated]
     def swap(self, model: nn.Module) -> Iterator[None]:
-        """블록 안에서만 모델 가중치를 EMA 값으로 바꿉니다 (나가면 원상복구).
+        """Use EMA weights only inside the context and restore raw weights afterward.
 
-        전체 모델 크기의 backup dict를 만들지 않고 파라미터와 shadow를
-        하나씩 교환합니다. 따라서 추가 peak 메모리는 가장 큰 파라미터
-        하나뿐이며, 평가나 내보내기 도중 예외가 나도 원래 상태로 복원됩니다.
+        Parameters and shadows are exchanged one at a time instead of allocating
+        a model-sized backup dictionary. Additional peak memory is therefore one
+        largest parameter, and raw weights are restored even if evaluation or
+        export raises an exception.
         """
         swapped: list[tuple[torch.Tensor, torch.Tensor]] = []
         try:
@@ -109,7 +109,7 @@ class EMAWeights:
                 parameter.copy_(shadow)
 
     def state_dict(self) -> dict[str, torch.Tensor]:
-        """체크포인트에 함께 저장해 재개 시 EMA 이력이 끊기지 않게 합니다."""
+        """Return shadows for checkpointing so resume preserves EMA history."""
         return dict(self.shadow)
 
     def _validated_state_dict(self, state: object) -> dict[str, torch.Tensor]:

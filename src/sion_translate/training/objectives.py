@@ -60,7 +60,7 @@ def _autocast_without_weight_cache(device_type: str) -> AbstractContextManager[A
 
 @dataclass
 class ObjectiveOutput:
-    """Trainer가 목적함수 종류와 무관하게 누적·정규화할 수 있는 출력."""
+    """Objective output that the trainer can accumulate and normalize uniformly."""
 
     loss_sum: torch.Tensor
     normalizer: torch.Tensor
@@ -71,18 +71,19 @@ class ObjectiveOutput:
 
 @dataclass
 class RewardOutput:
-    """문장별 최종 보상과 진단 가능한 세부 항목."""
+    """Final per-sentence rewards and their diagnostic components."""
 
     reward: torch.Tensor
     components: dict[str, torch.Tensor]
 
 
 class CompositeTranslationReward:
-    """참조 유사도와 번역 보존성/건전성을 결합한 로컬 보상.
+    """Local reward combining reference similarity and translation integrity.
 
-    단일 metric 최적화의 reward hacking을 줄이기 위해 chrF 외에 token F1,
-    숫자·URL·이메일·슬롯 보존, 목표 언어 문자, 길이를 함께 사용합니다.
-    반복 문자열과 원문 복사에는 별도의 감점을 적용합니다.
+    In addition to chrF, the reward includes token F1, number, URL, email, and
+    slot preservation, target-language characters, and length. This mixture
+    reduces reward hacking against any one metric. Repetition and copying the
+    source receive separate penalties.
     """
 
     def __init__(self, tokenizer: SionTokenizer, config: PostTrainingConfig):
@@ -151,8 +152,8 @@ class CompositeTranslationReward:
         reference_content = self._content_ids(reference_ids)
         chrf = self.chrf.sentence_score(hypothesis, [reference_text]).score / 100.0
         token_f1 = multiset_f1(reference_content, candidate_content)
-        # 평가(sion-evaluate / sion-compare)와 같은 정의를 씁니다. 보상과 지표가
-        # 다른 것을 재면 사후학습이 개선했다는 항목이 리포트에 나타나지 않습니다.
+        # Use the same definition as sion-evaluate and sion-compare. Otherwise,
+        # post-training could optimize behavior that the reports do not measure.
         number = multiset_f1(numeric_tokens(reference_text), numeric_tokens(hypothesis))
         structured = multiset_f1(structured_tokens(reference_text), structured_tokens(hypothesis))
         source_slots = [token_id for token_id in source_ids if token_id in self.slot_ids]
@@ -183,8 +184,8 @@ class CompositeTranslationReward:
         if "roundtrip" in self.weights:
             roundtrip = 0.0
             if roundtrip_ids is None:
-                # 단일언어 denoise처럼 역방향이 정의되지 않은 행은 기존
-                # 정방향 보상만 사용합니다.
+                # Rows without a defined reverse direction, such as monolingual
+                # denoising rows, retain the forward-only reward.
                 active_weights.pop("roundtrip")
             else:
                 roundtrip_text = self.decode(roundtrip_ids)
@@ -222,10 +223,10 @@ class CompositeTranslationReward:
         # not the very phenomenon the model is being taught to preserve.
         if has_excessive_repetition(hypothesis) and not has_excessive_repetition(reference_text):
             reward -= self.config.reward_repetition_penalty
-        # 값 변조는 개수로 셉니다. `number` 성분은 비율이라 값 하나를 지어낸
-        # 후보도 chrF 가 조금 높으면 이기고, 그것이 배포 홀드아웃에서 10문장 중
-        # 8문장의 숫자가 바뀐 이유입니다. 여기서는 변조 하나당 고정액을 빼서
-        # 숫자를 틀린 후보가 이기지 못하게 합니다.
+        # Count value corruption explicitly. The ratio-based `number` component
+        # can otherwise let a candidate invent one value and still win through a
+        # slightly higher chrF score. Subtracting a fixed amount per corruption
+        # prevents a numerically incorrect candidate from winning that tradeoff.
         if self.config.reward_number_corruption_penalty > 0:
             invented, dropped = numeric_corruption(source_text, reference_text, hypothesis)
             if invented or dropped:
@@ -252,7 +253,7 @@ class CompositeTranslationReward:
         roundtrip_candidates: torch.Tensor | None = None,
         roundtrip_mask: torch.Tensor | None = None,
     ) -> RewardOutput:
-        """candidates ``(batch, samples, length)``의 복합 보상을 계산합니다."""
+        """Compute composite rewards for ``(batch, samples, length)`` candidates."""
 
         cpu_output = self.score_cpu(
             candidates,
@@ -350,7 +351,7 @@ class CompositeTranslationReward:
 
 
 class MinimumRiskObjective:
-    """Reference CE + 복합 MRT + 다중 후보쌍 선호학습 목적함수."""
+    """Combine reference CE, composite MRT, and multi-candidate preference loss."""
 
     def __init__(self, tokenizer: SionTokenizer, config: PostTrainingConfig):
         self.tokenizer = tokenizer
@@ -361,7 +362,8 @@ class MinimumRiskObjective:
     @staticmethod
     def _candidate_labels(sampled: torch.Tensor, eos_id: int) -> torch.Tensor:
         labels = sampled[..., 1:].clone()
-        # sample()은 종료 뒤 EOS를 반복해 길이를 맞춥니다. 첫 EOS만 loss에 남깁니다.
+        # sample() pads completed rows by repeating EOS. Keep only the first EOS
+        # in the loss.
         labels.masked_fill_(labels.eq(eos_id).cumsum(dim=-1) > 1, -100)
         return labels
 
@@ -485,7 +487,8 @@ class MinimumRiskObjective:
             )
             source_lengths = batch["attention_mask"].sum(dim=-1)[:1]
 
-        # BOS와 기존 EOS를 제거한 후보 본문 뒤에 EOS를 정확히 한 번 붙입니다.
+        # Strip BOS and any existing EOS, then append exactly one EOS after the
+        # candidate content.
         max_content = max(0, base.config.max_seq_len - 2)
         raw_content = flat_candidates[:, 1 : 1 + max_content]
         before_eos = raw_content.eq(self.tokenizer.eos_id).cumsum(dim=-1).eq(0)
@@ -828,12 +831,13 @@ class MinimumRiskObjective:
         batch: dict[str, torch.Tensor],
         rewards: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """방향별 reward 합계와 행 수. 평균은 호출자가 나눠서 만듭니다.
+        """Return reward sums and row counts by direction.
 
-        평균을 여기서 내면 안 됩니다. 검증 aggregation 이 각 지표를 **배치
-        크기**로 가중하므로, 한 배치에 ko→ja 가 두 행뿐이어도 그 평균이 배치
-        전체 무게로 들어갑니다. 합계와 행 수를 따로 내보내면 두 값이 같은
-        가중을 받아 나눌 때 정확히 상쇄됩니다.
+        Do not calculate means here. Validation aggregation weights every metric
+        by the full batch size, so a direction represented by only two rows would
+        otherwise receive the weight of the entire batch. Exporting sums and
+        counts separately applies the same weight to both, which cancels exactly
+        when the caller divides them.
         """
 
         source_tags = batch.get("source_language_tag_ids")

@@ -314,9 +314,9 @@ def parallelize_model(
     if context.distributed:
         from torch.nn.parallel import DistributedDataParallel
 
-        # find_unused_parameters 는 forward 에서 안 쓰인 파라미터를 매 step
-        # 탐색하는 비용이 있으므로, 실험 모듈처럼 조건부로만 쓰이는 파라미터가
-        # 있을 때만 켭니다 (호출부에서 설정 기준으로 결정).
+        # Finding unused parameters adds a graph traversal to every step. Enable
+        # it only when the configured experimental modules can conditionally
+        # leave parameters unused.
         # SionOutput is a plain dataclass, so PyTorch 2.8's static-graph DDP
         # cannot traverse it to attach the first-backward synchronization sink.
         # Keep static-graph mode disabled to prevent ranks from diverging on the
