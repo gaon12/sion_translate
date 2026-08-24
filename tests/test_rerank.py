@@ -1,4 +1,4 @@
-"""후보 재순위(MBR / QE) 검증."""
+"""Verify complete-sequence candidate reranking with MBR and QE."""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ def test_qe_penalises_repetition_collapse_and_source_copy() -> None:
     healthy = "二つの恋が進化する。"
 
     assert qe_score(source, collapsed)[0] < qe_score(source, healthy)[0]
-    # 원문을 그대로 돌려주는 것은 번역이 아니다.
+    # Returning the source unchanged is not a translation.
     assert qe_score(source, source)[0] < qe_score(source, healthy)[0]
     assert qe_score(source, "")[0] == 0.0
 
@@ -56,7 +56,7 @@ def test_qe_omits_an_uncheckable_language_instead_of_awarding_full_credit() -> N
 
 
 def test_mbr_prefers_the_consensus_candidate() -> None:
-    # 세 후보가 서로 비슷하고 하나가 동떨어져 있으면 다수 쪽이 뽑혀야 한다.
+    # Three mutually similar candidates should outrank one outlier.
     candidates = [
         "会議は3時に始まります。",
         "会議は3時に始まります",
@@ -73,14 +73,14 @@ def test_mbr_with_a_single_candidate_is_neutral() -> None:
 
 
 def test_select_keeps_the_first_candidate_on_a_tie() -> None:
-    # 첫 후보를 beam 결과로 두므로, 동점이면 기존 동작이 유지되어야 한다.
+    # Keeping the beam result first preserves existing behavior on a tie.
     result = select("같은 문장", ["同じ文", "同じ文"], strategy="mbr+qe")
     assert result.chosen_index == 0
 
 
 def test_select_recovers_a_faithful_candidate_from_a_corrupted_beam() -> None:
     source = "합계 금액은 38,720엔입니다."
-    # 첫 후보(beam)가 금액을 바꿔 썼고, 샘플 후보 하나가 값을 지켰다.
+    # The beam candidate changes the amount; one sampled candidate preserves it.
     candidates = ["合計金額は38,000円です。", "合計金額は38,720円です。"]
     result = select(source, candidates, strategy="qe", target_language="ja")
     assert result.chosen_index == 1
@@ -94,9 +94,9 @@ def test_select_none_returns_the_first_candidate_untouched() -> None:
 
 
 def test_select_rejects_unknown_strategy_and_empty_candidates() -> None:
-    with pytest.raises(ValueError, match="알 수 없는 재순위 방식"):
+    with pytest.raises(ValueError, match="unknown reranking strategy"):
         select("원문", ["후보"], strategy="bogus")
-    with pytest.raises(ValueError, match="후보가 비어 있습니다"):
+    with pytest.raises(ValueError, match="candidate list must not be empty"):
         select("원문", [], strategy="mbr")
 
 

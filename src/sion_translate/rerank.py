@@ -1,45 +1,48 @@
-"""후보 번역을 생성한 뒤 하나를 고르는 재순위 로직.
+"""Sequence-level reranking after generating multiple complete translations.
 
-모델을 재학습하지 않고 추론 계산량만 늘려 품질을 올릴 수 있는지 확인하기 위한
-장치입니다. 두 가지 선택 기준을 제공하고, 둘을 합해 쓸 수도 있습니다.
+This optional inference-only feature tests whether extra decoding compute can
+improve quality without retraining. It provides two selection criteria and a
+combined mode. It is distinct from the model's trained full-vocabulary
+per-token distribution refinement.
 
 **MBR (Minimum Bayes Risk)**
-    후보 하나를 나머지 후보 전체와 비교해 평균 유사도가 가장 높은 것을 고릅니다.
-    "다수의 후보가 동의하는 번역이 맞을 가능성이 높다"는 가정이며, 정답이
-    필요하지 않습니다. 모델이 자신 있게 틀린 경우(모든 후보가 같은 오역)에는
-    도움이 되지 않습니다.
+    Compare each candidate with every other candidate and select the highest
+    average similarity. This assumes that agreement among candidates is useful
+    without requiring a reference. It cannot help when every candidate repeats
+    the same confident mistranslation.
 
-**QE (Quality Estimation, 참조 없음)**
-    정답 대신 **원문**과 대조합니다. 숫자·URL·식별자는 번역 후에도 보존되어야
-    하므로, 원문의 값과 다른 값을 쓴 후보를 감점할 수 있습니다. 사후학습 보상과
-    같은 신호를 쓰지만 참조가 필요한 항목(chrF, token F1)은 제외합니다.
+**QE (reference-free quality estimation)**
+    Compare each candidate with the source instead of a gold target. Numbers,
+    URLs, and identifiers should survive translation, so a candidate that
+    changes them can be penalized. This uses the reference-free parts of the
+    post-training reward and excludes reference-dependent chrF and token F1.
 
-두 기준의 성격이 다릅니다. MBR 은 유창성·일관성 쪽으로, QE 는 보존성 쪽으로
-후보를 밀어냅니다. 기본값 ``mbr+qe`` 는 둘을 평균합니다.
+MBR favors consensus and fluency, while QE favors source preservation. The
+default ``mbr+qe`` strategy averages them.
 
-**측정 결과 (홀드아웃 40문장, 배포된 export).** 유효 성분은 MBR 이고, QE 단독은
-쓰지 마십시오.
+The following measurements used 40 holdout sentences and a deployed export.
+MBR was the useful component; QE alone should not be used:
 
-    설정                    ko-ja chrF   ja-ko chrF   숫자 일치
-    beam4 (기준)                 59.81        49.87   19/20, 15/20
+    configuration            ko-ja chrF   ja-ko chrF   number exact
+    beam4 baseline                59.81        49.87   19/20, 15/20
     mbr,    n=7,  T=0.7          60.39        48.82   18/20, 16/20
     qe,     n=7,  T=0.7          54.33        46.56   19/20, 16/20
     mbr+qe, n=7,  T=0.7          60.51        49.29   19/20, 16/20
     mbr+qe, n=7,  T=0.3          60.53        50.36   19/20, 16/20
     mbr+qe, n=15, T=0.5          58.69        52.06   19/20, 16/20
 
-QE 단독은 ko-ja 에서 5.5점을 잃습니다. 참조 없는 신호만으로는 "유창한 쓰레기"를
-걸러내지 못하고, 숫자가 우연히 맞은 엉터리 후보가 멀쩡한 후보보다 높게 나옵니다.
-MBR 의 합의 조건이 그 이상치를 눌러 주기 때문에 합쳐야 쓸 수 있습니다.
+QE alone lost 5.5 chrF on ko-ja. Reference-free signals cannot reliably reject
+fluent nonsense; a poor candidate with coincidentally correct numbers can
+outrank a sound one. MBR consensus suppresses that outlier in the combined mode.
 
-이득은 작고 설정에 민감합니다 (T=0.3 에서 +0.7 / +0.5, 계산량 +28%). 방향당
-20문장이므로 이 차이는 잡음과 구분되지 않습니다 — 채택 전에 더 큰 셋으로
-확인하십시오.
+The gain was small and configuration-sensitive: about +0.7/+0.5 at T=0.3 for
+28% more compute. With only 20 sentences per direction, this difference may be
+noise and must be confirmed on a larger evaluation set before adoption.
 
-**숫자 오역은 이 방법으로 고쳐지지 않습니다.** 숫자 일치가 15/20 에서 16/20 으로
-한 문장 움직였을 뿐입니다. 토크나이저가 숫자를 자릿수로 보지 못하면 후보 전체가
-같은 방식으로 자릿수를 잘못 읽으므로, 고를 만한 올바른 후보가 애초에 생기지
-않습니다. 그쪽은 토크나이저 재학습으로만 해결됩니다.
+This method did not solve number mistranslation: exact matches moved only from
+15/20 to 16/20. If the tokenizer does not represent digits robustly, every
+candidate can misread them the same way and reranking has no correct candidate
+to select. That failure requires tokenizer retraining.
 """
 
 # Metric component dictionaries are assembled dynamically.
@@ -60,9 +63,9 @@ from sion_translate.evaluation import (
 
 STRATEGIES = ("none", "mbr", "qe", "mbr+qe")
 
-# QE 항목별 가중치. 보존성 신호(숫자/구조 문자열)를 가장 크게 둡니다 — 이 프로젝트
-# 모델의 관측된 최대 결함이고, 참조 없이도 원문만으로 확실하게 판정할 수 있는
-# 항목이기 때문입니다.
+# Preservation signals receive the largest QE weights because number and
+# structured-token corruption is the model's largest observed defect and can
+# be checked reliably against the source without a reference.
 DEFAULT_QE_WEIGHTS: dict[str, float] = {
     "number": 0.40,
     "structured": 0.20,
@@ -70,14 +73,14 @@ DEFAULT_QE_WEIGHTS: dict[str, float] = {
     "length": 0.20,
 }
 
-# 생성 붕괴와 원문 복사는 가중 평균이 아니라 직접 감점합니다.
+# Repetition collapse and source copying are direct penalties, not average components.
 REPETITION_PENALTY = 0.50
 COPY_PENALTY = 0.50
 
 
 @dataclass
 class RerankResult:
-    """한 문장의 재순위 결과. 어느 후보가 왜 뽑혔는지 추적할 수 있습니다."""
+    """Store one reranking decision and the evidence behind it."""
 
     text: str
     chosen_index: int
@@ -87,7 +90,7 @@ class RerankResult:
 
 
 def _length_score(source: str, hypothesis: str) -> float:
-    """원문 대비 길이비. 누락과 폭주를 모두 1에서 멀어지게 만듭니다."""
+    """Score target/source length ratio, penalizing omission and overgeneration."""
     import math
 
     source_length = sum(not char.isspace() for char in source)
@@ -101,16 +104,16 @@ def qe_components(
     *,
     target_language: str | None = None,
 ) -> dict[str, float]:
-    """참조 없이 원문만으로 계산한 QE 세부 항목 (각 0~1)."""
+    """Return reference-free QE components in [0, 1] using only the source."""
     letters = sum(char.isalpha() for char in hypothesis)
     components = {
-        # 원문의 숫자가 번역문에 그대로 남아야 합니다. 값이 바뀌면 여기서 떨어집니다.
+        # Numbers must remain consistent with the source after translation.
         "number": multiset_f1(numeric_tokens(source), numeric_tokens(hypothesis)),
         "structured": multiset_f1(structured_tokens(source), structured_tokens(hypothesis)),
         "length": _length_score(source, hypothesis),
     }
-    # 짧은 문장이나 script profile이 없는 임의 언어는 이 성분 자체를
-    # 제외합니다. 1.0을 넣으면 검사하지 않은 결과가 만점으로 기록됩니다.
+    # Omit this component for short text or languages without a script profile.
+    # Reporting 1.0 would incorrectly give an unchecked result a perfect score.
     language = (
         language_fraction(hypothesis, target_language)
         if target_language is not None and letters >= 4
@@ -128,28 +131,28 @@ def qe_score(
     target_language: str | None = None,
     weights: dict[str, float] | None = None,
 ) -> tuple[float, dict[str, float]]:
-    """(QE 점수, 세부 항목). 점수는 0~1 로 자릅니다."""
+    """Return ``(QE score, components)`` with the score clamped to [0, 1]."""
     weights = weights or DEFAULT_QE_WEIGHTS
     components = qe_components(source, hypothesis, target_language=target_language)
     active_weights = {name: weight for name, weight in weights.items() if name in components}
     total = sum(active_weights.values())
     if total <= 0:
-        raise ValueError("QE 가중치의 합이 0보다 커야 합니다")
+        raise ValueError("the sum of active QE weights must be positive")
     score = sum(active_weights[name] * components[name] for name in active_weights) / total
     if not hypothesis.strip():
         return 0.0, components
     if has_excessive_repetition(hypothesis):
         score -= REPETITION_PENALTY
     if canonical_text(source).casefold() == canonical_text(hypothesis).casefold():
-        # 원문을 그대로 돌려주는 것은 번역이 아닙니다.
+        # Returning the source unchanged is not a translation.
         score -= COPY_PENALTY
     return max(0.0, min(1.0, score)), components
 
 
 def mbr_scores(candidates: Sequence[str]) -> list[float]:
-    """후보별 기대 유용도 (자신을 제외한 나머지와의 평균 chrF, 0~1).
+    """Return expected utility per candidate as mean pairwise chrF in [0, 1].
 
-    후보가 하나면 비교 대상이 없으므로 모두 1.0 입니다.
+    A singleton candidate receives 1.0 because it has no comparison target.
     """
     if len(candidates) <= 1:
         return [1.0] * len(candidates)
@@ -175,15 +178,17 @@ def select(
     target_language: str | None = None,
     qe_weights: dict[str, float] | None = None,
 ) -> RerankResult:
-    """후보 중 하나를 고릅니다. 동점이면 먼저 온 후보를 유지합니다.
+    """Select one candidate, retaining the earliest candidate on a tie.
 
-    호출자가 첫 번째 후보를 beam 결과로 두면, 동점일 때 beam 결과가 유지되므로
-    재순위가 기존 동작보다 나빠지지 않습니다.
+    If the caller places the beam result first, a tied reranking decision keeps
+    the existing beam behavior.
     """
     if strategy not in STRATEGIES:
-        raise ValueError(f"알 수 없는 재순위 방식: {strategy} (가능: {', '.join(STRATEGIES)})")
+        raise ValueError(
+            f"unknown reranking strategy: {strategy} (available: {', '.join(STRATEGIES)})"
+        )
     if not candidates:
-        raise ValueError("후보가 비어 있습니다")
+        raise ValueError("candidate list must not be empty")
 
     pool = list(candidates)
     components: list[dict[str, float]] = []

@@ -1,30 +1,32 @@
-"""평가기가 멈출 시점을 정하는 반복 수정 루프.
+"""Iterative sequence-revision loop with evaluator-controlled stopping.
 
-쉬운 문장은 한 번에 맞습니다. 어려운 문장만 여러 번 고치게 하면, 문장마다 계산량을
-다르게 쓸 수 있습니다. 모든 문장에 같은 횟수를 쓰는 것보다 싸고, 한 번만 하는 것보다
-정확합니다.
+Easy sentences often need one pass. Revising only difficult sentences allows
+compute to vary by sentence, which is cheaper than applying a fixed number of
+passes everywhere and can be more accurate than always stopping after one:
 
-    번역 → 평가 → (기준 미달이면) 수정 → 평가 → …
+    translate -> evaluate -> revise if below threshold -> evaluate -> ...
 
-세 가지 종료 조건을 씁니다. 셋 다 필요합니다.
+All three stopping conditions are necessary:
 
 ``accept_score``
-    이미 충분히 좋으면 더 고치지 않습니다. 이것이 없으면 잘된 문장을 계속 건드려
-    오히려 망가뜨립니다.
+    Stop when the draft is already good enough. Without this guard, revision
+    can damage an acceptable translation.
 
 ``min_gain``
-    한 번 더 고쳐서 점수가 이만큼도 오르지 않으면 멈춥니다. 개선이 정체되면 남은
-    반복은 낭비입니다.
+    Stop when another revision improves the score by less than this amount.
+    Remaining passes are wasteful after progress stalls.
 
 ``max_rounds``
-    개선과 악화가 번갈아 나타날 수 있으므로 상한을 둡니다.
+    Set a hard bound because improvements and regressions can alternate.
 
-**점수가 떨어지면 되돌립니다.** 각 라운드에서 지금까지 가장 좋았던 결과를 들고
-있다가 마지막에 그것을 돌려줍니다. 수정 모델이 문장을 더 나쁘게 만든 라운드가
-최종 출력이 되는 일은 없습니다.
+The loop retains the best-scoring text seen so far and returns it at the end.
+A revision round that lowers the score is recorded but cannot become the final
+output.
 
-평가는 참조 없는 QE(``sion_translate.rerank``)입니다. 실제 정답이 없으므로 원문과
-대조해 숫자·식별자 보존, 목표 언어, 길이, 반복 붕괴를 봅니다.
+Evaluation uses reference-free QE from :mod:`sion_translate.rerank`. Because
+no gold target exists at inference time, it compares against the source for
+number and identifier preservation, target-language use, length, and repeated
+generation collapse.
 """
 
 # Iterative-run state is loaded from a JSON manifest.
@@ -40,7 +42,7 @@ from sion_translate.rerank import qe_score
 
 @dataclass
 class Round:
-    """한 라운드의 기록. 왜 멈췄는지 추적할 수 있습니다."""
+    """Record one revision round so the stopping decision remains auditable."""
 
     index: int
     text: str
@@ -50,7 +52,7 @@ class Round:
 
 @dataclass
 class IterativeResult:
-    """한 문장의 반복 수정 결과."""
+    """Store the iterative revision result for one sentence."""
 
     text: str
     score: float
@@ -59,7 +61,7 @@ class IterativeResult:
 
     @property
     def revisions_used(self) -> int:
-        """실제로 수행한 수정 횟수 (첫 번역은 세지 않습니다)."""
+        """Return the number of revision passes, excluding initial translation."""
         return max(0, len(self.rounds) - 1)
 
 
@@ -73,17 +75,17 @@ def refine(
     min_gain: float = 0.01,
     max_rounds: int = 3,
 ) -> IterativeResult:
-    """한 문장을 조건이 만족될 때까지 고칩니다.
+    """Revise one sentence until a configured stopping condition is met.
 
-    ``revise(source, draft)`` 는 고친 번역 하나를 돌려주는 호출 가능 객체입니다.
-    보통 ``Translator.revise`` 를 한 문장에 대해 감싼 것입니다.
+    ``revise(source, draft)`` returns one revised translation. It commonly
+    wraps ``Translator.revise`` for a single sentence.
     """
     if max_rounds < 0:
-        raise ValueError("max_rounds 는 0 이상이어야 합니다")
+        raise ValueError("max_rounds must be non-negative")
     if not 0.0 <= accept_score <= 1.0:
-        raise ValueError("accept_score 는 0~1 이어야 합니다")
+        raise ValueError("accept_score must be between 0 and 1")
     if min_gain < 0:
-        raise ValueError("min_gain 은 0 이상이어야 합니다")
+        raise ValueError("min_gain must be non-negative")
 
     score, _ = qe_score(source, initial, target_language=target_language)
     best_text, best_score = initial, score
@@ -103,7 +105,7 @@ def refine(
 
         gain = candidate_score - best_score
         if candidate_score > best_score:
-            # 나빠진 라운드는 채택하지 않으므로 최종 출력이 후퇴하지 않습니다.
+            # Rejecting worse rounds prevents the final output from regressing.
             best_text, best_score = candidate, candidate_score
         if accepted:
             stop_reason = "accept_score"
@@ -125,16 +127,18 @@ def refine_batch(
     min_gain: float = 0.01,
     max_rounds: int = 3,
 ) -> list[IterativeResult]:
-    """여러 문장을 함께 고칩니다. 남은 문장만 다음 라운드로 넘깁니다.
+    """Revise a batch while forwarding only unfinished sentences to each round.
 
-    한 문장씩 처리하면 배치 이득을 잃고, 전부 같은 횟수를 돌리면 동적 종료의
-    의미가 없습니다. 라운드마다 아직 끝나지 않은 문장만 모아 한 번에 수정하므로
-    둘을 모두 얻습니다.
+    Processing sentences individually loses batching efficiency, while forcing
+    every sentence through the same number of passes defeats dynamic stopping.
+    Grouping only unfinished sentences at each round preserves both benefits.
     """
     if len(sources) != len(initials):
-        raise ValueError(f"원문 {len(sources)}개와 초안 {len(initials)}개의 수가 다릅니다")
+        raise ValueError(
+            f"source count {len(sources)} does not match initial-draft count {len(initials)}"
+        )
     if max_rounds < 0:
-        raise ValueError("max_rounds 는 0 이상이어야 합니다")
+        raise ValueError("max_rounds must be non-negative")
 
     results: list[IterativeResult] = []
     for source, initial in zip(sources, initials, strict=True):
@@ -149,7 +153,7 @@ def refine_batch(
             )
         )
 
-    # 아직 기준에 못 미친 문장의 인덱스만 들고 갑니다.
+    # Carry only sentences that have not reached the acceptance threshold.
     pending = [
         index for index, result in enumerate(results) if result.stop_reason != "accept_score"
     ]
@@ -161,7 +165,9 @@ def refine_batch(
             [results[index].text for index in pending],
         )
         if len(revised) != len(pending):
-            raise ValueError(f"수정 결과 {len(revised)}개가 요청한 {len(pending)}개와 다릅니다")
+            raise ValueError(
+                f"revision returned {len(revised)} results for {len(pending)} requests"
+            )
         still_pending: list[int] = []
         for index, candidate in zip(pending, revised, strict=True):
             result = results[index]
@@ -185,7 +191,7 @@ def refine_batch(
 
 
 def summarize(results: Sequence[IterativeResult]) -> dict[str, object]:
-    """동적 종료가 실제로 계산량을 아꼈는지 확인할 요약."""
+    """Summarize whether dynamic stopping reduced revision work."""
     total = len(results)
     if not total:
         return {"sentences": 0}

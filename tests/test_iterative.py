@@ -1,4 +1,4 @@
-"""반복 수정 + 동적 종료 검증."""
+"""Verify iterative sequence revision and dynamic stopping."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ def test_already_good_translation_is_not_revised() -> None:
         return draft
 
     result = refine(SOURCE, GOOD, revise, target_language="ja", accept_score=0.9)
-    assert calls == [], "기준을 넘은 문장은 건드리지 않아야 한다"
+    assert calls == [], "a sentence above the threshold must not be revised"
     assert result.stop_reason == "accept_score"
     assert result.revisions_used == 0
     assert result.text == GOOD
@@ -29,7 +29,7 @@ def test_already_good_translation_is_not_revised() -> None:
 
 def test_bad_translation_is_revised_until_accepted() -> None:
     def revise(source: str, draft: str) -> str:
-        return GOOD  # 한 번에 고쳐 준다
+        return GOOD  # Correct the draft in one pass.
 
     result = refine(SOURCE, BAD, revise, target_language="ja", accept_score=0.9)
     assert result.revisions_used == 1
@@ -42,7 +42,7 @@ def test_a_worse_revision_is_never_returned() -> None:
         return "まったく無関係で数字のない文。"
 
     result = refine(SOURCE, BAD, revise, target_language="ja", accept_score=0.99)
-    # 원래 초안이 더 좋았으므로 되돌아가야 한다.
+    # Retain the initial draft because it scored higher than the revision.
     assert result.text == BAD
     assert len(result.rounds) > 1
 
@@ -52,7 +52,7 @@ def test_stalled_improvement_stops_early() -> None:
 
     def revise(source: str, draft: str) -> str:
         calls["count"] += 1
-        return draft  # 아무것도 바꾸지 않는다 → 이득 0
+        return draft  # No change means zero gain.
 
     result = refine(
         SOURCE,
@@ -64,15 +64,15 @@ def test_stalled_improvement_stops_early() -> None:
         max_rounds=5,
     )
     assert result.stop_reason == "min_gain"
-    assert calls["count"] == 1, "정체가 확인되면 남은 라운드를 쓰지 않아야 한다"
+    assert calls["count"] == 1, "stop remaining rounds after progress stalls"
 
 
 def test_max_rounds_caps_the_work() -> None:
-    """계속 개선되더라도 상한에서 멈춰야 한다.
+    """Stop at the hard bound even while the score continues to improve.
 
-    원문의 숫자를 끝까지 못 맞추므로 accept_score 에 도달하지 않고, 길이가
-    원문에 가까워지며 점수만 조금씩 오릅니다 — 즉 min_gain 으로는 멈추지
-    않으므로 max_rounds 만이 종료 조건입니다.
+    The draft never restores the source number, so it cannot reach
+    ``accept_score``. Its length approaches the source and the score keeps
+    improving enough to avoid ``min_gain``; only ``max_rounds`` can stop it.
     """
     calls = {"count": 0}
     texts = ["合計", "合計金額", "合計金額は38,000円"]
@@ -97,7 +97,7 @@ def test_max_rounds_caps_the_work() -> None:
 
 def test_zero_max_rounds_is_translation_only() -> None:
     def revise(source: str, draft: str) -> str:
-        raise AssertionError("max_rounds=0 이면 수정을 호출하지 않아야 한다")
+        raise AssertionError("revision must not run when max_rounds=0")
 
     result = refine(SOURCE, BAD, revise, accept_score=0.99, max_rounds=0)
     assert result.text == BAD
@@ -126,7 +126,7 @@ def test_batch_only_revises_the_sentences_that_need_it() -> None:
         return [GOOD] * len(drafts)
 
     results = refine_batch(sources, initials, revise_batch, target_language="ja", accept_score=0.9)
-    # 이미 좋은 두 번째 문장은 배치에 들어가지 않아야 한다.
+    # The already acceptable second sentence must not enter the revision batch.
     assert seen_batches == [[BAD, BAD]]
     assert results[1].revisions_used == 0
     assert results[0].text == GOOD
@@ -148,22 +148,22 @@ def test_batch_stops_when_nothing_is_pending() -> None:
         accept_score=0.9,
         max_rounds=5,
     )
-    assert calls["count"] == 1, "기준을 넘으면 남은 라운드를 돌지 않아야 한다"
+    assert calls["count"] == 1, "stop remaining rounds after reaching the threshold"
 
 
 def test_batch_rejects_mismatched_lengths() -> None:
     def revise_batch(sources: Sequence[str], drafts: Sequence[str]) -> list[str]:
         return []
 
-    with pytest.raises(ValueError, match="수가 다릅니다"):
+    with pytest.raises(ValueError, match="does not match"):
         refine_batch([SOURCE], [BAD, GOOD], revise_batch)
 
 
 def test_batch_rejects_a_reviser_that_returns_the_wrong_count() -> None:
     def revise_batch(sources: Sequence[str], drafts: Sequence[str]) -> list[str]:
-        return []  # 요청한 수와 다르다
+        return []  # Return fewer revisions than requested.
 
-    with pytest.raises(ValueError, match="수정 결과"):
+    with pytest.raises(ValueError, match="revision returned"):
         refine_batch([SOURCE], [BAD], revise_batch, accept_score=0.99)
 
 
