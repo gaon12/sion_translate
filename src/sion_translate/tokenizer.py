@@ -61,6 +61,7 @@ TOKENIZER_METADATA_FILENAME = "tokenizer_metadata.json"
 TOKENIZER_METADATA_VERSION = 2
 TOKENIZER_TRAINING_SCHEMA = "sion-tokenizer-training-v3"
 SENTENCEPIECE_MULTITHREADED_TRAINING_REGRESSION = "0.2.2"
+SENTENCEPIECE_META_PIECE_COUNT = 4  # pad, unknown, beginning, and end
 DEFAULT_TOKENIZER_INPUT_SENTENCE_SIZE = 1_000_000
 DEFAULT_TOKENIZER_SAMPLING_ALPHA = 0.7
 TOKENIZER_ARTIFACT_FILENAMES = (
@@ -1718,11 +1719,12 @@ def train_tokenizer(
         # vocab_size, and it only says so after the corpus scan. Say it here, with
         # the number to change, rather than after a long wait. This costs nothing,
         # so it runs before the probe below, which costs seconds.
-        reserved = len(required_characters) + len(symbols) + 256
+        reserved = len(required_characters) + len(symbols) + 256 + SENTENCEPIECE_META_PIECE_COUNT
         if reserved >= vocab_size:
             raise ValueError(
                 f"required characters ({len(required_characters):,}) plus control symbols "
-                f"({len(symbols):,}) and byte fallback (256) need {reserved:,} slots, but "
+                f"({len(symbols):,}), byte fallback (256), and SentencePiece meta pieces "
+                f"({SENTENCEPIECE_META_PIECE_COUNT}) consume {reserved:,} slots, but "
                 f"vocab_size is {vocab_size:,}. Raise vocab_size or raise "
                 f"required_character_min_occurrences (currently "
                 f"{required_character_min_occurrences})."

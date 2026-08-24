@@ -172,6 +172,47 @@ def _tiny_shard(tmp_path):
     return shard
 
 
+def test_the_vocab_floor_includes_all_four_sentencepiece_meta_pieces(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import sion_translate.tokenizer as tokenizer_module
+
+    counts = tokenizer_module.CorpusCounts(
+        characters=Counter({"Ж": 1}),
+        sentences=2,
+        sentences_per_language=Counter({"ko": 1, "ja": 1}),
+    )
+    monkeypatch.setattr(
+        tokenizer_module,
+        "corpus_character_counts",
+        lambda *args, **kwargs: counts,
+    )
+
+    def fail_if_the_lower_bound_is_missed(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("the vocabulary lower bound must fail before probing or training")
+
+    monkeypatch.setattr(
+        tokenizer_module,
+        "acceptable_required_characters",
+        fail_if_the_lower_bound_is_missed,
+    )
+    symbols = tokenizer_module.control_symbols(("ko", "ja")) + tokenizer_module.SLOT_SYMBOLS
+    exact_consumed_slots = 1 + len(symbols) + 256 + tokenizer_module.SENTENCEPIECE_META_PIECE_COUNT
+
+    with pytest.raises(ValueError, match="SentencePiece meta pieces"):
+        tokenizer_module.train_tokenizer(
+            [str(_tiny_shard(tmp_path))],
+            tmp_path / "out",
+            vocab_size=exact_consumed_slots,
+            required_character_min_occurrences=1,
+            language_pair=("ko", "ja"),
+            num_workers=1,
+            num_threads=1,
+        )
+
+
 def test_sentencepiece_022_multithreaded_regression_is_refused_before_scanning(
     tmp_path,
     monkeypatch,
