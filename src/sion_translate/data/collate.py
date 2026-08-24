@@ -184,6 +184,11 @@ class SionBatchCollator:
             int(augmentation_key), dtype=torch.int64
         ).share_memory_()
         self.slot_ids: set[int] = set(tokenizer.slot_ids)
+        raw_draft_id = getattr(tokenizer, "draft_id", None)
+        self.draft_id = raw_draft_id if isinstance(raw_draft_id, int) else None
+        self.source_protected_ids = set(self.slot_ids)
+        if self.draft_id is not None:
+            self.source_protected_ids.add(self.draft_id)
         self.reasoning_task_ids: set[int] = set(getattr(tokenizer, "reasoning_tags", {}).values())
         self.features: dict[str, torch.Tensor] | None = None
         if token_features is not None:
@@ -238,8 +243,10 @@ class SionBatchCollator:
                     "reasoning target exceeds max_target_length; rebuild the foundation "
                     "dataset so trace delimiters can be preserved during truncation"
                 )
+        has_revision_structure = self.draft_id is not None and src.count(self.draft_id) == 1
         denoise = (
             reasoning_task_id is None
+            and not has_revision_structure
             and item["src_language"] not in self.source_only_languages
             and self.denoise_probability > 0
             and rng.random() < self.denoise_probability
@@ -281,15 +288,7 @@ class SionBatchCollator:
             # reverse edge must not receive a roundtrip reward.
             reverse_direction_trained = bool(item.get("reverse_direction_trained", False))
             if self.source_token_dropout > 0:
-                # 온라인 증강: 보호 슬롯(<slot_n>)은 남기고, 일반 토큰만
-                # 낮은 확률로 탈락. 최소 1개 토큰은 반드시 남깁니다.
-                kept = [
-                    token_id
-                    for token_id in src
-                    if token_id in self.slot_ids or rng.random() >= self.source_token_dropout
-                ]
-                if kept:
-                    src = kept
+                src = self._drop_translation_source_tokens(src, rng)
 
         src = src[: self.max_source_length - 2]
         tgt = tgt[: self.max_target_length - 1]
@@ -309,6 +308,33 @@ class SionBatchCollator:
             "source_language_tag_id": source_language_tag_id,
             "reverse_direction_trained": reverse_direction_trained,
         }
+
+    def _drop_translation_source_tokens(
+        self,
+        source: Sequence[int],
+        rng: random.Random,
+    ) -> list[int]:
+        """Drop content without erasing revision structure or an entire segment."""
+
+        def drop_segment(segment: Sequence[int]) -> list[int]:
+            kept = [
+                token_id
+                for token_id in segment
+                if token_id in self.source_protected_ids
+                or rng.random() >= self.source_token_dropout
+            ]
+            if kept or not segment:
+                return kept
+            return [segment[rng.randrange(len(segment))]]
+
+        if self.draft_id is not None and source.count(self.draft_id) == 1:
+            separator = source.index(self.draft_id)
+            return [
+                *drop_segment(source[:separator]),
+                self.draft_id,
+                *drop_segment(source[separator + 1 :]),
+            ]
+        return drop_segment(source)
 
     def _noise_decoder_input(self, target: Sequence[int], rng: random.Random) -> list[int]:
         """Corrupt a fraction of the decoder input, leaving the labels alone.

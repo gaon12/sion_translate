@@ -628,3 +628,43 @@ def test_source_token_dropout_keeps_slots_and_length(tmp_path: Path) -> None:
     assert dropped_len >= 3  # 태그 + 최소 1 토큰 + EOS 는 남는다
     # 목표(레이블)는 증강의 영향을 받지 않는다.
     assert dropped["labels"].tolist() == clean["labels"].tolist()
+
+
+def test_source_token_dropout_preserves_revision_separator_and_both_segments(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "corpus.jsonl"
+    write_en_de_jsonl(source)
+    model_path = train_tokenizer(
+        [str(source)],
+        tmp_path / "tokenizer",
+        vocab_size=512,
+        input_sentence_size=1000,
+        seed_sentencepiece_size=1000,
+        language_pair=("en", "de"),
+    )
+    tokenizer = SionTokenizer(model_path)
+    assert tokenizer.draft_id is not None
+    item = {
+        "src": [100, 101, tokenizer.draft_id, 102, 103],
+        "tgt": [104],
+        "src_language": "en",
+        "target_language": "de",
+        "src_register": 0,
+        "target_register": 0,
+    }
+    collated = SionBatchCollator(
+        tokenizer,
+        max_source_length=64,
+        max_target_length=64,
+        source_token_dropout=1.0,
+        denoise_probability=1.0,
+    )([item])
+    content = collated["input_ids"][0][collated["attention_mask"][0].bool()].tolist()[1:-1]
+
+    assert content.count(tokenizer.draft_id) == 1
+    separator = content.index(tokenizer.draft_id)
+    assert separator > 0
+    assert separator < len(content) - 1
+    assert collated["input_ids"][0, 0].item() == tokenizer.language_tags["de"]
+    assert collated["labels"][0, :2].tolist() == [104, tokenizer.eos_id]
