@@ -1,16 +1,18 @@
-"""국립국어원 모두의 말뭉치 ZIP 을 foundation 코퍼스 JSONL 로 변환한다.
+"""Convert NIKL Modu Corpus ZIP archives into foundation-corpus JSONL.
 
-모두의 말뭉치는 배포본마다 폴더 이름이 다르지만 JSON 구조는 같습니다::
+Archive folder names vary by release, but each JSON document uses the same
+structure::
 
     {"id": ..., "metadata": {...},
      "document": [{"id": ..., "utterance"|"paragraph"|"sentence": [{"form": "..."}]}]}
 
-**발화/문단 단위로 한 줄씩** 씁니다. 문서 통째로 한 줄에 넣으면 foundation
-준비 단계가 문장 경계로 다시 나눠야 하고, 그 전 단계에서 잘리거나 버려질 수
-있습니다 — 실측으로 문서 단위 코퍼스는 문자의 25.9%를 잃었습니다.
+The converter writes **one utterance or paragraph per line**. Writing a whole
+document as one line forces foundation preparation to rediscover sentence
+boundaries after length filtering can already truncate or reject it. A measured
+document-level conversion lost 25.9% of its characters this way.
 
-빈 ``form`` 은 건너뜁니다. 구어 말뭉치에는 "배경 음악 있음" 처럼 note 만 있고
-발화가 없는 항목이 실제로 들어 있습니다.
+Empty ``form`` values are skipped. Spoken-language archives contain real entries
+that have only a note such as "배경 음악 있음" and no utterance.
 """
 
 from __future__ import annotations
@@ -26,20 +28,20 @@ from typing import Iterator
 
 from sion_translate.console import configure_stdio
 
-# 발화·문단·문장 중 어느 이름으로든 들어옵니다.
+# Different releases label their segments as utterances, paragraphs, or sentences.
 SEGMENT_KEYS = ("utterance", "paragraph", "sentence")
 
-# 구어 전사에 붙는 표기. 남겨 두면 모델이 이 기호를 배웁니다.
+# Remove spoken-transcription notation so the model does not learn it as content.
 _TRANSCRIPTION_NOISE = re.compile(
-    r"&[a-zA-Z-]+\d*&"  # &name&, &address& 같은 비식별 태그
-    r"|\([^)]{0,40}\)/\([^)]{0,40}\)"  # (철자)/(발음) 이중 표기
+    r"&[a-zA-Z-]+\d*&"  # De-identification tags such as &name& and &address&.
+    r"|\([^)]{0,40}\)/\([^)]{0,40}\)"  # Paired (spelling)/(pronunciation) notation.
     r"|[{}<>@#*~]"
 )
 _WHITESPACE = re.compile(r"\s+")
 
 
 def clean(text: str) -> str:
-    """전사 기호를 걷어내고 공백을 정규화한다."""
+    """Remove transcription notation and normalize whitespace."""
 
     text = unicodedata.normalize("NFC", text)
     text = _TRANSCRIPTION_NOISE.sub(" ", text)
@@ -47,7 +49,7 @@ def clean(text: str) -> str:
 
 
 def iter_segments(payload: object) -> Iterator[str]:
-    """하나의 JSON 문서에서 발화/문단 텍스트를 낸다."""
+    """Yield utterance, paragraph, or sentence text from one JSON document."""
 
     if not isinstance(payload, dict):
         return
@@ -112,15 +114,17 @@ def extract_archive(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="모두의 말뭉치 ZIP → foundation JSONL")
-    parser.add_argument("--archive", nargs="+", required=True, help="ZIP 경로")
-    parser.add_argument("--output", required=True, help="출력 JSONL")
+    parser = argparse.ArgumentParser(
+        description="Convert NIKL Modu Corpus ZIP archives to foundation JSONL"
+    )
+    parser.add_argument("--archive", nargs="+", required=True, help="input ZIP paths")
+    parser.add_argument("--output", required=True, help="output JSONL path")
     parser.add_argument("--minimum-characters", type=int, default=8)
     parser.add_argument("--maximum-characters", type=int, default=4000)
     parser.add_argument(
         "--keep-duplicates",
         action="store_true",
-        help="중복 제거를 끕니다 (기본은 파일 내 중복 제거)",
+        help="disable deduplication (default: deduplicate within this conversion)",
     )
     return parser
 
@@ -136,7 +140,7 @@ def main() -> None:
         for name in args.archive:
             archive = Path(name)
             if not archive.is_file():
-                print(f"  건너뜀 (없음): {archive}", flush=True)
+                print(f"  skipped missing archive: {archive}", flush=True)
                 continue
             stats = extract_archive(
                 archive,
@@ -147,13 +151,13 @@ def main() -> None:
             )
             totals.update(stats)
             print(
-                f"  {archive.name}: 발화 {stats['segments']:,} → 기록 {stats['written']:,}"
-                f" (짧음 {stats['too_short']:,} / 김 {stats['too_long']:,}"
-                f" / 중복 {stats['duplicate']:,})",
+                f"  {archive.name}: segments {stats['segments']:,} -> "
+                f"written {stats['written']:,} (too short {stats['too_short']:,} / "
+                f"too long {stats['too_long']:,} / duplicates {stats['duplicate']:,})",
                 flush=True,
             )
     print(
-        f"{output}: 총 {totals['written']:,}행, {output.stat().st_size / 1e9:.2f} GB",
+        f"{output}: {totals['written']:,} total rows, {output.stat().st_size / 1e9:.2f} GB",
         flush=True,
     )
 
