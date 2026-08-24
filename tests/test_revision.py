@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 import random
 from pathlib import Path
 
+import numpy as np
 import pytest
 
+from sion_translate.data import IndexedParallelDataset
+from sion_translate.data.prepare import prepare_dataset
 from sion_translate.evaluation import has_excessive_repetition, numeric_tokens
 from sion_translate.revision import (
     DEFAULT_CORRUPTIONS,
@@ -35,6 +39,42 @@ def test_serialize_round_trips() -> None:
 def test_parse_rejects_input_without_the_separator() -> None:
     with pytest.raises(ValueError, match=DRAFT_SEPARATOR):
         parse_revision_input("구분자가 없는 문장")
+
+
+@pytest.mark.parametrize(
+    ("source", "draft", "message"),
+    [
+        ("", "draft", "source must be nonblank"),
+        ("   ", "draft", "source must be nonblank"),
+        ("source", "", "draft must be nonblank"),
+        ("source", "   ", "draft must be nonblank"),
+        ("source <draft> injected", "draft", "reserved <draft> separator"),
+        ("source", "draft <draft> injected", "reserved <draft> separator"),
+    ],
+)
+def test_serialize_rejects_blank_or_embedded_separator_components(
+    source: str,
+    draft: str,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        serialize_revision_input(source, draft)
+
+
+@pytest.mark.parametrize(
+    ("serialized", "message"),
+    [
+        (" <draft> draft", "source must be nonblank"),
+        ("source <draft> ", "draft must be nonblank"),
+        ("source <draft> draft <draft> injected", "exactly one <draft> separator"),
+    ],
+)
+def test_parse_rejects_blank_or_multiple_separator_inputs(
+    serialized: str,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        parse_revision_input(serialized)
 
 
 def test_draft_separator_is_a_reserved_control_symbol() -> None:
@@ -157,10 +197,13 @@ def test_written_file_is_a_plain_translation_pair(tmp_path: Path) -> None:
     output = tmp_path / "revise_synthetic.jsonl"
     assert write_revision_examples(output, examples, ("ko", "ja")) == 5
     rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
-    assert all(set(row) == {"ko", "ja", "synthetic", "training_direction"} for row in rows)
+    assert all(
+        set(row) == {"ko", "ja", "synthetic", "training_direction", "provenance"} for row in rows
+    )
     assert all(DRAFT_SEPARATOR in row["ko"] for row in rows)
     assert all(row["synthetic"] is True for row in rows)
     assert all(row["training_direction"] == ["ko", "ja"] for row in rows)
+    assert all(row["provenance"] == {"transformation": "revision"} for row in rows)
 
 
 def test_written_revision_direction_and_keys_are_canonical_bcp47(tmp_path: Path) -> None:
@@ -180,7 +223,71 @@ def test_written_revision_direction_and_keys_are_canonical_bcp47(tmp_path: Path)
         "zh-Hant": "譯文",
         "synthetic": True,
         "training_direction": ["pt-BR", "zh-Hant"],
+        "provenance": {"transformation": "revision"},
     }
+
+
+def test_custom_filename_revision_round_trips_to_authenticated_arbitrary_edge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepare_module = importlib.import_module("sion_translate.data.prepare")
+
+    class StubTokenizer:
+        languages = ("pt-BR", "zh-Hant")
+        draft_id = 1_000_001
+
+        def __init__(self, _model_path: str | Path):
+            pass
+
+        @staticmethod
+        def encode(text: str) -> list[int]:
+            source, separator, draft = text.partition(DRAFT_SEPARATOR)
+            if not separator:
+                return [ord(character) for character in text]
+            return [
+                *[ord(character) for character in source.strip()],
+                StubTokenizer.draft_id,
+                *[ord(character) for character in draft.strip()],
+            ]
+
+    monkeypatch.setattr(prepare_module, "SionTokenizer", StubTokenizer)
+    tokenizer_path = tmp_path / "tokenizer.model"
+    tokenizer_path.write_bytes(b"stub tokenizer")
+    output = tmp_path / "custom_generated_rows.jsonl"
+    serialized = serialize_revision_input(
+        "Esta fonte precisa ser traduzida.",
+        "Este é o rascunho inicial.",
+    )
+    assert (
+        write_revision_examples(
+            output,
+            [(serialized, "這是修訂完成的譯文。")],
+            ("pt-BR", "zh-Hant"),
+        )
+        == 1
+    )
+
+    dataset_root = tmp_path / "dataset"
+    prepare_dataset(
+        [str(output)],
+        tokenizer_path,
+        dataset_root,
+        language_pairs=(("pt-BR", "zh-Hant"),),
+        translation_directions=(("pt-BR", "zh-Hant"),),
+        validation_fraction=0.0,
+        test_fraction=0.0,
+        filter_quality=False,
+        dedup_backend="memory",
+        num_workers=1,
+    )
+    dataset = IndexedParallelDataset(dataset_root, "train", bidirectional=True)
+
+    assert dataset.detect_revision_directions(
+        draft_token_id=StubTokenizer.draft_id,
+        max_source_tokens=10_000,
+        physical_mask=np.ones(dataset.pair_count, dtype=np.bool_),
+    ) == (("pt-BR", "zh-Hant"),)
 
 
 def test_revision_write_failure_preserves_existing_output(tmp_path: Path) -> None:
@@ -196,6 +303,28 @@ def test_revision_write_failure_preserves_existing_output(tmp_path: Path) -> Non
 
     assert output.read_text(encoding="utf-8") == "existing output\n"
     assert list(tmp_path.glob(".revise_atomic.jsonl.*.tmp")) == []
+
+
+@pytest.mark.parametrize(
+    "serialized",
+    [
+        " <draft> draft",
+        "source <draft> ",
+        "source <draft> draft <draft> injected",
+    ],
+)
+def test_revision_writer_rejects_invalid_structure_without_replacing_output(
+    tmp_path: Path,
+    serialized: str,
+) -> None:
+    output = tmp_path / "custom_output.jsonl"
+    output.write_text("existing output\n", encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        write_revision_examples(output, [(serialized, "target")], ("sw", "ar"))
+
+    assert output.read_text(encoding="utf-8") == "existing output\n"
+    assert list(tmp_path.glob(".custom_output.jsonl.*.tmp")) == []
 
 
 def test_revision_rejects_reverse_scoped_input_without_replacing_output(tmp_path: Path) -> None:

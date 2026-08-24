@@ -89,17 +89,36 @@ class RevisionExample:
 RevisionOutput: TypeAlias = tuple[str, str] | RevisionExample
 
 
+def _validated_revision_components(source: str, draft: str) -> tuple[str, str]:
+    normalized_source = source.strip()
+    normalized_draft = draft.strip()
+    if not normalized_source:
+        raise ValueError("revision source must be nonblank")
+    if not normalized_draft:
+        raise ValueError("revision draft must be nonblank")
+    if DRAFT_SEPARATOR in normalized_source or DRAFT_SEPARATOR in normalized_draft:
+        raise ValueError(
+            f"revision source and draft cannot contain the reserved {DRAFT_SEPARATOR} separator"
+        )
+    return normalized_source, normalized_draft
+
+
 def serialize_revision_input(source: str, draft: str) -> str:
     """``원문 <draft> 초안`` 형태로 직렬화합니다."""
-    return f"{source.strip()} {DRAFT_SEPARATOR} {draft.strip()}"
+    normalized_source, normalized_draft = _validated_revision_components(source, draft)
+    return f"{normalized_source} {DRAFT_SEPARATOR} {normalized_draft}"
 
 
 def parse_revision_input(text: str) -> tuple[str, str]:
     """직렬화된 입력을 (원문, 초안) 으로 되돌립니다."""
-    if DRAFT_SEPARATOR not in text:
-        raise ValueError(f"{DRAFT_SEPARATOR} 가 없습니다: {text[:60]}")
+    separator_count = text.count(DRAFT_SEPARATOR)
+    if separator_count != 1:
+        raise ValueError(
+            f"revision input must contain exactly one {DRAFT_SEPARATOR} separator; "
+            f"found={separator_count}: {text[:60]}"
+        )
     source, _, draft = text.partition(DRAFT_SEPARATOR)
-    return source.strip(), draft.strip()
+    return _validated_revision_components(source, draft)
 
 
 def _clauses(text: str) -> list[str]:
@@ -232,7 +251,8 @@ def write_revision_examples(
     """``prepare_dataset`` 가 읽는 형식으로 씁니다.
 
     ``원문 <draft> 초안`` 이 그대로 원문 자리에 들어가므로, 데이터 파이프라인은
-    이것을 평범한 번역쌍으로 처리합니다.
+    이것을 평범한 번역쌍으로 처리합니다. 파일명과 무관하게 모든 행에 revision
+    provenance를 기록해 인덱스 로더가 학습 목적을 인증할 수 있게 합니다.
     """
     key_a, key_b = canonicalize_language_pair(
         language_pair,
@@ -277,11 +297,15 @@ def write_revision_examples(
                 else:
                     serialized, target = example
                     metadata = {}
+                source, draft = parse_revision_input(serialized)
+                serialized = serialize_revision_input(source, draft)
+                provenance: dict[str, object] = {"transformation": "revision"}
                 row: dict[str, object] = {
                     key_a: serialized,
                     key_b: target,
                     "synthetic": True,
                     "training_direction": [key_a, key_b],
+                    "provenance": provenance,
                 }
                 if isinstance(example, RevisionExample):
                     for field in RECORD_METADATA_FIELDS:
@@ -293,10 +317,7 @@ def write_revision_examples(
                     if "provenance" in metadata:
                         provenance_input["provenance"] = deepcopy(metadata["provenance"])
                     if provenance_input:
-                        row["provenance"] = {
-                            "transformation": "revision",
-                            "input": provenance_input,
-                        }
+                        provenance["input"] = provenance_input
                 handle.write(json.dumps(row, ensure_ascii=False) + "\n")
                 written += 1
         os.replace(temporary_path, output_path)
