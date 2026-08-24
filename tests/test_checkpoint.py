@@ -2380,7 +2380,7 @@ def test_distributed_stage_transfer_supports_ddp_canonical_model_keys(
         torch.distributed.destroy_process_group()
 
 
-# ── 단계 인계 (foundation → SFT) ────────────────────────────────────────
+# ── Stage transfer (foundation -> SFT) ──────────────────────────────────
 
 
 def _identity(model, tmp_path: Path, *, dataset_name: str, stage: str) -> dict:
@@ -2401,11 +2401,11 @@ def _identity(model, tmp_path: Path, *, dataset_name: str, stage: str) -> dict:
 
 
 def test_stage_transfer_loads_weights_without_optimizer_or_step(tmp_path: Path) -> None:
-    """foundation → SFT 는 재개가 아니다.
+    """Moving from foundation training to SFT is not a resume operation.
 
-    새 단계는 새 목적함수와 새 LR schedule 을 갖습니다. 이전 단계의 Adam
-    moment 와 step 카운터를 이어받으면 warmup 이 건너뛰어지고 momentum 이
-    다른 loss 표면의 것을 가리킵니다.
+    The new stage has a new objective and learning-rate schedule. Carrying over
+    Adam moments and the step counter would skip warmup and apply momentum from
+    a different loss surface.
     """
     model, optimizer, scheduler, context = _components()
     checkpoint = tmp_path / "foundation"
@@ -2425,7 +2425,7 @@ def test_stage_transfer_loads_weights_without_optimizer_or_step(tmp_path: Path) 
     provenance = initialize_model_from_checkpoint(checkpoint, fresh, context)
 
     assert torch.allclose(fresh.token_embedding.weight, trained)
-    # step 은 반환값으로만 알려 주고, 새 단계는 0 에서 시작한다.
+    # Report the old step only as provenance; the new stage starts at step zero.
     assert provenance["step"] == 4200
     assert fresh_scheduler.state_dict() == scheduler_before
     assert fresh_optimizer.state_dict() == optimizer_before
@@ -2648,7 +2648,7 @@ def test_distributed_stage_transfer_preflights_ema_metadata(
 
 
 def test_stage_transfer_accepts_a_different_dataset(tmp_path: Path) -> None:
-    """두 단계가 서로 다른 데이터셋을 쓰는 것은 정상이다 (단일어 대 병렬)."""
+    """The two stages normally use different datasets: monolingual and parallel."""
     model, optimizer, scheduler, context = _components()
     checkpoint = tmp_path / "foundation"
     save_checkpoint(
@@ -2671,10 +2671,10 @@ def test_stage_transfer_accepts_a_different_dataset(tmp_path: Path) -> None:
 
 
 def test_stage_transfer_refuses_a_different_tokenizer(tmp_path: Path) -> None:
-    """토크나이저가 다르면 임베딩 행이 가리키는 것이 달라진다.
+    """A different tokenizer changes what each embedding row represents.
 
-    모양은 맞으므로 load_state_dict 는 성공합니다. 즉 막지 않으면 조용히
-    무의미한 가중치를 물려받습니다.
+    The shapes still match, so ``load_state_dict`` succeeds. Without this guard,
+    the new stage would silently inherit meaningless weights.
     """
     model, optimizer, scheduler, context = _components()
     checkpoint = tmp_path / "foundation"
@@ -2720,7 +2720,7 @@ def test_stage_transfer_refuses_a_different_model_config(tmp_path: Path) -> None
 
 
 def test_stage_transfer_refuses_a_checkpoint_without_an_identity(tmp_path: Path) -> None:
-    """검증할 수 없는 가중치를 물려받느니 멈추는 편이 낫다."""
+    """Stopping is safer than inheriting weights whose identity cannot be verified."""
     model, optimizer, scheduler, context = _components()
     checkpoint = tmp_path / "foundation"
     save_checkpoint(checkpoint, model, optimizer, scheduler, 1, context)
@@ -2735,7 +2735,7 @@ def test_stage_transfer_refuses_a_checkpoint_without_an_identity(tmp_path: Path)
         )
 
 
-# ── 목적함수 identity: 무엇을 최적화하는지도 정체성이다 ─────────────────
+# ── Objective identity: what the run optimizes is part of its identity ───
 
 
 def _objective_config():
@@ -2745,8 +2745,7 @@ def _objective_config():
 
 
 def test_the_objective_identity_covers_the_optimizer_schedule() -> None:
-    """학습률·Adam 계수를 바꾸고 optimizer state 를 이어받으면 momentum 이
-    다른 곡률을 가리킨다."""
+    """Changing optimizer settings makes inherited momentum describe another curve."""
     from sion_translate.training.checkpoint import build_objective_identity
 
     config = _objective_config()
@@ -2765,10 +2764,10 @@ def test_the_objective_identity_covers_the_optimizer_schedule() -> None:
 
 
 def test_reward_weights_are_part_of_the_posttraining_identity() -> None:
-    """MRT 는 reward 정의가 곧 선택 지표다.
+    """For MRT, the reward definition is also the selection metric.
 
-    가중치 하나만 바꿔도 validation_reward 는 다른 축의 수치가 되는데
-    early stopping 은 과거 best 와 비교합니다.
+    Changing one weight puts ``validation_reward`` on a different scale, while
+    early stopping still compares it with the previous best value.
     """
     from sion_translate.training.checkpoint import build_objective_identity
 
@@ -2800,7 +2799,7 @@ def test_reward_weights_are_part_of_the_posttraining_identity() -> None:
 
 
 def test_posttraining_settings_do_not_affect_a_supervised_identity() -> None:
-    """SFT 재개를 MRT 설정 변경만으로 거부하면 안 된다."""
+    """An MRT-only setting change must not prevent an SFT run from resuming."""
     from sion_translate.training.checkpoint import build_objective_identity
 
     config = _objective_config()

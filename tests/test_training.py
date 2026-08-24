@@ -241,7 +241,7 @@ def test_single_step_training_loop(tmp_path: Path) -> None:
     assert (tmp_path / "run" / "checkpoints" / "best" / "checkpoint.pt").exists()
     assert (tmp_path / "run" / "checkpoints" / "latest" / "checkpoint.pt").exists()
     assert (tmp_path / "run" / "checkpoints" / "final" / "checkpoint.pt").exists()
-    # raw 가중치는 checkpoint에 있으므로 중간 inference export는 EMA 하나뿐이다.
+    # Raw weights remain in checkpoints, so intermediate inference exports need only EMA.
     for name in ("best", "latest"):
         assert (tmp_path / "run" / "exports" / name / "model_ema.pt").exists()
         assert not (tmp_path / "run" / "exports" / name / "model.pt").exists()
@@ -1085,7 +1085,7 @@ def test_exported_models_reload_and_run(tmp_path: Path) -> None:
     context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
     train(model, [tiny_batch()], [tiny_batch()], config, context)
 
-    # 학습 종료 시 live model은 best EMA로 복원되므로 같은 export와 비교한다.
+    # Training restores the live model from best EMA, so compare it with that export.
     rebuilt, rebuilt_config, pad_id = load_exported_model(
         tmp_path / "run" / "exports" / "best" / "model_ema.pt",
     )
@@ -1192,8 +1192,8 @@ def test_cosine_scheduler_warms_up_then_decays() -> None:
 def test_gradient_accumulation_matches_combined_token_normalization(
     tmp_path: Path,
 ) -> None:
-    # 초기 가중치에 따라 두 학습 경로의 부동소수점 차이가 허용 오차 근처까지
-    # 커질 수 있으므로, 테스트가 항상 같은 가중치에서 출발하도록 시드를 고정한다.
+    # Initial weights can make floating-point differences between the two paths
+    # approach the tolerance, so fix the seed to start both from identical weights.
     torch.manual_seed(20260711)
     combined = tiny_batch()
     micros = [
@@ -1272,11 +1272,11 @@ def test_inference_prefers_posttrain_then_pretrain(tmp_path: Path) -> None:
     assert find_exported_model(tmp_path / "run") == posttrain
 
 
-# ── MRT 방향별 no-regression ────────────────────────────────────────────
+# ── MRT no-regression checks by direction ───────────────────────────────
 
 
 class _DirectionRewardObjective:
-    """ko→ja 는 낮은 reward, ja→ko 는 높은 reward 를 주는 가짜 목적함수."""
+    """A fake objective that gives ko->ja low reward and ja->ko high reward."""
 
     def __init__(self, tags: dict[str, int]):
         self.tags = tags
@@ -1306,19 +1306,19 @@ class _DirectionRewardObjective:
 
 
 def test_direction_rewards_are_weighted_by_rows_not_by_batch_size() -> None:
-    """평균 reward 하나로 best 를 고르면 한 방향의 후퇴가 가려진다.
+    """One mean reward can hide a regression in a single direction.
 
-    방향 평균을 objective 안에서 내면 안 되는 이유도 여기 있습니다. 검증
-    aggregation 은 각 지표를 **배치 크기**로 가중하므로, 한 배치에 ko→ja 가 한
-    행뿐이어도 그 평균이 배치 전체 무게로 들어갑니다. 합계와 행 수를 따로
-    내보내면 두 값이 같은 가중을 받아 나눌 때 상쇄됩니다.
+    This also explains why the objective must not emit direction means. Validation
+    aggregation weights every metric by **batch size**, so a mean from one ko->ja
+    row receives the full batch weight. Emitting sums and row counts separately
+    applies equal weighting to both values, which cancels when they are divided.
     """
     tags = {"ko": 4, "ja": 5}
     model = SionForConditionalGeneration(tiny_model_config())
     context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
 
     batch = tiny_batch()
-    # ko→ja 한 행, ja→ko 한 행.
+    # One ko->ja row and one ja->ko row.
     batch["input_ids"] = torch.tensor([[5, 10, 3], [4, 11, 3]])
     batch["source_language_tag_ids"] = torch.tensor([4, 5])
 
@@ -1337,12 +1337,12 @@ def test_direction_rewards_are_weighted_by_rows_not_by_batch_size() -> None:
     assert metrics["validation_worst_direction_reward"] == pytest.approx(0.2)
     assert metrics["validation_macro_direction_reward"] == pytest.approx(0.55)
     assert metrics["validation_reward_direction_count"] == 2.0
-    # 평균 reward 는 최저 방향보다 훨씬 높다 — 그것만 보면 후퇴를 놓친다.
+    # Mean reward is much higher than the worst direction and would hide its regression.
     assert metrics["validation_reward"] > metrics["validation_worst_direction_reward"]
 
 
 def test_the_intermediate_direction_sums_do_not_leak_into_the_report() -> None:
-    """합계와 행 수는 계산용이지 보고용 지표가 아니다."""
+    """Sums and row counts are calculation details, not report metrics."""
     tags = {"ko": 4, "ja": 5}
     model = SionForConditionalGeneration(tiny_model_config())
     context = DistributedContext(0, 0, 1, torch.device("cpu"), False)

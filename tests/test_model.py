@@ -470,7 +470,7 @@ def test_decode_constraints_block_control_tokens_and_repeated_ngrams() -> None:
     assert constrained[:, 0].isneginf().all()
     assert constrained[:, 2].isneginf().all()
     assert constrained[:, 3].isneginf().all()
-    # 첫 행의 마지막 5,6,7 뒤에는 과거에 5가 왔으므로 그 4-gram을 차단합니다.
+    # Block this 4-gram because token 5 previously followed the first row's final 5, 6, 7.
     assert constrained[0, 5].isneginf()
     assert torch.isfinite(constrained[1, 5])
 
@@ -789,8 +789,7 @@ def test_meta_materialization_rebuilds_rope_buffers() -> None:
 
 
 def test_kv_cache_greedy_matches_full_redecode() -> None:
-    """KV cache 디코딩이 '매번 prefix 전체를 다시 계산'하는 방식과
-    토큰 단위로 완전히 같은 결과를 내야 한다."""
+    """KV-cache decoding must exactly match full-prefix decoding token by token."""
     torch.manual_seed(7)
     model = SionForConditionalGeneration(tiny_config())
     model.eval()
@@ -851,8 +850,8 @@ def test_beam_search_generation() -> None:
         **features,
     )
     assert output.shape[0] == 2
-    assert output[:, 0].eq(2).all()  # BOS 로 시작
-    assert output[:, -1].eq(3).all() or output.shape[1] == 7  # EOS 로 끝나거나 길이 제한
+    assert output[:, 0].eq(2).all()  # Starts with BOS.
+    assert output[:, -1].eq(3).all() or output.shape[1] == 7  # Ends at EOS or the limit.
 
 
 def test_morph_gates_only_when_morphoscript_enabled() -> None:
@@ -1105,7 +1104,7 @@ def test_beam_search_is_reproducible_across_batch_and_beam_widths() -> None:
 
 
 class _Float32VocabCopyCounter(torch.utils._python_dispatch.TorchDispatchMode):
-    """(batch, seq, vocab) 텐서를 FP32 로 복사하는 횟수를 셉니다."""
+    """Count FP32 copies of tensors shaped ``(batch, sequence, vocabulary)``."""
 
     def __init__(self, vocab_size: int) -> None:
         self.vocab_size = vocab_size
@@ -1124,11 +1123,11 @@ class _Float32VocabCopyCounter(torch.utils._python_dispatch.TorchDispatchMode):
 
 
 def test_loss_materializes_the_fp32_logit_copy_only_once() -> None:
-    """혼합 정밀도에서 (batch, seq, vocab) FP32 사본은 하나만 만들어야 한다.
+    """Mixed-precision loss may make only one full-vocabulary FP32 copy.
 
-    사본 하나가 batch 32 · seq 512 · vocab 48,000 에서 3.1 GB 이고 backward
-    까지 상주하므로, cross-entropy 와 z-loss 가 각자 ``logits.float()`` 를
-    부르면 그대로 두 배가 됩니다.
+    One copy uses 3.1 GB for batch 32, sequence 512, and vocabulary 48,000, and
+    remains resident through backward. Separate ``logits.float()`` calls in
+    cross-entropy and z-loss would double that memory directly.
     """
     config = tiny_config()
     config.z_loss_weight = 1e-4
@@ -1144,31 +1143,31 @@ def test_loss_materializes_the_fp32_logit_copy_only_once() -> None:
 
 
 def test_residual_init_scale_counts_writes_not_layers() -> None:
-    """잔차 초기화 분모는 층 수가 아니라 잔차에 더해지는 항의 개수여야 한다."""
+    """Residual initialization scales by residual writes, not layer count."""
     config = tiny_config()
     config.encoder_layers = 6
     config.decoder_layers = 4
     model = SionForConditionalGeneration(config)
-    # encoder 6층 x 2회 = 12, decoder 4층 x 3회(self/cross/ffn) = 12
+    # Encoder: 6 layers x 2 writes = 12. Decoder: 4 x 3 (self/cross/FFN) = 12.
     assert model.residual_write_count() == 12
 
     config = tiny_config()
     config.encoder_layers = 4
     config.decoder_layers = 6
     model = SionForConditionalGeneration(config)
-    # decoder 가 지배: 6 x 3 = 18. 층 수만 세면 12 로 과소평가된다.
+    # Decoder dominates at 6 x 3 = 18; counting layers alone underestimates it as 12.
     assert model.residual_write_count() == 18
 
 
 def test_residual_init_scale_accounts_for_repeated_blocks() -> None:
-    """반복되는 블록은 반복 횟수만큼 잔차에 더 쓴다."""
+    """A recurrent block adds residual writes on every repetition."""
     config = tiny_config()
     config.encoder_layers = 8
     config.decoder_layers = 1
     config.experimental.recurrent_block_layers = 2
     config.experimental.recurrent_steps = 4
     model = SionForConditionalGeneration(config)
-    # 8층 x 2회 + 반복 블록 2층 x 2회 x 추가 3회 = 16 + 12 = 28
+    # 8 layers x 2 writes + 2 recurrent layers x 2 writes x 3 extra passes = 28.
     assert model.residual_write_count() == 28
 
 
@@ -1180,18 +1179,18 @@ def test_residual_projections_are_scaled_down_from_the_base_std() -> None:
     expected = config.init_std / model.residual_write_count() ** 0.5
     out_proj = model.encoder_layers[0].self_attn.out_proj.weight
     q_proj = model.encoder_layers[0].self_attn.q_proj.weight
-    # 표준편차 추정은 표본 오차가 있으므로 넉넉한 상대 허용오차를 씁니다.
+    # Standard-deviation estimates have sampling error, so use a generous tolerance.
     assert out_proj.std().item() == pytest.approx(expected, rel=0.25)
     assert q_proj.std().item() == pytest.approx(config.init_std, rel=0.25)
     assert out_proj.std().item() < q_proj.std().item()
 
 
 def test_every_norm_uses_the_configured_epsilon() -> None:
-    """RMSNorm eps 는 설정값 하나에서 와야 한다.
+    """Every RMSNorm epsilon must come from the same configuration value.
 
-    ``ContentRegisterState`` 만 ``RMSNorm(d_model)`` 로 기본값 1e-6 을 쓰고
-    있었습니다. 하필 루트 설정에서 유일하게 켜 두는 모듈이라, config 의
-    ``rms_norm_eps`` 를 바꿔도 그 하나만 따라오지 않았습니다.
+    ``ContentRegisterState`` previously used ``RMSNorm(d_model)`` and therefore
+    the default 1e-6. It was also the only module enabled by the root
+    configuration, so changing ``rms_norm_eps`` left this one module behind.
     """
     from sion_translate.model.layers import RMSNorm
 
@@ -1209,7 +1208,7 @@ def test_every_norm_uses_the_configured_epsilon() -> None:
     assert not offenders, f"설정 eps 를 쓰지 않는 RMSNorm: {offenders}"
 
 
-# ── CoRe: 감독받지 않는 class 는 분류기 출력에서 빠져야 한다 ────────────
+# ── CoRe: exclude the unsupervised class from classifier output ─────────
 
 
 def _register_model(register_classes: int = 4):
@@ -1223,19 +1222,19 @@ def _register_model(register_classes: int = 4):
 
 
 def test_the_unsupervised_register_class_cannot_win_the_softmax() -> None:
-    """class 0 은 "규칙에 안 걸림" 이지 학습 가능한 범주가 아니다.
+    """Class 0 means "no rule matched" and is not a trainable category.
 
-    register loss 는 labels > 0 만 학습하므로 class 0 은 한 번도 정답이 되지
-    않고 모든 예제에서 오답으로만 등장합니다. softmax 에 남겨 두면 실질적으로
-    3-way 인데 4-way 인 척하면서, class 0 의 embedding 은 context 혼합에 계속
-    섞이는데 register loss 로부터는 아무 신호도 못 받습니다.
+    Register loss trains only labels greater than zero, so class 0 is never
+    correct and appears only as a wrong answer. Leaving it in the softmax makes
+    a three-way problem pretend to be four-way. Its embedding still enters the
+    context mixture despite receiving no signal from register loss.
     """
     model, _ = _register_model()
     batch = make_batch()
     with torch.no_grad():
         output = model(**batch)
 
-    logits = output.register_loss  # 존재 확인용
+    logits = output.register_loss  # Presence check.
     assert logits is not None
     encoder_states = model.encode(batch["input_ids"], batch["attention_mask"])
     with torch.no_grad():
@@ -1243,7 +1242,7 @@ def test_the_unsupervised_register_class_cannot_win_the_softmax() -> None:
     probabilities = register_logits.softmax(-1)
     assert torch.isinf(register_logits[:, 0]).all() or register_logits[:, 0].min() < -1e30
     assert probabilities[:, 0].max() < 1e-6
-    # 나머지 class 의 확률은 정상적으로 합이 1 이어야 한다.
+    # Probabilities for the remaining classes must still sum to one.
     assert probabilities.sum(-1).allclose(torch.ones(probabilities.shape[0]), atol=1e-5)
 
 
@@ -1252,7 +1251,7 @@ def test_the_register_context_never_mixes_the_unsupervised_embedding() -> None:
     batch = make_batch()
     encoder_states = model.encode(batch["input_ids"], batch["attention_mask"])
     with torch.no_grad():
-        # class 0 의 embedding 을 크게 바꿔도 context 가 흔들리지 않아야 한다.
+        # A large change to class 0's embedding must not perturb the context.
         _, before, _ = model.register_state(encoder_states, batch["attention_mask"], None)
         model.register_state.register_embeddings.weight[0].fill_(1000.0)
         _, after, _ = model.register_state(encoder_states, batch["attention_mask"], None)
@@ -1260,8 +1259,11 @@ def test_the_register_context_never_mixes_the_unsupervised_embedding() -> None:
 
 
 def test_the_unsupervised_row_rate_is_reported() -> None:
-    """규칙에 안 걸린 문장이 loss 에서 빠지는 비율이 로그에 없으면,
-    CoRe 가 배치의 절반만 보고 있어도 알 수 없다."""
+    """Report how many unmatched rows are excluded from loss.
+
+    Without this rate in the log, CoRe could observe only half a batch without
+    making the loss of supervision visible.
+    """
     model, _ = _register_model()
     batch = make_batch()
     batch["register_labels"] = torch.tensor([0, 2])

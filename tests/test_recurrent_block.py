@@ -1,4 +1,4 @@
-"""공유 블록 hidden-state 반복 검증."""
+"""Test hidden-state recurrence through a shared block."""
 
 from __future__ import annotations
 
@@ -35,16 +35,17 @@ def _inputs(length: int = 6):
 def test_disabled_by_default_so_existing_checkpoints_load() -> None:
     plain = SionForConditionalGeneration(_config())
     recurrent = SionForConditionalGeneration(_config(recurrent_block_layers=2, recurrent_steps=3))
-    # 가중치를 새로 만들지 않으므로 state_dict 모양이 같아야 한다.
+    # Recurrence adds no weights, so the state-dictionary structure must match.
     assert plain.state_dict().keys() == recurrent.state_dict().keys()
     recurrent.load_state_dict(plain.state_dict())
 
 
 def test_repeats_the_block_as_a_unit_not_each_layer() -> None:
-    """마지막 N개 층은 **하나의 블록으로 묶여** 반복되어야 한다.
+    """Repeat the final N layers together as one block.
 
-    층별 반복(L2를 3번 → L3를 3번)과 블록 반복((L2,L3)을 3번)은 서로 다른
-    함수다. 설정 이름과 주석이 약속한 것은 후자이므로 그것을 직접 확인한다.
+    Per-layer recurrence (L2 three times, then L3 three times) differs from block
+    recurrence ((L2, L3) three times). The configuration promises the latter, so
+    the test checks it directly.
     """
     torch.manual_seed(4)
     steps, block = 3, 2
@@ -72,7 +73,7 @@ def test_repeats_the_block_as_a_unit_not_each_layer() -> None:
         per_layer = model.encoder_norm(hidden)
 
     assert torch.allclose(actual, per_block, atol=1e-6)
-    # 두 해석이 실제로 다른 값을 내는 설정이어야 위 assert 가 의미를 가진다.
+    # The fixture must make both interpretations differ for the assertion to matter.
     assert not torch.allclose(per_block, per_layer, atol=1e-5)
 
 
@@ -90,7 +91,7 @@ def test_recurrence_changes_the_encoder_output() -> None:
         base = plain.encode(input_ids, attention_mask)
         looped = recurrent.encode(input_ids, attention_mask)
     assert base.shape == looped.shape
-    # 같은 가중치인데도 계산이 달라야 반복이 실제로 일어난 것이다.
+    # Identical weights must compute a different result when recurrence is active.
     assert not torch.allclose(base, looped, atol=1e-5)
 
 
@@ -126,7 +127,7 @@ def test_gradients_flow_through_every_repeat() -> None:
     model = SionForConditionalGeneration(_config(recurrent_block_layers=2, recurrent_steps=3))
     input_ids, attention_mask = _inputs()
     model.encode(input_ids, attention_mask).sum().backward()
-    # 반복된 블록의 가중치는 여러 경로에서 기울기를 받아야 한다.
+    # Reused block weights must receive gradients through every recurrent path.
     last_layer = model.encoder_layers[-1]
     grads = [p.grad for p in last_layer.parameters() if p.requires_grad]
     assert grads and all(grad is not None for grad in grads)
