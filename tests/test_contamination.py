@@ -1,7 +1,7 @@
-"""오염된 정답쌍 탐지.
+"""Verify detection and conservative repair of contaminated target pairs.
 
-``assess_pair`` 는 길이·문자 비율·반복만 봅니다. 의미가 틀린 정답은
-그 검사를 전부 통과하므로 별도의 규칙이 필요합니다.
+``assess_pair`` checks length, script ratios, and repetition. A semantically
+wrong target can pass all of those checks and therefore needs separate rules.
 """
 
 from __future__ import annotations
@@ -53,9 +53,10 @@ def test_contamination_apis_require_explicit_language_identity() -> None:
 
 
 def test_the_documented_contamination_passes_the_quality_filter() -> None:
-    """이 모듈이 존재하는 이유.
+    """Demonstrate why a semantic contamination detector is necessary.
 
-    실제 원천에서 확인된 오역이 기존 품질 필터를 만점으로 통과합니다.
+    A mistranslation measured in the source corpus passes the old surface filter
+    with a perfect score.
     """
     accepted = assess_pair(
         "씨발 진짜 짜증나네",
@@ -75,15 +76,16 @@ def test_the_known_profanity_mistranslation_is_flagged() -> None:
 
 
 def test_spacing_and_repetition_do_not_hide_the_mistranslation() -> None:
-    """자간·문장부호·반복 문자는 걷어내고 비교한다."""
+    """Normalize spacing, punctuation, and repeated characters before matching."""
     findings = assess_contamination("씨 발!!! 아 진짜", "種 ま き ああ本当に")
     assert any(finding.rule == "known_literal_mistranslation" for finding in findings)
 
 
 def test_a_vowel_stretched_insult_is_a_known_limitation() -> None:
-    """`씨이이발` 은 모음을 끼워 넣은 변형이라 반복 축약으로 되돌릴 수 없다.
+    """Document that inserted-vowel stretching is outside normalizer coverage.
 
-    잡으려면 목록에 직접 넣어야 합니다. 잡히는 척하지 않도록 고정해 둡니다.
+    Detecting `씨이이발` requires a direct lexicon entry. This regression test
+    prevents the system from pretending that repetition collapse handles it.
     """
     assert "씨발" not in normalize("씨이이발")
     assert assess_contamination("씨이이발", "種まき") == []
@@ -98,7 +100,7 @@ def test_a_literally_translated_idiom_is_flagged() -> None:
 
 
 def test_the_lookalike_idiom_is_flagged() -> None:
-    """닮았다는 뜻의 `붕어빵` 이 음식 `たい焼き` 로 옮겨진 경우."""
+    """Flag `붕어빵` as literal only when context indicates resemblance."""
     findings = assess_contamination("아빠랑 붕어빵이네", "パパとたい焼きだね")
     assert any(finding.rule == "literal_idiom" for finding in findings)
 
@@ -109,10 +111,10 @@ def test_the_lookalike_idiom_is_flagged() -> None:
 
 
 def test_the_food_sense_of_the_lookalike_word_is_not_flagged() -> None:
-    """실측 오탐. queue 155행의 `literal_idiom` 은 대부분 진짜 음식이었다.
+    """Prevent measured false positives for literal food references.
 
-    `붕어빵을 입에 물고`, `펭수네 붕어빵` 에서 `たい焼き` 는 맞는 번역입니다.
-    닮음을 뜻하는 표지가 없으면 관용구로 보지 않습니다.
+    Most of the 155 queued ``literal_idiom`` rows referred to real food. Without
+    a resemblance marker, `たい焼き` is valid and must not trigger the idiom rule.
     """
 
     for source, target in (
@@ -132,7 +134,7 @@ def test_a_dog_prefix_insult_translated_as_the_animal_is_flagged() -> None:
 
 
 def test_a_spaced_animal_reference_is_not_a_dog_prefix_insult() -> None:
-    """실측 오탐. 공백을 지우면 `개 소리`(짖는 소리)가 `개소리`(헛소리)가 된다."""
+    """Keep the measured dog-sound false positive distinct from prefix profanity."""
 
     assert (
         assess_contamination(
@@ -144,13 +146,13 @@ def test_a_spaced_animal_reference_is_not_a_dog_prefix_insult() -> None:
 
 
 def test_profanity_losing_its_intensity_is_flagged_without_a_lookup_table() -> None:
-    """목록에 없는 새 오염도 잡아야 한다."""
+    """Catch unseen contamination through the generic intensity-loss rule."""
     findings = assess_contamination("존나 짜증나", "とても嫌です")
     assert any(finding.rule == "profanity_intensity_lost" for finding in findings)
 
 
 def test_a_correctly_localized_insult_is_not_flagged() -> None:
-    """비속 표지가 살아 있으면 오염이 아니다. 오탐이 많으면 queue 가 무용해진다."""
+    """Do not flag a target that retains an appropriate vulgarity marker."""
     assert assess_contamination("씨발 진짜 짜증나네", "くそ、本当にむかつく") == []
     assert assess_contamination("이 개새끼야", "このクソ野郎") == []
 
@@ -160,7 +162,7 @@ def test_ordinary_pairs_are_not_flagged() -> None:
 
 
 def test_an_unsupported_direction_returns_nothing_and_says_so() -> None:
-    """규칙 없는 방향을 '오염 없음' 으로 보고하면 감사가 무용해진다."""
+    """Make unsupported directions explicit instead of reporting them as clean."""
     assert (
         assess_contamination("hello", "bonjour", source_language="en", target_language="fr") == []
     )
@@ -195,7 +197,7 @@ def test_spaced_normalize_keeps_the_boundary_that_carries_meaning() -> None:
 
 
 def test_the_known_literal_artifact_is_repaired_and_verified() -> None:
-    """축자 산물은 그 자리에 있다는 것 자체가 오류이므로 규칙으로 고칠 수 있다."""
+    """Repair a context-independent literal artifact and validate the result."""
 
     repair = repair_pair("씨발 진짜 짜증나네", "種まき 本当にうざい")
     assert repair is not None
@@ -203,7 +205,7 @@ def test_the_known_literal_artifact_is_repaired_and_verified() -> None:
     assert repair.target == "くそ 本当にうざい"
     assert repair.original_target == "種まき 本当にうざい"
     assert ("種まき", "くそ") in repair.replacements
-    # 고친 결과는 더 이상 걸리지 않아야 한다. 이 검증이 repair_pair 안에 있다.
+    # ``repair_pair`` itself must ensure the repaired result no longer triggers.
     assert assess_contamination("씨발 진짜 짜증나네", repair.target) == []
 
 
@@ -214,7 +216,7 @@ def test_every_literal_artifact_occurrence_is_repaired() -> None:
 
 
 def test_a_pair_needing_a_new_translation_is_not_repaired() -> None:
-    """관용구 직역과 강도 소실은 대체어를 사람이 써야 한다. 규칙이 지어내면 안 된다."""
+    """Leave contextual idiom and intensity corrections to human translators."""
 
     assert repair_pair("아빠랑 붕어빵이네", "パパとたい焼きだね") is None
     assert repair_pair("존나 짜증나", "とても嫌です") is None
@@ -222,7 +224,7 @@ def test_a_pair_needing_a_new_translation_is_not_repaired() -> None:
 
 
 def test_a_clean_pair_is_not_repaired() -> None:
-    """``None`` 은 '못 고친다'는 뜻이지 '깨끗하다'는 뜻이 아니다."""
+    """Treat ``None`` as not repairable, not as proof that a row is clean."""
 
     assert repair_pair("오늘 날씨가 좋네요", "今日は天気がいいですね") is None
     assert repair_pair("씨발 진짜 짜증나네", "くそ、本当にむかつく") is None
@@ -248,5 +250,5 @@ def test_ranking_picks_the_most_confident_reason() -> None:
     ],
 )
 def test_every_documented_case_is_covered(source: str, target: str) -> None:
-    """로스트에 기록된 실제 사례가 전부 잡혀야 한다."""
+    """Keep every measured roast example covered by a detection rule."""
     assert assess_contamination(source, target)

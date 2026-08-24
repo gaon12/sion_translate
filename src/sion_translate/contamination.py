@@ -1,43 +1,43 @@
-"""오염된 정답쌍을 찾아내고, 확정적인 것만 고친다.
+"""Detect semantically contaminated targets and repair only deterministic cases.
 
-``data.quality.assess_pair`` 는 길이·문자 비율·반복을 봅니다. 그것으로는
-**의미가 틀린 정답**을 잡을 수 없습니다. `씨발` 을 `種まき`(씨 뿌리기)로 옮긴
-행은 길이도 문자 비율도 정상이라 ``accepted=True, score=100`` 으로 통과합니다.
-모델은 그것을 정답으로 배웁니다.
+``data.quality.assess_pair`` checks length, script ratios, and repetition. It
+cannot detect a target whose meaning is wrong but whose surface statistics are
+normal. A row translating `씨발` as `種まき` (seed planting), for example,
+passes with ``accepted=True, score=100`` and would otherwise be learned as gold.
 
-## 무엇을 잡는가
+This module detects three classes:
 
-1. **알려진 직역 매핑**: 실측으로 확인된 대응(`씨발` → `種まき`)입니다.
-   `種まき` 가 `씨발` 자리에 오는 정상적인 문맥은 없으므로 정밀도가 사실상
-   1.0 이고, **자동 수정 대상은 이 규칙 하나뿐**입니다.
-2. **관용구 직역**: 한국어 관용구가 있는데 일본어가 축자 번역인 경우입니다.
-3. **욕설 강도 소실**: 원문에 욕설이 있는데 번역문에 어떤 비속·강조 표지도
-   없는 경우입니다. 목록에 의존하지 않아 새 오염도 잡습니다.
+1. **Known literal mistranslations**, such as the measured `씨발` to `種まき`
+   mapping. There is no normal context for that pair, so its precision is near
+   1.0. This is the only automatically repairable class.
+2. **Literal idiom translations**, where a Korean idiom appears as a literal
+   Japanese rendering.
+3. **Lost profanity intensity**, where the source contains profanity but the
+   target contains no vulgarity or emphasis marker. This heuristic can find
+   unseen contamination but has lower precision.
 
-## 규칙마다 정밀도가 다르다 — 실측
+Manual review of the queue from 8.97 million rows showed very different rule
+precision:
 
-897만 행을 훑어 나온 queue 를 직접 읽고 정밀도를 확인했습니다. 세 규칙이
-전혀 다른 물건이었습니다.
+- All 89 sampled ``known_literal_mistranslation`` rows were true contamination.
+- Most of the 155 ``literal_idiom`` rows were false positives. Phrases such as
+  `붕어빵을 입에 물고` and `펭수네 붕어빵` refer to actual food, where `たい焼き`
+  is correct.
+- Most of the 84 ``dog_prefix_literal`` rows were false positives. Removing
+  whitespace makes `개 소리가 들려` (a dog's sound is heard) indistinguishable
+  from `개소리` (nonsense).
 
-* `known_literal_mistranslation` (89행) — 표본 전부가 진짜 오염이었습니다.
-* `literal_idiom` (155행) — **대부분 오탐**이었습니다. `붕어빵을 입에 물고`,
-  `펭수네 붕어빵` 은 전부 진짜 음식이고 `たい焼き` 가 맞는 번역입니다.
-* `dog_prefix_literal` (84행) — **대부분 오탐**이었습니다. `개 소리가 들려`
-  (개가 짖는 소리)가 공백을 지운 뒤 `개소리`(헛소리)와 같아졌기 때문입니다.
+Two safeguards follow from that review. Dog-prefix profanity is searched in a
+normalization that preserves spaces. Ambiguous idioms such as `붕어빵` also
+require a contextual idiomatic-sense marker from
+:attr:`LiteralIdiom.korean_sense_markers`; without one, the literal food sense
+is assumed.
 
-그래서 두 가지를 바꿨습니다. 첫째, `개`-접두 욕설은 **공백을 남긴 형태**에서
-찾습니다 — `개 소리` 와 `개소리` 는 다른 말이고, 공백을 지우는 순간 그 구별이
-사라집니다. 둘째, `붕어빵` 처럼 관용·축자 두 뜻이 다 살아 있는 표현은 관용
-의미를 가리키는 **문맥 표지**를 함께 요구합니다 (:class:`LiteralIdiom` 의
-``korean_sense_markers``). 표지가 없으면 음식으로 봅니다.
-
-## 왜 대부분은 여전히 고치지 않는가
-
-관용구 직역과 욕설 강도 소실은 **표시만** 합니다. 고치려면 대체할 일본어를
-새로 써야 하는데, 그것은 규칙이 아니라 번역이고 사람이 할 일입니다.
-:func:`repair_pair` 는 대체어가 문맥과 무관하게 결정되는 경우 — 축자 산물이
-그 자리에 있다는 것 자체가 오류인 경우 — 에만 동작하고, 고친 뒤 그 행이
-탐지에 더 이상 걸리지 않는지 **검증한 다음에야** 결과를 돌려줍니다.
+Literal idioms and lost intensity are flagged but not rewritten. Choosing new
+Japanese wording is contextual translation and requires human review.
+:func:`repair_pair` acts only when the replacement is context-independent
+because the literal artifact itself cannot be valid there. It returns a repair
+only after verifying that the rewritten row no longer triggers detection.
 """
 
 from __future__ import annotations
@@ -49,7 +49,7 @@ from typing import Iterable, Sequence
 
 from sion_translate.language_tags import LanguageTagError, parse_language_tag
 
-# 한국어 욕설·비속 표현. 자소 분리와 반복을 견디도록 정규화 후 검사합니다.
+# Korean profanity surfaces are matched after normalization for spacing and repetition.
 KOREAN_PROFANITY = (
     "씨발",
     "시발",
@@ -58,9 +58,9 @@ KOREAN_PROFANITY = (
     "존나",
     "졸라",
     "개새끼",
-    # 맨 `새끼` 는 넣지 않습니다. 새끼 짐승을 뜻하는 평범한 말이라
-    # `새끼 개`, `새끼 고양이` 가 전부 걸립니다 (실측 오탐). 욕설로 쓰일 때의
-    # 형태만 등재합니다. `normalize` 가 공백을 지우므로 `이 새끼` 도 잡힙니다.
+    # Do not include bare `새끼`, which also means a young animal and caused
+    # measured false positives for `새끼 개` and `새끼 고양이`. Include only
+    # profanity forms. Since ``normalize`` removes spaces, `이 새끼` still matches.
     "새끼야",
     "새끼들아",
     "이새끼",
@@ -76,8 +76,8 @@ KOREAN_PROFANITY = (
     "엿먹",
 )
 
-# 일본어 쪽에 하나라도 있으면 "강도가 살아 있다"고 봅니다. 완전한 목록일
-# 필요는 없습니다 — 없을 때만 의심하는 용도이므로 넓게 잡을수록 오탐이 줍니다.
+# Any Japanese marker indicates that intensity survived. This list need not be
+# exhaustive: the heuristic flags only their absence, so broad coverage reduces false positives.
 JAPANESE_VULGAR_MARKERS = (
     "くそ",
     "クソ",
@@ -106,8 +106,8 @@ JAPANESE_VULGAR_MARKERS = (
     "むかつく",
 )
 
-# 실측으로 확인된 직역 대응. `(한국어, 일본어 직역)` 이고, 둘이 같은 행에
-# 있으면 거의 확실한 오염입니다.
+# Measured ``(Korean source, literal Japanese target)`` pairs whose co-occurrence
+# is almost certainly contamination.
 KNOWN_LITERAL_MISTRANSLATIONS: tuple[tuple[str, str], ...] = (
     ("씨발", "種まき"),
     ("시발", "種まき"),
@@ -119,13 +119,12 @@ KNOWN_LITERAL_MISTRANSLATIONS: tuple[tuple[str, str], ...] = (
 
 @dataclass(frozen=True)
 class LiteralIdiom:
-    """관용구 하나와, 그것이 관용 의미로 쓰였다고 볼 근거.
+    """Describe an idiom and evidence that the source uses its idiomatic sense.
 
-    ``korean_sense_markers`` 가 비어 있으면 그 표현은 관용 의미로만 쓰입니다 —
-    `발 벗고 나서` 를 축자로 읽을 문맥은 없습니다. 비어 있지 않으면 표지 중
-    하나가 원문에 함께 있어야 관용구로 봅니다. `붕어빵` 이 그런 경우로, 닮음을
-    뜻하는 관용 용법과 밀가루 음식이라는 축자 용법이 둘 다 흔하고, 후자에서는
-    `たい焼き` 가 **맞는 번역**입니다.
+    An empty ``korean_sense_markers`` means the expression is only idiomatic;
+    there is no natural literal reading of `발 벗고 나서`. Otherwise, at least
+    one marker must appear in the source. `붕어빵` is ambiguous between a
+    resemblance idiom and food, and `たい焼き` is correct for the food sense.
     """
 
     korean: str
@@ -133,10 +132,10 @@ class LiteralIdiom:
     korean_sense_markers: tuple[str, ...] = ()
 
 
-# 관용구와 그 축자 번역. 일본어에 축자 번역이 그대로 나오면 현지화 실패입니다.
+# Idioms paired with Japanese literal renderings that indicate localization failure.
 KNOWN_LITERAL_IDIOMS: tuple[LiteralIdiom, ...] = (
     LiteralIdiom("같은 값이면 다홍치마", "紅スカート"),
-    # 닮음을 뜻할 때만 관용구입니다. 표지가 없으면 먹는 붕어빵입니다.
+    # This is idiomatic only in the resemblance sense; without a marker it means food.
     LiteralIdiom(
         "붕어빵",
         "たい焼き",
@@ -158,10 +157,9 @@ KNOWN_LITERAL_IDIOMS: tuple[LiteralIdiom, ...] = (
     LiteralIdiom("국수를 먹", "そうめんを食べ"),
 )
 
-# 개-접두 욕설이 동물 `犬` 으로 옮겨진 경우. `개` 가 실제 동물인 문장이 많아
-# 단독으로는 근거가 약하므로, 접두사로 쓰인 형태만 봅니다. 공백을 남긴
-# 형태에서 찾는 것이 핵심입니다 — `개 소리가 들려` 는 개가 짖는 소리이고,
-# 공백을 지우면 `개소리`(헛소리)와 구별할 수 없게 됩니다.
+# Detect dog-prefix profanity rendered as the animal `犬`. Because `개` often
+# denotes an actual dog, only attached prefix forms are evidence. Space-preserving
+# matching keeps `개 소리가 들려` distinct from `개소리`.
 DOG_PREFIX_PROFANITY = ("개새끼", "개자식", "개놈", "개년", "개소리", "개수작")
 
 _REPEATED = re.compile(r"(.)\1{2,}")
@@ -169,25 +167,25 @@ _PUNCTUATION = r"[.,!?~·・…\-_*]+"
 
 
 def normalize(text: str) -> str:
-    """반복 문자와 자간 기호를 걷어낸 비교용 표현.
+    """Normalize repetition and inter-character separators for comparison.
 
-    공백까지 지웁니다. `씨 발` 처럼 자간을 벌려 쓴 욕설을 잡기 위해서입니다.
-    그 대가로 띄어쓰기가 뜻을 가르는 쌍(`개 소리` 대 `개소리`)은 구별하지
-    못하므로, 그런 규칙은 :func:`spaced_normalize` 를 씁니다.
+    Whitespace is removed to catch separated profanity such as `씨 발`. This
+    loses distinctions where spacing changes meaning, such as `개 소리` versus
+    `개소리`; those rules must use :func:`spaced_normalize`.
 
-    한계: `씨이이발` 처럼 **모음을 끼워 늘인** 형태는 되돌리지 못합니다.
-    반복 축약은 같은 문자가 이어질 때만 동작하고, 늘임은 새 음절을 넣는
-    변형이기 때문입니다. 그런 형태는 목록에 직접 넣어야 잡힙니다.
+    The normalizer cannot restore forms stretched by inserting a vowel, such as
+    `씨이이발`. Repetition collapse handles only adjacent copies of the same
+    character; inserted syllables require an explicit lexicon entry.
     """
 
     return re.sub(r"\s+", "", spaced_normalize(text))
 
 
 def spaced_normalize(text: str) -> str:
-    """:func:`normalize` 와 같되 **띄어쓰기를 하나로 줄여 남긴다**.
+    """Normalize like :func:`normalize` while retaining collapsed whitespace.
 
-    띄어쓰기가 의미를 가르는 규칙에 씁니다. 실측에서 `개 소리가 들려` 가
-    `개소리`(헛소리)로 잘못 걸린 것이 공백을 지웠기 때문이었습니다.
+    Use this for rules where spacing changes meaning. Removing whitespace caused
+    the measured false positive that treated `개 소리가 들려` as `개소리`.
     """
 
     folded = unicodedata.normalize("NFKC", text)
@@ -199,11 +197,11 @@ def spaced_normalize(text: str) -> str:
 def _normalized_pairs(
     pairs: Sequence[tuple[str, str]],
 ) -> tuple[tuple[str, str, str, str], ...]:
-    """``(원문 패턴, 번역 패턴)`` 을 비교용 형태와 함께 미리 계산한다.
+    """Precompute source/target patterns and their comparison forms.
 
-    패턴을 텍스트와 **같은 방식으로** 정규화하지 않으면 공백이 든 관용구가
-    영영 걸리지 않습니다 — `같은 값이면 다홍치마` 는 정규화된 텍스트에서
-    `같은값이면다홍치마` 이므로 원문 그대로는 일치하지 않습니다.
+    Patterns must use the same normalization as text. Otherwise an idiom with
+    spaces can never match: `같은 값이면 다홍치마` becomes
+    `같은값이면다홍치마` in normalized text.
     """
 
     return tuple((source, target, normalize(source), normalize(target)) for source, target in pairs)
@@ -211,7 +209,7 @@ def _normalized_pairs(
 
 @dataclass(frozen=True)
 class ContaminationFinding:
-    """의심되는 행 하나. ``confidence`` 는 검수 순서를 정하는 용도입니다."""
+    """Describe one suspected row; ``confidence`` orders human review."""
 
     rule: str
     reason: str
@@ -233,7 +231,7 @@ _NORMALIZED_IDIOMS: tuple[tuple[LiteralIdiom, str, str, tuple[str, ...]], ...] =
     )
     for idiom in KNOWN_LITERAL_IDIOMS
 )
-# 공백을 남긴 형태에서 찾습니다. 위 DOG_PREFIX_PROFANITY 주석을 보십시오.
+# Match in the space-preserving form described above ``DOG_PREFIX_PROFANITY``.
 _SPACED_DOG = tuple(spaced_normalize(item) for item in DOG_PREFIX_PROFANITY)
 _NORMALIZED_PROFANITY = tuple(normalize(item) for item in KOREAN_PROFANITY)
 _NORMALIZED_VULGAR = tuple(normalize(item) for item in JAPANESE_VULGAR_MARKERS)
@@ -246,11 +244,11 @@ def assess_contamination(
     source_language: str,
     target_language: str,
 ) -> list[ContaminationFinding]:
-    """한 쌍에 대한 의심 근거를 전부 돌려준다 (없으면 빈 목록).
+    """Return all contamination evidence for one pair, or an empty list.
 
-    ko→ja 규칙만 있습니다. 다른 언어쌍은 빈 목록을 돌려주므로, 규칙 없는
-    언어쌍이 조용히 "깨끗하다"고 보고되지 않도록 호출자가 언어를 확인해야
-    합니다 — ``supported_direction`` 을 쓰십시오.
+    Rules currently cover only ko-to-ja. Other directions return an empty list,
+    so callers must use :func:`supported_direction` and must not report an
+    unsupported direction as clean.
     """
 
     if not supported_direction(source_language, target_language):
@@ -265,7 +263,7 @@ def assess_contamination(
             findings.append(
                 ContaminationFinding(
                     rule="known_literal_mistranslation",
-                    reason=f"욕설 {korean!r} 이 축자 번역 {japanese!r} 으로 옮겨졌습니다",
+                    reason=f"profanity {korean!r} was rendered literally as {japanese!r}",
                     confidence=0.95,
                     evidence=(korean, japanese),
                 )
@@ -274,16 +272,15 @@ def assess_contamination(
     for idiom, flat_korean, flat_japanese, flat_markers in _NORMALIZED_IDIOMS:
         if flat_korean not in flat_source or flat_japanese not in flat_target:
             continue
-        # 표지를 요구하는 표현은 축자 의미로도 흔하게 쓰입니다. 표지가 없으면
-        # 관용구가 아니라 그냥 그 사물이고, 축자 번역이 맞는 번역입니다.
+        # Marker-gated expressions also have common literal senses. Without a
+        # marker they refer to the object and a literal translation is correct.
         if flat_markers and not _contains_any(flat_source, flat_markers):
             continue
         findings.append(
             ContaminationFinding(
                 rule="literal_idiom",
                 reason=(
-                    f"관용구 {idiom.korean!r} 이 축자 번역 "
-                    f"{idiom.japanese_literal!r} 으로 옮겨졌습니다"
+                    f"idiom {idiom.korean!r} was rendered literally as {idiom.japanese_literal!r}"
                 ),
                 confidence=0.85,
                 evidence=(idiom.korean, idiom.japanese_literal),
@@ -295,20 +292,21 @@ def assess_contamination(
         findings.append(
             ContaminationFinding(
                 rule="dog_prefix_literal",
-                reason=f"접두 욕설 {dog[0]!r} 이 동물 '犬' 으로 옮겨졌습니다",
+                reason=f"prefix profanity {dog[0]!r} was rendered as the animal '犬'",
                 confidence=0.75,
                 evidence=dog + ("犬",),
             )
         )
 
-    # 목록에 의존하지 않는 규칙. 새 오염도 잡히지만 정밀도는 가장 낮습니다.
+    # This lexicon-independent rule finds unseen contamination at the lowest precision.
     profanity = _contains_any(flat_source, _NORMALIZED_PROFANITY)
     if profanity and not _contains_any(flat_target, _NORMALIZED_VULGAR):
         findings.append(
             ContaminationFinding(
                 rule="profanity_intensity_lost",
                 reason=(
-                    f"원문의 욕설 {profanity[0]!r} 에 대응하는 비속·강조 표지가 번역문에 없습니다"
+                    f"the target has no vulgarity or emphasis marker corresponding to "
+                    f"source profanity {profanity[0]!r}"
                 ),
                 confidence=0.45,
                 evidence=profanity,
@@ -317,28 +315,29 @@ def assess_contamination(
     return findings
 
 
-# 축자 산물과 그 자리에 있어야 할 표현. 여기 있는 열쇠는 **그 자리에 있다는
-# 것 자체가 오류**인 문자열입니다. `種まき` 가 `씨발` 옆에 오는 정상적인 문맥은
-# 없으므로 대체어가 문맥에 의존하지 않고, 그래서 규칙으로 고칠 수 있습니다.
+# Literal artifacts and their deterministic replacements. Each key is erroneous
+# merely by occurring in this context. `種まき` cannot validly correspond to
+# `씨발`, so its replacement does not depend on surrounding context.
 #
-# `くそ` 를 고른 이유는 강도와 품사가 둘 다 맞기 때문입니다. 감탄사로도
-# (`このくそ`), 강조 접두사로도 (`くそ暑い`) 쓰이므로 `種まき` 가 나타나던
-# 두 자리를 모두 감당합니다.
+# `くそ` preserves both intensity and grammatical use. It works as an
+# exclamation (`このくそ`) and as an intensifying prefix (`くそ暑い`), covering
+# both positions where the literal artifact appeared.
 #
-# 여기 없는 것: `좆`→`種` 같은 한 글자 대응입니다. `種` 는 흔한 보통명사라
-# 문장 안의 멀쩡한 `種` 까지 바꿔 버립니다. 그런 행은 사람 검수로 갑니다.
+# A single-character mapping such as `좆` to `種` is intentionally absent.
+# `種` is a common noun, so replacement could corrupt valid text. Those rows
+# remain in the human-review queue.
 LITERAL_ARTIFACT_REPAIRS: dict[str, str] = {
     "種まき": "くそ",
     "種の足": "くそ",
 }
 
-# 자동 수정을 허용하는 규칙. 나머지는 대체어를 새로 써야 하므로 사람이 합니다.
+# Only this rule permits automatic repair; all others require contextual human translation.
 REPAIRABLE_RULES = frozenset({"known_literal_mistranslation"})
 
 
 @dataclass(frozen=True)
 class ContaminationRepair:
-    """고친 결과 하나. 되돌릴 수 있도록 원본을 함께 들고 있습니다."""
+    """Store one repair together with its original target for reversibility."""
 
     target: str
     original_target: str
@@ -357,24 +356,24 @@ def repair_pair(
     source_language: str,
     target_language: str,
 ) -> ContaminationRepair | None:
-    """확정적으로 고칠 수 있는 오염만 고친다. 아니면 ``None``.
+    """Repair only deterministic contamination; otherwise return ``None``.
 
-    ``None`` 은 "깨끗하다"가 아니라 **"규칙으로 못 고친다"** 입니다. 호출자는
-    :func:`assess_contamination` 으로 오염 여부를 따로 판단해서, 못 고친 행을
-    사람 검수 queue 에 남겨야 합니다.
+    ``None`` means "not safely repairable by a rule," not "clean." Callers must
+    assess contamination separately and keep unrepaired findings in the human
+    review queue.
 
-    고친 뒤 :func:`assess_contamination` 을 다시 돌려 그 행이 더 이상 걸리지
-    않는지 확인합니다. 확인에 실패하면 고치지 않은 것으로 봅니다 — 절반만
-    고쳐 놓고 탐지에서 사라지는 것이 원래 상태보다 나쁩니다.
+    The repaired target is assessed again. If any finding remains, the repair
+    is rejected because publishing a partial correction that evades one rule
+    would be worse than preserving the original for review.
     """
 
     findings = assess_contamination(
         source, target, source_language=source_language, target_language=target_language
     )
-    # 고칠 근거가 하나는 있어야 합니다. 다른 규칙이 함께 걸린 것은 막지
-    # 않습니다 — 축자 산물이 욕설을 밀어낸 행은 **반드시** `강도 소실` 도 같이
-    # 띄우므로, 그것을 이유로 거절하면 고칠 수 있는 행이 하나도 남지 않습니다.
-    # 진짜 관문은 아래의 사후 검증입니다.
+    # At least one repairable finding is required. Other findings do not block
+    # the attempt: a literal artifact that displaced profanity also triggers
+    # lost intensity, so rejecting multiple findings would eliminate every
+    # repairable row. Post-repair validation is the authoritative gate.
     if not any(finding.rule in REPAIRABLE_RULES for finding in findings):
         return None
 
@@ -387,8 +386,7 @@ def repair_pair(
     if not applied or repaired == target:
         return None
 
-    # 고친 결과가 깨끗한지 확인합니다. 남아 있으면 손대지 않은 것으로 처리해
-    # 사람 검수로 보냅니다.
+    # Reject any repair that still triggers a finding and leave it for review.
     if assess_contamination(
         source, repaired, source_language=source_language, target_language=target_language
     ):
@@ -403,9 +401,10 @@ def repair_pair(
 
 
 def supported_direction(source_language: str, target_language: str) -> bool:
-    """이 모듈이 규칙을 가진 방향인지.
+    """Return whether this module has rules for the requested direction.
 
-    규칙이 없는 방향을 "오염 없음" 으로 보고하면 감사가 있으나 마나 합니다.
+    Reporting an unsupported direction as contamination-free would make the
+    audit misleading.
     """
 
     try:
@@ -421,7 +420,7 @@ def supported_direction(source_language: str, target_language: str) -> bool:
 
 
 def rank_findings(findings: Sequence[ContaminationFinding]) -> ContaminationFinding | None:
-    """검수 우선순위를 정할 대표 근거 (가장 확신이 높은 것)."""
+    """Return the highest-confidence finding for review prioritization."""
 
     return max(findings, key=lambda finding: finding.confidence, default=None)
 
