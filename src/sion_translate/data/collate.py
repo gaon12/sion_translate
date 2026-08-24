@@ -156,9 +156,9 @@ class SionBatchCollator:
         # teach the decoder to generate exactly the output the data contract
         # forbids.  Keep the empty default for ordinary bilingual callers.
         self.source_only_languages = frozenset(map(str, source_only_languages))
-        # 온라인 증강: 원문 토큰을 이 확률로 무작위 탈락시켜 모델이 일부
-        # 단어가 빠진 입력에도 견고해지게 합니다. 학습 collator 에만 적용하고
-        # 검증 collator 에는 0 을 넣어야 합니다.
+        # Online augmentation randomly drops source tokens with this probability so
+        # the model remains robust when an input omits some words. Enable it only in
+        # the training collator; validation must use zero for a stable measurement.
         self.source_token_dropout = source_token_dropout
         # Exposure bias mitigation for the supervised stage. Teacher forcing only
         # ever shows the decoder gold prefixes, so at inference the first error
@@ -178,8 +178,9 @@ class SionBatchCollator:
         # from-scratch run would be a guess.
         self.decoder_input_noise = decoder_input_noise
         self.augmentation_seed = int(augmentation_seed)
-        # shared-memory scalar라 persistent DataLoader worker에도 epoch 변경이
-        # 전달됩니다. 각 샘플은 이 값과 pair identity로 독립 RNG를 만듭니다.
+        # This shared-memory scalar propagates epoch changes to persistent DataLoader
+        # workers. Each example combines it with the pair identity to seed an
+        # independent random-number stream.
         self._augmentation_key: torch.Tensor = torch.tensor(
             int(augmentation_key), dtype=torch.int64
         ).share_memory_()
@@ -270,16 +271,16 @@ class SionBatchCollator:
                 rng=rng,
             )
             tgt = original
-            # <denoise_xx>: 원문 언어에 맞는 복원 과제 태그
+            # <denoise_xx> selects reconstruction for the configured source language.
             source_language = item["src_language"]
             task_id = self.tokenizer.denoise_tags[source_language]
             target_register = int(item["src_register"])
-            # 단일언어 복원 과제에는 번역 방향이 없으므로 순환 번역 보상을
-            # 적용하지 않습니다.
+            # A monolingual reconstruction task has no translation direction, so it
+            # must not receive a round-trip translation reward.
             source_language_tag_id = -1
             reverse_direction_trained = False
         else:
-            # <2xx>: 목표 언어를 지정하는 방향 태그 (양방향 학습의 핵심)
+            # <2xx> selects the target language and therefore the translation edge.
             target_language = item["target_language"]
             source_language = item["src_language"]
             task_id = self.tokenizer.language_tags[target_language]
@@ -426,8 +427,8 @@ class SionBatchCollator:
             "decoder_input_ids": decoder_input_ids,
             "labels": labels,
             "register_labels": register_labels,
-            # 학습 목적함수 전용 메타데이터입니다. 모델 forward는 이 값을
-            # 사용하지 않고, MRT 순환 번역 rollout만 역방향 태그로 씁니다.
+            # These fields are objective-only metadata. The model forward pass ignores
+            # them; only the MRT round-trip rollout consumes the reverse-direction tag.
             "source_language_tag_ids": source_language_tag_ids,
             "reverse_direction_trained": reverse_direction_trained,
             "memory_token_ids": memory_token_ids,
