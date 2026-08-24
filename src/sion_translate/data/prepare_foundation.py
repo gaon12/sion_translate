@@ -29,8 +29,10 @@ import math
 import os
 import shutil
 import sqlite3
+import stat
 import tempfile
 import unicodedata
+import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
@@ -130,8 +132,10 @@ class _FileSnapshot:
     size_bytes: int
     sha256: str
     modified_ns: int
+    changed_ns: int
     device: int
     inode: int
+    file_attributes: int
 
 
 class _DiskDigestIndex:
@@ -255,31 +259,89 @@ def _source_sha256(path: Path) -> str:
         raise OSError(f"foundation 원천 파일 hash를 읽을 수 없습니다: {path}: {error}") from error
 
 
+def _is_reparse_stat(value: os.stat_result) -> bool:
+    """Return whether an lstat result identifies a link or Windows reparse point."""
+
+    return bool(
+        stat.S_ISLNK(value.st_mode)
+        or getattr(value, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    )
+
+
+def _absolute_path(path: Path) -> Path:
+    return Path(os.path.abspath(path))
+
+
+def _assert_no_reparse_components(path: Path, *, role: str) -> None:
+    """Reject links and junctions in every existing component of ``path``."""
+
+    absolute = _absolute_path(path)
+    current = Path(absolute.anchor)
+    parts = absolute.parts[1:] if absolute.anchor else absolute.parts
+    for part in parts:
+        current /= part
+        if not _path_exists(current):
+            continue
+        try:
+            current_stat = os.lstat(current)
+        except OSError as error:
+            raise OSError(f"Cannot inspect foundation {role} path: {current}") from error
+        if _is_reparse_stat(current_stat):
+            raise ValueError(
+                f"Foundation {role} cannot traverse a symlink or reparse point: {current}"
+            )
+
+
+def _regular_file_stat(path: Path, *, role: str) -> os.stat_result:
+    _assert_no_reparse_components(path, role=role)
+    try:
+        value = os.lstat(path)
+    except OSError as error:
+        raise OSError(f"Cannot inspect foundation {role}: {path}") from error
+    if _is_reparse_stat(value) or not stat.S_ISREG(value.st_mode):
+        raise ValueError(f"Foundation {role} must be a regular file without reparse points: {path}")
+    return value
+
+
+def _assert_regular_directory(path: Path, *, role: str) -> None:
+    _assert_no_reparse_components(path, role=role)
+    try:
+        value = os.lstat(path)
+    except OSError as error:
+        raise OSError(f"Cannot inspect foundation {role}: {path}") from error
+    if _is_reparse_stat(value) or not stat.S_ISDIR(value.st_mode):
+        raise ValueError(f"Foundation {role} must be a regular directory: {path}")
+
+
 def _file_snapshot(path: Path, *, role: str) -> _FileSnapshot:
     """Capture a stable path/size/hash snapshot, rejecting a hash-time mutation."""
 
     try:
+        stat_before = _regular_file_stat(path, role=role)
         resolved_before = path.resolve(strict=True)
-        stat_before = path.stat()
         content_hash = file_sha256(path)
-        stat_after = path.stat()
         resolved_after = path.resolve(strict=True)
-    except OSError as error:
+        stat_after = _regular_file_stat(path, role=role)
+    except (OSError, ValueError) as error:
         raise OSError(f"foundation {role} snapshot을 읽을 수 없습니다: {path}: {error}") from error
 
     identity_before = (
         str(resolved_before),
         stat_before.st_size,
         stat_before.st_mtime_ns,
+        stat_before.st_ctime_ns,
         stat_before.st_dev,
         stat_before.st_ino,
+        getattr(stat_before, "st_file_attributes", 0),
     )
     identity_after = (
         str(resolved_after),
         stat_after.st_size,
         stat_after.st_mtime_ns,
+        stat_after.st_ctime_ns,
         stat_after.st_dev,
         stat_after.st_ino,
+        getattr(stat_after, "st_file_attributes", 0),
     )
     if identity_before != identity_after:
         raise RuntimeError(f"foundation {role}이 snapshot 생성 중 변경되었습니다: {path}")
@@ -288,8 +350,10 @@ def _file_snapshot(path: Path, *, role: str) -> _FileSnapshot:
         size_bytes=stat_after.st_size,
         sha256=content_hash,
         modified_ns=stat_after.st_mtime_ns,
+        changed_ns=stat_after.st_ctime_ns,
         device=stat_after.st_dev,
         inode=stat_after.st_ino,
+        file_attributes=getattr(stat_after, "st_file_attributes", 0),
     )
 
 
@@ -338,9 +402,9 @@ def _verify_source_metadata(
         expected_by_path[snapshot.resolved_path] = (source.language, snapshot)
     for source in rediscovered.sources:
         try:
+            source_stat = _regular_file_stat(source.path, role="source file")
             resolved_path = source.path.resolve(strict=True)
-            source_stat = source.path.stat()
-        except OSError as error:
+        except (OSError, ValueError) as error:
             raise RuntimeError(
                 f"foundation 원천 파일이 준비 중 변경되었습니다: {source.path}"
             ) from error
@@ -352,15 +416,19 @@ def _verify_source_metadata(
             str(resolved_path),
             source_stat.st_size,
             source_stat.st_mtime_ns,
+            source_stat.st_ctime_ns,
             source_stat.st_dev,
             source_stat.st_ino,
+            getattr(source_stat, "st_file_attributes", 0),
         )
         expected_metadata = (
             expected_snapshot.resolved_path,
             expected_snapshot.size_bytes,
             expected_snapshot.modified_ns,
+            expected_snapshot.changed_ns,
             expected_snapshot.device,
             expected_snapshot.inode,
+            expected_snapshot.file_attributes,
         )
         if actual_metadata != expected_metadata:
             raise RuntimeError(f"foundation 원천 파일이 준비 중 변경되었습니다: {source.path}")
@@ -408,10 +476,15 @@ def _refuse_existing_output(output_dir: Path) -> None:
 def _remove_staging_path(path: Path) -> None:
     if not _path_exists(path):
         return
-    if path.is_symlink() or not path.is_dir():
-        path.unlink()
-        return
-    shutil.rmtree(path)
+    _regular_staging_tree(path)
+    quarantine = path.with_name(f".{path.name}.rejected-{uuid.uuid4().hex}")
+    os.rename(path, quarantine)
+    _fsync_directory(path.parent)
+    # Revalidate after the namespace move so cleanup never follows an entry
+    # that was exchanged between the first inspection and the rename.
+    _regular_staging_tree(quarantine)
+    shutil.rmtree(quarantine)
+    _fsync_directory(path.parent)
 
 
 def _fsync_file(path: Path) -> None:
@@ -431,20 +504,48 @@ def _fsync_directory(path: Path) -> None:
 
 
 def _fsync_directory_tree(root: Path) -> None:
-    directories = [root]
-    for artifact in root.rglob("*"):
-        if artifact.is_symlink():
-            raise RuntimeError(f"foundation staging에는 symlink를 게시할 수 없습니다: {artifact}")
-        if artifact.is_dir():
-            directories.append(artifact)
-        elif artifact.is_file():
-            _fsync_file(artifact)
-        else:
-            raise RuntimeError(
-                f"foundation staging에는 일반 파일/폴더만 게시할 수 있습니다: {artifact}"
-            )
+    directories, files = _regular_staging_tree(root)
+    for artifact in files:
+        _fsync_file(artifact)
     for directory in sorted(directories, key=lambda item: len(item.parts), reverse=True):
         _fsync_directory(directory)
+
+
+def _regular_staging_tree(root: Path) -> tuple[list[Path], list[Path]]:
+    """Inspect a private tree without following symlinks or Windows junctions."""
+
+    _assert_regular_directory(root, role="staging directory")
+    directories = [root]
+    files: list[Path] = []
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        try:
+            entries = list(os.scandir(directory))
+        except OSError as error:
+            raise RuntimeError(f"Cannot inspect foundation staging: {directory}") from error
+        for entry in entries:
+            artifact = Path(entry.path)
+            try:
+                artifact_stat = entry.stat(follow_symlinks=False)
+            except OSError as error:
+                raise RuntimeError(
+                    f"Cannot inspect foundation staging artifact: {artifact}"
+                ) from error
+            if _is_reparse_stat(artifact_stat):
+                raise RuntimeError(
+                    f"Foundation staging cannot contain a symlink or reparse point: {artifact}"
+                )
+            if stat.S_ISDIR(artifact_stat.st_mode):
+                directories.append(artifact)
+                pending.append(artifact)
+            elif stat.S_ISREG(artifact_stat.st_mode):
+                files.append(artifact)
+            else:
+                raise RuntimeError(
+                    f"Foundation staging contains a non-regular artifact: {artifact}"
+                )
+    return directories, files
 
 
 def _close_shard_writers(
@@ -493,6 +594,31 @@ def _publish_staged_directory(staging_dir: Path, output_dir: Path) -> None:
                 f"Foundation output appeared while publishing: {output_dir}"
             ) from error
         raise
+
+
+def _publication_failure_is_resumable(
+    error: BaseException,
+    staging_dir: Path,
+    output_dir: Path,
+    *,
+    generation_complete: bool,
+) -> bool:
+    """Keep a completed private generation after an ordinary publication failure."""
+
+    if (
+        not generation_complete
+        or not isinstance(error, OSError)
+        or isinstance(error, FileExistsError)
+        or not _path_exists(staging_dir)
+        or _path_exists(output_dir)
+    ):
+        return False
+    try:
+        _assert_regular_directory(staging_dir, role="staging directory")
+        _regular_file_stat(staging_dir / "manifest.json", role="staging manifest")
+    except (OSError, ValueError):
+        return False
+    return True
 
 
 def foundation_dataset_problem(
@@ -821,6 +947,18 @@ def _foundation_manifest_semantic_problem(
 ) -> str | None:
     """Validate every manifest field consumed after dataset preparation."""
 
+    expected_top_level = {"train", "validation", "manifest.json"}
+    try:
+        actual_top_level = {path.name for path in output_dir.iterdir()}
+    except OSError as error:
+        return f"Cannot inspect foundation dataset tree: {error}"
+    if actual_top_level != expected_top_level:
+        return (
+            "foundation dataset top-level artifacts are incomplete or unexpected: "
+            f"missing={sorted(expected_top_level - actual_top_level)}, "
+            f"unexpected={sorted(actual_top_level - expected_top_level)}"
+        )
+
     try:
         stats = _stats_from_manifest(manifest)
     except (TypeError, ValueError) as error:
@@ -1070,9 +1208,10 @@ def _recover_or_clean_staging(
 ) -> FoundationPrepareStats | None:
     valid: list[tuple[Path, FoundationPrepareStats]] = []
     for candidate in _staging_candidates(output_dir):
-        if candidate.is_symlink() or not candidate.is_dir():
-            _remove_staging_path(candidate)
-            continue
+        try:
+            _regular_staging_tree(candidate)
+        except (OSError, RuntimeError, ValueError) as error:
+            raise RuntimeError(f"Refusing unsafe foundation staging path: {candidate}") from error
         try:
             manifest_before = _file_snapshot(
                 candidate / "manifest.json",
@@ -1137,9 +1276,14 @@ def _recover_or_clean_staging(
         _verify_source_snapshots(discovery, source_snapshots)
         _verify_tokenizer_snapshot(Path(tokenizer_model), tokenizer_snapshot)
         _publish_staged_directory(selected, output_dir)
-    except Exception:
-        for candidate, _stats in valid:
-            _remove_staging_path(candidate)
+    except BaseException as error:
+        if not _publication_failure_is_resumable(
+            error,
+            selected,
+            output_dir,
+            generation_complete=True,
+        ):
+            _remove_staging_path(selected)
         raise
     return recovered_stats
 
@@ -1529,6 +1673,7 @@ def prepare_foundation_dataset(
     if max_target_tokens is None:
         max_target_tokens = max_tokens
     final_output.parent.mkdir(parents=True, exist_ok=True)
+    _assert_regular_directory(final_output.parent, role="output parent")
     source_snapshots = _capture_source_snapshots(discovery)
     tokenizer_snapshot = _tokenizer_snapshot(Path(tokenizer_model))
     # This immediate rediscovery also rejects a plan whose source list changed
@@ -1561,7 +1706,7 @@ def prepare_foundation_dataset(
             dir=final_output.parent,
         )
     )
-    published = False
+    generation_complete = False
     try:
         stats = _prepare_foundation_dataset_in_staging(
             discovery,
@@ -1585,12 +1730,18 @@ def prepare_foundation_dataset(
         # manifest construction before the durable rename.
         _verify_source_snapshots(discovery, source_snapshots)
         _verify_tokenizer_snapshot(Path(tokenizer_model), tokenizer_snapshot)
+        generation_complete = True
         _publish_staged_directory(staging_dir, final_output)
-        published = True
         return stats
-    finally:
-        if not published and _path_exists(staging_dir):
+    except BaseException as error:
+        if not _publication_failure_is_resumable(
+            error,
+            staging_dir,
+            final_output,
+            generation_complete=generation_complete,
+        ):
             _remove_staging_path(staging_dir)
+        raise
 
 
 def render_prepare_report(stats: FoundationPrepareStats) -> list[str]:

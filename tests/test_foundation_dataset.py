@@ -12,7 +12,8 @@ import hashlib
 import json
 import os
 import shutil
-from pathlib import PurePosixPath
+import stat
+from pathlib import Path, PurePosixPath
 
 import pytest
 
@@ -622,6 +623,129 @@ def test_complete_exact_contract_orphan_staging_is_recovered(
     assert recovered_stats == original_stats
     assert (dataset / "manifest.json").is_file()
     assert not orphan.exists()
+    assert not list(tmp_path.glob(".dataset.staging-*"))
+
+
+def test_recovery_rejects_and_removes_uninventoried_deduplication_scratch(
+    tmp_path,
+    tokenizer_model,
+) -> None:
+    discovery = discover_monolingual_sources(_corpus(tmp_path / "corpus"), ["ko", "ja"])
+    dataset = tmp_path / "dataset"
+    prepare_foundation_dataset(discovery, tokenizer_model, dataset)
+    orphan = tmp_path / ".dataset.staging-with-scratch"
+    dataset.rename(orphan)
+    (orphan / ".foundation-dedup.sqlite3").write_bytes(b"private scratch must not publish")
+
+    rebuilt = prepare_foundation_dataset(discovery, tokenizer_model, dataset)
+
+    assert rebuilt.total_records == 100
+    assert not (dataset / ".foundation-dedup.sqlite3").exists()
+    assert not list(dataset.glob(".foundation-dedup.sqlite3*"))
+    assert not list(tmp_path.glob(".dataset.staging-*"))
+
+
+def test_publication_failure_preserves_a_complete_foundation_generation(
+    tmp_path,
+    tokenizer_model,
+    monkeypatch,
+) -> None:
+    discovery = discover_monolingual_sources(_corpus(tmp_path / "corpus"), ["ko", "ja"])
+    dataset = tmp_path / "dataset"
+    actual_publish = foundation_prepare._publish_staged_directory
+
+    def fail_publication(_staging_dir, _output_dir):
+        raise OSError("simulated foundation publication failure")
+
+    monkeypatch.setattr(
+        foundation_prepare,
+        "_publish_staged_directory",
+        fail_publication,
+    )
+    with pytest.raises(OSError, match="simulated foundation publication failure"):
+        prepare_foundation_dataset(discovery, tokenizer_model, dataset)
+
+    staging = list(tmp_path.glob(".dataset.staging-*"))
+    assert len(staging) == 1
+    assert (staging[0] / "manifest.json").is_file()
+
+    monkeypatch.setattr(
+        foundation_prepare,
+        "_publish_staged_directory",
+        actual_publish,
+    )
+
+    def forbid_rebuild(*_args, **_kwargs):
+        raise AssertionError("a complete foundation generation must resume without rebuilding")
+
+    monkeypatch.setattr(
+        foundation_prepare,
+        "_prepare_foundation_dataset_in_staging",
+        forbid_rebuild,
+    )
+    recovered = prepare_foundation_dataset(discovery, tokenizer_model, dataset)
+
+    assert recovered.total_records == 100
+    assert (dataset / "manifest.json").is_file()
+    assert not list(tmp_path.glob(".dataset.staging-*"))
+
+
+def test_unsafe_foundation_staging_root_is_preserved_and_refused(
+    tmp_path,
+    tokenizer_model,
+    monkeypatch,
+) -> None:
+    discovery = discover_monolingual_sources(_corpus(tmp_path / "corpus"), ["ko", "ja"])
+    unsafe = tmp_path / ".dataset.staging-junction"
+    unsafe.mkdir()
+    (unsafe / "owner.txt").write_text("do not delete\n", encoding="utf-8")
+    actual_lstat = foundation_prepare.os.lstat
+
+    def mark_staging_as_reparse(path):
+        value = actual_lstat(path)
+        if Path(path) != unsafe:
+            return value
+
+        class ReparseStat:
+            st_mode = value.st_mode
+            st_size = value.st_size
+            st_mtime_ns = value.st_mtime_ns
+            st_ctime_ns = value.st_ctime_ns
+            st_dev = value.st_dev
+            st_ino = value.st_ino
+            st_file_attributes = (
+                getattr(value, "st_file_attributes", 0) | stat.FILE_ATTRIBUTE_REPARSE_POINT
+            )
+
+        return ReparseStat()
+
+    monkeypatch.setattr(foundation_prepare.os, "lstat", mark_staging_as_reparse)
+
+    with pytest.raises(RuntimeError, match="unsafe foundation staging path"):
+        prepare_foundation_dataset(discovery, tokenizer_model, tmp_path / "dataset")
+
+    assert (unsafe / "owner.txt").read_text(encoding="utf-8") == "do not delete\n"
+
+
+def test_foundation_source_symlink_is_rejected_before_staging(
+    tmp_path,
+    tokenizer_model,
+) -> None:
+    corpus = tmp_path / "corpus"
+    (corpus / "ko").mkdir(parents=True)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("A sufficiently long sentence outside the corpus.\n", encoding="utf-8")
+    linked = corpus / "ko" / "linked.txt"
+    try:
+        linked.symlink_to(outside)
+    except OSError as error:
+        pytest.skip(f"file symlinks are unavailable: {error}")
+    discovery = discover_monolingual_sources(corpus, ["ko"])
+
+    with pytest.raises(OSError, match="symlink or reparse point"):
+        prepare_foundation_dataset(discovery, tokenizer_model, tmp_path / "dataset")
+
+    assert outside.read_text(encoding="utf-8").startswith("A sufficiently long sentence")
     assert not list(tmp_path.glob(".dataset.staging-*"))
 
 

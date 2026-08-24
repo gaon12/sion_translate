@@ -541,6 +541,70 @@ def test_prepare_recovers_a_complete_exact_orphan_without_rebuilding(
     assert not orphan.exists()
 
 
+def test_prepare_publication_failure_preserves_a_complete_resumable_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "pairs.jsonl"
+    tokenizer = tmp_path / "sion.model"
+    output = tmp_path / "dataset"
+    _write_atomic_prepare_source(source)
+    tokenizer.write_bytes(b"stable-tokenizer")
+    expected = _atomic_prepare_fingerprint(source, tokenizer)
+    actual_publish = prepare_module._publish_staged_directory
+
+    monkeypatch.setattr(prepare_module, "SionTokenizer", _FakePrepareTokenizer)
+
+    def fail_publication(*_args: object, **_kwargs: object) -> None:
+        raise OSError("simulated dataset publication failure")
+
+    monkeypatch.setattr(
+        prepare_module,
+        "_publish_staged_directory",
+        fail_publication,
+    )
+    with pytest.raises(OSError, match="simulated dataset publication failure"):
+        _prepare_atomic_dataset(
+            str(source),
+            tokenizer,
+            output,
+            expected_fingerprint=expected,
+        )
+
+    staging = list(tmp_path.glob(".dataset.staging-*"))
+    assert len(staging) == 1
+    assert (staging[0] / prepare_module.PREPARE_COMPLETION_FILENAME).is_file()
+
+    monkeypatch.setattr(prepare_module, "_publish_staged_directory", actual_publish)
+
+    def forbid_rebuild(_args: object) -> list[prepare_module._PrepareEvent]:
+        raise AssertionError("a complete generation must resume without tokenization")
+
+    monkeypatch.setattr(prepare_module, "_process_prepare_batch", forbid_rebuild)
+    recovered = _prepare_atomic_dataset(
+        str(source),
+        tokenizer,
+        output,
+        expected_fingerprint=expected,
+    )
+
+    assert recovered.valid_pairs == 1
+    assert (output / "manifest.json").is_file()
+    assert not list(tmp_path.glob(".dataset.staging-*"))
+
+
+def test_prepare_does_not_preserve_an_incomplete_staging_generation(tmp_path: Path) -> None:
+    staging = tmp_path / ".dataset.staging-incomplete"
+    output = tmp_path / "dataset"
+    staging.mkdir()
+
+    assert not prepare_module._publication_failure_is_resumable(
+        OSError("simulated build failure"),
+        staging,
+        output,
+    )
+
+
 def test_prepare_quarantines_a_contradictory_orphan_then_rebuilds(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

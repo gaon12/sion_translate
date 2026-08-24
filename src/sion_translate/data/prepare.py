@@ -870,6 +870,31 @@ def _discard_private_staging(staging_dir: Path, output_dir: Path) -> None:
     _quarantine_staging(staging_dir, output_dir)
 
 
+def _publication_failure_is_resumable(
+    error: BaseException,
+    staging_dir: Path,
+    output_dir: Path,
+) -> bool:
+    """Keep a complete generation after an ordinary publication I/O failure."""
+
+    if (
+        not isinstance(error, OSError)
+        or isinstance(error, FileExistsError)
+        or not _path_exists(staging_dir)
+        or _path_exists(output_dir)
+    ):
+        return False
+    try:
+        _assert_regular_directory(staging_dir, role="dataset staging")
+        _regular_file_stat(
+            staging_dir / PREPARE_COMPLETION_FILENAME,
+            role="dataset completion marker",
+        )
+    except (OSError, ValueError):
+        return False
+    return True
+
+
 def _validate_staging_tree_shape(staging_dir: Path) -> None:
     _assert_regular_directory(staging_dir, role="dataset staging")
     allowed = {
@@ -2056,7 +2081,13 @@ def prepare_dataset(
                 tokenizer_snapshot,
             ),
         )
-    except BaseException:
-        _discard_private_staging(staging_dir, output_dir)
+    except BaseException as error:
+        # A completion marker exists only after payload validation. Preserve
+        # that authenticated generation across ENOSPC, sharing violations, or
+        # another ordinary publication I/O error so the next run can publish it
+        # without repeating tokenization. Contract drift and output collisions
+        # remain non-resumable and are cleaned immediately.
+        if not _publication_failure_is_resumable(error, staging_dir, output_dir):
+            _discard_private_staging(staging_dir, output_dir)
         raise
     return stats
