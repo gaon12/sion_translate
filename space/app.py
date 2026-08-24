@@ -31,13 +31,13 @@ MODEL_ARTIFACTS = {
     },
 }
 DIRECTIONS = {
-    "한국어 → 日本語": "ja",
-    "日本語 → 한국어": "ko",
+    "Korean → Japanese": "ja",
+    "Japanese → Korean": "ko",
 }
 BEAMS = {
-    "빠름 (greedy)": 1,
-    "균형 (beam 2)": 2,
-    "품질 (beam 4)": 4,
+    "Fast (greedy)": 1,
+    "Balanced (beam 2)": 2,
+    "Quality (beam 4)": 4,
 }
 
 
@@ -59,7 +59,9 @@ def _download_verified(filename: str) -> Path:
         )
     )
     if path.stat().st_size != identity["size"] or _sha256_file(path) != identity["sha256"]:
-        raise RuntimeError(f"다운로드한 {filename}의 크기 또는 SHA-256이 고정된 값과 다릅니다.")
+        raise RuntimeError(
+            f"Downloaded {filename} does not match its pinned size or SHA-256 digest."
+        )
     return path
 
 
@@ -78,18 +80,18 @@ def _load_safe_state_dict(
 
     payload = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
     if not isinstance(payload, Mapping):
-        raise ValueError("모델 파일이 state-dict export 형식이 아닙니다.")
+        raise ValueError("The model file is not a state-dict export.")
     schema = payload.get("schema")
     if schema is None and not allow_legacy:
-        raise ValueError(f"모델 파일에 {EXPORT_SCHEMA} schema가 없습니다.")
+        raise ValueError(f"The model file does not contain the {EXPORT_SCHEMA} schema.")
     if schema is not None and schema != EXPORT_SCHEMA:
-        raise ValueError(f"지원하지 않는 모델 schema입니다: {schema!r}")
+        raise ValueError(f"Unsupported model schema: {schema!r}")
     raw_config = payload.get("model_config")
     stored = payload.get("model")
     if not isinstance(raw_config, Mapping) or not isinstance(stored, Mapping):
-        raise ValueError("모델 파일에 config 또는 state dictionary가 없습니다.")
+        raise ValueError("The model file is missing its config or state dictionary.")
     if any(not isinstance(value, torch.Tensor) for value in stored.values()):
-        raise ValueError("모델 state dictionary에는 tensor만 들어 있어야 합니다.")
+        raise ValueError("The model state dictionary must contain tensors only.")
 
     config = _model_config_from_dict(raw_config)
     pad_id = int(payload["pad_id"])
@@ -102,7 +104,7 @@ def _load_safe_state_dict(
     model.eval()
     raw_metadata = payload.get("metadata") or {}
     if not isinstance(raw_metadata, Mapping):
-        raise ValueError("모델 metadata는 object여야 합니다.")
+        raise ValueError("Model metadata must be an object.")
     metadata = copy.deepcopy(dict(raw_metadata))
     if return_metadata:
         return model, config, pad_id, metadata
@@ -127,9 +129,9 @@ def translate(text: str, direction: str, quality: str) -> str:
     """Translate one short text using the direction selected in the UI."""
     text = text.strip()
     if not text:
-        raise gr.Error("번역할 문장을 입력하세요.")
+        raise gr.Error("Enter text to translate.")
     if len(text) > 2_000:
-        raise gr.Error("한 번에 2,000자 이하로 입력하세요.")
+        raise gr.Error("Enter no more than 2,000 characters at a time.")
 
     translator = load_translator()
     result = translator.translate(
@@ -145,34 +147,35 @@ def translate(text: str, direction: str, quality: str) -> str:
 with gr.Blocks(title="sion_translate Translator") as demo:
     gr.Markdown(
         """
-        # sion_translate 한국어 ↔ 日本語
+        # sion_translate Korean ↔ Japanese
 
-        SHA-256으로 검증한 고정 revision의 sion_translate EMA 모델을 CPU에서 실행합니다.
-        첫 번역은 모델 로딩 때문에 오래 걸릴 수 있습니다. 중요한 번역은 반드시 사람이 검토하세요.
+        This Space runs a pinned sion_translate EMA model whose files are verified
+        with SHA-256. Inference runs on CPU, so the first translation may take
+        longer while the model loads. Always have a person review important translations.
         """
     )
     with gr.Row():
         direction = gr.Radio(
             choices=list(DIRECTIONS),
-            value="한국어 → 日本語",
-            label="번역 방향",
+            value="Korean → Japanese",
+            label="Translation direction",
         )
         quality = gr.Radio(
             choices=list(BEAMS),
-            value="균형 (beam 2)",
-            label="탐색 품질",
+            value="Balanced (beam 2)",
+            label="Search quality",
         )
     source = gr.Textbox(
-        label="원문",
+        label="Source text",
         lines=5,
-        placeholder="번역할 문장을 입력하세요.",
+        placeholder="Enter text to translate.",
     )
-    submit = gr.Button("번역", variant="primary")
-    output = gr.Textbox(label="번역 결과", lines=5)
+    submit = gr.Button("Translate", variant="primary")
+    output = gr.Textbox(label="Translation", lines=5)
     gr.Examples(
         examples=[
-            ["회의가 끝나면 수정된 자료를 검토해 주시겠어요?", "한국어 → 日本語"],
-            ["恐れ入りますが、こちらにお名前をご記入いただけますか。", "日本語 → 한국어"],
+            ["회의가 끝나면 수정된 자료를 검토해 주시겠어요?", "Korean → Japanese"],
+            ["恐れ入りますが、こちらにお名前をご記入いただけますか。", "Japanese → Korean"],
         ],
         inputs=[source, direction],
     )

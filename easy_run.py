@@ -1,8 +1,9 @@
-"""인자 없이 실행하는 sion_translate 고성능 학습 진입점.
+"""High-performance sion_translate training entry point with no arguments.
 
-Linux에서 충분한 /dev/shm 공간이 있으면 원천 데이터와 전처리 산출물을 RAM
-디스크에 배치합니다. tokenizer/dataset은 학습 전에 일반 디스크 artifacts/에도
-원자적으로 동기화하고, checkpoints/exports는 항상 일반 디스크에 기록합니다.
+On Linux, this script places source data and preprocessing outputs on a RAM disk
+when ``/dev/shm`` has enough free space. Before training, it also synchronizes
+the tokenizer and dataset atomically to the persistent ``artifacts/`` directory.
+Checkpoints and exports are always written to persistent storage.
 """
 
 from __future__ import annotations
@@ -41,8 +42,9 @@ def _install_tmux() -> str | None:
     tmux = shutil.which("tmux")
     if tmux is None:
         print(
-            "[easy_run] tmux가 없어 현재 프로세스에서 계속합니다. "
-            "지속 세션이 필요하면 tmux를 설치하거나 nohup/Slurm을 사용하세요.",
+            "[easy_run] tmux is unavailable, so training will continue in the "
+            "current process. Install tmux or use nohup/Slurm if you need a "
+            "persistent session.",
             flush=True,
         )
     return tmux
@@ -75,14 +77,15 @@ def _enter_tmux() -> None:
     )
     if existing:
         print(
-            f"[easy_run] 기존 tmux 세션 '{session}'에 재접속합니다. "
-            f"나중에는 tmux attach -t {session}",
+            f"[easy_run] Reattaching to existing tmux session '{session}'. "
+            f"To attach later, run: tmux attach -t {session}",
             flush=True,
         )
         os.execv(tmux, [tmux, "attach-session", "-t", session])
 
     print(
-        f"[easy_run] tmux 세션 '{session}'을 만들고 학습을 시작합니다. 분리: Ctrl+B, D",
+        f"[easy_run] Creating tmux session '{session}' and starting training. "
+        "Detach with Ctrl+B, D.",
         flush=True,
     )
     environment = os.environ.copy()
@@ -148,8 +151,10 @@ def _ram_workspace(required_bytes: int) -> Path | None:
     free = shutil.disk_usage(shm).free
     if free < required_bytes + MIN_RAM_HEADROOM:
         print(
-            f"[easy_run] /dev/shm 여유 공간 부족: 필요 약 {required_bytes / 2**30:.1f} GiB "
-            f"+ 여유 8 GiB, 사용 가능 {free / 2**30:.1f} GiB. 일반 디스크를 사용합니다."
+            f"[easy_run] Insufficient free space in /dev/shm: approximately "
+            f"{required_bytes / 2**30:.1f} GiB plus an 8 GiB safety margin is "
+            f"required, but only {free / 2**30:.1f} GiB is available. Using "
+            "persistent storage instead."
         )
         return None
     identity = hashlib.sha256(str(ROOT).encode("utf-8")).hexdigest()[:8]
@@ -183,7 +188,7 @@ def _generated_config(raw_dir: Path, artifacts_dir: Path) -> Path:
         raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     data = raw.setdefault("data", {})
     data["raw_dir"] = str(raw_dir)
-    # Source 규모 차이를 완화하되 사용자가 sion_translate.yaml에서 지정한 값은 보존합니다.
+    # Reduce source-size imbalance while preserving any explicit user setting.
     data.setdefault("source_sampling_alpha", 0.9)
     data["tokenizer_model"] = str(artifacts_dir / "tokenizer" / "sion.model")
     data["tokenizer_features"] = str(artifacts_dir / "tokenizer" / "token_features.npz")
@@ -198,7 +203,7 @@ def _generated_config(raw_dir: Path, artifacts_dir: Path) -> Path:
 
 
 def _run(command: list[str], env: dict[str, str]) -> None:
-    print("[easy_run] 실행:", " ".join(command), flush=True)
+    print("[easy_run] Running:", " ".join(command), flush=True)
     subprocess.run(command, cwd=ROOT, env=env, check=True)
 
 
@@ -216,10 +221,14 @@ def _build_expressive_cultural_corpus(data_dir: Path, env: dict[str, str]) -> Pa
     challenge_output = ROOT / "examples" / "expressive_cultural_cases.jsonl"
     if not builder.is_file() or not seed.is_file():
         raise SystemExit(
-            f"[easy_run] 표현·문화 데이터 빌더 또는 시드 파일이 없습니다: {builder}, {seed}"
+            "[easy_run] The expressive/cultural data builder or seed file is "
+            f"missing: {builder}, {seed}"
         )
 
-    print("[easy_run] 표현·문화 학습 코퍼스를 재현 가능하게 빌드합니다.", flush=True)
+    print(
+        "[easy_run] Building the expressive/cultural training corpus reproducibly.",
+        flush=True,
+    )
     _run(
         [
             sys.executable,
@@ -235,7 +244,8 @@ def _build_expressive_cultural_corpus(data_dir: Path, env: dict[str, str]) -> Pa
     )
     if not training_output.is_file():
         raise SystemExit(
-            f"[easy_run] 표현·문화 코퍼스 빌더가 성공했지만 출력이 없습니다: {training_output}"
+            "[easy_run] The expressive/cultural corpus builder completed, but "
+            f"its expected output is missing: {training_output}"
         )
     return training_output
 
@@ -246,7 +256,7 @@ def _discover_raw_files(data_dir: Path, env: dict[str, str]) -> list[Path]:
     _build_expressive_cultural_corpus(data_dir, env)
     raw_files = sorted(data_dir.glob("*.jsonl"))
     if not raw_files:
-        raise SystemExit("data/*.jsonl 파일이 없습니다.")
+        raise SystemExit("No data/*.jsonl files were found.")
     return raw_files
 
 
@@ -255,44 +265,47 @@ def _validate_gpu_runtime(torch_module) -> tuple[int, tuple[str, ...]]:
 
     gpu_count = int(torch_module.cuda.device_count())
     if not torch_module.cuda.is_available() or gpu_count < 1:
-        raise SystemExit("CUDA GPU를 찾지 못했습니다. CUDA 지원 PyTorch 환경을 확인하세요.")
+        raise SystemExit(
+            "No CUDA GPU was found. Check that PyTorch was installed with CUDA support."
+        )
     if gpu_count > 1 and not torch_module.distributed.is_nccl_available():
         raise SystemExit(
-            f"CUDA GPU {gpu_count}개를 찾았지만 PyTorch에 NCCL 지원이 없습니다. "
-            "다중 GPU용 CUDA PyTorch 패키지를 설치하세요."
+            f"Found {gpu_count} CUDA GPUs, but this PyTorch build does not "
+            "include NCCL support. Install a CUDA-enabled PyTorch package that "
+            "supports multi-GPU training."
         )
     names = tuple(sorted({torch_module.cuda.get_device_name(index) for index in range(gpu_count)}))
     return gpu_count, names
 
 
 def _report_foundation_corpus(config_path: Path) -> None:
-    """단일어 코퍼스에서 무엇이 학습에 들어가고 무엇이 빠지는지 먼저 보여 준다.
+    """Report which monolingual corpora will and will not enter training.
 
-    foundation 단계는 "폴더가 있으면 자동 실행"이라 **건너뛰는 것이 정상
-    경로**입니다. 그래서 조용히 건너뛰면 사용자는 5 GB 코퍼스가 학습에
-    들어갔다고 믿은 채로 며칠을 씁니다. 여기서 이유와 제외 목록을 먼저
-    출력합니다.
+    Skipping foundation pretraining is a normal path because the stage runs only
+    when its input directories are present. A silent skip could otherwise make a
+    user wait for days while assuming that a multi-gigabyte corpus was included.
+    This report therefore prints the reason and all excluded inputs first.
 
-    학습을 막지는 않습니다 — 언어를 나중에 채우는 것이 정상적인 작업
-    흐름이기 때문입니다. 막고 싶으면 foundation.require_all_languages 를
-    켜십시오.
+    Missing languages do not stop training because adding them later is a valid
+    workflow. Set ``foundation.require_all_languages`` to require every language.
     """
 
     from sion_translate.config import load_config
     from sion_translate.foundation import plan_foundation_stage
 
     plan = plan_foundation_stage(load_config(config_path))
-    print("[easy_run] foundation(단일어 사전학습) 코퍼스를 확인합니다.", flush=True)
+    print("[easy_run] Checking foundation (monolingual pretraining) corpora.", flush=True)
     for line in plan.report:
         print(f"[easy_run]   {line}", flush=True)
     if not plan.enabled:
-        print(f"[easy_run] foundation 단계를 건너뜁니다: {plan.reason}", flush=True)
+        print(f"[easy_run] Skipping the foundation stage: {plan.reason}", flush=True)
         return
     for warning in plan.warnings:
-        print(f"[easy_run] [경고] {warning}", flush=True)
+        print(f"[easy_run] [warning] {warning}", flush=True)
     print(
-        f"[easy_run] foundation 단계를 실행합니다 (언어: {', '.join(plan.languages)}). "
-        "산출물은 번역 모델과 별도로 runs/*/foundation/ 에 저장됩니다.",
+        f"[easy_run] Running the foundation stage (languages: "
+        f"{', '.join(plan.languages)}). Outputs are stored in runs/*/foundation/ "
+        "separately from the translation model.",
         flush=True,
     )
 
@@ -308,7 +321,10 @@ def _check_shard_keys(env: dict[str, str]) -> None:
     checker = ROOT / "scripts" / "data" / "check_shard_keys.py"
     if not checker.exists():
         return
-    print("[easy_run] shard 키 이름을 확인합니다 (설정된 언어쌍과 맞는지).", flush=True)
+    print(
+        "[easy_run] Checking whether shard keys match the configured language pairs.",
+        flush=True,
+    )
     result = subprocess.run(
         [sys.executable, str(checker)],
         cwd=ROOT,
@@ -317,9 +333,10 @@ def _check_shard_keys(env: dict[str, str]) -> None:
     )
     if result.returncode != 0:
         raise SystemExit(
-            "[easy_run] 위 shard 는 설정된 언어쌍으로 읽히지 않아 학습에서 조용히 빠집니다.\n"
-            "           JSONL 의 키 이름을 고치거나 sion_translate.yaml 의 "
-            "data.language_pairs 를 맞춘 뒤 다시 실행하세요."
+            "[easy_run] The shard above cannot be read with the configured "
+            "language pairs and would be silently excluded from training.\n"
+            "           Correct the JSONL key names or update "
+            "sion_translate.yaml data.language_pairs, then run again."
         )
 
 
@@ -347,10 +364,10 @@ def _verify_tokenizer(
     try:
         import sentencepiece as spm
     except ImportError:
-        print("[easy_run] sentencepiece 를 불러오지 못해 토크나이저 검증을 건너뜁니다.")
+        print("[easy_run] sentencepiece is unavailable; skipping tokenizer validation.")
         return
     if not tokenizer_model.exists():
-        print(f"[easy_run] 토크나이저를 찾지 못해 검증을 건너뜁니다: {tokenizer_model}")
+        print(f"[easy_run] Tokenizer not found; skipping validation: {tokenizer_model}")
         return
 
     import json
@@ -361,7 +378,7 @@ def _verify_tokenizer(
 
     shards = sorted(data_dir.glob("*.jsonl"))
     if not shards:
-        print("[easy_run] 코퍼스를 찾지 못해 토크나이저 검증을 건너뜁니다.")
+        print("[easy_run] No corpus was found; skipping tokenizer validation.")
         return
     per_shard = max(1, sample_rows // len(shards))
 
@@ -399,27 +416,27 @@ def _verify_tokenizer(
                             offenders[character] += 1
 
     if total_tokens == 0:
-        print("[easy_run] 표본에서 토큰을 얻지 못해 검증을 건너뜁니다.")
+        print("[easy_run] No tokens were produced from the sample; skipping validation.")
         return
 
     rate = fallback_tokens / total_tokens
     print(
-        f"[easy_run] 토크나이저 검증: vocab {processor.vocab_size():,}, "
-        f"표본 {total_tokens:,} 토큰 중 byte fallback {fallback_tokens:,} ({rate:.4%})",
+        f"[easy_run] Tokenizer validation: vocab {processor.vocab_size():,}; "
+        f"{fallback_tokens:,} byte-fallback tokens among {total_tokens:,} "
+        f"sample tokens ({rate:.4%}).",
         flush=True,
     )
     for character, count in offenders.most_common(10):
-        print(f"           U+{ord(character):04X} {character!r}  {count:,}회")
+        print(f"           U+{ord(character):04X} {character!r}  {count:,} occurrences")
     if rate > max_fallback_rate:
         raise SystemExit(
-            f"[easy_run] byte fallback 비율 {rate:.4%} 이 상한 {max_fallback_rate:.4%} 을 넘습니다. "
-            "학습을 중단합니다.\n"
-            f"           {DEFAULT_ARTIFACT_ROOT}/tokenizer 를 지우고 "
-            "다시 실행하거나, "
-            "sion-train-tokenizer 를 --required-character-min-occurrences 를 낮춰 직접 "
-            "실행하세요."
+            f"[easy_run] The byte-fallback rate {rate:.4%} exceeds the allowed "
+            f"maximum {max_fallback_rate:.4%}. Training is stopping.\n"
+            f"           Remove {DEFAULT_ARTIFACT_ROOT}/tokenizer and run again, "
+            "or run sion-train-tokenizer directly with a lower "
+            "--required-character-min-occurrences value."
         )
-    print("[easy_run] byte fallback 비율이 허용 범위입니다. 계속합니다.", flush=True)
+    print("[easy_run] The byte-fallback rate is within the allowed limit. Continuing.", flush=True)
 
 
 def main() -> None:
@@ -445,11 +462,11 @@ def main() -> None:
     runtime_artifacts = _runtime_artifact_directory(ram)
     if ram is None:
         runtime_data = source_data
-        print("[easy_run] RAM 디스크 없이 일반 디스크에서 실행합니다.")
+        print("[easy_run] Running from persistent storage without a RAM disk.")
     else:
         runtime_data = ram / "data"
-        print(f"[easy_run] RAM 디스크 사용: {ram}")
-        print(f"[easy_run] 원천 데이터 {len(raw_files)}개를 RAM으로 복사합니다.")
+        print(f"[easy_run] Using RAM disk: {ram}")
+        print(f"[easy_run] Copying {len(raw_files)} source data files to RAM.")
         shutil.rmtree(runtime_data, ignore_errors=True)
         _copy_files_parallel(source_data, runtime_data)
         # The /dev/shm workspace has a stable checkout-derived name and can
@@ -464,8 +481,8 @@ def main() -> None:
     _check_shard_keys(env)
     _report_foundation_corpus(generated_config)
     try:
-        # 전처리를 단일 rank에서 끝내야 torchrun worker가 장시간 barrier에서
-        # 기다리거나 통신 timeout에 걸리지 않습니다.
+        # Complete preprocessing on one rank so torchrun workers do not wait at
+        # a barrier for an extended period or hit a communication timeout.
         _run(
             [
                 sys.executable,
@@ -484,7 +501,8 @@ def main() -> None:
 
         if ram is not None:
             print(
-                f"[easy_run] tokenizer/dataset을 일반 디스크 {DEFAULT_ARTIFACT_ROOT}/에 보존합니다."
+                "[easy_run] Preserving tokenizer and dataset on persistent "
+                f"storage at {DEFAULT_ARTIFACT_ROOT}/."
             )
             _atomic_sync_directory(
                 runtime_artifacts / "tokenizer", PERSISTENT_ARTIFACTS / "tokenizer"
@@ -502,7 +520,7 @@ def main() -> None:
             "--config",
             str(generated_config),
         ]
-        print(f"[easy_run] CUDA GPU {gpu_count}개({', '.join(gpu_names)})로 학습을 시작합니다.")
+        print(f"[easy_run] Starting training on {gpu_count} CUDA GPUs ({', '.join(gpu_names)}).")
         _run(command, env)
     finally:
         generated_config.unlink(missing_ok=True)

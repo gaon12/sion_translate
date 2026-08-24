@@ -217,7 +217,7 @@ def test_missing_tmux_continues_in_foreground(monkeypatch, capsys) -> None:
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not run apt")),
     )
     assert easy_run._install_tmux() is None
-    assert "현재 프로세스에서 계속" in capsys.readouterr().out
+    assert "continue in the current process" in capsys.readouterr().out
 
 
 def _fake_torch(*, gpu_count: int, available: bool = True, nccl: bool = True):
@@ -243,7 +243,7 @@ def test_gpu_preflight_accepts_single_and_mixed_cuda_devices() -> None:
 
 
 def test_gpu_preflight_rejects_cpu_only_pytorch() -> None:
-    with pytest.raises(SystemExit, match="CUDA 지원 PyTorch"):
+    with pytest.raises(SystemExit, match="CUDA support"):
         easy_run._validate_gpu_runtime(_fake_torch(gpu_count=0, available=False))
 
 

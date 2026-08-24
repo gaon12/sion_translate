@@ -1,30 +1,31 @@
-"""학습한 sion_translate 모델을 위한 독립 실행형 추론 CLI.
+"""Standalone inference CLI for a trained sion_translate model.
 
-사용 예시:
+Examples:
     python inferences.py --to ja "오늘 날씨가 좋습니다."
     python inferences.py --quality accurate --thinking high --to ko < input.txt
     python inferences.py --quality best --to ja --input input.txt
     python inferences.py --int8 --to ja --input input.txt
     python inferences.py --quality best --batch-size 1 --profile --to ja --input input.txt
 
-``--int8``은 용량과 메모리를 줄이는 옵션이며 속도 옵션이 아닙니다.
-품질/속도는 ``--quality``로만 조절하십시오.
+``--int8`` reduces file size and memory use; it is not a speed option.
+Use ``--quality`` to control the quality/speed tradeoff.
 
-``thinking``은 번역 모델의 숨은 사고 과정을 출력하는 기능이 아닙니다.
-이 모델은 번역 전용 seq2seq 모델이므로, 여기서는 더 넓은 beam 탐색에
-할당할 계산량을 뜻합니다.
+``thinking`` does not expose a hidden reasoning process. This is a
+translation-only seq2seq model, so the option specifies how much computation
+to allocate to wider beam search.
 
-출력에는 최종 번역만 포함됩니다.
+Output contains only the final translation.
 
-품질 우선순위:
+Generation-option precedence:
     --num-beams > --thinking > --quality
 
-예를 들어 다음 명령에서 --thinking high가 지정되었으므로
---quality best의 기본 beam 수보다 --thinking high의 beam 수가 우선됩니다.
+For example, ``--thinking high`` in the following command overrides the default
+beam count from ``--quality best``:
 
     python inferences.py --quality best --thinking high ...
 
-best 프리셋의 권장 beam 4를 그대로 사용하려면 --thinking을 생략하십시오.
+Omit ``--thinking`` to retain the recommended beam count of 4 from the ``best``
+preset:
 
     python inferences.py --quality best ...
 """
@@ -39,8 +40,8 @@ import time
 from pathlib import Path
 from typing import Iterator, Sequence
 
-# editable install을 하지 않은 상태에서도 프로젝트 루트에서
-# 바로 실행할 수 있도록 src 디렉터리를 모듈 검색 경로에 추가한다.
+# Add src to the module search path so this file can run from the project root
+# without an editable installation.
 ROOT = Path(__file__).resolve().parent
 SRC = ROOT / "src"
 
@@ -55,12 +56,12 @@ from sion_translate.glossary import Glossary, load_glossary  # noqa: E402
 from sion_translate.inference import Translator, find_exported_model  # noqa: E402
 
 
-# 품질 프리셋이다.
+# Quality presets.
 #
-# 이 모델의 holdout 평가와 코어 generate() 권장값에 맞춘 프리셋이다.
-# beam 수를 지나치게 늘리면 품질이 오히려 떨어지고 반복 생성이 늘 수 있으므로,
-# best는 검증된 beam 4를 사용한다. 더 넓은 탐색 실험은 --thinking 또는
-# --num-beams로 명시할 수 있다.
+# These values follow the model's holdout evaluation and the recommended core
+# generate() settings. Excessive beam counts can reduce quality and increase
+# repetition, so ``best`` uses the validated count of 4. Request wider search
+# explicitly with ``--thinking`` or ``--num-beams``.
 QUALITY_DEFAULTS = {
     "fast": {
         "num_beams": 1,
@@ -85,8 +86,8 @@ QUALITY_DEFAULTS = {
 }
 
 
-# thinking 옵션은 내부 사고 과정 출력 기능이 아니라
-# beam search에 할당할 탐색량을 의미한다.
+# The thinking option controls the beam-search budget; it does not expose an
+# internal reasoning process.
 THINKING_BEAMS = {
     "off": 1,
     "low": 2,
@@ -97,55 +98,56 @@ THINKING_BEAMS = {
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """명령행 인자 파서를 생성한다."""
+    """Create the command-line argument parser."""
     parser = argparse.ArgumentParser(
-        description="sion_translate 학습 모델로 한↔일 번역을 수행합니다.",
+        description="Translate between Korean and Japanese with a trained sion_translate model.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
     parser.add_argument(
         "text",
         nargs="*",
-        help="번역할 문장. 없으면 --input 또는 표준 입력을 사용합니다.",
+        help="Text to translate. If omitted, use --input or standard input.",
     )
 
     parser.add_argument(
         "--input",
         type=Path,
-        help="입력 텍스트 파일입니다. 한 줄을 한 문장으로 처리합니다.",
+        help="Input text file. Each line is treated as one sentence.",
     )
 
     parser.add_argument(
         "--output",
         type=Path,
-        help="출력 파일입니다. 지정하지 않으면 표준 출력으로 출력합니다.",
+        help="Output file. Results are written to standard output when omitted.",
     )
 
     parser.add_argument(
         "--to",
         dest="target",
-        help="목표 언어입니다. 기본값은 설정 언어쌍의 두 번째 언어입니다.",
+        help="Target language. Defaults to the second language in the configured pair.",
     )
 
     parser.add_argument(
         "--model",
         type=Path,
-        help="model.pt, model_ema.pt 또는 model_int8.pt 경로입니다.",
+        help="Path to model.pt, model_ema.pt, or model_int8.pt.",
     )
 
     parser.add_argument(
         "--config",
         type=Path,
         default=ROOT / "sion_translate.yaml",
-        help="sion_translate 설정 파일입니다.",
+        help="Path to the sion_translate configuration file.",
     )
 
     parser.add_argument(
         "--int8",
         action="store_true",
         help=(
-            "CPU용 INT8 export 모델을 사용합니다. 파일과 메모리가 작아지지만 "
-            "번역 속도는 빨라지지 않습니다 (--quality fast 와는 무관)."
+            "Use the CPU-only INT8 export. It reduces file size and memory use "
+            "but does not make translation faster (it is independent of "
+            "--quality fast)."
         ),
     )
 
@@ -153,98 +155,101 @@ def build_parser() -> argparse.ArgumentParser:
         "--quality",
         choices=tuple(QUALITY_DEFAULTS),
         default="balanced",
-        help=("속도와 품질 프리셋입니다. best는 holdout 평가에서 검증된 beam 4를 사용합니다."),
+        help=("Speed/quality preset. best uses beam 4, which was validated in holdout evaluation."),
     )
 
     parser.add_argument(
         "--thinking",
         choices=tuple(THINKING_BEAMS),
         help=(
-            "탐색 예산입니다. "
+            "Search budget. "
             "off=greedy, low=beam 2, medium=beam 4, "
-            "high=beam 8, max=beam 16입니다. "
-            "출력에는 최종 번역만 표시됩니다."
+            "high=beam 8, and max=beam 16. "
+            "Only the final translation is shown."
         ),
     )
 
     parser.add_argument(
         "--num-beams",
         type=int,
-        help="beam 수입니다. 지정하면 --quality와 --thinking보다 우선합니다.",
+        help="Beam count. This overrides --quality and --thinking when provided.",
     )
 
     parser.add_argument(
         "--length-penalty",
         type=float,
-        help="beam search 길이 보정값입니다.",
+        help="Length penalty used by beam search.",
     )
 
     parser.add_argument(
         "--max-new-tokens",
         type=int,
         default=256,
-        help="문장당 최대 생성 토큰 수입니다.",
+        help="Maximum number of generated tokens per sentence.",
     )
     parser.add_argument(
         "--no-repeat-ngram-size",
         type=int,
         default=4,
-        help="이 크기의 n-gram 재생성을 금지합니다. 0이면 끕니다.",
+        help="Forbid repeated n-grams of this size. Set to 0 to disable.",
     )
     parser.add_argument(
         "--max-output-length-ratio",
         type=float,
         default=3.0,
-        help="원문 토큰 수 대비 출력 상한 비율입니다. 여유 토큰 16개를 별도로 둡니다.",
+        help=(
+            "Maximum output-to-source token ratio. An additional allowance of "
+            "16 tokens is applied separately."
+        ),
     )
 
     parser.add_argument(
         "--batch-size",
         type=int,
-        help="배치 크기입니다. 메모리 부족이 발생하면 값을 낮추십시오.",
+        help="Batch size. Lower this value if inference runs out of memory.",
     )
 
     parser.add_argument(
         "--device",
         default="auto",
-        help="실행 장치입니다. auto, cuda, cuda:0, cpu 등을 사용할 수 있습니다.",
+        help="Execution device, such as auto, cuda, cuda:0, or cpu.",
     )
 
     parser.add_argument(
         "--dtype",
         choices=("auto", "fp32", "bf16", "fp16"),
         default="auto",
-        help="일반 export 모델의 계산 정밀도입니다. INT8에서는 무시됩니다.",
+        help="Compute precision for regular exports. Ignored for INT8 exports.",
     )
 
     parser.add_argument(
         "--compile",
         action="store_true",
-        help="CUDA에서 torch.compile을 적용합니다. 첫 추론은 느릴 수 있습니다.",
+        help="Apply torch.compile on CUDA. The first inference may be slow.",
     )
 
     parser.add_argument(
         "--threads",
         type=int,
-        help="CPU 추론에 사용할 PyTorch 스레드 수입니다.",
+        help="Number of PyTorch threads to use for CPU inference.",
     )
 
     parser.add_argument(
         "--glossary",
         type=Path,
-        help="용어집 JSON 파일 경로입니다.",
+        help="Path to a glossary JSON file.",
     )
 
     parser.add_argument(
         "--no-glossary",
         action="store_true",
-        help="명령행 및 설정 파일의 용어집을 모두 사용하지 않습니다.",
+        help="Disable glossaries from both the command line and configuration file.",
     )
 
     parser.add_argument(
         "--json",
         action="store_true",
-        help="각 번역 결과를 행별 JSONL 형식으로 출력합니다.",
+        help="Write one JSONL object per translation.",
     )
 
     parser.add_argument(
@@ -252,15 +257,17 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "추론 시간, 전체 시간 및 처리량을 stderr에 출력합니다. "
-            "--no-timing으로 비활성화할 수 있습니다."
+            "Write inference time, total time, and throughput to stderr. Disable with --no-timing."
         ),
     )
 
     parser.add_argument(
         "--profile",
         action="store_true",
-        help=("설정 준비, 모델 준비, 추론, 출력 시간을 구분하여 상세하게 stderr에 출력합니다."),
+        help=(
+            "Write a detailed breakdown of configuration, model preparation, "
+            "inference, and output time to stderr."
+        ),
     )
 
     parser.add_argument(
@@ -268,8 +275,8 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "반복·과다 길이 출력만 더 좁은 beam으로 재시도합니다. "
-            "--no-degeneration-retry로 비활성화할 수 있습니다."
+            "Retry only repetitive or excessively long outputs with narrower "
+            "beams. Disable with --no-degeneration-retry."
         ),
     )
 
@@ -277,27 +284,26 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def to_python_string(value: object, *, value_name: str) -> str:
-    """문자열 계열 값을 Python 기본 str로 변환한다.
+    """Convert a string-like value to a built-in Python ``str``.
 
-    argparse와 일반 텍스트 파일에서는 대부분 기본 str이 들어오지만,
-    외부 코드에서 main 함수나 번역 함수를 호출하는 경우 numpy.str_,
-    pandas 문자열 스칼라 또는 bytes가 들어올 수 있다.
+    argparse and ordinary text files normally provide built-in strings, but
+    external callers can pass ``numpy.str_``, pandas string scalars, or bytes.
 
-    리스트나 딕셔너리 같은 구조적 데이터는 문자열로 강제 변환하지 않는다.
-    해당 값을 강제로 str로 바꾸면 데이터 오류가 숨겨질 수 있기 때문이다.
+    Structured data such as lists and dictionaries is intentionally rejected.
+    Coercing those values with ``str`` could conceal a data error.
     """
     if isinstance(value, str):
-        # 문자열 하위 클래스일 가능성까지 고려해 기본 str로 변환한다.
+        # Normalize possible string subclasses to the built-in str type.
         return str(value)
 
     if isinstance(value, bytes):
         try:
             return value.decode("utf-8")
         except UnicodeDecodeError as error:
-            raise SystemExit(f"{value_name}이 UTF-8로 해석할 수 없는 bytes입니다.") from error
+            raise SystemExit(f"{value_name} contains bytes that are not valid UTF-8.") from error
 
-    # numpy 또는 pandas 스칼라 객체는 item()으로
-    # 기본 Python 스칼라를 얻을 수 있다.
+    # numpy and pandas scalar objects can expose a built-in Python scalar via
+    # item().
     item_method = getattr(value, "item", None)
 
     if callable(item_method):
@@ -314,18 +320,18 @@ def to_python_string(value: object, *, value_name: str) -> str:
                 return scalar_value.decode("utf-8")
             except UnicodeDecodeError as error:
                 raise SystemExit(
-                    f"{value_name}의 스칼라 값이 UTF-8로 해석할 수 없는 bytes입니다."
+                    f"The scalar value for {value_name} contains bytes that are not valid UTF-8."
                 ) from error
 
     raise SystemExit(
-        f"{value_name}은 문자열이어야 합니다. 현재 타입={type(value).__name__}, 값={value!r}"
+        f"{value_name} must be a string; got type={type(value).__name__}, value={value!r}"
     )
 
 
 def read_lines(args: argparse.Namespace) -> list[str]:
-    """명령행, 입력 파일 또는 표준 입력에서 번역할 문장을 읽는다."""
+    """Read sentences from arguments, an input file, or standard input."""
     if args.text and args.input:
-        raise SystemExit("문장 위치 인자와 --input은 함께 사용할 수 없습니다.")
+        raise SystemExit("Positional text and --input cannot be used together.")
 
     raw_lines: Sequence[object]
 
@@ -338,7 +344,7 @@ def read_lines(args: argparse.Namespace) -> list[str]:
                 encoding="utf-8",
             ).splitlines()
         except (OSError, UnicodeError) as error:
-            raise SystemExit(f"입력 파일을 읽을 수 없습니다: {args.input}: {error}") from error
+            raise SystemExit(f"Could not read input file {args.input}: {error}") from error
 
     else:
         raw_lines = [line.rstrip("\r\n") for line in sys.stdin]
@@ -348,25 +354,25 @@ def read_lines(args: argparse.Namespace) -> list[str]:
     for line_number, raw_line in enumerate(raw_lines, start=1):
         line = to_python_string(
             raw_line,
-            value_name=f"{line_number}번째 입력",
+            value_name=f"input line {line_number}",
         ).strip()
 
-        # 빈 줄은 번역 대상에서 제외한다.
+        # Exclude blank lines from translation.
         if line:
             lines.append(line)
 
     if not lines:
-        raise SystemExit("번역할 문장이 없습니다.")
+        raise SystemExit("No text was provided for translation.")
 
     return lines
 
 
 def choose_device(value: str, int8: bool) -> torch.device:
-    """명령행 옵션에 따라 추론 장치를 결정한다."""
+    """Select the inference device from the command-line options."""
     if int8:
         if value not in ("auto", "cpu"):
             print(
-                "[sion] INT8 export는 CPU 전용이므로 device=cpu를 사용합니다.",
+                "[sion] INT8 exports are CPU-only; using device=cpu.",
                 file=sys.stderr,
             )
 
@@ -378,23 +384,23 @@ def choose_device(value: str, int8: bool) -> torch.device:
     try:
         device = torch.device(value)
     except (RuntimeError, ValueError) as error:
-        raise SystemExit(f"유효하지 않은 --device 값입니다: {value}") from error
+        raise SystemExit(f"Invalid --device value: {value}") from error
 
     if device.type == "cuda" and not torch.cuda.is_available():
-        raise SystemExit("CUDA를 요청했지만 사용 가능한 CUDA GPU가 없습니다.")
+        raise SystemExit("CUDA was requested, but no CUDA GPU is available.")
 
     if device.type == "cuda" and device.index is not None:
         if device.index >= torch.cuda.device_count():
             raise SystemExit(
-                f"CUDA 장치 {device.index}번을 요청했지만 "
-                f"사용 가능한 GPU는 {torch.cuda.device_count()}개입니다."
+                f"CUDA device {device.index} was requested, but only "
+                f"{torch.cuda.device_count()} GPUs are available."
             )
 
     return device
 
 
 def synchronize_device(device: torch.device) -> None:
-    """정확한 CUDA 시간 측정을 위해 비동기 연산 완료를 기다린다."""
+    """Wait for asynchronous CUDA work to finish for accurate timing."""
     if device.type == "cuda":
         torch.cuda.synchronize(device)
 
@@ -404,7 +410,7 @@ def resolve_config_path(
     *,
     config_path: Path | None,
 ) -> Path:
-    """설정에 적힌 상대 경로를 설정 파일 위치를 기준으로 해석한다."""
+    """Resolve a configured relative path from the configuration directory."""
     path = Path(value).expanduser()
     if path.is_absolute():
         return path
@@ -414,11 +420,11 @@ def resolve_config_path(
 
 
 def require_file(path: Path, *, value_name: str) -> Path:
-    """필수 입력 경로가 읽을 수 있는 일반 파일인지 검사한다."""
+    """Require an input path to exist as a regular file."""
     if not path.exists():
-        raise SystemExit(f"{value_name}을 찾을 수 없습니다: {path}")
+        raise SystemExit(f"Could not find {value_name}: {path}")
     if not path.is_file():
-        raise SystemExit(f"{value_name}은 파일이어야 합니다: {path}")
+        raise SystemExit(f"{value_name} must be a file: {path}")
     return path
 
 
@@ -427,13 +433,14 @@ def apply_runtime_options(
     args: argparse.Namespace,
     device: torch.device,
 ) -> None:
-    """장치, 정밀도 및 torch.compile 설정을 모델에 적용한다.
+    """Apply device, precision, and torch.compile settings to the model.
 
-    INT8 모듈은 CPU 전용 양자화 모델이므로 장치나 dtype을 변경하지 않는다.
+    INT8 modules are CPU-only quantized models, so their device and dtype remain
+    unchanged.
     """
     if args.threads is not None:
         if args.threads < 1:
-            raise SystemExit("--threads는 1 이상이어야 합니다.")
+            raise SystemExit("--threads must be at least 1.")
 
         torch.set_num_threads(args.threads)
 
@@ -441,7 +448,7 @@ def apply_runtime_options(
         return
 
     if args.dtype == "fp16" and device.type != "cuda":
-        raise SystemExit("fp16은 CUDA에서만 지원합니다. CPU에서는 fp32 또는 bf16을 사용하십시오.")
+        raise SystemExit("fp16 requires CUDA. Use fp32 or bf16 on CPU.")
 
     dtype = {
         "fp32": torch.float32,
@@ -462,13 +469,13 @@ def apply_runtime_options(
     if args.compile:
         if device.type != "cuda":
             print(
-                "[sion] --compile은 CUDA에서만 적용합니다.",
+                "[sion] --compile is applied only on CUDA.",
                 file=sys.stderr,
             )
 
         elif not hasattr(torch, "compile"):
             print(
-                "[sion] 현재 PyTorch에는 torch.compile이 없어 컴파일을 건너뜁니다.",
+                "[sion] This PyTorch build has no torch.compile; skipping compilation.",
                 file=sys.stderr,
             )
 
@@ -482,14 +489,14 @@ def apply_runtime_options(
 def generation_options(
     args: argparse.Namespace,
 ) -> tuple[int, int, float]:
-    """품질 프리셋과 명령행 옵션을 합쳐 생성 옵션을 결정한다."""
+    """Combine the quality preset and CLI overrides into generation options."""
     preset = QUALITY_DEFAULTS[args.quality]
 
-    # 명시적인 --num-beams가 가장 높은 우선순위를 가진다.
+    # An explicit --num-beams value has the highest precedence.
     beams = args.num_beams
 
     if beams is None:
-        # --thinking이 지정되었으면 품질 프리셋의 beam 수보다 우선한다.
+        # An explicit --thinking value overrides the quality preset's beam count.
         if args.thinking is not None:
             beams = THINKING_BEAMS[args.thinking]
         else:
@@ -506,16 +513,16 @@ def generation_options(
         length_penalty = float(preset["length_penalty"])
 
     if beams < 1:
-        raise SystemExit("--num-beams는 1 이상이어야 합니다.")
+        raise SystemExit("--num-beams must be at least 1.")
 
     if batch_size < 1:
-        raise SystemExit("--batch-size는 1 이상이어야 합니다.")
+        raise SystemExit("--batch-size must be at least 1.")
 
     if args.max_new_tokens < 1:
-        raise SystemExit("--max-new-tokens는 1 이상이어야 합니다.")
+        raise SystemExit("--max-new-tokens must be at least 1.")
 
     if length_penalty <= 0:
-        raise SystemExit("--length-penalty는 0보다 커야 합니다.")
+        raise SystemExit("--length-penalty must be greater than 0.")
 
     return beams, batch_size, length_penalty
 
@@ -524,13 +531,13 @@ def validate_translations(
     sources: Sequence[str],
     translations: Sequence[object],
 ) -> list[str]:
-    """모델이 반환한 번역 결과의 개수와 타입을 검사한다."""
+    """Validate the number and type of translations returned by the model."""
     translation_list = list(translations)
 
     if len(translation_list) != len(sources):
         raise SystemExit(
-            "번역 결과 개수가 입력 문장 개수와 다릅니다. "
-            f"입력={len(sources)}, 결과={len(translation_list)}"
+            "The number of translations does not match the number of input "
+            f"sentences: input={len(sources)}, output={len(translation_list)}"
         )
 
     validated: list[str] = []
@@ -542,7 +549,7 @@ def validate_translations(
         validated.append(
             to_python_string(
                 translation,
-                value_name=f"{index}번째 번역 결과",
+                value_name=f"translation {index}",
             )
         )
 
@@ -550,10 +557,11 @@ def validate_translations(
 
 
 def degeneration_reasons(source: str, translation: str) -> set[str]:
-    """명백한 생성 붕괴 신호를 반환한다.
+    """Return signals of obvious generation degeneration.
 
-    짧은 감탄사나 의도적인 반복을 과도하게 잡지 않도록 5회 이상의 문자 반복,
-    4회 이상의 구절 반복, 원문에 비해 비정상적으로 긴 출력만 대상으로 한다.
+    To avoid flagging short interjections or intentional repetition, this check
+    targets only runs of at least five characters, at least four repeated
+    phrases, and outputs that are abnormally long relative to the source.
     """
     stripped = translation.strip()
     if not stripped:
@@ -589,10 +597,11 @@ def retry_degenerate_translations(
     no_repeat_ngram_size: int = 4,
     max_output_length_ratio: float = 3.0,
 ) -> tuple[list[str], int, int]:
-    """붕괴한 결과만 좁은 beam 후보로 교체한다.
+    """Replace only degenerate results with narrower-beam candidates.
 
-    후보가 기존 결과보다 붕괴 사유 수를 실제로 줄일 때만 채택하므로 정상 번역은
-    건드리지 않는다. beam 4라면 beam 2, greedy 순으로 남은 문제 문장만 재시도한다.
+    A candidate is accepted only when it reduces the number of degeneration
+    reasons, leaving normal translations unchanged. For beam 4, the remaining
+    problem sentences are retried with beam 2 and then greedy search.
     """
     resolved = list(translations)
     initial_problem_indices = [
@@ -642,7 +651,7 @@ def render_rows(
     translations: Sequence[str],
     as_json: bool,
 ) -> Iterator[str]:
-    """번역 결과를 일반 텍스트 또는 JSONL 문자열로 변환한다."""
+    """Render translations as plain-text or JSONL rows."""
     for source, translation in zip(
         sources,
         translations,
@@ -664,7 +673,7 @@ def write_output(
     rows: str,
     output_path: Path | None,
 ) -> None:
-    """결과를 파일 또는 표준 출력으로 기록한다."""
+    """Write results to a file or standard output."""
     if output_path is None:
         sys.stdout.write(rows)
         sys.stdout.flush()
@@ -682,7 +691,7 @@ def write_output(
         )
 
     except OSError as error:
-        raise SystemExit(f"출력 파일을 쓸 수 없습니다: {output_path}: {error}") from error
+        raise SystemExit(f"Could not write output file {output_path}: {error}") from error
 
 
 def print_timing_report(
@@ -695,7 +704,7 @@ def print_timing_report(
     total_elapsed: float,
     detailed: bool,
 ) -> None:
-    """시간 측정 결과를 stderr에 출력한다."""
+    """Write timing measurements to stderr."""
     safe_inference_elapsed = max(
         inference_elapsed,
         1e-9,
@@ -706,12 +715,12 @@ def print_timing_report(
 
     print(
         (
-            f"[sion] 추론 완료: "
-            f"{sentence_count}문장 / "
-            f"추론 {inference_elapsed:.3f}초 / "
-            f"전체 {total_elapsed:.3f}초 / "
-            f"{throughput:.2f}문장/초 / "
-            f"문장당 평균 {average_milliseconds:.2f}ms"
+            f"[sion] Inference complete: "
+            f"{sentence_count} sentences / "
+            f"inference {inference_elapsed:.3f}s / "
+            f"total {total_elapsed:.3f}s / "
+            f"{throughput:.2f} sentences/s / "
+            f"average {average_milliseconds:.2f} ms/sentence"
         ),
         file=sys.stderr,
         flush=True,
@@ -719,45 +728,45 @@ def print_timing_report(
 
     if detailed:
         print(
-            "[sion] 상세 시간:",
+            "[sion] Detailed timing:",
             file=sys.stderr,
         )
 
         print(
-            f"[sion]   설정 및 입력 준비: {config_elapsed:.3f}초",
+            f"[sion]   Configuration and input: {config_elapsed:.3f}s",
             file=sys.stderr,
         )
 
         print(
-            f"[sion]   모델 로딩 및 준비: {model_elapsed:.3f}초",
+            f"[sion]   Model loading and preparation: {model_elapsed:.3f}s",
             file=sys.stderr,
         )
 
         print(
-            f"[sion]   실제 번역 추론: {inference_elapsed:.3f}초",
+            f"[sion]   Translation inference: {inference_elapsed:.3f}s",
             file=sys.stderr,
         )
 
         print(
-            f"[sion]   결과 변환 및 출력: {output_elapsed:.3f}초",
+            f"[sion]   Result rendering and output: {output_elapsed:.3f}s",
             file=sys.stderr,
         )
 
         print(
-            f"[sion]   전체 실행: {total_elapsed:.3f}초",
+            f"[sion]   Total execution: {total_elapsed:.3f}s",
             file=sys.stderr,
             flush=True,
         )
 
 
 def main() -> None:
-    """CLI의 전체 추론 절차를 실행한다."""
+    """Run the complete CLI inference workflow."""
     configure_stdio()
     total_started = time.perf_counter()
 
     args = build_parser().parse_args()
 
-    # 설정 파일, 입력 문장, 장치 및 생성 옵션을 준비한다.
+    # Prepare the configuration, input sentences, device, and generation options.
     config_started = time.perf_counter()
 
     sources = read_lines(args)
@@ -765,10 +774,9 @@ def main() -> None:
     default_config_path = ROOT / "sion_translate.yaml"
     config_path = args.config if args.config.exists() else None
 
-    # 사용자가 기본 경로가 아닌 별도 설정 파일을 지정했는데
-    # 해당 파일이 없으면 즉시 오류를 발생시킨다.
+    # Fail immediately when an explicitly selected non-default config is missing.
     if args.config != default_config_path and config_path is None:
-        raise SystemExit(f"설정 파일을 찾을 수 없습니다: {args.config}")
+        raise SystemExit(f"Could not find configuration file: {args.config}")
 
     raw_config = load_raw_config(config_path) if config_path is not None else {}
 
@@ -784,7 +792,7 @@ def main() -> None:
     if args.model is not None:
         model_path = require_file(
             args.model,
-            value_name="모델",
+            value_name="model",
         )
     else:
         output_dir = resolve_config_path(
@@ -804,7 +812,7 @@ def main() -> None:
             config.data.tokenizer_model,
             config_path=config_path,
         ),
-        value_name="토크나이저 모델",
+        value_name="tokenizer model",
     )
 
     if args.no_glossary:
@@ -812,11 +820,11 @@ def main() -> None:
     elif args.glossary is not None:
         glossary_path = args.glossary
     else:
-        # DataConfig.glossary의 빈 문자열은 "용어집 사용 안 함"을 뜻한다.
-        # Path("")는 현재 디렉터리(".")가 되므로 Path로 바꾸기 전에 걸러야 한다.
+        # An empty DataConfig.glossary string disables the glossary. Filter it
+        # before constructing a Path because Path("") resolves to ".".
         configured_glossary = to_python_string(
             config.data.glossary,
-            value_name="설정 파일의 data.glossary",
+            value_name="configuration data.glossary",
         ).strip()
         glossary_path = (
             resolve_config_path(
@@ -832,12 +840,12 @@ def main() -> None:
     else:
         glossary_path = require_file(
             glossary_path,
-            value_name="용어집",
+            value_name="glossary",
         )
         try:
             glossary = load_glossary(glossary_path)
         except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
-            raise SystemExit(f"용어집을 읽을 수 없습니다: {glossary_path}: {error}") from error
+            raise SystemExit(f"Could not read glossary {glossary_path}: {error}") from error
 
     config_elapsed = time.perf_counter() - config_started
 
@@ -854,7 +862,7 @@ def main() -> None:
         flush=True,
     )
 
-    # 모델과 토크나이저를 불러오고 런타임 옵션을 적용한다.
+    # Load the model and tokenizer, then apply runtime options.
     model_started = time.perf_counter()
 
     translator = Translator(
@@ -877,22 +885,24 @@ def main() -> None:
         if args.target is not None
         else to_python_string(
             config.data.language_pair[1],
-            value_name="설정 파일의 목표 언어",
+            value_name="configured target language",
         ).strip()
     )
 
     if target not in translator.languages:
         supported_languages = ", ".join(sorted(translator.languages))
 
-        raise SystemExit(f"--to {target}는 지원하지 않습니다. 지원 언어: {supported_languages}")
+        raise SystemExit(
+            f"--to {target} is unsupported. Supported languages: {supported_languages}"
+        )
 
     synchronize_device(device)
     model_elapsed = time.perf_counter() - model_started
 
-    # 실제 번역 추론 시간을 측정한다.
+    # Measure the translation inference itself.
     #
-    # CUDA 연산은 기본적으로 비동기이므로 추론 시작 전과 종료 후에
-    # synchronize를 호출해야 실제 완료 시간을 정확히 측정할 수 있다.
+    # CUDA work is asynchronous, so synchronization is required before and after
+    # inference to measure the true completion time.
     synchronize_device(device)
     inference_started = time.perf_counter()
 
@@ -914,9 +924,8 @@ def main() -> None:
             torch.cuda.empty_cache()
 
         raise SystemExit(
-            "CUDA 메모리가 부족합니다. "
-            "--batch-size 값을 낮추십시오. "
-            "best 모드라면 --batch-size 1을 권장합니다."
+            "CUDA ran out of memory. Lower --batch-size. For best mode, "
+            "--batch-size 1 is recommended."
         ) from error
 
     except TypeError as error:
@@ -924,9 +933,9 @@ def main() -> None:
 
         if "not a string" in error_message:
             raise SystemExit(
-                "SentencePiece에 문자열이 아닌 값이 전달되었습니다. "
-                "src/sion_translate/tokenizer.py의 encode()에서 입력값과 "
-                "normalize_text() 반환값을 Python 기본 str로 변환해야 합니다."
+                "SentencePiece received a non-string value. Convert both the "
+                "input and the normalize_text() result to a built-in Python str "
+                "inside src/sion_translate/tokenizer.py encode()."
             ) from error
 
         raise
@@ -952,7 +961,8 @@ def main() -> None:
         )
         if rescued_count or remaining_count:
             print(
-                f"[sion] 반복 붕괴 재시도: 복구 {rescued_count}문장 / 잔여 {remaining_count}문장",
+                f"[sion] Degeneration retry: rescued {rescued_count} sentences; "
+                f"{remaining_count} remain.",
                 file=sys.stderr,
                 flush=True,
             )
@@ -960,7 +970,7 @@ def main() -> None:
     synchronize_device(device)
     inference_elapsed = time.perf_counter() - inference_started
 
-    # 반환 결과를 검사하고 출력 형식으로 변환한다.
+    # Validate returned results and render them in the requested output format.
     output_started = time.perf_counter()
 
     rows = (
@@ -982,7 +992,7 @@ def main() -> None:
     output_elapsed = time.perf_counter() - output_started
     total_elapsed = time.perf_counter() - total_started
 
-    # --profile은 --timing이 꺼져 있어도 상세 시간 측정을 출력한다.
+    # --profile emits detailed timings even when --timing is disabled.
     if args.timing or args.profile:
         print_timing_report(
             sentence_count=len(sources),

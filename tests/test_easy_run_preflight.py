@@ -81,7 +81,7 @@ def test_a_high_fallback_rate_stops_the_run(tmp_path: Path) -> None:
     corpus = write_corpus(data)
     model = build_tokenizer(tmp_path, corpus, reserve="")
     # The gate is a rate, so force it low enough that any fallback trips it.
-    with pytest.raises(SystemExit, match="상한"):
+    with pytest.raises(SystemExit, match="exceeds the allowed maximum"):
         EASY._verify_tokenizer(model, data, max_fallback_rate=0.0)
 
 
@@ -101,7 +101,7 @@ def test_a_tolerable_rate_passes(tmp_path: Path, capsys) -> None:
     model = build_tokenizer(tmp_path, corpus, reserve=FUSED)
     # Generous ceiling: the point is that a passing run does not raise.
     EASY._verify_tokenizer(model, data, max_fallback_rate=1.0)
-    assert "허용 범위" in capsys.readouterr().out
+    assert "within the allowed limit" in capsys.readouterr().out
 
 
 def test_the_report_names_the_offending_characters(tmp_path: Path, capsys) -> None:
@@ -128,7 +128,7 @@ def test_nothing_language_specific_is_hardcoded() -> None:
 
 def test_a_missing_tokenizer_is_skipped_rather_than_crashing(tmp_path: Path, capsys) -> None:
     EASY._verify_tokenizer(tmp_path / "absent.model", tmp_path)
-    assert "건너뜁니다" in capsys.readouterr().out
+    assert "skipping" in capsys.readouterr().out
 
 
 def test_a_missing_corpus_is_skipped_rather_than_crashing(tmp_path: Path, capsys) -> None:
@@ -138,7 +138,7 @@ def test_a_missing_corpus_is_skipped_rather_than_crashing(tmp_path: Path, capsys
     empty = tmp_path / "empty"
     empty.mkdir()
     EASY._verify_tokenizer(model, empty)
-    assert "코퍼스를 찾지 못해" in capsys.readouterr().out
+    assert "No corpus was found" in capsys.readouterr().out
 
 
 def test_the_shard_key_check_stops_the_run(monkeypatch) -> None:
@@ -152,7 +152,7 @@ def test_the_shard_key_check_stops_the_run(monkeypatch) -> None:
         return Result()
 
     monkeypatch.setattr(EASY.subprocess, "run", fake_run)
-    with pytest.raises(SystemExit, match="조용히 빠집니다"):
+    with pytest.raises(SystemExit, match="silently excluded"):
         EASY._check_shard_keys({})
     assert calls, "the checker must actually be invoked"
 
@@ -185,7 +185,7 @@ def test_the_foundation_corpus_is_reported_before_training(tmp_path, capsys) -> 
     easy_run._report_foundation_corpus(config)
 
     output = capsys.readouterr().out
-    assert "foundation 단계를 건너뜁니다" in output
+    assert "Skipping the foundation stage" in output
     # 무엇을 어디에 두면 되는지가 출력에 있어야 한다.
     assert ".txt" in output and ".jsonl" in output
 
@@ -209,7 +209,7 @@ def test_a_usable_corpus_is_announced_with_its_languages(tmp_path, capsys) -> No
     easy_run._report_foundation_corpus(config)
 
     output = capsys.readouterr().out
-    assert "foundation 단계를 실행합니다" in output
+    assert "Running the foundation stage" in output
     assert "ko" in output and "ja" in output
     # 산출물이 번역 모델과 분리된다는 사실을 미리 알린다.
     assert "runs/*/foundation/" in output

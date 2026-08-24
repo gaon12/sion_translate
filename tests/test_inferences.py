@@ -35,8 +35,8 @@ def test_resolve_config_path_uses_config_directory(tmp_path: Path) -> None:
 
 
 def test_require_file_rejects_directory(tmp_path: Path) -> None:
-    with pytest.raises(SystemExit, match="파일이어야"):
-        inferences.require_file(tmp_path, value_name="용어집")
+    with pytest.raises(SystemExit, match="must be a file"):
+        inferences.require_file(tmp_path, value_name="glossary")
 
 
 @pytest.mark.parametrize(
