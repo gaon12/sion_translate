@@ -2844,7 +2844,7 @@ def test_resuming_with_a_changed_objective_is_refused(tmp_path: Path) -> None:
 def test_a_legacy_checkpoint_without_an_objective_warns_instead_of_failing(
     tmp_path: Path,
 ) -> None:
-    """구버전 체크포인트의 재개를 막지는 않되, 검사하지 못한 것을 밝힌다."""
+    """Legacy resume remains allowed but reports which checks are unavailable."""
     import warnings as warnings_module
 
     from sion_translate.training.checkpoint import build_objective_identity
@@ -2869,4 +2869,4 @@ def test_a_legacy_checkpoint_without_an_objective_warns_instead_of_failing(
     with warnings_module.catch_warnings(record=True) as caught:
         warnings_module.simplefilter("always")
         load_checkpoint(checkpoint, model, optimizer, scheduler, context, expected_identity=modern)
-    assert any("목적함수" in str(entry.message) for entry in caught)
+    assert any("objective/optimization identity" in str(entry.message) for entry in caught)

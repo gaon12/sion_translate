@@ -1,15 +1,16 @@
-"""학습 재개용 체크포인트 저장/복원.
+"""Save and restore checkpoints for resuming training.
 
-여기서 저장하는 체크포인트는 '학습을 이어서 하기 위한' 것으로,
-모델 가중치 외에 optimizer / scheduler / (fp16이면) scaler / 진행 상태
-(best loss, early-stopping 카운터, epoch)까지 전부 포함합니다.
+These checkpoints contain everything needed to continue training: model
+weights, optimizer and scheduler state, the fp16 scaler when applicable, and
+progress such as the best loss, early-stopping counter, and epoch.
 
-번역(추론)에만 쓸 가벼운 저장본은 ``sion_translate.training.export`` 가 따로 만듭니다.
+``sion_translate.training.export`` creates the smaller inference-only artifact.
 
-저장 형식은 학습 방식에 따라 둘로 나뉩니다.
-- 단일 프로세스: ``checkpoint.pt`` 파일 하나에 torch.save 로 저장
-- 분산 학습(FSDP2/DDP): torch.distributed.checkpoint(DCP) 형식의 디렉터리.
-  가중치가 rank 별로 조각나 있어도 그대로 저장/복원할 수 있습니다.
+The storage format depends on the training mode:
+
+- Single process: one ``checkpoint.pt`` file written with ``torch.save``.
+- Distributed FSDP2/DDP: a ``torch.distributed.checkpoint`` (DCP) directory
+  that preserves rank-sharded weights without gathering them first.
 """
 
 from __future__ import annotations
@@ -385,9 +386,9 @@ def _portable_data_config(data_config: Any) -> Any:
     }
 
 
-# 재개 시 같아야 하는 최적화·목적함수 설정. 여기 빠진 값을 바꾸고 재개하면
-# optimizer state 를 그대로 이어받으면서 다른 목적을 최적화하게 되고, 과거
-# best 지표와 새 지표를 같은 축에 놓고 비교하게 됩니다.
+# Optimization and objective settings that must match on resume. Omitting a
+# field would allow a run to retain optimizer state while changing its objective
+# and then compare old and new best metrics as if they shared the same scale.
 _SUPERVISED_OBJECTIVE_FIELDS = (
     "learning_rate",
     "min_learning_rate_ratio",
@@ -402,8 +403,9 @@ _SUPERVISED_OBJECTIVE_FIELDS = (
     "sft_selection_metric",
 )
 
-# MRT 는 reward 정의 자체가 선택 지표입니다. 가중치 하나만 바꿔도
-# validation_reward 는 다른 축의 수치가 되므로 반드시 identity 에 들어갑니다.
+# In MRT, the reward definition is the selection metric. Changing even one
+# weight changes the scale of validation_reward, so every field belongs in the
+# checkpoint identity.
 _POSTTRAINING_OBJECTIVE_FIELDS = (
     "method",
     "learning_rate",
@@ -449,12 +451,13 @@ def build_objective_identity(
     *,
     include_posttraining: bool = False,
 ) -> dict[str, Any]:
-    """무엇을 최적화하고 무엇으로 best 를 고르는지의 정체성.
+    """Describe what the run optimizes and how it selects its best checkpoint.
 
-    모델·토크나이저·데이터가 같아도 목적이 다르면 재개는 안전하지 않습니다.
-    학습률 스케줄이나 Adam 계수를 바꾸고 optimizer state 를 이어받으면 momentum
-    이 다른 곡률을 가리키고, MRT 의 reward 가중치를 바꾸면 ``validation_reward``
-    가 다른 축의 수치가 되는데 early stopping 은 과거 best 와 비교합니다.
+    Resume is unsafe when the objective differs, even if the model, tokenizer,
+    and data match. Reusing optimizer state after changing the learning-rate
+    schedule or Adam coefficients carries momentum from a different curvature.
+    Changing MRT reward weights also changes the scale of ``validation_reward``,
+    while early stopping would still compare it with the previous best value.
     """
 
     payload: dict[str, Any] = {
@@ -656,8 +659,9 @@ def _validate_identity(
                 "new training.output_dir or resume from a checkpoint created by this pipeline."
             )
         warnings.warn(
-            "이전 버전 체크포인트에는 model/tokenizer/data identity가 없습니다. "
-            "이번 재개에서는 안전한 동일성 검사를 건너뜁니다. 다음 저장부터는 identity가 기록됩니다.",
+            "This legacy checkpoint has no model/tokenizer/data identity. "
+            "Safe identity verification is unavailable for this resume. Future "
+            "checkpoints from this run will record the identity.",
             RuntimeWarning,
             stacklevel=3,
         )
@@ -673,14 +677,14 @@ def _validate_identity(
             "training.output_dir or resume from a checkpoint created by this pipeline."
         )
     if "objective" in expected and "objective" not in actual:
-        # 목적함수 identity 가 없던 시절의 체크포인트입니다. 재개 자체를 막지는
-        # 않되, 무엇을 검사하지 못했는지 밝힙니다 — 그 사이에 학습률이나 reward
-        # 가중치가 바뀌었다면 이 재개는 과거 best 와 비교 불가능한 숫자를
-        # 이어받습니다.
+        # This checkpoint predates objective identities. Preserve legacy resume
+        # compatibility, but state what cannot be checked: if the learning rate
+        # or reward weights changed, the resumed metric cannot be compared with
+        # the stored best value.
         warnings.warn(
-            "이 체크포인트에는 목적함수/최적화 identity 가 없습니다(구버전). "
-            "학습률·Adam 계수·EMA·MRT reward 가중치가 그대로인지 확인할 수 없으므로 "
-            "그 부분의 동일성 검사는 건너뜁니다.",
+            "This legacy checkpoint has no objective/optimization identity. "
+            "The learning rate, Adam coefficients, EMA settings, and MRT reward "
+            "weights cannot be verified, so those identity checks are skipped.",
             RuntimeWarning,
             stacklevel=3,
         )
@@ -2605,9 +2609,10 @@ def save_checkpoint(
     ema: Any | None = None,
     identity: Mapping[str, Any] | None = None,
 ) -> None:
-    """현재 학습 상태 전체를 ``path`` 디렉터리에 저장합니다.
+    """Save the complete training state in the ``path`` directory.
 
-    분산 학습에서는 모든 rank 가 함께 호출해야 합니다(집단 통신 발생).
+    Every rank must call this function during distributed training because it
+    performs collective communication.
     """
     path = Path(path)
     if context.is_main and not context.distributed:
@@ -2624,11 +2629,11 @@ def save_checkpoint(
     if scaler is not None:
         state["scaler"] = scaler.state_dict()
     if ema is not None:
-        # EMA shadow 가중치도 함께 저장해 재개 시 평균 이력이 끊기지 않게 합니다.
+        # Preserve EMA shadows so their averaging history survives resume.
         state["ema"] = ema.state_dict()
 
     if context.distributed:
-        # 분산 학습: DCP 가 rank 별 조각(shard)을 병렬로 저장합니다.
+        # DCP writes the shard owned by each rank in parallel.
         import torch.distributed.checkpoint as dcp
         from torch.distributed.checkpoint.state_dict import get_state_dict
 
@@ -2690,11 +2695,11 @@ def save_checkpoint(
             rank_zero_only=True,
         )
     elif context.is_main:
-        # 단일 프로세스: 파일 하나로 충분합니다.
+        # A single file is sufficient for single-process training.
         state["model"] = _unwrap_compiled_model(model).state_dict()
         state["optimizer"] = optimizer.state_dict()
-        # RNG state를 함께 저장하면 같은 데이터 위치에서 재개할 때 Python,
-        # NumPy, torch의 확률적 연산도 중단 전 상태에서 이어집니다.
+        # Restoring RNG state resumes Python, NumPy, and PyTorch stochastic
+        # operations from the interruption point at the same data position.
         state["rng_state"] = _capture_rng_state()
         _atomic_torch_save(state, path / "checkpoint.pt")
 
@@ -2706,26 +2711,26 @@ def _initialize_model_from_checkpoint_impl(
     *,
     expected_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """다른 **단계**의 체크포인트에서 가중치만 가져온다 (재개가 아님).
+    """Import only weights from a checkpoint in another stage, without resuming.
 
-    foundation → SFT 처럼 단계가 바뀔 때 쓰는 경로입니다. ``load_checkpoint``
-    와 의도적으로 다릅니다.
+    This path handles stage transitions such as foundation to SFT. It is
+    deliberately different from ``load_checkpoint``:
 
-    - optimizer/scheduler/scaler/RNG/step 을 **복원하지 않습니다.** 새
-      단계는 새 목적함수와 새 LR schedule 을 가지므로, 이전 단계의 Adam
-      moment 와 step 카운터를 이어받으면 warmup 이 건너뛰어지고 momentum 이
-      다른 loss 표면의 것을 가리킵니다.
-    - 단, 체크포인트에 EMA shadow가 있으면 raw model 대신 그 파라미터를 다음
-      단계의 초기 가중치로 선택합니다. 이는 fresh foundation 종료 직후 trainer가
-      선택하는 가중치와 완료-marker 재사용 경로를 동일하게 만듭니다. EMA의
-      decay/history 자체를 새 단계로 이어받는 것은 아닙니다.
-    - dataset identity 를 비교하지 않습니다. 두 단계는 서로 다른 데이터셋을
-      쓰는 것이 정상입니다(단일어 대 병렬).
-    - 대신 **tokenizer 와 model config 는 반드시 같아야 합니다.** 토크나이저가
-      다르면 임베딩 행이 가리키는 것이 달라져 가중치 인계가 조용히 무의미해지고,
-      model config 가 다르면 애초에 모양이 맞지 않습니다.
+    - It does **not** restore optimizer, scheduler, scaler, RNG, or step state.
+      A new stage has a new objective and learning-rate schedule. Carrying Adam
+      moments and the step counter forward would skip warmup and apply momentum
+      from a different loss surface.
+    - If the checkpoint contains EMA shadows, those parameters initialize the
+      next stage instead of the raw model. This keeps fresh foundation completion
+      consistent with completion-marker reuse. EMA decay and history themselves
+      do not carry into the new stage.
+    - Dataset identities are not compared because different stages normally use
+      different datasets, such as monolingual versus parallel data.
+    - The **tokenizer and model configuration must match**. A tokenizer mismatch
+      silently changes what embedding rows mean, while a model mismatch makes
+      weight shapes incompatible.
 
-    반환값은 출처 정보(step, stage)로, 호출자가 provenance 에 기록합니다.
+    The return value contains source step and stage information for provenance.
     """
 
     path = resolve_checkpoint_source(path, context)
@@ -2739,9 +2744,9 @@ def _initialize_model_from_checkpoint_impl(
         resolved = path
         source_identity = _preflight_dcp_stage_transfer(resolved, expected_identity)
         checkpoint_model = _unwrap_compiled_model(model)
-        # DCP 는 여기 넣어 둔 값 '안으로' 읽어들이므로, 가져올 것만 등록합니다.
-        # optimizer/scheduler는 등록하지 않고, EMA는 초기 파라미터 선택용으로만
-        # 읽습니다. 새 단계가 EMA history 자체를 이어받는 것은 아닙니다.
+        # DCP loads into the supplied template, so register only state that the
+        # stage transfer needs. Optimizer and scheduler state are excluded. EMA
+        # is loaded only to select initial parameters, not to inherit its history.
         state: dict[str, Any] = {"model": get_model_state_dict(checkpoint_model), "step": 0}
         try:
             metadata = dcp.FileSystemReader(  # pyright: ignore[reportPrivateImportUsage]
@@ -2868,10 +2873,11 @@ def _validate_stage_transfer(
     *,
     source: Path,
 ) -> None:
-    """단계 인계에서 반드시 같아야 하는 것만 비교한다.
+    """Compare only identities that must match across a stage transfer.
 
-    데이터셋은 달라야 정상이므로 비교하지 않습니다. tokenizer 와 model config
-    가 다르면 인계 자체가 뜻을 잃으므로 여기서 막습니다.
+    Different datasets are expected and are therefore not compared. A tokenizer
+    or model-configuration mismatch makes the transfer meaningless and is
+    rejected here.
     """
 
     if expected_identity is None:
@@ -2915,10 +2921,10 @@ def _load_checkpoint_impl(
     ema: Any | None = None,
     expected_identity: Mapping[str, Any] | None = None,
 ) -> int:
-    """``path`` 의 체크포인트를 읽어 학습 상태를 복원하고, 재개할 step 을 반환합니다.
+    """Restore training state from ``path`` and return the step to resume from.
 
-    ``training_state`` dict 를 넘기면 best loss / early-stopping 카운터 /
-    epoch 같은 진행 상태가 그 안에 채워집니다.
+    When supplied, ``training_state`` receives progress such as the best loss,
+    early-stopping counter, and epoch.
     """
     path = resolve_checkpoint_source(path, context)
     if context.distributed:
@@ -3005,8 +3011,9 @@ def _load_checkpoint_impl(
             raise ValueError("distributed checkpoint RNG payload is invalid")
         validated_rng_state = cast(Mapping[str, Any], typed_rng_payload["rng_state"])
         _validate_rng_state(validated_rng_state)
-        # 체크포인트가 불완전하거나 구조가 맞지 않으면 여기서 바로 실패합니다.
-        # 일부 파라미터가 초기값인 채로 조용히 재개되는 것이 훨씬 위험하기 때문입니다.
+        # Fail immediately on incomplete or structurally incompatible state.
+        # Silently resuming with some parameters left at initialization is much
+        # more dangerous than rejecting the checkpoint.
         try:
             dcp.load(  # pyright: ignore[reportUnknownMemberType, reportPrivateImportUsage]
                 state, checkpoint_id=path
@@ -3035,7 +3042,8 @@ def _load_checkpoint_impl(
         _restore_rng_state(validated_rng_state)
         return int(state["step"])
 
-    # 단일 프로세스: 임의 코드 실행이 가능한 일반 pickle 로드는 사용하지 않습니다.
+    # Avoid unrestricted pickle loading for single-process checkpoints because
+    # it can execute arbitrary code.
     try:
         loaded = torch.load(
             path / "checkpoint.pt",
@@ -3049,7 +3057,7 @@ def _load_checkpoint_impl(
             "refusing to fall back to executable pickle"
         ) from error
     loaded_state = _validate_loaded_state(loaded)
-    # 모델/optimizer를 변경하기 전에 현재 실행과 체크포인트의 정체성을 비교합니다.
+    # Verify run and checkpoint identities before mutating model or optimizer state.
     _validate_identity(loaded_state, expected_identity)
     _validate_stage_transfer_model_state(model, loaded_state["model"])
     optimizer_group_count = _validate_local_optimizer_structure(
