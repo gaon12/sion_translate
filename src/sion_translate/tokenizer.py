@@ -1421,7 +1421,10 @@ def _publish_tokenizer_generation(staging: Path, output_dir: Path) -> Path:
     for name in TOKENIZER_ARTIFACT_FILENAMES:
         source = staging / name
         _assert_plain_tokenizer_file(source, role=f"staged tokenizer artifact {name}")
-        with source.open("rb") as handle:
+        # Windows maps ``fsync`` to FlushFileBuffers, which requires a handle
+        # opened for writing even though the staged payload is already complete.
+        with source.open("r+b") as handle:
+            handle.flush()
             os.fsync(handle.fileno())
     for name in TOKENIZER_ARTIFACT_FILENAMES:
         source = staging / name
