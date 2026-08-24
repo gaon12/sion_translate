@@ -1,8 +1,8 @@
-"""FP8 export 왕복.
+"""FP8 export round-trip tests.
 
-여기서 확인하는 것은 "FP8 로 저장된다"가 아니라 **무엇이 FP8 로 저장되지
-않는가** 입니다. 어휘 projection 이 섞여 들어가면 export 는 성공하고 번역만
-망가집니다.
+The important property is **what does not get stored as FP8**, not merely that
+some tensors do. If vocabulary projection enters the quantized set, export still
+succeeds while translation quality silently fails.
 """
 
 from __future__ import annotations
@@ -75,9 +75,9 @@ def test_only_the_ffn_projections_are_quantized_by_default() -> None:
 
 
 def test_the_tied_vocabulary_matrix_is_never_quantized() -> None:
-    """tie_embeddings 라 이 행렬은 임베딩이자 출력 헤드다.
+    """With tied embeddings, this matrix is both embedding and output head.
 
-    FP8 로 저장하면 export 는 성공하고 번역만 조용히 망가집니다.
+    Storing it as FP8 allows export to succeed while silently damaging translation.
     """
     state = _state()
     for scope in ("ffn", "all"):
@@ -100,7 +100,7 @@ def test_quantized_weights_survive_the_round_trip_within_the_measured_bound() ->
 
     for name, entry in packed.items():
         if entry["kind"] != "block_fp8":
-            # 양자화하지 않은 것은 비트까지 같아야 한다.
+            # Unquantized tensors must remain bit-for-bit identical.
             assert torch.equal(restored[name], state[name]), name
         else:
             assert relative_error(restored[name], state[name]) < 0.05, name
@@ -125,7 +125,7 @@ def test_the_manifest_records_what_was_done() -> None:
 
 
 def test_a_tensor_whose_width_is_not_a_multiple_of_the_block_is_preserved() -> None:
-    """조용히 자르거나 채우지 않고 고정밀도로 남긴다."""
+    """Keep full precision instead of silently truncating or padding."""
     state = {"encoder_layers.0.ffn.gate_proj.weight": torch.randn(8, 130)}
     packed, quantization = _pack_fp8_state(state, Fp8Policy(enabled=True))
     assert packed["encoder_layers.0.ffn.gate_proj.weight"]["kind"] == "tensor"

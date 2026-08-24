@@ -1,8 +1,8 @@
-"""FP8 가중치를 FP8 인 채로 들고 추론하는 경로.
+"""Inference with weights that remain resident in FP8.
 
-불러올 때 고정밀도로 되돌려 상주시켜 버리면 디스크만 줄어듭니다. 여기서
-확인하는 것은 **상주 가중치가 FP8 인가** 와 실제 계산 경로를 정확히 보고하는가
-입니다.
+Restoring weights to high precision at load time reduces only disk use. These
+tests verify that **resident weights remain FP8** and that runtime diagnostics
+describe the actual compute path accurately.
 """
 
 from __future__ import annotations
@@ -66,9 +66,9 @@ def test_the_ffn_projections_become_fp8_modules() -> None:
 
 
 def test_the_resident_weights_are_actually_fp8_not_restored() -> None:
-    """이 테스트가 이 모듈의 존재 이유다.
+    """Verify the defining behavior of the FP8 runtime module.
 
-    되돌려 실은 채 두면 export 는 성공하고 대역폭은 그대로입니다.
+    If weights remain restored, export succeeds but memory bandwidth is unchanged.
     """
     packed = _packed()
     model = _loaded(packed)
@@ -82,7 +82,7 @@ def test_the_resident_weights_are_actually_fp8_not_restored() -> None:
                 + module.scales.element_size() * module.scales.numel()
             ) / module.weight.numel()
     assert bytes_per_element
-    # bf16 이면 2.0. 스케일 오버헤드를 포함해도 1.1 을 넘지 않아야 한다.
+    # BF16 would use 2.0 bytes; FP8 must stay below 1.1 including scale overhead.
     assert max(bytes_per_element.values()) < 1.1
 
 
@@ -98,9 +98,9 @@ def test_the_attention_projections_stay_dense_under_the_default_scope() -> None:
 
 
 def test_the_model_still_runs_and_matches_the_restored_weights() -> None:
-    """FP8 상주 모델과 되돌려 실은 모델은 같은 가중치를 본다.
+    """FP8-resident and restored models represent the same weights.
 
-    남는 차이는 계산 정밀도(bf16 대 fp32)뿐이라 작아야 합니다.
+    Only compute precision (BF16 versus FP32) differs, so error must remain small.
     """
     packed = _packed()
     restored = _loaded(packed)

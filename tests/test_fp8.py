@@ -1,8 +1,8 @@
-"""FP8 수치와 정책.
+"""FP8 measurements and policy tests.
 
-여기 테스트의 상당수는 "FP8 이 정확하다"가 아니라 **얼마나 부정확한지를
-고정**합니다. FP8 학습이 실패하는 방식은 대부분 느려짐이 아니라 내리면 안
-되는 것을 내리는 것이고, 그 경계는 숫자로 남겨 두지 않으면 잊힙니다.
+Many tests here pin **how inaccurate FP8 is**, rather than claiming that it is
+accurate. FP8 training usually fails by quantizing tensors that must remain
+precise, not merely by becoming slower. Numeric bounds preserve that distinction.
 """
 
 from __future__ import annotations
@@ -21,9 +21,9 @@ from sion_translate.fp8 import (
     scale_for,
 )
 
-# 아래 세 함수는 **측정 장비**입니다. 프로덕션 경로가 쓰지 않으므로
-# 프로덕션 코드에 두지 않습니다. FP8 이 얼마나 부정확한지를 여기서 재고,
-# 그 수치를 위 테스트들이 고정합니다.
+# The next three functions are **measurement tools**. The production path does
+# not use them, so they stay out of production code. They measure FP8 error, and
+# the tests below pin the measured bounds.
 
 
 def quantize_dequantize(
@@ -32,11 +32,12 @@ def quantize_dequantize(
     dtype: torch.dtype = FORWARD_DTYPE,
     block: int | None = DEFAULT_BLOCK,
 ) -> torch.Tensor:
-    """FP8 왕복. 실제 FP8 GEMM 이 보는 값을 고정밀도로 재현합니다.
+    """Reproduce an FP8 round trip in high precision.
 
-    학습 경로에서 쓰는 것이 아니라, 하드웨어 없이 **오차를 측정**하고
-    회귀를 잡기 위한 것입니다. 네이티브 FP8 GEMM에서 관측할 양자화 값의
-    기준이며, 현재 프로덕션 런타임은 ``torch._scaled_mm`` 을 쓰지 않습니다.
+    This is not part of training. It measures error without requiring FP8
+    hardware and catches regressions. The result is the quantized-value reference
+    for a native FP8 GEMM; the current production runtime does not use
+    ``torch._scaled_mm``.
     """
 
     original = tensor.dtype
@@ -50,7 +51,7 @@ def quantize_dequantize(
 
 
 def relative_error(approximate: torch.Tensor, exact: torch.Tensor) -> float:
-    """Frobenius 상대 오차. 0 텐서에서도 정의됩니다."""
+    """Return Frobenius relative error, defined even for an all-zero tensor."""
 
     denominator = exact.float().norm()
     if denominator == 0:
@@ -64,11 +65,11 @@ def gemm_error(
     *,
     block: int | None = DEFAULT_BLOCK,
 ) -> float:
-    """``activations @ weights.T`` 을 FP8 로 했을 때의 출력 상대 오차.
+    """Measure output error when ``activations @ weights.T`` uses FP8.
 
-    개별 텐서의 양자화 오차가 아니라 **출력** 오차를 봅니다. 실제로 학습에
-    영향을 주는 것은 이쪽이고, 축소 차원을 따라 오차가 일부 상쇄되므로 두
-    수치는 같지 않습니다.
+    This measures **output** error, not the quantization error of an individual
+    tensor. Output error affects training directly, and some errors cancel along
+    the reduction dimension, so the two measurements differ.
     """
 
     exact = activations.float() @ weights.float().T
@@ -111,14 +112,15 @@ def test_per_tensor_scaling_is_available_for_comparison() -> None:
     assert scale_for(tensor, block=None).ndim == 0
 
 
-# ── 측정한 사실을 고정한다 ──────────────────────────────────────────────
+# ── Pin measured behavior ───────────────────────────────────────────────
 
 
 def test_fp8_gemm_error_is_an_order_of_magnitude_worse_than_bf16() -> None:
-    """FP8 은 bf16 과 "거의 같다"가 아니다.
+    """FP8 is not "almost the same" as BF16.
 
-    실측 (M=2048, K=768, N=2048, 정규분포): FP8 block128 3.64% 대 bf16 0.23%.
-    이 배율을 잊으면 정확도 하락을 다른 원인에서 찾게 됩니다.
+    Measured with normal inputs at M=2048, K=768, N=2048: FP8 block-128 error
+    was 3.64%, versus 0.23% for BF16. Losing this ratio can send an accuracy
+    investigation toward the wrong cause.
     """
     torch.manual_seed(0)
     activations = torch.randn(512, 768)
@@ -137,9 +139,10 @@ def test_fp8_gemm_error_is_an_order_of_magnitude_worse_than_bf16() -> None:
 
 
 def test_block_scaling_earns_its_cost_only_when_there_are_outliers() -> None:
-    """블록 스케일링은 이상치 대책이지 일반적인 정확도 개선이 아니다.
+    """Block scaling addresses outliers; it is not a general accuracy improvement.
 
-    실측: 정규분포 3.74%→3.64% (거의 없음), 이상치 3.75%→3.19%.
+    Measured error changed from 3.74% to 3.64% on normal inputs, but from 3.75%
+    to 3.19% with outliers.
     """
     torch.manual_seed(0)
     weights = torch.randn(1024, 768) * 0.02
@@ -157,7 +160,7 @@ def test_block_scaling_earns_its_cost_only_when_there_are_outliers() -> None:
 
 
 def test_e5m2_trades_precision_for_range() -> None:
-    """기울기에 E5M2 를 쓰는 이유는 정밀도가 아니라 동적 범위다."""
+    """E5M2 is used for gradients because of dynamic range, not precision."""
     torch.manual_seed(0)
     tensor = torch.randn(256, 768)
 
@@ -169,10 +172,11 @@ def test_e5m2_trades_precision_for_range() -> None:
 
 
 def test_the_vocabulary_projection_changes_the_predicted_token(monkeypatch) -> None:
-    """이 저장소에서 FP8 을 어휘 projection 에 쓰면 안 되는 이유.
+    """Demonstrate why this project must not use FP8 for vocabulary projection.
 
-    48,000 어휘에서 hidden 과 가중치를 모두 E4M3 로 내리면 argmax 가 실측
-    6.45% 바뀝니다. greedy 디코딩에서 그것은 그대로 다른 단어입니다.
+    Quantizing hidden states and weights to E4M3 changed measured argmax results
+    by 6.45% with a 48,000-piece vocabulary. In greedy decoding, every changed
+    argmax is a different output token.
     """
     torch.manual_seed(0)
     hidden = torch.randn(256, 768)
@@ -187,7 +191,7 @@ def test_the_vocabulary_projection_changes_the_predicted_token(monkeypatch) -> N
     assert mismatch > 0.01, "이 경고가 무의미해졌다면 측정을 다시 하십시오"
 
 
-# ── 정책 ────────────────────────────────────────────────────────────────
+# ── Policy ──────────────────────────────────────────────────────────────
 
 
 def test_the_policy_is_off_by_default() -> None:
@@ -229,10 +233,10 @@ def test_the_protected_tensors_are_never_quantized(name: str) -> None:
 
 
 def test_the_tied_embedding_is_protected_because_it_is_also_the_output_head() -> None:
-    """``tie_embeddings=True`` 면 출력 projection 이 곧 임베딩 행렬이다.
+    """With ``tie_embeddings=True``, output projection is the embedding matrix.
 
-    가중치를 FP8 로 저장하면 출력만이 아니라 입력 임베딩 조회까지 같이
-    망가집니다.
+    Storing this weight in FP8 damages both output projection and input embedding
+    lookup.
     """
     assert not Fp8Policy(enabled=True, scope=SCOPE_ALL).allows("token_embedding.weight")
     assert (
@@ -240,7 +244,7 @@ def test_the_tied_embedding_is_protected_because_it_is_also_the_output_head() ->
             "token_embedding.weight"
         )
         is False
-    )  # QUANTIZABLE_PROJECTIONS 에 없으므로 그래도 대상이 아니다
+    )  # It remains excluded because it is not in QUANTIZABLE_PROJECTIONS.
 
 
 def test_the_policy_rejects_a_non_power_of_two_block() -> None:
@@ -252,22 +256,22 @@ def test_the_policy_rejects_a_non_power_of_two_block() -> None:
 
 
 def test_hardware_support_is_reported_separately_from_dtype_availability() -> None:
-    """dtype 이 있는 것과 커널이 있는 것은 다르다.
+    """Dtype availability and kernel availability are separate capabilities.
 
-    CPU 에서도 FP8 캐스팅은 됩니다. ``_scaled_mm`` 은 안 됩니다.
+    A CPU can cast to FP8 but cannot run ``_scaled_mm``.
     """
     assert torch.zeros(1).to(FORWARD_DTYPE).dtype is FORWARD_DTYPE
     assert not fp8_gemm_supported(torch.device("cpu"))
 
 
-# ── 범위(scope): 측정에서 나온 기본값 ────────────────────────────────────
+# ── Scope: defaults derived from measurements ──────────────────────────
 
 
 def test_the_default_scope_is_ffn_only() -> None:
-    """실측: FFN 만 내리면 logits 오차 6.39%, 전 층이면 13.11%.
+    """Measured logit error is 6.39% for FFN-only and 13.11% for all layers.
 
-    attention projection 은 softmax 를 거치며 오차가 증폭되고, FFN 의 오차는
-    잔차에 더해질 뿐입니다.
+    Attention-projection error is amplified through softmax, while FFN error is
+    only added to the residual stream.
     """
     policy = Fp8Policy(enabled=True)
     assert policy.scope == SCOPE_FFN
@@ -291,10 +295,11 @@ def test_an_unknown_scope_is_rejected() -> None:
 
 
 def test_weight_only_quantization_beats_quantizing_both_operands() -> None:
-    """가중치만 양자화하면 두 operand 를 양자화할 때보다 오차가 작다.
+    """Weight-only quantization has less error than quantizing both operands.
 
-    실측: 가중치만 2.57%, 양쪽 다 3.63%. 그리고 가중치만 내리면 활성값
-    이상치에 영향받지 않습니다. 이 검사는 실행 성능 이득을 주장하지 않습니다.
+    Measured error was 2.57% for weights only and 3.63% for both operands.
+    Weight-only quantization is also unaffected by activation outliers. This test
+    makes no claim about runtime speed.
     """
     torch.manual_seed(0)
     activations = torch.randn(256, 768)
@@ -313,10 +318,11 @@ def test_weight_only_quantization_beats_quantizing_both_operands() -> None:
 
 
 def test_quantization_error_compounds_with_depth() -> None:
-    """단일 GEMM 오차로 모델 전체를 판단하면 안 된다.
+    """A single GEMM error does not characterize a complete model.
 
-    실측: GEMM 1회 2.57% → encoder 16층 11.7% → 최종 logits 13.1%.
-    독립적인 양자화 잡음이 잔차 스트림에 쌓입니다.
+    Measured error grew from 2.57% for one GEMM to 11.7% after 16 encoder layers
+    and 13.1% at final logits. Independent quantization noise accumulates in the
+    residual stream.
     """
     import copy
 
@@ -349,8 +355,8 @@ def test_quantization_error_compounds_with_depth() -> None:
     with torch.no_grad():
         deep = relative_error(quantized.encode(ids, mask), reference.encode(ids, mask))
 
-    # 같은 기준으로 비교한다: 모델 경로는 가중치만 양자화하므로, 기준도
-    # 개별 가중치 텐서 하나의 양자화 오차여야 한다.
+    # Use a comparable baseline: the model path quantizes only weights, so compare
+    # it with the quantization error of one individual weight tensor.
     with torch.no_grad():
         per_tensor = [
             relative_error(quantize_dequantize(parameter), parameter)
