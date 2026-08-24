@@ -3620,7 +3620,8 @@ def _select_translation_resume_candidate(
     if not bindings:
         raise FileNotFoundError(f"{stage} checkpoint has no discoverable generation: {candidate}")
     last_error: BaseException | None = None
-    for binding in bindings:
+    rejected_generations: list[str] = []
+    for generation_index, binding in enumerate(bindings, start=1):
         attempt_scope = ExitStack()
         try:
             source = _coordinated_resume_preflight(
@@ -3665,9 +3666,21 @@ def _select_translation_resume_candidate(
                 )
         except BaseException as error:
             last_error = error
+            rejected_generations.append(
+                f"generation {generation_index} "
+                f"({binding.artifact_sha256[:12]}...): "
+                f"{_bounded_status_text(error, max_bytes=512)}"
+            )
             attempt_scope.close()
             continue
         lease_scope.enter_context(attempt_scope.pop_all())
+        if rejected_generations:
+            announce(
+                f"[warning] {stage}: rejected a newer checkpoint before selecting "
+                f"authenticated generation {generation_index} at {source}. "
+                f"Rejected candidate details: {'; '.join(rejected_generations)}",
+                context,
+            )
         return source, candidate_pipeline_identity
     failure = RuntimeError(
         f"no authenticated, compatible, structurally loadable {stage} generation matched "

@@ -1137,6 +1137,7 @@ def test_resume_candidate_selection_closes_rejected_generation_and_keeps_previou
 ) -> None:
     active: set[str] = set()
     closed: list[str] = []
+    announcements: list[str] = []
     bindings = (
         SimpleNamespace(artifact_sha256="a" * 64),
         SimpleNamespace(artifact_sha256="b" * 64),
@@ -1203,6 +1204,11 @@ def test_resume_candidate_selection_closes_rejected_generation_and_keeps_previou
         "_coordinated_checkpoint_load_structure",
         structure_preflight,
     )
+    monkeypatch.setattr(
+        train_module,
+        "announce",
+        lambda message, _context: announcements.append(message),
+    )
     config = AppConfig()
     plan = SimpleNamespace(enabled=True)
     context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
@@ -1224,6 +1230,13 @@ def test_resume_candidate_selection_closes_rejected_generation_and_keeps_previou
         assert pipeline == {"candidate": "previous"}
         assert active == {"previous"}
         assert closed == ["current"]
+        assert len(announcements) == 1
+        assert announcements[0].startswith(
+            "[warning] SFT: rejected a newer checkpoint before selecting authenticated "
+            "generation 2 at previous."
+        )
+        assert f"generation 1 ({'a' * 12}...)" in announcements[0]
+        assert f"current {rejected_phase} mismatch" in announcements[0]
     assert not active
     assert closed == ["current", "previous"]
 
