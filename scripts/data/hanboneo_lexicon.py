@@ -222,11 +222,12 @@ NOUNS: tuple[Noun, ...] = (
     Noun("테", "手", "손", BODY),
     Noun("메", "目", "눈", BODY),
     Noun("코코로", "心", "심장", BODY),
-    # --- 2차 확장 -------------------------------------------------------
-    # 어휘가 생성량의 상한입니다. 40,000행을 요청했을 때 6,719행에서 멈췄고,
-    # 중복 16,787건이 버려졌으며, 쓰인 항목이 234개뿐이라 상위 항목은 전부
-    # per-item 상한 200 에 걸려 있었습니다. 프레임 수가 아니라 조합할 것이
-    # 모자란 것이므로 어휘를 늘립니다.
+    # --- Second expansion ------------------------------------------------
+    # Vocabulary size limits the number of distinct generated rows. A request for
+    # 40,000 rows stopped at 6,719 after rejecting 16,787 duplicates. Only 234
+    # items were used, and every frequent item hit the per-item cap of 200. More
+    # sentence frames cannot solve that shortage, so this section expands the
+    # vocabulary available for combinations.
     Noun("오토코노코", "男の子", "남자아이", PERSON),
     Noun("온나노코", "女の子", "여자아이", PERSON),
     Noun("세이토", "生徒", "학생", PERSON),
