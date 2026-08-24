@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 import re
+import unicodedata
 
 from sion_translate.language_tags import parse_language_tag
 
@@ -69,9 +70,9 @@ LANGUAGE_SCRIPTS: dict[str, tuple[str, ...]] = {
     "hi": ("devanagari",),
     "th": ("thai",),
     "he": ("hebrew",),
-    # 한본어: a code-mixed variety, so both writing systems are expected.
+    # Hanboneo is a code-mixed variety, so both writing systems are expected.
     "kj": ("hangul", "kana", "han"),
-    # Regional varieties. Same writing system as the standard language, so the
+    # Regional varieties use the same writing systems as their standard forms.
     # script checks are identical; they exist as separate tags only so that
     # ``data.source_only_languages`` can stop the model learning to *produce*
     # dialect from a standard prompt. The region is row metadata, not a tag.
@@ -114,10 +115,70 @@ CHARACTER_TOKENIZATION_SCRIPTS: frozenset[str] = SPACELESS_SCRIPTS | {"hangul"}
 SUBSTRING_MATCH_SCRIPTS: frozenset[str] = SPACELESS_SCRIPTS | {"hangul"}
 
 _WHITESPACE_RUN = re.compile(r"\s+")
+_SCRIPT_POLICY_NAME = re.compile(r"^[a-z][a-z0-9_-]{1,31}$")
+_UNSAFE_GENERIC_SCRIPT_NAMES = frozenset(
+    {
+        "alpha",
+        "character",
+        "digit",
+        "letter",
+        "mark",
+        "number",
+        "sign",
+        "small",
+        "capital",
+        "symbol",
+    }
+)
 
 
 def known_scripts() -> tuple[str, ...]:
     return tuple(sorted(SCRIPT_RANGES))
+
+
+def canonicalize_script_policy_name(value: object) -> str:
+    """Return a safe script-policy name, including an open Unicode-name script.
+
+    Built-in names use fast range checks. Other names, such as ``bengali`` or
+    ``georgian``, match the script word in Unicode character names. Rejecting
+    generic Unicode words prevents a rule such as ``letter`` from matching
+    unrelated writing systems.
+    """
+
+    if not isinstance(value, str) or value != value.strip():
+        raise ValueError("script policy names must be non-empty strings without outer spaces")
+    normalized = value.casefold().replace("-", "_")
+    if _SCRIPT_POLICY_NAME.fullmatch(normalized) is None:
+        raise ValueError(
+            "script policy names must contain 2-32 lowercase ASCII letters, digits, or underscores"
+        )
+    words = frozenset(normalized.split("_"))
+    if words & _UNSAFE_GENERIC_SCRIPT_NAMES:
+        raise ValueError(f"script policy name is too generic to be safe: {value!r}")
+    return normalized
+
+
+def script_letter_count(text: str, script: str) -> int:
+    """Count actual letters in one built-in or Unicode-name writing system.
+
+    Modifier letters and punctuation do not satisfy a minimum. This excludes
+    Japanese prolonged-sound marks and Arabic punctuation while retaining
+    syllabic letters, ideographs, and ordinary alphabetic letters.
+    """
+
+    normalized = canonicalize_script_policy_name(script)
+    name_words = tuple(word.upper() for word in normalized.split("_") if word)
+    total = 0
+    for character in text:
+        if unicodedata.category(character) not in {"Lu", "Ll", "Lt", "Lo"}:
+            continue
+        if normalized in SCRIPT_RANGES and script_of(character) == normalized:
+            total += 1
+            continue
+        unicode_name = unicodedata.name(character, "")
+        if name_words and all(word in unicode_name for word in name_words):
+            total += 1
+    return total
 
 
 def known_languages() -> tuple[str, ...]:
@@ -312,6 +373,7 @@ __all__ = [
     "SCRIPT_SUBTAG_SCRIPTS",
     "SPACELESS_SCRIPTS",
     "SUBSTRING_MATCH_SCRIPTS",
+    "canonicalize_script_policy_name",
     "collapse_spurious_spaces",
     "foreign_scripts",
     "has_foreign_script",
@@ -322,6 +384,7 @@ __all__ = [
     "primary_language",
     "resolve_scripts",
     "script_of",
+    "script_letter_count",
     "scripts_for_language",
     "scripts_in",
     "spurious_space_count",

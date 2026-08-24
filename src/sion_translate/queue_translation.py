@@ -26,7 +26,7 @@ import json
 import math
 import os
 from pathlib import Path
-import shutil
+import sqlite3
 import stat
 import tempfile
 from typing import Any, BinaryIO, Protocol, cast
@@ -40,7 +40,12 @@ from sion_translate.data.quality import (
 )
 from sion_translate.evaluation import multiset_f1, numeric_tokens
 from sion_translate.language_tags import canonicalize_language_pair, canonicalize_language_tag
-from sion_translate.scripts_registry import known_scripts, script_of
+from sion_translate.scripts_registry import (
+    canonicalize_script_policy_name,
+    script_letter_count,
+    script_of,
+    scripts_for_language,
+)
 from sion_translate.structured import structured_similarity
 
 
@@ -51,13 +56,23 @@ ACCEPTED_SHARD_PREFIX = "queue_bt_"
 LEGACY_ACCEPTED_SHARD_PREFIX = "bt_"
 PRIVATE_ACCEPTED_DIRNAME = ".queue-runs"
 SOURCE_SNAPSHOT_FILENAME = ".queue-source.snapshot.jsonl"
-PIPELINE_VERSION = 2
+SOURCE_INDEX_FILENAME = ".queue-source.index.sqlite3"
+LEGACY_PUBLIC_MARKER = "verified-legacy-public-parts-v1"
+PIPELINE_VERSION = 3
 SIGNATURE_VERSION = 2
 RUN_LOCK_FILENAME = ".queue-translation.lock"
 ACCEPTED_LOCK_FILENAME = RUN_LOCK_FILENAME
 _PROVENANCE_PLACEHOLDERS = frozenset({"n/a", "na", "none", "tbd", "unknown", "unset"})
 _CONTENT_IDENTITY_FIELDS = ("path", "size", "sha256")
 _RUNTIME_IDENTITY_FIELDS = (*_CONTENT_IDENTITY_FIELDS, "device", "inode", "mtime_ns")
+_ARTIFACT_RUNTIME_FIELDS = (
+    "device",
+    "inode",
+    "mtime_ns",
+    "nlink",
+    "mode",
+    "file_attributes",
+)
 _LOCAL_INTEGRITY_DESCRIPTOR = {
     "algorithm": "sha256",
     "scope": "configuration_only",
@@ -68,6 +83,10 @@ _CHRF = CHRF(word_order=0)
 
 class RetryableQueueTranslationError(RuntimeError):
     """Abort only the current uncommitted shard after a transient runtime fault."""
+
+
+class PermanentQueueRowError(ValueError):
+    """Identify an input-specific translation failure that is safe to persist."""
 
 
 def _manifest_run_id(manifest: Mapping[str, Any]) -> str:
@@ -84,6 +103,56 @@ def _manifest_run_id(manifest: Mapping[str, Any]) -> str:
     return value
 
 
+def _exact_non_negative_integer(value: object, *, field: str) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{field} must be a non-negative integer")
+    return value
+
+
+def _validate_artifact_shape(value: object, *, field: str) -> None:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{field} must be an artifact object")
+    path = value.get("path")
+    if not isinstance(path, str) or not path:
+        raise ValueError(f"{field}.path must be a non-empty string")
+    _exact_non_negative_integer(value.get("size"), field=f"{field}.size")
+    _exact_non_negative_integer(value.get("rows"), field=f"{field}.rows")
+    digest = value.get("sha256")
+    if (
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or digest != digest.lower()
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        raise ValueError(f"{field}.sha256 must be a lowercase SHA-256")
+    recorded_runtime_fields = [name for name in _ARTIFACT_RUNTIME_FIELDS if name in value]
+    if recorded_runtime_fields and len(recorded_runtime_fields) != len(_ARTIFACT_RUNTIME_FIELDS):
+        raise ValueError(f"{field} must record every runtime identity field or none")
+    for name in recorded_runtime_fields:
+        _exact_non_negative_integer(value.get(name), field=f"{field}.{name}")
+
+
+def _expected_teacher_review_required(manifest: Mapping[str, Any]) -> bool:
+    review = manifest.get("teacher_review")
+    if not isinstance(review, Mapping):
+        return False
+    stats = manifest.get("stats")
+    progress = manifest.get("progress")
+    if not isinstance(stats, Mapping) or not isinstance(progress, Mapping):
+        return False
+    generated = stats.get("generated")
+    if type(generated) is not int:
+        accepted = stats.get("accepted")
+        rejected = stats.get("rejected")
+        if type(accepted) is not int or type(rejected) is not int:
+            return False
+        generated = accepted + rejected
+    pilot_rows = review.get("pilot_rows")
+    if type(pilot_rows) is not int:
+        return False
+    return generated >= pilot_rows or (progress.get("complete") is True and generated > 0)
+
+
 def _validate_manifest_control_state(manifest: Mapping[str, Any]) -> None:
     """Validate mutable control fields before any resume or approval decision."""
 
@@ -91,9 +160,10 @@ def _validate_manifest_control_state(manifest: Mapping[str, Any]) -> None:
     if not isinstance(progress, Mapping):
         raise ValueError("queue manifest progress must be an object")
     for field in ("completed_rows", "source_byte_offset", "next_part"):
-        value = progress.get(field)
-        if type(value) is not int or value < 0:
-            raise ValueError(f"queue manifest progress.{field} must be a non-negative integer")
+        _exact_non_negative_integer(
+            progress.get(field),
+            field=f"queue manifest progress.{field}",
+        )
     if type(progress.get("complete")) is not bool:
         raise ValueError("queue manifest progress.complete must be a boolean")
 
@@ -103,9 +173,63 @@ def _validate_manifest_control_state(manifest: Mapping[str, Any]) -> None:
     required_stats = ("processed", "accepted", "rejected", "errors", "skipped_existing")
     stat_fields = required_stats + (("generated",) if "generated" in stats else ())
     for field in stat_fields:
-        value = stats.get(field)
-        if type(value) is not int or value < 0:
-            raise ValueError(f"queue manifest stats.{field} must be a non-negative integer")
+        _exact_non_negative_integer(
+            stats.get(field),
+            field=f"queue manifest stats.{field}",
+        )
+
+    parts = manifest.get("parts")
+    if parts is not None:
+        if not isinstance(parts, list):
+            raise ValueError("queue manifest parts must be a list")
+        for index, part in enumerate(parts):
+            if not isinstance(part, Mapping):
+                raise ValueError(f"queue manifest parts[{index}] must be an object")
+            for field in ("part", "source_start_index", "source_rows"):
+                _exact_non_negative_integer(
+                    part.get(field),
+                    field=f"queue manifest parts[{index}].{field}",
+                )
+            if "source_end_byte_offset" in part:
+                _exact_non_negative_integer(
+                    part.get("source_end_byte_offset"),
+                    field=f"queue manifest parts[{index}].source_end_byte_offset",
+                )
+            if "generated_rows" in part:
+                _exact_non_negative_integer(
+                    part.get("generated_rows"),
+                    field=f"queue manifest parts[{index}].generated_rows",
+                )
+            if type(part.get("published")) is not bool:
+                raise ValueError(f"queue manifest parts[{index}].published must be a boolean")
+            _validate_artifact_shape(
+                part.get("result"), field=f"queue manifest parts[{index}].result"
+            )
+            _validate_artifact_shape(
+                part.get("accepted"),
+                field=f"queue manifest parts[{index}].accepted",
+            )
+            training = part.get("training")
+            if training is not None:
+                _validate_artifact_shape(
+                    training,
+                    field=f"queue manifest parts[{index}].training",
+                )
+            status_counts = part.get("status_counts")
+            if status_counts is not None:
+                if not isinstance(status_counts, Mapping):
+                    raise ValueError(
+                        f"queue manifest parts[{index}].status_counts must be an object"
+                    )
+                for status in ("accepted", "rejected", "error", "skipped_existing"):
+                    _exact_non_negative_integer(
+                        status_counts.get(status),
+                        field=f"queue manifest parts[{index}].status_counts.{status}",
+                    )
+
+    training_set = manifest.get("training_set")
+    if training_set is not None:
+        _validate_artifact_shape(training_set, field="queue manifest training_set")
 
     review = manifest.get("teacher_review")
     if review is None:
@@ -118,6 +242,11 @@ def _validate_manifest_control_state(manifest: Mapping[str, Any]) -> None:
     for field in ("review_required", "approved"):
         if type(review.get(field)) is not bool:
             raise ValueError(f"queue manifest teacher_review.{field} must be a boolean")
+    expected_required = _expected_teacher_review_required(manifest)
+    if review.get("review_required") is not expected_required:
+        raise ValueError(
+            "queue manifest teacher_review.review_required contradicts the verified pilot progress"
+        )
     approved_at = review.get("approved_at")
     approved_by = review.get("approved_by")
     if review["approved"] is True:
@@ -231,22 +360,37 @@ class QueueTranslationOptions:
     min_structured_similarity: float = 1.0
 
     def validate(self) -> None:
-        if self.batch_size <= 0:
-            raise ValueError("batch_size must be positive")
-        if self.shard_size <= 0:
-            raise ValueError("shard_size must be positive")
-        if self.num_beams <= 0 or self.roundtrip_num_beams <= 0:
-            raise ValueError("beam counts must be positive")
-        if self.max_new_tokens <= 0 or self.roundtrip_max_new_tokens <= 0:
-            raise ValueError("generation limits must be positive")
+        for field, value in (
+            ("batch_size", self.batch_size),
+            ("shard_size", self.shard_size),
+            ("num_beams", self.num_beams),
+            ("roundtrip_num_beams", self.roundtrip_num_beams),
+            ("max_new_tokens", self.max_new_tokens),
+            ("roundtrip_max_new_tokens", self.roundtrip_max_new_tokens),
+        ):
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{field} must be a positive integer")
+        for field, value in (
+            ("max_output_length_margin", self.max_output_length_margin),
+            ("roundtrip_max_output_length_margin", self.roundtrip_max_output_length_margin),
+        ):
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{field} must be a non-negative integer")
+        for field, value in (
+            ("max_output_length_ratio", self.max_output_length_ratio),
+            ("roundtrip_max_output_length_ratio", self.roundtrip_max_output_length_ratio),
+            ("min_roundtrip_score", self.min_roundtrip_score),
+            ("min_target_language_fraction", self.min_target_language_fraction),
+            ("min_structured_similarity", self.min_structured_similarity),
+        ):
+            if isinstance(value, bool) or not math.isfinite(value):
+                raise ValueError(f"{field} must be a finite number")
         if self.max_output_length_ratio <= 0 or self.roundtrip_max_output_length_ratio <= 0:
             raise ValueError("output length ratios must be positive")
-        if self.max_output_length_margin < 0 or self.roundtrip_max_output_length_margin < 0:
-            raise ValueError("output length margins must be non-negative")
         if not 0.0 <= self.min_roundtrip_score <= 1.0:
             raise ValueError("min_roundtrip_score must be in [0, 1]")
-        if not 0 <= self.min_pair_score <= 100:
-            raise ValueError("min_pair_score must be in [0, 100]")
+        if type(self.min_pair_score) is not int or not 0 <= self.min_pair_score <= 100:
+            raise ValueError("min_pair_score must be an integer in [0, 100]")
         if not 0.0 <= self.min_target_language_fraction <= 1.0:
             raise ValueError("min_target_language_fraction must be in [0, 1]")
         seen_script_requirements: set[tuple[str, str]] = set()
@@ -265,15 +409,15 @@ class QueueTranslationOptions:
                 raw_language,
                 field=f"required_target_scripts[{index}].language",
             )
-            if not isinstance(raw_script, str) or raw_script not in known_scripts():
-                raise ValueError(
-                    f"required_target_scripts[{index}].script must be one of {known_scripts()}"
-                )
+            try:
+                script = canonicalize_script_policy_name(raw_script)
+            except ValueError as exc:
+                raise ValueError(f"required_target_scripts[{index}].script is invalid") from exc
             if type(minimum) is not int or minimum <= 0:
                 raise ValueError(
                     f"required_target_scripts[{index}].minimum must be a positive integer"
                 )
-            key = (language, raw_script)
+            key = (language, script)
             if key in seen_script_requirements:
                 raise ValueError(
                     "required_target_scripts contains a duplicate canonical language/script rule"
@@ -290,7 +434,7 @@ class QueueTranslationOptions:
             field="target_language",
         )
         return {
-            script: minimum
+            canonicalize_script_policy_name(script): minimum
             for language, script, minimum in self.required_target_scripts
             if canonicalize_language_tag(language, field="required_target_scripts.language")
             == canonical_target
@@ -303,6 +447,57 @@ def sha256_file(path: str | Path, *, block_size: int = 8 * 1024 * 1024) -> str:
         while block := handle.read(block_size):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _stable_file_artifact(path: Path, *, label: str) -> dict[str, Any]:
+    """Hash one plain file and reject path or inode changes during the read."""
+
+    _assert_plain_file(path, label=label)
+    before = os.lstat(path)
+    digest = hashlib.sha256()
+    size = 0
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened_before = os.fstat(descriptor)
+        while block := os.read(descriptor, 8 * 1024 * 1024):
+            digest.update(block)
+            size += len(block)
+        opened_after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    after = os.lstat(path)
+    identities = (
+        (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_nlink),
+        (
+            opened_before.st_dev,
+            opened_before.st_ino,
+            opened_before.st_size,
+            opened_before.st_mtime_ns,
+            opened_before.st_nlink,
+        ),
+        (
+            opened_after.st_dev,
+            opened_after.st_ino,
+            opened_after.st_size,
+            opened_after.st_mtime_ns,
+            opened_after.st_nlink,
+        ),
+        (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_nlink),
+    )
+    if len(set(identities)) != 1 or size != after.st_size:
+        raise RuntimeError(f"{label} changed while its content identity was captured: {path}")
+    return {
+        "path": str(path.resolve(strict=True)),
+        "size": size,
+        "sha256": digest.hexdigest(),
+        "device": after.st_dev,
+        "inode": after.st_ino,
+        "mtime_ns": after.st_mtime_ns,
+        "nlink": after.st_nlink,
+        "mode": stat.S_IMODE(after.st_mode),
+        "file_attributes": getattr(after, "st_file_attributes", 0),
+    }
 
 
 def _stable_digest(value: Mapping[str, Any]) -> str:
@@ -332,6 +527,52 @@ def _signature_configuration(configuration: Mapping[str, Any]) -> dict[str, Any]
             key: source_snapshot.get(key) for key in ("path", "size", "sha256")
         }
     return stable
+
+
+def _validate_run_signature_binding(manifest: Mapping[str, Any]) -> None:
+    """Bind current run IDs to the signed configuration and preserve audited legacy IDs."""
+
+    run_id = _manifest_run_id(manifest)
+    signature = manifest.get("run_signature")
+    if (
+        not isinstance(signature, str)
+        or len(signature) != 64
+        or signature != signature.lower()
+        or any(character not in "0123456789abcdef" for character in signature)
+    ):
+        raise ValueError("queue manifest run_signature must be a lowercase SHA-256")
+    configuration = manifest.get("configuration")
+    if not isinstance(configuration, Mapping):
+        raise ValueError("queue manifest has no valid configuration")
+    prefix = configuration.get("accepted_shard_prefix")
+    if prefix == ACCEPTED_SHARD_PREFIX:
+        if configuration.get("pipeline_version") != PIPELINE_VERSION:
+            raise ValueError("current queue prefix requires the current pipeline version")
+        if run_id != signature[:16]:
+            raise ValueError("current queue manifest run_id does not match run_signature")
+        if configuration.get("legacy_public_marker") is not None:
+            raise ValueError("current queue manifest cannot carry a legacy public marker")
+        return
+    if prefix == LEGACY_ACCEPTED_SHARD_PREFIX:
+        if configuration.get("legacy_public_marker") != LEGACY_PUBLIC_MARKER:
+            raise ValueError("legacy queue prefix requires an explicit verified migration marker")
+        legacy_signature = configuration.get("legacy_run_signature")
+        legacy_run_id = configuration.get("legacy_run_id")
+        if (
+            not isinstance(legacy_signature, str)
+            or len(legacy_signature) != 64
+            or legacy_signature != legacy_signature.lower()
+            or any(character not in "0123456789abcdef" for character in legacy_signature)
+            or legacy_run_id != legacy_signature[:16]
+            or run_id != legacy_run_id
+        ):
+            raise ValueError("legacy queue run_id is not bound to its original signature")
+        return
+    if prefix is None and _is_exact_legacy_manifest(manifest):
+        if run_id != signature[:16]:
+            raise ValueError("legacy queue manifest run_id does not match run_signature")
+        return
+    raise ValueError("queue manifest accepted_shard_prefix is not an allowed policy value")
 
 
 def _content_identity(value: object, *, field: str) -> dict[str, Any]:
@@ -725,6 +966,7 @@ def load_queue_run_metadata(output_dir: str | Path) -> dict[str, Any] | None:
         _stable_digest(typed_configuration),
     }:
         raise ValueError("queue manifest configuration digest is invalid")
+    _validate_run_signature_binding(manifest)
     run_metadata = typed_configuration.get("run_metadata")
     if not isinstance(run_metadata, Mapping):
         raise ValueError("queue manifest has no valid run_metadata")
@@ -740,10 +982,26 @@ def load_signed_queue_run_metadata(output_dir: str | Path) -> dict[str, Any] | N
 def _is_exact_legacy_manifest(manifest: Mapping[str, Any]) -> bool:
     """Recognize the exact pre-part-ledger manifest shape eligible for migration."""
 
-    if any(field in manifest for field in ("signature_version", "parts", "integrity")):
+    legacy_fields = {
+        "schema",
+        "run_id",
+        "run_signature",
+        "created_at",
+        "updated_at",
+        "configuration",
+        "progress",
+        "stats",
+        "teacher_review",
+    }
+    if set(manifest) != legacy_fields:
         return False
     configuration = manifest.get("configuration")
-    if not isinstance(configuration, Mapping) or "accepted_shard_prefix" in configuration:
+    if (
+        not isinstance(configuration, Mapping)
+        or set(configuration)
+        != {"pipeline_version", "source", "options", "run_metadata", "accepted_dir"}
+        or configuration.get("pipeline_version") != 1
+    ):
         return False
     recorded_signature = manifest.get("run_signature")
     if not isinstance(recorded_signature, str):
@@ -774,6 +1032,66 @@ def _secure_temporary_path(path: Path) -> tuple[int, Path]:
     return descriptor, Path(name)
 
 
+def _fsync_directory(directory: Path) -> None:
+    """Persist directory-entry changes on POSIX and Windows."""
+
+    resolved = directory.resolve(strict=True)
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # pyright: ignore[reportAttributeAccessIssue]
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        create_file.restype = wintypes.HANDLE
+        handle = create_file(
+            str(resolved),
+            0x40000000,  # GENERIC_WRITE is required to flush a directory handle.
+            0x00000007,  # Share reads, writes, and deletes with cooperating workers.
+            None,
+            3,  # OPEN_EXISTING
+            0x02000000,  # FILE_FLAG_BACKUP_SEMANTICS permits directory handles.
+            None,
+        )
+        invalid_handle = wintypes.HANDLE(-1).value
+        if handle == invalid_handle:
+            raise OSError(ctypes.get_last_error(), f"cannot open directory for flush: {resolved}")
+        try:
+            if not kernel32.FlushFileBuffers(handle):
+                raise OSError(
+                    ctypes.get_last_error(),
+                    f"cannot flush queue directory: {resolved}",
+                )
+        finally:
+            kernel32.CloseHandle(handle)
+        return
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(resolved, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _durable_unlink(path: Path, *, missing_ok: bool = False) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        if missing_ok:
+            return
+        raise
+    _fsync_directory(path.parent)
+
+
 def _write_atomic_text(
     path: Path,
     writer: Callable[[Any], None],
@@ -788,10 +1106,11 @@ def _write_atomic_text(
             os.fsync(handle.fileno())
         _assert_plain_file(temporary, label="atomic queue temporary file")
         os.replace(temporary, path)
+        _fsync_directory(path.parent)
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-        temporary.unlink(missing_ok=True)
+        _durable_unlink(temporary, missing_ok=True)
 
 
 def _atomic_write_json(path: Path, value: Mapping[str, Any]) -> None:
@@ -822,12 +1141,13 @@ def _cleanup_orphaned_initialization_temps(output_dir: Path) -> None:
 
     patterns = (
         f".{SOURCE_SNAPSHOT_FILENAME}.*.tmp",
+        f".{SOURCE_INDEX_FILENAME}.*.tmp*",
         ".manifest.json.*.tmp",
     )
     for pattern in patterns:
         for path in output_dir.glob(pattern):
             if path.is_file():
-                path.unlink()
+                _durable_unlink(path)
 
 
 def _acquire_file_lock(handle: BinaryIO) -> None:
@@ -910,11 +1230,23 @@ def _manifest_accepted_shard_prefix(manifest: Mapping[str, Any]) -> str:
     raw_prefix = (
         configuration.get("accepted_shard_prefix") if isinstance(configuration, Mapping) else None
     )
-    if raw_prefix is None:
+    if raw_prefix is None and _is_exact_legacy_manifest(manifest):
         return LEGACY_ACCEPTED_SHARD_PREFIX
-    if not isinstance(raw_prefix, str) or not raw_prefix or Path(raw_prefix).name != raw_prefix:
-        raise ValueError("queue manifest accepted_shard_prefix is invalid")
-    return raw_prefix
+    if raw_prefix == ACCEPTED_SHARD_PREFIX:
+        if (
+            not isinstance(configuration, Mapping)
+            or configuration.get("pipeline_version") != PIPELINE_VERSION
+        ):
+            raise ValueError("current accepted shard prefix requires the current pipeline version")
+        return ACCEPTED_SHARD_PREFIX
+    if raw_prefix == LEGACY_ACCEPTED_SHARD_PREFIX:
+        if (
+            not isinstance(configuration, Mapping)
+            or configuration.get("legacy_public_marker") != LEGACY_PUBLIC_MARKER
+        ):
+            raise ValueError("legacy accepted shard prefix lacks a verified migration marker")
+        return LEGACY_ACCEPTED_SHARD_PREFIX
+    raise ValueError("queue manifest accepted_shard_prefix is not allowed")
 
 
 def _accepted_shard_path(
@@ -925,10 +1257,16 @@ def _accepted_shard_path(
     part_index: int,
 ) -> Path:
     prefix = _manifest_accepted_shard_prefix(manifest)
-    if prefix == ACCEPTED_SHARD_PREFIX:
+    configuration = manifest.get("configuration")
+    migrated_legacy = (
+        prefix == LEGACY_ACCEPTED_SHARD_PREFIX
+        and isinstance(configuration, Mapping)
+        and configuration.get("legacy_public_marker") == LEGACY_PUBLIC_MARKER
+    )
+    if prefix == ACCEPTED_SHARD_PREFIX or migrated_legacy:
         # New queue outputs intentionally do not carry a public ``.jsonl``
-        # suffix. Even recursive glob ingestion must follow a published manifest
-        # part rather than treating an unrelated collision as training data.
+        # suffix. Migrated legacy shards are quarantined here as well, so only
+        # a complete consolidated set can enter top-level discovery.
         private_filename = f"part-{part_index:06d}.accepted.jsonl.private"
         run_root = _ensure_private_run_directory(accepted_dir, _manifest_run_id(manifest))
         return run_root / private_filename
@@ -936,21 +1274,54 @@ def _accepted_shard_path(
     return accepted_dir / filename
 
 
-def _training_shard_path(
+def _legacy_public_accepted_path(
     manifest: Mapping[str, Any],
     *,
     accepted_dir: Path,
     input_stem: str,
     part_index: int,
 ) -> Path:
-    """Return the public training path for one current private accepted part."""
+    """Return the old public shard path consumed only by verified migration."""
 
-    if _manifest_accepted_shard_prefix(manifest) != ACCEPTED_SHARD_PREFIX:
-        raise ValueError("legacy queue manifests do not use separate training materialization")
-    filename = (
-        f"{ACCEPTED_SHARD_PREFIX}{input_stem}_{_manifest_run_id(manifest)}_{part_index:06d}.jsonl"
+    return accepted_dir / (
+        f"{LEGACY_ACCEPTED_SHARD_PREFIX}{input_stem}_{_manifest_run_id(manifest)}_"
+        f"{part_index:06d}.jsonl"
     )
-    return accepted_dir / filename
+
+
+def _training_stage_path(
+    manifest: Mapping[str, Any],
+    *,
+    accepted_dir: Path,
+    input_stem: str,
+    part_index: int,
+) -> Path:
+    """Return the private staging path for one policy-verified training part."""
+
+    if _manifest_accepted_shard_prefix(manifest) not in {
+        ACCEPTED_SHARD_PREFIX,
+        LEGACY_ACCEPTED_SHARD_PREFIX,
+    }:
+        raise ValueError("queue manifest has no supported training materialization policy")
+    del input_stem
+    run_root = _ensure_private_run_directory(accepted_dir, _manifest_run_id(manifest))
+    return run_root / f"part-{part_index:06d}.training.jsonl.private"
+
+
+def _training_set_path(
+    manifest: Mapping[str, Any],
+    *,
+    accepted_dir: Path,
+    input_stem: str,
+) -> Path:
+    """Return the single public path exposed only after the complete run is ready."""
+
+    if _manifest_accepted_shard_prefix(manifest) not in {
+        ACCEPTED_SHARD_PREFIX,
+        LEGACY_ACCEPTED_SHARD_PREFIX,
+    }:
+        raise ValueError("queue manifest has no supported consolidated training policy")
+    return accepted_dir / f"{ACCEPTED_SHARD_PREFIX}{input_stem}_{_manifest_run_id(manifest)}.jsonl"
 
 
 def _pending_accepted_path(path: Path) -> Path:
@@ -960,6 +1331,10 @@ def _pending_accepted_path(path: Path) -> Path:
 def _publish_no_replace(pending_path: Path, accepted_path: Path) -> None:
     """Atomically publish without overwriting a target created by another host."""
 
+    pending_before = os.lstat(pending_path)
+    if not stat.S_ISREG(pending_before.st_mode) or pending_before.st_nlink != 1:
+        raise ValueError(f"publication source is not an unaliased plain file: {pending_path}")
+    source_identity = (pending_before.st_dev, pending_before.st_ino)
     try:
         os.link(pending_path, accepted_path)
     except FileExistsError:
@@ -968,7 +1343,41 @@ def _publish_no_replace(pending_path: Path, accepted_path: Path) -> None:
         raise OSError(
             f"filesystem does not support atomic no-clobber publication: {accepted_path}"
         ) from exc
-    pending_path.unlink()
+    try:
+        _fsync_directory(accepted_path.parent)
+        pending_linked = os.lstat(pending_path)
+        accepted_linked = os.lstat(accepted_path)
+        if (
+            not stat.S_ISREG(accepted_linked.st_mode)
+            or (pending_linked.st_dev, pending_linked.st_ino) != source_identity
+            or (accepted_linked.st_dev, accepted_linked.st_ino) != source_identity
+            or pending_linked.st_nlink != 2
+            or accepted_linked.st_nlink != 2
+        ):
+            raise ValueError(f"publication source changed or gained an alias: {pending_path}")
+        if os.name == "nt":
+            # Windows will not unlink a read-only file. Both names still refer
+            # to the verified queue-owned inode, and callers restore the final
+            # read-only mode after their post-publication checks.
+            os.chmod(pending_path, 0o600)
+        _durable_unlink(pending_path)
+        accepted_after = os.lstat(accepted_path)
+        if (
+            not stat.S_ISREG(accepted_after.st_mode)
+            or (accepted_after.st_dev, accepted_after.st_ino) != source_identity
+            or accepted_after.st_nlink != 1
+        ):
+            raise ValueError(f"published file has an unsafe filesystem identity: {accepted_path}")
+    except Exception:
+        try:
+            accepted_metadata = os.lstat(accepted_path)
+            if (accepted_metadata.st_dev, accepted_metadata.st_ino) == source_identity:
+                if os.name == "nt":
+                    os.chmod(accepted_path, 0o600)
+                _durable_unlink(accepted_path)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def _claim_accepted_namespace(
@@ -1021,19 +1430,43 @@ def _claim_accepted_namespace(
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-        temporary.unlink(missing_ok=True)
+        _durable_unlink(temporary, missing_ok=True)
 
 
 def _jsonl_artifact(path: Path) -> dict[str, Any]:
+    _assert_plain_file(path, label="queue JSONL artifact")
+    path_before = os.lstat(path)
     digest = hashlib.sha256()
     rows = 0
     final_byte = b""
-    with path.open("rb") as handle:
-        while block := handle.read(8 * 1024 * 1024):
-            digest.update(block)
-            rows += block.count(b"\n")
-            final_byte = block[-1:]
-    size = path.stat().st_size
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened_before = os.fstat(descriptor)
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            while block := handle.read(8 * 1024 * 1024):
+                digest.update(block)
+                rows += block.count(b"\n")
+                final_byte = block[-1:]
+            opened_after = os.fstat(handle.fileno())
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    path_after = os.lstat(path)
+    identities = {
+        (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            metadata.st_nlink,
+        )
+        for metadata in (path_before, opened_before, opened_after, path_after)
+    }
+    if len(identities) != 1:
+        raise RuntimeError(f"queue JSONL artifact changed while hashing: {path}")
+    size = path_after.st_size
     if size and final_byte != b"\n":
         rows += 1
     return {
@@ -1041,52 +1474,170 @@ def _jsonl_artifact(path: Path) -> dict[str, Any]:
         "size": size,
         "rows": rows,
         "sha256": digest.hexdigest(),
+        "device": path_after.st_dev,
+        "inode": path_after.st_ino,
+        "mtime_ns": path_after.st_mtime_ns,
+        "nlink": path_after.st_nlink,
+        "mode": stat.S_IMODE(path_after.st_mode),
+        "file_attributes": getattr(path_after, "st_file_attributes", 0),
     }
 
 
-def _artifact_content_matches(path: Path, expected: Mapping[str, Any]) -> bool:
-    if not path.is_file():
+def _refresh_artifact_runtime(path: Path, artifact: Mapping[str, Any]) -> dict[str, Any]:
+    """Refresh cheap stat fields after making an already-hashed artifact immutable."""
+
+    _assert_plain_file(path, label="queue artifact runtime refresh")
+    metadata = os.lstat(path)
+    if metadata.st_size != artifact.get("size"):
+        raise RuntimeError(f"queue artifact size changed before runtime identity refresh: {path}")
+    return {
+        **dict(artifact),
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "mtime_ns": metadata.st_mtime_ns,
+        "nlink": metadata.st_nlink,
+        "mode": stat.S_IMODE(metadata.st_mode),
+        "file_attributes": getattr(metadata, "st_file_attributes", 0),
+    }
+
+
+def _artifact_runtime_unchanged(path: Path, artifact: Mapping[str, Any]) -> bool:
+    """Check a persisted inode identity without re-reading a potentially huge shard."""
+
+    if type(artifact.get("size")) is not int or any(
+        type(artifact.get(field)) is not int for field in _ARTIFACT_RUNTIME_FIELDS
+    ):
         return False
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    recorded_mode = artifact["mode"]
+    return (
+        metadata.st_nlink == 1
+        and metadata.st_size == artifact["size"]
+        and recorded_mode & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH) == 0
+        and stat.S_ISREG(metadata.st_mode)
+        and all(
+            artifact[field] == observed
+            for field, observed in (
+                ("device", metadata.st_dev),
+                ("inode", metadata.st_ino),
+                ("mtime_ns", metadata.st_mtime_ns),
+                ("nlink", metadata.st_nlink),
+                ("mode", stat.S_IMODE(metadata.st_mode)),
+                ("file_attributes", getattr(metadata, "st_file_attributes", 0)),
+            )
+        )
+    )
+
+
+def _artifact_content_matches(path: Path, expected: Mapping[str, Any]) -> bool:
+    if not path.exists():
+        return False
+    if _artifact_runtime_unchanged(path, expected):
+        return True
     observed = _jsonl_artifact(path)
     return all(observed[field] == expected.get(field) for field in ("size", "rows", "sha256"))
 
 
-def _jsonl_semantically_equal(left: Path, right: Path) -> bool:
-    """Compare JSONL records while ignoring harmless serialization differences."""
+def _copy_plain_file_no_replace(
+    source: Path,
+    target: Path,
+    *,
+    expected: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Copy stable source bytes and verify the no-clobber final before returning."""
 
-    with (
-        left.open("r", encoding="utf-8") as left_handle,
-        right.open("r", encoding="utf-8") as right_handle,
-    ):
-        while True:
-            left_line = left_handle.readline()
-            right_line = right_handle.readline()
-            if not left_line or not right_line:
-                return left_line == right_line
-            try:
-                if json.loads(left_line) != json.loads(right_line):
-                    return False
-            except json.JSONDecodeError:
-                return False
-
-
-def _copy_plain_file_no_replace(source: Path, target: Path) -> None:
-    """Copy a private artifact into a new public path without following aliases."""
-
+    _validate_artifact_shape(expected, field="expected private training artifact")
     _assert_plain_file(source, label="private accepted training source")
+    source_path_before = os.lstat(source)
+    source_flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    source_descriptor = os.open(source, source_flags)
     descriptor, temporary = _secure_temporary_path(target)
+    published_identity: tuple[int, int] | None = None
     try:
-        with source.open("rb") as source_handle, os.fdopen(descriptor, "wb") as target_handle:
+        source_opened_before = os.fstat(source_descriptor)
+        if not stat.S_ISREG(source_opened_before.st_mode) or source_opened_before.st_nlink != 1:
+            raise ValueError(f"private accepted training source is not an unaliased file: {source}")
+        digest = hashlib.sha256()
+        rows = 0
+        final_byte = b""
+        copied_size = 0
+        with (
+            os.fdopen(source_descriptor, "rb") as source_handle,
+            os.fdopen(descriptor, "wb") as target_handle,
+        ):
+            source_descriptor = -1
             descriptor = -1
-            shutil.copyfileobj(source_handle, target_handle, length=8 * 1024 * 1024)
+            while block := source_handle.read(8 * 1024 * 1024):
+                target_handle.write(block)
+                digest.update(block)
+                copied_size += len(block)
+                rows += block.count(b"\n")
+                final_byte = block[-1:]
+            source_opened_after = os.fstat(source_handle.fileno())
             target_handle.flush()
             os.fsync(target_handle.fileno())
+        source_path_after = os.lstat(source)
+        source_identities = {
+            (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+                metadata.st_nlink,
+            )
+            for metadata in (
+                source_path_before,
+                source_opened_before,
+                source_opened_after,
+                source_path_after,
+            )
+        }
+        if len(source_identities) != 1:
+            raise RuntimeError(f"private accepted training source changed while copying: {source}")
+        if copied_size and final_byte != b"\n":
+            rows += 1
+        copied = {
+            "size": copied_size,
+            "rows": rows,
+            "sha256": digest.hexdigest(),
+        }
+        if any(copied[field] != expected.get(field) for field in copied):
+            raise ValueError("private accepted training source changed before publication")
         _assert_plain_file(temporary, label="training materialization temporary file")
+        temporary_metadata = os.lstat(temporary)
+        published_identity = (temporary_metadata.st_dev, temporary_metadata.st_ino)
         _publish_no_replace(temporary, target)
+        final_metadata = os.lstat(target)
+        if (
+            not stat.S_ISREG(final_metadata.st_mode)
+            or final_metadata.st_nlink != 1
+            or (final_metadata.st_dev, final_metadata.st_ino) != published_identity
+        ):
+            raise ValueError(f"published training file has an unsafe filesystem identity: {target}")
+        observed = _jsonl_artifact(target)
+        if any(observed[field] != expected.get(field) for field in ("size", "rows", "sha256")):
+            raise ValueError(f"published training file differs from its verified source: {target}")
+        os.chmod(target, 0o444)
+        return _refresh_artifact_runtime(target, observed)
+    except Exception:
+        if target.exists() and published_identity is not None:
+            try:
+                target_metadata = os.lstat(target)
+                if (target_metadata.st_dev, target_metadata.st_ino) == published_identity:
+                    os.chmod(target, 0o600)
+                    _durable_unlink(target)
+            except (FileNotFoundError, OSError):
+                pass
+        raise
     finally:
+        if source_descriptor >= 0:
+            os.close(source_descriptor)
         if descriptor >= 0:
             os.close(descriptor)
-        temporary.unlink(missing_ok=True)
+        _durable_unlink(temporary, missing_ok=True)
 
 
 def _teacher_review_allows_training(manifest: Mapping[str, Any]) -> bool:
@@ -1098,25 +1649,39 @@ def _teacher_review_allows_training(manifest: Mapping[str, Any]) -> bool:
     )
 
 
-def _materialize_training_parts(
+def _stage_training_parts(
     manifest: dict[str, Any],
     *,
     accepted_dir: Path,
     input_stem: str,
+    part_indices: Sequence[int] | None = None,
+    verify_content: bool = False,
 ) -> bool:
-    """Expose only validated private parts allowed by the frozen review policy."""
+    """Stage policy-verified parts privately; no incomplete set becomes discoverable."""
 
-    if _manifest_accepted_shard_prefix(manifest) != ACCEPTED_SHARD_PREFIX:
-        return False
+    _manifest_accepted_shard_prefix(manifest)
     parts = manifest.get("parts")
     if not isinstance(parts, list):
         raise ValueError("current queue manifest parts must be a list")
     allowed = _teacher_review_allows_training(manifest)
     changed = False
-    for part_index, part in enumerate(parts):
+    indices = range(len(parts)) if part_indices is None else part_indices
+    public_path = _training_set_path(
+        manifest,
+        accepted_dir=accepted_dir,
+        input_stem=input_stem,
+    )
+    if not allowed and (manifest.get("training_set") is not None or public_path.exists()):
+        raise ValueError(
+            f"unapproved teacher output is present in the public training namespace: {public_path}"
+        )
+    for part_index in indices:
+        if type(part_index) is not int or not 0 <= part_index < len(parts):
+            raise ValueError(f"invalid queue training part index: {part_index!r}")
+        part = parts[part_index]
         if not isinstance(part, dict):
             raise ValueError(f"queue part {part_index:06d} must be an object")
-        training_path = _training_shard_path(
+        training_path = _training_stage_path(
             manifest,
             accepted_dir=accepted_dir,
             input_stem=input_stem,
@@ -1126,7 +1691,7 @@ def _materialize_training_parts(
         if not allowed:
             if recorded_training is not None or training_path.exists():
                 raise ValueError(
-                    "unapproved teacher output is present in the public training namespace: "
+                    "unapproved teacher output is present in the private training stage: "
                     f"{training_path}"
                 )
             continue
@@ -1135,7 +1700,9 @@ def _materialize_training_parts(
         accepted = part.get("accepted")
         if not isinstance(accepted, Mapping):
             raise ValueError(f"queue part {part_index:06d} has no accepted artifact")
-        if accepted.get("rows") == 0 and recorded_training is None and not training_path.exists():
+        if accepted.get("rows") == 0:
+            if recorded_training is not None or training_path.exists():
+                raise ValueError(f"empty accepted part {part_index:06d} has a training stage")
             continue
         private_path = _accepted_shard_path(
             manifest,
@@ -1147,35 +1714,184 @@ def _materialize_training_parts(
         if not _artifact_content_matches(private_path, accepted):
             raise ValueError(f"private accepted part {part_index:06d} failed verification")
         if training_path.exists():
-            _assert_plain_file(training_path, label=f"training part {part_index:06d}")
-            exact_private_copy = _artifact_content_matches(training_path, accepted)
-            recorded_public_copy = (
-                isinstance(recorded_training, Mapping)
-                and _artifact_content_matches(training_path, recorded_training)
-                and _jsonl_semantically_equal(training_path, private_path)
-            )
-            if not exact_private_copy and not recorded_public_copy:
-                raise FileExistsError(
-                    f"public training part collision cannot be overwritten: {training_path}"
-                )
-        else:
-            _copy_plain_file_no_replace(private_path, training_path)
-        training_artifact = _jsonl_artifact(training_path)
-        if recorded_training is not None:
             if not isinstance(recorded_training, Mapping):
-                raise ValueError(f"queue part {part_index:06d} has invalid training metadata")
-            recorded_path = Path(str(recorded_training.get("path", "")))
-            if recorded_path.resolve() != training_path.resolve() or any(
-                recorded_training.get(field) != training_artifact[field]
-                for field in ("size", "rows", "sha256")
-            ):
-                raise ValueError(
-                    f"queue part {part_index:06d} training metadata contradicts its bytes"
+                raise FileExistsError(
+                    f"unowned private training stage cannot be overwritten: {training_path}"
                 )
+            recorded_path = Path(str(recorded_training.get("path", "")))
+            if recorded_path.resolve() != training_path.resolve():
+                raise ValueError(
+                    f"queue part {part_index:06d} training path contradicts its manifest"
+                )
+            if (
+                not verify_content
+                and _artifact_runtime_unchanged(training_path, recorded_training)
+                and all(
+                    recorded_training.get(field) == accepted.get(field)
+                    for field in ("size", "rows", "sha256")
+                )
+            ):
+                continue
+            _assert_plain_file(training_path, label=f"training stage {part_index:06d}")
+            if not _artifact_content_matches(training_path, accepted):
+                raise ValueError(f"private training stage {part_index:06d} failed verification")
+        else:
+            training_artifact = _copy_plain_file_no_replace(
+                private_path,
+                training_path,
+                expected=accepted,
+            )
+            part["training"] = training_artifact
+            changed = True
+            continue
+        training_artifact = _jsonl_artifact(training_path)
+        recorded_path = Path(str(recorded_training.get("path", "")))
+        if recorded_path.resolve() != training_path.resolve() or any(
+            recorded_training.get(field) != training_artifact[field]
+            for field in ("size", "rows", "sha256")
+        ):
+            raise ValueError(f"queue part {part_index:06d} training metadata contradicts its bytes")
         if recorded_training != training_artifact:
             part["training"] = training_artifact
             changed = True
     return changed
+
+
+def _publish_complete_training_set(
+    manifest: dict[str, Any],
+    *,
+    accepted_dir: Path,
+    input_stem: str,
+) -> bool:
+    """Atomically expose one complete accepted set after all private stages exist."""
+
+    _manifest_accepted_shard_prefix(manifest)
+    public_path = _training_set_path(
+        manifest,
+        accepted_dir=accepted_dir,
+        input_stem=input_stem,
+    )
+    if not _teacher_review_allows_training(manifest):
+        if manifest.get("training_set") is not None or public_path.exists():
+            raise ValueError(f"unapproved public training set exists: {public_path}")
+        return False
+    if manifest["progress"].get("complete") is not True:
+        if manifest.get("training_set") is not None or public_path.exists():
+            raise ValueError(f"incomplete queue has a public training set: {public_path}")
+        return False
+    parts = manifest.get("parts")
+    if not isinstance(parts, list):
+        raise ValueError("current queue manifest parts must be a list")
+
+    descriptor, temporary = _secure_temporary_path(public_path)
+    expected_digest = hashlib.sha256()
+    expected_size = 0
+    expected_rows = 0
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            descriptor = -1
+            for part_index, part in enumerate(parts):
+                accepted = part.get("accepted") if isinstance(part, Mapping) else None
+                if not isinstance(accepted, Mapping):
+                    raise ValueError(f"queue part {part_index:06d} has no accepted artifact")
+                rows = _exact_non_negative_integer(
+                    accepted.get("rows"),
+                    field=f"queue part {part_index:06d} accepted rows",
+                )
+                if rows == 0:
+                    continue
+                training = part.get("training") if isinstance(part, Mapping) else None
+                if not isinstance(training, Mapping):
+                    raise ValueError(f"queue part {part_index:06d} has no verified training stage")
+                stage_path = _training_stage_path(
+                    manifest,
+                    accepted_dir=accepted_dir,
+                    input_stem=input_stem,
+                    part_index=part_index,
+                )
+                _validate_artifact(
+                    training,
+                    expected_path=stage_path,
+                    label=f"training stage {part_index:06d}",
+                )
+                with stage_path.open("rb") as stage:
+                    while block := stage.read(8 * 1024 * 1024):
+                        output.write(block)
+                        expected_digest.update(block)
+                        expected_size += len(block)
+                expected_rows += rows
+            output.flush()
+            os.fsync(output.fileno())
+        expected = {
+            "path": str(public_path.resolve()),
+            "size": expected_size,
+            "rows": expected_rows,
+            "sha256": expected_digest.hexdigest(),
+        }
+        temporary_artifact = _jsonl_artifact(temporary)
+        if any(
+            temporary_artifact[field] != expected[field] for field in ("size", "rows", "sha256")
+        ):
+            raise RuntimeError("consolidated queue training temporary failed verification")
+        published_identity: tuple[int, int] | None = None
+        if public_path.exists():
+            _assert_plain_file(public_path, label="public queue training set")
+            if not _artifact_content_matches(public_path, expected):
+                raise FileExistsError(
+                    f"public training set collision cannot be overwritten: {public_path}"
+                )
+        else:
+            temporary_metadata = os.lstat(temporary)
+            published_identity = (temporary_metadata.st_dev, temporary_metadata.st_ino)
+            try:
+                _publish_no_replace(temporary, public_path)
+                public_metadata = os.lstat(public_path)
+                if (
+                    not stat.S_ISREG(public_metadata.st_mode)
+                    or public_metadata.st_nlink != 1
+                    or (public_metadata.st_dev, public_metadata.st_ino) != published_identity
+                ):
+                    raise ValueError(
+                        f"public queue training set has an unsafe filesystem identity: {public_path}"
+                    )
+            except Exception:
+                if public_path.exists():
+                    try:
+                        public_metadata = os.lstat(public_path)
+                        if (public_metadata.st_dev, public_metadata.st_ino) == published_identity:
+                            os.chmod(public_path, 0o600)
+                            _durable_unlink(public_path)
+                    except (FileNotFoundError, OSError):
+                        pass
+                raise
+        try:
+            _assert_plain_file(public_path, label="public queue training set")
+            artifact = _jsonl_artifact(public_path)
+            if any(artifact[field] != expected[field] for field in ("size", "rows", "sha256")):
+                raise ValueError("published complete queue training set failed verification")
+        except Exception:
+            if public_path.exists() and published_identity is not None:
+                try:
+                    public_metadata = os.lstat(public_path)
+                    if (public_metadata.st_dev, public_metadata.st_ino) == published_identity:
+                        os.chmod(public_path, 0o600)
+                        _durable_unlink(public_path)
+                except (FileNotFoundError, OSError):
+                    pass
+            raise
+        os.chmod(public_path, 0o444)
+        artifact = _refresh_artifact_runtime(public_path, artifact)
+        recorded = manifest.get("training_set")
+        if recorded is not None:
+            if not isinstance(recorded, Mapping) or recorded != artifact:
+                raise ValueError("queue manifest training_set contradicts its public bytes")
+            return False
+        manifest["training_set"] = artifact
+        return True
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        _durable_unlink(temporary, missing_ok=True)
 
 
 def _recover_pending_accepted_parts(
@@ -1261,7 +1977,7 @@ def _recover_pending_accepted_parts(
             pending_matches = _artifact_content_matches(pending_path, expected)
             if final_matches:
                 if pending_path.exists():
-                    pending_path.unlink()
+                    _durable_unlink(pending_path)
                 if part.get("published") is not True:
                     part["published"] = True
                     changed = True
@@ -1271,7 +1987,7 @@ def _recover_pending_accepted_parts(
                     _publish_no_replace(pending_path, accepted_path)
                 except FileExistsError as exc:
                     if _artifact_content_matches(accepted_path, expected):
-                        pending_path.unlink()
+                        _durable_unlink(pending_path)
                     else:
                         raise ValueError(
                             f"accepted part {part_index:06d} collided during recovery"
@@ -1485,7 +2201,6 @@ def _validate_result_source_identity(
     *,
     source_index: int,
     label: str,
-    seen_ids: set[str],
 ) -> None:
     """Reconcile one immutable queue row with its persisted result record."""
 
@@ -1493,10 +2208,6 @@ def _validate_result_source_identity(
     if result.get("source_index") != source_index:
         raise ValueError(f"source_index mismatch against the source queue in {label}")
     row_id = result.get("id")
-    if isinstance(row_id, str) and row_id:
-        if row_id in seen_ids:
-            raise ValueError(f"duplicate queue id across committed result parts: {row_id!r}")
-        seen_ids.add(row_id)
     if row_id != expected.get("id"):
         raise ValueError(f"queue id mismatch against the source queue in {label}")
 
@@ -1530,7 +2241,6 @@ def _part_semantics(
     run_lineage: Mapping[str, Any],
     source_identity: Mapping[str, Any],
     source_handle: BinaryIO,
-    seen_ids: set[str],
 ) -> tuple[dict[str, int], int, list[dict[str, Any]], bool, list[bytes]]:
     """Validate result/accepted equivalence and normalize verified legacy rows."""
 
@@ -1565,7 +2275,6 @@ def _part_semantics(
                 source_raw,
                 source_index=source_start_index + offset,
                 label=f"{result_path}:{offset + 1}",
-                seen_ids=seen_ids,
             )
             row_id = result.get("id")
             status = result.get("status")
@@ -1665,13 +2374,13 @@ def _translate_resilient(
                 run(indices[:midpoint])
                 run(indices[midpoint:])
                 return
-            if not isinstance(exc, (TypeError, ValueError)):
-                raise RetryableQueueTranslationError(
-                    "translator runtime failed for one row; the current shard was not "
-                    "committed and can be retried safely"
-                ) from exc
-            errors[indices[0]] = f"{type(exc).__name__}: {exc}"
-            return
+            if isinstance(exc, PermanentQueueRowError):
+                errors[indices[0]] = f"{type(exc).__name__}: {exc}"
+                return
+            raise RetryableQueueTranslationError(
+                "translator runtime failed for one row; the current shard was not "
+                "committed and can be retried safely"
+            ) from exc
         for index, translation in zip(indices, translated, strict=True):
             outputs[index] = canonical_text(str(translation))
 
@@ -1818,24 +2527,153 @@ def _artifact_translation_directions(
     )
 
 
-def _pending_queue_directions(input_path: Path) -> set[tuple[str, str]]:
-    directions: set[tuple[str, str]] = set()
-    seen_ids: dict[str, int] = {}
-    with input_path.open("rb") as handle:
-        for source_index, raw in enumerate(handle):
-            result, needs_translation = _parse_queue_line(raw, source_index)
-            row_id = result.get("id")
-            if isinstance(row_id, str) and row_id:
-                previous_index = seen_ids.get(row_id)
-                if previous_index is not None:
-                    raise ValueError(
-                        f"duplicate queue id {row_id!r} at source rows "
-                        f"{previous_index} and {source_index}"
+def _source_index_artifact(path: Path) -> dict[str, Any]:
+    artifact = _stable_file_artifact(path, label="queue source SQLite index")
+    return {
+        **artifact,
+        "rows": 1,
+    }
+
+
+def _read_source_index(
+    index_path: Path,
+    *,
+    source_snapshot: Mapping[str, Any],
+    verify_integrity: bool = True,
+) -> set[tuple[str, str]]:
+    """Read the bounded on-disk queue index after checking its source binding."""
+
+    _assert_plain_file(index_path, label="queue source SQLite index")
+    uri = f"{index_path.resolve(strict=True).as_uri()}?mode=ro&immutable=1"
+    with sqlite3.connect(uri, uri=True) as database:
+        if verify_integrity:
+            integrity = database.execute("PRAGMA quick_check").fetchone()
+            if integrity != ("ok",):
+                raise ValueError(f"queue source SQLite index failed integrity check: {index_path}")
+        metadata = dict(database.execute("SELECT key, value FROM metadata"))
+        if metadata.get("source_size") != str(source_snapshot.get("size")) or metadata.get(
+            "source_sha256"
+        ) != source_snapshot.get("sha256"):
+            raise ValueError("queue source SQLite index is bound to different source bytes")
+        rows = database.execute(
+            "SELECT source_language, target_language FROM directions "
+            "ORDER BY source_language, target_language"
+        ).fetchall()
+    return {canonicalize_language_pair(row, field="queue source index direction") for row in rows}
+
+
+def _ensure_source_index(
+    source_snapshot_path: Path,
+    output_dir: Path,
+    source_snapshot: Mapping[str, Any],
+    *,
+    expected: Mapping[str, Any] | None,
+) -> tuple[Path, dict[str, Any], set[tuple[str, str]]]:
+    """Build or validate a disk-backed duplicate-ID and direction index."""
+
+    index_path = output_dir / SOURCE_INDEX_FILENAME
+    if index_path.exists():
+        trusted_runtime_identity = expected is not None and _artifact_runtime_unchanged(
+            index_path,
+            expected,
+        )
+        if trusted_runtime_identity:
+            typed_expected = cast(Mapping[str, Any], expected)
+            _validate_artifact_shape(typed_expected, field="queue source SQLite index")
+            recorded_path = Path(str(typed_expected.get("path", "")))
+            if recorded_path.resolve() != index_path.resolve():
+                raise ValueError("queue source SQLite index path differs from its manifest")
+            observed: dict[str, Any] = dict(typed_expected)
+        else:
+            observed = _source_index_artifact(index_path)
+            if expected is not None and any(
+                observed.get(field) != expected.get(field) for field in ("path", "size", "sha256")
+            ):
+                raise ValueError("queue source SQLite index differs from its manifest")
+        directions = _read_source_index(
+            index_path,
+            source_snapshot=source_snapshot,
+            verify_integrity=not trusted_runtime_identity,
+        )
+        os.chmod(index_path, 0o444)
+        return index_path, observed, directions
+    if expected is not None:
+        raise FileNotFoundError(f"queue source SQLite index is missing: {index_path}")
+
+    descriptor, temporary = _secure_temporary_path(index_path)
+    os.close(descriptor)
+    descriptor = -1
+    database: sqlite3.Connection | None = None
+    try:
+        database = sqlite3.connect(temporary)
+        database.execute("PRAGMA journal_mode=DELETE")
+        database.execute("PRAGMA synchronous=FULL")
+        database.execute("PRAGMA temp_store=FILE")
+        database.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        database.execute(
+            "CREATE TABLE queue_ids (id TEXT PRIMARY KEY, source_index INTEGER NOT NULL)"
+        )
+        database.execute(
+            "CREATE TABLE directions ("
+            "source_language TEXT NOT NULL, target_language TEXT NOT NULL, "
+            "PRIMARY KEY (source_language, target_language))"
+        )
+        database.executemany(
+            "INSERT INTO metadata(key, value) VALUES (?, ?)",
+            (
+                ("schema", "sion-queue-source-index-v1"),
+                ("source_size", str(source_snapshot.get("size"))),
+                ("source_sha256", str(source_snapshot.get("sha256"))),
+            ),
+        )
+        with source_snapshot_path.open("rb") as source_handle:
+            for source_index, raw in enumerate(source_handle):
+                result, needs_translation = _parse_queue_line(raw, source_index)
+                row_id = result.get("id")
+                if isinstance(row_id, str) and row_id:
+                    try:
+                        database.execute(
+                            "INSERT INTO queue_ids(id, source_index) VALUES (?, ?)",
+                            (row_id, source_index),
+                        )
+                    except sqlite3.IntegrityError as exc:
+                        previous = database.execute(
+                            "SELECT source_index FROM queue_ids WHERE id = ?",
+                            (row_id,),
+                        ).fetchone()
+                        previous_index = previous[0] if previous is not None else "unknown"
+                        raise ValueError(
+                            f"duplicate queue id {row_id!r} at source rows "
+                            f"{previous_index} and {source_index}"
+                        ) from exc
+                if needs_translation:
+                    database.execute(
+                        "INSERT OR IGNORE INTO directions(source_language, target_language) "
+                        "VALUES (?, ?)",
+                        (result["source_lang"], result["target_lang"]),
                     )
-                seen_ids[row_id] = source_index
-            if needs_translation:
-                directions.add((result["source_lang"], result["target_lang"]))
-    return directions
+        database.commit()
+        database.close()
+        database = None
+        # Windows rejects fsync on a read-only descriptor. The temporary index is
+        # still private here, so opening it read/write is safe and makes the
+        # durability barrier portable.
+        with temporary.open("r+b") as handle:
+            os.fsync(handle.fileno())
+        _assert_plain_file(temporary, label="queue source SQLite index temporary file")
+        os.replace(temporary, index_path)
+        _fsync_directory(index_path.parent)
+        _assert_plain_file(index_path, label="queue source SQLite index")
+        os.chmod(index_path, 0o444)
+    finally:
+        if database is not None:
+            database.close()
+        if descriptor >= 0:
+            os.close(descriptor)
+        _durable_unlink(temporary, missing_ok=True)
+    artifact = _source_index_artifact(index_path)
+    directions = _read_source_index(index_path, source_snapshot=source_snapshot)
+    return index_path, artifact, directions
 
 
 def _validate_requested_directions(
@@ -1863,6 +2701,27 @@ def _validate_requested_directions(
         raise ValueError(
             "round-trip filtering requires reverse directions absent from the artifact graph: "
             f"{unsupported}; use --no-roundtrip only if forward-only filtering is intended"
+        )
+
+
+def _validate_target_script_policies(
+    requested: set[tuple[str, str]],
+    options: QueueTranslationOptions,
+) -> None:
+    """Require explicit policy for unknown or multi-script target identities."""
+
+    missing: list[str] = []
+    for target_language in sorted({target for _source, target in requested}):
+        if options.target_script_requirements(target_language):
+            continue
+        scripts = scripts_for_language(target_language)
+        if scripts is None or len(scripts) > 1:
+            missing.append(target_language)
+    if missing:
+        targets = ", ".join(missing)
+        raise ValueError(
+            "queue targets with unknown or multiple writing systems require an explicit "
+            f"required_target_scripts policy: {targets}"
         )
 
 
@@ -1904,6 +2763,7 @@ def _process_raw_rows(
     translator: TranslatorLike,
     options: QueueTranslationOptions,
     seen_ids: set[str] | None = None,
+    source_index_database: sqlite3.Connection | None = None,
     expected_directions: Sequence[tuple[str, str]] | None = None,
 ) -> list[dict[str, Any]]:
     """Run the deterministic queue policy for source rows or reproduce a committed part."""
@@ -1913,6 +2773,17 @@ def _process_raw_rows(
     for offset, raw in enumerate(raw_rows):
         result, needs_translation = _parse_queue_line(raw, start_index + offset)
         row_id = result.get("id")
+        if source_index_database is not None and isinstance(row_id, str) and row_id:
+            indexed = source_index_database.execute(
+                "SELECT source_index FROM queue_ids WHERE id = ?",
+                (row_id,),
+            ).fetchone()
+            expected_source_index = start_index + offset
+            if indexed != (expected_source_index,):
+                raise ValueError(
+                    f"queue source index does not bind {row_id!r} to source row "
+                    f"{expected_source_index}"
+                )
         if seen_ids is not None and isinstance(row_id, str) and row_id:
             if row_id in seen_ids:
                 raise ValueError(f"duplicate queue id in processing stream: {row_id!r}")
@@ -1975,9 +2846,13 @@ def _process_raw_rows(
                 and target_fraction < options.min_target_language_fraction
             ):
                 reasons.append("target_language")
-            script_counts = cast(Mapping[str, int], quality["target_script_characters"])
-            for script, minimum in options.target_script_requirements(target_language).items():
-                if script_counts.get(script, 0) < minimum:
+            script_requirements = options.target_script_requirements(target_language)
+            script_letter_counts = {
+                script: script_letter_count(translation, script) for script in script_requirements
+            }
+            quality["target_script_letters"] = script_letter_counts
+            for script, minimum in script_requirements.items():
+                if script_letter_counts.get(script, 0) < minimum:
                     reasons.append(f"target_script:{script}")
             if reasons:
                 job["status"] = "rejected"
@@ -2087,8 +2962,22 @@ def _source_identity(
     resolved = str(path.resolve())
     digest = sha256_file(path)
     after = path.stat()
-    before_identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-    after_identity = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+    before_identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+        before.st_nlink,
+    )
+    after_identity = (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+        after.st_nlink,
+    )
     if before_identity != after_identity:
         raise ValueError(f"input source changed while hashing: {path}")
     return {
@@ -2096,6 +2985,10 @@ def _source_identity(
         "size": after.st_size,
         "mtime_ns": after.st_mtime_ns,
         "sha256": digest,
+        "device": after.st_dev,
+        "inode": after.st_ino,
+        "ctime_ns": after.st_ctime_ns,
+        "nlink": after.st_nlink,
     }
 
 
@@ -2106,6 +2999,69 @@ def _assert_source_content_identity(path: Path, expected: Mapping[str, Any]) -> 
     if any(observed.get(field) != expected.get(field) for field in _CONTENT_IDENTITY_FIELDS):
         raise ValueError("input source content changed during queue translation")
     return observed
+
+
+def _source_snapshot_runtime_unchanged(path: Path, expected: Mapping[str, Any]) -> bool:
+    """Trust an unchanged private snapshot inode until the final full hash barrier."""
+
+    fields = ("device", "inode", "mtime_ns", "ctime_ns", "nlink")
+    if type(expected.get("size")) is not int or any(
+        type(expected.get(field)) is not int for field in fields
+    ):
+        return False
+    metadata = os.lstat(path)
+    return (
+        metadata.st_nlink == 1
+        and metadata.st_size == expected["size"]
+        and stat.S_ISREG(metadata.st_mode)
+        and all(
+            expected[field] == observed
+            for field, observed in (
+                ("device", metadata.st_dev),
+                ("inode", metadata.st_ino),
+                ("mtime_ns", metadata.st_mtime_ns),
+                ("ctime_ns", metadata.st_ctime_ns),
+                ("nlink", metadata.st_nlink),
+            )
+        )
+    )
+
+
+def _open_snapshot_runtime_identity(handle: BinaryIO, path: Path) -> tuple[int, ...]:
+    """Capture a cheap immutable-snapshot identity without rehashing all bytes."""
+
+    opened = os.fstat(handle.fileno())
+    linked = os.lstat(path)
+    opened_identity = (
+        opened.st_dev,
+        opened.st_ino,
+        opened.st_size,
+        opened.st_mtime_ns,
+        opened.st_ctime_ns,
+        opened.st_nlink,
+        getattr(opened, "st_file_attributes", 0),
+    )
+    linked_identity = (
+        linked.st_dev,
+        linked.st_ino,
+        linked.st_size,
+        linked.st_mtime_ns,
+        linked.st_ctime_ns,
+        linked.st_nlink,
+        getattr(linked, "st_file_attributes", 0),
+    )
+    if opened_identity != linked_identity or opened.st_nlink != 1:
+        raise ValueError("private queue source snapshot path or inode changed")
+    return opened_identity
+
+
+def _assert_open_snapshot_unchanged(
+    handle: BinaryIO,
+    path: Path,
+    expected: tuple[int, ...],
+) -> None:
+    if _open_snapshot_runtime_identity(handle, path) != expected:
+        raise ValueError("private queue source snapshot changed during shard processing")
 
 
 def _ensure_source_snapshot(
@@ -2165,7 +3121,7 @@ def _ensure_source_snapshot(
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-        temporary.unlink(missing_ok=True)
+        _durable_unlink(temporary, missing_ok=True)
     snapshot = _source_identity(snapshot_path, None, force_hash=True)
     if any(snapshot.get(field) != source_after.get(field) for field in ("size", "sha256")):
         raise ValueError("published private queue source snapshot does not match the input bytes")
@@ -2195,10 +3151,15 @@ def _resolve_source_snapshot(
     if recorded_path.resolve() != snapshot_path.resolve():
         raise ValueError("queue source snapshot path does not match its manifest")
     _assert_plain_file(snapshot_path, label="private queue source snapshot")
-    snapshot = _assert_source_content_identity(snapshot_path, recorded_snapshot)
+    snapshot_metadata = os.lstat(snapshot_path)
+    if snapshot_metadata.st_mode & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH):
+        os.chmod(snapshot_path, 0o444)
+    if _source_snapshot_runtime_unchanged(snapshot_path, recorded_snapshot):
+        snapshot = dict(recorded_snapshot)
+    else:
+        snapshot = _assert_source_content_identity(snapshot_path, recorded_snapshot)
     if any(source.get(field) != snapshot.get(field) for field in ("size", "sha256")):
         raise ValueError("queue input and private source snapshot no longer match")
-    os.chmod(snapshot_path, 0o444)
     return source, snapshot_path, snapshot
 
 
@@ -2206,12 +3167,14 @@ def _new_manifest(
     *,
     source: Mapping[str, Any],
     source_snapshot: Mapping[str, Any] | None = None,
+    source_index: Mapping[str, Any] | None = None,
     options: QueueTranslationOptions,
     run_metadata: Mapping[str, Any],
     accepted_dir: Path,
     accepted_shard_prefix: str | None,
     teacher_pilot_rows: int | None,
     runtime_verification: str | None = None,
+    legacy_public_binding: tuple[str, str] | None = None,
 ) -> dict[str, Any]:
     configuration = {
         "pipeline_version": PIPELINE_VERSION,
@@ -2222,10 +3185,21 @@ def _new_manifest(
     }
     if source_snapshot is not None:
         configuration["source_snapshot"] = dict(source_snapshot)
+    if source_index is not None:
+        configuration["source_index"] = dict(source_index)
     if runtime_verification is not None:
         configuration["runtime_verification"] = runtime_verification
     if accepted_shard_prefix is not None:
         configuration["accepted_shard_prefix"] = accepted_shard_prefix
+    if legacy_public_binding is not None:
+        legacy_run_id, legacy_run_signature = legacy_public_binding
+        configuration.update(
+            {
+                "legacy_public_marker": LEGACY_PUBLIC_MARKER,
+                "legacy_run_id": legacy_run_id,
+                "legacy_run_signature": legacy_run_signature,
+            }
+        )
     signature = _stable_digest(_signature_configuration(configuration))
     return {
         "schema": MANIFEST_SCHEMA,
@@ -2262,6 +3236,7 @@ def _new_manifest(
             else None
         ),
         "parts": [],
+        "training_set": None,
     }
 
 
@@ -2278,13 +3253,21 @@ def _validate_or_register_parts(
     translator: TranslatorLike,
     options: QueueTranslationOptions,
     expected_directions: Sequence[tuple[str, str]],
-) -> tuple[bool, set[str]]:
+    replay_unstaged_parts: bool,
+    replay_all_parts: bool,
+    replay_before_part: int | None = None,
+) -> bool:
     """Verify committed shards, registering legacy v1 shards on first resume."""
 
     progress = manifest["progress"]
     next_part = int(progress["next_part"])
+    if replay_before_part is not None and (
+        type(replay_before_part) is not int or not 0 <= replay_before_part <= next_part
+    ):
+        raise ValueError("replay_before_part must be a committed part boundary")
     parts = manifest.get("parts")
     changed = False
+    legacy_public_artifacts: dict[int, tuple[Path, dict[str, Any]]] = {}
     if parts is None:
         if not allow_legacy_registration:
             raise ValueError(
@@ -2303,12 +3286,42 @@ def _validate_or_register_parts(
                 input_stem=input_stem,
                 part_index=part_index,
             )
+            legacy_public_path = _legacy_public_accepted_path(
+                manifest,
+                accepted_dir=accepted_dir,
+                input_stem=input_stem,
+                part_index=part_index,
+            )
             if not result_path.is_file():
                 raise FileNotFoundError(f"legacy result shard is missing: {result_path}")
-            if not accepted_path.is_file():
-                raise FileNotFoundError(f"legacy accepted shard is missing: {accepted_path}")
             result_artifact = _jsonl_artifact(result_path)
-            accepted_artifact = _jsonl_artifact(accepted_path)
+            legacy_public_artifact = (
+                _jsonl_artifact(legacy_public_path) if legacy_public_path.is_file() else None
+            )
+            if accepted_path.is_file():
+                accepted_artifact = _jsonl_artifact(accepted_path)
+                if legacy_public_artifact is not None and any(
+                    accepted_artifact[field] != legacy_public_artifact[field]
+                    for field in ("size", "rows", "sha256")
+                ):
+                    raise ValueError(
+                        f"legacy accepted part {part_index:06d} differs from its private recovery"
+                    )
+            elif legacy_public_artifact is not None:
+                accepted_artifact = _copy_plain_file_no_replace(
+                    legacy_public_path,
+                    accepted_path,
+                    expected=legacy_public_artifact,
+                )
+            else:
+                raise FileNotFoundError(
+                    f"legacy accepted shard and private migration are missing: {legacy_public_path}"
+                )
+            if legacy_public_artifact is not None:
+                legacy_public_artifacts[part_index] = (
+                    legacy_public_path,
+                    legacy_public_artifact,
+                )
             parts.append(
                 {
                     "part": part_index,
@@ -2328,10 +3341,14 @@ def _validate_or_register_parts(
     total_generated_rows = 0
     total_status_counts: Counter[str] = Counter()
     expected_source_start = 0
-    seen_ids: set[str] = set()
     with input_path.open("rb") as source_handle:
+        source_size = os.fstat(source_handle.fileno()).st_size
         for part_index, part in enumerate(parts):
-            if not isinstance(part, dict) or int(part.get("part", -1)) != part_index:
+            if (
+                not isinstance(part, dict)
+                or type(part.get("part")) is not int
+                or part.get("part") != part_index
+            ):
                 raise ValueError("queue manifest contains an invalid or out-of-order part")
             if part.get("published") is not True:
                 raise ValueError(f"accepted part {part_index:06d} is not published")
@@ -2342,11 +3359,14 @@ def _validate_or_register_parts(
                 input_stem=input_stem,
                 part_index=part_index,
             )
-            result = _validate_artifact(
-                part.get("result", {}),
-                expected_path=result_path,
-                label=f"result part {part_index:06d}",
-            )
+            recorded_result = part.get("result")
+            if not isinstance(recorded_result, Mapping):
+                raise ValueError(f"result part {part_index:06d} has no artifact metadata")
+            recorded_result_path = Path(str(recorded_result.get("path", "")))
+            if recorded_result_path.resolve() != result_path.resolve():
+                raise ValueError(
+                    f"result part {part_index:06d} path does not match its queue manifest"
+                )
             recorded_accepted = part.get("accepted")
             if not isinstance(recorded_accepted, Mapping):
                 raise ValueError(f"accepted part {part_index:06d} has no artifact metadata")
@@ -2355,67 +3375,157 @@ def _validate_or_register_parts(
                 raise ValueError(
                     f"accepted part {part_index:06d} path does not match its queue manifest"
                 )
-            if not accepted_path.is_file():
-                raise FileNotFoundError(
-                    f"accepted part {part_index:06d} is missing: {accepted_path}"
-                )
-            _assert_plain_file(
-                accepted_path,
-                label=f"accepted part {part_index:06d}",
+            source_rows_count = _exact_non_negative_integer(
+                part.get("source_rows"),
+                field=f"queue manifest parts[{part_index}].source_rows",
             )
-            observed_before = _jsonl_artifact(accepted_path)
-            accepted_artifact_matches = all(
-                observed_before[field] == recorded_accepted.get(field)
-                for field in ("size", "rows", "sha256")
+            source_start_index = _exact_non_negative_integer(
+                part.get("source_start_index"),
+                field=f"queue manifest parts[{part_index}].source_start_index",
             )
-            if int(part.get("source_rows", -1)) != result["rows"]:
-                raise ValueError(f"result part {part_index:06d} source row count mismatch")
-            if int(part.get("source_start_index", -1)) != expected_source_start:
+            if source_start_index != expected_source_start:
                 raise ValueError(f"result part {part_index:06d} source range is not contiguous")
-            (
-                semantic_counts,
-                semantic_generated_rows,
-                normalized_rows,
-                accepted_changed,
-                source_rows,
-            ) = _part_semantics(
-                result_path,
-                accepted_path,
-                source_start_index=expected_source_start,
-                run_id=str(manifest["run_id"]),
-                run_lineage=run_lineage,
-                source_identity=source_identity,
-                source_handle=source_handle,
-                seen_ids=seen_ids,
-            )
-            # Current manifests bind the model artifacts, directed graph,
-            # policy version, options, immutable source snapshot, and complete
-            # result/accepted digests. Re-running every historical model call
-            # would make bounded resumes quadratic. Only the one-time legacy
-            # migration pays for behavioral replay.
-            if allow_legacy_registration:
-                _verify_committed_result_part(
-                    result_path,
-                    source_rows,
-                    source_start_index=expected_source_start,
-                    translator=translator,
-                    options=options,
-                    expected_directions=expected_directions,
+            should_replay = (
+                allow_legacy_registration
+                or replay_all_parts
+                or (replay_before_part is not None and part_index < replay_before_part)
+                or (
+                    replay_unstaged_parts
+                    and recorded_accepted.get("rows") != 0
+                    and part.get("training") is None
                 )
-            if accepted_changed:
-                _atomic_write_jsonl(accepted_path, normalized_rows)
-            accepted = _jsonl_artifact(accepted_path)
-            if accepted_changed or not accepted_artifact_matches:
-                part["accepted"] = accepted
-                changed = True
+            )
             status_counts = part.get("status_counts")
             generated_rows = part.get("generated_rows")
+            source_end_byte_offset = part.get("source_end_byte_offset")
+            can_use_runtime_index = (
+                not should_replay
+                and not allow_legacy_registration
+                and type(source_end_byte_offset) is int
+                and isinstance(status_counts, Mapping)
+                and type(generated_rows) is int
+                and _artifact_runtime_unchanged(result_path, recorded_result)
+                and _artifact_runtime_unchanged(accepted_path, recorded_accepted)
+            )
+            if can_use_runtime_index:
+                typed_source_end = cast(int, source_end_byte_offset)
+                typed_status_counts = cast(Mapping[str, Any], status_counts)
+                typed_generated_rows = cast(int, generated_rows)
+                result = dict(recorded_result)
+                accepted = dict(recorded_accepted)
+                if source_rows_count != result["rows"]:
+                    raise ValueError(f"result part {part_index:06d} source row count mismatch")
+                current_offset = source_handle.tell()
+                if typed_source_end <= current_offset or typed_source_end > source_size:
+                    raise ValueError(
+                        f"result part {part_index:06d} has an invalid source byte boundary"
+                    )
+                source_handle.seek(typed_source_end)
+                semantic_counts = {
+                    status: _exact_non_negative_integer(
+                        typed_status_counts.get(status),
+                        field=f"queue manifest parts[{part_index}].status_counts.{status}",
+                    )
+                    for status in ("accepted", "rejected", "error", "skipped_existing")
+                }
+                semantic_generated_rows = typed_generated_rows
+            else:
+                result = _validate_artifact(
+                    recorded_result,
+                    expected_path=result_path,
+                    label=f"result part {part_index:06d}",
+                )
+                if not accepted_path.is_file():
+                    raise FileNotFoundError(
+                        f"accepted part {part_index:06d} is missing: {accepted_path}"
+                    )
+                _assert_plain_file(
+                    accepted_path,
+                    label=f"accepted part {part_index:06d}",
+                )
+                observed_accepted_before = _jsonl_artifact(accepted_path)
+                if source_rows_count != result["rows"]:
+                    raise ValueError(f"result part {part_index:06d} source row count mismatch")
+                (
+                    semantic_counts,
+                    semantic_generated_rows,
+                    normalized_rows,
+                    accepted_changed,
+                    source_rows,
+                ) = _part_semantics(
+                    result_path,
+                    accepted_path,
+                    source_start_index=expected_source_start,
+                    run_id=str(manifest["run_id"]),
+                    run_lineage=run_lineage,
+                    source_identity=source_identity,
+                    source_handle=source_handle,
+                )
+                observed_source_end = source_handle.tell()
+                if source_end_byte_offset is None:
+                    part["source_end_byte_offset"] = observed_source_end
+                    changed = True
+                elif (
+                    type(source_end_byte_offset) is not int
+                    or source_end_byte_offset != observed_source_end
+                ):
+                    raise ValueError(
+                        f"result part {part_index:06d} source byte boundary is invalid"
+                    )
+                if should_replay:
+                    _verify_committed_result_part(
+                        result_path,
+                        source_rows,
+                        source_start_index=expected_source_start,
+                        translator=translator,
+                        options=options,
+                        expected_directions=expected_directions,
+                    )
+                canonical_accepted_digest = hashlib.sha256()
+                canonical_accepted_size = 0
+                for normalized_row in normalized_rows:
+                    encoded = (
+                        json.dumps(
+                            normalized_row,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                        + "\n"
+                    ).encode("utf-8")
+                    canonical_accepted_digest.update(encoded)
+                    canonical_accepted_size += len(encoded)
+                accepted_changed = accepted_changed or (
+                    observed_accepted_before["size"] != canonical_accepted_size
+                    or observed_accepted_before["sha256"] != canonical_accepted_digest.hexdigest()
+                )
+                if accepted_changed:
+                    os.chmod(accepted_path, 0o600)
+                    try:
+                        _atomic_write_jsonl(accepted_path, normalized_rows)
+                    finally:
+                        if accepted_path.exists():
+                            os.chmod(accepted_path, 0o444)
+                accepted = _jsonl_artifact(accepted_path)
+                os.chmod(result_path, 0o444)
+                os.chmod(accepted_path, 0o444)
+                result = _refresh_artifact_runtime(result_path, result)
+                accepted = _refresh_artifact_runtime(accepted_path, accepted)
+                if dict(recorded_result) != result:
+                    part["result"] = result
+                    changed = True
+                if dict(recorded_accepted) != accepted:
+                    part["accepted"] = accepted
+                    changed = True
             if not isinstance(status_counts, Mapping):
                 part["status_counts"] = semantic_counts
                 status_counts = semantic_counts
                 changed = True
             elif any(
-                int(status_counts.get(status, 0)) != semantic_counts[status]
+                _exact_non_negative_integer(
+                    status_counts.get(status),
+                    field=f"queue manifest parts[{part_index}].status_counts.{status}",
+                )
+                != semantic_counts[status]
                 for status in ("accepted", "rejected", "error", "skipped_existing")
             ):
                 raise ValueError(f"result part {part_index:06d} status counts contradict its rows")
@@ -2423,12 +3533,15 @@ def _validate_or_register_parts(
                 part["generated_rows"] = semantic_generated_rows
                 generated_rows = semantic_generated_rows
                 changed = True
-            elif int(generated_rows) != semantic_generated_rows:
+            elif type(generated_rows) is not int or generated_rows != semantic_generated_rows:
                 raise ValueError(
                     f"result part {part_index:06d} generated row count contradicts its rows"
                 )
             normalized_counts = {
-                status: int(status_counts.get(status, 0))
+                status: _exact_non_negative_integer(
+                    status_counts.get(status),
+                    field=f"queue manifest parts[{part_index}].status_counts.{status}",
+                )
                 for status in ("accepted", "rejected", "error", "skipped_existing")
             }
             if sum(normalized_counts.values()) != result["rows"]:
@@ -2437,40 +3550,59 @@ def _validate_or_register_parts(
                 raise ValueError(
                     f"accepted part {part_index:06d} row count does not match statuses"
                 )
-            if not 0 <= int(generated_rows) <= int(result["rows"]):
+            if type(generated_rows) is not int or not 0 <= generated_rows <= result["rows"]:
                 raise ValueError(f"result part {part_index:06d} has invalid generated row count")
-            total_result_rows += int(result["rows"])
-            total_accepted_rows += int(accepted["rows"])
-            total_generated_rows += int(generated_rows)
+            total_result_rows += result["rows"]
+            total_accepted_rows += accepted["rows"]
+            total_generated_rows += generated_rows
             total_status_counts.update(normalized_counts)
-            expected_source_start += int(result["rows"])
-        if source_handle.tell() != int(progress["source_byte_offset"]):
+            expected_source_start += result["rows"]
+        if source_handle.tell() != progress["source_byte_offset"]:
             raise ValueError(
                 "committed source queue byte range does not match progress.source_byte_offset"
             )
         if progress.get("complete") is True and source_handle.read(1):
             raise ValueError("queue manifest marks an unconsumed source tail as complete")
 
-    if total_result_rows != int(progress["completed_rows"]):
+    if total_result_rows != progress["completed_rows"]:
         raise ValueError("committed result rows do not match progress.completed_rows")
     stats = cast(dict[str, Any], manifest["stats"])
-    if total_result_rows != int(stats["processed"]):
+    if total_result_rows != stats["processed"]:
         raise ValueError("committed result rows do not match stats.processed")
-    if total_accepted_rows != int(stats["accepted"]):
+    if total_accepted_rows != stats["accepted"]:
         raise ValueError("committed accepted rows do not match stats.accepted")
     for status, stat_name in (
         ("rejected", "rejected"),
         ("error", "errors"),
         ("skipped_existing", "skipped_existing"),
     ):
-        if total_status_counts[status] != int(stats[stat_name]):
+        if total_status_counts[status] != stats[stat_name]:
             raise ValueError(f"committed {status} rows do not match stats.{stat_name}")
     if "generated" not in stats:
         stats["generated"] = total_generated_rows
         changed = True
-    elif total_generated_rows != int(stats["generated"]):
+    elif total_generated_rows != stats["generated"]:
         raise ValueError("committed generated rows do not match stats.generated")
-    return changed, seen_ids
+    for part_index, (legacy_public_path, legacy_public_artifact) in legacy_public_artifacts.items():
+        if not _artifact_content_matches(legacy_public_path, legacy_public_artifact):
+            raise ValueError(
+                f"legacy public accepted part {part_index:06d} changed during migration"
+            )
+        os.chmod(legacy_public_path, 0o600)
+        _durable_unlink(legacy_public_path)
+        changed = True
+    return changed
+
+
+def _synchronize_teacher_review_state(manifest: dict[str, Any]) -> bool:
+    review = manifest.get("teacher_review")
+    if not isinstance(review, dict):
+        return False
+    expected = _expected_teacher_review_required(manifest)
+    if review.get("review_required") is expected:
+        return False
+    review["review_required"] = expected
+    return True
 
 
 def _configure_teacher_review(
@@ -2508,23 +3640,12 @@ def _configure_teacher_review(
     elif review is not None and not isinstance(review, dict):
         raise ValueError("invalid teacher_review in queue manifest")
 
-    if (
-        isinstance(review, dict)
-        and review.get("approved") is False
-        and (
-            int(stats["generated"]) >= int(str(review["pilot_rows"]))
-            or (manifest["progress"].get("complete") is True and int(stats["generated"]) > 0)
-        )
-        and review.get("review_required") is False
-    ):
-        review = cast(dict[str, Any], review)
-        review["review_required"] = True
-        changed = True
+    changed = _synchronize_teacher_review_state(manifest) or changed
 
     if approve_teacher:
         if not existing_manifest or not isinstance(review, dict):
             raise ValueError("a teacher cannot be approved before a pilot run")
-        if review.get("review_required") is not True:
+        if not _expected_teacher_review_required(manifest):
             raise ValueError("the teacher pilot is not complete or has no reviewable output")
         if review.get("approved") is False:
             review = cast(dict[str, Any], review)
@@ -2567,10 +3688,12 @@ def _translate_queue_unlocked(
 
     options = options or QueueTranslationOptions()
     options.validate()
-    if max_rows is not None and max_rows <= 0:
-        raise ValueError("max_rows must be positive or None")
-    if teacher_pilot_rows is not None and teacher_pilot_rows <= 0:
-        raise ValueError("teacher_pilot_rows must be positive or None")
+    if max_rows is not None and (type(max_rows) is not int or max_rows <= 0):
+        raise ValueError("max_rows must be a positive integer or None")
+    if teacher_pilot_rows is not None and (
+        type(teacher_pilot_rows) is not int or teacher_pilot_rows <= 0
+    ):
+        raise ValueError("teacher_pilot_rows must be a positive integer or None")
     input_path = Path(input_path)
     output_dir = Path(output_dir)
     accepted_dir = Path(accepted_dir)
@@ -2607,23 +3730,33 @@ def _translate_queue_unlocked(
         effective_run_metadata = dict(run_metadata)
     if existing is None:
         accepted_shard_prefix: str | None = ACCEPTED_SHARD_PREFIX
+    elif legacy_manifest:
+        accepted_shard_prefix = LEGACY_ACCEPTED_SHARD_PREFIX
     else:
         existing_configuration = existing.get("configuration")
-        accepted_shard_prefix = (
-            _manifest_accepted_shard_prefix(existing)
-            if isinstance(existing_configuration, Mapping)
-            and "accepted_shard_prefix" in existing_configuration
-            else None
-        )
+        accepted_shard_prefix = _manifest_accepted_shard_prefix(existing)
     snapshot_migrated = False
     recorded_signature: str | None = None
+    legacy_public_binding: tuple[str, str] | None = None
+    if existing is not None and accepted_shard_prefix == LEGACY_ACCEPTED_SHARD_PREFIX:
+        existing_configuration = cast(Mapping[str, Any], existing["configuration"])
+        if not legacy_manifest:
+            legacy_id = existing_configuration.get("legacy_run_id")
+            legacy_signature = existing_configuration.get("legacy_run_signature")
+            if isinstance(legacy_id, str) and isinstance(legacy_signature, str):
+                legacy_public_binding = (legacy_id, legacy_signature)
     if existing is None:
         _cleanup_orphaned_initialization_temps(output_dir)
         non_lock_entries = [
             entry
             for entry in output_dir.iterdir()
             if entry.name
-            not in {RUN_LOCK_FILENAME, ACCEPTED_LOCK_FILENAME, SOURCE_SNAPSHOT_FILENAME}
+            not in {
+                RUN_LOCK_FILENAME,
+                ACCEPTED_LOCK_FILENAME,
+                SOURCE_SNAPSHOT_FILENAME,
+                SOURCE_INDEX_FILENAME,
+            }
         ]
         if non_lock_entries:
             raise FileExistsError(f"{output_dir} is not empty and has no compatible queue manifest")
@@ -2644,6 +3777,7 @@ def _translate_queue_unlocked(
         }:
             raise ValueError("queue manifest configuration digest is invalid")
         recorded_signature = raw_recorded_signature
+        _validate_run_signature_binding(existing)
         if not isinstance(existing_configuration.get("source_snapshot"), Mapping):
             source, source_snapshot_path, source_snapshot = _ensure_source_snapshot(
                 input_path,
@@ -2657,12 +3791,43 @@ def _translate_queue_unlocked(
                 input_path=input_path,
                 output_dir=output_dir,
             )
-    requested_directions = _pending_queue_directions(source_snapshot_path)
+        if legacy_manifest:
+            legacy_public_binding = (_manifest_run_id(existing), raw_recorded_signature)
+            existing_configuration.update(
+                {
+                    "pipeline_version": PIPELINE_VERSION,
+                    "accepted_shard_prefix": LEGACY_ACCEPTED_SHARD_PREFIX,
+                    "legacy_public_marker": LEGACY_PUBLIC_MARKER,
+                    "legacy_run_id": legacy_public_binding[0],
+                    "legacy_run_signature": legacy_public_binding[1],
+                }
+            )
+            snapshot_migrated = True
+    existing_index = None
+    mutable_existing_configuration: dict[str, Any] | None = None
+    if existing is not None:
+        raw_configuration = existing["configuration"]
+        if not isinstance(raw_configuration, dict):
+            raise ValueError("queue manifest configuration must be a JSON object")
+        mutable_existing_configuration = cast(dict[str, Any], raw_configuration)
+        raw_index = mutable_existing_configuration.get("source_index")
+        if isinstance(raw_index, Mapping):
+            existing_index = cast(Mapping[str, Any], raw_index)
+    source_index_path, source_index, requested_directions = _ensure_source_index(
+        source_snapshot_path,
+        output_dir,
+        source_snapshot,
+        expected=existing_index,
+    )
+    if mutable_existing_configuration is not None and existing_index is None:
+        mutable_existing_configuration["source_index"] = dict(source_index)
+        snapshot_migrated = True
     _validate_requested_directions(
         requested_directions,
         artifact_directions,
         roundtrip_enabled=options.roundtrip_enabled,
     )
+    _validate_target_script_policies(requested_directions, options)
     run_lineage = _validated_run_lineage(
         effective_run_metadata,
         translator,
@@ -2670,15 +3835,31 @@ def _translate_queue_unlocked(
         legacy_manifest=legacy_manifest,
         allow_unverified_translator=allow_unverified_translator,
     )
+    if legacy_manifest:
+        # A migrated manifest must be independently resumable under the current
+        # schema. Persist every field that legacy validation safely derived from
+        # the bound translator instead of requiring the old relaxation again.
+        effective_run_metadata = {
+            **effective_run_metadata,
+            "tokenizer_metadata": run_lineage["tokenizer_metadata"],
+            "translation_directions": run_lineage["translation_directions"],
+            "translation_graph_source": run_lineage["translation_graph_source"],
+        }
+        if mutable_existing_configuration is None:
+            raise AssertionError("legacy migration requires a mutable configuration")
+        mutable_existing_configuration["run_metadata"] = dict(effective_run_metadata)
+        snapshot_migrated = True
     candidate = _new_manifest(
         source=source,
         source_snapshot=source_snapshot,
+        source_index=source_index,
         options=options,
         run_metadata=effective_run_metadata,
         accepted_dir=accepted_dir,
         accepted_shard_prefix=accepted_shard_prefix,
         teacher_pilot_rows=teacher_pilot_rows,
         runtime_verification=str(run_lineage["runtime_verification"]),
+        legacy_public_binding=legacy_public_binding,
     )
     resume_metadata_changed = False
     if existing is None:
@@ -2713,6 +3894,9 @@ def _translate_queue_unlocked(
         manifest["integrity"] = dict(_LOCAL_INTEGRITY_DESCRIPTOR)
         manifest["configuration"]["source"] = source
         manifest["configuration"]["source_snapshot"] = source_snapshot
+        manifest["configuration"]["source_index"] = source_index
+        manifest.setdefault("training_set", None)
+    _validate_run_signature_binding(manifest)
     _validate_manifest_control_state(manifest)
     _claim_accepted_namespace(
         manifest,
@@ -2729,7 +3913,21 @@ def _translate_queue_unlocked(
         )
     else:
         recovery_changed = False
-    validation_changed, seen_ids = _validate_or_register_parts(
+    historical_part_boundary = _exact_non_negative_integer(
+        cast(Mapping[str, Any], manifest["progress"]).get("next_part"),
+        field="queue manifest progress.next_part",
+    )
+    startup_replays_every_historical_part = legacy_manifest or (
+        existing is not None
+        and (
+            approve_teacher
+            or (
+                cast(Mapping[str, Any], manifest["progress"]).get("complete") is True
+                and manifest.get("training_set") is None
+            )
+        )
+    )
+    validation_changed = _validate_or_register_parts(
         manifest,
         input_path=source_snapshot_path,
         output_dir=output_dir,
@@ -2741,6 +3939,17 @@ def _translate_queue_unlocked(
         translator=translator,
         options=options,
         expected_directions=artifact_direction_list,
+        replay_unstaged_parts=(
+            existing is not None
+            and (
+                manifest.get("teacher_review") is None
+                or (
+                    isinstance(manifest.get("teacher_review"), Mapping)
+                    and cast(Mapping[str, Any], manifest["teacher_review"]).get("approved") is True
+                )
+            )
+        ),
+        replay_all_parts=startup_replays_every_historical_part,
     )
     parts_changed = recovery_changed or validation_changed
     review_changed = _configure_teacher_review(
@@ -2754,10 +3963,19 @@ def _translate_queue_unlocked(
     if existing is None or resume_metadata_changed or parts_changed or review_changed:
         manifest["updated_at"] = datetime.now(UTC).isoformat()
         _atomic_write_json(manifest_path, manifest)
-    training_changed = _materialize_training_parts(
+    training_changed = _stage_training_parts(
         manifest,
         accepted_dir=accepted_dir,
         input_stem=input_path.stem,
+        verify_content=cast(Mapping[str, Any], manifest["progress"]).get("complete") is True,
+    )
+    training_changed = (
+        _publish_complete_training_set(
+            manifest,
+            accepted_dir=accepted_dir,
+            input_stem=input_path.stem,
+        )
+        or training_changed
     )
     if training_changed:
         manifest["updated_at"] = datetime.now(UTC).isoformat()
@@ -2767,14 +3985,20 @@ def _translate_queue_unlocked(
         return manifest
 
     processed_this_call = 0
-    with source_snapshot_path.open("rb") as source_handle:
+    with ExitStack() as processing_resources:
+        source_handle = processing_resources.enter_context(source_snapshot_path.open("rb"))
+        index_uri = f"{source_index_path.resolve(strict=True).as_uri()}?mode=ro&immutable=1"
+        source_index_database = sqlite3.connect(index_uri, uri=True)
+        processing_resources.callback(source_index_database.close)
+        snapshot_runtime_identity = _open_snapshot_runtime_identity(
+            source_handle,
+            source_snapshot_path,
+        )
         source_handle.seek(int(progress["source_byte_offset"]))
         while max_rows is None or processed_this_call < max_rows:
             pilot_remaining = _remaining_teacher_pilot_rows(manifest)
             if pilot_remaining == 0:
-                review = manifest["teacher_review"]
-                if review["review_required"] is False:
-                    review["review_required"] = True
+                if _synchronize_teacher_review_state(manifest):
                     manifest["updated_at"] = datetime.now(UTC).isoformat()
                     _atomic_write_json(manifest_path, manifest)
                 break
@@ -2799,15 +4023,44 @@ def _translate_queue_unlocked(
                 )
                 manifest["configuration"]["source_snapshot"] = final_snapshot
                 progress["complete"] = True
-                review = manifest.get("teacher_review")
-                if (
-                    isinstance(review, dict)
-                    and review["approved"] is False
-                    and manifest["stats"]["generated"] > 0
-                ):
-                    review["review_required"] = True
+                _synchronize_teacher_review_state(manifest)
                 manifest["updated_at"] = datetime.now(UTC).isoformat()
                 _atomic_write_json(manifest_path, manifest)
+                replay_changed = False
+                if historical_part_boundary and not startup_replays_every_historical_part:
+                    replay_changed = _validate_or_register_parts(
+                        manifest,
+                        input_path=source_snapshot_path,
+                        output_dir=output_dir,
+                        accepted_dir=accepted_dir,
+                        input_stem=input_path.stem,
+                        run_lineage=run_lineage,
+                        source_identity=source,
+                        allow_legacy_registration=False,
+                        translator=translator,
+                        options=options,
+                        expected_directions=artifact_direction_list,
+                        replay_unstaged_parts=False,
+                        replay_all_parts=False,
+                        replay_before_part=historical_part_boundary,
+                    )
+                stage_changed = _stage_training_parts(
+                    manifest,
+                    accepted_dir=accepted_dir,
+                    input_stem=input_path.stem,
+                    verify_content=True,
+                )
+                if (
+                    _publish_complete_training_set(
+                        manifest,
+                        accepted_dir=accepted_dir,
+                        input_stem=input_path.stem,
+                    )
+                    or replay_changed
+                    or stage_changed
+                ):
+                    manifest["updated_at"] = datetime.now(UTC).isoformat()
+                    _atomic_write_json(manifest_path, manifest)
                 break
 
             results = _process_raw_rows(
@@ -2815,7 +4068,7 @@ def _translate_queue_unlocked(
                 start_index=start_index,
                 translator=translator,
                 options=options,
-                seen_ids=seen_ids,
+                source_index_database=source_index_database,
                 expected_directions=artifact_direction_list,
             )
 
@@ -2864,16 +4117,17 @@ def _translate_queue_unlocked(
             position = source_handle.tell()
             source_exhausted = source_handle.read(1) == b""
             source_handle.seek(position)
-            final_snapshot = _assert_source_content_identity(
+            _assert_open_snapshot_unchanged(
+                source_handle,
                 source_snapshot_path,
-                source_snapshot,
+                snapshot_runtime_identity,
             )
-            manifest["configuration"]["source_snapshot"] = final_snapshot
             manifest["parts"].append(
                 {
                     "part": part,
                     "source_start_index": start_index,
                     "source_rows": len(raw_rows),
+                    "source_end_byte_offset": position,
                     "result": _jsonl_artifact(result_path),
                     "accepted": accepted_artifact,
                     "status_counts": status_counts,
@@ -2897,31 +4151,79 @@ def _translate_queue_unlocked(
             progress["next_part"] += 1
             processed_this_call += len(raw_rows)
             progress["complete"] = source_exhausted
-            review = manifest.get("teacher_review")
-            if (
-                isinstance(review, dict)
-                and review["approved"] is False
-                and (
-                    stats["generated"] >= review["pilot_rows"]
-                    or (source_exhausted and stats["generated"] > 0)
-                )
-            ):
-                review["review_required"] = True
+            _synchronize_teacher_review_state(manifest)
             manifest["updated_at"] = datetime.now(UTC).isoformat()
             _atomic_write_json(manifest_path, manifest)
             _publish_no_replace(pending_accepted_path, accepted_path)
-            _assert_source_content_identity(source_snapshot_path, source_snapshot)
+            _assert_open_snapshot_unchanged(
+                source_handle,
+                source_snapshot_path,
+                snapshot_runtime_identity,
+            )
             _assert_plain_file(accepted_path, label=f"published accepted part {part:06d}")
             if not _artifact_content_matches(accepted_path, accepted_artifact):
                 raise ValueError(f"published accepted shard failed verification: {accepted_path}")
             manifest["parts"][-1]["published"] = True
+            os.chmod(accepted_path, 0o444)
+            os.chmod(result_path, 0o444)
+            manifest["parts"][-1]["accepted"] = _refresh_artifact_runtime(
+                accepted_path,
+                cast(Mapping[str, Any], manifest["parts"][-1]["accepted"]),
+            )
+            manifest["parts"][-1]["result"] = _refresh_artifact_runtime(
+                result_path,
+                cast(Mapping[str, Any], manifest["parts"][-1]["result"]),
+            )
+            if source_exhausted:
+                final_snapshot = _assert_source_content_identity(
+                    source_snapshot_path,
+                    source_snapshot,
+                )
+                manifest["configuration"]["source_snapshot"] = final_snapshot
             manifest["updated_at"] = datetime.now(UTC).isoformat()
             _atomic_write_json(manifest_path, manifest)
-            if _materialize_training_parts(
+            publication_validation_changed = False
+            if (
+                progress["complete"]
+                and historical_part_boundary
+                and not startup_replays_every_historical_part
+            ):
+                # Local shard digests are corruption checks, not authentication.
+                # Reproduce every model decision loaded from an earlier process
+                # exactly once at the publication boundary. Parts created in
+                # this call are already authenticated by their live inference.
+                publication_validation_changed = _validate_or_register_parts(
+                    manifest,
+                    input_path=source_snapshot_path,
+                    output_dir=output_dir,
+                    accepted_dir=accepted_dir,
+                    input_stem=input_path.stem,
+                    run_lineage=run_lineage,
+                    source_identity=source,
+                    allow_legacy_registration=False,
+                    translator=translator,
+                    options=options,
+                    expected_directions=artifact_direction_list,
+                    replay_unstaged_parts=False,
+                    replay_all_parts=False,
+                    replay_before_part=historical_part_boundary,
+                )
+                if publication_validation_changed:
+                    manifest["updated_at"] = datetime.now(UTC).isoformat()
+                    _atomic_write_json(manifest_path, manifest)
+            staged_current_part = _stage_training_parts(
                 manifest,
                 accepted_dir=accepted_dir,
                 input_stem=input_path.stem,
-            ):
+                part_indices=None if progress["complete"] else (part,),
+                verify_content=progress["complete"],
+            )
+            published_training_set = _publish_complete_training_set(
+                manifest,
+                accepted_dir=accepted_dir,
+                input_stem=input_path.stem,
+            )
+            if publication_validation_changed or staged_current_part or published_training_set:
                 manifest["updated_at"] = datetime.now(UTC).isoformat()
                 _atomic_write_json(manifest_path, manifest)
             if log is not None:

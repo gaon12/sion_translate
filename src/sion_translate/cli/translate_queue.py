@@ -23,7 +23,7 @@ from sion_translate.queue_translation import (
     load_queue_run_metadata,
     translate_queue,
 )
-from sion_translate.scripts_registry import known_scripts
+from sion_translate.scripts_registry import canonicalize_script_policy_name
 
 DEFAULT_CONFIG_FILE = "sion_translate.yaml"
 DEFAULT_TEACHER_PILOT_ROWS = 1_000
@@ -52,10 +52,10 @@ def _target_script_requirement(value: str) -> tuple[str, str, int]:
         language = canonicalize_language_tag(raw_language.strip(), field="target language")
     except ValueError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from exc
-    script = raw_script.strip().lower()
-    if script not in known_scripts():
-        choices = ", ".join(known_scripts())
-        raise argparse.ArgumentTypeError(f"unknown script {script!r}; choose one of: {choices}")
+    try:
+        script = canonicalize_script_policy_name(raw_script.strip())
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
     try:
         minimum = int(raw_minimum)
     except ValueError as exc:
@@ -137,8 +137,9 @@ def build_parser() -> argparse.ArgumentParser:
         type=_target_script_requirement,
         metavar="LANGUAGE=SCRIPT:MINIMUM",
         help=(
-            "require a minimum writing-system character count for an exact BCP 47 target tag; "
-            "repeat this option for additional languages or scripts"
+            "require a minimum writing-system letter count for an exact BCP 47 target tag; "
+            "SCRIPT may be a built-in name or a Unicode script name such as bengali; repeat "
+            "this option for additional languages or scripts"
         ),
     )
     parser.add_argument("--min-structured-similarity", type=float, default=1.0)
