@@ -1,4 +1,4 @@
-"""자동 설정(sion_translate.auto)과 EMA 의 동작 검증."""
+"""Tests for automatic configuration and exponential moving averages."""
 
 from __future__ import annotations
 
@@ -12,9 +12,11 @@ import torch
 import sion_translate.auto as auto_module
 from sion_translate.auto import (
     EnvironmentInfo,
+    MODEL_SIZE_KEYS,
     _all_devices_support_native_bf16,
     apply_auto_settings,
     backup_stale_dataset,
+    buffered_model_promotion_threshold,
     pick_model_preset,
     pick_parallel_strategy,
     pick_vocab_size,
@@ -51,6 +53,12 @@ def gpu_environment(vram: float = 24.0, world_size: int = 8) -> EnvironmentInfo:
         cpu_count=32,
         os_name="Linux",
     )
+
+
+def explicit_architecture(config: AppConfig) -> dict[str, int]:
+    """Return one complete architecture override for auto-setting tests."""
+
+    return {key: int(getattr(config.model, key)) for key in MODEL_SIZE_KEYS}
 
 
 def test_stale_dataset_backups_cannot_collide_or_nest(tmp_path: Path) -> None:
@@ -112,21 +120,64 @@ def test_model_preset_scales_with_data() -> None:
     assert pick_vocab_size(11_000_000) == 48_000
 
 
+@pytest.mark.parametrize(
+    ("pair_count", "expected_name"),
+    [
+        (209_999, "small"),
+        (210_000, "medium"),
+        (3_149_999, "medium"),
+        (3_150_000, "base"),
+        (31_499_999, "base"),
+        (31_500_000, "large"),
+        (104_999_999, "large"),
+        (105_000_000, "xlarge"),
+    ],
+)
+def test_model_preset_promotes_only_after_the_five_percent_buffer(
+    pair_count: int,
+    expected_name: str,
+) -> None:
+    assert pick_model_preset(pair_count)[0] == expected_name
+
+
+def test_half_million_pair_growth_near_the_nominal_base_boundary_does_not_promote() -> None:
+    assert pick_model_preset(29_750_000)[0] == "base"
+    assert pick_model_preset(30_250_000)[0] == "base"
+    assert buffered_model_promotion_threshold(30_000_000) == 31_500_000
+
+
+@pytest.mark.parametrize("invalid", [-1, True, False, 1.5])
+def test_model_preset_rejects_invalid_pair_counts(invalid: object) -> None:
+    expected = ValueError if invalid == -1 else TypeError
+    with pytest.raises(expected):
+        pick_model_preset(invalid)  # type: ignore[arg-type]
+
+
+def test_model_preset_has_an_unbounded_deterministic_final_tier() -> None:
+    first_name, first_values = pick_model_preset(10**30)
+    first_values["d_model"] = -1
+    second_name, second_values = pick_model_preset(10**30)
+
+    assert first_name == second_name == "xlarge"
+    assert second_values["d_model"] == 1280
+
+
 def test_auto_settings_fill_unspecified_fields() -> None:
     config = AppConfig()
+    config.data.language_pair = ["ko", "ja"]
     decisions = apply_auto_settings(
         config,
         raw={},
         env=gpu_environment(),
-        train_examples=22_000_000,  # 양방향 포함 (11M쌍)
+        train_examples=22_000_000,  # Includes both directions for 11M physical pairs.
         validation_examples=110_000,
     )
     assert decisions
-    assert config.model.d_model == 768  # 11M쌍 → base 프리셋
+    assert config.model.d_model == 768  # 11M pairs select the base preset.
     assert config.training.precision == "bf16"
     assert config.model.gradient_checkpointing is True
-    assert config.training.batch_size_per_gpu == 8  # 24GiB 기준
-    # effective batch 가 목표(256) 근처가 되도록 accumulation 조정
+    assert config.training.batch_size_per_gpu == 8  # Selected for 24 GiB.
+    # Accumulation keeps the effective batch at the target of 256.
     effective = config.training.batch_size_per_gpu * 8 * config.training.gradient_accumulation_steps
     assert effective == 256
     assert config.training.num_train_epochs == 3
@@ -156,7 +207,10 @@ def test_auto_settings_respect_user_values() -> None:
     config = AppConfig()
     config.training.max_steps = 777
     config.model.d_model = 512
-    raw = {"training": {"max_steps": 777}, "model": {"d_model": 512}}
+    raw = {
+        "training": {"max_steps": 777},
+        "model": explicit_architecture(config),
+    }
     apply_auto_settings(
         config,
         raw=raw,
@@ -164,9 +218,21 @@ def test_auto_settings_respect_user_values() -> None:
         train_examples=1000,
         validation_examples=100,
     )
-    # 사용자가 직접 적은 값은 자동 설정이 덮어쓰지 않는다.
+    # Automatic settings never overwrite explicit user values.
     assert config.training.max_steps == 777
     assert config.model.d_model == 512
+
+
+def test_auto_settings_reject_partial_manual_architecture_overrides() -> None:
+    config = AppConfig()
+    with pytest.raises(ValueError, match="every preset-defining key"):
+        apply_auto_settings(
+            config,
+            raw={"model": {"d_model": 768}},
+            env=cpu_environment(),
+            train_examples=1_000_000,
+            validation_examples=10_000,
+        )
 
 
 def test_h100_defaults_leave_memory_headroom_without_checkpointing() -> None:
@@ -235,7 +301,7 @@ def test_explicit_auto_parallel_strategy_uses_environment_picker() -> None:
     apply_auto_settings(
         config,
         raw={
-            "model": {"d_model": 1024},
+            "model": explicit_architecture(config),
             "training": {"parallel_strategy": "auto"},
         },
         env=gpu_environment(vram=24.0, world_size=4),
@@ -251,7 +317,7 @@ def test_multi_h100_fsdp2_keeps_resharding_unless_explicitly_disabled() -> None:
     config.model.d_model = 1280
     apply_auto_settings(
         config,
-        raw={"model": {"d_model": 1280}},
+        raw={"model": explicit_architecture(config)},
         env=env,
         train_examples=400_000_000,
         validation_examples=110_000,
@@ -265,7 +331,7 @@ def test_multi_h100_fsdp2_keeps_resharding_unless_explicitly_disabled() -> None:
     apply_auto_settings(
         explicit,
         raw={
-            "model": {"d_model": 1280},
+            "model": explicit_architecture(explicit),
             "training": {"reshard_after_forward": False},
         },
         env=env,
@@ -298,8 +364,8 @@ def test_auto_downweights_synthetic_sources() -> None:
         "revise_legal.jsonl": 0.5,
         "synthetic_numeric_data38.jsonl": 0.5,
     }
-    assert any("합성" in line for line in decisions)
-    # 사용자가 직접 가중치를 정했으면 손대지 않는다.
+    assert any("Synthetic sampling" in line for line in decisions)
+    # Preserve an explicit user sampling policy.
     config2 = AppConfig()
     config2.data.source_sampling_weights = {"bt_news.jsonl": 0.9}
     apply_auto_settings(
@@ -340,7 +406,7 @@ def test_fingerprint_detects_data_changes(tmp_path: Path) -> None:
     assert dict(first) == {"a.jsonl": (data_dir / "a.jsonl").stat().st_size}
     assert not (dataset_dir / "raw_fingerprint.json.tmp").exists()
 
-    # 같은 바이트 수로 내용을 바꿔도 SHA-256이 달라져 재준비 대상이다.
+    # A same-size content change still changes SHA-256 and forces preparation.
     (data_dir / "a.jsonl").write_text("y\n", encoding="utf-8")
     changed = scan_raw_data(
         data_dir,
@@ -413,7 +479,7 @@ def test_ema_tracks_and_swaps() -> None:
     # shadow = 0.5*0 + 0.5*1 = 0.5
     shadow = ema.shadow["weight"]
     assert torch.allclose(shadow, torch.full_like(shadow, 0.5))
-    # swap 블록 안에서는 EMA 값, 나가면 원래 값으로 복원
+    # The swap block exposes EMA values and restores the original values on exit.
     with ema.swap(model):
         assert torch.allclose(model.weight, torch.full_like(model.weight, 0.5))
     assert torch.allclose(model.weight, torch.full_like(model.weight, 1.0))

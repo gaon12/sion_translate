@@ -1,14 +1,12 @@
-"""자동 설정(auto-configuration).
+"""Environment-aware defaults for zero-argument training.
 
-목표: 인자 없이 ``sion-train`` 만 실행하면
-  ① 실행 환경(GPU 수·VRAM·bf16 지원·CPU 코어)을 스스로 인식하고,
-  ② ``data/`` 의 원천 JSONL 을 스스로 찾아(추가·변경도 감지)
-     토크나이저 학습과 데이터 준비까지 자동으로 수행하며,
-  ③ 데이터 규모에 맞춰 모델 크기·step 수·배치 등 수치를 자동으로 정하도록
-합니다.
+The automatic pipeline detects available accelerators, memory, BF16 support,
+and CPU capacity; fingerprints raw JSONL inputs; prepares the tokenizer and
+indexed datasets when inputs change; and chooses model, batch, and schedule
+settings from the resulting data scale.
 
-사용자가 프로젝트 루트의 ``sion_translate.yaml`` 에 적은 값은 항상 자동값보다
-우선합니다. 즉 sion_translate.yaml 은 '바꾸고 싶은 것만 적는 얇은 override 파일'입니다.
+Explicit values in ``sion_translate.yaml`` always take precedence. The project
+configuration can therefore remain a small, intentional override file.
 """
 
 # CUDA device properties and YAML payloads are dynamically typed boundaries.
@@ -38,23 +36,21 @@ from sion_translate.fingerprint import (
 )
 from sion_translate.performance import available_cpu_count
 
-# ──────────────────────────────────────────────────────────────────────────
-# ① 실행 환경 인식
-# ──────────────────────────────────────────────────────────────────────────
+# Environment discovery
 
 
 @dataclass(frozen=True)
 class EnvironmentInfo:
-    """학습 수치를 정하는 데 필요한 하드웨어/실행 환경 요약."""
+    """Hardware and process properties used to choose training settings."""
 
-    cuda: bool  # CUDA GPU 사용 가능 여부
-    world_size: int  # torchrun 이 띄운 프로세스 수 (단일 실행이면 1)
-    device_count: int  # 이 머신에서 보이는 GPU 수
-    device_name: str  # 대표 GPU 이름 (없으면 "CPU")
-    min_vram_gib: float  # 가장 작은 GPU 의 메모리(GiB) — 배치 크기 기준
-    bf16: bool  # bfloat16 연산 지원 여부
-    cpu_count: int  # 논리 CPU 코어 수
-    os_name: str  # "Windows" / "Linux" / "Darwin"
+    cuda: bool  # Whether a CUDA accelerator is available.
+    world_size: int  # Number of processes launched by torchrun; one otherwise.
+    device_count: int  # Number of GPUs visible on this machine.
+    device_name: str  # Representative GPU name, or "CPU".
+    min_vram_gib: float  # Memory of the smallest GPU, used for safe batch sizing.
+    bf16: bool  # Whether every visible accelerator supports native BF16.
+    cpu_count: int  # Available logical CPU count.
+    os_name: str  # "Windows", "Linux", or "Darwin".
 
 
 def _all_devices_support_native_bf16(properties: Sequence[Any]) -> bool:
@@ -68,7 +64,7 @@ def _all_devices_support_native_bf16(properties: Sequence[Any]) -> bool:
 
 
 def probe_environment() -> EnvironmentInfo:
-    """현재 머신의 하드웨어를 조사합니다."""
+    """Inspect the local hardware and distributed process environment."""
     cuda = torch.cuda.is_available()
     device_count = torch.cuda.device_count() if cuda else 0
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -118,19 +114,17 @@ def synchronize_environment(
 
 
 def describe_environment(env: EnvironmentInfo) -> str:
-    """사람이 읽기 좋은 한 줄 요약."""
+    """Return a concise, human-readable environment summary."""
     if env.cuda:
         return (
-            f"GPU {env.device_count}개 ({env.device_name}, "
-            f"최소 {env.min_vram_gib:.0f}GiB), 프로세스 {env.world_size}개, "
-            f"bf16 {'지원' if env.bf16 else '미지원'}, CPU {env.cpu_count}코어"
+            f"{env.device_count} GPU(s) ({env.device_name}, minimum "
+            f"{env.min_vram_gib:.0f} GiB), {env.world_size} process(es), "
+            f"BF16 {'supported' if env.bf16 else 'unsupported'}, {env.cpu_count} CPU(s)"
         )
-    return f"GPU 없음 (CPU {env.cpu_count}코어, {env.os_name})"
+    return f"No GPU ({env.cpu_count} CPU(s), {env.os_name})"
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# ② 원천 데이터 인식 (추가/변경 감지)
-# ──────────────────────────────────────────────────────────────────────────
+# Raw-data discovery and change detection
 
 FINGERPRINT_FILENAME = "raw_fingerprint.json"
 
@@ -163,7 +157,7 @@ def scan_raw_data(
 def stored_fingerprint(
     dataset_dir: str | Path,
 ) -> DatasetFingerprint | dict[str, int] | None:
-    """이전 준비 때 기록해 둔 데이터 지문을 읽습니다 (없으면 None)."""
+    """Read the fingerprint from a previous preparation, if one exists."""
     path = Path(dataset_dir) / FINGERPRINT_FILENAME
     if not path.exists():
         return None
@@ -189,7 +183,7 @@ def write_fingerprint(
     dataset_dir: str | Path,
     fingerprint: DatasetFingerprint | Mapping[str, int],
 ) -> None:
-    """준비가 끝난 데이터셋 디렉터리에 지문을 기록합니다."""
+    """Record a completed dataset generation's raw-data fingerprint."""
     payload = (
         fingerprint.to_dict() if isinstance(fingerprint, DatasetFingerprint) else dict(fingerprint)
     )
@@ -203,9 +197,10 @@ def write_fingerprint(
 
 
 def backup_stale_dataset(dataset_dir: str | Path) -> Path:
-    """원천 데이터가 바뀌어 못 쓰게 된 기존 데이터셋을 옆으로 치워 둡니다.
+    """Move an incompatible prepared dataset to a recoverable sibling path.
 
-    삭제하지 않고 이름을 바꿔 보관하므로, 필요하면 수동으로 되돌릴 수 있습니다.
+    The operation retains the old generation instead of deleting it, so an
+    operator can restore it manually when needed.
     """
     dataset_dir = Path(dataset_dir)
     if not dataset_dir.exists() and not dataset_dir.is_symlink():
@@ -226,32 +221,40 @@ def backup_stale_dataset(dataset_dir: str | Path) -> Path:
 
 
 def estimate_pair_count(files: Mapping[str, int], data_dir: str | Path) -> int:
-    """원천 JSONL 의 행 수(≒ 번역쌍 수)를 빠르게 셉니다.
+    """Count raw JSONL rows as a fast approximation of parallel pair count.
 
-    토크나이저 vocab 크기를 정할 때 한 번만 사용합니다. 줄바꿈 문자를
-    큰 버퍼 단위로 세므로 수 GiB 도 수십 초 안에 끝납니다.
+    This runs once when selecting the tokenizer vocabulary size. Counting
+    newline bytes in large blocks avoids parsing multi-gigabyte files.
     """
     data_dir = Path(data_dir)
     total = 0
     for name in files:
         with (data_dir / name).open("rb") as handle:
-            while chunk := handle.read(1 << 22):  # 4 MiB 씩
+            while chunk := handle.read(1 << 22):  # Read 4 MiB per iteration.
                 total += chunk.count(b"\n")
     return total
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# ③ 데이터 규모·환경 기반 자동 수치 결정
-# ──────────────────────────────────────────────────────────────────────────
+# Data- and environment-aware defaults
 
-# 데이터 양에 맞는 모델 크기 프리셋.
-# 데이터가 적은데 모델이 크면 과적합, 반대면 과소적합이 되므로
-# '번역쌍 수' 구간별로 적정 크기를 고릅니다.
-MODEL_PRESETS: list[tuple[int, str, dict[str, int]]] = [
-    # (이 값 미만의 번역쌍 수, 프리셋 이름, 모델 설정)
+# Nominal boundaries describe the original data-fit policy. A promotion buffer
+# keeps small corpus changes from doubling model capacity at a sharp boundary.
+# The final preset is intentionally unbounded.
+MODEL_PROMOTION_BUFFER_PERCENT = 5
+MODEL_PROMOTION_BUFFER_RATIO = MODEL_PROMOTION_BUFFER_PERCENT / 100
+MODEL_SIZE_KEYS = (
+    "d_model",
+    "encoder_layers",
+    "decoder_layers",
+    "num_heads",
+    "num_kv_heads",
+    "d_ff",
+)
+MODEL_PRESETS: tuple[tuple[int | None, str, dict[str, int]], ...] = (
+    # (nominal upper boundary, stable preset name, model settings)
     (
         200_000,
-        "small(~60M)",
+        "small",
         dict(
             d_model=512,
             encoder_layers=8,
@@ -263,7 +266,7 @@ MODEL_PRESETS: list[tuple[int, str, dict[str, int]]] = [
     ),
     (
         3_000_000,
-        "medium(~120M)",
+        "medium",
         dict(
             d_model=640,
             encoder_layers=12,
@@ -275,7 +278,7 @@ MODEL_PRESETS: list[tuple[int, str, dict[str, int]]] = [
     ),
     (
         30_000_000,
-        "base(~200M)",
+        "base",
         dict(
             d_model=768,
             encoder_layers=16,
@@ -287,7 +290,7 @@ MODEL_PRESETS: list[tuple[int, str, dict[str, int]]] = [
     ),
     (
         100_000_000,
-        "large(~450M)",
+        "large",
         dict(
             d_model=1024,
             encoder_layers=20,
@@ -298,8 +301,8 @@ MODEL_PRESETS: list[tuple[int, str, dict[str, int]]] = [
         ),
     ),
     (
-        10**12,
-        "xlarge(~900M)",
+        None,
+        "xlarge",
         dict(
             d_model=1280,
             encoder_layers=24,
@@ -309,16 +312,18 @@ MODEL_PRESETS: list[tuple[int, str, dict[str, int]]] = [
             d_ff=3584,
         ),
     ),
-]
+)
 
-# update 당 목표 시퀀스 수 (배치 × GPU 수 × accumulation)
+# Target sequences per optimizer update: batch times ranks times accumulation.
 TARGET_EFFECTIVE_BATCH = 256
 
 
 def target_epochs(pair_count: int) -> int:
-    """corpus 통과 목표 횟수. 데이터가 커질수록 적은 epoch 으로 충분하므로
-    (매 step 새 데이터를 보게 됨) step 예산이 데이터에 선형으로 폭주하지
-    않도록 낮춥니다. early stopping 이 있어 넉넉해도 낭비되지 않습니다."""
+    """Choose complete corpus passes without allowing the step budget to explode.
+
+    Larger datasets expose new examples on nearly every update and therefore
+    need fewer passes. Early stopping can still end an over-provisioned budget.
+    """
     if pair_count < 500_000:
         return 8
     if pair_count < 5_000_000:
@@ -327,13 +332,13 @@ def target_epochs(pair_count: int) -> int:
         return 3
     if pair_count < 100_000_000:
         return 2
-    # 공식 학습은 epoch 중간에서 끊지 않습니다. 초대형 corpus도 두 번은
-    # 완주해 첫 pass의 순서/초기화 편향을 다음 shuffle에서 다시 보게 합니다.
+    # Complete at least two shuffled passes, even for very large corpora, so the
+    # second pass can counter initialization and first-order ordering effects.
     return 2
 
 
 def pick_vocab_size(pair_estimate: int) -> int:
-    """corpus 크기에 맞는 SentencePiece vocab 크기."""
+    """Choose a SentencePiece vocabulary size from the corpus scale."""
     if pair_estimate < 200_000:
         return 16_000
     if pair_estimate < 3_000_000:
@@ -343,21 +348,50 @@ def pick_vocab_size(pair_estimate: int) -> int:
     return 64_000
 
 
+def buffered_model_promotion_threshold(nominal_threshold: int) -> int:
+    """Return the first pair count that promotes beyond a nominal boundary."""
+
+    if type(nominal_threshold) is not int:
+        raise TypeError("nominal_threshold must be an integer")
+    if nominal_threshold <= 0:
+        raise ValueError("nominal_threshold must be positive")
+    return (nominal_threshold * (100 + MODEL_PROMOTION_BUFFER_PERCENT) + 99) // 100
+
+
+def _validated_pair_count(pair_count: int) -> int:
+    if type(pair_count) is not int:
+        raise TypeError("pair_count must be a non-negative integer")
+    if pair_count < 0:
+        raise ValueError("pair_count must be non-negative")
+    return pair_count
+
+
+def _selected_model_preset_index(pair_count: int) -> int:
+    count = _validated_pair_count(pair_count)
+    for index, (nominal_threshold, _name, _preset) in enumerate(MODEL_PRESETS):
+        if nominal_threshold is None:
+            return index
+        if count < buffered_model_promotion_threshold(nominal_threshold):
+            return index
+    raise AssertionError("MODEL_PRESETS must end with an unbounded preset")
+
+
 def pick_model_preset(pair_count: int) -> tuple[str, dict[str, int]]:
-    for threshold, name, preset in MODEL_PRESETS:
-        if pair_count < threshold:
-            return name, preset
-    raise AssertionError("unreachable")
+    """Select a deterministic preset after applying the promotion buffer."""
+
+    _threshold, name, preset = MODEL_PRESETS[_selected_model_preset_index(pair_count)]
+    return name, dict(preset)
 
 
 def pick_batch_size(env: EnvironmentInfo, d_model: int) -> int:
-    """GPU 메모리(GiB)와 모델 폭으로 GPU당 배치 크기를 고릅니다.
+    """Choose a per-GPU batch size from memory and model width.
 
-    max_seq_len 512, gradient checkpointing 활성 기준의 보수적인 값입니다.
-    OOM 이 나면 sion_translate.yaml 의 training.batch_size_per_gpu 로 낮추면 됩니다.
+    Values are conservative for 512-token sequences with activation
+    checkpointing. Explicit ``training.batch_size_per_gpu`` remains available
+    when a workload needs more headroom.
     """
     if not env.cuda:
-        return 2  # CPU 는 스모크 테스트 용도
+        return 2  # CPU execution is intended for smoke tests.
     vram = env.min_vram_gib
     if vram >= 70:
         # 80 GiB-class cards run the baseline without checkpointing by default.
@@ -374,7 +408,7 @@ def pick_batch_size(env: EnvironmentInfo, d_model: int) -> int:
         base = 2
     else:
         base = 1
-    # base 프리셋(768)보다 큰 모델이면 배치를 줄입니다.
+    # Reduce the batch above the 768-wide base preset.
     if d_model > 1024:
         base = max(1, base // 4)
     elif d_model > 768:
@@ -408,11 +442,11 @@ def apply_auto_settings(
     physical_train_pairs: int | None = None,
     source_names: list[str] | None = None,
 ) -> list[str]:
-    """사용자가 sion_translate.yaml 에 적지 않은 항목을 자동값으로 채웁니다.
+    """Fill settings that the user did not specify in ``sion_translate.yaml``.
 
-    ``raw`` 는 sion_translate.yaml 을 그대로 읽은 dict 로, '어떤 키를 사용자가 직접
-    적었는지'를 판단하는 데 씁니다 (적은 값은 절대 덮어쓰지 않습니다).
-    반환값은 자동으로 결정된 항목의 사람이 읽을 요약 목록입니다.
+    ``raw`` retains key presence from the source configuration so explicit
+    values are never overwritten. The return value contains readable summaries
+    of every automatic decision.
     """
     raw_model = dict(raw.get("model") or {})
     raw_training = dict(raw.get("training") or {})
@@ -420,37 +454,53 @@ def apply_auto_settings(
     decisions: list[str] = []
 
     def auto(section: dict[str, Any], key: str) -> bool:
-        """해당 키를 사용자가 적지 않았으면 True (= 자동 결정 대상)."""
+        """Return whether a key is eligible for automatic configuration."""
         return key not in section
 
-    pair_count = (
+    pair_count = _validated_pair_count(
         physical_train_pairs
         if physical_train_pairs is not None
         else train_examples // (2 if config.data.bidirectional else 1)
     )
 
-    # ── 모델 크기: 데이터 양 기준 프리셋 ────────────────────────────────
-    size_keys = ("d_model", "encoder_layers", "decoder_layers", "num_heads", "num_kv_heads", "d_ff")
-    if all(auto(raw_model, key) for key in size_keys):
+    # Model capacity follows physical pair count, not expanded virtual directions.
+    explicit_size_keys = tuple(key for key in MODEL_SIZE_KEYS if key in raw_model)
+    if explicit_size_keys and len(explicit_size_keys) != len(MODEL_SIZE_KEYS):
+        missing = tuple(key for key in MODEL_SIZE_KEYS if key not in raw_model)
+        raise ValueError(
+            "Manual model architecture overrides must provide every preset-defining key. "
+            f"Provided: {explicit_size_keys}; missing: {missing}."
+        )
+    if not explicit_size_keys:
         name, preset = pick_model_preset(pair_count)
         for key, value in preset.items():
             setattr(config.model, key, value)
-        decisions.append(f"모델 크기: {name} — 학습쌍 {pair_count:,}개 기준")
+        preset_index = _selected_model_preset_index(pair_count)
+        nominal_next = MODEL_PRESETS[preset_index][0]
+        next_note = (
+            f"; next promotion at {buffered_model_promotion_threshold(nominal_next):,}"
+            if nominal_next is not None
+            else "; final unbounded tier"
+        )
+        decisions.append(
+            f"Model preset: {name} for {pair_count:,} physical training pairs "
+            f"({MODEL_PROMOTION_BUFFER_RATIO:.0%} promotion buffer{next_note})"
+        )
     if auto(raw_model, "gradient_checkpointing"):
         config.model.gradient_checkpointing = env.cuda and env.min_vram_gib < 70
         if config.model.gradient_checkpointing:
-            decisions.append("activation checkpointing: 활성 (70GiB 미만 GPU 메모리 보호)")
+            decisions.append("Activation checkpointing: enabled to protect GPUs below 70 GiB")
 
-    # ── 정밀도: bf16 > fp16 > fp32 ──────────────────────────────────────
+    # Precision preference: BF16, then FP16, then FP32.
     if auto(raw_training, "precision"):
         config.training.precision = "bf16" if env.bf16 else ("fp16" if env.cuda else "fp32")
-        decisions.append(f"정밀도: {config.training.precision}")
+        decisions.append(f"Precision: {config.training.precision}")
 
-    # ── 배치/accumulation: VRAM 과 목표 effective batch 기준 ───────────
+    # Batch and accumulation target a stable effective batch across hardware.
     if auto(raw_training, "batch_size_per_gpu"):
         config.training.batch_size_per_gpu = pick_batch_size(env, config.model.d_model)
-        basis = f"VRAM {env.min_vram_gib:.0f}GiB 기준" if env.cuda else "CPU 스모크 기준"
-        decisions.append(f"GPU당 배치: {config.training.batch_size_per_gpu} ({basis})")
+        basis = f"{env.min_vram_gib:.0f} GiB VRAM" if env.cuda else "CPU smoke-test policy"
+        decisions.append(f"Per-device batch: {config.training.batch_size_per_gpu} ({basis})")
     if auto(raw_training, "gradient_accumulation_steps"):
         per_update = config.training.batch_size_per_gpu * env.world_size
         config.training.gradient_accumulation_steps = max(
@@ -462,7 +512,7 @@ def apply_auto_settings(
             f"(effective batch {effective} sequences/update)"
         )
 
-    # ── epoch 예산: corpus를 중간에서 자르지 않고 N번 완주 ─────────────
+    # Use complete epochs instead of truncating the corpus at an arbitrary step.
     batches_per_epoch = math.ceil(
         train_examples / max(1, config.training.batch_size_per_gpu * env.world_size)
     )
@@ -473,7 +523,7 @@ def apply_auto_settings(
         config.training.max_steps = None
         decisions.append(
             f"num_train_epochs: {epochs} "
-            f"(epoch당 약 {steps_per_epoch:,} optimizer step, 전체 corpus 완주 기준)"
+            f"(about {steps_per_epoch:,} optimizer steps per complete corpus pass)"
         )
     planned_steps = config.training.max_steps or (
         config.training.num_train_epochs * steps_per_epoch
@@ -483,7 +533,7 @@ def apply_auto_settings(
         config.training.warmup_steps = min(config.training.warmup_steps, planned_steps)
         decisions.append(f"warmup_steps: {config.training.warmup_steps:,}")
 
-    # ── 검증/저장 주기: epoch 길이에 비례 ───────────────────────────────
+    # Scale validation and checkpoint cadence with epoch length.
     if auto(raw_training, "eval_every"):
         config.training.eval_every = _clamp(steps_per_epoch // 8, 50, 2500)
         decisions.append(f"eval_every: {config.training.eval_every:,}")
@@ -496,7 +546,7 @@ def apply_auto_settings(
         config.training.eval_batches = _clamp(needed, 8, 200)
         decisions.append(f"eval_batches: {config.training.eval_batches}")
 
-    # ── 실행 방식 ───────────────────────────────────────────────────────
+    # Execution strategy.
     # ``parallel_strategy: auto`` is an explicit request for the environment
     # picker, not a request to leave the generic DDP fallback unresolved.
     if config.training.parallel_strategy.lower() == "auto" and auto(raw_training, "fsdp2"):
@@ -505,7 +555,7 @@ def apply_auto_settings(
             config.model.d_model,
         )
         if env.world_size > 1:
-            decisions.append(f"다중 GPU 병렬화: {config.training.parallel_strategy.upper()}")
+            decisions.append(f"Multi-GPU strategy: {config.training.parallel_strategy.upper()}")
     if auto(raw_training, "fsdp_reduce_dtype"):
         config.training.fsdp_reduce_dtype = "bf16" if env.bf16 else "fp32"
     if auto(raw_training, "reshard_after_forward"):
@@ -523,10 +573,8 @@ def apply_auto_settings(
         config.data.num_workers = min(16, max(0, per_rank - 1))
         decisions.append(f"DataLoader workers: {config.data.num_workers}")
 
-    # ── 합성(역번역) 데이터 자동 다운웨이트 ────────────────────────────
-    # 합성 데이터가 실데이터와 같은 비중으로 섞이면 모델이 자기 출력의
-    # 오류 패턴을 학습할 수 있으므로, 사용자가 직접 가중치를 정하지 않은 한
-    # 합성 출처의 샘플링 비중을 절반으로 낮춥니다.
+    # Downweight synthetic sources unless the user supplies an explicit policy.
+    # Equal weighting can amplify systematic errors from a model's own output.
     if auto(raw_data, "source_sampling_weights") and source_names:
         prefixes = config.data.configured_synthetic_prefixes()
         synthetic = [name for name in source_names if name.startswith(prefixes)]
@@ -534,8 +582,8 @@ def apply_auto_settings(
             weight = config.data.synthetic_sampling_weight
             config.data.source_sampling_weights = {name: weight for name in synthetic}
             decisions.append(
-                f"합성 데이터 가중치: {len(synthetic)}개 출처"
-                f"({', '.join(prefixes)}*) × {weight:g} 다운웨이트"
+                f"Synthetic sampling: {len(synthetic)} source(s) matching "
+                f"{', '.join(prefixes)}* weighted by {weight:g}"
             )
 
     return decisions
