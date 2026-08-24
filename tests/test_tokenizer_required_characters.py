@@ -41,13 +41,13 @@ def test_whitespace_is_never_required() -> None:
 
 
 def test_the_sentencepiece_unknown_character_is_never_required() -> None:
-    """실측 실패. ⁇ 하나가 코퍼스 전체를 읽은 뒤에 학습을 죽인다.
+    """Reproduce a measured failure where one ⁇ aborts training after a full scan.
 
-    U+2047 은 SentencePiece 가 unknown 조각을 찍을 때 쓰는 문자라
-    ``required_chars`` 로 넘기면 트레이너가 assert 로 죽습니다
-    (``[!port::ContainsKey(required_chars_, kUNKChar)]``). 단일어 웹 코퍼스에
-    이 문자가 임계값을 넘겨 들어 있었고, 실패는 코퍼스 스캔이 끝난 뒤에야
-    났습니다 — 빌린 CPU 시간을 다 쓰고 난 다음입니다.
+    SentencePiece uses U+2047 to render its unknown piece. Passing it through
+    ``required_chars`` triggers the trainer assertion
+    ``[!port::ContainsKey(required_chars_, kUNKChar)]``. A monolingual web corpus
+    contained it above the threshold, and failure occurred only after scanning
+    the complete corpus, wasting all allocated CPU time.
     """
 
     counts = Counter({"⁇": 10**6, "가": 100})
@@ -55,12 +55,12 @@ def test_the_sentencepiece_unknown_character_is_never_required() -> None:
 
 
 def test_the_verifier_finds_a_character_sentencepiece_will_not_take() -> None:
-    """규칙을 추측하지 않고 SentencePiece 에게 직접 묻는다.
+    """Ask SentencePiece directly instead of guessing its acceptance rules.
 
-    U+2585 는 실제 실패를 이분 탐색해서 찾은 문자입니다. ``kUNKChar`` 도 아니고
-    공백 기호 U+2581 도 아니며, 이웃한 블록 문자는 전부 통과합니다. 설명되지
-    않는 거부가 존재하는 이상 목록을 손으로 관리하는 것은 다음 코퍼스에서 또
-    무너집니다.
+    U+2585 was isolated by bisecting a real failure. It is neither ``kUNKChar``
+    nor the U+2581 whitespace symbol, and neighboring block elements all pass.
+    Because unexplained rejection exists, maintaining a manual list would fail
+    again on a future corpus.
     """
 
     accepted, refused = acceptable_required_characters(list("가나▅다"))
@@ -78,7 +78,7 @@ def test_the_verifier_leaves_a_clean_set_alone() -> None:
 
 
 def test_the_known_rejects_are_filtered_before_the_probe_runs() -> None:
-    """확인된 것은 목록으로 빠르게 걸러 탐색 횟수를 줄인다."""
+    """Filter known rejects cheaply before probing to reduce the number of trials."""
 
     counts = Counter({character: 10**6 for character in SENTENCEPIECE_RESERVED_CHARACTERS})
     counts["가"] = 100
@@ -253,13 +253,13 @@ def test_full_coverage_is_rejected_because_it_disables_the_other_two_mechanisms(
     tmp_path,
     monkeypatch,
 ) -> None:
-    """``character_coverage=1.0`` 은 required_chars 와 byte fallback 을 동시에 무력화한다.
+    """``character_coverage=1.0`` defeats required characters and byte fallback.
 
-    코퍼스의 모든 문자를 어휘에 넣으므로 (a) required_chars 가 이미 포함된
-    부분집합이 되고, (b) byte fallback 256 조각이 발화할 대상을 잃고,
-    (c) GPU 시간 앞의 byte fallback 비율 관문이 정의상 통과합니다.
-    실측: 8,978,338 레코드 코퍼스에서 distinct 문자 10,760개 중 4,275개가
-    25회 미만입니다.
+    It puts every corpus character into the vocabulary, making required
+    characters an already included subset, leaving the 256 byte-fallback pieces
+    nothing to encode, and making the pre-GPU byte-fallback ratio gate pass by
+    definition. In 8,978,338 measured records, 4,275 of 10,760 distinct
+    characters occurred fewer than 25 times.
     """
     import sion_translate.tokenizer as tokenizer_module
 
@@ -285,7 +285,7 @@ def test_full_coverage_is_allowed_when_the_frequency_floor_is_opted_out(
     tmp_path,
     monkeypatch,
 ) -> None:
-    """두 장치 중 하나만 쓰겠다는 명시적 선택은 막지 않는다."""
+    """Allow an explicit choice to use only one of the two mechanisms."""
     import sion_translate.tokenizer as tokenizer_module
 
     trained: list[dict] = []
