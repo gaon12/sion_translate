@@ -313,6 +313,76 @@ def test_multi_pair_preference_loss_uses_reward_ordering() -> None:
     assert reversed_scores.grad is not None
 
 
+def test_reference_preference_preserves_sequence_gradient_when_rewards_tie() -> None:
+    objective = MinimumRiskObjective(TextTokenizer(), PostTrainingConfig())
+    generated_scores = torch.tensor([[0.0, 0.0]], requires_grad=True)
+    reference_scores = torch.tensor([0.0], requires_grad=True)
+    candidate_labels = torch.tensor([[[20, 22, 3], [23, 21, 3]]])
+    reference_labels = torch.tensor([[20, 21, 3]])
+    tied_rewards = torch.tensor([[0.5, 0.5]])
+
+    candidate_loss, pair_weight = objective._pairwise_preference_loss(
+        generated_scores,
+        tied_rewards,
+    )
+    anchor_loss, margin, violation_rate, comparisons = objective._reference_preference_loss(
+        generated_scores,
+        reference_scores,
+        candidate_labels,
+        reference_labels,
+    )
+
+    assert candidate_loss.item() == 0.0
+    assert pair_weight.item() == 0.0
+    assert anchor_loss.item() == pytest.approx(torch.log(torch.tensor(2.0)).item())
+    assert margin.item() == 0.0
+    assert violation_rate.item() == 1.0
+    assert comparisons.item() == 2.0
+    anchor_loss.backward()
+    assert reference_scores.grad is not None
+    assert reference_scores.grad.item() < 0.0
+    assert generated_scores.grad is not None
+    assert torch.all(generated_scores.grad > 0.0)
+
+
+def test_reference_preference_excludes_exact_gold_duplicates() -> None:
+    objective = MinimumRiskObjective(TextTokenizer(), PostTrainingConfig())
+    generated_scores = torch.tensor([[0.0, -0.5]], requires_grad=True)
+    reference_scores = torch.tensor([0.0], requires_grad=True)
+    reference_labels = torch.tensor([[20, 21, 3]])
+    candidate_labels = torch.tensor([[[20, 21, 3], [20, 22, 3]]])
+
+    loss, margin, violation_rate, comparisons = objective._reference_preference_loss(
+        generated_scores,
+        reference_scores,
+        candidate_labels,
+        reference_labels,
+    )
+
+    assert loss.item() == pytest.approx(F.softplus(torch.tensor(-0.5)).item())
+    assert margin.item() == pytest.approx(0.5)
+    assert violation_rate.item() == 0.0
+    assert comparisons.item() == 1.0
+    loss.backward()
+    assert generated_scores.grad is not None
+    assert generated_scores.grad[0, 0].item() == 0.0
+    assert generated_scores.grad[0, 1].item() > 0.0
+
+
+def test_reference_preference_rejects_non_finite_sequence_scores() -> None:
+    objective = MinimumRiskObjective(TextTokenizer(), PostTrainingConfig())
+    candidate_labels = torch.tensor([[[20, 22, 3]]])
+    reference_labels = torch.tensor([[20, 21, 3]])
+
+    with pytest.raises(FloatingPointError, match="generated sequence scores"):
+        objective._reference_preference_loss(
+            torch.tensor([[float("nan")]]),
+            torch.tensor([0.0]),
+            candidate_labels,
+            reference_labels,
+        )
+
+
 class TinyCandidateScorer(nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -375,7 +445,7 @@ def test_mrt_reference_pass_keeps_native_auxiliary_supervision() -> None:
     batch["register_labels"] = torch.tensor([2])
     batch["alignment_targets"] = torch.tensor([[[0, 1], [1, 2]]])
 
-    ce, tokens, auxiliary, diagnostics = objective._reference_cross_entropy(
+    ce, tokens, auxiliary, reference_scores, diagnostics = objective._reference_cross_entropy(
         model,
         batch,
         batch["decoder_input_ids"],
@@ -386,6 +456,8 @@ def test_mrt_reference_pass_keeps_native_auxiliary_supervision() -> None:
 
     assert tokens.item() == 3
     assert auxiliary.item() == pytest.approx(0.25)
+    assert reference_scores.shape == (1,)
+    assert torch.isfinite(reference_scores).all()
     assert diagnostics["evidence_request_rate"].item() == pytest.approx(
         torch.sigmoid(torch.tensor(0.5)).item()
     )
@@ -618,9 +690,27 @@ def test_reward_cpu_work_overlaps_candidate_scoring_and_reports_wait_telemetry()
         "reward_overlap_fraction",
         "reward_input_transfer_seconds",
         "candidate_scoring_seconds",
+        "candidate_preference_loss",
+        "reference_preference_loss",
+        "reference_preference_margin",
+        "reference_preference_violation_rate",
+        "reference_preference_comparison_fraction",
+        "reference_sequence_score",
     ):
         assert torch.isfinite(output.metrics[metric_name])
+    for metric_name in (
+        "reward_cpu_seconds",
+        "reward_wait_seconds",
+        "reward_overlap_seconds",
+        "reward_overlap_fraction",
+        "reward_input_transfer_seconds",
+        "candidate_scoring_seconds",
+        "candidate_preference_loss",
+        "reference_preference_loss",
+    ):
         assert output.metrics[metric_name].item() >= 0.0
+    assert 0.0 <= output.metrics["reference_preference_violation_rate"].item() <= 1.0
+    assert 0.0 <= output.metrics["reference_preference_comparison_fraction"].item() <= 1.0
     assert output.metrics["reward_overlap_fraction"].item() <= 1.0
     assert (
         output.metrics["reward_overlap_seconds"].item()
@@ -732,6 +822,22 @@ def _legacy_full_candidate_loss(
     preference_loss, _ = objective._pairwise_preference_loss(generated_scores, rewards)
     reference_logits = logits[:, samples]
     reference_labels = labels[:, samples]
+    reference_valid = reference_labels.ne(-100)
+    reference_token_nll = F.cross_entropy(
+        reference_logits.transpose(1, 2),
+        reference_labels,
+        ignore_index=-100,
+        reduction="none",
+    )
+    reference_scores = -reference_token_nll.masked_fill(~reference_valid, 0.0).sum(
+        -1
+    ) / reference_valid.sum(-1).clamp_min(1)
+    reference_preference_loss, _, _, _ = objective._reference_preference_loss(
+        generated_scores,
+        reference_scores,
+        labels[:, :samples],
+        reference_labels,
+    )
     ce_sum = F.cross_entropy(
         reference_logits.reshape(-1, reference_logits.shape[-1]),
         reference_labels.reshape(-1),
@@ -743,7 +849,7 @@ def _legacy_full_candidate_loss(
     return (
         ce_loss
         + objective.config.risk_weight * risk
-        + objective.config.preference_weight * preference_loss,
+        + objective.config.preference_weight * (preference_loss + reference_preference_loss),
         generated_scores,
     )
 
@@ -799,7 +905,7 @@ def test_candidate_micro_batches_match_legacy_loss_and_gradients() -> None:
         for start in range(0, config.samples_per_source, config.candidate_micro_batch)
     ]
     chunked_scores = torch.cat(score_chunks, dim=1)
-    ce_loss, _, reference_auxiliary_loss, _ = objective._reference_cross_entropy(
+    ce_loss, _, reference_auxiliary_loss, reference_scores, _ = objective._reference_cross_entropy(
         chunked_model,
         batch,
         decoder_inputs[:, config.samples_per_source],
@@ -809,11 +915,17 @@ def test_candidate_micro_batches_match_legacy_loss_and_gradients() -> None:
     distribution = torch.softmax(config.mrt_alpha * chunked_scores, dim=-1)
     risk = (distribution * (1.0 - rewards)).sum(-1).mean()
     preference_loss, _ = objective._pairwise_preference_loss(chunked_scores, rewards)
+    reference_preference_loss, _, _, _ = objective._reference_preference_loss(
+        chunked_scores,
+        reference_scores,
+        labels[:, : config.samples_per_source],
+        labels[:, config.samples_per_source],
+    )
     chunked_loss = (
         ce_loss
         + reference_auxiliary_loss
         + config.risk_weight * risk
-        + config.preference_weight * preference_loss
+        + config.preference_weight * (preference_loss + reference_preference_loss)
     )
 
     torch.testing.assert_close(chunked_scores, legacy_scores)

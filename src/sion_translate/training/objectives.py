@@ -509,16 +509,89 @@ class MinimumRiskObjective:
     def _pairwise_preference_loss(
         self, generated_scores: torch.Tensor, rewards: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """reward 차이가 충분한 모든 ordered candidate pair를 학습합니다."""
+        """Train every ordered candidate pair with a sufficient reward gap."""
+        if generated_scores.shape != rewards.shape:
+            raise ValueError("generated scores and rewards must have the same shape")
+        if not bool(torch.isfinite(generated_scores).all()):
+            raise FloatingPointError("generated sequence scores must be finite")
+        if not bool(torch.isfinite(rewards).all()):
+            raise FloatingPointError("candidate rewards must be finite")
         reward_gap = rewards[:, :, None] - rewards[:, None, :]
         score_gap = generated_scores[:, :, None] - generated_scores[:, None, :]
         mask = reward_gap > self.config.preference_min_gap
         weights = reward_gap.masked_fill(~mask, 0.0)
-        losses = F.softplus(-score_gap / self.config.preference_temperature)
+        temperature = max(
+            float(self.config.preference_temperature),
+            torch.finfo(generated_scores.dtype).eps,
+        )
+        losses = F.softplus(-score_gap / temperature)
         pair_weight = weights.sum()
         if not bool(mask.any()):
             return generated_scores.sum() * 0.0, pair_weight
         return (losses * weights).sum() / pair_weight.clamp_min(1e-8), pair_weight
+
+    def _reference_preference_loss(
+        self,
+        generated_scores: torch.Tensor,
+        reference_scores: torch.Tensor,
+        candidate_labels: torch.Tensor,
+        reference_labels: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Prefer the gold sequence over every distinct sampled candidate.
+
+        Candidate-only MRT has no sequence-ordering gradient when every sample
+        receives the same reward. The supervised cross-entropy term still
+        teaches gold tokens independently, but it does not explicitly lower
+        competing sequence probabilities. This anchor compares each distinct
+        candidate with the gold sequence, independent of sampled reward ties.
+
+        Exact gold duplicates are excluded because both sides represent the
+        same token sequence and their pairwise gradients cancel. Empty rows are
+        also excluded defensively. The returned diagnostics are the mean score
+        margin, violation rate, and number of active comparisons.
+        """
+        if generated_scores.ndim != 2:
+            raise ValueError("generated scores must have shape (batch, candidates)")
+        batch_size, candidates = generated_scores.shape
+        if reference_scores.shape != (batch_size,):
+            raise ValueError("reference scores must have shape (batch,)")
+        if candidate_labels.ndim != 3 or candidate_labels.shape[:2] != (
+            batch_size,
+            candidates,
+        ):
+            raise ValueError("candidate labels must have shape (batch, candidates, target length)")
+        if reference_labels.shape != (batch_size, candidate_labels.shape[-1]):
+            raise ValueError("reference labels must match candidate target length")
+        if not bool(torch.isfinite(generated_scores).all()):
+            raise FloatingPointError("generated sequence scores must be finite")
+        if not bool(torch.isfinite(reference_scores).all()):
+            raise FloatingPointError("reference sequence scores must be finite")
+
+        candidate_valid = candidate_labels.ne(-100).any(dim=-1)
+        reference_valid = reference_labels.ne(-100).any(dim=-1)
+        exact_reference = candidate_labels.eq(reference_labels[:, None, :]).all(dim=-1)
+        active = candidate_valid & reference_valid[:, None] & ~exact_reference
+        active_count = active.sum().to(dtype=generated_scores.dtype)
+        differentiable_zero = generated_scores.sum() * 0.0 + reference_scores.sum() * 0.0
+        if not bool(active.any()):
+            detached_zero = differentiable_zero.detach()
+            return differentiable_zero, detached_zero, detached_zero, active_count
+
+        score_gaps = reference_scores[:, None] - generated_scores
+        selected_gaps = score_gaps[active]
+        if not bool(torch.isfinite(selected_gaps).all()):
+            raise FloatingPointError("reference preference score gaps must be finite")
+        temperature = max(
+            float(self.config.preference_temperature),
+            torch.finfo(generated_scores.dtype).eps,
+        )
+        scaled_gaps = selected_gaps / temperature
+        if not bool(torch.isfinite(scaled_gaps).all()):
+            raise FloatingPointError("scaled reference preference gaps must be finite")
+        loss = F.softplus(-scaled_gaps).mean()
+        mean_margin = selected_gaps.detach().mean()
+        violation_rate = selected_gaps.detach().le(0).to(torch.float32).mean()
+        return loss, mean_margin, violation_rate, active_count
 
     @staticmethod
     def _repeated_model_inputs(
@@ -600,7 +673,13 @@ class MinimumRiskObjective:
         labels: torch.Tensor,
         *,
         label_smoothing: float,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        dict[str, torch.Tensor],
+    ]:
         reference_inputs = self._repeated_model_inputs(batch, 1)
         # Candidate scoring deliberately excludes target-side annotations. The
         # single reference pass can safely retain them, preserving CoRe/BATS
@@ -617,6 +696,14 @@ class MinimumRiskObjective:
             labels=labels,
         )
         reference_tokens = labels.ne(-100).sum()
+        token_nll = F.cross_entropy(
+            output.logits.float().transpose(1, 2),
+            labels,
+            ignore_index=-100,
+            reduction="none",
+        )
+        valid = labels.ne(-100)
+        reference_scores = -token_nll.masked_fill(~valid, 0.0).sum(-1) / valid.sum(-1).clamp_min(1)
         lm_loss_sum = getattr(output, "lm_loss_sum", None)
         if lm_loss_sum is None:
             lm_loss_sum = F.cross_entropy(
@@ -652,6 +739,7 @@ class MinimumRiskObjective:
             lm_loss_sum / reference_tokens.clamp_min(1),
             reference_tokens,
             auxiliary_loss,
+            reference_scores,
             diagnostics,
         )
 
@@ -833,6 +921,7 @@ class MinimumRiskObjective:
                 ce_loss,
                 reference_tokens,
                 reference_auxiliary_loss,
+                reference_scores,
                 reference_diagnostics,
             ) = self._reference_cross_entropy(
                 model,
@@ -872,7 +961,22 @@ class MinimumRiskObjective:
         rewards = reward_output.reward
         candidate_distribution = torch.softmax(self.config.mrt_alpha * generated_scores, dim=-1)
         risk = (candidate_distribution * (1.0 - rewards)).sum(-1).mean()
-        preference_loss, pair_weight = self._pairwise_preference_loss(generated_scores, rewards)
+        candidate_preference_loss, pair_weight = self._pairwise_preference_loss(
+            generated_scores,
+            rewards,
+        )
+        (
+            reference_preference_loss,
+            reference_preference_margin,
+            reference_preference_violation_rate,
+            reference_preference_comparisons,
+        ) = self._reference_preference_loss(
+            generated_scores,
+            reference_scores,
+            labels[:, :samples],
+            labels[:, samples],
+        )
+        preference_loss = candidate_preference_loss + reference_preference_loss
 
         total_loss = (
             ce_loss
@@ -886,7 +990,15 @@ class MinimumRiskObjective:
             "reference_auxiliary_loss": reference_auxiliary_loss.detach(),
             "risk": risk.detach(),
             "preference_loss": preference_loss.detach(),
+            "candidate_preference_loss": candidate_preference_loss.detach(),
+            "reference_preference_loss": reference_preference_loss.detach(),
             "preference_pair_weight": pair_weight.detach(),
+            "reference_preference_margin": reference_preference_margin,
+            "reference_preference_violation_rate": reference_preference_violation_rate,
+            "reference_preference_comparison_fraction": (
+                reference_preference_comparisons / max(1, generated_scores.numel())
+            ).detach(),
+            "reference_sequence_score": reference_scores.mean().detach(),
             "reward": rewards.mean().detach(),
             "reward_cpu_seconds": torch.tensor(
                 reward_cpu_seconds,
