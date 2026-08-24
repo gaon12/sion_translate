@@ -2,12 +2,12 @@
 
     sion-evaluate                          # 자체 test split 양방향 평가
     sion-evaluate --benchmark flores.jsonl # 외부 벤치마크(JSONL) 평가
-    sion-evaluate --direction ko-ja \
+    sion-evaluate --direction ko ja \
       --compare deepl=deepl_out.txt \
       --compare google=google_out.txt     # 외부 서비스 출력과 비교
 
 외부 서비스 비교 방법:
-    1. sion-evaluate --direction ko-ja --export-sources src.txt 로
+    1. sion-evaluate --direction ko ja --export-sources src.txt 로
        평가셋 원문을 파일로 뽑습니다.
     2. 그 원문을 DeepL/Google/Papago 등에 넣어 번역 결과를
        한 줄에 한 문장씩 파일로 저장합니다.
@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import time
+from collections.abc import Sequence
 from pathlib import Path
 
 from sion_translate.config import config_from_raw, load_raw_config
@@ -39,6 +40,7 @@ from sion_translate.evaluation import (
     score_translations,
 )
 from sion_translate.inference import Translator, find_exported_model
+from sion_translate.language_tags import LanguageTagError, canonicalize_language_pair
 
 DEFAULT_CONFIG_FILE = "sion_translate.yaml"
 
@@ -54,8 +56,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--direction",
-        default="both",
-        help="평가 방향: both(기본) 또는 ko-ja 처럼 '원문-목표' 형식",
+        nargs="+",
+        metavar="LANG",
+        help=(
+            "평가 방향: --direction SOURCE TARGET (기본: 모든 학습 방향). "
+            "하이픈이 없는 단순 태그는 기존 ko-ja 형식도 지원"
+        ),
     )
     parser.add_argument("--max-samples", type=int, default=500, help="방향당 최대 평가 문장 수")
     parser.add_argument("--num-beams", type=int, default=4)
@@ -93,26 +99,97 @@ def log(message: str) -> None:
 
 
 def resolve_evaluation_directions(
-    requested: str,
-    trained_directions: tuple[tuple[str, str], ...],
+    requested: str | Sequence[str] | None,
+    trained_directions: Sequence[Sequence[str]],
 ) -> list[tuple[str, str]]:
-    """Resolve CLI direction labels against the model's exact trained graph."""
+    """Resolve a structured CLI request against the model's exact trained graph."""
 
-    if not trained_directions:
+    directions: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for index, raw_direction in enumerate(trained_directions):
+        try:
+            direction = canonicalize_language_pair(
+                raw_direction,
+                field=f"model translation_directions[{index}]",
+            )
+        except LanguageTagError as error:
+            raise SystemExit(str(error)) from error
+        if direction in seen:
+            raise SystemExit(
+                "모델 translation_directions에 BCP 47 정규화 후 중복인 방향이 "
+                f"있습니다: {_direction_label(*direction)}"
+            )
+        seen.add(direction)
+        directions.append(direction)
+
+    if not directions:
         raise SystemExit("모델에 인증된 translation_directions가 없습니다")
-    if requested == "both":
-        return list(trained_directions)
-    matches = [
-        direction
-        for direction in trained_directions
-        if f"{direction[0]}-{direction[1]}" == requested
-    ]
-    if len(matches) != 1:
-        valid = ", ".join(
-            ["both", *(f"{source}-{target}" for source, target in trained_directions)]
+
+    tokens = (requested,) if isinstance(requested, str) else tuple(requested or ())
+    if not tokens or tokens == ("both",):
+        return directions
+
+    if len(tokens) == 2:
+        try:
+            selected = canonicalize_language_pair(tokens, field="--direction")
+        except LanguageTagError as error:
+            raise SystemExit(str(error)) from error
+        if selected in seen:
+            return [selected]
+    elif len(tokens) == 1:
+        # Backwards compatibility is limited to labels whose two members do
+        # not contain a hyphen.  Such labels have exactly one separator and
+        # cannot collide with an extended or private-use BCP 47 identity.
+        legacy = tokens[0]
+        matches = [
+            direction
+            for direction in directions
+            if "-" not in direction[0]
+            and "-" not in direction[1]
+            and f"{direction[0]}-{direction[1]}" == legacy
+        ]
+        if len(matches) == 1:
+            return matches
+
+    valid = ", ".join(f"--direction {source} {target}" for source, target in directions)
+    raise SystemExit(f"--direction은 SOURCE TARGET 두 개의 언어 태그로 지정하세요 (지원: {valid})")
+
+
+def _direction_label(source_language: str, target_language: str) -> str:
+    """Return a collision-free label while preserving legacy simple labels."""
+
+    if "-" not in source_language and "-" not in target_language:
+        return f"{source_language}-{target_language}"
+    return f"{source_language}→{target_language}"
+
+
+def _read_comparison_lines(file_path: str | Path, *, expected_count: int) -> list[str]:
+    lines = Path(file_path).read_text(encoding="utf-8").splitlines()
+    if len(lines) != expected_count:
+        raise SystemExit(
+            f"{file_path}: 번역 {len(lines)}줄 != 평가쌍 {expected_count}개 — "
+            "줄 수가 평가셋과 정확히 일치해야 합니다"
         )
-        raise SystemExit(f"--direction 은 다음 중 하나여야 합니다: {valid}")
-    return matches
+    return lines
+
+
+def _parse_comparison_specs(specs: Sequence[str]) -> list[tuple[str, str]]:
+    parsed: list[tuple[str, str]] = []
+    seen_names: set[str] = set()
+    for spec in specs:
+        raw_name, separator, raw_path = spec.partition("=")
+        name = raw_name.strip()
+        file_path = raw_path.strip()
+        if not separator or not name or not file_path:
+            raise SystemExit(f"--compare 형식은 이름=파일 입니다: {spec}")
+        identity = name.casefold()
+        if identity == "sion":
+            raise SystemExit("--compare 시스템 이름 'sion'은 내장 모델 레이블로 예약되어 있습니다")
+        if identity in seen_names:
+            raise SystemExit(f"--compare 시스템 이름이 중복됩니다: {name}")
+        seen_names.add(identity)
+        parsed.append((name, file_path))
+    return parsed
 
 
 def main() -> None:
@@ -132,6 +209,7 @@ def main() -> None:
         raise SystemExit(
             "--compare / --export-sources 는 --direction 을 한 방향으로 지정해야 합니다"
         )
+    comparison_specs = _parse_comparison_specs(args.compare)
 
     # ── 글로서리 (선택) ─────────────────────────────────────────────────
     glossary = None
@@ -156,6 +234,7 @@ def main() -> None:
             config.data.dataset_dir,
             args.split,
             translator.tokenizer,
+            model_language_pairs=translator.language_pairs,
             max_samples_per_direction=args.max_samples,
         )
         eval_set_name = f"dataset:{args.split}"
@@ -175,11 +254,11 @@ def main() -> None:
     for source_language, target_language in directions:
         samples = pairs.get((source_language, target_language), [])
         if not samples:
-            log(f"{source_language}-{target_language}: 평가쌍이 없어 건너뜁니다")
+            log(f"{_direction_label(source_language, target_language)}: 평가쌍이 없어 건너뜁니다")
             continue
         sources = [source for source, _ in samples]
         references = [reference for _, reference in samples]
-        direction_name = f"{source_language}-{target_language}"
+        direction_name = _direction_label(source_language, target_language)
 
         log(f"{direction_name}: {len(samples)}문장 번역 중 (beam {args.num_beams})...")
         started = time.perf_counter()
@@ -224,20 +303,11 @@ def main() -> None:
         )
 
         # 외부 시스템 출력 채점 (같은 정답, 같은 지표)
-        for spec in args.compare:
-            name, _, file_path = spec.partition("=")
-            if not file_path:
-                raise SystemExit(f"--compare 형식은 이름=파일 입니다: {spec}")
-            lines = [
-                line.rstrip("\n")
-                for line in Path(file_path).read_text(encoding="utf-8").splitlines()
-            ]
-            if len(lines) < len(references):
-                raise SystemExit(
-                    f"{file_path}: 번역 {len(lines)}줄 < 평가쌍 {len(references)}개 — "
-                    "줄 수가 평가셋과 일치해야 합니다"
-                )
-            hypotheses = lines[: len(references)]
+        for name, file_path in comparison_specs:
+            hypotheses = _read_comparison_lines(
+                file_path,
+                expected_count=len(references),
+            )
             chrf, bleu, tokenize = score_translations(
                 hypotheses, references, target_language=target_language
             )
@@ -273,6 +343,10 @@ def main() -> None:
             "num_beams": args.num_beams,
             "max_samples": args.max_samples,
             "language_pairs": [list(pair) for pair in translator.language_pairs],
+            "translation_directions": [
+                list(direction) for direction in translator.translation_directions
+            ],
+            "evaluated_directions": [list(direction) for direction in directions],
         },
     )
     log(f"저장: {output}.json / {output}.md")

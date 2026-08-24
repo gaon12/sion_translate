@@ -10,8 +10,12 @@ from types import SimpleNamespace
 import pytest
 
 import sion_translate.cli.evaluate as evaluate_cli
+import sion_translate.cli.translate as translate_cli
 from sion_translate.cli.evaluate import resolve_evaluation_directions
-from sion_translate.cli.translate import resolve_translation_target
+from sion_translate.cli.translate import (
+    resolve_translation_direction,
+    resolve_translation_target,
+)
 from sion_translate.data.prepare import prepare_dataset
 from sion_translate.evaluation import (
     DirectionResult,
@@ -149,20 +153,208 @@ def test_cli_direction_resolution_uses_only_the_model_graph() -> None:
 
     assert resolve_evaluation_directions("both", directions) == list(directions)
     assert resolve_evaluation_directions("sw-ar", directions) == [("sw", "ar")]
-    with pytest.raises(SystemExit, match="다음 중 하나"):
+    with pytest.raises(SystemExit, match="SOURCE TARGET"):
         resolve_evaluation_directions("ar-sw", directions)
+
+
+def test_cli_direction_resolution_supports_structured_bcp47_pairs() -> None:
+    directions = (("zh-Hant", "x-acme"), ("x-acme", "zh-Hant"))
+
+    assert resolve_evaluation_directions(
+        ["ZH-hant", "X-ACME"],
+        directions,
+    ) == [("zh-Hant", "x-acme")]
+    with pytest.raises(SystemExit, match="SOURCE TARGET"):
+        resolve_evaluation_directions("zh-Hant-x-acme", directions)
+
+    parsed = evaluate_cli.build_parser().parse_args(["--direction", "ZH-hant", "X-ACME"])
+    assert parsed.direction == ["ZH-hant", "X-ACME"]
+    assert evaluate_cli._direction_label("x-a", "x-b-x-c") == "x-a→x-b-x-c"
+    assert evaluate_cli._direction_label("x-a-x-b", "x-c") == "x-a-x-b→x-c"
+
+
+def test_cli_direction_resolution_rejects_canonical_model_duplicates() -> None:
+    directions = (("zh-hant", "X-ACME"), ("zh-Hant", "x-acme"))
+
+    with pytest.raises(SystemExit, match="중복"):
+        resolve_evaluation_directions(None, directions)
+
+
+def test_comparison_output_requires_an_exact_line_count(tmp_path: Path) -> None:
+    comparison = tmp_path / "comparison.txt"
+    comparison.write_text("first\nsecond\nthird\n", encoding="utf-8")
+
+    with pytest.raises(SystemExit, match=r"3줄 != 평가쌍 2개"):
+        evaluate_cli._read_comparison_lines(comparison, expected_count=2)
+
+    comparison.write_text("first\nsecond\n", encoding="utf-8")
+    assert evaluate_cli._read_comparison_lines(comparison, expected_count=2) == [
+        "first",
+        "second",
+    ]
+
+
+def test_comparison_specs_require_distinct_trimmed_names_and_paths() -> None:
+    assert evaluate_cli._parse_comparison_specs([" Service = output.txt "]) == [
+        ("Service", "output.txt")
+    ]
+    with pytest.raises(SystemExit, match="형식"):
+        evaluate_cli._parse_comparison_specs([" =output.txt"])
+    with pytest.raises(SystemExit, match="중복"):
+        evaluate_cli._parse_comparison_specs(["Service=a.txt", " service =b.txt"])
+    with pytest.raises(SystemExit, match="예약"):
+        evaluate_cli._parse_comparison_specs(["SION=external.txt"])
+
+
+def test_result_markdown_escapes_untrusted_labels() -> None:
+    rendered = results_as_markdown(
+        [
+            DirectionResult(
+                "A|B\nC",
+                "x-a|x-b",
+                1,
+                100.0,
+                100.0,
+                "13a",
+                100.0,
+                1,
+                1,
+                0,
+            )
+        ]
+    )
+
+    assert "| A\\|B<br>C | x-a\\|x-b | 1 |" in rendered
 
 
 def test_translate_target_resolution_uses_reachable_model_edges() -> None:
     directions = (("de", "fr"), ("fr", "de"), ("sw", "ar"))
 
-    assert resolve_translation_target(None, None, directions) == "fr"
+    with pytest.raises(SystemExit, match="--from LANG 또는 --to LANG"):
+        resolve_translation_target(None, None, directions)
+    assert resolve_translation_target(None, None, (("de", "fr"),)) == "fr"
     assert resolve_translation_target(None, "sw", directions) == "ar"
     assert resolve_translation_target("de", "fr", directions) == "de"
     with pytest.raises(SystemExit, match="출발하는 학습 방향"):
         resolve_translation_target(None, "ar", directions)
     with pytest.raises(SystemExit, match="학습된 target"):
         resolve_translation_target("sw", None, directions)
+
+
+def test_translate_target_resolution_requires_target_for_branching_source() -> None:
+    directions = (("zh-Hant", "x-acme"), ("zh-Hant", "x-other"))
+
+    with pytest.raises(SystemExit, match="--to LANG"):
+        resolve_translation_target(None, "ZH-hant", directions)
+    assert resolve_translation_target("X-OTHER", "zh-Hant", directions) == "x-other"
+
+
+def test_translate_direction_resolution_fills_only_unambiguous_endpoints() -> None:
+    directions = (("ko", "ja"), ("en", "de"), ("fr", "de"))
+
+    with pytest.raises(SystemExit, match="--from LANG 또는 --to LANG"):
+        resolve_translation_direction(None, None, directions)
+    assert resolve_translation_direction(None, None, (("ko", "ja"),)) == ("ko", "ja")
+    assert resolve_translation_direction("ja", None, directions) == ("ko", "ja")
+    assert resolve_translation_direction(None, "EN", directions) == ("en", "de")
+    with pytest.raises(SystemExit, match="--from LANG"):
+        resolve_translation_direction("de", None, directions)
+
+
+def test_translate_target_resolution_canonicalizes_bcp47_cli_identities() -> None:
+    directions = (("zh-Hant", "x-acme"), ("de", "zh-Hant"))
+
+    assert resolve_translation_target(None, "ZH-hant", directions) == "x-acme"
+    assert resolve_translation_target("X-ACME", "zh-Hant", directions) == "x-acme"
+
+    with pytest.raises(SystemExit, match="학습되지 않은 방향"):
+        resolve_translation_target("zh-Hant", "x-acme", directions)
+
+
+def test_translate_target_resolution_rejects_canonical_model_duplicates() -> None:
+    directions = (("zh-hant", "X-ACME"), ("zh-Hant", "x-acme"))
+
+    with pytest.raises(SystemExit, match="중복"):
+        resolve_translation_target(None, None, directions)
+
+
+def test_translate_main_passes_canonical_cli_languages_to_inference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeTranslator:
+        translation_directions = (("zh-Hant", "x-acme"),)
+
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def translate(self, _lines: object, **kwargs: object) -> list[str]:
+            captured.update(kwargs)
+            return ["translated"]
+
+    config = SimpleNamespace(
+        training=SimpleNamespace(output_dir="exports"),
+        data=SimpleNamespace(tokenizer_model="tokenizer.model", glossary=None),
+    )
+    monkeypatch.setattr(translate_cli, "configure_stdio", lambda: None)
+    monkeypatch.setattr(translate_cli, "load_raw_config", lambda *_args: {})
+    monkeypatch.setattr(translate_cli, "config_from_raw", lambda _raw: config)
+    monkeypatch.setattr(translate_cli, "Translator", FakeTranslator)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "sion-translate",
+            "--model",
+            "model.pt",
+            "--from",
+            "ZH-hant",
+            "--to",
+            "X-ACME",
+            "hello",
+        ],
+    )
+
+    translate_cli.main()
+
+    assert captured["source_language"] == "zh-Hant"
+    assert captured["target_language"] == "x-acme"
+
+
+def test_translate_main_passes_a_uniquely_implied_source_to_inference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeTranslator:
+        translation_directions = (("ko", "ja"), ("en", "de"))
+
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def translate(self, _lines: object, **kwargs: object) -> list[str]:
+            captured.update(kwargs)
+            return ["translated"]
+
+    config = SimpleNamespace(
+        training=SimpleNamespace(output_dir="exports"),
+        data=SimpleNamespace(tokenizer_model="tokenizer.model", glossary=None),
+    )
+    monkeypatch.setattr(translate_cli, "configure_stdio", lambda: None)
+    monkeypatch.setattr(translate_cli, "load_raw_config", lambda *_args: {})
+    monkeypatch.setattr(translate_cli, "config_from_raw", lambda _raw: config)
+    monkeypatch.setattr(translate_cli, "Translator", FakeTranslator)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["sion-translate", "--model", "model.pt", "--to", "DE", "hello"],
+    )
+
+    translate_cli.main()
+
+    assert captured["source_language"] == "en"
+    assert captured["target_language"] == "de"
 
 
 def test_evaluate_main_records_model_owned_language_pairs(
@@ -251,7 +443,31 @@ def test_load_split_pairs_round_trips_text(tmp_path: Path) -> None:
         language_pair=("en", "de"),
     )
     assert stats.test > 0
-    pairs = load_split_pairs(dataset_dir, "test", tokenizer, max_samples_per_direction=10)
+    # Simulate an indexed generation that predates manifest-owned language
+    # identity while preserving its authenticated payload inventory. The model
+    # graph is the only trustworthy identity for this legacy holdout.
+    manifest_path = dataset_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["format"] = "sion-indexed-parallel-v5"
+    manifest.pop("language_pair")
+    manifest.pop("language_pairs")
+    manifest.pop("languages")
+    manifest.pop("language_to_id")
+    manifest.pop("preprocessing_schema")
+    manifest["fingerprint"].pop("preprocessing_schema")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    raw_fingerprint_path = dataset_dir / "raw_fingerprint.json"
+    raw_fingerprint = json.loads(raw_fingerprint_path.read_text(encoding="utf-8"))
+    raw_fingerprint.pop("preprocessing_schema")
+    raw_fingerprint_path.write_text(json.dumps(raw_fingerprint), encoding="utf-8")
+
+    pairs = load_split_pairs(
+        dataset_dir,
+        "test",
+        tokenizer,
+        model_language_pairs=(("en", "de"),),
+        max_samples_per_direction=10,
+    )
     forward = pairs[("en", "de")]
     backward = pairs[("de", "en")]
     assert len(forward) == min(stats.test, 10)

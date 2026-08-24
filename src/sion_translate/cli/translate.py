@@ -22,9 +22,46 @@ from sion_translate.console import configure_stdio
 from sion_translate.glossary import load_glossary
 from sion_translate.inference import Translator, find_exported_model
 from sion_translate.iterative import refine_batch, summarize
+from sion_translate.language_tags import (
+    LanguageTagError,
+    canonicalize_language_pair,
+    canonicalize_language_tag,
+)
 from sion_translate.rerank import STRATEGIES as RERANK_STRATEGIES
 
 DEFAULT_CONFIG_FILE = "sion_translate.yaml"
+
+
+def _canonical_cli_language(value: str | None, *, option: str) -> str | None:
+    if value is None:
+        return None
+    try:
+        return canonicalize_language_tag(value, field=option)
+    except LanguageTagError as error:
+        raise SystemExit(str(error)) from error
+
+
+def _canonical_model_directions(
+    trained_directions: Sequence[Sequence[str]],
+) -> tuple[tuple[str, str], ...]:
+    directions: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for index, raw_direction in enumerate(trained_directions):
+        try:
+            direction = canonicalize_language_pair(
+                raw_direction,
+                field=f"model translation_directions[{index}]",
+            )
+        except LanguageTagError as error:
+            raise SystemExit(str(error)) from error
+        if direction in seen:
+            raise SystemExit(
+                "모델 translation_directions에 BCP 47 정규화 후 중복인 방향이 "
+                f"있습니다: {direction[0]}→{direction[1]}"
+            )
+        seen.add(direction)
+        directions.append(direction)
+    return tuple(directions)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -36,7 +73,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="원문 언어 (다국어 모델에서는 필수)",
     )
     parser.add_argument(
-        "--to", dest="target", help="목표 언어 (기본: 모델이 기록한 첫 학습 방향의 target)"
+        "--to",
+        dest="target",
+        help="목표 언어 (모델에 학습 방향이 정확히 하나일 때만 생략 가능)",
     )
     parser.add_argument("--model", help="내보낸 모델 경로 (기본: exports 에서 자동 탐색)")
     parser.add_argument(
@@ -133,28 +172,67 @@ def resolve_translation_target(
     source_language: str | None,
     trained_directions: Sequence[Sequence[str]],
 ) -> str:
-    """Resolve a target only from directions authenticated by the model artifact."""
+    """Compatibility wrapper returning the target of an authenticated direction."""
 
-    directions = [tuple(map(str, direction)) for direction in trained_directions]
+    return resolve_translation_direction(
+        requested,
+        source_language,
+        trained_directions,
+    )[1]
+
+
+def resolve_translation_direction(
+    requested_target: str | None,
+    requested_source: str | None,
+    trained_directions: Sequence[Sequence[str]],
+) -> tuple[str, str]:
+    """Resolve both endpoints, including a uniquely implied missing endpoint."""
+
+    directions = _canonical_model_directions(trained_directions)
     if not directions:
         raise SystemExit("모델에 인증된 translation_directions가 없습니다")
-    if requested is not None:
-        target = requested
-    elif source_language is not None:
-        reachable = [target for source, target in directions if source == source_language]
-        if not reachable:
-            supported = ", ".join(f"{source}→{target}" for source, target in directions)
+    source = _canonical_cli_language(requested_source, option="--from")
+    target = _canonical_cli_language(requested_target, option="--to")
+    supported = ", ".join(f"{edge_source}→{edge_target}" for edge_source, edge_target in directions)
+
+    if source is None and target is None:
+        if len(directions) != 1:
             raise SystemExit(
-                f"--from {source_language} 에서 출발하는 학습 방향이 없습니다 (지원: {supported})"
+                "모델에 학습 방향이 여러 개입니다. --from LANG 또는 --to LANG을 "
+                f"지정하세요 (지원: {supported})"
             )
-        target = reachable[0]
-    else:
-        target = directions[0][1]
-    trained_targets = {direction[1] for direction in directions}
-    if target not in trained_targets:
-        supported = ", ".join(f"{source}→{destination}" for source, destination in directions)
+        return directions[0]
+    if source is not None and target is not None:
+        if (source, target) in set(directions):
+            return source, target
+        raise SystemExit(f"{source}→{target} 는 학습되지 않은 방향입니다 (지원: {supported})")
+    if source is not None:
+        outgoing = [direction for direction in directions if direction[0] == source]
+        if not outgoing:
+            raise SystemExit(
+                f"--from {source} 에서 출발하는 학습 방향이 없습니다 (지원: {supported})"
+            )
+        if len(outgoing) > 1:
+            choices = ", ".join(
+                f"{edge_source}→{edge_target}" for edge_source, edge_target in outgoing
+            )
+            raise SystemExit(
+                f"--from {source} 에서 갈 수 있는 target이 여러 개입니다. "
+                f"--to LANG을 지정하세요 (지원: {choices})"
+            )
+        return outgoing[0]
+
+    assert target is not None
+    incoming = [direction for direction in directions if direction[1] == target]
+    if not incoming:
         raise SystemExit(f"--to {target} 는 학습된 target이 아닙니다 (지원: {supported})")
-    return target
+    if len(incoming) > 1:
+        choices = ", ".join(f"{edge_source}→{edge_target}" for edge_source, edge_target in incoming)
+        raise SystemExit(
+            f"--to {target} 로 들어오는 source가 여러 개입니다. "
+            f"--from LANG을 지정하세요 (지원: {choices})"
+        )
+    return incoming[0]
 
 
 def main() -> None:
@@ -170,19 +248,11 @@ def main() -> None:
     model_path = args.model or find_exported_model(config.training.output_dir, int8=args.int8)
     translator = Translator(model_path, config.data.tokenizer_model)
 
-    target = resolve_translation_target(
+    source_language, target = resolve_translation_direction(
         args.target,
         args.source,
         translator.translation_directions,
     )
-    if args.source is not None and (
-        args.source,
-        target,
-    ) not in set(translator.translation_directions):
-        supported = ", ".join(
-            f"{source}→{destination}" for source, destination in translator.translation_directions
-        )
-        raise SystemExit(f"{args.source}→{target} 는 학습되지 않은 방향입니다 (지원: {supported})")
 
     # 글로서리: --glossary > 설정 data.glossary. --no-glossary 면 끔.
     glossary = None
@@ -210,7 +280,7 @@ def main() -> None:
         )
     translations = translator.translate(
         lines,
-        source_language=args.source,
+        source_language=source_language,
         target_language=target,
         num_beams=args.num_beams,
         length_penalty=args.length_penalty,
@@ -237,7 +307,7 @@ def main() -> None:
             return translator.revise(
                 sources,
                 drafts,
-                source_language=args.source,
+                source_language=source_language,
                 target_language=target,
                 num_beams=args.num_beams,
                 length_penalty=args.length_penalty,

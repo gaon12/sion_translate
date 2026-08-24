@@ -235,6 +235,7 @@ def load_split_pairs(
     split: str,
     tokenizer: SionTokenizer,
     *,
+    model_language_pairs: Sequence[Sequence[str]],
     max_samples_per_direction: int,
 ) -> dict[tuple[str, str], list[tuple[str, str]]]:
     """준비된 데이터셋의 holdout split 을 (원문, 정답) 텍스트 쌍으로 되돌립니다.
@@ -242,7 +243,12 @@ def load_split_pairs(
     반환: {(원문 언어, 목표 언어): [(원문, 정답), ...]}
     shard 에는 토큰 id 만 저장되어 있으므로 토크나이저로 디코딩합니다.
     """
-    dataset = IndexedParallelDataset(dataset_dir, split, bidirectional=True)
+    dataset = IndexedParallelDataset(
+        dataset_dir,
+        split,
+        bidirectional=True,
+        legacy_language_pairs=model_language_pairs,
+    )
     # Source-only languages (한본어 kj) are never a target, so the reachable
     # direction count is smaller than 2x the pair count and the early exit
     # below has to use the real number or it never fires.
@@ -321,11 +327,16 @@ def results_as_markdown(results: Sequence[DirectionResult]) -> str:
         number_f1 = f"{result.number_f1:.2f}" if result.number_samples else "-"
         exact = f"{result.number_exact}/{result.number_samples}" if result.number_samples else "-"
         lines.append(
-            f"| {result.system} | {result.direction} | {result.samples} "
+            f"| {_markdown_cell(result.system)} | {_markdown_cell(result.direction)} "
+            f"| {result.samples} "
             f"| {result.chrf:.2f} | {result.bleu:.2f} "
             f"| {number_f1} | {exact} | {result.number_inventions} |"
         )
     return "\n".join(lines)
+
+
+def _markdown_cell(value: str) -> str:
+    return value.replace("|", "\\|").replace("\r", " ").replace("\n", "<br>")
 
 
 def save_results(
