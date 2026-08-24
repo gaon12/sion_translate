@@ -10,13 +10,13 @@ Nothing else in the working tree is eligible.  In particular, stale artifacts,
 checkpoints, virtual environments, caches, and ``data/excluded`` cannot enter
 the archive just because they happen to exist beside the source tree.
 
-Three further trees can be added, but only when asked for by name:
+Four further trees can be added, but only when asked for by name:
 
 ``--with-monolingual-corpus``
-    ``data/corpus`` -- the foundation stage's input.  Without it that stage
-    finds no monolingual text and is skipped, so a bundle built for a
-    three-stage run needs it.  It is tens of gigabytes, which is exactly why
-    it is not a default.
+    The configured ``foundation.corpus_dir`` input, restricted to the
+    configured foundation languages.  Unconfigured language directories are
+    deliberately excluded.  The corpus can be tens of gigabytes, which is
+    exactly why it is not a default.
 
 ``--with-tokenizer``
     ``artifacts/tokenizer``.  Training a tokenizer is CPU and RAM work that
@@ -32,7 +32,13 @@ Three further trees can be added, but only when asked for by name:
     because the shards are token ids and mean nothing without the tokenizer
     that produced them -- shipping them alone only wastes the upload.
 
-All three are recorded in the manifest with their own origin, so
+``--with-foundation-dataset``
+    ``artifacts/foundation_dataset``, the prepared denoising/reasoning shards.
+    Like the translation dataset, it requires the tokenizer whose token ids it
+    stores.  Its manifest inventory is authenticated before any archive is
+    published.
+
+All four are recorded in the manifest with their own origin, so
 ``verify-archive`` and ``verify-tree`` cover them like everything else.
 Shipping fourteen gigabytes of corpus outside the manifest would leave the
 largest part of the payload with no integrity check at all.
@@ -41,6 +47,7 @@ largest part of the payload with no integrity check at all.
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 from dataclasses import dataclass
 import hashlib
 import json
@@ -51,9 +58,11 @@ import stat
 import subprocess
 import sys
 import tempfile
-from typing import BinaryIO, Callable, Iterable, cast
+from typing import Callable, IO, Iterable, cast
 import unicodedata
 import zipfile
+
+import yaml
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -62,9 +71,21 @@ MANIFEST_NAME = "PACKAGE_MANIFEST.json"
 CHECKSUMS_NAME = "SHA256SUMS"
 FORMAT_VERSION = 1
 DATASET_FINGERPRINT_SCHEMA = "sion-dataset-fingerprint-v2"
+DATASET_ARTIFACT_INVENTORY_SCHEMA = "sion-indexed-artifact-inventory-v1"
+TRANSLATION_DATASET_FORMAT = "sion-indexed-parallel-v6"
+FOUNDATION_DATASET_FORMAT = "sion-foundation-indexed-v2"
+PREPARE_COMPLETION_SCHEMA = "sion-prepare-completion-v1"
+TOKENIZER_ROOT_PATH = "artifacts/tokenizer"
 TOKENIZER_MODEL_PATH = "artifacts/tokenizer/sion.model"
+TOKENIZER_VOCAB_PATH = "artifacts/tokenizer/sion.vocab"
+TOKENIZER_METADATA_PATH = "artifacts/tokenizer/tokenizer_metadata.json"
+TOKENIZER_FEATURES_PATH = "artifacts/tokenizer/token_features.npz"
+TRANSLATION_DATASET_ROOT_PATH = "artifacts/dataset"
 DATASET_RAW_FINGERPRINT_PATH = "artifacts/dataset/raw_fingerprint.json"
 DATASET_MANIFEST_PATH = "artifacts/dataset/manifest.json"
+DATASET_COMPLETION_PATH = "artifacts/dataset/.sion-prepare-complete.json"
+FOUNDATION_DATASET_ROOT_PATH = "artifacts/foundation_dataset"
+FOUNDATION_DATASET_MANIFEST_PATH = "artifacts/foundation_dataset/manifest.json"
 COPY_BUFFER_SIZE = 8 * 1024 * 1024
 ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 MAX_METADATA_SIZE = 64 * 1024 * 1024
@@ -106,6 +127,12 @@ ALLOWED_ORIGINS = {
     "monolingual-corpus",
     "tokenizer",
     "dataset",
+    "foundation-dataset",
+}
+ARTIFACT_ORIGIN_ROOTS = {
+    "tokenizer": TOKENIZER_ROOT_PATH,
+    "dataset": TRANSLATION_DATASET_ROOT_PATH,
+    "foundation-dataset": FOUNDATION_DATASET_ROOT_PATH,
 }
 
 # Monolingual corpus files the foundation stage can actually read. Mirrors
@@ -116,10 +143,25 @@ MONOLINGUAL_SUFFIXES = {".txt", ".jsonl"}
 # A tokenizer is only useful to the training pipeline as a complete set. The
 # model alone loads, but ``tokenizer_policy_problem`` then cannot read the
 # digit policy or the language tags and the run stops after the upload.
-REQUIRED_TOKENIZER_FILES = {"sion.model", "sion.vocab", "tokenizer_metadata.json"}
+REQUIRED_TOKENIZER_FILES = {
+    "sion.model",
+    "sion.vocab",
+    "token_features.npz",
+    "tokenizer_metadata.json",
+}
 REGULAR_GIT_MODES = {"100644", "100755"}
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 GIT_OBJECT_PATTERN = re.compile(r"[0-9a-f]{40,64}")
+WINDOWS_RESERVED_NAMES = {
+    "aux",
+    "clock$",
+    "con",
+    "nul",
+    "prn",
+    *(f"com{index}" for index in range(1, 10)),
+    *(f"lpt{index}" for index in range(1, 10)),
+}
+WINDOWS_FORBIDDEN_CHARACTERS = frozenset('<>:"|?*')
 
 
 class BundleError(RuntimeError):
@@ -178,6 +220,16 @@ class BuildResult:
     git_tree: str
 
 
+@dataclass(frozen=True)
+class MonolingualSelection:
+    """Repository-relative corpus root and languages authorized by one config."""
+
+    config_path: PurePosixPath
+    corpus_root: PurePosixPath
+    languages: tuple[str, ...]
+    require_all_languages: bool
+
+
 def _run_git(root: Path, *arguments: str) -> bytes:
     completed = subprocess.run(
         ["git", *arguments],
@@ -223,11 +275,23 @@ def _git_identity(root: Path) -> tuple[str, str]:
 def _validated_relative_path(raw_path: str) -> PurePosixPath:
     if not raw_path or "\\" in raw_path or "\r" in raw_path or "\n" in raw_path:
         raise BundleError(f"unsupported bundle path: {raw_path!r}")
+    if unicodedata.normalize("NFC", raw_path) != raw_path:
+        raise BundleError(f"bundle path is not NFC-normalized: {raw_path!r}")
     path = PurePosixPath(raw_path)
     if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
         raise BundleError(f"unsafe bundle path: {raw_path!r}")
     if path.as_posix() != raw_path:
         raise BundleError(f"non-canonical bundle path: {raw_path!r}")
+    for part in path.parts:
+        if part.endswith((" ", ".")):
+            raise BundleError(f"bundle path has a Windows-ambiguous segment: {raw_path!r}")
+        if any(ord(character) < 32 for character in part) or any(
+            character in WINDOWS_FORBIDDEN_CHARACTERS for character in part
+        ):
+            raise BundleError(f"bundle path has a Windows-unsafe segment: {raw_path!r}")
+        device_name = part.split(".", 1)[0].casefold()
+        if device_name in WINDOWS_RESERVED_NAMES:
+            raise BundleError(f"bundle path uses a reserved Windows name: {raw_path!r}")
     return path
 
 
@@ -245,6 +309,93 @@ def _portable_path_key(path: PurePosixPath) -> str:
     """Normalize names the way common case-insensitive extractors do."""
 
     return unicodedata.normalize("NFC", path.as_posix()).casefold()
+
+
+def _repository_relative_path(root: Path, raw_path: object, *, field: str) -> PurePosixPath:
+    if not isinstance(raw_path, str) or not raw_path:
+        raise BundleError(f"bundle config {field} must be a non-empty path string")
+    configured = Path(raw_path)
+    if configured.is_absolute():
+        raise BundleError(f"bundle config {field} must be repository-relative")
+    candidate = (root / configured).resolve(strict=False)
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError as error:
+        raise BundleError(f"bundle config {field} escapes the repository") from error
+    return _validated_relative_path(relative.as_posix())
+
+
+def _load_validated_project_config(path: Path) -> object:
+    """Load the same validated configuration contract used by training."""
+
+    source_root = REPOSITORY_ROOT / "src"
+    source_root_text = str(source_root)
+    if source_root_text not in sys.path:
+        # Running this file directly places scripts/, not src/, on sys.path.
+        # Add the repository's source tree so packaging and training share the
+        # exact BCP 47 canonicalization and configuration validation rules.
+        sys.path.insert(0, source_root_text)
+    try:
+        from sion_translate.config import load_config
+
+        return load_config(path)
+    except (OSError, TypeError, ValueError, yaml.YAMLError) as error:
+        raise BundleError(f"could not validate bundle config: {path}: {error}") from error
+
+
+def _canonical_language(value: object, *, field: str) -> str:
+    source_root = REPOSITORY_ROOT / "src"
+    source_root_text = str(source_root)
+    if source_root_text not in sys.path:
+        sys.path.insert(0, source_root_text)
+    try:
+        from sion_translate.language_tags import canonicalize_language_tag
+
+        return canonicalize_language_tag(value, field=field)
+    except ValueError as error:
+        raise BundleError(str(error)) from error
+
+
+def _load_monolingual_selection(
+    root: Path,
+    config_path: Path | str | None,
+) -> MonolingualSelection:
+    raw_config_path = Path(config_path) if config_path is not None else Path("sion_translate.yaml")
+    if raw_config_path.is_absolute():
+        resolved_candidate = raw_config_path.resolve(strict=False)
+        try:
+            candidate_relative = resolved_candidate.relative_to(root)
+        except ValueError as error:
+            raise BundleError("bundle config path escapes the repository") from error
+        config_relative = _validated_relative_path(candidate_relative.as_posix())
+    else:
+        config_relative = _repository_relative_path(root, str(raw_config_path), field="config path")
+    resolved_config = root.joinpath(*config_relative.parts)
+    _assert_regular_source(resolved_config, config_relative)
+    config_object = _load_validated_project_config(resolved_config)
+    from sion_translate.config import AppConfig
+
+    if not isinstance(config_object, AppConfig):
+        raise BundleError("validated bundle config returned an unexpected object")
+    config = config_object
+    if not config.foundation.enabled:
+        raise BundleError(
+            "--with-monolingual-corpus conflicts with foundation.enabled=false in the config"
+        )
+    selected_languages = config.foundation_languages()
+    if not selected_languages:
+        raise BundleError("bundle config selects no foundation languages after exclusions")
+    corpus_root = _repository_relative_path(
+        root,
+        config.foundation.corpus_dir,
+        field="foundation.corpus_dir",
+    )
+    return MonolingualSelection(
+        config_path=config_relative,
+        corpus_root=corpus_root,
+        languages=selected_languages,
+        require_all_languages=config.foundation.require_all_languages,
+    )
 
 
 def _tracked_stage_zero_entries(root: Path) -> list[SourceEntry]:
@@ -308,6 +459,9 @@ def _collect_tree(
     """
 
     entries: list[SourceEntry] = []
+    if tree_root.is_symlink():
+        relative = tree_root.relative_to(root).as_posix()
+        raise BundleError(f"{origin} root may not be a symlink: {relative}")
     if not tree_root.is_dir():
         return entries
     for source_path in sorted(tree_root.rglob("*"), key=lambda path: path.as_posix()):
@@ -326,6 +480,74 @@ def _collect_tree(
                 origin=origin,
                 mode="100644",
             )
+        )
+    return entries
+
+
+def _collect_configured_monolingual_sources(
+    root: Path,
+    selection: MonolingualSelection,
+) -> list[SourceEntry]:
+    corpus_root = root.joinpath(*selection.corpus_root.parts)
+    if corpus_root.is_symlink():
+        raise BundleError(f"monolingual-corpus root may not be a symlink: {selection.corpus_root}")
+    if not corpus_root.is_dir():
+        raise BundleError(
+            "--with-monolingual-corpus was requested but the configured corpus directory "
+            f"does not exist: {selection.corpus_root}"
+        )
+
+    configured = {language: language for language in selection.languages}
+    matching_directories: dict[str, Path] = {}
+    for candidate in sorted(corpus_root.iterdir(), key=lambda path: path.name.casefold()):
+        if not candidate.is_dir():
+            continue
+        try:
+            key = _canonical_language(candidate.name, field="monolingual corpus directory")
+        except BundleError:
+            continue
+        if key not in configured:
+            continue
+        previous = matching_directories.get(key)
+        if previous is not None:
+            raise BundleError(
+                "multiple monolingual directories match one configured language: "
+                f"{previous.relative_to(root)} and {candidate.relative_to(root)}"
+            )
+        matching_directories[key] = candidate
+
+    missing = [language for language in selection.languages if language not in matching_directories]
+    if missing and selection.require_all_languages:
+        raise BundleError(
+            "configured foundation languages have no monolingual corpus directory: "
+            f"{', '.join(missing)}"
+        )
+
+    entries: list[SourceEntry] = []
+    languages_without_files: list[str] = []
+    for language in selection.languages:
+        directory = matching_directories.get(language)
+        if directory is None:
+            continue
+        language_entries = _collect_tree(
+            root,
+            directory,
+            "monolingual-corpus",
+            suffixes=MONOLINGUAL_SUFFIXES,
+        )
+        if not language_entries:
+            languages_without_files.append(language)
+            continue
+        entries.extend(language_entries)
+    if languages_without_files and selection.require_all_languages:
+        raise BundleError(
+            "configured foundation languages have no readable monolingual files: "
+            f"{', '.join(languages_without_files)}"
+        )
+    if not entries:
+        raise BundleError(
+            "--with-monolingual-corpus selected no readable files for the configured "
+            f"foundation languages: {', '.join(selection.languages)}"
         )
     return entries
 
@@ -349,107 +571,247 @@ def _fingerprint_tokenizer_hash(fingerprint: dict[str, object], name: str) -> st
     return recorded_hash
 
 
-def _dataset_tokenizer_hash(
-    payload_paths: set[str],
-    read_payload: Callable[[str], bytes],
-) -> str:
-    """Read and cross-check every packaged dataset identity source."""
+def _canonical_json_bytes(value: object) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
 
-    identities: dict[str, str] = {}
-    if DATASET_RAW_FINGERPRINT_PATH in payload_paths:
+
+def _validate_tokenizer_contract(
+    payload_paths: set[str],
+    identities: Mapping[str, tuple[int, str]],
+    read_payload: Callable[[str], bytes],
+) -> str | None:
+    tokenizer_prefix = f"{TOKENIZER_ROOT_PATH}/"
+    tokenizer_paths = {path for path in payload_paths if path.startswith(tokenizer_prefix)}
+    if not tokenizer_paths:
+        return None
+    expected = {
+        TOKENIZER_MODEL_PATH,
+        TOKENIZER_VOCAB_PATH,
+        TOKENIZER_METADATA_PATH,
+        TOKENIZER_FEATURES_PATH,
+    }
+    if tokenizer_paths != expected:
+        missing = sorted(expected - tokenizer_paths)
+        unexpected = sorted(tokenizer_paths - expected)
+        raise BundleError(
+            "tokenizer artifact inventory differs from the complete contract; "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+
+    metadata = _parse_json_object(
+        read_payload(TOKENIZER_METADATA_PATH),
+        TOKENIZER_METADATA_PATH,
+    )
+    version = metadata.get("version")
+    if isinstance(version, bool) or not isinstance(version, int) or version < 2:
+        raise BundleError("tokenizer metadata must use version 2 or newer")
+    if metadata.get("model_file") != "sion.model":
+        raise BundleError("tokenizer metadata model_file must be 'sion.model'")
+    if metadata.get("vocab_file") != "sion.vocab":
+        raise BundleError("tokenizer metadata vocab_file must be 'sion.vocab'")
+    if metadata.get("token_features_file") != "token_features.npz":
+        raise BundleError("tokenizer metadata must require the token_features.npz sidecar")
+
+    checks = (
+        (TOKENIZER_MODEL_PATH, "model_sha256", None),
+        (TOKENIZER_VOCAB_PATH, "vocab_sha256", None),
+        (TOKENIZER_FEATURES_PATH, "token_features_sha256", "token_features_size"),
+    )
+    for path, hash_field, size_field in checks:
+        size, digest = identities[path]
+        recorded_digest = metadata.get(hash_field)
+        if (
+            not isinstance(recorded_digest, str)
+            or not SHA256_PATTERN.fullmatch(recorded_digest)
+            or recorded_digest != digest
+        ):
+            raise BundleError(f"tokenizer metadata {hash_field} does not match {path}")
+        if size_field is not None:
+            recorded_size = metadata.get(size_field)
+            if (
+                isinstance(recorded_size, bool)
+                or not isinstance(recorded_size, int)
+                or recorded_size != size
+            ):
+                raise BundleError(f"tokenizer metadata {size_field} does not match {path}")
+    return identities[TOKENIZER_MODEL_PATH][1]
+
+
+def _validated_artifact_inventory(
+    manifest: Mapping[str, object],
+    *,
+    dataset_root: str,
+) -> dict[str, tuple[int, str]]:
+    raw_inventory = manifest.get("artifact_inventory")
+    if not isinstance(raw_inventory, Mapping):
+        raise BundleError(f"{dataset_root}/manifest.json has no artifact inventory")
+    inventory = cast(Mapping[object, object], raw_inventory)
+    if set(inventory) != {"schema", "files"}:
+        raise BundleError(f"{dataset_root} artifact inventory has unexpected fields")
+    if inventory.get("schema") != DATASET_ARTIFACT_INVENTORY_SCHEMA:
+        raise BundleError(f"{dataset_root} artifact inventory has an unsupported schema")
+    raw_files = inventory.get("files")
+    if not isinstance(raw_files, list) or not raw_files:
+        raise BundleError(f"{dataset_root} artifact inventory has no files")
+
+    files: dict[str, tuple[int, str]] = {}
+    ordered_paths: list[str] = []
+    for raw_entry in cast(list[object], raw_files):
+        if not isinstance(raw_entry, Mapping):
+            raise BundleError(f"{dataset_root} artifact inventory contains a non-object entry")
+        entry = cast(Mapping[object, object], raw_entry)
+        if set(entry) != {"path", "size", "sha256"}:
+            raise BundleError(f"{dataset_root} artifact inventory entry has unexpected fields")
+        raw_path = entry.get("path")
+        if not isinstance(raw_path, str):
+            raise BundleError(f"{dataset_root} artifact inventory path must be a string")
+        relative = _validated_relative_path(raw_path)
+        if relative.parts[0] not in {"train", "validation", "test"}:
+            raise BundleError(f"{dataset_root} artifact inventory path is outside a split")
+        size = entry.get("size")
+        digest = entry.get("sha256")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise BundleError(f"{dataset_root} artifact inventory size is invalid for {raw_path}")
+        if not isinstance(digest, str) or not SHA256_PATTERN.fullmatch(digest):
+            raise BundleError(
+                f"{dataset_root} artifact inventory SHA-256 is invalid for {raw_path}"
+            )
+        if raw_path in files:
+            raise BundleError(f"{dataset_root} artifact inventory repeats {raw_path}")
+        files[raw_path] = (size, digest)
+        ordered_paths.append(raw_path)
+    if ordered_paths != sorted(ordered_paths):
+        raise BundleError(f"{dataset_root} artifact inventory paths must be sorted")
+    return files
+
+
+def _validate_dataset_contract(
+    *,
+    payload_paths: set[str],
+    identities: Mapping[str, tuple[int, str]],
+    read_payload: Callable[[str], bytes],
+    dataset_root: str,
+    manifest_path: str,
+    expected_format: str,
+    tokenizer_sha256: str | None,
+    translation: bool,
+) -> None:
+    prefix = f"{dataset_root}/"
+    dataset_paths = {path for path in payload_paths if path.startswith(prefix)}
+    if not dataset_paths:
+        return
+    if tokenizer_sha256 is None:
+        raise BundleError(f"{dataset_root} requires the complete tokenizer in the same payload")
+    if manifest_path not in dataset_paths:
+        raise BundleError(f"{dataset_root} is missing manifest.json")
+
+    manifest = _parse_json_object(read_payload(manifest_path), manifest_path)
+    if manifest.get("format") != expected_format:
+        raise BundleError(f"{manifest_path} does not use {expected_format}")
+    inventory = _validated_artifact_inventory(manifest, dataset_root=dataset_root)
+
+    sidecars = {manifest_path}
+    if translation:
+        sidecars.update({DATASET_RAW_FINGERPRINT_PATH, DATASET_COMPLETION_PATH})
+    missing_sidecars = sorted(sidecars - dataset_paths)
+    if missing_sidecars:
+        raise BundleError(f"{dataset_root} is missing required sidecars: {missing_sidecars}")
+
+    indexed_paths = dataset_paths - sidecars
+    expected_indexed_paths = {f"{dataset_root}/{path}" for path in inventory}
+    if indexed_paths != expected_indexed_paths:
+        missing = sorted(expected_indexed_paths - indexed_paths)
+        unexpected = sorted(indexed_paths - expected_indexed_paths)
+        raise BundleError(
+            f"{dataset_root} file set differs from its artifact inventory; "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+    for relative, expected_identity in inventory.items():
+        path = f"{dataset_root}/{relative}"
+        if identities[path] != expected_identity:
+            raise BundleError(f"{dataset_root} artifact identity mismatch for {relative}")
+
+    if translation:
         raw_fingerprint = _parse_json_object(
             read_payload(DATASET_RAW_FINGERPRINT_PATH),
             DATASET_RAW_FINGERPRINT_PATH,
         )
-        identities[DATASET_RAW_FINGERPRINT_PATH] = _fingerprint_tokenizer_hash(
-            raw_fingerprint,
-            DATASET_RAW_FINGERPRINT_PATH,
+        manifest_fingerprint = manifest.get("fingerprint")
+        if not isinstance(manifest_fingerprint, dict):
+            raise BundleError(f"{manifest_path} has no valid fingerprint object")
+        if raw_fingerprint != manifest_fingerprint:
+            raise BundleError("prepared dataset fingerprint sidecar disagrees with its manifest")
+        recorded_hash = _fingerprint_tokenizer_hash(raw_fingerprint, DATASET_RAW_FINGERPRINT_PATH)
+        completion = _parse_json_object(
+            read_payload(DATASET_COMPLETION_PATH),
+            DATASET_COMPLETION_PATH,
         )
+        expected_completion = {
+            "schema": PREPARE_COMPLETION_SCHEMA,
+            "manifest_sha256": identities[manifest_path][1],
+            "raw_fingerprint_sha256": identities[DATASET_RAW_FINGERPRINT_PATH][1],
+            "artifact_inventory_sha256": hashlib.sha256(
+                _canonical_json_bytes(manifest["artifact_inventory"])
+            ).hexdigest(),
+        }
+        if completion != expected_completion:
+            raise BundleError(
+                "prepared dataset completion marker does not authenticate its sidecars"
+            )
+    else:
+        recorded_hash = manifest.get("tokenizer_sha256")
+        if not isinstance(recorded_hash, str) or not SHA256_PATTERN.fullmatch(recorded_hash):
+            raise BundleError(f"{manifest_path} has no valid tokenizer_sha256")
 
-    if DATASET_MANIFEST_PATH in payload_paths:
-        manifest = _parse_json_object(
-            read_payload(DATASET_MANIFEST_PATH),
-            DATASET_MANIFEST_PATH,
-        )
-        raw_manifest_fingerprint = manifest.get("fingerprint")
-        if not isinstance(raw_manifest_fingerprint, dict):
-            raise BundleError(f"{DATASET_MANIFEST_PATH} has no valid fingerprint object")
-        manifest_fingerprint = cast(dict[str, object], raw_manifest_fingerprint)
-        identities[DATASET_MANIFEST_PATH] = _fingerprint_tokenizer_hash(
-            manifest_fingerprint,
-            f"{DATASET_MANIFEST_PATH}.fingerprint",
-        )
-
-    if not identities:
-        raise BundleError(
-            "the prepared dataset has neither raw_fingerprint.json nor a manifest.json "
-            "fingerprint; refusing to ship token ids whose tokenizer identity cannot be verified"
-        )
-    if len(set(identities.values())) != 1:
-        rendered = ", ".join(f"{name}={digest}" for name, digest in identities.items())
-        raise BundleError(f"prepared dataset tokenizer fingerprints disagree: {rendered}")
-    return next(iter(identities.values()))
-
-
-def _validate_payload_dataset_tokenizer_identity(
-    payload_paths: set[str],
-    tokenizer_sha256: str | None,
-    read_payload: Callable[[str], bytes],
-    *,
-    dataset_included: bool | None = None,
-) -> None:
-    """Verify the semantic tokenizer/dataset relation inside one payload."""
-
-    has_dataset = (
-        any(path.startswith("artifacts/dataset/") for path in payload_paths)
-        if dataset_included is None
-        else dataset_included
-    )
-    if not has_dataset:
-        return
-    if TOKENIZER_MODEL_PATH not in payload_paths or tokenizer_sha256 is None:
-        raise BundleError(
-            "a prepared dataset requires artifacts/tokenizer/sion.model in the same payload"
-        )
-    recorded_hash = _dataset_tokenizer_hash(payload_paths, read_payload)
     if recorded_hash != tokenizer_sha256:
         raise BundleError(
-            "prepared dataset tokenizer mismatch: dataset fingerprint records "
-            f"{recorded_hash}, but {TOKENIZER_MODEL_PATH} is {tokenizer_sha256}. "
-            "Rebuild artifacts/dataset with this tokenizer before packaging."
+            f"{dataset_root} tokenizer mismatch: manifest records {recorded_hash}, "
+            f"but {TOKENIZER_MODEL_PATH} is {tokenizer_sha256}"
         )
 
 
-def _validate_dataset_tokenizer_identity(root: Path) -> None:
-    """Require prepared token ids to name the tokenizer that produced them."""
-
-    tokenizer_path = root.joinpath(*PurePosixPath(TOKENIZER_MODEL_PATH).parts)
-    payload_paths = {TOKENIZER_MODEL_PATH}
-    for relative_path in (DATASET_RAW_FINGERPRINT_PATH, DATASET_MANIFEST_PATH):
-        candidate = root.joinpath(*PurePosixPath(relative_path).parts)
-        if candidate.is_file():
-            payload_paths.add(relative_path)
-
-    def read_payload(relative_path: str) -> bytes:
-        path = root.joinpath(*PurePosixPath(relative_path).parts)
-        with path.open("rb") as source:
-            return _read_limited(source, path.stat().st_size, relative_path)
-
-    _model_size, actual_hash = _hash_file(tokenizer_path)
-    _validate_payload_dataset_tokenizer_identity(
-        payload_paths,
-        actual_hash,
-        read_payload,
-        dataset_included=True,
+def _validate_artifact_contracts(
+    payload_paths: set[str],
+    identities: Mapping[str, tuple[int, str]],
+    read_payload: Callable[[str], bytes],
+) -> None:
+    tokenizer_sha256 = _validate_tokenizer_contract(payload_paths, identities, read_payload)
+    _validate_dataset_contract(
+        payload_paths=payload_paths,
+        identities=identities,
+        read_payload=read_payload,
+        dataset_root=TRANSLATION_DATASET_ROOT_PATH,
+        manifest_path=DATASET_MANIFEST_PATH,
+        expected_format=TRANSLATION_DATASET_FORMAT,
+        tokenizer_sha256=tokenizer_sha256,
+        translation=True,
+    )
+    _validate_dataset_contract(
+        payload_paths=payload_paths,
+        identities=identities,
+        read_payload=read_payload,
+        dataset_root=FOUNDATION_DATASET_ROOT_PATH,
+        manifest_path=FOUNDATION_DATASET_MANIFEST_PATH,
+        expected_format=FOUNDATION_DATASET_FORMAT,
+        tokenizer_sha256=tokenizer_sha256,
+        translation=False,
     )
 
 
 def _collect_sources(
     root: Path,
     *,
+    config_path: Path | str | None = None,
     include_monolingual_corpus: bool = False,
     include_tokenizer: bool = False,
     include_dataset: bool = False,
+    include_foundation_dataset: bool = False,
 ) -> list[SourceEntry]:
     selected: dict[PurePosixPath, SourceEntry] = {}
     portable_paths = {
@@ -515,18 +877,13 @@ def _collect_sources(
             )
 
     if include_monolingual_corpus:
-        corpus_entries = _collect_tree(
-            root,
-            data_root / "corpus",
-            "monolingual-corpus",
-            suffixes=MONOLINGUAL_SUFFIXES,
-        )
-        if not corpus_entries:
+        selection = _load_monolingual_selection(root, config_path)
+        if selection.config_path not in selected:
             raise BundleError(
-                "--with-monolingual-corpus was requested but data/corpus holds no "
-                f"readable {'/'.join(sorted(MONOLINGUAL_SUFFIXES))} files"
+                "the config used to select monolingual corpora is not a tracked bundle file: "
+                f"{selection.config_path}"
             )
-        for entry in corpus_entries:
+        for entry in _collect_configured_monolingual_sources(root, selection):
             add(entry)
 
     if include_tokenizer:
@@ -550,7 +907,7 @@ def _collect_sources(
             add(entry)
 
     if include_dataset:
-        dataset_root = root / "artifacts" / "dataset"
+        dataset_root = root.joinpath(*PurePosixPath(TRANSLATION_DATASET_ROOT_PATH).parts)
         dataset_entries = _collect_tree(root, dataset_root, "dataset")
         if not dataset_entries:
             raise BundleError(
@@ -564,9 +921,46 @@ def _collect_sources(
                 "--with-dataset requires --with-tokenizer: a prepared dataset is "
                 "only reusable together with the tokenizer whose ids it holds"
             )
-        _validate_dataset_tokenizer_identity(root)
         for entry in dataset_entries:
             add(entry)
+
+    if include_foundation_dataset:
+        foundation_root = root.joinpath(*PurePosixPath(FOUNDATION_DATASET_ROOT_PATH).parts)
+        foundation_entries = _collect_tree(
+            root,
+            foundation_root,
+            "foundation-dataset",
+        )
+        if not foundation_entries:
+            raise BundleError(
+                "--with-foundation-dataset was requested but "
+                f"{foundation_root} does not exist or holds no files"
+            )
+        if not include_tokenizer:
+            raise BundleError(
+                "--with-foundation-dataset requires --with-tokenizer because its token ids "
+                "must remain bound to the tokenizer that produced them"
+            )
+        for entry in foundation_entries:
+            add(entry)
+
+    artifact_entries = {
+        entry.relative_path.as_posix(): entry
+        for entry in selected.values()
+        if entry.origin in {"tokenizer", "dataset", "foundation-dataset"}
+    }
+    if artifact_entries:
+        identities = {
+            path: _hash_file(entry.source_path) for path, entry in artifact_entries.items()
+        }
+
+        def read_payload(relative_path: str) -> bytes:
+            entry = artifact_entries[relative_path]
+            size = identities[relative_path][0]
+            with entry.source_path.open("rb") as source:
+                return _read_limited(source, size, relative_path)
+
+        _validate_artifact_contracts(set(artifact_entries), identities, read_payload)
 
     entries = [selected[path] for path in sorted(selected, key=lambda item: item.as_posix())]
     if not any(
@@ -592,11 +986,11 @@ def _zip_info(relative_path: str, mode: str) -> zipfile.ZipInfo:
     info.external_attr = int(mode, 8) << 16
     info.flag_bits |= 0x800
     # ZipFile.open has no public per-entry compression-level argument.
-    info._compresslevel = 6
+    info._compresslevel = 6  # pyright: ignore[reportAttributeAccessIssue]
     return info
 
 
-def _copy_and_hash(source: BinaryIO, destination: BinaryIO) -> tuple[int, str]:
+def _copy_and_hash(source: IO[bytes], destination: IO[bytes]) -> tuple[int, str]:
     digest = hashlib.sha256()
     total = 0
     while True:
@@ -743,7 +1137,28 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def _hash_stream(source: BinaryIO) -> tuple[int, str]:
+def _publish_archive(temporary_path: Path, output: Path, *, overwrite: bool) -> None:
+    """Publish atomically while making the non-overwrite promise race-free."""
+
+    if overwrite:
+        os.replace(temporary_path, output)
+        return
+    try:
+        # Both files are in the same directory, so the hard-link publication is
+        # atomic and cannot replace a destination created by another process.
+        os.link(temporary_path, output)
+    except FileExistsError as error:
+        raise BundleError(
+            f"bundle output appeared while building; refusing to replace it: {output}"
+        ) from error
+    except OSError as error:
+        raise BundleError(
+            f"could not atomically publish bundle without overwrite: {error}"
+        ) from error
+    temporary_path.unlink()
+
+
+def _hash_stream(source: IO[bytes]) -> tuple[int, str]:
     digest = hashlib.sha256()
     size = 0
     while True:
@@ -760,7 +1175,7 @@ def _hash_file(path: Path) -> tuple[int, str]:
         return _hash_stream(source)
 
 
-def _read_limited(source: BinaryIO, size: int, name: str) -> bytes:
+def _read_limited(source: IO[bytes], size: int, name: str) -> bytes:
     if size > MAX_METADATA_SIZE:
         raise BundleError(f"{name} is unreasonably large ({size} bytes)")
     content = source.read(MAX_METADATA_SIZE + 1)
@@ -771,11 +1186,12 @@ def _read_limited(source: BinaryIO, size: int, name: str) -> bytes:
 
 def _parse_manifest(content: bytes) -> tuple[dict[str, object], list[FileRecord]]:
     try:
-        raw = json.loads(content.decode("utf-8"))
+        decoded = cast(object, json.loads(content.decode("utf-8")))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise BundleError(f"{MANIFEST_NAME} is not valid UTF-8 JSON") from error
-    if not isinstance(raw, dict):
+    if not isinstance(decoded, dict):
         raise BundleError(f"{MANIFEST_NAME} must contain a JSON object")
+    raw = cast(dict[str, object], decoded)
     if raw.get("format_version") != FORMAT_VERSION:
         raise BundleError("unsupported package manifest format version")
     if raw.get("archive_root") != ARCHIVE_ROOT:
@@ -784,8 +1200,9 @@ def _parse_manifest(content: bytes) -> tuple[dict[str, object], list[FileRecord]
     git_identity = raw.get("git")
     if not isinstance(git_identity, dict):
         raise BundleError("manifest git identity is missing")
-    commit = git_identity.get("commit")
-    tree = git_identity.get("tree")
+    git_values = cast(dict[object, object], git_identity)
+    commit = git_values.get("commit")
+    tree = git_values.get("tree")
     if not isinstance(commit, str) or not GIT_OBJECT_PATTERN.fullmatch(commit):
         raise BundleError("manifest Git commit is invalid")
     if not isinstance(tree, str) or not GIT_OBJECT_PATTERN.fullmatch(tree):
@@ -795,14 +1212,15 @@ def _parse_manifest(content: bytes) -> tuple[dict[str, object], list[FileRecord]
     if not isinstance(raw_files, list):
         raise BundleError("manifest files must be a list")
     records: list[FileRecord] = []
-    for raw_record in raw_files:
+    for raw_record in cast(list[object], raw_files):
         if not isinstance(raw_record, dict):
             raise BundleError("manifest contains a non-object file record")
-        path = raw_record.get("path")
-        size = raw_record.get("size")
-        digest = raw_record.get("sha256")
-        origin = raw_record.get("origin")
-        mode = raw_record.get("mode")
+        record_values = cast(dict[object, object], raw_record)
+        path = record_values.get("path")
+        size = record_values.get("size")
+        digest = record_values.get("sha256")
+        origin = record_values.get("origin")
+        mode = record_values.get("mode")
         if not isinstance(path, str):
             raise BundleError("manifest file path is invalid")
         _validated_relative_path(path)
@@ -810,10 +1228,23 @@ def _parse_manifest(content: bytes) -> tuple[dict[str, object], list[FileRecord]
             raise BundleError(f"manifest size is invalid for {path}")
         if not isinstance(digest, str) or not SHA256_PATTERN.fullmatch(digest):
             raise BundleError(f"manifest sha256 is invalid for {path}")
-        if origin not in ALLOWED_ORIGINS:
+        if not isinstance(origin, str) or origin not in ALLOWED_ORIGINS:
             raise BundleError(f"manifest origin is invalid for {path}")
-        if mode not in REGULAR_GIT_MODES:
+        if not isinstance(mode, str) or mode not in REGULAR_GIT_MODES:
             raise BundleError(f"manifest mode is invalid for {path}")
+        expected_artifact_origin = next(
+            (
+                candidate_origin
+                for candidate_origin, root_path in ARTIFACT_ORIGIN_ROOTS.items()
+                if path.startswith(f"{root_path}/")
+            ),
+            None,
+        )
+        if expected_artifact_origin is not None and origin != expected_artifact_origin:
+            raise BundleError(f"manifest origin does not match the artifact root for {path}")
+        artifact_root = ARTIFACT_ORIGIN_ROOTS.get(origin)
+        if artifact_root is not None and not path.startswith(f"{artifact_root}/"):
+            raise BundleError(f"manifest {origin} file is outside its artifact root: {path}")
         records.append(
             FileRecord(
                 path=path,
@@ -827,15 +1258,19 @@ def _parse_manifest(content: bytes) -> tuple[dict[str, object], list[FileRecord]
     paths = [record.path for record in records]
     if paths != sorted(paths) or len(paths) != len(set(paths)):
         raise BundleError("manifest file paths must be unique and sorted")
+    portable_paths = [_portable_path_key(PurePosixPath(path)) for path in paths]
+    if len(portable_paths) != len(set(portable_paths)):
+        raise BundleError("manifest file paths collide on portable filesystems")
     if MANIFEST_NAME in paths or CHECKSUMS_NAME in paths:
         raise BundleError("generated metadata may not appear as a payload file")
 
     payload = raw.get("payload")
     if not isinstance(payload, dict):
         raise BundleError("manifest payload summary is missing")
-    if payload.get("file_count") != len(records):
+    payload_values = cast(dict[object, object], payload)
+    if payload_values.get("file_count") != len(records):
         raise BundleError("manifest payload file_count does not match its files")
-    if payload.get("total_bytes") != sum(record.size for record in records):
+    if payload_values.get("total_bytes") != sum(record.size for record in records):
         raise BundleError("manifest payload total_bytes does not match its files")
     return raw, records
 
@@ -846,6 +1281,7 @@ def _parse_checksums(content: bytes) -> dict[str, str]:
     except UnicodeDecodeError as error:
         raise BundleError(f"{CHECKSUMS_NAME} is not valid UTF-8") from error
     checksums: dict[str, str] = {}
+    portable_paths: dict[str, str] = {}
     for line_number, line in enumerate(text.splitlines(), start=1):
         if not line:
             raise BundleError(f"{CHECKSUMS_NAME}:{line_number}: blank lines are not allowed")
@@ -858,6 +1294,13 @@ def _parse_checksums(content: bytes) -> dict[str, str]:
         _validated_relative_path(path)
         if path in checksums:
             raise BundleError(f"{CHECKSUMS_NAME}: duplicate path {path!r}")
+        portable_key = _portable_path_key(PurePosixPath(path))
+        collision = portable_paths.get(portable_key)
+        if collision is not None:
+            raise BundleError(
+                f"{CHECKSUMS_NAME}: portable path collision between {collision!r} and {path!r}"
+            )
+        portable_paths[portable_key] = path
         checksums[path] = digest
     return checksums
 
@@ -910,6 +1353,7 @@ def verify_archive(archive_path: Path | str) -> VerificationResult:
             if len(names) != len(set(names)):
                 raise BundleError("ZIP contains duplicate member names")
             by_relative_path: dict[str, zipfile.ZipInfo] = {}
+            portable_members: dict[str, str] = {}
             for info in infos:
                 if info.is_dir():
                     raise BundleError(
@@ -917,7 +1361,27 @@ def verify_archive(archive_path: Path | str) -> VerificationResult:
                     )
                 if info.flag_bits & 0x1:
                     raise BundleError(f"encrypted ZIP members are not supported: {info.filename}")
+                if info.compress_type != zipfile.ZIP_DEFLATED:
+                    raise BundleError(
+                        f"ZIP member uses an unsupported compression method: {info.filename}"
+                    )
+                if info.date_time != ZIP_TIMESTAMP:
+                    raise BundleError(
+                        f"ZIP member has a non-reproducible timestamp: {info.filename}"
+                    )
+                if info.create_system != 3:
+                    raise BundleError(
+                        f"ZIP member has an unsupported creator system: {info.filename}"
+                    )
                 _root, relative = _validate_zip_member_name(info.filename)
+                portable_key = _portable_path_key(relative)
+                collision = portable_members.get(portable_key)
+                if collision is not None:
+                    raise BundleError(
+                        "ZIP contains a portable member-name collision between "
+                        f"{collision!r} and {info.filename!r}"
+                    )
+                portable_members[portable_key] = info.filename
                 by_relative_path[relative.as_posix()] = info
 
             if MANIFEST_NAME not in by_relative_path or CHECKSUMS_NAME not in by_relative_path:
@@ -970,15 +1434,14 @@ def verify_archive(archive_path: Path | str) -> VerificationResult:
                 info = by_relative_path[relative_path]
                 with archive.open(info, mode="r") as source:
                     return _read_limited(
-                        cast(BinaryIO, source),
+                        source,
                         info.file_size,
                         relative_path,
                     )
 
-            tokenizer_record = records_by_path.get(TOKENIZER_MODEL_PATH)
-            _validate_payload_dataset_tokenizer_identity(
+            _validate_artifact_contracts(
                 set(records_by_path),
-                tokenizer_record.sha256 if tokenizer_record is not None else None,
+                {record.path: (record.size, record.sha256) for record in records},
                 read_payload,
             )
             if _zip_mode(manifest_info) != "100644":
@@ -989,14 +1452,13 @@ def verify_archive(archive_path: Path | str) -> VerificationResult:
         raise BundleError(f"invalid ZIP archive: {error}") from error
 
     git_identity = raw_manifest["git"]
-    payload = raw_manifest["payload"]
     assert isinstance(git_identity, dict)
-    assert isinstance(payload, dict)
+    git_values = cast(dict[str, object], git_identity)
     return VerificationResult(
         file_count=len(records),
         total_bytes=sum(record.size for record in records),
-        git_commit=str(git_identity["commit"]),
-        git_tree=str(git_identity["tree"]),
+        git_commit=cast(str, git_values["commit"]),
+        git_tree=cast(str, git_values["tree"]),
     )
 
 
@@ -1067,20 +1529,20 @@ def verify_tree(tree_path: Path | str) -> VerificationResult:
         source_path = root.joinpath(*PurePosixPath(relative_path).parts)
         return _read_tree_metadata(source_path, relative_path)
 
-    tokenizer_record = records_by_path.get(TOKENIZER_MODEL_PATH)
-    _validate_payload_dataset_tokenizer_identity(
+    _validate_artifact_contracts(
         set(records_by_path),
-        tokenizer_record.sha256 if tokenizer_record is not None else None,
+        {record.path: (record.size, record.sha256) for record in records},
         read_payload,
     )
 
     git_identity = raw_manifest["git"]
     assert isinstance(git_identity, dict)
+    git_values = cast(dict[str, object], git_identity)
     return VerificationResult(
         file_count=len(records),
         total_bytes=sum(record.size for record in records),
-        git_commit=str(git_identity["commit"]),
-        git_tree=str(git_identity["tree"]),
+        git_commit=cast(str, git_values["commit"]),
+        git_tree=cast(str, git_values["tree"]),
     )
 
 
@@ -1089,9 +1551,11 @@ def build_bundle(
     output_path: Path | str | None = None,
     *,
     overwrite: bool = False,
+    config_path: Path | str | None = None,
     include_monolingual_corpus: bool = False,
     include_tokenizer: bool = False,
     include_dataset: bool = False,
+    include_foundation_dataset: bool = False,
 ) -> BuildResult:
     """Build, verify, and atomically publish a deterministic GPU bundle."""
 
@@ -1113,9 +1577,11 @@ def build_bundle(
     commit, tree = _git_identity(root)
     sources = _collect_sources(
         root,
+        config_path=config_path,
         include_monolingual_corpus=include_monolingual_corpus,
         include_tokenizer=include_tokenizer,
         include_dataset=include_dataset,
+        include_foundation_dataset=include_foundation_dataset,
     )
     if not sources:
         raise BundleError("the bundle source allowlist selected no files")
@@ -1136,11 +1602,7 @@ def build_bundle(
         _ensure_clean_tracked_tree(root)
         if _git_identity(root) != (commit, tree):
             raise BundleError("Git HEAD changed while the bundle was being built")
-        if output.exists() and not overwrite:
-            raise BundleError(
-                f"bundle output appeared while building; refusing to replace it: {output}"
-            )
-        os.replace(temporary_path, output)
+        _publish_archive(temporary_path, output, overwrite=overwrite)
         _fsync_directory(output.parent)
     except BaseException:
         temporary_path.unlink(missing_ok=True)
@@ -1181,6 +1643,14 @@ def _argument_parser() -> argparse.ArgumentParser:
         help="atomically replace an existing output ZIP",
     )
     build_parser.add_argument(
+        "--config",
+        type=Path,
+        help=(
+            "repository-relative YAML configuration used to select the monolingual "
+            "corpus (default: ROOT/sion_translate.yaml)"
+        ),
+    )
+    build_parser.add_argument(
         "--with-monolingual-corpus",
         action="store_true",
         help=(
@@ -1203,6 +1673,14 @@ def _argument_parser() -> argparse.ArgumentParser:
             "also ship artifacts/dataset, the tokenized training shards. "
             "Requires --with-tokenizer, because the ids only mean anything "
             "alongside the tokenizer that produced them."
+        ),
+    )
+    build_parser.add_argument(
+        "--with-foundation-dataset",
+        action="store_true",
+        help=(
+            "also ship artifacts/foundation_dataset, the prepared foundation shards. "
+            "Requires --with-tokenizer and authenticates the manifest inventory."
         ),
     )
 
@@ -1229,9 +1707,11 @@ def main(arguments: list[str] | None = None) -> int:
                 parsed.root,
                 parsed.output,
                 overwrite=parsed.overwrite,
+                config_path=parsed.config,
                 include_monolingual_corpus=parsed.with_monolingual_corpus,
                 include_tokenizer=parsed.with_tokenizer,
                 include_dataset=parsed.with_dataset,
+                include_foundation_dataset=parsed.with_foundation_dataset,
             )
             print(f"bundle: {result.output_path}")
             print(f"sha256: {result.archive_sha256}")

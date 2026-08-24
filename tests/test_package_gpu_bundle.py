@@ -110,21 +110,110 @@ def test_build_is_deterministic_allowlisted_and_verifiable(tmp_path: Path) -> No
 
 def _with_monolingual_corpus(root: Path) -> None:
     corpus = root / "data" / "corpus"
-    for language, text in (("ko", "단일어 문장\n"), ("ja", "単言語の文\n")):
+    for language, text in (
+        ("ko", "단일어 문장\n"),
+        ("ja", "単言語の文\n"),
+        ("iw", "טקסט בשפה שהוגדרה.\n"),
+        ("x-demo", "Private language corpus.\n"),
+        ("de", "Nicht konfigurierte Sprache.\n"),
+    ):
         directory = corpus / language
         directory.mkdir(parents=True)
         (directory / "wiki.txt").write_text(text, encoding="utf-8")
         # Not a readable monolingual format; must not be shipped.
         (directory / "notes.md").write_text("stray download\n", encoding="utf-8")
+    config = root / "sion_translate.yaml"
+    config.write_text(
+        """\
+data:
+  language_pairs:
+    - [ko, ja]
+    - [he, ko]
+    - [x-demo, ja]
+    - [de, ko]
+  source_only_languages: [de]
+foundation:
+  corpus_dir: data/corpus
+  languages: []
+  require_all_languages: true
+""",
+        encoding="utf-8",
+    )
+    _git(root, "add", config.name)
+    _git(root, "commit", "-qm", "add bundle selection config")
+
+
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _rewrite_tokenizer_metadata(root: Path) -> None:
+    tokenizer = root / "artifacts" / "tokenizer"
+    model = tokenizer / "sion.model"
+    vocab = tokenizer / "sion.vocab"
+    features = tokenizer / "token_features.npz"
+    (tokenizer / "tokenizer_metadata.json").write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "split_digits": True,
+                "model_file": model.name,
+                "model_sha256": _file_sha256(model),
+                "vocab_file": vocab.name,
+                "vocab_sha256": _file_sha256(vocab),
+                "token_features_file": features.name,
+                "token_features_size": features.stat().st_size,
+                "token_features_sha256": _file_sha256(features),
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 def _with_tokenizer(root: Path, *, complete: bool = True) -> None:
     tokenizer = root / "artifacts" / "tokenizer"
     tokenizer.mkdir(parents=True, exist_ok=True)
     (tokenizer / "sion.model").write_bytes(b"model")
-    (tokenizer / "tokenizer_metadata.json").write_text('{"split_digits":true}\n', encoding="utf-8")
     if complete:
         (tokenizer / "sion.vocab").write_text("piece\t0\n", encoding="utf-8")
+        (tokenizer / "token_features.npz").write_bytes(b"features")
+        _rewrite_tokenizer_metadata(root)
+    else:
+        (tokenizer / "tokenizer_metadata.json").write_text(
+            '{"version":2,"split_digits":true}\n',
+            encoding="utf-8",
+        )
+
+
+def _artifact_inventory(dataset: Path) -> dict[str, object]:
+    files: list[dict[str, object]] = []
+    for split in ("train", "validation", "test"):
+        split_root = dataset / split
+        if not split_root.is_dir():
+            continue
+        for path in sorted(split_root.rglob("*")):
+            if path.is_file():
+                files.append(
+                    {
+                        "path": path.relative_to(dataset).as_posix(),
+                        "size": path.stat().st_size,
+                        "sha256": _file_sha256(path),
+                    }
+                )
+    return {"schema": "sion-indexed-artifact-inventory-v1", "files": files}
+
+
+def _canonical_json_sha256(value: object) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _with_dataset(
@@ -134,36 +223,53 @@ def _with_dataset(
     manifest_tokenizer_sha256: str | None = None,
     include_raw_fingerprint: bool = True,
     include_manifest: bool = True,
+    include_completion: bool = True,
 ) -> None:
     dataset = root / "artifacts" / "dataset"
     dataset.mkdir(parents=True)
-    (dataset / "train.00000.idx.npy").write_bytes(b"ids")
+    for split in ("train", "validation", "test"):
+        (dataset / split).mkdir()
+    (dataset / "train" / "train.00000.idx.npy").write_bytes(b"ids")
     digest = (
         tokenizer_sha256
         or hashlib.sha256(
             (root / "artifacts" / "tokenizer" / "sion.model").read_bytes()
         ).hexdigest()
     )
+    fingerprint = {
+        "schema": "sion-dataset-fingerprint-v2",
+        "tokenizer_sha256": digest,
+    }
+    raw_fingerprint = dataset / "raw_fingerprint.json"
     if include_raw_fingerprint:
-        (dataset / "raw_fingerprint.json").write_text(
-            json.dumps(
-                {
-                    "schema": "sion-dataset-fingerprint-v2",
-                    "tokenizer_sha256": digest,
-                }
-            )
-            + "\n",
-            encoding="utf-8",
-        )
+        raw_fingerprint.write_text(json.dumps(fingerprint) + "\n", encoding="utf-8")
+    manifest_path = dataset / "manifest.json"
     if include_manifest:
-        (dataset / "manifest.json").write_text(
+        manifest_path.write_text(
             json.dumps(
                 {
-                    "format": "sion-indexed-parallel-v5",
+                    "format": "sion-indexed-parallel-v6",
                     "fingerprint": {
                         "schema": "sion-dataset-fingerprint-v2",
                         "tokenizer_sha256": manifest_tokenizer_sha256 or digest,
                     },
+                    "artifact_inventory": _artifact_inventory(dataset),
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    if include_completion and include_raw_fingerprint and include_manifest:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        (dataset / ".sion-prepare-complete.json").write_text(
+            json.dumps(
+                {
+                    "schema": "sion-prepare-completion-v1",
+                    "manifest_sha256": _file_sha256(manifest_path),
+                    "raw_fingerprint_sha256": _file_sha256(raw_fingerprint),
+                    "artifact_inventory_sha256": _canonical_json_sha256(
+                        manifest["artifact_inventory"]
+                    ),
                 }
             )
             + "\n",
@@ -171,12 +277,32 @@ def _with_dataset(
         )
 
 
-def test_the_monolingual_corpus_ships_only_when_asked_for(tmp_path: Path) -> None:
-    """foundation 입력이라 없으면 그 단계가 통째로 건너뛰어진다.
+def _with_foundation_dataset(
+    root: Path,
+    *,
+    tokenizer_sha256: str | None = None,
+) -> None:
+    dataset = root / "artifacts" / "foundation_dataset"
+    (dataset / "train").mkdir(parents=True)
+    (dataset / "validation").mkdir()
+    (dataset / "train" / "train.00000.idx.npy").write_bytes(b"foundation ids")
+    digest = tokenizer_sha256 or _file_sha256(root / "artifacts" / "tokenizer" / "sion.model")
+    (dataset / "manifest.json").write_text(
+        json.dumps(
+            {
+                "format": "sion-foundation-indexed-v2",
+                "stage": "foundation",
+                "tokenizer_sha256": digest,
+                "artifact_inventory": _artifact_inventory(dataset),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
-    기본에 넣지 않는 이유는 분량입니다. 실제 코퍼스는 13.86 GiB 이고, 그것을
-    모르고 배포물에 넣는 것은 실수로 치르기에 비싼 비용입니다.
-    """
+
+def test_the_monolingual_corpus_ships_only_when_asked_for(tmp_path: Path) -> None:
+    """Only configured foundation languages should consume bundle space."""
 
     root = _repository(tmp_path)
     _with_monolingual_corpus(root)
@@ -184,8 +310,7 @@ def test_the_monolingual_corpus_ships_only_when_asked_for(tmp_path: Path) -> Non
     default_archive = tmp_path / "default.zip"
     package_gpu_bundle.build_bundle(root, default_archive)
     with zipfile.ZipFile(default_archive) as archive:
-        # `data/corpus.jsonl` 은 병렬 shard 라 들어가야 한다. 빠져야 하는 것은
-        # `data/corpus/` **폴더** 이므로 구분자까지 보고 판정한다.
+        # data/corpus.jsonl is a parallel shard. Only the data/corpus/ tree is opt-in.
         assert not any("data/corpus/" in name for name in archive.namelist())
 
     included = tmp_path / "with-corpus.zip"
@@ -194,7 +319,10 @@ def test_the_monolingual_corpus_ships_only_when_asked_for(tmp_path: Path) -> Non
         names = set(archive.namelist())
     assert "sion_translate/data/corpus/ko/wiki.txt" in names
     assert "sion_translate/data/corpus/ja/wiki.txt" in names
-    # 읽을 수 없는 형식은 빼야 한다. 넣으면 기가바이트를 조용히 낭비한다.
+    assert "sion_translate/data/corpus/iw/wiki.txt" in names
+    assert "sion_translate/data/corpus/x-demo/wiki.txt" in names
+    assert "sion_translate/data/corpus/de/wiki.txt" not in names
+    # Unsupported formats must not consume upload space.
     assert not any(name.endswith("notes.md") for name in names)
 
     origins = {entry["path"]: entry["origin"] for entry in _manifest(included)["files"]}
@@ -203,7 +331,7 @@ def test_the_monolingual_corpus_ships_only_when_asked_for(tmp_path: Path) -> Non
 
 
 def test_the_tokenizer_ships_only_when_asked_for_and_only_if_complete(tmp_path: Path) -> None:
-    """반쪽 토크나이저를 실으면 실패가 업로드 뒤 GPU 서버로 미뤄진다."""
+    """A partial tokenizer must fail before the GPU upload."""
 
     root = _repository(tmp_path)
     _with_tokenizer(root, complete=False)
@@ -218,15 +346,40 @@ def test_the_tokenizer_ships_only_when_asked_for_and_only_if_complete(tmp_path: 
         names = set(archive.namelist())
     assert "sion_translate/artifacts/tokenizer/sion.model" in names
     assert "sion_translate/artifacts/tokenizer/tokenizer_metadata.json" in names
+    assert "sion_translate/artifacts/tokenizer/token_features.npz" in names
 
     origins = {entry["path"]: entry["origin"] for entry in _manifest(included)["files"]}
     assert origins["artifacts/tokenizer/sion.model"] == "tokenizer"
     package_gpu_bundle.verify_archive(included)
 
 
+def test_tokenizer_sidecar_hashes_and_inventory_are_enforced(tmp_path: Path) -> None:
+    root = _repository(tmp_path)
+    _with_tokenizer(root)
+    metadata_path = root / "artifacts" / "tokenizer" / "tokenizer_metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["token_features_sha256"] = "0" * 64
+    metadata_path.write_text(json.dumps(metadata) + "\n", encoding="utf-8")
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="token_features_sha256"):
+        package_gpu_bundle.build_bundle(
+            root,
+            tmp_path / "bad-tokenizer-sidecar.zip",
+            include_tokenizer=True,
+        )
+
+    _rewrite_tokenizer_metadata(root)
+    (root / "artifacts" / "tokenizer" / "stale.tmp").write_bytes(b"stale")
+    with pytest.raises(package_gpu_bundle.BundleError, match="unexpected"):
+        package_gpu_bundle.build_bundle(
+            root,
+            tmp_path / "unexpected-tokenizer-file.zip",
+            include_tokenizer=True,
+        )
+
+
 def test_the_dataset_needs_the_tokenizer_that_produced_its_ids(tmp_path: Path) -> None:
-    """데이터셋은 토큰 id 다. 그 id 를 만든 토크나이저가 없으면 서버가 어차피
-    다시 만들고, 기가바이트짜리 업로드만 버려진다."""
+    """Prepared token ids are reusable only with their authenticated tokenizer."""
 
     root = _repository(tmp_path)
     _with_tokenizer(root, complete=True)
@@ -239,11 +392,11 @@ def test_the_dataset_needs_the_tokenizer_that_produced_its_ids(tmp_path: Path) -
     package_gpu_bundle.build_bundle(root, both, include_tokenizer=True, include_dataset=True)
     with zipfile.ZipFile(both) as archive:
         names = set(archive.namelist())
-    assert "sion_translate/artifacts/dataset/train.00000.idx.npy" in names
+    assert "sion_translate/artifacts/dataset/train/train.00000.idx.npy" in names
     assert "sion_translate/artifacts/tokenizer/sion.model" in names
 
     origins = {entry["path"]: entry["origin"] for entry in _manifest(both)["files"]}
-    assert origins["artifacts/dataset/train.00000.idx.npy"] == "dataset"
+    assert origins["artifacts/dataset/train/train.00000.idx.npy"] == "dataset"
     archive_result = package_gpu_bundle.verify_archive(both)
     extracted = tmp_path / "both-extracted"
     with zipfile.ZipFile(both) as archive:
@@ -265,12 +418,12 @@ def test_the_dataset_refuses_a_different_tokenizer_fingerprint(tmp_path: Path) -
         )
 
 
-def test_the_dataset_requires_a_tokenizer_fingerprint(tmp_path: Path) -> None:
+def test_the_dataset_requires_all_generation_sidecars(tmp_path: Path) -> None:
     root = _repository(tmp_path)
     _with_tokenizer(root, complete=True)
-    _with_dataset(root, include_raw_fingerprint=False, include_manifest=False)
+    _with_dataset(root, include_raw_fingerprint=False)
 
-    with pytest.raises(package_gpu_bundle.BundleError, match="neither raw_fingerprint.json"):
+    with pytest.raises(package_gpu_bundle.BundleError, match="missing required sidecars"):
         package_gpu_bundle.build_bundle(
             root,
             tmp_path / "missing-fingerprint.zip",
@@ -279,19 +432,18 @@ def test_the_dataset_requires_a_tokenizer_fingerprint(tmp_path: Path) -> None:
         )
 
 
-def test_the_dataset_manifest_is_a_safe_fingerprint_fallback(tmp_path: Path) -> None:
+def test_the_dataset_requires_a_completion_marker(tmp_path: Path) -> None:
     root = _repository(tmp_path)
     _with_tokenizer(root, complete=True)
-    _with_dataset(root, include_raw_fingerprint=False)
+    _with_dataset(root, include_completion=False)
 
-    archive = tmp_path / "manifest-fallback.zip"
-    package_gpu_bundle.build_bundle(
-        root,
-        archive,
-        include_tokenizer=True,
-        include_dataset=True,
-    )
-    package_gpu_bundle.verify_archive(archive)
+    with pytest.raises(package_gpu_bundle.BundleError, match="missing required sidecars"):
+        package_gpu_bundle.build_bundle(
+            root,
+            tmp_path / "missing-completion.zip",
+            include_tokenizer=True,
+            include_dataset=True,
+        )
 
 
 def test_the_dataset_identity_sources_must_agree(tmp_path: Path) -> None:
@@ -299,12 +451,68 @@ def test_the_dataset_identity_sources_must_agree(tmp_path: Path) -> None:
     _with_tokenizer(root, complete=True)
     _with_dataset(root, manifest_tokenizer_sha256="0" * 64)
 
-    with pytest.raises(package_gpu_bundle.BundleError, match="fingerprints disagree"):
+    with pytest.raises(package_gpu_bundle.BundleError, match="sidecar disagrees"):
         package_gpu_bundle.build_bundle(
             root,
             tmp_path / "disagree.zip",
             include_tokenizer=True,
             include_dataset=True,
+        )
+
+
+def test_dataset_payload_must_match_the_manifest_inventory(tmp_path: Path) -> None:
+    root = _repository(tmp_path)
+    _with_tokenizer(root)
+    _with_dataset(root)
+    (root / "artifacts" / "dataset" / "train" / "train.00000.idx.npy").write_bytes(b"changed ids")
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="artifact identity mismatch"):
+        package_gpu_bundle.build_bundle(
+            root,
+            tmp_path / "changed-dataset.zip",
+            include_tokenizer=True,
+            include_dataset=True,
+        )
+
+
+def test_foundation_dataset_has_an_explicit_authenticated_opt_in(tmp_path: Path) -> None:
+    root = _repository(tmp_path)
+    _with_tokenizer(root)
+    _with_foundation_dataset(root)
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="requires --with-tokenizer"):
+        package_gpu_bundle.build_bundle(
+            root,
+            tmp_path / "foundation-without-tokenizer.zip",
+            include_foundation_dataset=True,
+        )
+
+    archive_path = tmp_path / "with-foundation-dataset.zip"
+    package_gpu_bundle.build_bundle(
+        root,
+        archive_path,
+        include_tokenizer=True,
+        include_foundation_dataset=True,
+    )
+    with zipfile.ZipFile(archive_path) as archive:
+        names = set(archive.namelist())
+    assert "sion_translate/artifacts/foundation_dataset/train/train.00000.idx.npy" in names
+    origins = {entry["path"]: entry["origin"] for entry in _manifest(archive_path)["files"]}
+    assert origins["artifacts/foundation_dataset/train/train.00000.idx.npy"] == "foundation-dataset"
+    package_gpu_bundle.verify_archive(archive_path)
+
+
+def test_foundation_dataset_rejects_a_stale_tokenizer_identity(tmp_path: Path) -> None:
+    root = _repository(tmp_path)
+    _with_tokenizer(root)
+    _with_foundation_dataset(root, tokenizer_sha256="0" * 64)
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="tokenizer mismatch"):
+        package_gpu_bundle.build_bundle(
+            root,
+            tmp_path / "stale-foundation.zip",
+            include_tokenizer=True,
+            include_foundation_dataset=True,
         )
 
 
@@ -320,10 +528,11 @@ def test_archive_and_tree_verification_recheck_dataset_tokenizer_semantics(
         include_dataset=True,
     )
 
-    # Emulate a tokenizer replacement after the build preflight. _write_archive
-    # creates internally consistent manifest/checksum metadata for the changed
-    # payload, so only the semantic verifier can detect the stale token ids.
+    # Emulate a tokenizer replacement after source selection. Rewriting the
+    # tokenizer sidecar makes that artifact internally valid, while the dataset
+    # remains bound to the previous model hash.
     (root / "artifacts" / "tokenizer" / "sion.model").write_bytes(b"replacement model")
+    _rewrite_tokenizer_metadata(root)
     archive = tmp_path / "semantic-mismatch.zip"
     commit, tree = package_gpu_bundle._git_identity(root)
     package_gpu_bundle._write_archive(archive, sources, commit, tree)
@@ -339,7 +548,7 @@ def test_archive_and_tree_verification_recheck_dataset_tokenizer_semantics(
 
 
 def test_the_default_bundle_still_refuses_stale_artifacts(tmp_path: Path) -> None:
-    """opt-in 이 artifacts/ 전체를 여는 것이 아니어야 한다."""
+    """One opt-in must never expose all stale files below artifacts/."""
 
     root = _repository(tmp_path)
     _with_tokenizer(root, complete=True)
@@ -357,10 +566,17 @@ def test_the_default_bundle_still_refuses_stale_artifacts(tmp_path: Path) -> Non
 
 
 def test_requesting_an_absent_optional_tree_is_an_error(tmp_path: Path) -> None:
-    """조용히 빠지면 서버에서야 foundation 이 없다는 것을 알게 된다."""
+    """An explicitly requested missing input must fail before upload."""
 
     root = _repository(tmp_path)
-    with pytest.raises(package_gpu_bundle.BundleError, match="data/corpus"):
+    config = root / "sion_translate.yaml"
+    config.write_text(
+        "data:\n  language_pair: [ko, ja]\nfoundation:\n  corpus_dir: data/corpus\n",
+        encoding="utf-8",
+    )
+    _git(root, "add", config.name)
+    _git(root, "commit", "-qm", "add corpus config")
+    with pytest.raises(package_gpu_bundle.BundleError, match="configured corpus directory"):
         package_gpu_bundle.build_bundle(
             root, tmp_path / "no-corpus.zip", include_monolingual_corpus=True
         )
@@ -409,6 +625,49 @@ def test_existing_output_requires_explicit_overwrite(tmp_path: Path) -> None:
     result = package_gpu_bundle.build_bundle(root, output, overwrite=True)
     assert result.output_path == output
     package_gpu_bundle.verify_archive(output)
+
+
+def test_non_overwrite_publication_refuses_a_racing_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _repository(tmp_path)
+    output = tmp_path / "bundle.zip"
+    original_verify = package_gpu_bundle.verify_archive
+
+    def create_destination_during_verification(
+        archive_path: Path,
+    ) -> package_gpu_bundle.VerificationResult:
+        result = original_verify(archive_path)
+        output.write_bytes(b"other process")
+        return result
+
+    monkeypatch.setattr(
+        package_gpu_bundle, "verify_archive", create_destination_during_verification
+    )
+    with pytest.raises(package_gpu_bundle.BundleError, match="appeared while building"):
+        package_gpu_bundle.build_bundle(root, output)
+
+    assert output.read_bytes() == b"other process"
+
+
+def test_archive_verification_rejects_portable_member_name_collisions(tmp_path: Path) -> None:
+    archive_path = tmp_path / "collision.zip"
+    with zipfile.ZipFile(archive_path, mode="w") as archive:
+        package_gpu_bundle._write_bytes(archive, "Payload.txt", b"first")
+        package_gpu_bundle._write_bytes(archive, "payload.txt", b"second")
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="portable member-name collision"):
+        package_gpu_bundle.verify_archive(archive_path)
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["AUX.txt", "data/name. ", "data/bad?.jsonl", "data/../escape.jsonl"],
+)
+def test_bundle_paths_reject_cross_platform_unsafe_names(path: str) -> None:
+    with pytest.raises(package_gpu_bundle.BundleError):
+        package_gpu_bundle._validated_relative_path(path)
 
 
 def test_tree_verification_detects_payload_tampering(tmp_path: Path) -> None:
