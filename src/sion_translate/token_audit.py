@@ -12,26 +12,145 @@ reports both failure modes by language and translation direction.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
+from copy import deepcopy
+from collections.abc import Mapping
 from collections import Counter
+from dataclasses import fields
 from pathlib import Path
 from typing import Any, Iterator, Sequence, cast
 
 import numpy as np
 
+from sion_translate.data.integrity import validate_dataset_artifact_inventory
 from sion_translate.data.monolingual import MonolingualDiscovery, iter_monolingual_lines
+from sion_translate.data.prepare import (
+    INDEX_DTYPE,
+    INDEX_FORMAT,
+    PREPARE_COMPLETION_FILENAME,
+    PREPARE_COMPLETION_SCHEMA,
+    RAW_FINGERPRINT_FILENAME,
+    PrepareStats,
+)
 from sion_translate.data.quality import QualityPolicy, assess_pair, canonical_text
+from sion_translate.data.record_metadata import (
+    RECORD_METADATA_DATA_SUFFIX,
+    RECORD_METADATA_FIELDS,
+    RECORD_METADATA_FORMAT,
+    RECORD_METADATA_INDEX_DTYPE,
+    RECORD_METADATA_INDEX_SUFFIX,
+    decode_record_metadata,
+    resolve_record_training_direction,
+)
 from sion_translate.data.records import (
     expand_parallel_record,
     languages_from_pairs,
     normalize_language_pairs,
+    normalize_translation_directions,
 )
-from sion_translate.fingerprint import file_sha256
+from sion_translate.fingerprint import (
+    FINGERPRINT_SCHEMA,
+    PREPROCESSING_SCHEMA,
+    DatasetFingerprint,
+    file_sha256,
+)
+from sion_translate.language_tags import (
+    canonicalize_language_pair,
+    canonicalize_language_tag,
+    canonicalize_language_tags,
+)
+from sion_translate.synthetic import (
+    normalize_synthetic_prefixes,
+    synthetic_path,
+    synthetic_record,
+)
 from sion_translate.tokenizer import SionTokenizer, expand_inputs
+
+
+_KNOWN_LEGACY_PREPROCESSING_SCHEMAS = frozenset(
+    {
+        "sion-prepare-v4",
+        "sion-prepare-v5",
+        "sion-prepare-v6",
+        "sion-prepare-v7",
+        "sion-prepare-v8",
+    }
+)
+_SYNTHETIC_AUDIT_MARKER = "_sion_token_audit_synthetic_v1"
 
 
 def _piece_is_special(piece: str) -> bool:
     return piece.startswith("<") and piece.endswith(">") and not piece.startswith("<0x")
+
+
+def _direction_label(source: str, target: str) -> str:
+    """Keep legacy labels for simple tags and delimit BCP 47 tags safely."""
+
+    separator = "-" if "-" not in source and "-" not in target else "/"
+    return f"{source}{separator}{target}"
+
+
+def _annotate_synthetic_scopes(node: object, *, inherited: bool = False) -> object:
+    """Attach a private provenance marker to each generated record subtree.
+
+    ``expand_parallel_record`` deliberately supports one JSONL value containing
+    multiple nested records.  A line-global boolean would therefore taint real
+    siblings whenever only one child is generated.  The private provenance key
+    follows the record expander's existing metadata inheritance without changing
+    user data or the training-direction field.
+    """
+
+    if isinstance(node, (list, tuple)):
+        return [
+            _annotate_synthetic_scopes(item, inherited=inherited)
+            for item in cast(Sequence[object], node)
+        ]
+    if not isinstance(node, Mapping):
+        return deepcopy(node)
+
+    current = inherited or synthetic_record(node)
+    annotated: dict[object, object] = {}
+    for key, value in node.items():
+        if key in {"metadata", "provenance"}:
+            annotated[key] = deepcopy(value)
+        else:
+            annotated[key] = _annotate_synthetic_scopes(value, inherited=current)
+    if current:
+        raw_provenance = annotated.get("provenance")
+        if isinstance(raw_provenance, Mapping):
+            provenance: dict[object, object] = deepcopy(dict(raw_provenance))
+        elif raw_provenance is None:
+            provenance = {}
+        else:
+            provenance = {"original": deepcopy(raw_provenance)}
+        provenance[_SYNTHETIC_AUDIT_MARKER] = True
+        annotated["provenance"] = provenance
+    return annotated
+
+
+def _metadata_is_synthetic(metadata: Mapping[str, object]) -> bool:
+    provenance = metadata.get("provenance")
+    return isinstance(provenance, Mapping) and provenance.get(_SYNTHETIC_AUDIT_MARKER) is True
+
+
+def _raw_audit_synthetic_prefixes(
+    configured: Sequence[str],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Normalize shared train-only prefixes and select ambiguous generated files.
+
+    ``concat_`` is the one documented exception: that namespace may contain
+    ordinary concatenated real bitext and therefore needs row metadata, rather
+    than its filename alone, to be classified as generated. Every other shared
+    or caller-configured train-only prefix fails closed without a direction.
+    """
+
+    if isinstance(configured, (str, bytes)):
+        raise ValueError("train_only_prefixes must be a sequence of filename prefixes")
+    normalized = normalize_synthetic_prefixes(configured)
+    direction_required = tuple(prefix for prefix in normalized if prefix != "concat_")
+    return normalized, direction_required
 
 
 def _frequency_summary(counts: np.ndarray, eligible: np.ndarray) -> dict[str, int | float]:
@@ -63,23 +182,49 @@ def _load_indexed_manifest(dataset_root: Path) -> dict[str, Any]:
     return manifest
 
 
+def _normalize_explicit_language_pairs(
+    value: object,
+    *,
+    field: str,
+) -> tuple[tuple[str, str], ...]:
+    """Canonicalize physical pairs and reject duplicate undirected identities."""
+
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence) or not value:
+        raise ValueError(f"{field} must be a non-empty sequence of two-language pairs")
+    pairs: list[tuple[str, str]] = []
+    seen: set[frozenset[str]] = set()
+    for index, raw_pair in enumerate(value):
+        pair = canonicalize_language_pair(raw_pair, field=f"{field}[{index}]")
+        edge = frozenset(pair)
+        if edge in seen:
+            raise ValueError(
+                f"{field} contains a duplicate or reversed physical pair after "
+                f"canonicalization: {pair!r}"
+            )
+        seen.add(edge)
+        pairs.append(pair)
+    return tuple(pairs)
+
+
 def _indexed_tokenizer_identity(
     manifest: dict[str, Any],
     tokenizer_model: Path,
-) -> dict[str, str | bool | None]:
-    """Verify the tokenizer mapping when an indexed manifest has an identity."""
+) -> dict[str, object]:
+    """Verify a pinned digest, or label a mutable legacy path match as unverified."""
 
     expected_sha256 = None
     identity_source = None
+    pinned_identity = False
     fingerprint = manifest.get("fingerprint")
     if isinstance(fingerprint, dict) and isinstance(fingerprint.get("tokenizer_sha256"), str):
         expected_sha256 = fingerprint["tokenizer_sha256"].lower()
         identity_source = "manifest.fingerprint.tokenizer_sha256"
+        pinned_identity = True
     else:
         recorded_path = manifest.get("tokenizer_model")
         if isinstance(recorded_path, str) and Path(recorded_path).is_file():
             expected_sha256 = file_sha256(recorded_path).lower()
-            identity_source = "manifest.tokenizer_model"
+            identity_source = "manifest.tokenizer_model (mutable path-time comparison)"
 
     actual_sha256 = file_sha256(tokenizer_model).lower()
     if expected_sha256 is not None and actual_sha256 != expected_sha256:
@@ -89,25 +234,1102 @@ def _indexed_tokenizer_identity(
         )
     return {
         "sha256": actual_sha256,
-        "verified_against_manifest": expected_sha256 is not None,
+        "verified_against_manifest": pinned_identity,
+        "mutable_path_match": expected_sha256 is not None and not pinned_identity,
+        "assurance": (
+            "pinned-sha256"
+            if pinned_identity
+            else "mutable-path-match-unverified"
+            if expected_sha256 is not None
+            else "unverified"
+        ),
         "identity_source": identity_source,
     }
 
 
-def _indexed_languages(manifest: dict[str, Any], *, modern: bool) -> tuple[str, ...]:
-    raw_languages = manifest.get("languages")
-    if isinstance(raw_languages, list) and raw_languages:
-        languages = tuple(str(language) for language in raw_languages)
+def _indexed_source_only_languages(
+    manifest: Mapping[str, object],
+    languages: Sequence[str],
+) -> tuple[str, ...]:
+    raw_source_only = manifest.get("source_only_languages", [])
+    if not isinstance(raw_source_only, list):
+        raise ValueError("Indexed dataset source_only_languages must be a list")
+    source_only = canonicalize_language_tags(
+        raw_source_only,
+        field="indexed manifest source_only_languages",
+        reject_duplicates=True,
+    )
+    unknown = sorted(set(source_only) - set(languages))
+    if unknown:
+        raise ValueError(f"Indexed dataset manifest has unknown source-only languages: {unknown}")
+    return source_only
+
+
+def _validate_indexed_language_to_id(
+    manifest: Mapping[str, object],
+    languages: Sequence[str],
+) -> None:
+    raw_mapping = manifest.get("language_to_id")
+    if raw_mapping is None:
+        return
+    if not isinstance(raw_mapping, Mapping):
+        raise ValueError("Indexed dataset language_to_id must be an object")
+    actual: dict[str, int] = {}
+    for raw_language, raw_id in raw_mapping.items():
+        language = canonicalize_language_tag(
+            raw_language,
+            field="indexed manifest language_to_id key",
+        )
+        if language in actual:
+            raise ValueError(
+                "Indexed dataset language_to_id contains duplicate canonical language aliases"
+            )
+        if isinstance(raw_id, bool) or not isinstance(raw_id, int):
+            raise ValueError("Indexed dataset language_to_id values must be integer ids")
+        actual[language] = raw_id
+    expected = {language: index for index, language in enumerate(languages)}
+    if actual != expected:
+        raise ValueError(
+            f"Indexed dataset language_to_id disagrees with languages: {actual!r} != {expected!r}"
+        )
+
+
+def _indexed_direction_contract(
+    manifest: Mapping[str, object],
+    *,
+    current_schema: bool,
+    legacy_storage_layout: bool,
+    legacy_bidirectional: bool | None,
+) -> tuple[
+    tuple[str, ...],
+    tuple[tuple[str, str], ...],
+    tuple[tuple[str, str], ...],
+    tuple[str, ...],
+    tuple[str, str] | None,
+]:
+    """Authenticate canonical language identities and trained direction edges."""
+
+    legacy_storage_pair: tuple[str, str] | None = None
+    if current_schema and legacy_bidirectional is not None:
+        raise ValueError(
+            "bidirectional is a legacy indexed-dataset override; current datasets "
+            "authenticate directions in manifest.translation_directions"
+        )
+
+    if legacy_storage_layout:
+        raw_pair = manifest.get("language_pair")
+        pair = canonicalize_language_pair(
+            raw_pair,
+            field="legacy indexed manifest language_pair",
+        )
+        assert isinstance(raw_pair, Sequence) and not isinstance(raw_pair, (str, bytes))
+        legacy_storage_pair = (cast(str, raw_pair[0]), cast(str, raw_pair[1]))
+        pairs = (pair,)
     else:
-        raw_pair = manifest.get("language_pair", ["ko", "ja"])
-        if not isinstance(raw_pair, list) or len(raw_pair) != 2:
-            raise ValueError("Indexed dataset manifest has no valid language metadata")
-        languages = tuple(dict.fromkeys(str(language) for language in raw_pair))
-    if any(not language for language in languages) or len(set(languages)) != len(languages):
-        raise ValueError("Indexed dataset languages must be unique, non-empty strings")
-    if modern and len(languages) > np.iinfo(np.uint16).max:
+        raw_pairs = manifest.get("language_pairs")
+        if raw_pairs is None and not current_schema:
+            raw_primary = manifest.get("language_pair")
+            pairs = (
+                canonicalize_language_pair(
+                    raw_primary,
+                    field="legacy indexed manifest language_pair",
+                ),
+            )
+        else:
+            pairs = _normalize_explicit_language_pairs(
+                raw_pairs,
+                field="indexed manifest language_pairs",
+            )
+        raw_primary = manifest.get("language_pair")
+        if raw_primary is not None:
+            primary = canonicalize_language_pair(
+                raw_primary,
+                field="indexed manifest language_pair",
+            )
+            if primary != pairs[0]:
+                raise ValueError(
+                    "Indexed dataset language_pair must equal the first canonical language_pairs "
+                    f"entry: {primary!r} != {pairs[0]!r}"
+                )
+
+    expected_languages = languages_from_pairs(pairs)
+    raw_languages = manifest.get("languages")
+    if raw_languages is None and not current_schema:
+        languages = expected_languages
+    else:
+        if not isinstance(raw_languages, list) or not raw_languages:
+            raise ValueError("Indexed dataset manifest has no valid languages list")
+        languages = canonicalize_language_tags(
+            raw_languages,
+            field="indexed manifest languages",
+            reject_duplicates=True,
+        )
+    if languages != expected_languages:
+        raise ValueError(
+            "Indexed dataset languages must exactly match first appearance in language_pairs: "
+            f"{languages!r} != {expected_languages!r}"
+        )
+    if not legacy_storage_layout and len(languages) > np.iinfo(np.uint16).max:
         raise ValueError("Indexed dataset has too many languages for uint16 language ids")
-    return languages
+    _validate_indexed_language_to_id(manifest, languages)
+
+    source_only = _indexed_source_only_languages(manifest, languages)
+    raw_directions = manifest.get("translation_directions")
+    if raw_directions is None:
+        if current_schema:
+            raise ValueError("Current indexed dataset requires manifest.translation_directions")
+        if legacy_bidirectional is not None:
+            compatibility_bidirectional = legacy_bidirectional
+        else:
+            raise ValueError(
+                "Legacy indexed dataset without translation_directions requires an explicit "
+                "bidirectional=True or bidirectional=False audit policy"
+            )
+        directions = normalize_translation_directions(
+            pairs,
+            bidirectional=compatibility_bidirectional,
+            source_only_languages=source_only,
+        )
+    else:
+        if isinstance(raw_directions, (str, bytes)) or not isinstance(raw_directions, Sequence):
+            raise ValueError("Indexed dataset translation_directions must be a sequence")
+        directions = normalize_translation_directions(
+            pairs,
+            cast(Sequence[Sequence[str]], raw_directions),
+            bidirectional=False,
+            source_only_languages=source_only,
+        )
+        if not current_schema and legacy_bidirectional is not None:
+            expected = normalize_translation_directions(
+                pairs,
+                bidirectional=legacy_bidirectional,
+                source_only_languages=source_only,
+            )
+            if directions != expected:
+                raise ValueError(
+                    "Legacy bidirectional compatibility policy contradicts "
+                    "manifest.translation_directions"
+                )
+    return languages, pairs, directions, source_only, legacy_storage_pair
+
+
+def _read_indexed_json_object(path: Path, *, role: str) -> dict[str, Any]:
+    if not path.is_file():
+        raise FileNotFoundError(f"Indexed dataset {role} not found: {path}")
+    try:
+        raw: object = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"Indexed dataset {role} cannot be read: {path}") from error
+    if not isinstance(raw, dict):
+        raise ValueError(f"Indexed dataset {role} must be a JSON object: {path}")
+    return cast(dict[str, Any], raw)
+
+
+def _uses_current_indexed_schema(
+    dataset_root: Path,
+    manifest: Mapping[str, object],
+) -> bool:
+    """Match the loader's downgrade-resistant current-schema detection."""
+
+    top_level = manifest.get("preprocessing_schema")
+    raw_nested = manifest.get("fingerprint")
+    nested = (
+        cast(Mapping[object, object], raw_nested).get("preprocessing_schema")
+        if isinstance(raw_nested, Mapping)
+        else None
+    )
+    raw_fingerprint_path = dataset_root / RAW_FINGERPRINT_FILENAME
+    raw_fingerprint_schema: object = None
+    if raw_fingerprint_path.exists():
+        raw_fingerprint_schema = _read_indexed_json_object(
+            raw_fingerprint_path,
+            role="raw fingerprint",
+        ).get("preprocessing_schema")
+    markers = (top_level, nested, raw_fingerprint_schema)
+    if PREPROCESSING_SCHEMA not in markers:
+        return False
+    if any(marker != PREPROCESSING_SCHEMA for marker in markers):
+        raise ValueError("Current dataset preprocessing schema markers disagree")
+    return True
+
+
+def _validate_legacy_indexed_identity(
+    dataset_root: Path,
+    manifest: Mapping[str, object],
+) -> None:
+    """Accept named legacy generations without treating a bare v6 label as proof."""
+
+    dataset_format = manifest.get("format")
+    if dataset_format in {
+        "sion-indexed-parallel-v1",
+        "sion-indexed-parallel-v2",
+        "sion-indexed-parallel-v3",
+        "sion-indexed-parallel-v4",
+        "sion-indexed-parallel-v5",
+    }:
+        return
+    if dataset_format != INDEX_FORMAT:
+        raise ValueError(f"Unsupported indexed dataset format: {dataset_format!r}")
+
+    fingerprint = manifest.get("fingerprint")
+    nested = (
+        cast(Mapping[object, object], fingerprint).get("preprocessing_schema")
+        if isinstance(fingerprint, Mapping)
+        else None
+    )
+    raw_path = dataset_root / RAW_FINGERPRINT_FILENAME
+    raw_marker = (
+        _read_indexed_json_object(raw_path, role="raw fingerprint").get("preprocessing_schema")
+        if raw_path.exists()
+        else None
+    )
+    markers = (manifest.get("preprocessing_schema"), nested, raw_marker)
+    if not all(isinstance(marker, str) for marker in markers) or not (
+        markers[0] == markers[1] == markers[2]
+    ):
+        raise ValueError(
+            "Unauthenticated v6 dataset is neither a complete current artifact nor an "
+            "explicit early-v6 preprocessing generation"
+        )
+    if markers[0] == PREPROCESSING_SCHEMA:
+        raise ValueError("Current v6 preprocessing markers require full artifact authentication")
+    if markers[0] not in _KNOWN_LEGACY_PREPROCESSING_SCHEMAS:
+        raise ValueError(
+            "Unauthenticated v6 dataset claims an unknown historical preprocessing "
+            f"generation: {markers[0]!r}"
+        )
+
+
+def _canonical_json_bytes(value: object) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _manifest_dtype(dtype: np.dtype[Any]) -> object:
+    return json.loads(json.dumps(dtype.descr))
+
+
+_LEGACY_GENERIC_REQUIRED_DTYPES = {
+    "src_offset": np.dtype("<u8"),
+    "src_length": np.dtype("<u4"),
+    "tgt_offset": np.dtype("<u8"),
+    "tgt_length": np.dtype("<u4"),
+    "src_language_id": np.dtype("<u2"),
+    "tgt_language_id": np.dtype("<u2"),
+}
+_LEGACY_GENERIC_OPTIONAL_DTYPES = {
+    "src_register": np.dtype("u1"),
+    "tgt_register": np.dtype("u1"),
+    "source_id": np.dtype("<u2"),
+    "quality_score": np.dtype("u1"),
+    "synthetic": np.dtype("u1"),
+    "forward_only": np.dtype("u1"),
+}
+_LEGACY_STORAGE_REQUIRED_DTYPES = {
+    "ko_offset": np.dtype("<u8"),
+    "ko_length": np.dtype("<u4"),
+    "ja_offset": np.dtype("<u8"),
+    "ja_length": np.dtype("<u4"),
+}
+_LEGACY_STORAGE_OPTIONAL_DTYPES = {
+    "ko_register": np.dtype("u1"),
+    "ja_register": np.dtype("u1"),
+    "source_id": np.dtype("<u2"),
+    "quality_score": np.dtype("u1"),
+    "synthetic": np.dtype("u1"),
+    "forward_only": np.dtype("u1"),
+}
+
+
+def _validate_legacy_index_dtype(
+    index: np.ndarray,
+    path: Path,
+    *,
+    generic: bool,
+) -> None:
+    """Reject coercible-but-malformed legacy fields before interpreting them."""
+
+    if index.ndim != 1 or index.dtype.names is None:
+        raise ValueError(f"Legacy indexed shard must be a one-dimensional structured array: {path}")
+    required = _LEGACY_GENERIC_REQUIRED_DTYPES if generic else _LEGACY_STORAGE_REQUIRED_DTYPES
+    optional = _LEGACY_GENERIC_OPTIONAL_DTYPES if generic else _LEGACY_STORAGE_OPTIONAL_DTYPES
+    fields_by_name = cast(
+        Mapping[str, tuple[np.dtype[Any], int]],
+        index.dtype.fields or {},
+    )
+    names = set(index.dtype.names)
+    missing = set(required) - names
+    unknown = names - set(required) - set(optional)
+    if missing or unknown:
+        raise ValueError(
+            f"Legacy indexed shard fields are invalid at {path}: "
+            f"missing={sorted(missing)}, unexpected={sorted(unknown)}"
+        )
+    for name, expected in {**required, **optional}.items():
+        if name not in fields_by_name:
+            continue
+        actual = fields_by_name[name][0]
+        if actual != expected:
+            raise ValueError(
+                f"Legacy indexed shard field {name!r} has invalid dtype at {path}: "
+                f"{actual!r} != {expected!r}"
+            )
+
+
+def _validated_prepare_stats(value: object, *, role: str) -> dict[str, int]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{role} stats must be an object")
+    raw = cast(Mapping[object, object], value)
+    expected_fields = {field.name for field in fields(PrepareStats)}
+    if set(raw) != expected_fields:
+        raise ValueError(f"{role} stats fields differ from PrepareStats")
+    result: dict[str, int] = {}
+    for name in expected_fields:
+        field_value = raw[name]
+        if isinstance(field_value, bool) or not isinstance(field_value, int) or field_value < 0:
+            raise ValueError(f"{role} stat is invalid: {name}")
+        result[name] = field_value
+    return result
+
+
+def _valid_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and value == value.lower()
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _strict_positive_integer(value: object, *, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"Current dataset preprocessing {field} must be a positive integer")
+    return value
+
+
+def _strict_fraction(value: object, *, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"Current dataset preprocessing {field} must be numeric")
+    normalized = float(value)
+    if not math.isfinite(normalized) or normalized < 0.0:
+        raise ValueError(f"Current dataset preprocessing {field} must be finite and non-negative")
+    return normalized
+
+
+def _validated_quality_policy(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise ValueError("Current dataset preprocessing quality_policy must be an object")
+    policy = cast(Mapping[str, object], value)
+    expected_fields = {field.name for field in fields(QualityPolicy)}
+    if set(policy) != expected_fields:
+        raise ValueError("Current dataset preprocessing quality_policy fields are invalid")
+    integer_fields = {
+        "min_chars_per_side",
+        "min_language_check_chars",
+        "long_ja_kana_warning_chars",
+    }
+    numeric_fields = {"max_length_ratio", "min_language_fraction"}
+    boolean_fields = {
+        "reject_identical",
+        "reject_script_mismatch",
+        "reject_controls",
+        "reject_repetition",
+    }
+    for name in integer_fields:
+        _strict_positive_integer(policy[name], field=f"quality_policy.{name}")
+    for name in numeric_fields:
+        raw_value = policy[name]
+        if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
+            raise ValueError(f"Current dataset preprocessing quality_policy.{name} must be numeric")
+        if not math.isfinite(float(raw_value)):
+            raise ValueError(f"Current dataset preprocessing quality_policy.{name} must be finite")
+    for name in boolean_fields:
+        if not isinstance(policy[name], bool):
+            raise ValueError(f"Current dataset preprocessing quality_policy.{name} must be boolean")
+    normalized = QualityPolicy(
+        min_chars_per_side=cast(int, policy["min_chars_per_side"]),
+        max_length_ratio=float(cast(int | float, policy["max_length_ratio"])),
+        min_language_fraction=float(cast(int | float, policy["min_language_fraction"])),
+        min_language_check_chars=cast(int, policy["min_language_check_chars"]),
+        long_ja_kana_warning_chars=cast(int, policy["long_ja_kana_warning_chars"]),
+        reject_identical=cast(bool, policy["reject_identical"]),
+        reject_script_mismatch=cast(bool, policy["reject_script_mismatch"]),
+        reject_controls=cast(bool, policy["reject_controls"]),
+        reject_repetition=cast(bool, policy["reject_repetition"]),
+    )
+    normalized.validate()
+    return normalized.to_dict()
+
+
+def _validate_current_preprocessing_options(
+    options: Mapping[str, object],
+    *,
+    language_pair_count: int,
+) -> tuple[int, int]:
+    """Validate self-described preprocessing values, not only their field names."""
+
+    for name in ("approximate_split", "filter_quality", "prevent_target_leakage"):
+        if not isinstance(options.get(name), bool):
+            raise ValueError(f"Current dataset preprocessing {name} must be boolean")
+    if options.get("dedup_backend") not in {"memory", "sqlite"}:
+        raise ValueError("Current dataset preprocessing dedup_backend is invalid")
+    shard_size = _strict_positive_integer(options.get("shard_size"), field="shard_size")
+    maximum_tokens = _strict_positive_integer(
+        options.get("max_tokens_per_side"),
+        field="max_tokens_per_side",
+    )
+    validation_fraction = _strict_fraction(
+        options.get("validation_fraction"),
+        field="validation_fraction",
+    )
+    test_fraction = _strict_fraction(
+        options.get("test_fraction"),
+        field="test_fraction",
+    )
+    if validation_fraction + test_fraction >= 0.5:
+        raise ValueError("Current dataset preprocessing split fractions are unexpectedly large")
+
+    approximate = cast(bool, options["approximate_split"])
+    endpoint_key = (
+        "language-prefixed-minhash-char5-v1" if approximate else "language-prefixed-exact-v1"
+    )
+    split_key = "record-sha256-v1" if language_pair_count > 1 else endpoint_key
+    if options.get("endpoint_leakage_guard") != "language-endpoint-bloom-v2":
+        raise ValueError("Current dataset preprocessing endpoint leakage guard is invalid")
+    if options.get("endpoint_leakage_key") != endpoint_key:
+        raise ValueError("Current dataset preprocessing endpoint leakage key is invalid")
+    if options.get("split_key") != split_key:
+        raise ValueError("Current dataset preprocessing split key is invalid")
+    _validated_quality_policy(options.get("quality_policy"))
+    return shard_size, maximum_tokens
+
+
+def _validate_current_manifest_contract(
+    dataset_root: Path,
+    manifest: Mapping[str, Any],
+    *,
+    language_pairs: tuple[tuple[str, str], ...],
+    languages: tuple[str, ...],
+    translation_directions: tuple[tuple[str, str], ...],
+    source_only_languages: tuple[str, ...],
+) -> tuple[
+    dict[str, int],
+    tuple[dict[str, int], ...],
+    tuple[bool, ...],
+    int,
+    int,
+    str,
+]:
+    """Authenticate the non-payload half of a published current dataset."""
+
+    if dataset_root.is_symlink() or not dataset_root.is_dir():
+        raise ValueError(f"Current dataset root is not a regular directory: {dataset_root}")
+    allowed_top_level = {
+        "train",
+        "validation",
+        "test",
+        RAW_FINGERPRINT_FILENAME,
+        "manifest.json",
+        PREPARE_COMPLETION_FILENAME,
+    }
+    actual_top_level = {candidate.name for candidate in dataset_root.iterdir()}
+    if actual_top_level != allowed_top_level:
+        raise ValueError(
+            "Current dataset top-level artifacts differ from the complete contract: "
+            f"missing={sorted(allowed_top_level - actual_top_level)}, "
+            f"unexpected={sorted(actual_top_level - allowed_top_level)}"
+        )
+    for split in ("train", "validation", "test"):
+        split_path = dataset_root / split
+        if split_path.is_symlink() or not split_path.is_dir():
+            raise ValueError(f"Current dataset split is not a regular directory: {split_path}")
+    for filename in (
+        RAW_FINGERPRINT_FILENAME,
+        "manifest.json",
+        PREPARE_COMPLETION_FILENAME,
+    ):
+        metadata_path = dataset_root / filename
+        if metadata_path.is_symlink() or not metadata_path.is_file():
+            raise ValueError(f"Current dataset metadata is not a regular file: {metadata_path}")
+
+    if manifest.get("format") != INDEX_FORMAT:
+        raise ValueError("Current dataset manifest format is unsupported")
+    if manifest.get("preprocessing_schema") != PREPROCESSING_SCHEMA:
+        raise ValueError("Current dataset manifest preprocessing schema is invalid")
+
+    raw_fingerprint = _read_indexed_json_object(
+        dataset_root / RAW_FINGERPRINT_FILENAME,
+        role="raw fingerprint",
+    )
+    if manifest.get("fingerprint") != raw_fingerprint:
+        raise ValueError("Current dataset manifest fingerprint differs from its raw sidecar")
+    if raw_fingerprint.get("preprocessing_schema") != PREPROCESSING_SCHEMA:
+        raise ValueError("Current dataset raw fingerprint preprocessing schema is invalid")
+    if (
+        set(raw_fingerprint)
+        != {
+            "schema",
+            "preprocessing_schema",
+            "language_pairs",
+            "tokenizer_sha256",
+            "preprocessing_options",
+            "files",
+        }
+        or raw_fingerprint.get("schema") != FINGERPRINT_SCHEMA
+    ):
+        raise ValueError("Current dataset raw fingerprint schema is invalid")
+    try:
+        normalized_fingerprint = DatasetFingerprint.from_dict(raw_fingerprint).to_dict()
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("Current dataset raw fingerprint payload is invalid") from error
+    if normalized_fingerprint != raw_fingerprint or not _valid_sha256(
+        raw_fingerprint.get("tokenizer_sha256")
+    ):
+        raise ValueError("Current dataset raw fingerprint payload is invalid")
+
+    raw_options = manifest.get("preprocessing_options")
+    if not isinstance(raw_options, Mapping):
+        raise ValueError("Current dataset preprocessing_options must be an object")
+    options = cast(Mapping[str, object], raw_options)
+    if raw_fingerprint.get("preprocessing_options") != dict(options):
+        raise ValueError("Current dataset preprocessing options differ from its raw fingerprint")
+    required_option_fields = {
+        "approximate_split",
+        "dedup_backend",
+        "endpoint_leakage_guard",
+        "endpoint_leakage_key",
+        "filter_quality",
+        "index_dtype",
+        "max_tokens_per_side",
+        "prevent_target_leakage",
+        "quality_policy",
+        "record_metadata_fields",
+        "record_metadata_format",
+        "record_metadata_index_dtype",
+        "shard_size",
+        "source_only_languages",
+        "translation_directions",
+        "split_key",
+        "synthetic_sampling_weight",
+        "test_fraction",
+        "train_only_prefixes",
+        "validation_fraction",
+    }
+    actual_option_fields = frozenset(options)
+    if actual_option_fields not in {
+        frozenset(required_option_fields),
+        frozenset((*required_option_fields, "managed_augmentation_prefix")),
+    }:
+        raise ValueError("Current dataset preprocessing option fields are invalid")
+    shard_size, maximum_tokens = _validate_current_preprocessing_options(
+        options,
+        language_pair_count=len(language_pairs),
+    )
+
+    canonical_pairs = [list(pair) for pair in language_pairs]
+    canonical_directions = [list(direction) for direction in translation_directions]
+    canonical_languages = list(languages)
+    canonical_source_only = list(source_only_languages)
+    if manifest.get("language_pairs") != canonical_pairs:
+        raise ValueError("Current dataset manifest language_pairs are not canonical")
+    if manifest.get("language_pair") != canonical_pairs[0]:
+        raise ValueError("Current dataset manifest primary language_pair is invalid")
+    if manifest.get("translation_directions") != canonical_directions:
+        raise ValueError("Current dataset manifest translation_directions are not canonical")
+    if manifest.get("languages") != canonical_languages:
+        raise ValueError("Current dataset manifest languages are not canonical")
+    if manifest.get("language_to_id") != {
+        language: index for index, language in enumerate(languages)
+    }:
+        raise ValueError("Current dataset manifest language_to_id is invalid")
+    if manifest.get("source_only_languages") != canonical_source_only:
+        raise ValueError("Current dataset manifest source_only_languages are not canonical")
+    if raw_fingerprint.get("language_pairs") != canonical_pairs:
+        raise ValueError("Current dataset raw fingerprint language_pairs are invalid")
+    fingerprint_files = raw_fingerprint.get("files")
+    if not isinstance(fingerprint_files, Mapping):
+        raise ValueError("Current dataset raw fingerprint files are invalid")
+    for raw_name, raw_identity in fingerprint_files.items():
+        if (
+            not isinstance(raw_name, str)
+            or not raw_name
+            or not isinstance(raw_identity, Mapping)
+            or set(raw_identity) != {"size", "sha256"}
+        ):
+            raise ValueError("Current dataset raw fingerprint file identity is invalid")
+        raw_size = raw_identity.get("size")
+        if (
+            isinstance(raw_size, bool)
+            or not isinstance(raw_size, int)
+            or raw_size < 0
+            or not _valid_sha256(raw_identity.get("sha256"))
+        ):
+            raise ValueError("Current dataset raw fingerprint file identity is invalid")
+
+    raw_prefixes = manifest.get("train_only_prefixes")
+    if not isinstance(raw_prefixes, list) or not all(
+        isinstance(prefix, str) for prefix in raw_prefixes
+    ):
+        raise ValueError("Current dataset train_only_prefixes must be a string list")
+    normalized_prefixes = normalize_synthetic_prefixes(cast(list[str], raw_prefixes))
+    if tuple(raw_prefixes) != normalized_prefixes:
+        raise ValueError("Current dataset train_only_prefixes are not normalized")
+
+    expected_index_dtype = _manifest_dtype(INDEX_DTYPE)
+    expected_metadata_dtype = _manifest_dtype(RECORD_METADATA_INDEX_DTYPE)
+    if manifest.get("storage_sides") != ["src", "tgt"]:
+        raise ValueError("Current dataset storage-side contract is invalid")
+    if manifest.get("index_dtype") != expected_index_dtype:
+        raise ValueError("Current dataset manifest index_dtype is invalid")
+    if options.get("index_dtype") != expected_index_dtype:
+        raise ValueError("Current dataset preprocessing index_dtype is invalid")
+    expected_metadata = {
+        "format": RECORD_METADATA_FORMAT,
+        "fields": list(RECORD_METADATA_FIELDS),
+        "optional": True,
+        "index_suffix": RECORD_METADATA_INDEX_SUFFIX,
+        "data_suffix": RECORD_METADATA_DATA_SUFFIX,
+        "index_dtype": expected_metadata_dtype,
+    }
+    if manifest.get("record_metadata") != expected_metadata:
+        raise ValueError("Current dataset record-metadata contract is invalid")
+    if options.get("record_metadata_format") != RECORD_METADATA_FORMAT:
+        raise ValueError("Current dataset preprocessing record-metadata format is invalid")
+    if options.get("record_metadata_fields") != list(RECORD_METADATA_FIELDS):
+        raise ValueError("Current dataset preprocessing record-metadata fields are invalid")
+    if options.get("record_metadata_index_dtype") != expected_metadata_dtype:
+        raise ValueError("Current dataset preprocessing record-metadata dtype is invalid")
+    if options.get("translation_directions") != canonical_directions:
+        raise ValueError("Current dataset preprocessing translation graph is invalid")
+    if options.get("source_only_languages") != canonical_source_only:
+        raise ValueError("Current dataset preprocessing source-only policy is invalid")
+    if options.get("train_only_prefixes") != list(normalized_prefixes):
+        raise ValueError("Current dataset preprocessing synthetic prefixes are invalid")
+    managed_prefix = options.get("managed_augmentation_prefix")
+    if managed_prefix is not None and (
+        not isinstance(managed_prefix, str) or managed_prefix not in normalized_prefixes
+    ):
+        raise ValueError("Current dataset managed augmentation prefix is invalid")
+    sampling_weight = options.get("synthetic_sampling_weight")
+    if (
+        isinstance(sampling_weight, bool)
+        or not isinstance(sampling_weight, (int, float))
+        or not 0.0 <= float(sampling_weight) <= 1.0
+    ):
+        raise ValueError("Current dataset synthetic sampling weight is invalid")
+    expected_synthetic_policy = {
+        "record_field": "synthetic",
+        "train_only": True,
+        "sampling_weight": options.get("synthetic_sampling_weight"),
+        "prefixes": list(normalized_prefixes),
+    }
+    if manifest.get("synthetic_policy") != expected_synthetic_policy:
+        raise ValueError("Current dataset synthetic policy contradicts preprocessing options")
+    if manifest.get("atomic_build") is not True:
+        raise ValueError("Current dataset is not marked as an atomic generation")
+
+    direct_option_fields = {
+        "approximate_split": "approximate_split",
+        "dedup_backend": "dedup_backend",
+        "endpoint_leakage_key": "endpoint_leakage_key",
+        "shard_size": "shard_size",
+        "test_fraction": "test_fraction",
+        "validation_fraction": "validation_fraction",
+    }
+    for manifest_name, option_name in direct_option_fields.items():
+        manifest_value = manifest.get(manifest_name)
+        option_value = options.get(option_name)
+        if manifest_value != option_value or type(manifest_value) is not type(option_value):
+            raise ValueError(
+                f"Current dataset manifest {manifest_name} contradicts preprocessing options"
+            )
+    if manifest.get("quality_filter_enabled") is not options.get("filter_quality"):
+        raise ValueError("Current dataset quality filter contradicts preprocessing options")
+    if manifest.get("quality_policy") != options.get("quality_policy") or _validated_quality_policy(
+        manifest.get("quality_policy")
+    ) != _validated_quality_policy(options.get("quality_policy")):
+        raise ValueError("Current dataset quality policy contradicts preprocessing options")
+    if manifest.get("target_leakage_guard_enabled") is not options.get("prevent_target_leakage"):
+        raise ValueError("Current dataset leakage guard contradicts preprocessing options")
+    if manifest.get("target_leakage_guard") != options.get("endpoint_leakage_guard"):
+        raise ValueError("Current dataset leakage guard schema contradicts preprocessing options")
+    if manifest.get("split_key") != options.get("split_key"):
+        raise ValueError("Current dataset split key contradicts preprocessing options")
+
+    stats = _validated_prepare_stats(manifest.get("stats"), role="Current dataset manifest")
+    raw_sources = manifest.get("sources")
+    if not isinstance(raw_sources, list) or not raw_sources:
+        raise ValueError("Current dataset manifest sources must be a non-empty list")
+    source_stats: list[dict[str, int]] = []
+    source_paths: list[str] = []
+    source_synthetic_files: list[bool] = []
+    accumulated = {name: 0 for name in stats}
+    for source_id, raw_source in enumerate(cast(list[object], raw_sources)):
+        if not isinstance(raw_source, Mapping):
+            raise ValueError(f"Current dataset manifest source {source_id} must be an object")
+        source = cast(Mapping[object, object], raw_source)
+        if set(source) != {
+            "id",
+            "name",
+            "path",
+            "synthetic_file",
+            "stats",
+            "mean_quality_score",
+        }:
+            raise ValueError(f"Current dataset manifest source {source_id} fields are invalid")
+        raw_path = source.get("path")
+        if not isinstance(raw_path, str):
+            raise ValueError(f"Current dataset manifest source {source_id} path is invalid")
+        synthetic_file = source.get("synthetic_file")
+        if (
+            source.get("id") != source_id
+            or source.get("name") != Path(raw_path).name
+            or not isinstance(synthetic_file, bool)
+            or synthetic_file != synthetic_path(raw_path, normalized_prefixes)
+        ):
+            raise ValueError(f"Current dataset manifest source {source_id} identity is invalid")
+        normalized_stats = _validated_prepare_stats(
+            source.get("stats"),
+            role=f"Current dataset manifest source {source_id}",
+        )
+        expected_mean = normalized_stats["quality_score_sum"] / max(
+            normalized_stats["valid_pairs"], 1
+        )
+        raw_mean = source.get("mean_quality_score")
+        if (
+            isinstance(raw_mean, bool)
+            or not isinstance(raw_mean, (int, float))
+            or not math.isclose(float(raw_mean), expected_mean, rel_tol=1e-12, abs_tol=1e-15)
+        ):
+            raise ValueError(f"Current dataset manifest source {source_id} mean score is invalid")
+        for name, count in normalized_stats.items():
+            accumulated[name] += count
+        source_stats.append(normalized_stats)
+        source_paths.append(raw_path)
+        source_synthetic_files.append(synthetic_file)
+    if accumulated != stats:
+        raise ValueError("Current dataset per-source stats do not add up to total stats")
+    if manifest.get("inputs") != source_paths:
+        raise ValueError("Current dataset input paths differ from its source identities")
+    source_names = [Path(path).name for path in source_paths]
+    if len(source_names) != len(set(source_names)) or set(
+        cast(Mapping[object, object], fingerprint_files)
+    ) != set(source_names):
+        raise ValueError("Current dataset raw fingerprint files differ from its sources")
+    if not isinstance(manifest.get("tokenizer_model"), str) or not manifest.get("tokenizer_model"):
+        raise ValueError("Current dataset tokenizer_model is invalid")
+    expected_mean = stats["quality_score_sum"] / max(stats["valid_pairs"], 1)
+    raw_mean = manifest.get("mean_quality_score")
+    if (
+        isinstance(raw_mean, bool)
+        or not isinstance(raw_mean, (int, float))
+        or not math.isclose(float(raw_mean), expected_mean, rel_tol=1e-12, abs_tol=1e-15)
+    ):
+        raise ValueError("Current dataset manifest mean quality score is invalid")
+
+    inventory_digest = validate_dataset_artifact_inventory(dataset_root, manifest)
+    if inventory_digest is None:
+        raise ValueError("Current dataset artifact inventory did not produce an identity")
+    completion = _read_indexed_json_object(
+        dataset_root / PREPARE_COMPLETION_FILENAME,
+        role="completion marker",
+    )
+    expected_completion = {
+        "schema": PREPARE_COMPLETION_SCHEMA,
+        "manifest_sha256": file_sha256(dataset_root / "manifest.json"),
+        "raw_fingerprint_sha256": file_sha256(dataset_root / RAW_FINGERPRINT_FILENAME),
+        "artifact_inventory_sha256": hashlib.sha256(
+            _canonical_json_bytes(manifest.get("artifact_inventory"))
+        ).hexdigest(),
+    }
+    if completion != expected_completion:
+        raise ValueError("Current dataset completion marker does not authenticate its generation")
+    return (
+        stats,
+        tuple(source_stats),
+        tuple(source_synthetic_files),
+        shard_size,
+        maximum_tokens,
+        inventory_digest,
+    )
+
+
+def _validate_current_indexed_payload(
+    dataset_root: Path,
+    *,
+    stats: Mapping[str, int],
+    source_stats: Sequence[Mapping[str, int]],
+    source_synthetic_files: Sequence[bool],
+    languages: tuple[str, ...],
+    translation_directions: tuple[tuple[str, str], ...],
+    source_only_languages: tuple[str, ...],
+    shard_size: int,
+    maximum_tokens_per_side: int,
+    vocab_size: int,
+) -> None:
+    """Match prepare's exact INDEX_DTYPE, split, and metadata-sidecar checks."""
+
+    source_count = len(source_stats)
+    if len(source_synthetic_files) != source_count:
+        raise ValueError("Current dataset source synthetic identities are incomplete")
+    language_to_id = {language: index for index, language in enumerate(languages)}
+    direction_set = frozenset(translation_directions)
+    allowed_pairs = {
+        (language_to_id[source], language_to_id[target])
+        for source, target in translation_directions
+    }
+    source_only = frozenset(source_only_languages)
+    source_rows = np.zeros(source_count, dtype=np.int64)
+    source_synthetic = np.zeros(source_count, dtype=np.int64)
+    source_forward_only = np.zeros(source_count, dtype=np.int64)
+    source_quality = np.zeros(source_count, dtype=np.int64)
+    source_src_tokens = np.zeros(source_count, dtype=np.int64)
+    source_tgt_tokens = np.zeros(source_count, dtype=np.int64)
+    source_split_rows = {
+        split: np.zeros(source_count, dtype=np.int64) for split in ("train", "validation", "test")
+    }
+    split_rows: dict[str, int] = {}
+
+    for split in ("train", "validation", "test"):
+        split_root = dataset_root / split
+        expected_artifacts: set[str] = set()
+        split_total = 0
+        for index_path in sorted(split_root.glob("*.idx.npy")):
+            try:
+                index = np.load(index_path, allow_pickle=False)
+            except (OSError, ValueError) as error:
+                raise ValueError(f"Cannot read current dataset index: {index_path}") from error
+            if index.ndim != 1 or index.dtype != INDEX_DTYPE:
+                raise ValueError(f"Current dataset index dtype is invalid: {index_path}")
+            if len(index) > shard_size:
+                raise ValueError(
+                    f"Current dataset shard exceeds configured shard_size: {index_path}"
+                )
+            prefix = index_path.name.removesuffix(".idx.npy")
+            src_path = split_root / f"{prefix}.src.bin"
+            tgt_path = split_root / f"{prefix}.tgt.bin"
+            src_lengths = np.asarray(index["src_length"], dtype=np.uint64)
+            tgt_lengths = np.asarray(index["tgt_length"], dtype=np.uint64)
+            if (src_lengths.size and int(src_lengths.max()) > maximum_tokens_per_side) or (
+                tgt_lengths.size and int(tgt_lengths.max()) > maximum_tokens_per_side
+            ):
+                raise ValueError(
+                    f"Current dataset row exceeds configured max_tokens_per_side: {index_path}"
+                )
+            src_store = _open_indexed_token_store(src_path, index["src_offset"], src_lengths)
+            tgt_store = _open_indexed_token_store(tgt_path, index["tgt_offset"], tgt_lengths)
+            for store, token_path in ((src_store, src_path), (tgt_store, tgt_path)):
+                if store.size and int(store.max(initial=0)) >= vocab_size:
+                    raise ValueError(
+                        f"Current dataset token id exceeds tokenizer vocabulary: {token_path}"
+                    )
+
+            source_ids = np.asarray(index["source_id"], dtype=np.int64)
+            src_language_ids = np.asarray(index["src_language_id"], dtype=np.int64)
+            tgt_language_ids = np.asarray(index["tgt_language_id"], dtype=np.int64)
+            synthetic = np.asarray(index["synthetic"], dtype=np.int64)
+            forward_only = np.asarray(index["forward_only"], dtype=np.int64)
+            quality = np.asarray(index["quality_score"], dtype=np.int64)
+            if source_ids.size and (
+                int(source_ids.min()) < 0 or int(source_ids.max()) >= source_count
+            ):
+                raise ValueError(f"Current dataset source_id is outside manifest: {index_path}")
+            for values, name in (
+                (src_language_ids, "src_language_id"),
+                (tgt_language_ids, "tgt_language_id"),
+            ):
+                if values.size and (int(values.min()) < 0 or int(values.max()) >= len(languages)):
+                    raise ValueError(f"Current dataset {name} is outside manifest: {index_path}")
+            if not bool(np.isin(synthetic, (0, 1)).all()) or not bool(
+                np.isin(forward_only, (0, 1)).all()
+            ):
+                raise ValueError(f"Current dataset boolean flags are invalid: {index_path}")
+            if split != "train" and bool(np.count_nonzero(synthetic)):
+                raise ValueError(f"Current dataset synthetic rows must be train-only: {index_path}")
+            for source_id, synthetic_file in enumerate(source_synthetic_files):
+                if not synthetic_file:
+                    continue
+                source_mask = source_ids == source_id
+                if bool(source_mask.any()) and not bool((synthetic[source_mask] == 1).all()):
+                    raise ValueError(
+                        "Current dataset synthetic-file source contains a row without the "
+                        f"synthetic flag: {index_path} source_id={source_id}"
+                    )
+            if quality.size and (int(quality.min()) < 0 or int(quality.max()) > 100):
+                raise ValueError(f"Current dataset quality score is invalid: {index_path}")
+            if not bool(
+                np.isin(np.asarray(index["src_register"], dtype=np.int64), (0, 1, 2, 3)).all()
+            ) or not bool(
+                np.isin(np.asarray(index["tgt_register"], dtype=np.int64), (0, 1, 2, 3)).all()
+            ):
+                raise ValueError(f"Current dataset register is invalid: {index_path}")
+
+            scoped_rows: set[int] = set()
+            for row_id, (source_id, target_id, one_way) in enumerate(
+                zip(src_language_ids, tgt_language_ids, forward_only, strict=True)
+            ):
+                pair = (int(source_id), int(target_id))
+                if pair not in allowed_pairs:
+                    raise ValueError(
+                        f"Current dataset language pair is not configured: {index_path}"
+                    )
+                source_language = languages[pair[0]]
+                target_language = languages[pair[1]]
+                reverse_trained = (target_language, source_language) in direction_set
+                if (not bool(one_way) and not reverse_trained) or target_language in source_only:
+                    raise ValueError(
+                        f"Current dataset translation direction is invalid: {index_path}"
+                    )
+                if bool(one_way) and reverse_trained:
+                    scoped_rows.add(row_id)
+
+            row_count = len(index)
+            split_total += row_count
+            counts = np.bincount(source_ids, minlength=source_count)[:source_count]
+            source_rows += counts
+            source_split_rows[split] += counts
+            source_synthetic += np.bincount(source_ids, weights=synthetic, minlength=source_count)[
+                :source_count
+            ].astype(np.int64)
+            source_forward_only += np.bincount(
+                source_ids, weights=forward_only, minlength=source_count
+            )[:source_count].astype(np.int64)
+            source_quality += np.bincount(source_ids, weights=quality, minlength=source_count)[
+                :source_count
+            ].astype(np.int64)
+            source_src_tokens += np.bincount(
+                source_ids, weights=src_lengths, minlength=source_count
+            )[:source_count].astype(np.int64)
+            source_tgt_tokens += np.bincount(
+                source_ids, weights=tgt_lengths, minlength=source_count
+            )[:source_count].astype(np.int64)
+
+            metadata_index_path = split_root / f"{prefix}{RECORD_METADATA_INDEX_SUFFIX}"
+            metadata_data_path = split_root / f"{prefix}{RECORD_METADATA_DATA_SUFFIX}"
+            metadata_present = metadata_index_path.exists() or metadata_data_path.exists()
+            expected_artifacts.update({index_path.name, src_path.name, tgt_path.name})
+            if metadata_present:
+                if not metadata_index_path.is_file() or not metadata_data_path.is_file():
+                    raise ValueError(f"Incomplete record metadata sidecar for {index_path}")
+                metadata_index = np.load(metadata_index_path, allow_pickle=False)
+                if (
+                    metadata_index.ndim != 1
+                    or metadata_index.dtype != RECORD_METADATA_INDEX_DTYPE
+                    or len(metadata_index) != len(index)
+                ):
+                    raise ValueError(
+                        f"Current dataset record metadata index is invalid: {metadata_index_path}"
+                    )
+                metadata_offsets = np.asarray(metadata_index["offset"], dtype=np.uint64)
+                metadata_lengths = np.asarray(metadata_index["length"], dtype=np.uint64)
+                expected_offsets = np.cumsum(
+                    np.concatenate((np.zeros(1, dtype=np.uint64), metadata_lengths[:-1])),
+                    dtype=np.uint64,
+                )
+                if not np.array_equal(metadata_offsets, expected_offsets):
+                    raise ValueError(
+                        "Current dataset record metadata offsets are not contiguous: "
+                        f"{metadata_index_path}"
+                    )
+                if int(metadata_lengths.sum(dtype=np.uint64)) != metadata_data_path.stat().st_size:
+                    raise ValueError(
+                        "Current dataset record metadata offsets exceed payload: "
+                        f"{metadata_index_path}"
+                    )
+                metadata_store = (
+                    np.memmap(metadata_data_path, dtype=np.uint8, mode="r")
+                    if metadata_data_path.stat().st_size
+                    else np.empty(0, dtype=np.uint8)
+                )
+                for row_id, metadata_row in enumerate(metadata_index):
+                    offset = int(metadata_row["offset"])
+                    length = int(metadata_row["length"])
+                    payload = np.asarray(
+                        metadata_store[offset : offset + length],
+                        dtype=np.uint8,
+                    ).tobytes()
+                    try:
+                        metadata = decode_record_metadata(payload)
+                    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+                        raise ValueError(
+                            f"Current dataset record metadata is invalid: {index_path} row={row_id}"
+                        ) from error
+                    stored_direction = (
+                        languages[int(src_language_ids[row_id])],
+                        languages[int(tgt_language_ids[row_id])],
+                    )
+                    try:
+                        row_direction = resolve_record_training_direction(
+                            metadata,
+                            stored_direction,
+                            direction_set,
+                        )
+                    except ValueError as error:
+                        raise ValueError(
+                            "Current dataset record metadata direction is invalid: "
+                            f"{index_path} row={row_id}"
+                        ) from error
+                    if row_direction is not None:
+                        if metadata.get("training_direction") != list(row_direction):
+                            raise ValueError(
+                                "Current dataset record metadata direction is not canonical: "
+                                f"{index_path} row={row_id}"
+                            )
+                        if row_direction != stored_direction or not bool(forward_only[row_id]):
+                            raise ValueError(
+                                "Current dataset record metadata direction contradicts its "
+                                f"index flags: {index_path} row={row_id}"
+                            )
+                    elif row_id in scoped_rows:
+                        raise ValueError(
+                            "Current dataset row-scoped direction lacks matching metadata: "
+                            f"{index_path} row={row_id}"
+                        )
+                del metadata_store
+                expected_artifacts.update({metadata_index_path.name, metadata_data_path.name})
+            elif scoped_rows:
+                raise ValueError(
+                    f"Current dataset row-scoped directions require metadata: {index_path}"
+                )
+        actual_artifacts = {path.name for path in split_root.iterdir()}
+        if actual_artifacts != expected_artifacts:
+            raise ValueError(
+                f"Current dataset split artifacts are incomplete or unexpected: {split}; "
+                f"missing={sorted(expected_artifacts - actual_artifacts)}, "
+                f"unexpected={sorted(actual_artifacts - expected_artifacts)}"
+            )
+        split_rows[split] = split_total
+
+    if split_rows != {
+        "train": stats["train"],
+        "validation": stats["validation"],
+        "test": stats["test"],
+    }:
+        raise ValueError("Current dataset manifest split counts differ from indexed payload rows")
+    if stats["valid_pairs"] != stats["train"] + stats["validation"] + stats["test"]:
+        raise ValueError("Current dataset valid_pairs differs from its split counts")
+    for source_id, expected in enumerate(source_stats):
+        derived = {
+            "valid_pairs": int(source_rows[source_id]),
+            "train": int(source_split_rows["train"][source_id]),
+            "validation": int(source_split_rows["validation"][source_id]),
+            "test": int(source_split_rows["test"][source_id]),
+            "synthetic_pairs": int(source_synthetic[source_id]),
+            "forward_only_pairs": int(source_forward_only[source_id]),
+            "quality_score_sum": int(source_quality[source_id]),
+            "ko_tokens": int(source_src_tokens[source_id]),
+            "ja_tokens": int(source_tgt_tokens[source_id]),
+        }
+        for name, value in derived.items():
+            if expected[name] != value:
+                raise ValueError(
+                    f"Current dataset source {source_id} {name} differs from indexed payload"
+                )
 
 
 def _row_blocks(lengths: np.ndarray, maximum_tokens: int = 4_000_000) -> Iterator[slice]:
@@ -240,7 +1462,7 @@ def _add_direction_totals(
     for pair_key in np.unique(pair_keys):
         selected = enabled_indices[pair_keys == pair_key]
         source_id, target_id = divmod(int(pair_key), len(languages))
-        direction = f"{languages[source_id]}-{languages[target_id]}"
+        direction = _direction_label(languages[source_id], languages[target_id])
         direction_totals = totals.setdefault(direction, Counter())
         direction_totals["examples"] += len(selected)
         direction_totals["source_tokens"] += int(source_lengths[selected].sum(dtype=np.uint64))
@@ -421,10 +1643,12 @@ def audit_token_exposure(
     input_patterns: Sequence[str],
     tokenizer_model: str | Path,
     *,
-    language_pair: Sequence[str] = ("ko", "ja"),
+    translation_directions: Sequence[Sequence[str]],
+    language_pair: Sequence[str] | None = None,
     language_pairs: Sequence[Sequence[str]] | None = None,
-    source_only_languages: Sequence[str] = (),
-    bidirectional: bool = True,
+    source_only_languages: Sequence[str] | None = None,
+    bidirectional: bool | None = None,
+    train_only_prefixes: Sequence[str] = (),
     max_physical_pairs: int = 0,
     rare_threshold: int = 25,
     max_piece_examples: int = 50,
@@ -441,6 +1665,15 @@ def audit_token_exposure(
     ``max_physical_pairs=0`` performs an exact full scan. A positive value is a
     deterministic prefix sample and is labelled as such in the report; it is
     useful for a quick preflight, not for declaring a vocabulary safe.
+
+    ``translation_directions`` is the authenticated ordered training graph.
+    A row-scoped ``training_direction`` narrows one physical record to that
+    edge; ordinary parallel rows without the annotation expand only over the
+    configured edges for their physical pair.
+
+    ``source_only_languages`` and ``bidirectional`` are migration-only policy
+    assertions. They never manufacture an omitted graph; when supplied, their
+    legacy-derived graph must exactly match ``translation_directions``.
     """
 
     if max_physical_pairs < 0:
@@ -453,24 +1686,70 @@ def audit_token_exposure(
     paths = expand_inputs(input_patterns)
     if not paths:
         raise FileNotFoundError(f"No JSONL files matched: {list(input_patterns)}")
-    pairs = normalize_language_pairs(language_pair, language_pairs)
+    if language_pair is not None and language_pairs is not None:
+        raise ValueError("language_pair and language_pairs are mutually exclusive")
+    if language_pairs is not None:
+        pairs = _normalize_explicit_language_pairs(
+            language_pairs,
+            field="language_pairs",
+        )
+    elif language_pair is not None:
+        pairs = normalize_language_pairs(language_pair=language_pair)
+    else:
+        pairs = normalize_language_pairs(language_pairs=translation_directions)
+    legacy_source_only = (
+        ()
+        if source_only_languages is None
+        else canonicalize_language_tags(
+            source_only_languages,
+            field="source_only_languages",
+            reject_duplicates=True,
+        )
+    )
+    directions = normalize_translation_directions(
+        pairs,
+        translation_directions,
+        bidirectional=False,
+        source_only_languages=legacy_source_only,
+    )
+    if source_only_languages is not None or bidirectional is not None:
+        compatibility_directions = normalize_translation_directions(
+            pairs,
+            bidirectional=True if bidirectional is None else bidirectional,
+            source_only_languages=legacy_source_only,
+        )
+        if directions != compatibility_directions:
+            raise ValueError(
+                "legacy source_only_languages/bidirectional policy contradicts the explicit "
+                "translation_directions graph; migrate by removing the legacy arguments"
+            )
+    normalized_prefixes, direction_required_prefixes = _raw_audit_synthetic_prefixes(
+        train_only_prefixes
+    )
+    direction_set = frozenset(directions)
+    directions_by_pair: dict[frozenset[str], tuple[tuple[str, str], ...]] = {}
+    for pair in pairs:
+        edge = frozenset(pair)
+        directions_by_pair[edge] = tuple(
+            direction for direction in directions if frozenset(direction) == edge
+        )
     languages = languages_from_pairs(pairs)
-    source_only = frozenset(map(str, source_only_languages))
-    unknown = sorted(source_only - set(languages))
-    if unknown:
-        raise ValueError(f"unknown source_only_languages: {unknown}")
+    target_languages = frozenset(target for _, target in directions)
 
-    tokenizer = SionTokenizer(tokenizer_model)
+    tokenizer_path = Path(tokenizer_model)
+    tokenizer_sha256 = file_sha256(tokenizer_path)
+    tokenizer = SionTokenizer(tokenizer_path)
     missing_tags = sorted(set(languages) - set(tokenizer.languages))
     if missing_tags:
         raise ValueError(f"tokenizer is missing configured language tags: {missing_tags}")
 
     vocab_size = len(tokenizer)
     physical_counts = {language: np.zeros(vocab_size, dtype=np.uint64) for language in languages}
-    source_counts = {language: np.zeros(vocab_size, dtype=np.uint64) for language in languages}
     target_counts = {language: np.zeros(vocab_size, dtype=np.uint64) for language in languages}
     language_totals: dict[str, Counter[str]] = {language: Counter() for language in languages}
-    direction_totals: dict[str, Counter[str]] = {}
+    direction_totals: dict[str, Counter[str]] = {
+        _direction_label(source, target): Counter() for source, target in directions
+    }
     invalid = Counter()
     physical_pairs = 0
     virtual_examples = 0
@@ -482,8 +1761,9 @@ def audit_token_exposure(
 
     stop = False
     for path in paths:
+        path_is_synthetic = synthetic_path(path, direction_required_prefixes)
         with path.open("rb") as handle:
-            for raw_line in handle:
+            for line_number, raw_line in enumerate(handle, start=1):
                 try:
                     row = json.loads(raw_line.decode("utf-8-sig"))
                 except UnicodeDecodeError:
@@ -492,9 +1772,27 @@ def audit_token_exposure(
                 except json.JSONDecodeError:
                     invalid["invalid_json"] += 1
                     continue
-                expansion = expand_parallel_record(row, pairs)
+                annotated_row = _annotate_synthetic_scopes(
+                    row,
+                    inherited=path_is_synthetic,
+                )
+                expansion = expand_parallel_record(annotated_row, pairs)
                 invalid.update(expansion.issues)
                 for pair in expansion.pairs:
+                    row_is_synthetic = _metadata_is_synthetic(pair.metadata)
+                    try:
+                        row_direction = resolve_record_training_direction(
+                            pair.metadata,
+                            (pair.language_a, pair.language_b),
+                            direction_set,
+                        )
+                    except ValueError as error:
+                        raise ValueError(f"{path}:{line_number}: {error}") from error
+                    if row_is_synthetic and row_direction is None:
+                        raise ValueError(
+                            f"{path}:{line_number}: synthetic records require an explicit "
+                            "training_direction for token exposure auditing"
+                        )
                     text_a = canonical_text(pair.text_a)
                     text_b = canonical_text(pair.text_b)
                     if (
@@ -514,18 +1812,21 @@ def audit_token_exposure(
                     add_counts(physical_counts[pair.language_b], ids_b)
                     physical_pairs += 1
 
-                    directions = [(pair.language_a, ids_a, text_a, pair.language_b, ids_b, text_b)]
-                    if bidirectional:
-                        directions.append(
-                            (pair.language_b, ids_b, text_b, pair.language_a, ids_a, text_a)
-                        )
-                    for src_lang, src_ids, src_text, tgt_lang, tgt_ids, tgt_text in directions:
-                        if tgt_lang in source_only:
-                            continue
-                        add_counts(source_counts[src_lang], src_ids)
+                    content = {
+                        pair.language_a: (ids_a, text_a),
+                        pair.language_b: (ids_b, text_b),
+                    }
+                    active_directions = (
+                        (row_direction,)
+                        if row_direction is not None
+                        else directions_by_pair[frozenset((pair.language_a, pair.language_b))]
+                    )
+                    for src_lang, tgt_lang in active_directions:
+                        src_ids, src_text = content[src_lang]
+                        tgt_ids, tgt_text = content[tgt_lang]
                         add_counts(target_counts[tgt_lang], tgt_ids)
                         virtual_examples += 1
-                        direction = f"{src_lang}-{tgt_lang}"
+                        direction = _direction_label(src_lang, tgt_lang)
                         totals = direction_totals.setdefault(direction, Counter())
                         totals["examples"] += 1
                         totals["source_tokens"] += len(src_ids)
@@ -576,7 +1877,7 @@ def audit_token_exposure(
         totals = language_totals[language]
         tokens = totals["physical_tokens"]
         characters = totals["physical_characters"]
-        target_enabled = language not in source_only
+        target_enabled = language in target_languages
         target_eligible = (
             eligible & (physical_counts[language] > 0)
             if target_enabled
@@ -612,7 +1913,16 @@ def audit_token_exposure(
         target_tokens = totals["target_tokens"]
         target_characters = totals["target_characters"]
         direction_report[direction] = {
-            **{name: int(value) for name, value in totals.items()},
+            **{
+                name: int(totals[name])
+                for name in (
+                    "examples",
+                    "source_tokens",
+                    "target_tokens",
+                    "source_characters",
+                    "target_characters",
+                )
+            },
             "target_tokens_per_character": round(target_tokens / max(target_characters, 1), 6),
             "mean_target_tokens": round(target_tokens / max(totals["examples"], 1), 6),
         }
@@ -630,16 +1940,24 @@ def audit_token_exposure(
     global_summary["rare_observed_pieces"] = int(
         np.count_nonzero(eligible & (global_target > 0) & (global_target < rare_threshold))
     )
+    global_summary["below_threshold_pieces"] = int(
+        global_summary["unused_pieces"] + global_summary["rare_observed_pieces"]
+    )
     report_counts = {"global_target_counts": global_target} if return_counts else {}
-    return {
+    report = {
         **report_counts,
-        "schema": "sion-token-exposure-audit-v1",
+        "schema": "sion-token-exposure-audit-v2",
         "complete_scan": max_physical_pairs == 0 or not stop,
         "parameters": {
             "tokenizer_model": str(Path(tokenizer_model).resolve()),
+            "tokenizer_sha256": tokenizer_sha256,
+            "tokenizer_scan_stability": "sha256-reverified-after-scan",
             "language_pairs": [list(pair) for pair in pairs],
-            "source_only_languages": sorted(source_only),
-            "bidirectional": bidirectional,
+            "translation_directions": [list(direction) for direction in directions],
+            "source_only_languages": list(legacy_source_only),
+            "legacy_bidirectional_validation": bidirectional,
+            "train_only_prefixes": list(normalized_prefixes),
+            "direction_required_synthetic_prefixes": list(direction_required_prefixes),
             "max_physical_pairs": max_physical_pairs,
             "rare_threshold": rare_threshold,
             "filter_quality": filter_quality,
@@ -659,6 +1977,9 @@ def audit_token_exposure(
             include_unused=True,
         ),
     }
+    if file_sha256(tokenizer_path) != tokenizer_sha256:
+        raise RuntimeError("Tokenizer changed while raw token exposure was scanned")
+    return report
 
 
 def audit_indexed_token_exposure(
@@ -666,18 +1987,18 @@ def audit_indexed_token_exposure(
     tokenizer_model: str | Path,
     *,
     split: str = "train",
-    bidirectional: bool = True,
+    bidirectional: bool | None = None,
     rare_threshold: int = 25,
     max_piece_examples: int = 50,
 ) -> dict[str, Any]:
     """Audit exact decoder-target exposure from already indexed token shards.
 
-    The scan follows the indexed dataset's virtual-direction semantics without
-    decoding or re-tokenizing text. Side B is a target for the stored forward
-    direction. Side A is additionally a target only when bidirectional loading
-    is enabled, the row is not ``forward_only``, and its language is not listed
-    as source-only in the manifest. Runtime-added BOS/EOS/language control tokens
-    are intentionally outside this content-piece audit.
+    The scan follows the indexed dataset's recorded direction graph without
+    decoding or re-tokenizing text. Current rows must store an allowed source to
+    target edge, and expose the reverse only when ``forward_only`` is false and
+    that reverse edge is also authenticated. Legacy datasets without a recorded
+    graph require an explicit ``bidirectional`` compatibility policy. Runtime-added
+    BOS/EOS/language control tokens are outside this content-piece audit.
     """
 
     if not split or split in {".", ".."} or Path(split).name != split:
@@ -688,9 +2009,14 @@ def audit_indexed_token_exposure(
         raise ValueError("max_piece_examples must be non-negative")
 
     root = Path(dataset_root)
+    manifest_path = root / "manifest.json"
+    manifest_sha256 = file_sha256(manifest_path)
     manifest = _load_indexed_manifest(root)
-    tokenizer_path = Path(tokenizer_model)
-    tokenizer_identity = _indexed_tokenizer_identity(manifest, tokenizer_path)
+    if file_sha256(manifest_path) != manifest_sha256:
+        raise RuntimeError("Indexed dataset manifest changed while it was read")
+    current_schema = _uses_current_indexed_schema(root, manifest)
+    if not current_schema:
+        _validate_legacy_indexed_identity(root, manifest)
     split_root = root / split
     index_paths = sorted(split_root.glob("*.idx.npy"))
     if not index_paths:
@@ -698,49 +2024,128 @@ def audit_indexed_token_exposure(
 
     first_index = np.load(index_paths[0], mmap_mode="r", allow_pickle=False)
     first_fields = frozenset(first_index.dtype.names or ())
-    modern = {"src_offset", "src_length", "tgt_offset", "tgt_length"}.issubset(first_fields)
-    legacy = {"ko_offset", "ko_length", "ja_offset", "ja_length"}.issubset(first_fields)
-    if modern == legacy:
+    src_tgt_layout = {"src_offset", "src_length", "tgt_offset", "tgt_length"}.issubset(first_fields)
+    legacy_storage_layout = {"ko_offset", "ko_length", "ja_offset", "ja_length"}.issubset(
+        first_fields
+    )
+    if src_tgt_layout == legacy_storage_layout:
         raise ValueError(
             f"Unsupported indexed shard layout in {index_paths[0]}: {first_index.dtype.descr!r}"
         )
-
-    languages = _indexed_languages(manifest, modern=modern)
-    language_to_id = {language: index for index, language in enumerate(languages)}
-    raw_source_only = manifest.get("source_only_languages", [])
-    if not isinstance(raw_source_only, list):
-        raise ValueError("Indexed dataset source_only_languages must be a list")
-    source_only = frozenset(str(value) for value in raw_source_only)
-    unknown_source_only = sorted(source_only - set(languages))
-    if unknown_source_only:
-        raise ValueError(
-            f"Indexed dataset manifest has unknown source-only languages: {unknown_source_only}"
+    if current_schema and not src_tgt_layout:
+        raise ValueError("Current indexed dataset must use the src/tgt storage layout")
+    if not current_schema:
+        _validate_legacy_index_dtype(
+            first_index,
+            index_paths[0],
+            generic=src_tgt_layout,
         )
-    source_only_ids = np.asarray(
-        [language_to_id[language] for language in source_only],
-        dtype=np.uint16,
-    )
 
-    if legacy:
-        raw_pair = manifest.get("language_pair", ["ko", "ja"])
-        if not isinstance(raw_pair, list) or len(raw_pair) != 2:
-            raise ValueError("Legacy indexed dataset requires a two-language language_pair")
-        legacy_pair = (str(raw_pair[0]), str(raw_pair[1]))
-        missing_pair_languages = sorted(set(legacy_pair) - set(languages))
-        if missing_pair_languages:
-            raise ValueError(
-                "Legacy indexed language_pair is absent from language metadata: "
-                f"{missing_pair_languages}"
-            )
-    else:
-        legacy_pair = None
+    (
+        languages,
+        language_pairs,
+        translation_directions,
+        source_only_languages,
+        legacy_storage_pair,
+    ) = _indexed_direction_contract(
+        manifest,
+        current_schema=current_schema,
+        legacy_storage_layout=legacy_storage_layout,
+        legacy_bidirectional=bidirectional,
+    )
+    current_inventory_digest: str | None = None
+    current_metadata_sha256: dict[Path, str] = {}
+    current_manifest_contract: (
+        tuple[
+            dict[str, int],
+            tuple[dict[str, int], ...],
+            tuple[bool, ...],
+            int,
+            int,
+            str,
+        ]
+        | None
+    ) = None
+    current_payload_contract: (
+        tuple[
+            dict[str, int],
+            tuple[dict[str, int], ...],
+            tuple[bool, ...],
+            int,
+            int,
+        ]
+        | None
+    ) = None
+    if current_schema:
+        current_metadata_sha256 = {
+            root / RAW_FINGERPRINT_FILENAME: file_sha256(root / RAW_FINGERPRINT_FILENAME),
+            root / PREPARE_COMPLETION_FILENAME: file_sha256(root / PREPARE_COMPLETION_FILENAME),
+        }
+        current_manifest_contract = _validate_current_manifest_contract(
+            root,
+            manifest,
+            language_pairs=language_pairs,
+            languages=languages,
+            translation_directions=translation_directions,
+            source_only_languages=source_only_languages,
+        )
+        (
+            stats,
+            source_stats,
+            source_synthetic_files,
+            shard_size,
+            maximum_tokens_per_side,
+            current_inventory_digest,
+        ) = current_manifest_contract
+        current_payload_contract = (
+            stats,
+            source_stats,
+            source_synthetic_files,
+            shard_size,
+            maximum_tokens_per_side,
+        )
+        for metadata_path, expected_sha256 in current_metadata_sha256.items():
+            if file_sha256(metadata_path) != expected_sha256:
+                raise RuntimeError(
+                    f"Current dataset metadata changed while it was authenticated: {metadata_path}"
+                )
+    tokenizer_path = Path(tokenizer_model)
+    tokenizer_identity = _indexed_tokenizer_identity(manifest, tokenizer_path)
+    language_to_id = {language: index for index, language in enumerate(languages)}
+    direction_set = frozenset(translation_directions)
+    target_languages = frozenset(target for _, target in translation_directions)
 
     tokenizer = SionTokenizer(tokenizer_path)
+    missing_tags = sorted(set(languages) - set(tokenizer.languages))
+    if missing_tags:
+        raise ValueError(f"tokenizer is missing indexed language tags: {missing_tags}")
     vocab_size = len(tokenizer)
+    if current_payload_contract is not None:
+        (
+            stats,
+            source_stats,
+            source_synthetic_files,
+            shard_size,
+            maximum_tokens_per_side,
+        ) = current_payload_contract
+        _validate_current_indexed_payload(
+            root,
+            stats=stats,
+            source_stats=source_stats,
+            source_synthetic_files=source_synthetic_files,
+            languages=languages,
+            translation_directions=translation_directions,
+            source_only_languages=source_only_languages,
+            shard_size=shard_size,
+            maximum_tokens_per_side=maximum_tokens_per_side,
+            vocab_size=vocab_size,
+        )
     physical_counts = [np.zeros(vocab_size, dtype=np.uint64) for _ in languages]
     target_counts = [np.zeros(vocab_size, dtype=np.uint64) for _ in languages]
     physical_sentences = np.zeros(len(languages), dtype=np.uint64)
-    direction_totals: dict[str, Counter[str]] = {}
+    direction_totals: dict[str, Counter[str]] = {
+        _direction_label(source, target): Counter() for source, target in translation_directions
+    }
     physical_pairs = 0
     virtual_examples = 0
     forward_only_pairs = 0
@@ -748,28 +2153,40 @@ def audit_indexed_token_exposure(
     for index_path in index_paths:
         index = np.load(index_path, mmap_mode="r", allow_pickle=False)
         fields = frozenset(cast(tuple[str, ...], index.dtype.names or ()))
-        shard_modern = {"src_offset", "src_length", "tgt_offset", "tgt_length"}.issubset(fields)
-        shard_legacy = {"ko_offset", "ko_length", "ja_offset", "ja_length"}.issubset(fields)
-        if shard_modern != modern or shard_legacy != legacy:
+        shard_src_tgt = {"src_offset", "src_length", "tgt_offset", "tgt_length"}.issubset(fields)
+        shard_legacy_storage = {
+            "ko_offset",
+            "ko_length",
+            "ja_offset",
+            "ja_length",
+        }.issubset(fields)
+        if shard_src_tgt != src_tgt_layout or shard_legacy_storage != legacy_storage_layout:
             raise ValueError(f"Indexed shard layouts are inconsistent at {index_path}")
+        if not current_schema:
+            _validate_legacy_index_dtype(
+                index,
+                index_path,
+                generic=src_tgt_layout,
+            )
 
         row_count = len(index)
         physical_pairs += row_count
-        if modern:
+        if src_tgt_layout:
             required_metadata = {"src_language_id", "tgt_language_id"}
             if not required_metadata.issubset(fields):
-                raise ValueError(f"Modern indexed shard lacks language ids: {index_path}")
+                raise ValueError(f"Generic indexed shard lacks language ids: {index_path}")
             side_a_offsets = index["src_offset"]
             side_a_lengths = index["src_length"]
             side_b_offsets = index["tgt_offset"]
             side_b_lengths = index["tgt_length"]
-            side_a_languages = index["src_language_id"].astype(np.uint16)
-            side_b_languages = index["tgt_language_id"].astype(np.uint16)
+            side_a_languages = index["src_language_id"].astype(np.int64)
+            side_b_languages = index["tgt_language_id"].astype(np.int64)
             prefix = index_path.name.removesuffix(".idx.npy")
             side_a_path = split_root / f"{prefix}.src.bin"
             side_b_path = split_root / f"{prefix}.tgt.bin"
         else:
-            assert legacy_pair is not None
+            assert legacy_storage_pair is not None
+            legacy_pair = language_pairs[0]
             side_a_offsets = index["ko_offset"]
             side_a_lengths = index["ko_length"]
             side_b_offsets = index["ja_offset"]
@@ -777,41 +2194,70 @@ def audit_indexed_token_exposure(
             side_a_languages = np.full(
                 row_count,
                 language_to_id[legacy_pair[0]],
-                dtype=np.uint16,
+                dtype=np.int64,
             )
             side_b_languages = np.full(
                 row_count,
                 language_to_id[legacy_pair[1]],
-                dtype=np.uint16,
+                dtype=np.int64,
             )
             prefix = index_path.name.removesuffix(".idx.npy")
-            side_a_path = split_root / f"{prefix}.{legacy_pair[0]}.bin"
-            side_b_path = split_root / f"{prefix}.{legacy_pair[1]}.bin"
+            side_a_path = split_root / f"{prefix}.{legacy_storage_pair[0]}.bin"
+            side_b_path = split_root / f"{prefix}.{legacy_storage_pair[1]}.bin"
 
         if row_count:
+            minimum_language_id = min(
+                int(side_a_languages.min(initial=0)),
+                int(side_b_languages.min(initial=0)),
+            )
             maximum_language_id = max(
                 int(side_a_languages.max(initial=0)),
                 int(side_b_languages.max(initial=0)),
             )
-            if maximum_language_id >= len(languages):
+            if minimum_language_id < 0 or maximum_language_id >= len(languages):
                 raise ValueError(
-                    f"Indexed language id {maximum_language_id} exceeds manifest metadata at "
-                    f"{index_path}"
+                    "Indexed language ids are outside manifest metadata at "
+                    f"{index_path}: min={minimum_language_id}, max={maximum_language_id}"
                 )
-        forward_only = (
-            index["forward_only"].astype(np.bool_)
-            if "forward_only" in fields
-            else np.zeros(row_count, dtype=np.bool_)
-        )
+        if "forward_only" in fields:
+            raw_forward_only = np.asarray(index["forward_only"])
+            if not bool(np.isin(raw_forward_only, (0, 1)).all()):
+                raise ValueError(f"Indexed forward_only flags are invalid at {index_path}")
+            forward_only = raw_forward_only.astype(np.bool_)
+        else:
+            forward_only = np.zeros(row_count, dtype=np.bool_)
+            for row_id, (source_id, target_id) in enumerate(
+                zip(side_a_languages, side_b_languages, strict=True)
+            ):
+                forward = (languages[int(source_id)], languages[int(target_id)])
+                forward_only[row_id] = (forward[1], forward[0]) not in direction_set
         forward_only_pairs += int(np.count_nonzero(forward_only))
-        side_a_source_only = np.isin(side_a_languages, source_only_ids)
-        side_b_source_only = np.isin(side_b_languages, source_only_ids)
-        forward_enabled = ~side_b_source_only
-        reverse_enabled = (
-            np.asarray(bidirectional & ~forward_only & ~side_a_source_only, dtype=np.bool_)
-            if row_count
-            else np.empty(0, dtype=np.bool_)
-        )
+        forward_enabled = np.zeros(row_count, dtype=np.bool_)
+        reverse_enabled = np.zeros(row_count, dtype=np.bool_)
+        if src_tgt_layout:
+            for row_id, (source_id, target_id, one_way) in enumerate(
+                zip(side_a_languages, side_b_languages, forward_only, strict=True)
+            ):
+                forward = (languages[int(source_id)], languages[int(target_id)])
+                if forward not in direction_set:
+                    raise ValueError(
+                        "Indexed stored direction is absent from "
+                        "manifest.translation_directions "
+                        f"at {index_path} row {row_id}: {forward!r}"
+                    )
+                forward_enabled[row_id] = True
+                if not bool(one_way):
+                    reverse = (forward[1], forward[0])
+                    if reverse not in direction_set:
+                        raise ValueError(
+                            "Indexed row exposes an unauthenticated reverse direction because "
+                            f"forward_only is false at {index_path} row {row_id}: {reverse!r}"
+                        )
+                    reverse_enabled[row_id] = True
+        else:
+            legacy_pair = language_pairs[0]
+            forward_enabled.fill(legacy_pair in direction_set)
+            reverse_enabled[:] = ((legacy_pair[1], legacy_pair[0]) in direction_set) & ~forward_only
 
         side_a_store = _open_indexed_token_store(
             side_a_path,
@@ -885,7 +2331,7 @@ def audit_indexed_token_exposure(
         physical = physical_counts[language_id]
         target = target_counts[language_id]
         physical_tokens = int(physical.sum(dtype=np.uint64))
-        target_enabled = language not in source_only
+        target_enabled = language in target_languages
         target_eligible = (
             eligible & (physical > 0) if target_enabled else np.zeros(vocab_size, dtype=np.bool_)
         )
@@ -915,7 +2361,7 @@ def audit_indexed_token_exposure(
 
     direction_report = {
         direction: {
-            **{name: int(value) for name, value in totals.items()},
+            **{name: int(totals[name]) for name in ("examples", "source_tokens", "target_tokens")},
             "mean_target_tokens": round(
                 totals["target_tokens"] / max(totals["examples"], 1),
                 6,
@@ -932,19 +2378,43 @@ def audit_indexed_token_exposure(
     global_summary["rare_observed_pieces"] = int(
         np.count_nonzero(eligible & (global_target > 0) & (global_target < rare_threshold))
     )
-    return {
-        "schema": "sion-indexed-token-exposure-audit-v1",
+    global_summary["below_threshold_pieces"] = int(
+        global_summary["unused_pieces"] + global_summary["rare_observed_pieces"]
+    )
+    report = {
+        "schema": "sion-indexed-token-exposure-audit-v2",
         "complete_scan": True,
         "count_basis": "stored_target_content_tokens",
         "runtime_control_tokens_included": False,
         "parameters": {
             "dataset_root": str(root.resolve()),
             "dataset_format": str(manifest.get("format", "unknown")),
+            "dataset_contract": (
+                "current-integrity-verified"
+                if current_schema
+                else "legacy-unverified-explicit-policy"
+            ),
+            "integrity_assurance": {
+                "level": (
+                    "self-consistent-hashes-not-signed"
+                    if current_schema
+                    else "legacy-payload-unverified"
+                ),
+                "payload_sha256_reverified_after_scan": current_schema,
+                "manifest_sha256_reverified_after_scan": True,
+                "tokenizer_sha256_reverified_after_scan": True,
+                "cryptographically_signed": False,
+            },
+            "manifest_sha256": manifest_sha256,
+            "artifact_inventory_sha256": current_inventory_digest,
             "tokenizer_model": str(tokenizer_path.resolve()),
             "tokenizer_identity": tokenizer_identity,
             "split": split,
-            "source_only_languages": sorted(source_only),
-            "bidirectional": bidirectional,
+            "languages": list(languages),
+            "language_pairs": [list(pair) for pair in language_pairs],
+            "translation_directions": [list(direction) for direction in translation_directions],
+            "source_only_languages": list(source_only_languages),
+            "legacy_bidirectional_override": bidirectional if not current_schema else None,
             "rare_threshold": rare_threshold,
         },
         "vocab_size": vocab_size,
@@ -962,6 +2432,30 @@ def audit_indexed_token_exposure(
             include_unused=True,
         ),
     }
+    if current_manifest_contract is not None:
+        try:
+            post_manifest_contract = _validate_current_manifest_contract(
+                root,
+                manifest,
+                language_pairs=language_pairs,
+                languages=languages,
+                translation_directions=translation_directions,
+                source_only_languages=source_only_languages,
+            )
+        except (OSError, RuntimeError, ValueError) as error:
+            raise RuntimeError("Current dataset contract changed during token audit") from error
+        if post_manifest_contract != current_manifest_contract:
+            raise RuntimeError("Current dataset contract changed during token audit")
+        for metadata_path, expected_sha256 in current_metadata_sha256.items():
+            if file_sha256(metadata_path) != expected_sha256:
+                raise RuntimeError(
+                    f"Current dataset metadata changed during token audit: {metadata_path}"
+                )
+    if file_sha256(manifest_path) != manifest_sha256:
+        raise RuntimeError("Indexed dataset manifest changed during token audit")
+    if file_sha256(tokenizer_path) != tokenizer_identity["sha256"]:
+        raise RuntimeError("Tokenizer changed during indexed token audit")
+    return report
 
 
 __all__ = ["audit_indexed_token_exposure", "audit_token_exposure"]
