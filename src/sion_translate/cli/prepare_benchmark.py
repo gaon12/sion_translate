@@ -18,7 +18,9 @@ FLORES-200 은 공개 논문·상용 번역 서비스가 공통으로 쓰는 표
 from __future__ import annotations
 
 import argparse
+from collections.abc import Sequence
 from pathlib import Path
+import re
 
 from sion_translate.benchmark import (
     flores_code,
@@ -28,8 +30,14 @@ from sion_translate.benchmark import (
 )
 from sion_translate.config import config_from_raw, load_raw_config
 from sion_translate.console import configure_stdio
+from sion_translate.language_tags import (
+    LanguageTagError,
+    canonicalize_language_pair,
+    canonicalize_language_tag,
+)
 
 DEFAULT_CONFIG_FILE = "sion_translate.yaml"
+_SAFE_FLORES_CODE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*\Z")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -67,6 +75,96 @@ def log(message: str) -> None:
     print(f"[sion] {message}", flush=True)
 
 
+def resolve_benchmark_language_pair(
+    requested: Sequence[str] | None,
+    configured_pairs: Sequence[Sequence[str]],
+) -> tuple[str, str]:
+    """Canonicalize one requested physical pair and reject alias collisions."""
+
+    canonical_pairs: list[tuple[str, str]] = []
+    seen_edges: set[frozenset[str]] = set()
+    for index, raw_pair in enumerate(configured_pairs):
+        try:
+            pair = canonicalize_language_pair(
+                raw_pair,
+                field=f"configured language_pairs[{index}]",
+            )
+        except LanguageTagError as error:
+            raise SystemExit(str(error)) from error
+        edge = frozenset(pair)
+        if edge in seen_edges:
+            raise SystemExit(
+                f"설정 language_pairs에 BCP 47 정규화 후 중복인 언어쌍이 있습니다: {pair!r}"
+            )
+        seen_edges.add(edge)
+        canonical_pairs.append(pair)
+
+    if requested is not None:
+        try:
+            pair = canonicalize_language_pair(requested, field="--language-pair")
+        except LanguageTagError as error:
+            raise SystemExit(str(error)) from error
+        if frozenset(pair) not in seen_edges:
+            raise SystemExit(
+                f"설정에 없는 --language-pair 입니다: {pair} (지원: {tuple(canonical_pairs)})"
+            )
+        return pair
+    if len(canonical_pairs) == 1:
+        return canonical_pairs[0]
+    raise SystemExit(
+        "다국어 설정에서는 --language-pair LANG_A LANG_B를 지정하세요 "
+        f"(지원: {tuple(canonical_pairs)})"
+    )
+
+
+def parse_flores_code_overrides(specs: Sequence[str]) -> dict[str, str]:
+    """Parse canonical language keys without silently overwriting aliases."""
+
+    overrides: dict[str, str] = {}
+    for spec in specs:
+        raw_language, separator, code = spec.partition("=")
+        if not separator or not raw_language or not code or code != code.strip():
+            raise SystemExit(f"--flores-code 형식은 언어=코드 입니다: {spec}")
+        try:
+            language = canonicalize_language_tag(raw_language, field="--flores-code language")
+        except LanguageTagError as error:
+            raise SystemExit(str(error)) from error
+        if language in overrides:
+            raise SystemExit(
+                f"--flores-code에 BCP 47 정규화 후 중복인 언어 키가 있습니다: {language!r}"
+            )
+        overrides[language] = code
+    return overrides
+
+
+def resolve_flores_codes(
+    language_pair: tuple[str, str],
+    overrides: dict[str, str],
+) -> dict[str, str]:
+    """Resolve two distinct, path-safe FLORES identities for one benchmark pair."""
+
+    unused = set(overrides).difference(language_pair)
+    if unused:
+        raise SystemExit(
+            "--flores-code에 선택한 --language-pair에 없는 언어가 있습니다: "
+            + ", ".join(sorted(unused))
+        )
+    codes = {language: flores_code(language, overrides.get(language)) for language in language_pair}
+    for language, code in codes.items():
+        if _SAFE_FLORES_CODE.fullmatch(code) is None:
+            raise SystemExit(
+                f"{language!r}의 FLORES 코드는 안전한 파일/필드 이름이 아닙니다: {code!r}"
+            )
+    if codes[language_pair[0]].casefold() == codes[language_pair[1]].casefold():
+        raise SystemExit(
+            "두 언어가 대소문자 구분 없는 파일시스템에서 같은 FLORES 코드로 "
+            "해석됩니다: "
+            f"{language_pair[0]}={codes[language_pair[0]]}, "
+            f"{language_pair[1]}={codes[language_pair[1]]}"
+        )
+    return codes
+
+
 def main() -> None:
     configure_stdio()
     args = build_parser().parse_args()
@@ -75,30 +173,13 @@ def main() -> None:
         DEFAULT_CONFIG_FILE if Path(DEFAULT_CONFIG_FILE).exists() else None
     )
     config = config_from_raw(load_raw_config(config_path) if config_path else {})
-    configured_pairs = config.data.configured_language_pairs()
-    if args.language_pair:
-        pair = tuple(args.language_pair)
-        if frozenset(pair) not in {frozenset(item) for item in configured_pairs}:
-            raise SystemExit(
-                f"설정에 없는 --language-pair 입니다: {pair} (지원: {configured_pairs})"
-            )
-    elif len(configured_pairs) == 1:
-        pair = configured_pairs[0]
-    else:
-        raise SystemExit(
-            "다국어 설정에서는 --language-pair LANG_A LANG_B를 지정하세요 "
-            f"(지원: {configured_pairs})"
-        )
+    configured_pairs = config.data.language_pairs or [config.data.language_pair]
+    pair = resolve_benchmark_language_pair(args.language_pair, configured_pairs)
 
     # --flores-code ko=kor_Hang ... 파싱
-    overrides: dict[str, str] = {}
-    for spec in args.flores_code:
-        language, _, code = spec.partition("=")
-        if not code:
-            raise SystemExit(f"--flores-code 형식은 언어=코드 입니다: {spec}")
-        overrides[language] = code
+    overrides = parse_flores_code_overrides(args.flores_code)
     # 코드가 모두 확인되는지 먼저 검사 (친절한 에러를 위해)
-    codes = {language: flores_code(language, overrides.get(language)) for language in pair}
+    codes = resolve_flores_codes(pair, overrides)
 
     if args.hf:
         log(f"Hugging Face datasets 에서 FLORES {args.split} 로드 ({pair[0]}↔{pair[1]})")

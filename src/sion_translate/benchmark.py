@@ -99,8 +99,14 @@ def pairs_from_local_flores(
     key_a, key_b = language_pair
     code_a = flores_code(key_a, code_overrides.get(key_a))
     code_b = flores_code(key_b, code_overrides.get(key_b))
-    lines_a = _read_lines(find_flores_file(root, code_a, split))
-    lines_b = _read_lines(find_flores_file(root, code_b, split))
+    path_a = find_flores_file(root, code_a, split)
+    path_b = find_flores_file(root, code_b, split)
+    if path_a.samefile(path_b):
+        raise ValueError(
+            f"두 FLORES 언어 코드가 같은 실제 파일을 가리킵니다: {key_a}={path_a}, {key_b}={path_b}"
+        )
+    lines_a = _read_lines(path_a)
+    lines_b = _read_lines(path_b)
     if len(lines_a) != len(lines_b):
         raise ValueError(
             f"두 언어 파일의 문장 수가 다릅니다: {code_a}={len(lines_a)}, "

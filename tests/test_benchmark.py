@@ -12,6 +12,11 @@ from sion_translate.benchmark import (
     pairs_from_local_flores,
     write_jsonl,
 )
+from sion_translate.cli.prepare_benchmark import (
+    parse_flores_code_overrides,
+    resolve_benchmark_language_pair,
+    resolve_flores_codes,
+)
 from sion_translate.evaluation import load_benchmark_pairs
 
 
@@ -77,3 +82,79 @@ def test_custom_language_pair_with_override(tmp_path: Path) -> None:
         code_overrides={"en": "eng_Latn", "de": "deu_Latn"},
     )
     assert pairs == [{"en": "hello", "de": "hallo"}, {"en": "world", "de": "Welt"}]
+
+
+def test_benchmark_cli_canonicalizes_requested_bcp47_pair() -> None:
+    pair = resolve_benchmark_language_pair(
+        ["ZH-hant", "X-ACME"],
+        (("zh-Hant", "x-acme"),),
+    )
+
+    assert pair == ("zh-Hant", "x-acme")
+
+
+def test_benchmark_cli_rejects_canonical_config_pair_collisions() -> None:
+    with pytest.raises(SystemExit, match="중복"):
+        resolve_benchmark_language_pair(
+            None,
+            (("zh-hant", "X-ACME"), ("x-acme", "zh-Hant")),
+        )
+
+
+def test_flores_override_keys_are_canonical_and_collision_safe() -> None:
+    assert parse_flores_code_overrides(["ZH-hant=zho_Hant", "X-ACME=abc_Latn"]) == {
+        "zh-Hant": "zho_Hant",
+        "x-acme": "abc_Latn",
+    }
+
+    with pytest.raises(SystemExit, match="중복"):
+        parse_flores_code_overrides(
+            ["zh-hant=zho_Hant", "zh-Hant=zho_Hans"],
+        )
+
+
+def test_flores_codes_reject_same_identity_unsafe_names_and_unused_overrides() -> None:
+    pair = ("zh-Hant", "x-acme")
+
+    assert resolve_flores_codes(
+        pair,
+        {"zh-Hant": "zho_Hant", "x-acme": "abc_Latn"},
+    ) == {"zh-Hant": "zho_Hant", "x-acme": "abc_Latn"}
+    with pytest.raises(SystemExit, match="같은 FLORES 코드"):
+        resolve_flores_codes(
+            pair,
+            {"zh-Hant": "zho_Hant", "x-acme": "zho_Hant"},
+        )
+    with pytest.raises(SystemExit, match="대소문자 구분 없는"):
+        resolve_flores_codes(
+            pair,
+            {"zh-Hant": "zho_Hant", "x-acme": "ZHO_hANT"},
+        )
+    with pytest.raises(SystemExit, match="안전한"):
+        resolve_flores_codes(
+            pair,
+            {"zh-Hant": "../zho_Hant", "x-acme": "abc_Latn"},
+        )
+    with pytest.raises(SystemExit, match="없는 언어"):
+        resolve_flores_codes(
+            pair,
+            {
+                "zh-Hant": "zho_Hant",
+                "x-acme": "abc_Latn",
+                "de": "deu_Latn",
+            },
+        )
+
+
+def test_local_flores_rejects_two_languages_bound_to_the_same_file(tmp_path: Path) -> None:
+    split_dir = tmp_path / "devtest"
+    split_dir.mkdir()
+    (split_dir / "shared.devtest").write_text("one\ntwo\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="같은 실제 파일"):
+        pairs_from_local_flores(
+            tmp_path,
+            ("zh-Hant", "x-acme"),
+            split="devtest",
+            code_overrides={"zh-Hant": "shared", "x-acme": "shared"},
+        )
