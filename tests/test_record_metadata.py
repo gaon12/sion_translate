@@ -559,6 +559,69 @@ def test_unmarked_draft_structure_is_rejected_even_when_row_is_not_selected(
         )
 
 
+def test_draft_token_in_target_cannot_create_a_reverse_revision_edge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepare_module = importlib.import_module("sion_translate.data.prepare")
+
+    class StubTokenizer:
+        languages = ("pt-BR", "zh-Hant")
+        draft_id = 1_000_001
+
+        def __init__(self, _model_path: str | Path):
+            pass
+
+        @staticmethod
+        def encode(text: str) -> list[int]:
+            source, separator, draft = text.partition("<draft>")
+            if not separator:
+                return [ord(character) for character in text]
+            return [
+                *[ord(character) for character in source.strip()],
+                StubTokenizer.draft_id,
+                *[ord(character) for character in draft.strip()],
+            ]
+
+    monkeypatch.setattr(prepare_module, "SionTokenizer", StubTokenizer)
+    tokenizer_path = tmp_path / "tokenizer.model"
+    tokenizer_path.write_bytes(b"stub tokenizer")
+    source_path = tmp_path / "ordinary_parallel.jsonl"
+    source_path.write_text(
+        json.dumps(
+            {
+                "pt-BR": "Uma tradução comum sem estrutura de revisão.",
+                "zh-Hant": "反向來源。 <draft> 不可信的反向草稿。",
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    dataset_root = tmp_path / "dataset"
+    prepare_dataset(
+        [str(source_path)],
+        tokenizer_path,
+        dataset_root,
+        language_pairs=(("pt-BR", "zh-Hant"),),
+        translation_directions=(("pt-BR", "zh-Hant"), ("zh-Hant", "pt-BR")),
+        validation_fraction=0.0,
+        test_fraction=0.0,
+        filter_quality=False,
+        dedup_backend="memory",
+        num_workers=1,
+    )
+    dataset = IndexedParallelDataset(dataset_root, "train", bidirectional=True)
+
+    assert len(dataset) == 2
+    assert list(dataset[1]["src"]).count(StubTokenizer.draft_id) == 1
+    with pytest.raises(ValueError, match="target contains the reserved <draft>"):
+        dataset.detect_revision_directions(
+            draft_token_id=StubTokenizer.draft_id,
+            max_source_tokens=10_000,
+        )
+
+
 def test_revision_source_rejects_conflicting_provenance_label(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -593,6 +593,8 @@ class IndexedParallelDataset(Dataset[dict[str, object]]):
             "tgt_language_id",
             "src_offset",
             "src_length",
+            "tgt_offset",
+            "tgt_length",
             "forward_only",
         }
         physical_index = 0
@@ -627,11 +629,12 @@ class IndexedParallelDataset(Dataset[dict[str, object]]):
                 revision_marked = source_marked or provenance_marked
                 source_tokens: np.ndarray | None = None
                 draft_positions: np.ndarray | None = None
+                target_draft_positions: np.ndarray | None = None
                 source_length = -1
                 if (
                     draft_token_id is not None
                     and self.is_v3
-                    and {"src_offset", "src_length"} <= names
+                    and {"src_offset", "src_length", "tgt_offset", "tgt_length"} <= names
                 ):
                     source_start = int(row["src_offset"])
                     source_length = int(row["src_length"])
@@ -641,6 +644,19 @@ class IndexedParallelDataset(Dataset[dict[str, object]]):
                         dtype=np.int64,
                     )
                     draft_positions = np.flatnonzero(source_tokens == draft_token_id)
+                    target_start = int(row["tgt_offset"])
+                    target_length = int(row["tgt_length"])
+                    target_store = self._tokens(shard, "tgt")
+                    target_tokens = np.asarray(
+                        target_store[target_start : target_start + target_length],
+                        dtype=np.int64,
+                    )
+                    target_draft_positions = np.flatnonzero(target_tokens == draft_token_id)
+                if target_draft_positions is not None and len(target_draft_positions):
+                    raise ValueError(
+                        "row target contains the reserved <draft> token; revision structure "
+                        "is valid only in an authenticated forward source"
+                    )
                 if not revision_marked:
                     if draft_positions is not None and len(draft_positions):
                         raise ValueError(
