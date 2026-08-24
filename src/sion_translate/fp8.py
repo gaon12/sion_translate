@@ -1,95 +1,84 @@
-"""FP8 수치와 "어디까지 내려도 되는가" 정책.
+"""FP8 measurements and the policy that defines safe quantization scope.
 
-이 모듈은 FP8 **연산**을 하지 않습니다. 이 저장소의 현재 추론 런타임도
-FP8 가중치를 BF16(BF16 미지원 CUDA에서는 FP16)으로 역양자화한 뒤 dense
-GEMM 을 하며, 네이티브 FP8 텐서코어 GEMM 을 사용하지 않습니다. 여기 있는
-것은 두 가지입니다.
+This module does not perform native FP8 computation. The current inference
+runtime dequantizes resident FP8 weights to BF16, or FP16 on CUDA devices that
+do not support BF16, and then runs a dense GEMM. It does not use a native FP8
+Tensor Core GEMM. This module provides two things:
 
-1. 스케일링·양자화 수치. CPU 에서 그대로 검증됩니다(캐스팅은 CPU 에서
-   동작합니다). 아래 오차 측정은 FP8 로 반올림된 값을 고정밀도로 복원해
-   GEMM 한 결과이며, 프로덕션 런타임의 커널 종류를 뜻하지 않습니다.
-2. **정책**: 어떤 텐서를 FP8 로 내려도 되는가. 이쪽이 더 중요합니다 —
-   FP8 학습이 실패하는 방식은 대부분 "느려짐"이 아니라 "내리면 안 되는 것을
-   내림"이기 때문입니다.
+1. Scaling and quantization utilities that can be verified on a CPU. The error
+   measurements below restore FP8-rounded values to a higher precision before
+   running GEMM; they do not describe the kernel used in production.
+2. The policy that decides which tensors may be quantized. This is the more
+   important part because an unsafe FP8 configuration usually fails by
+   quantizing a sensitive tensor, not merely by running slowly.
 
-## 이 모델에서 실측한 것 (sion_data_fit, vocab 48,000)
+Measurements for ``sion_data_fit`` with a 48,000-token vocabulary follow.
+Relative GEMM output error was measured at M=2048, K=768, and N=2048:
 
-GEMM 출력 상대오차 (M=2048, K=768, N=2048):
+    input distribution       per-tensor   block128   block32   bf16
+    normal                       3.74%       3.64%     3.39%    0.23%
+    0.1% outliers at 30x         3.75%       3.19%     2.97%    0.23%
 
-    입력 분포              per-tensor   block128   block32   bf16
-    정규분포                  3.74%       3.64%     3.39%    0.23%
-    이상치 0.1% x30배         3.75%       3.19%     2.97%    0.23%
+FP8 GEMM error is about 15 times the BF16 error, so it is not "nearly the
+same." Block scaling helps mainly when outliers are present: 3.74% to 3.64%
+for a normal distribution, but 3.75% to 3.19% with outliers. Trained
+activations contain outliers, so block scaling is the default.
 
-두 가지를 읽을 수 있습니다. 첫째, FP8 GEMM 오차는 bf16 의 **약 15배**입니다 —
-"거의 같다"가 아닙니다. 둘째, block 단위 스케일링의 이득은 **이상치가 있을
-때만** 나옵니다(정규분포에서는 3.74%→3.64%, 이상치에서는 3.75%→3.19%).
-학습된 활성값에는 이상치가 생기므로 기본값을 block 으로 둡니다.
+E5M2 produced twice the error of E4M3 on the same tensor (5.25% versus 2.66%).
+It has one fewer mantissa bit. E5M2 is nevertheless useful for gradients
+because of its dynamic range, not because of its precision.
 
-기울기용 E5M2 는 같은 텐서에서 E4M3 의 두 배 오차입니다(2.66% 대 5.25%).
-mantissa 가 한 비트 적으니 당연하고, 그럼에도 기울기에 E5M2 를 쓰는 이유는
-정밀도가 아니라 **동적 범위** 때문입니다.
+The vocabulary projection must not be quantized by default. Quantizing both
+hidden states and weights to E4M3 changed the argmax for 6.45% of positions in
+a 48,000-token vocabulary. In greedy decoding, each change directly selects a
+different token. With ``tie_embeddings=True``, this restriction also protects
+``token_embedding.weight`` because it is the output projection. Storing that
+weight in FP8 would also degrade input embedding lookup.
 
-## 절대 내리면 안 되는 것
+The export and runtime format stores weights, but not activations, in FP8.
+Dense computation uses BF16, or FP16 where CUDA BF16 is unavailable. This
+reduces stored and resident weight bytes while avoiding activation
+quantization error. The default runtime still dequantizes each weight to the
+selected compute dtype on every forward pass and uses dense GEMM, so this
+format does not promise execution-bandwidth or operation-count savings:
 
-어휘 projection 입니다. 48,000 어휘에서 hidden 과 가중치를 모두 E4M3 로
-내리면 **argmax 가 6.45% 바뀝니다** — 여섯 토큰 중 하나 꼴로 다른 단어를
-고른다는 뜻이고, greedy 디코딩에서는 그대로 오역입니다.
+    FP8 weights + BF16 activations     output error 2.57%
+    FP8 weights + FP8 activations      output error 3.63%
+    BF16                               output error 0.23%
 
-이 모델에서는 그 금지가 임베딩까지 번집니다. ``tie_embeddings=True`` 라
-출력 projection 이 곧 ``token_embedding.weight`` 이기 때문입니다. 가중치를
-FP8 로 **저장**해 버리면 입력 임베딩 조회까지 같이 망가집니다.
+Quantization error accumulates with depth. A single GEMM's 2.57% error became
+11.7% after the 16-layer encoder and 13.1% at the final logits in the measured
+16-encoder/8-decoder model. Independent quantization noise accumulates in the
+residual stream, so a single-GEMM measurement must not be treated as the
+end-to-end model error.
 
-## 가중치만 FP8 (활성값은 기본 BF16, 미지원 CUDA에서는 FP16)
+Measured scope trade-offs were:
 
-현재 export/runtime 형식은 가중치만 FP8 로 상주시킵니다. dense 계산은 BF16,
-BF16 을 지원하지 않는 CUDA 장치에서는 FP16 을 사용합니다. 이 선택은
-저장·상주 가중치 바이트를 줄이면서 활성값 FP8 양자화 오차를 피합니다. 다만
-기본 runtime 은 매 forward 에서 가중치를 선택한 계산 dtype 으로 역양자화한
-뒤 dense GEMM 을 사용하므로 실행 대역폭·연산량 이득을 보장하지 않습니다:
+    configuration              logit error   argmax mismatch   KL      FP8 share
+    every layer FP8                13.11%          18.75%      0.0628      100%
+    first/last 1 layer BF16        11.37%          18.75%      0.0471       83%
+    first/last 2 layers BF16        9.42%          13.54%      0.0325       65%
+    first/last 3 layers BF16        7.61%          13.54%      0.0213       48%
+    FFN only FP8                     6.39%           8.33%      0.0150       69%
 
-    가중치 FP8 + 활성값 bf16    출력오차 2.57%   (활성값 이상치와 무관)
-    가중치·활성값 모두 FP8       출력오차 3.63%
-    bf16                       출력오차 0.23%
+FFN-only quantization is the best measured trade-off: it halves error while
+covering 69% of quantizable weights. Attention projection error is amplified
+through softmax, while FFN error is added to the residual stream. This was
+better for this model than merely exempting edge layers.
 
-## 오차는 깊이를 따라 누적된다
+Two attempted corrections were not useful and should not be repeated without
+new evidence:
 
-이것이 이 파일에서 가장 중요한 수치입니다. GEMM 하나의 2.57% 는 그대로
-남지 않습니다. sion_data_fit(encoder 16 / decoder 8) 전체를 통과시키면:
+- A rank-32 low-rank quantization-residual correction (LQER family) consumed
+  11.5% more bandwidth and reduced weight error only from 2.57% to 2.44%. The
+  rounding residual was close to white noise and had little low-rank structure.
+- Activation-aware scaling (AWQ family) reduced error only from 2.571% to
+  2.544%, even when activation channel magnitudes differed by 100 times.
 
-    GEMM 1회        2.57%
-    encoder 16층    11.7%      (약 sqrt(층수) 배)
-    최종 logits     13.1%
-
-층을 지날수록 독립적인 양자화 잡음이 잔차 스트림에 쌓입니다. 단일 GEMM
-수치만 보고 "3% 정도"라고 판단하면 안 됩니다.
-
-## 무엇이 누적을 끊는가 (실측)
-
-    구성                          logits오차  argmax불일치   KL      FP8비율
-    전 층 FP8                       13.11%      18.75%   0.0628    100%
-    앞뒤 1층씩 bf16                   11.37%      18.75%   0.0471     83%
-    앞뒤 2층씩 bf16                    9.42%      13.54%   0.0325     65%
-    앞뒤 3층씩 bf16                    7.61%      13.54%   0.0213     48%
-    FFN 만 FP8 (attention bf16)      6.39%       8.33%   0.0150     69%
-
-**FFN 만 내리는 것이 가장 좋은 거래입니다.** 오차는 절반인데 양자화 대상의
-69% 를 덮습니다. attention projection 은 softmax 를 거치며 오차가 증폭되고,
-FFN 의 오차는 잔차에 더해질 뿐이라 그렇습니다. "가장자리 층을 빼는" 흔한
-처방보다 이 모델에서는 이쪽이 낫습니다.
-
-## 시도했으나 효과가 없던 보정 (다시 하지 마십시오)
-
-- **양자화 잔차의 저계수 보정** (LQER 계열): rank-32 가 대역폭을 11.5% 더
-  쓰면서 가중치 오차를 2.57% → 2.44% 로 줄일 뿐입니다. 반올림 잔차는
-  백색잡음에 가까워 저계수 구조가 없습니다.
-- **활성값 인지 스케일링** (AWQ 계열): 2.571% → 2.544%. 채널 크기가 100 배
-  차이 나는 활성값에서도 그렇습니다.
-
-둘 다 실패하는 이유는 같습니다. 여기서 남은 오차는 **범위**가 아니라 E4M3
-의 mantissa 3 비트, 즉 **해상도** 문제입니다. 블록 스케일링으로 범위를 이미
-맞춘 뒤에는 스케일을 아무리 영리하게 골라도 mantissa 를 늘릴 수 없습니다.
-블록 폭을 128→32 로 좁히면 2.571% → 2.400% 로 조금 더 가지만, 스케일 계수가
-4 배가 됩니다.
+Both approaches fail for the same reason: after block scaling controls range,
+the remaining limit is the three-bit E4M3 mantissa, or resolution. Smarter
+scales cannot add mantissa bits. Reducing the block width from 128 to 32 lowers
+error from 2.571% to 2.400%, but requires four times as many scale values.
 """
 
 from __future__ import annotations
@@ -98,55 +87,54 @@ from dataclasses import dataclass
 
 import torch
 
-# 순전파(가중치·활성값)는 E4M3, 역전파(기울기)는 E5M2. 활성값은 정밀도가,
-# 기울기는 동적 범위가 아쉬운 쪽이라 표준적으로 이렇게 나눕니다.
+# E4M3 favors forward precision; E5M2 gives gradients more dynamic range.
 FORWARD_DTYPE = torch.float8_e4m3fn
 GRADIENT_DTYPE = torch.float8_e5m2
 
-# 블록 단위 스케일링의 기본 폭. 좁힐수록 이상치에 강하지만 스케일 계수가
-# 늘고 커널이 느려집니다. 128 은 이상치 실험에서 이득의 대부분을 가져오는
-# 지점입니다(3.75% → 3.19%; block32 로 더 좁혀도 2.97% 로 조금 더 갈 뿐).
+# Narrow blocks handle outliers better, but add scale values and kernel cost.
+# Width 128 captured most of the measured gain (3.75% to 3.19%); width 32
+# improved it only to 2.97%.
 DEFAULT_BLOCK = 128
 
-# FFN projection. 실측에서 가장 좋은 거래를 주는 범위입니다 — 오차는 전 층
-# FP8 의 절반인데 양자화 대상의 69% 를 덮습니다.
+# FFN projections gave the best measured trade-off: half the all-layer error
+# while covering 69% of quantizable weights.
 FFN_PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
 
-# attention projection. 여기까지 내리면 FP8 로 상주하는 가중치 비중은 늘지만
-# softmax 를 거치며 오차가 증폭됩니다 (logits 오차 6.39% → 13.11%).
+# Adding attention projections increases resident FP8 coverage, but softmax
+# amplifies their error (6.39% to 13.11% logit error).
 ATTENTION_PROJECTIONS = ("q_proj", "k_proj", "v_proj", "out_proj")
 
-# 두 범위를 합친 것. 모델 전체 파라미터의 81.6%.
+# Together these scopes cover 81.6% of all model parameters.
 QUANTIZABLE_PROJECTIONS = FFN_PROJECTIONS + ATTENTION_PROJECTIONS
 
-# 기본 범위. 이름이 아니라 측정에서 나온 값입니다.
+# Scope defaults are based on the measurements above.
 SCOPE_FFN = "ffn"
 SCOPE_ALL = "all"
 SCOPES = (SCOPE_FFN, SCOPE_ALL)
 
-# 이름에 이것이 들어가면 어떤 설정에서도 FP8 로 내리지 않습니다.
+# Parameters containing these names remain high precision under every scope.
 PROTECTED_SUBSTRINGS = (
-    "token_embedding",  # tie_embeddings 면 이것이 곧 출력 projection
+    "token_embedding",  # This is also the output projection when embeddings are tied.
     "lm_head",
-    "norm",  # RMSNorm 은 이미 fp32 로 계산합니다
+    "norm",  # RMSNorm already computes in FP32.
     "register_embeddings",
     "type_embedding",
     "mode_embedding",
-    "uncertainty_head",  # 스칼라 게이트, 이득 없음
+    "uncertainty_head",  # A scalar gate offers no useful memory saving.
 )
 
 
 @dataclass(frozen=True)
 class Fp8Policy:
-    """무엇을 FP8 로 내릴지. 기본값은 측정에서 나온 것입니다."""
+    """Select which weights use FP8; defaults follow measured quality trade-offs."""
 
     enabled: bool = False
     block: int = DEFAULT_BLOCK
-    # 기본은 FFN 만. attention 까지 내리면 FP8 상주 가중치는 늘지만 최종
-    # logits 오차가 두 배가 됩니다 (6.39% → 13.11%).
+    # FFN-only is the default. Adding attention doubles measured final-logit
+    # error from 6.39% to 13.11% despite increasing resident FP8 coverage.
     scope: str = SCOPE_FFN
-    # 어휘 projection 을 내리는 것은 실측에서 argmax 6.45% 변경이라
-    # 기본은 False 입니다. 연구 목적으로 켜려면 명시해야 합니다.
+    # Vocabulary projection quantization changed 6.45% of measured argmax
+    # choices, so experimental use requires an explicit opt-in.
     quantize_vocabulary_projection: bool = False
 
     def validate(self) -> None:
@@ -161,7 +149,7 @@ class Fp8Policy:
         return FFN_PROJECTIONS if self.scope == SCOPE_FFN else QUANTIZABLE_PROJECTIONS
 
     def allows(self, parameter_name: str) -> bool:
-        """``named_parameters()`` 이름 하나가 FP8 대상인지."""
+        """Return whether a ``named_parameters()`` entry is eligible for FP8."""
 
         if not self.enabled:
             return False
@@ -180,11 +168,10 @@ def scale_for(
     dtype: torch.dtype = FORWARD_DTYPE,
     block: int | None = DEFAULT_BLOCK,
 ) -> torch.Tensor:
-    """양자화 스케일. ``block`` 이 ``None`` 이면 텐서 전체가 한 블록입니다.
+    """Return quantization scales, treating the full tensor as one block if needed.
 
-    스케일은 ``amax / dtype_max`` 입니다. 0 인 블록에서 0 으로 나누지 않도록
-    아주 작은 값으로 하한을 둡니다 — 그 블록은 어차피 전부 0 이라 어떤
-    스케일을 써도 결과가 같습니다.
+    Each scale is ``amax / dtype_max``. A tiny lower bound avoids division by
+    zero for an all-zero block; any nonzero scale produces the same zeros there.
     """
 
     maximum = torch.finfo(dtype).max
@@ -201,11 +188,11 @@ def scale_for(
 
 
 def fp8_gemm_supported(device: torch.device | None = None) -> bool:
-    """이 장치 세대가 FP8 텐서코어 GEMM 을 지원할 수 있는지.
+    """Return whether the device generation can support FP8 Tensor Core GEMM.
 
-    dtype 이 존재하는 것과 커널이 있는 것은 다릅니다. CPU 에서도 FP8 로
-    캐스팅은 되지만 ``_scaled_mm`` 은 없습니다. 이 함수는 하드웨어 capability
-    만 판별하며, ``Fp8Linear`` 가 해당 커널을 사용한다는 뜻은 아닙니다.
+    A dtype can exist even when no corresponding kernel exists; a CPU can cast
+    to FP8 but cannot run ``_scaled_mm``. This checks hardware capability only.
+    It does not imply that :class:`Fp8Linear` uses a native FP8 kernel.
     """
 
     if device is not None and device.type != "cuda":
@@ -213,7 +200,7 @@ def fp8_gemm_supported(device: torch.device | None = None) -> bool:
     if not torch.cuda.is_available():
         return False
     major, minor = torch.cuda.get_device_capability(device)
-    # 8.9 = Ada, 9.0 = Hopper. 그 아래는 FP8 텐서코어가 없습니다.
+    # Ada is capability 8.9 and Hopper is 9.0; earlier devices lack FP8 Tensor Cores.
     return (major, minor) >= (8, 9)
 
 

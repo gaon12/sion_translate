@@ -231,21 +231,31 @@ def test_cpu_fp8_runtime_keeps_the_existing_bf16_dense_path() -> None:
     assert resolve_fp8_compute_dtype(device) is torch.bfloat16
     description = describe_runtime(device)
 
-    assert "FP8 상주 가중치" in description
-    assert "BF16 즉시 역양자화" in description
+    assert "FP8-resident weights" in description
+    assert "on-demand BF16 dequantization" in description
     assert "CPU dense fallback" in description
 
 
 @pytest.mark.parametrize(
     ("capability", "expected_dtype", "compute_name", "hardware_description"),
     [
-        ((8, 0), torch.bfloat16, "BF16", "네이티브 FP8 텐서코어 미지원 장치 fallback"),
-        ((7, 0), torch.float16, "FP16", "네이티브 FP8 텐서코어 미지원 장치 fallback"),
+        (
+            (8, 0),
+            torch.bfloat16,
+            "BF16",
+            "device lacks native FP8 Tensor Cores; using the dense fallback",
+        ),
+        (
+            (7, 0),
+            torch.float16,
+            "FP16",
+            "device lacks native FP8 Tensor Cores; using the dense fallback",
+        ),
         (
             (9, 0),
             torch.bfloat16,
             "BF16",
-            "네이티브 FP8 텐서코어 지원 장치이지만 현재 경로에서는 미사용",
+            "native FP8 Tensor Cores are available but unused by this path",
         ),
     ],
     ids=("a100", "bf16-unsupported", "h100"),
@@ -264,9 +274,9 @@ def test_cuda_fp8_runtime_falls_back_without_requiring_native_fp8(
     assert resolve_fp8_compute_dtype(device) is expected_dtype
     description = describe_runtime(device)
 
-    assert "FP8 상주 가중치" in description
-    assert f"{compute_name} 즉시 역양자화" in description
+    assert "FP8-resident weights" in description
+    assert f"on-demand {compute_name} dequantization" in description
     assert "dense GEMM" in description
-    assert "상주 메모리 절감" in description
+    assert "reduced resident weight memory" in description
     assert hardware_description in description
-    assert "대역폭" not in description
+    assert "bandwidth saving" not in description

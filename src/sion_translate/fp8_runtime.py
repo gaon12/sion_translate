@@ -1,19 +1,19 @@
-"""FP8 가중치를 FP8 인 채로 상주시켜 추론하는 경로.
+"""Run inference while keeping exported weights resident in FP8.
 
-export 가 저장한 FP8 가중치와 블록 스케일은 모델 버퍼에서도 FP8 로 유지되므로
-상주 메모리는 줄어듭니다. 현재 ``Fp8Linear`` 의 계산 경로는 하나뿐입니다.
-매 ``forward`` 에서 전체 가중치를 장치가 지원하는 ``compute_dtype``
-(기본 BF16, BF16 미지원 CUDA에서는 FP16)으로 역양자화한 뒤 평범한
-``torch.nn.functional.linear`` 를 호출합니다.
+Exported FP8 weights and their block scales remain in their packed dtypes in
+model buffers, which reduces resident weight memory. ``Fp8Linear`` currently
+has one compute path: each forward pass dequantizes the complete weight to the
+device's supported ``compute_dtype`` (BF16 by default, or FP16 on CUDA devices
+without BF16 support) and calls ``torch.nn.functional.linear``.
 
-따라서 이 구현은 ``torch._scaled_mm`` 을 호출하지 않고 네이티브 FP8
-텐서코어 GEMM 을 사용하지 않습니다. 역양자화된 임시 dense 가중치를 만들기
-때문에 실행 중 메모리 대역폭이나 연산량이 줄어든다고도 보장할 수 없습니다.
-장치 성능 이득은 별도 벤치마크로 확인해야 합니다.
+This implementation does not call ``torch._scaled_mm`` or use native FP8
+Tensor Core GEMM. It creates a temporary dense dequantized weight, so it also
+does not promise lower runtime bandwidth or fewer operations. Benchmark the
+target device before claiming a performance gain.
 
-활성값은 FP8 로 내리지 않습니다. 가중치만 내리는 편이 더 정확하고(출력 오차
-2.57% 대 3.63%) 활성값 이상치에 영향받지 않습니다. 근거 수치는
-``sion_translate.fp8`` 문서에 있습니다.
+Activations remain high precision. Weight-only FP8 was more accurate in the
+measurements (2.57% versus 3.63% output error) and is insensitive to activation
+outliers. See :mod:`sion_translate.fp8` for the supporting measurements.
 """
 
 # Torch FP8 primitives and optional packed-module hooks are incompletely typed.
@@ -58,10 +58,10 @@ def resolve_fp8_compute_dtype(device: torch.device) -> torch.dtype:
 
 
 class Fp8Linear(nn.Module):
-    """``nn.Linear`` 대체품. 가중치를 E4M3 + 블록 스케일로 들고 있습니다.
+    """Replace ``nn.Linear`` while storing weights as E4M3 plus block scales.
 
-    ``bias`` 는 받지 않습니다 — 이 모델의 projection 은 전부 bias 가 없고,
-    쓰지 않을 분기를 두지 않기 위해서입니다.
+    Bias is intentionally unsupported because every projection in this model
+    is bias-free and an unused branch would add unnecessary state and checks.
     """
 
     def __init__(
@@ -91,7 +91,7 @@ class Fp8Linear(nn.Module):
         self.out_features = out_features
         self.block = block
         self.compute_dtype = compute_dtype
-        # 버퍼로 둡니다. 학습 대상이 아니고, state_dict 에는 남아야 합니다.
+        # Buffers are not trainable, but remain available in ``state_dict``.
         self.register_buffer("weight", weight)
         self.register_buffer("scales", scales)
 
@@ -135,15 +135,15 @@ def apply_fp8_weights(
     *,
     compute_dtype: torch.dtype | None = None,
 ) -> int:
-    """FP8 로 저장된 항목을 ``Fp8Linear`` 로 바꿔 끼운다.
+    """Replace modules backed by packed FP8 entries with ``Fp8Linear``.
 
-    ``packed_state`` 는 ``training.export._pack_fp8_state`` 가 낸 것입니다.
-    ``block_fp8`` 항목만 교체하고 나머지는 건드리지 않으므로, 어떤 텐서가
-    고정밀도로 남을지는 export 시점의 정책이 이미 정해 둔 그대로입니다.
+    ``packed_state`` is produced by ``training.export._pack_fp8_state``. Only
+    ``block_fp8`` entries are replaced. The export policy therefore remains
+    authoritative about which tensors stay in high precision.
 
-    ``compute_dtype`` 을 지정하지 않으면 forward 시점의 장치에서 BF16 지원을
-    확인하고, 지원하지 않는 CUDA 장치에서는 FP16 으로 자동 fallback 합니다.
-    반환값은 교체한 모듈 수입니다.
+    When ``compute_dtype`` is omitted, the forward path checks BF16 support on
+    the active device and falls back to FP16 on unsupported CUDA devices. The
+    return value is the number of replaced modules.
     """
 
     replaced = 0
@@ -209,24 +209,25 @@ def prepare_fp8_model_for_device(model: nn.Module, device: torch.device) -> torc
 
 
 def describe_runtime(device: torch.device) -> str:
-    """실제로 사용하는 계산 경로를 배포 로그용 한 줄로 설명합니다.
+    """Describe the actual compute path in one deployment-log message.
 
-    상주 형식, 실제 dense 계산 dtype, 네이티브 FP8 지원 여부를 구분해서
-    기록합니다. 네이티브 FP8 지원 장치에서도 현재 커널은 이를 사용하지 않습니다.
+    The message separates resident format, dense compute dtype, and hardware
+    FP8 support. The current kernel does not use native FP8 even when the
+    hardware supports it.
     """
 
     compute_dtype = resolve_fp8_compute_dtype(device)
     compute_name = "BF16" if compute_dtype is torch.bfloat16 else "FP16"
     if device.type == "cuda":
         if fp8_gemm_supported(device):
-            hardware = "네이티브 FP8 텐서코어 지원 장치이지만 현재 경로에서는 미사용"
+            hardware = "native FP8 Tensor Cores are available but unused by this path"
         else:
-            hardware = "네이티브 FP8 텐서코어 미지원 장치 fallback"
+            hardware = "device lacks native FP8 Tensor Cores; using the dense fallback"
     else:
         hardware = f"{device.type.upper()} dense fallback"
     return (
-        f"FP8 상주 가중치 + {compute_name} 즉시 역양자화 후 dense GEMM "
-        f"(상주 메모리 절감; {hardware})"
+        f"FP8-resident weights with on-demand {compute_name} dequantization and dense GEMM "
+        f"(reduced resident weight memory; {hardware})"
     )
 
 

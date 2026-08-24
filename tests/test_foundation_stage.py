@@ -53,8 +53,8 @@ def test_the_stage_runs_when_the_corpus_has_data(tmp_path) -> None:
 def test_a_missing_corpus_skips_with_an_actionable_reason(tmp_path) -> None:
     plan = plan_foundation_stage(_config(tmp_path))
     assert not plan.enabled
-    # 무엇을 어디에 두면 되는지가 문장 안에 있어야 한다.
-    assert "언어 코드 폴더" in plan.reason
+    # The message must say what type of file to add and where to put it.
+    assert "language-code directories" in plan.reason
     assert ".txt" in plan.reason and ".jsonl" in plan.reason
 
 

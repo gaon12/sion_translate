@@ -1,9 +1,10 @@
-"""foundation(단일어 사전학습) 단계의 계획·설정 유도.
+"""Plan the monolingual foundation stage and derive its configuration.
 
-CLI 밖에 두는 이유는 두 가지입니다. 이 단계를 **돌릴지 말지** 판단하는 규칙과
-그 이유를 사람에게 설명하는 문장은 CLI 배선과 별개로 검증할 수 있어야 하고,
-번역 설정에서 foundation 설정을 유도하는 규칙(무엇을 덮어쓰고 무엇을 물려받는지)
-은 조용히 틀리기 쉬운 종류이기 때문입니다.
+This logic stays outside the CLI for two reasons. The decision to run the
+stage, including its human-readable explanation, must be testable without CLI
+wiring. The inheritance rules that derive a foundation configuration from the
+translation configuration are also easy to get subtly wrong and deserve a
+separate, directly tested boundary.
 """
 
 from __future__ import annotations
@@ -30,7 +31,7 @@ FOUNDATION_LINEAGE_SCHEMA = "sion-foundation-lineage-v1"
 
 @dataclass(frozen=True)
 class FoundationPlan:
-    """이 실행에서 foundation 단계를 돌릴지, 그리고 그 이유."""
+    """Record whether this run includes the foundation stage and explain why."""
 
     enabled: bool
     reason: str
@@ -125,11 +126,12 @@ def build_translation_pipeline_identity(
 
 
 def plan_foundation_stage(config: AppConfig) -> FoundationPlan:
-    """코퍼스를 훑어 단계 실행 여부와 그 이유를 정한다.
+    """Inspect the corpus and decide whether to run the foundation stage.
 
-    "폴더가 있으면 자동 실행" 이므로 건너뛰는 경우가 정상 경로이고, 그래서
-    **왜 건너뛰는지가 항상 문장으로 남아야 합니다.** 조용히 건너뛰면 사용자는
-    5 GB 코퍼스가 학습에 들어갔다고 믿은 채로 번역 학습을 끝내게 됩니다.
+    Automatic execution when a corpus is present makes skipping a normal code
+    path. Every skip therefore includes a clear reason. A silent skip could
+    otherwise leave an operator believing that gigabytes of monolingual data
+    were included when translation training never consumed them.
     """
 
     languages = config.foundation_languages()
@@ -139,7 +141,7 @@ def plan_foundation_stage(config: AppConfig) -> FoundationPlan:
     if not config.foundation.enabled:
         return FoundationPlan(
             enabled=False,
-            reason="foundation.enabled=false — 설정에서 껐습니다.",
+            reason="Skipping the foundation stage because foundation.enabled=false.",
             discovery=discovery,
             languages=languages,
             report=report,
@@ -148,10 +150,11 @@ def plan_foundation_stage(config: AppConfig) -> FoundationPlan:
         return FoundationPlan(
             enabled=False,
             reason=(
-                f"{config.foundation.corpus_dir} 에 학습 가능한 단일어 파일이 없어 "
-                "건너뜁니다. 언어 코드 폴더(예: "
+                f"Skipping the foundation stage because {config.foundation.corpus_dir} "
+                "contains no usable monolingual files. Add .txt or .jsonl files under "
+                "language-code directories (for example, "
                 f"{config.foundation.corpus_dir}/{languages[0] if languages else 'ko'}/) "
-                "안에 .txt 또는 .jsonl 을 두면 다음 실행에서 자동으로 잡습니다."
+                "and the next run will discover them automatically."
             ),
             discovery=discovery,
             languages=languages,
@@ -171,12 +174,13 @@ def plan_foundation_stage(config: AppConfig) -> FoundationPlan:
     if config.foundation.require_all_languages and discovery.languages_without_data:
         missing = ", ".join(discovery.languages_without_data)
         raise RuntimeError(
-            f"foundation.require_all_languages=true 인데 단일어 데이터가 없는 언어가 "
-            f"있습니다: {missing}. 데이터를 채우거나 require_all_languages 를 끄십시오."
+            "foundation.require_all_languages=true, but these configured languages have "
+            f"no monolingual data: {missing}. Add the missing data or disable "
+            "require_all_languages."
         )
     return FoundationPlan(
         enabled=True,
-        reason=f"단일어 코퍼스 {len(discovery.sources)}개 파일을 찾았습니다.",
+        reason=f"Found {len(discovery.sources)} usable monolingual corpus files.",
         discovery=discovery,
         languages=languages,
         report=report,
@@ -189,17 +193,18 @@ def foundation_run_directory(config: AppConfig) -> Path:
 
 
 def build_foundation_config(config: AppConfig) -> AppConfig:
-    """번역 설정에서 foundation 단계 설정을 유도한다.
+    """Derive a foundation-stage configuration from translation settings.
 
-    물려받는 것: 모델 구조, 정밀도, 병렬 전략, seed, 토크나이저.
-    덮어쓰는 것: 데이터셋 경로, 목적(복원 + 선택적 reasoning), 학습 일정,
-    산출 경로.
+    The stage inherits model structure, precision, parallel strategy, random
+    seed, and tokenizer. It replaces dataset paths, objective settings
+    (reconstruction plus optional reasoning), schedule, and output paths.
 
-    복원 확률을 학습·검증 **양쪽 다** 1.0 으로 둡니다. 일반 단일어 shard 는
-    ``src == tgt`` 라, 복원을 걸지 않은 예제는 "입력을 그대로 베껴라" 가 되어
-    아무것도 가르치지 않습니다. 검증만 0 으로 두면 검증 손실이 복사 과제의
-    손실이 되어 best 선택이 무의미해집니다. 구조화 reasoning 행은 별도 task
-    tag가 있어 collator가 이 확률과 무관하게 denoising을 우회합니다.
+    Reconstruction probability is 1.0 for both training and validation. A
+    normal monolingual shard has ``src == tgt``, so an uncorrupted example only
+    teaches copying. Setting validation alone to zero would also turn model
+    selection into a meaningless copy-task comparison. Structured reasoning
+    rows carry a separate task tag, allowing the collator to bypass denoising
+    independently of this probability.
     """
 
     foundation = config.foundation
@@ -209,20 +214,20 @@ def build_foundation_config(config: AppConfig) -> AppConfig:
     derived.data.validation_denoise_probability = 1.0
     derived.data.denoise_noise_density = foundation.noise_density
     derived.data.denoise_mean_span = foundation.mean_span
-    # 손상 자체가 이 단계의 잡음입니다. 원문 토큰 dropout 을 겹치면 복원해야
-    # 할 근거까지 지워집니다.
+    # Span corruption already supplies noise. Source-token dropout would erase
+    # evidence that the model needs in order to reconstruct the target.
     derived.data.source_token_dropout = 0.0
     derived.data.decoder_input_noise = 0.0
-    # foundation shard 에는 source-only 언어가 없습니다(설계상 제외). 남겨 두면
-    # collator 가 그 언어의 복원 예제를 건너뛰려 하다가 아무것도 못 찾습니다.
+    # Foundation shards intentionally exclude source-only languages. Keeping
+    # them here could make the collator skip every reconstruction example.
     derived.data.source_only_languages = []
-    # ``data.language_pairs`` 는 번역 설정 그대로 둡니다. 복원 과제의 "쌍"은
-    # (ko, ko) 처럼 자기 자신인데, 공용 검증기는 두 키가 서로 달라야 한다고
-    # 요구합니다 — 번역 설정에서는 옳은 규칙이므로 여기서 예외를 만들지
-    # 않습니다. 이 단계가 실제로 읽는 언어는 foundation 데이터셋 manifest 가
-    # 정하고(``IndexedParallelDataset`` 이 거기서 읽습니다), collator 는
-    # record 의 ``src_language``/``target_language`` 만 봅니다. 설정의 쌍은
-    # 이 경로에서 쓰이지 않습니다.
+    # Keep ``data.language_pairs`` from the translation configuration. A
+    # reconstruction pair would be self-directed, such as (ko, ko), while the
+    # shared validator correctly requires distinct endpoints for translation.
+    # Introducing an exception here would weaken that invariant. The foundation
+    # manifest selects the languages actually read by ``IndexedParallelDataset``,
+    # and the collator uses each record's source and target language fields, so
+    # configured translation pairs are not consulted on this path.
 
     training = derived.training
     training.output_dir = str(foundation_run_directory(config))
@@ -242,10 +247,10 @@ def build_foundation_config(config: AppConfig) -> AppConfig:
     training.final_export_formats = list(foundation.final_export_formats)
     training.resume_from = None
     training.tensorboard_dir = None
-    # 방향별 지표는 번역 단계의 개념입니다. 복원 과제에는 방향이 없습니다.
+    # Direction-specific metrics describe translation, not reconstruction.
     training.sft_selection_metric = "global_nll"
 
-    # 이 단계는 번역을 하지 않으므로 사후학습도 없습니다.
+    # A reconstruction-only stage does not run translation post-training.
     derived.posttraining.enabled = False
     derived.foundation.enabled = False
     return derived
@@ -253,7 +258,7 @@ def build_foundation_config(config: AppConfig) -> AppConfig:
 
 @dataclass
 class FoundationOutcome:
-    """단계 실행 결과. 번역 단계가 provenance 로 기록합니다."""
+    """Record the stage outcome for translation provenance."""
 
     ran: bool
     reason: str
