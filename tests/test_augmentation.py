@@ -162,16 +162,16 @@ def test_raw_contract_fails_closed_for_stale_graph_and_inputs(
         ["de", "en"],
         ["sw", "ar"],
     ]
-    with pytest.raises(RuntimeError, match="언어 그래프"):
+    with pytest.raises(RuntimeError, match="language graph"):
         validate_prepared_raw_contract(stale_graph, augment_prefix="bt_")
 
     (raw_dir / "new_real.jsonl").write_text("{}\n", encoding="utf-8")
-    with pytest.raises(RuntimeError, match="아직 준비되지 않은"):
+    with pytest.raises(RuntimeError, match="absent from the prepared baseline"):
         validate_prepared_raw_contract(data, augment_prefix="bt_")
     (raw_dir / "new_real.jsonl").unlink()
 
     (raw_dir / "real.jsonl").unlink()
-    with pytest.raises(RuntimeError, match="삭제"):
+    with pytest.raises(RuntimeError, match="were deleted"):
         validate_prepared_raw_contract(data, augment_prefix="bt_")
 
 
@@ -183,7 +183,7 @@ def test_registry_rejects_unowned_legacy_or_corrupt_outputs(tmp_path: Path) -> N
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="ledger가 인증하지 않은"):
+    with pytest.raises(ValueError, match="not authenticated by a ledger"):
         load_augmentation_registry(data_dir, "bt_", ())
 
 
@@ -198,7 +198,7 @@ def test_registry_rejects_accepted_hashes_without_declared_shards(tmp_path: Path
         JobProgress(identity, mono_text_hashes=frozenset({"a" * 64})),
     )
 
-    with pytest.raises(ValueError, match="선언된 shard"):
+    with pytest.raises(ValueError, match="declared shards"):
         load_augmentation_registry(data_dir, "bt_", ())
 
 
@@ -231,7 +231,7 @@ def test_registry_rejects_the_same_mono_hash_across_shards(tmp_path: Path) -> No
     second_path = augmentation_shard_path(data_dir, identity, 1)
     second_path.write_text(json.dumps(duplicate_row) + "\n", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="중복"):
+    with pytest.raises(ValueError, match="repeat"):
         load_augmentation_registry(data_dir, "bt_", ())
 
 
@@ -268,7 +268,7 @@ def test_training_raw_scan_rejects_unowned_bidirectional_synthetic_rows(
         )
     )
 
-    with pytest.raises(ValueError, match="ledger가 인증하지 않은"):
+    with pytest.raises(ValueError, match="not authenticated by a ledger"):
         scan_configured_raw_data(config, raw_dir, tokenizer_path)
 
 
@@ -428,7 +428,7 @@ def test_registry_rejects_a_wrong_direction_shard(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="손상되거나"):
+    with pytest.raises(ValueError, match="is corrupt"):
         load_augmentation_registry(data_dir, "bt_", ())
 
 
@@ -578,14 +578,14 @@ def test_orphan_shard_rejects_synthetic_corruption_and_wrong_generator_identity(
 
     row["en"] = "Silently corrupted synthetic source."
     shard_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="소유권이 불명확"):
+    with pytest.raises(ValueError, match="does not prove job ownership"):
         load_augmentation_registry(data_dir, "bt_", ())
 
     row["_sion_augment"]["synthetic_text_sha256"] = hashlib.sha256(row["en"].encode()).hexdigest()
     other_identity = _job_identity(mono_path, model_identity="9" * 64)
     row["_sion_augment"]["identity_sha256"] = augmentation_identity_sha256(other_identity)
     shard_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="소유권이 불명확"):
+    with pytest.raises(ValueError, match="does not prove job ownership"):
         load_augmentation_registry(data_dir, "bt_", ())
 
 
@@ -603,7 +603,7 @@ def test_input_change_during_translation_publishes_nothing(tmp_path: Path) -> No
             return ["A valid generated source sentence." for _ in texts]
 
     seen: set[str] = set()
-    with pytest.raises(RuntimeError, match="번역 중 단일어 입력이 변경"):
+    with pytest.raises(RuntimeError, match="monolingual input changed during translation"):
         run_augmentation_job(
             MutatingTranslator(),
             mono_path=mono_path,

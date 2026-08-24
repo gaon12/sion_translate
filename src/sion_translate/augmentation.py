@@ -358,7 +358,7 @@ def snapshot_file(path: str | Path) -> FileSnapshot:
         after.st_ino,
     )
     if identity_before != identity_after:
-        raise RuntimeError(f"파일이 해시 계산 중 변경되었습니다: {resolved}")
+        raise RuntimeError(f"file changed while its digest was being computed: {resolved}")
     return FileSnapshot(resolved.name, after.st_size, digest)
 
 
@@ -549,7 +549,7 @@ def validate_prepared_raw_contract(
     fingerprint = stored_fingerprint(dataset_dir)
     if not isinstance(fingerprint, DatasetFingerprint):
         raise RuntimeError(
-            f"{dataset_dir}의 인증된 raw fingerprint가 없습니다. 먼저 sion-train을 실행하세요."
+            f"{dataset_dir} has no authenticated raw-input fingerprint; run sion-train first"
         )
     tokenizer_path = Path(data.tokenizer_model)
     if not tokenizer_path.is_file():
@@ -560,32 +560,34 @@ def validate_prepared_raw_contract(
         or fingerprint.preprocessing_options != _expected_preprocessing_options(data)
     ):
         raise RuntimeError(
-            "준비된 데이터셋의 언어 그래프·토크나이저·전처리 계약이 현재 설정과 "
-            "다릅니다. 먼저 sion-train으로 데이터셋을 다시 준비하세요."
+            "the prepared dataset's language graph, tokenizer, or preprocessing contract "
+            "does not match the current configuration; rebuild it with sion-train first"
         )
     if not raw_dir.is_dir():
-        raise RuntimeError(f"준비된 데이터셋의 raw_dir가 사라졌습니다: {raw_dir}")
+        raise RuntimeError(f"the prepared dataset's raw_dir no longer exists: {raw_dir}")
 
     prepared = {item.name: item for item in fingerprint.files}
     current = {path.name: path for path in raw_dir.glob("*.jsonl") if path.is_file()}
     missing = sorted(set(prepared) - set(current))
     if missing:
         raise RuntimeError(
-            f"준비 뒤 raw 입력이 삭제되었습니다. 증강 전에 데이터셋을 다시 준비하세요: {missing}"
+            "raw inputs were deleted after dataset preparation; rebuild the dataset before "
+            f"augmentation: {missing}"
         )
     for name, expected in prepared.items():
         path = current[name]
         if path.stat().st_size != expected.size or file_sha256(path) != expected.sha256:
             raise RuntimeError(
-                f"준비 뒤 raw 입력이 변경되었습니다. 증강 전에 데이터셋을 다시 준비하세요: {name}"
+                "a raw input changed after dataset preparation; rebuild the dataset before "
+                f"augmentation: {name}"
             )
     unexpected = sorted(
         name for name in set(current) - set(prepared) if not name.startswith(augment_prefix)
     )
     if unexpected:
         raise RuntimeError(
-            "아직 준비되지 않은 일반/synthetic raw 입력이 있습니다. 증강 예산을 "
-            f"계산하기 전에 sion-train을 실행하세요: {unexpected}"
+            "raw or synthetic inputs exist that are absent from the prepared baseline; run "
+            f"sion-train before computing the augmentation budget: {unexpected}"
         )
     return fingerprint
 
@@ -710,12 +712,12 @@ def _read_ledger(
     try:
         raw: object = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ValueError(f"augmentation ledger를 읽을 수 없습니다: {path}") from error
+        raise ValueError(f"cannot read augmentation ledger: {path}") from error
     if not isinstance(raw, dict):
-        raise ValueError(f"augmentation ledger는 JSON object여야 합니다: {path}")
+        raise ValueError(f"augmentation ledger must contain a JSON object: {path}")
     values = cast(dict[object, object], raw)
     if values.get("schema") != AUGMENT_LEDGER_SCHEMA:
-        raise ValueError(f"지원하지 않는 augmentation ledger schema입니다: {path}")
+        raise ValueError(f"augmentation ledger uses an unsupported schema: {path}")
     identity = AugmentationIdentity.from_dict(values.get("identity"))
     cursor = values.get("cursor_line")
     eof = values.get("eof")
@@ -729,14 +731,14 @@ def _read_ledger(
         or not isinstance(raw_shards, list)
         or not isinstance(raw_hashes, list)
     ):
-        raise ValueError(f"augmentation ledger progress가 잘못되었습니다: {path}")
+        raise ValueError(f"augmentation ledger has invalid progress fields: {path}")
     shards = tuple(ShardSummary.from_dict(value) for value in cast(list[object], raw_shards))
     hashes = cast(list[object], raw_hashes)
     if any(not isinstance(value, str) or _SHA256.fullmatch(value) is None for value in hashes):
-        raise ValueError(f"augmentation ledger mono hash inventory가 잘못되었습니다: {path}")
+        raise ValueError(f"augmentation ledger has an invalid monolingual hash inventory: {path}")
     typed_hashes = cast(list[str], hashes)
     if len(typed_hashes) != len(set(typed_hashes)):
-        raise ValueError(f"augmentation ledger mono hash inventory가 중복됩니다: {path}")
+        raise ValueError(f"augmentation ledger repeats monolingual hashes: {path}")
     return identity, cursor, eof, shards, frozenset(typed_hashes)
 
 
@@ -798,10 +800,10 @@ def _validate_shard(
                 rows += 1
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
         raise ValueError(
-            f"손상되거나 소유권이 불명확한 augmentation shard입니다: {path}"
+            f"augmentation shard is corrupt or does not prove job ownership: {path}"
         ) from error
     if rows < 1 or first_line is None:
-        raise ValueError(f"빈 augmentation shard는 완료 산출물이 아닙니다: {path}")
+        raise ValueError(f"an empty augmentation shard is not a completed artifact: {path}")
     return (
         ShardSummary(path.name, rows, file_sha256(path), first_line, last_line),
         frozenset(mono_hashes),
@@ -820,7 +822,7 @@ def _load_job_progress(
 ) -> JobProgress:
     identity, cursor, eof, declared, declared_hashes = _read_ledger(ledger_path)
     if ledger_path.stem != identity.job_id:
-        raise ValueError(f"augmentation ledger filename과 job_id가 다릅니다: {ledger_path}")
+        raise ValueError(f"augmentation ledger filename does not match its job_id: {ledger_path}")
     pattern = _shard_pattern(identity)
     discovered: list[tuple[int, Path]] = []
     for path in data_dir.iterdir():
@@ -831,7 +833,7 @@ def _load_job_progress(
             discovered.append((int(match.group(1)), path))
     discovered.sort()
     if [sequence for sequence, _ in discovered] != list(range(len(discovered))):
-        raise ValueError(f"augmentation shard sequence에 빈 구간이 있습니다: {identity.job_id}")
+        raise ValueError(f"augmentation shard sequence contains a gap: {identity.job_id}")
 
     summaries: list[ShardSummary] = []
     mono_hashes: set[str] = set()
@@ -846,7 +848,7 @@ def _load_job_progress(
         overlap = mono_hashes & shard_hashes
         if overlap:
             raise ValueError(
-                f"augmentation shard들에 같은 mono text hash가 중복됩니다: {identity.job_id}"
+                f"augmentation shards repeat a monolingual text hash: {identity.job_id}"
             )
         summaries.append(summary)
         mono_hashes.update(shard_hashes)
@@ -854,15 +856,18 @@ def _load_job_progress(
             declared_shard_hashes.update(shard_hashes)
         previous_input_line = summary.last_input_line
     if len(declared) > len(summaries) or tuple(summaries[: len(declared)]) != declared:
-        raise ValueError(f"augmentation ledger와 shard inventory가 다릅니다: {identity.job_id}")
+        raise ValueError(
+            f"augmentation ledger does not match the shard inventory: {identity.job_id}"
+        )
     if declared_hashes != frozenset(declared_shard_hashes):
         raise ValueError(
-            f"augmentation ledger mono hash inventory가 선언된 shard와 다릅니다: {identity.job_id}"
+            "augmentation ledger's monolingual hash inventory does not match its declared "
+            f"shards: {identity.job_id}"
         )
     recovered = len(summaries) > len(declared)
     minimum_cursor = previous_input_line + 1
     if cursor < (declared[-1].last_input_line + 1 if declared else 0):
-        raise ValueError(f"augmentation ledger cursor가 shard보다 뒤처졌습니다: {identity.job_id}")
+        raise ValueError(f"augmentation ledger cursor trails its shards: {identity.job_id}")
     progress = JobProgress(
         identity=identity,
         cursor_line=max(cursor, minimum_cursor),
@@ -919,7 +924,7 @@ def load_augmentation_registry(
     }
     if actual != owned:
         raise ValueError(
-            "ledger가 인증하지 않은 legacy/corrupt augmentation output이 있습니다: "
+            "legacy or corrupt augmentation output is not authenticated by a ledger: "
             f"unowned={sorted(actual - owned)}, missing={sorted(owned - actual)}"
         )
     return AugmentationRegistry(jobs=jobs, prepared_names=frozenset(prepared_names))
@@ -966,7 +971,9 @@ def run_augmentation_job(
     if synthetic_prefix != identity.synthetic_prefix:
         raise ValueError("augmentation job prefix differs from its immutable identity")
     if snapshot_file(mono_path) != identity.input:
-        raise RuntimeError(f"단일어 입력이 augmentation ledger 생성 뒤 변경되었습니다: {mono_path}")
+        raise RuntimeError(
+            f"monolingual input changed after the augmentation ledger was created: {mono_path}"
+        )
     # Establish ownership before a shard can be published. If the process dies
     # after rename but before the final ledger update, registry loading can
     # validate and recover that immutable orphan shard.
@@ -1108,14 +1115,14 @@ def run_augmentation_job(
                         cursor = total_lines
             if progress.cursor_line > total_lines:
                 raise ValueError(
-                    "augmentation ledger cursor가 단일어 입력 행 수보다 큽니다: "
+                    "augmentation ledger cursor exceeds the monolingual input line count: "
                     f"{progress.cursor_line} > {total_lines}"
                 )
             out.flush()
             os.fsync(out.fileno())
 
         if snapshot_file(mono_path) != identity.input:
-            raise RuntimeError(f"번역 중 단일어 입력이 변경되었습니다: {mono_path}")
+            raise RuntimeError(f"monolingual input changed during translation: {mono_path}")
         shards = progress.shards
         if written:
             assert temporary_path is not None
@@ -1165,8 +1172,8 @@ def reconcile_job_identity(
         ):
             return JobProgress(identity=identity)
         raise RuntimeError(
-            "기존 augmentation job의 입력·모델·토크나이저·생성 설정이 현재와 "
-            f"다릅니다: {identity.input.filename}. 기존 shard를 임의 재사용하지 않습니다."
+            "the existing augmentation job uses different input, model, tokenizer, or "
+            f"generation settings for {identity.input.filename}; refusing to reuse its shards"
         )
     return existing
 
