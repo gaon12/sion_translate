@@ -200,6 +200,11 @@ For example, growing a 29.75-million-pair corpus to 30.25 million pairs remains 
 `base` preset. Explicit model settings in YAML still take precedence over automatic
 selection.
 
+With the production 48,000-piece vocabulary and candidate refinement enabled, `base`
+contains about 203.4 million parameters and `large` about 418.9 million. The current
+27,602,231-row inventory remains `base`; promotion does not occur until 31,500,000 rows.
+Parameter totals vary when the automatic vocabulary size changes.
+
 The buffer controls only promotion stability. It does not claim that a larger model is
 always better; data quality, direction balance, effective tokens, hardware capacity, and
 validation results still decide whether a preset is appropriate.

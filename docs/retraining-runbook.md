@@ -165,12 +165,18 @@ Automatic sizing uses effective training data, not a hard-coded language combina
 Release 1.5 adds a five-percent promotion buffer at each preset boundary. The current
 promotion points are:
 
-| Larger preset | Raw boundary | Promotion point |
-|---|---:|---:|
-| 200M class | 200,000 | 210,000 |
-| 450M class | 3,000,000 | 3,150,000 |
-| 1.3B class | 30,000,000 | 31,500,000 |
-| 3B class | 100,000,000 | 105,000,000 |
+| Promotion | Raw boundary | Promotion point | Approximate parameters at a 48k vocabulary |
+|---|---:|---:|---:|
+| `small` -> `medium` | 200,000 | 210,000 | 64.7M -> 118.3M |
+| `medium` -> `base` | 3,000,000 | 3,150,000 | 118.3M -> 203.4M |
+| `base` -> `large` | 30,000,000 | 31,500,000 | 203.4M -> 418.9M |
+| `large` -> `xlarge` | 100,000,000 | 105,000,000 | 418.9M -> 753.9M |
+
+The parameter figures include the enabled candidate-refinement module and hold the
+vocabulary at 48,000 pieces so the architectural jump is visible. Actual totals also
+depend on the automatically selected vocabulary. The current 27,602,231-row snapshot
+therefore remains on the 203M-class `base` preset until it reaches 31,500,000 rows,
+instead of jumping to the roughly 419M `large` preset at the nominal 30M boundary.
 
 The buffer prevents a modest addition near a boundary from abruptly selecting a much
 larger model. It is a stability policy, not a claim that one preset is universally best.
