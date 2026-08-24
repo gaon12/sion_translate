@@ -1,32 +1,26 @@
-# 양방향·표현력 품질 개편 기록
+# Bidirectional and Expressive-Language Quality Overhaul
 
-이 문서는 2026-08-05 기준으로 공개 체크포인트와 로컬 학습 파이프라인을 감사한
-결과, 이번 코드 개편이 해결한 문제, 그리고 새 모델을 검증하는 절차를 기록합니다.
-가장 중요한 결론은 하나입니다. **코드가 고쳐져도 기존 가중치의 품질은 바뀌지
-않습니다.** 과거 토크나이저와 indexed dataset은 새 설정과 호환되지 않으므로
-복구 가능한 백업으로 격리한 뒤 표준 `artifacts/` 경로에서 처음부터 다시 학습해야
-합니다.
+This document records the audit of the public checkpoint and local training pipeline as of 2026-08-05, the defects addressed by the code overhaul, and the procedure for validating a newly trained model. The most important conclusion is simple: **correcting the code does not improve existing weights**. The old tokenizer and indexed dataset are incompatible with the revised configuration. Isolate them in a recoverable backup, then train again from the beginning using the standard `artifacts/` paths.
 
-## 확인된 원인과 조치
+## Confirmed causes and corrective actions
 
-| 영역 | 확인된 문제 | 이번 조치 |
+| Area | Confirmed problem | Corrective action |
 |---|---|---|
-| 방향별 품질 | 공개 측정은 ko→ja chrF 59.81, ja→ko 49.87로 약 10점 차이인데, checkpoint 선택은 전체 평균 loss 중심이어서 약한 방향을 숨길 수 있었습니다. | label smoothing이 섞이지 않은 방향별 NLL/PPL을 집계하고 `macro_direction_nll`을 기본 선택 기준으로 사용합니다. worst-direction 지표도 기록합니다. |
-| 방향 구성 | 입력 전용 언어도 denoising target이 될 수 있었고, 양방향 그래프의 실제 학습 가능 방향을 평가·사후학습이 일관되게 보지 못했습니다. | `kj`, `kd`, `jd`를 target/denoising에서 제외하고, reverse edge 학습 여부를 batch에 명시합니다. |
-| HF 경로 | native 경로와 HF wrapper의 정규화·방향 태그·생성 기본값이 달랐습니다. | NFC와 trim, 양방향 BOS/tag, beam·길이·반복 억제·제어 토큰 억제를 동일하게 맞췄습니다. |
-| 사후학습 | TETM memory를 사용해 후보를 채점하면서 후보 생성에는 전달하지 않는 경로가 있었습니다. supervised auxiliary head도 MRT candidate/reference forward 사이에서 끊겼습니다. | sampling·scoring·validation에 같은 memory를 전달하고, reference pass에서 CoRe/BATS/evidence/parity supervision을 유지합니다. |
-| 화자 레지스터 | CoRe가 학습 중에는 정답 register embedding을 decoder에 주고 추론 중에는 예측값을 줬습니다. | 정답 register는 분류 loss에만 쓰고 decoder는 학습·추론 모두 예측 분포로 조건화합니다. |
-| 짧고 반복적인 표현 | `아!`, `으아아아`, `ㅋㅋ`, 신음처럼 정상적인 표현이 `too_short`나 `excessive_repetition`으로 제거될 수 있었습니다. | 검토된 `expressive_v1` 행에 한해 두 사유만 완화합니다. 제어 문자, 언어 mismatch, 구조 손상 같은 안전 검사는 그대로 유지합니다. |
-| MRT 보상 | 정답 자체가 반복형 감탄사이거나 원문 유지가 정답인 경우에도 repetition/copy penalty가 걸렸습니다. | reference가 뒷받침하는 반복과 복사는 벌점에서 제외합니다. |
-| 데이터 누수 | 표현 예제를 학습과 평가에 함께 넣으면 개선을 측정할 수 없습니다. | 사람이 검토한 seed를 train 18쌍과 challenge 12쌍으로 고정 분리하고 challenge만 양방향 24 case로 확장합니다. `easy_run.py`가 train shard만 자동 생성합니다. |
-| 아티팩트 재사용 | 로컬 `artifacts/`는 구형 2언어 토크나이저와 v2 dataset이지만 현재 설정은 5언어와 source-only 정책을 사용합니다. | 공개 경로는 `artifacts/`로 유지합니다. 대신 tokenizer SHA-256, 숫자 분리, 언어쌍·제어 토큰, dataset schema·원천 지문을 검사합니다. 여러 run이 이 경로를 공유할 수 있으므로 불일치 산출물을 자동 이동·덮어쓰기하지 않고 중단합니다. 운영자가 관련 checkpoint 전체를 확인한 뒤 직접 백업해야 합니다. |
+| Per-direction quality | Published measurements differed by approximately 10 chrF: 59.81 for ko→ja and 49.87 for ja→ko. Checkpoint selection used aggregate mean loss and could hide the weaker direction. | Aggregate unsmoothed NLL/PPL per direction and use `macro_direction_nll` as the default selection metric. Also record the worst-direction metric. |
+| Direction graph | Source-only languages could become denoising targets, and evaluation and post-training did not consistently use the directions that the bidirectional graph could actually train. | Exclude `kj`, `kd`, and `jd` from target/denoising use and record reverse-edge training eligibility explicitly in each batch. |
+| Hugging Face path | Native and Hugging Face paths disagreed on normalization, direction tags, and generation defaults. | Align NFC normalization and trimming, bidirectional BOS/tags, beam and length settings, repetition suppression, and control-token suppression. |
+| Post-training | One path used TETM memory to score candidates but did not provide that memory during candidate generation. Supervised auxiliary heads were also disconnected between MRT candidate and reference forwards. | Pass the same memory through sampling, scoring, and validation, and preserve CoRe, BATS, evidence, and parity supervision during the reference pass. |
+| Speaker register | During training, CoRe gave the decoder the gold register embedding, while inference used the predicted register. | Use the gold register only for classification loss. Condition the decoder on the predicted distribution in both training and inference. |
+| Short expressive text | Valid short or repetitive expressions such as “Ah!”, prolonged cries, laughter strings, and moans could be removed as `too_short` or `excessive_repetition`. | Relax only those two reasons for reviewed `expressive_v1` rows. Keep safety checks for control characters, language mismatch, and structural corruption. |
+| MRT reward | Repetition and copy penalties were applied even when the reference itself was a repeated exclamation or correctly preserved source text. | Exempt repetition and copying supported by the reference from those penalties. |
+| Data leakage | Putting expressive examples into both training and evaluation would make improvement impossible to measure. | Fix a human-reviewed split of 18 training pairs and 12 challenge pairs, then expand only the challenge set to 24 bidirectional cases. `easy_run.py` generates only the training shard. |
+| Artifact reuse | The audited local `artifacts/` contained an old two-language tokenizer and v2 dataset, while the audited training configuration used five languages and a source-only policy. | Keep `artifacts/` as the public path, but validate tokenizer SHA-256, digit splitting, language graph, control tokens, dataset schema, and source fingerprints. Because several runs may share this path, stop on mismatches rather than moving or overwriting artifacts automatically. An operator must inspect all related checkpoints before making a manual backup. |
 
-## 실제 구형 토큰 노출 감사
+Release 1.5 generalizes artifact identity to an explicit, configuration-driven BCP 47 language graph. The five-language graph above describes the 2026-08-05 audit configuration, not a hard-coded requirement for every user.
 
-전체 train shard를 다시 tokenize하지 않고 `.bin`/`.idx.npy`를 직접 스캔했습니다.
-전체 결과는
-[`legacy-token-exposure-2026-08-05.json`](audits/legacy-token-exposure-2026-08-05.json)에
-있습니다.
+## Audit of legacy token exposure
+
+The audit scanned `.bin` and `.idx.npy` files directly instead of tokenizing every training shard again. The complete report is in [`legacy-token-exposure-2026-08-05.json`](audits/legacy-token-exposure-2026-08-05.json).
 
 ```text
 physical pairs                  11,129,222
@@ -41,23 +35,14 @@ seen 1–24 times                        2,295
 median observed count                  2,503
 ```
 
-판정은 다음과 같습니다.
+The findings were:
 
-- byte fallback 비율은 ko 0.002762%, ja 0.006657%로 낮습니다. 즉 문자열을 아예
-  표현하지 못하는 coverage 문제가 주원인은 아닙니다.
-- 반면 ordinary piece의 4.8%인 2,295개는 decoder target으로 25회 미만 노출됐고
-  11개는 한 번도 target update를 받지 못했습니다. **희소·미학습 tail은 실제로
-  존재합니다.** 새 모델에서는 tokenizer 학습 직후 raw audit, dataset 생성 직후
-  indexed audit를 모두 통과시켜야 합니다.
-- ja→ko 쪽 target token 수는 오히려 ko→ja보다 약 4.8% 많습니다. 따라서 ja→ko
-  열세를 단순한 총 token 수 부족으로 설명할 수 없습니다. 방향별 데이터 품질,
-  한국어 표면형 다양성, 전역 평균 checkpoint 선택, 학습/추론 불일치가 더 직접적인
-  원인 후보입니다.
-- 구형 tokenizer는 `split_digits=false`이고 언어 태그도 `ja`, `ko`뿐입니다.
-  현재 5언어 설정에 이어 학습할 수 없으며 embedding vocabulary가 달라지므로
-  처음부터 재학습해야 합니다.
+- Byte fallback was low: 0.002762% for Korean and 0.006657% for Japanese. Complete inability to represent strings was therefore not the primary coverage problem.
+- However, 2,295 ordinary pieces, or 4.8%, appeared fewer than 25 times as decoder targets, and 11 pieces never received a target update. **A sparse or untrained vocabulary tail was real.** A newly trained model must pass both a raw audit immediately after tokenizer training and an indexed audit immediately after dataset construction.
+- The ja→ko target-token count was approximately 4.8% higher than ko→ja, so the ja→ko deficit cannot be explained by lower total token volume alone. More direct candidates include per-direction data quality, Korean surface-form diversity, global-mean checkpoint selection, and training/inference mismatch.
+- The legacy tokenizer used `split_digits=false` and contained only the `ja` and `ko` language tags. It could not continue training with the audited five-language configuration. The changed embedding vocabulary requires full retraining.
 
-재현 명령은 다음과 같습니다.
+Reproduce the legacy audit with:
 
 ```bash
 sion-audit-tokens \
@@ -68,7 +53,7 @@ sion-audit-tokens \
   --output legacy-token-audit.json
 ```
 
-새 dataset을 준비한 뒤에는 같은 공개 경로에서 새 내용 지문을 감사합니다.
+After preparing a new dataset, audit the new content fingerprint at the same public paths.
 
 ```bash
 sion-audit-tokens \
@@ -80,16 +65,11 @@ sion-audit-tokens \
   --output current-token-audit.json
 ```
 
-`--fail-rare-pieces`는 corpus와 vocab 크기에 따라 기준이 달라지므로 첫 full scan을
-기준선으로 저장한 뒤 CI 상한을 정합니다. indexed audit은 stored content token을
-정확히 세지만 sampler 재가중치, epoch 반복, BOS/EOS/언어 태그, denoising과 collator
-truncation은 포함하지 않습니다.
+The correct value for `--fail-rare-pieces` depends on corpus and vocabulary size. Save the first full scan as the baseline before setting a CI ceiling. The indexed audit counts stored content tokens exactly, but does not include sampler reweighting, repeated epochs, BOS/EOS or language tags, denoising, or collator truncation.
 
-## 욕설·신음·관용 표현 데이터 계약
+## Contract for profanity, moans, and idiomatic expressions
 
-seed schema에는 `category`, `subcategory`, `intensity`, `register`,
-`localization_strategy`, `split`이 필수입니다. 현재 세 상위 category는
-`profanity_slang`, `interjection_moan`, `idiom_culture`입니다.
+The seed schema requires `category`, `subcategory`, `intensity`, `register`, `localization_strategy`, and `split`. The three top-level categories are `profanity_slang`, `interjection_moan`, and `idiom_culture`.
 
 ```bash
 python scripts/data/build_expressive_cultural_corpus.py \
@@ -98,13 +78,9 @@ python scripts/data/build_expressive_cultural_corpus.py \
   --report reports/expressive-cultural-build.json
 ```
 
-`synthetic_expressive_cultural.jsonl`은 train-only synthetic sampling 정책을 받고,
-challenge 문장은 그 파일에 들어가지 않습니다. 18쌍은 의미와 강도를 고정하는
-회귀 anchor이지 충분한 학습량이 아닙니다. 실제 품질에는 기존 자연 대화 데이터와
-`synthetic_netspeak.jsonl` 같은 대규모 shard를 함께 사용하되, 동일 template의
-과다 복제로 숫자만 높은 모델을 만들지 않아야 합니다.
+`synthetic_expressive_cultural.jsonl` follows the training-only synthetic-sampling policy, and challenge sentences never enter that file. The 18 pairs are regression anchors that fix meaning and intensity; they are not sufficient training volume. Use existing natural dialogue and large shards such as `synthetic_netspeak.jsonl` for practical quality, but do not inflate counts through excessive copies of one template.
 
-challenge 평가는 전체 평균과 세 category를 함께 봅니다.
+Evaluate both the overall challenge average and all three categories.
 
 ```bash
 sion-translate-cases \
@@ -119,48 +95,38 @@ sion-compare \
   --system sion=comparison_outputs/sion-expressive.jsonl
 ```
 
-## 첨부 구조에서 구현한 범위
+## Scope implemented from the attached research design
 
-연구 아이디어와 현재 코드 사이의 경계를 명확히 해야 결과를 해석할 수 있습니다.
+Interpreting results requires a clear boundary between the research proposal and current code.
 
-| 첨부 아이디어 | 현재 구현 | 아직 구현하지 않은 것 |
+| Proposed idea | Current implementation | Not implemented |
 |---|---|---|
-| decoder의 evidence 재질문 | decoder stack 뒤에 별도 GQA source reread를 두고 token별 uncertainty gate로 bounded residual repair를 적용합니다. 수정 전 argmax 오류, 수정 전후 NLL gain, 무효 요청 벌점, 요청률 상한을 학습하며 생성 시 evidence K/V를 한 번만 투영합니다. | 특정 source 구간 선택, 해당 구간 재인코딩, 여러 번의 질의/응답, 출력 구간 mask 후 재생성은 없습니다. 현재 reread는 모든 source token에 대한 dense attention이라 실제 sparse compute 절약도 없습니다. |
-| semantic parity/checksum | source와 teacher-forced decoder pooled representation을 양방향 contrastive loss와 positive cosine으로 맞춥니다. batch size 1과 empty target도 유한합니다. | 생성문을 독립적으로 encode한 checksum, 관계·부정·숫자별 구조화 parity, inference syndrome에 의한 자동 repair는 없습니다. 따라서 이름 그대로 학습용 representation parity ablation입니다. |
-| adaptive budget | evidence request rate가 설정 상한을 넘을 때만 budget loss를 냅니다. 유용하지 않은 요청은 실제 NLL gain으로 추가 벌점 처리합니다. | 입력별 latent token 수, precision, encoder depth를 바꾸지는 않습니다. |
-| multi-channel latent | 기존 CoRe는 register/style, TETM은 보호 entity, BATS는 alignment 채널 역할을 분담합니다. | 채널 직교성·정보 분리 loss가 없으므로 명시적인 disentangled latent channel이라고 주장하지 않습니다. |
-| counterfactual pair | provenance/category sidecar와 challenge 분리는 후속 데이터 실험 기반을 제공합니다. | 변화 벡터를 분리하는 counterfactual encoder/loss는 아직 없습니다. 검증되지 않은 자동 반사실 쌍을 대량 생성하지 않았습니다. |
+| Decoder evidence re-query | A separate GQA source reread follows the decoder stack and applies bounded residual repair through a token-level uncertainty gate. Training tracks pre-repair argmax error, NLL gain before and after repair, penalties for invalid requests, and a request-rate ceiling. Generation projects evidence K/V once. | There is no selection and re-encoding of a source span, repeated query/response cycle, or regeneration after masking an output span. The current reread uses dense attention over every source token and therefore does not provide actual sparse-compute savings. |
+| Semantic parity/checksum | Bidirectional contrastive loss and positive cosine align pooled source and teacher-forced decoder representations. Batch size one and an empty target remain finite. | There is no independently encoded checksum of generated text, structured parity for relations, negation, or numbers, or automatic repair triggered by an inference syndrome. The feature is therefore a training-time representation-parity ablation. |
+| Adaptive budget | Budget loss is applied only when the evidence-request rate exceeds its configured ceiling. Requests without useful NLL gain receive an additional penalty. | The system does not change latent-token count, numeric precision, or encoder depth per input. |
+| Multi-channel latent representation | Existing modules divide roles: CoRe handles register/style, TETM protects entities, and BATS handles alignment. | There is no channel-orthogonality or information-separation loss, so the project does not claim an explicitly disentangled latent channel. |
+| Counterfactual pairs | Provenance/category sidecars and a separated challenge set provide a basis for later data experiments. | There is no counterfactual encoder or loss that separates change vectors. The pipeline does not mass-generate unverified automatic counterfactual pairs. |
 
-`sion_translate.yaml`에서는 evidence/parity를 기본으로 끕니다. 새 구조는 기존
-가중치에 추론 때만 켤 기능이 아니라 **처음부터 학습하고 제거 실험으로 검증할
-모듈**이기 때문입니다.
+`sion_translate.yaml` disables evidence and parity by default. These modules cannot be enabled only at inference on existing weights; they must be **trained from initialization and validated through ablation experiments**.
 
-권장 실험 순서는 다음과 같습니다.
+Recommended experiment order:
 
-1. 같은 tokenizer/data/seed로 baseline을 학습합니다.
-2. `evidence_repair_enabled: true`만 켭니다.
-3. 새 초기화로 `semantic_parity_enabled: true`만 켭니다.
-4. 각각의 이득이 재현된 경우에만 둘을 함께 켭니다.
+1. Train a baseline with the same tokenizer, data, and seed.
+2. Enable only `evidence_repair_enabled: true`.
+3. Start from a fresh initialization and enable only `semantic_parity_enabled: true`.
+4. Enable both only after each individual gain is reproduced.
 
-모든 run에서 `macro_direction_nll`, `worst_direction_nll`, ko→ja/ja→ko chrF,
-숫자·고유명사 보존, 세 expressive category, language purity, repetition/copy를
-기록합니다. evidence run은 `evidence_request_rate`, `evidence_repair_gain`, latency도
-함께 비교해야 합니다. 평균만 좋아지고 ja→ko나 특정 category가 후퇴하면 채택하지
-않습니다.
+For every run, record `macro_direction_nll`, `worst_direction_nll`, ko→ja and ja→ko chrF, number and proper-name preservation, all three expressive categories, language purity, repetition, and copying. For evidence runs, also compare `evidence_request_rate`, `evidence_repair_gain`, and latency. Do not adopt a run when the average improves but ja→ko or a specific category regresses.
 
-## 새 학습 절차
+## Retraining procedure
 
-GPU 서버에서는 다음 한 명령이 표현 seed 생성부터 새 tokenizer/dataset, SFT,
-MRT까지 연결합니다.
+On the GPU server, the following command connects expressive-seed generation, tokenizer and dataset construction, SFT, and MRT.
 
 ```bash
 python3 easy_run.py
 ```
 
-구형 `artifacts/tokenizer`, `artifacts/dataset`이 내용 검사에 실패하면 학습기는
-자동 교체하지 않고 중단합니다. 여러 run이 같은 vocabulary를 공유할 수 있으므로
-관련 checkpoint를 확인한 운영자가 두 디렉터리를 복구 가능한 별도 위치로 직접
-옮겨야 합니다. 정상 실행은 아래의 안정된 공개 경로를 사용합니다.
+If legacy `artifacts/tokenizer` or `artifacts/dataset` contents fail identity checks, training stops instead of replacing them automatically. Because multiple runs may share the vocabulary, an operator must inspect related checkpoints and manually move both directories to a separate recoverable location. A valid run uses these stable public paths:
 
 ```text
 artifacts/tokenizer/
@@ -169,7 +135,4 @@ runs/auto/pretrain/
 runs/auto/posttrain/
 ```
 
-학습 완료라는 판정은 코드 test 통과가 아니라 새 가중치의 고정 challenge 결과까지
-확인했을 때만 내립니다. 이 저장소에서 GPU 재학습을 실행하지 않은 상태라면 이번
-변경은 “품질 결함을 수정한 학습 파이프라인”이지 “품질 향상이 실측된 새 모델”은
-아닙니다.
+Passing code tests does not establish that training is complete. Completion requires fixed-challenge results from newly trained weights. Until GPU retraining has run and those measurements have been reviewed, this work is a **training pipeline with known quality defects corrected**, not a **new model with measured quality improvement**.

@@ -1,181 +1,139 @@
-# 코퍼스 결손 분야와 실데이터 확보처
+# Corpus Coverage Gaps and Real-Data Sources
 
-2026-07-31 조사. 출처 URL과 라이선스만 담고, 코퍼스 내용이나 행 단위 통계는
-`data/data.txt`(로컬 원장, 추적 대상 아님)에 있다.
+Survey date: 2026-07-31. This document records source URLs and licensing notes only. Corpus contents and row-level statistics remain in `data/data.txt`, the untracked local data ledger.
 
-## 왜 이 문서가 필요한가
+## Why this document exists
 
-배포판 진단에서 카테고리별 chrF 순위가 카테고리별 행 수 순위와 일치했다.
-방언 3,409행 → 9.89, 관용구 2,424행 → 36.69, 고객지원 4,895행 → 35.96 대
-학술 1,330,632행 → 78.36, 구조 문자열 346,352행 → 93.58. 즉 이 실패들은
-구조나 하이퍼파라미터 문제가 아니라 커버리지 문제다.
+The release diagnostic showed that category-level chrF rank closely followed category-level row-count rank. Dialect had 3,409 rows and chrF 9.89; idioms had 2,424 rows and chrF 36.69; customer support had 4,895 rows and chrF 35.96. By comparison, academic text had 1,330,632 rows and chrF 78.36, while structured strings had 346,352 rows and chrF 93.58. These failures therefore point to coverage gaps rather than only architecture or hyperparameter problems.
 
-2026-07-30~31에 규칙 기반 생성으로 방언 88,000행, 인터넷 구어 30,994행,
-정형 도메인 4,013행을 채웠다. 다만 **합성은 실데이터를 대체하지 못한다**.
-방언·구어 생성기는 표준 문장의 어미를 바꾼 것이므로 어휘와 화용은 여전히
-표준어의 것이고, 정형 도메인 생성기는 정형문만 담으므로 법률·의료의 비정형
-텍스트(판결문 서술, 진료 기록)는 여전히 비어 있다.
+From 2026-07-30 through 2026-07-31, rule-based generation added 88,000 dialect rows, 30,994 internet-colloquial rows, and 4,013 structured-domain rows. However, **synthetic data cannot replace real data**. The dialect and colloquial generators modify endings in standard-language sentences, so their vocabulary and pragmatics remain standard. The structured-domain generator contains only templates, leaving unstructured legal and medical text, such as judicial narratives and clinical notes, uncovered.
 
-아래 `[확인]`은 페이지를 직접 열어 본 것, `[검색]`은 검색 결과만 본 것이다.
-이 구분을 지우지 말 것 — 확인하지 않은 것을 확인한 것처럼 적으면 다음 사람이
-같은 조사를 다시 해야 한다.
+The `[verified]` label below means the page was opened and reviewed directly. `[search-only]` means only search results were reviewed. Do not erase this distinction. Presenting an unverified source as verified forces the next reviewer to repeat the research.
 
-## 우선순위 1 — 즉시 신청 가능하고 결손을 직접 메운다
+## Priority 1: available by application and directly addresses a gap
 
-### AIHub 71263 방송 콘텐츠 한-중, 한-일 번역 병렬 말뭉치 `[확인]`
+### AIHub 71263 Korean-Chinese and Korean-Japanese broadcast-content parallel corpus `[verified]`
 
 <https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=71263>
 
-- 한-일 **75만 쌍** (ko→ja / ja→ko 양방향 분할)
-- 분야: 교양 / 관찰예능 / 리얼버라이어티 예능
-- 형식: txt + JSON 라벨링, 분할 압축(병합에 Linux 명령 필요)
-- 조건: 로그인 + 승인, **내국인만 신청 가능**
+- **750,000 Korean-Japanese pairs**, divided into ko→ja and ja→ko directions
+- Domains: educational programming, observational entertainment, and reality/variety entertainment
+- Format: text plus JSON labels in split archives; Linux commands are required to combine the parts
+- Access: login and approval required; **applications are limited to Korean nationals**
 
-구어 chrF 30.45를 실데이터로 올릴 수 있는 가장 큰 단일 후보다. 관찰예능과
-리얼버라이어티는 기존 방송 대담 shard보다 훨씬 구어에 가깝다.
+This is the largest single candidate for improving the measured colloquial chrF score of 30.45 with real data. Observational and reality/variety programming is substantially closer to spontaneous speech than the existing broadcast-dialogue shards.
 
-**투입 시 주의**: 방송 자막 계열이므로 기존 방송·전사 shard와의 중복을
-반드시 측정할 것.
+**Ingestion caution:** because this is broadcast/subtitle data, measure overlap with existing broadcast and transcription shards before admitting it.
 
-### AIHub 71411 일상생활 및 구어체 한-중, 한-일 번역 병렬 말뭉치 `[확인]`
+### AIHub 71411 Korean-Chinese and Korean-Japanese daily-life and colloquial parallel corpus `[verified]`
 
 <https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=71411>
 
-- 전체 90,003쌍이 6개 언어쌍에 균등 분배(각 16.67%) → 한-일 약 30,000쌍
-- 문체 3종: **채팅체** / 구어체 / 문어체
-- 조건: 로그인 + 승인, 내국인만
+- 90,003 total pairs divided evenly across six language pairs at 16.67% each, yielding approximately 30,000 Korean-Japanese pairs
+- Three styles: **chat**, colloquial, and written
+- Access: login and approval required; limited to Korean nationals
 
-**채팅체가 인터넷 구어 결손을 메우는 유일한 실데이터**다. 이 register는
-현재 실데이터 0행이고 규칙 기반 합성뿐이므로, 규모는 작아도 합성이 흉내낸
-것의 정답지 역할을 한다.
+The **chat style is the only identified real-data source for the internet-colloquial gap**. At the survey date, this register had zero real rows and only rule-generated synthetic data. Although the dataset is small, it can serve as a ground-truth reference for behavior the synthetic generator attempts to imitate.
 
-## 우선순위 2 — 공개돼 있고 일괄 내려받을 수 있으나 라이선스 확인이 남았다
+## Priority 2: publicly downloadable, but licensing still requires confirmation
 
-### 일본 관광청 지역관광자원 다국어 해설문 데이터베이스 `[확인]`
+### Japan Tourism Agency multilingual regional-tourism commentary database `[verified]`
 
 <https://www.mlit.go.jp/tagengo-db/>
 
-- 5개 언어(일/영/중간/중번/한) 해설문
-- **전체 해설문 Excel 일괄 다운로드 13.8MB** 제공
+- Commentary in five languages: Japanese, English, Simplified Chinese, Traditional Chinese, and Korean
+- Provides a **13.8 MB bulk Excel download containing all commentary**
 
-관광·교통 결손을 실데이터로 메운다. 다만 두 가지를 먼저 해결해야 한다.
+This source addresses tourism and transportation coverage. Resolve both issues below before ingestion.
 
-1. 푸터가 `Japan Tourism Agency. All Rights Reserved`이고 이용조건 페이지는
-   확인하지 않았다. **투입 전 이용약관을 반드시 읽을 것.**
-2. 사이트가 "일본어판은 영어 원문의 잠정 번역"이라고 명시한다. 즉 ko-ja가
-   직접 번역이 아니라 **영어 경유**일 수 있다. 표본 검수가 필요하다.
+1. The footer says `Japan Tourism Agency. All Rights Reserved`, and the terms-of-use page was not reviewed. **Read the terms before using the data.**
+2. The site states that the Japanese edition is a provisional translation of the English original. The Korean-Japanese relation may therefore be an **English-pivoted translation** rather than a direct translation. Inspect a sample manually.
 
-### 일본 관광청 한국어 해설문 용어집 `[검색]`
+### Japan Tourism Agency Korean commentary glossary `[search-only]`
 
 - <https://www.mlit.go.jp/kankocho/jirei_shien/tagengo_kor.html>
-- <https://www.mlit.go.jp/kankocho/content/001732567.pdf> (용어집, 2026-03판)
+- <https://www.mlit.go.jp/kankocho/content/001732567.pdf> (glossary, March 2026 edition)
 
-코퍼스가 아니라 용어집이므로 glossary로 쓸 것. 다국어 대응 가이드라인에
-400개 이상 용어의 영·중·한 대역이 있다.
+This is a glossary, not a corpus, and should be used as such. The multilingual guidance contains English, Chinese, and Korean equivalents for more than 400 terms.
 
-### 한국관광공사 스마트관광도시 다국어 POI 데이터 `[검색]`
+### Korea Tourism Organization multilingual smart-tourism-city POI data `[search-only]`
 
-- <https://www.data.go.kr/data/15124972/fileData.do> (대구)
-- <https://www.data.go.kr/data/15124975/fileData.do> (울산)
+- <https://www.data.go.kr/data/15124972/fileData.do> (Daegu)
+- <https://www.data.go.kr/data/15124975/fileData.do> (Ulsan)
 
-관광지명·한줄소개·상세소개·운영시간을 한/영/일/중 4개 언어로 제공.
-공공누리 1유형(상업 이용·변형 허용)으로 표기됨 — 확인 필요.
+The files provide attraction names, short descriptions, detailed descriptions, and operating hours in Korean, English, Japanese, and Chinese. They are marked as Korea Open Government License Type 1, which permits commercial use and modification, but this still requires confirmation.
 
-규모는 도시 단위라 작다. 위 관광청 DB와 방향이 반대(한국 관광지)이므로
-둘 다 넣으면 양방향 관광 어휘가 채워진다.
+The city-level datasets are small. Their direction complements the Japan Tourism Agency database because they describe Korean destinations. Using both would strengthen tourism vocabulary in both directions.
 
-## 우선순위 3 — 존재하지만 수율이 낮거나 가공이 크다
+## Priority 3: real sources with low yield or high processing cost
 
-### 외교부 조약정보시스템 `[확인]`
+### Ministry of Foreign Affairs Treaty Information System `[verified]`
 
 <https://treatyweb.mofa.go.kr>
 
-총 2,835건. 한일 양자조약은 국문·일문 **양쪽이 정본**이다(1965년 한일기본
-조약이 "동등히 정본인 한국어 및 일본어로 작성"). 법률 문체의 진짜 실데이터다.
+The system contains 2,835 treaties. Korean-Japanese bilateral treaties have **equally authentic Korean and Japanese texts**; for example, the 1965 Treaty on Basic Relations states that it was written in Korean and Japanese, both equally authentic. This is genuine legal-domain parallel data.
 
-그러나 시스템의 병렬 보기 기능은 **국·영문**이고 국·일문 병렬 내보내기는
-없다. 엑셀 내보내기는 목록 수준이다. 한일 조약만 추리면 수백 건 규모이고
-조문 단위 정렬을 직접 해야 한다. 노력 대비 수율은 낮지만, 법률 도메인에서
-진짜 정본 대역을 얻는 사실상 유일한 경로다.
+However, the side-by-side viewer supports **Korean and English**, not Korean and Japanese, and there is no Korean-Japanese parallel export. The Excel export contains only list-level metadata. Filtering to bilateral Korean-Japanese treaties would likely yield only hundreds of documents, and article-level alignment would have to be built manually. The effort-to-yield ratio is poor, but this appears to be the only practical source of genuinely authentic legal translations in this domain.
 
-### COJADS 일본어 제방언 코퍼스 (국립국어연구소) `[확인]`
+### COJADS Corpus of Japanese Dialects, National Institute for Japanese Language and Linguistics `[verified]`
 
 <https://www2.ninjal.ac.jp/cojads/>
 
-문화청 각지방언수집긴급조사(1977~1985) 47도도부현 약 200지점, 담화 약
-2,500시간. 방언 담화와 표준어 대역이 함께 있다.
+The corpus covers the 1977–1985 Emergency Survey of Regional Dialects conducted by the Agency for Cultural Affairs: approximately 200 locations across all 47 prefectures and about 2,500 hours of discourse. Dialect speech is paired with standard Japanese equivalents.
 
-단 **일본어 단일언어**다(방언 ↔ 표준 일본어). ko-ja 병렬이 아니므로 일본어
-방언 → 표준 일본어 방향의 실데이터로만 쓸 수 있다. 현재 그 방향이 전부
-합성이므로 정답지로서 가치가 크다. 中納言 사용자 등록 + 이용 신청 필요.
+This is **monolingual Japanese** dialect↔standard data, not Korean-Japanese parallel data. It is useful only as real data for the Japanese-dialect-to-standard-Japanese direction. At the survey date, that direction was entirely synthetic, so COJADS would be valuable as a ground-truth reference. Chūnagon user registration and a separate access application are required.
 
-### OpenWHO 문서 단위 병렬 코퍼스 `[검색]`
+### OpenWHO document-level parallel corpus `[search-only]`
 
 <https://aclanthology.org/2025.wmt-1.8/>
 
-WHO e-learning 2,978문서 / 26,824문장, 20개 이상 언어.
-**한국어·일본어 포함 여부를 확인하지 못했다.** 포함된다면 의료 도메인이자
-문서 단위 문맥(현재 201자 이상이 0.26%)을 동시에 메우는 드문 자원이다.
+The corpus contains 2,978 WHO e-learning documents and 26,824 sentences in more than 20 languages. **Korean and Japanese inclusion was not confirmed.** If both are present, this would be an unusual resource that addresses both medical-domain coverage and document-level context; at the survey date, only 0.26% of examples exceeded 201 characters.
 
-## 조사해서 배제한 것
+## Sources investigated and excluded
 
-기록해 두지 않으면 다시 찾게 된다.
+Record exclusions so future work does not repeat the same search.
 
-### 일본 법령외국어역 DB `[확인]`
+### Japanese Law Translation database `[verified]`
 
 <https://www.japaneselawtranslation.go.jp/>
 
-800개 이상 법령을 공개하지만 **영어 번역만** 있다. 한국어 없음. 대역사전
-다운로드도 일-영이다. 법률 ko-ja에는 쓸 수 없다.
+The database publishes more than 800 laws, but translations are **English only**. It has no Korean translations, and its downloadable bilingual dictionary is Japanese-English. It cannot provide legal Korean-Japanese pairs.
 
-### 대한민국 영문법령 / 국가법령정보센터 `[확인]`
+### Korean statutory translations and the Korean Law Information Center `[verified]`
 
 <https://elaw.klri.re.kr/>
 
-마찬가지로 **국-영문만** 제공한다. 일본어 번역 공개분이 없다.
+These services likewise provide **Korean-English only** and do not publish Japanese translations.
 
-즉 **양국 정부 모두 법령을 영어로만 번역한다.** 법령 조문에서 ko-ja 직접
-대역을 얻을 방법이 없다. 영어 경유 피벗은 서로 다른 법을 번역한 것이라
-문장 정렬이 성립하지 않는다. 법률 결손은 조약 외에 실데이터가 없다.
+In other words, **both governments translate legislation only into English**. There is no known path to direct Korean-Japanese parallel statutes. Pivoting through English does not solve the problem because the two sides translate different laws, so sentence alignment is not valid. Outside treaties, no real legal-domain source was identified.
 
-### Tatoeba `[검색]`
+### Tatoeba `[search-only]`
 
-라이선스(CC BY / CC0)는 깨끗하지만 기존 원장이 이미 "번역마이닝 잡음과
-중복"으로 제외 결정을 내렸다. 재검토하려면 ko-ja 부분만 따로 품질 표본을
-봐야 한다.
+The licensing is clear (CC BY or CC0), but the local ledger already records an exclusion decision because of translation-mining noise and duplicates. Any reconsideration should begin with a separate quality sample of the Korean-Japanese subset.
 
-## 여전히 확보처를 못 찾은 결손
+## Gaps with no identified source
 
-- **전자상거래**(상품설명·리뷰·배송 안내): 공개 ko-ja 병렬이 없다. 상품
-  데이터는 플랫폼 소유이고 크롤링은 이용약관 위반이다.
-- **행정 민원**: 지자체 다국어 안내가 산재하나 병렬로 정렬돼 배포되지 않는다.
-- **IT 기술문서**: 오픈소스 프로젝트의 ko/ja 번역 파일을 동일 리소스 키로
-  조인하는 것이 유일한 경로다. 이 방법은 기존 Firefox/VS Code 현지화 shard로
-  이미 검증됐으므로 확장이 현실적이다. 후보: KDE, Django, Kubernetes 문서.
-  (GNOME은 과거 품질 문제로 제외한 이력이 있으니 재검토 시 표본을 먼저 볼 것.)
-- **제3언어(ko-ja 외)**: 범용 번역이 목표인데 0행이다. AIHub 한-영/한-중
-  말뭉치(dataSetSn 124/125/128/129, 각 130~150만 쌍)가 즉시 확보 가능하지만,
-  현재 토크나이저가 ko-ja 전용이므로 언어쌍 추가는 재학습 설계 자체를 바꾸는
-  결정이다. 별도 판단이 필요하다.
+- **E-commerce** (product descriptions, reviews, and shipping notices): no public Korean-Japanese parallel corpus was found. Product data is platform-owned, and scraping would violate terms of service.
+- **Administrative civil-service requests:** multilingual local-government guidance is scattered across sites and is not distributed in aligned parallel form.
+- **IT technical documentation:** the only practical route is joining Korean and Japanese localization files from open-source projects by identical resource key. This method has already been validated with the Firefox and VS Code localization shards. Candidates include KDE, Django, and Kubernetes documentation. GNOME was previously excluded for quality reasons, so inspect a sample before reconsidering it.
+- **Additional languages outside Korean-Japanese:** the stated goal is general translation, but the survey snapshot had zero rows outside Korean-Japanese. AIHub Korean-English and Korean-Chinese corpora (dataSetSn 124, 125, 128, and 129; 1.3–1.5 million pairs each) were available immediately. At that time, however, the tokenizer was Korean-Japanese-specific, so adding language pairs required a redesign and full retraining rather than a simple data append. The current release 1.5 software contract supports configuration-driven language graphs, but every new graph still requires a newly trained compatible tokenizer, dataset, and model.
 
-## 투입 순서 권고
+## Recommended acquisition order
 
-1. AIHub 71263(75만) + 71411(3만) 신청. 둘 다 승인제이므로 먼저 신청해 두고
-   심사 기간에 나머지를 진행한다.
-2. 관광청 다국어 DB 이용약관 확인 후 Excel 파싱. 영어 경유 여부 표본 검수.
-3. COJADS 신청.
-4. OpenWHO의 ko/ja 포함 여부 확인.
-5. 조약 국·일문 정본은 수작업 규모를 먼저 산정한 뒤 결정.
+1. Apply for AIHub 71263 (750,000 pairs) and 71411 (approximately 30,000 pairs). Both require approval, so apply first and work on the remaining sources during review.
+2. Review the Tourism Agency database terms, then parse the Excel file and inspect whether samples are English-pivoted.
+3. Apply for COJADS access.
+4. Confirm whether OpenWHO contains both Korean and Japanese.
+5. Estimate the manual effort for authentic Korean-Japanese treaty alignment before committing to it.
 
-## 투입 시 게이트
+## Ingestion gates
 
-새 데이터는 예외 없이 기존 게이트를 통과시킨다.
+Every new dataset must pass the existing gates without exception.
 
-```
-scripts/data/audit_generated_shards.py      # 템플릿 붕괴·홀드아웃 유출
-sion-check-preservation                     # 숫자·부호·단위·문자체계
-scripts/data/screen_protected_content.py    # 미성년 스크리닝
+```text
+scripts/data/audit_generated_shards.py      # Template collapse and holdout leakage
+sion-check-preservation                     # Numbers, signs, units, and writing systems
+scripts/data/screen_protected_content.py    # Minor-content screening
 ```
 
-정렬이 의심스러운 출처는 `scripts/data/recover_shard.py`의 prepare 단계를
-먼저 통과시켜 플레이스홀더 구멍과 분절 공백을 제거할 것.
+For sources with questionable alignment, first run the preparation stage in `scripts/data/recover_shard.py` to remove placeholder gaps and segmentation whitespace.

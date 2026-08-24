@@ -1,37 +1,31 @@
-# 번역 시스템 비교 가이드
+# Translation System Comparison Guide
 
-이 문서는 특정 시스템이 항상 더 낫다고 단정하지 않고, 같은 입력과 같은 기준으로
-재현 가능한 비교를 만드는 방법을 설명합니다. 서비스 출력은 호출 시점, 제품 버전,
-요금제와 옵션에 따라 바뀔 수 있으므로 결과 JSONL에는 생성 날짜와 설정을 별도 메모로
-남기는 편이 좋습니다.
+This document explains how to build a reproducible comparison using the same inputs and evaluation criteria. It does not assume that one system is always better than every other system. Service output can change with the request date, product version, subscription plan, and enabled options, so record the generation date and complete settings alongside each result JSONL file.
 
-## 비교 대상별 관점
+## What to examine for each system
 
-| 시스템 | 확인할 강점 | 주의할 점 |
+| System | Strengths to examine | Important cautions |
 |---|---|---|
-| sion_translate | 한↔일 전용, 완전 로컬 실행, 코드·생성 옵션 통제, slot 기반 용어 강제 | 작은 전용 모델의 일반화 한계, custom PyTorch loader 필요, 공개 점수만으로 프로덕션 품질을 보장할 수 없음 |
-| [LibreTranslate](https://docs.libretranslate.com/) | 오픈 소스 API, self-host 가능, 외부 전송 없이 운영 가능 | 설치된 언어 모델에 따라 지원 범위가 달라지고 직접 언어쌍이 없으면 보통 영어를 경유하므로 `/languages` 결과를 기록해야 함 |
-| [Papago](https://api.ncloud-docs.com/docs/en/ai-naver-papagowebsitetranslation-translation) | 공식 API가 한국어↔일본어 방향을 명시적으로 지원 | 폐쇄형 클라우드 서비스이므로 모델 버전 고정이 어렵고 인증·요금·이용약관 확인 필요 |
-| [Google Cloud Translation](https://cloud.google.com/translate/docs) | 폭넓은 언어 지원, glossary와 adaptive translation 같은 옵션 | 클라우드 인증·비용이 필요하고 Basic/Advanced 및 적응형 설정을 섞으면 공정 비교가 아님 |
-| [DeepL](https://developers.deepl.com/docs) | 문맥(`context`), glossary, 언어별 style rule 등 번역 제어 기능 | 기능 지원 범위가 언어·API 버전에 따라 다르고 인증·비용이 필요함 |
-| [M2M100 418M](https://huggingface.co/facebook/m2m100_418M) | 100개 언어 사이 직접 번역, 로컬 재현, 버전 고정 가능 | 418M 가중치의 메모리·지연 비용, 오래된 범용 checkpoint, upstream 조건을 별도로 확인해야 함 |
-| [NLLB-200 distilled 600M](https://huggingface.co/facebook/nllb-200-distilled-600M) | 매우 넓은 언어 범위, 로컬 재현, 저자원 언어 연구 baseline | CC-BY-NC 4.0, 모델 카드가 연구용·비프로덕션을 명시, 512토큰을 넘는 입력에서 품질 저하 가능 |
+| sion_translate | Specialized Korean↔Japanese translation, fully local execution, control over code and generation settings, and slot-based terminology enforcement | A small specialized model has limited generalization, requires a custom PyTorch loader, and public scores alone cannot establish production quality |
+| [LibreTranslate](https://docs.libretranslate.com/) | Open-source API, self-hosting, and operation without sending text to an external provider | Language coverage depends on the installed models. Translation usually pivots through English when no direct pair exists, so record the `/languages` response |
+| [Papago](https://api.ncloud-docs.com/docs/en/ai-naver-papagowebsitetranslation-translation) | The official API explicitly supports both Korean-to-Japanese and Japanese-to-Korean translation | It is a closed cloud service, so pinning a model version may be impossible. Authentication, pricing, and terms of use also require review |
+| [Google Cloud Translation](https://cloud.google.com/translate/docs) | Broad language coverage and options such as glossaries and adaptive translation | Cloud credentials and usage fees are required. Mixing Basic, Advanced, or adaptive settings would make the comparison unfair |
+| [DeepL](https://developers.deepl.com/docs) | Translation controls such as `context`, glossaries, and language-specific style rules | Feature availability varies by language and API version. Authentication and usage fees are required |
+| [M2M100 418M](https://huggingface.co/facebook/m2m100_418M) | Direct translation among 100 languages, reproducible local execution, and a pinnable model revision | The 418M checkpoint has memory and latency costs, is an older general-purpose checkpoint, and requires a separate review of upstream terms |
+| [NLLB-200 distilled 600M](https://huggingface.co/facebook/nllb-200-distilled-600M) | Very broad language coverage, reproducible local execution, and usefulness as a low-resource research baseline | CC-BY-NC 4.0 licensing, an explicit research/non-production limitation in the model card, and possible quality degradation beyond 512 tokens |
 
-표의 강점은 품질 우승을 뜻하지 않습니다. 각 시스템이 제공하는 배포·제어 특성을
-뜻하며, 실제 품질은 동일한 JSONL 결과로 확인해야 합니다.
+The strengths in this table are deployment and control characteristics, not claims that a system wins on translation quality. Measure actual quality from the same JSONL inputs and outputs.
 
-## 두 개의 진단셋
+## Two diagnostic sets
 
-| 파일 | 문장 | 목적 |
+| File | Sentences | Purpose |
 |---|---:|---|
-| `examples/comparison_cases.jsonl` | 16 | 언어 현상 중심. 존댓말, 동음이의어, 숫자, 기술 문자열, 구어체, 장문 의존성, 고유명사, 관용 표현 |
-| `examples/diagnostic_cases.jsonl` | 40 | 도메인 중심. 위 항목에 의료, 법률, 행정, 관광, 학술, 부정 표현을 추가하고 고유명사·숫자 케이스를 늘림 |
+| `examples/comparison_cases.jsonl` | 16 | Language-focused cases covering honorifics, homonyms, numbers, technical strings, colloquial speech, long-range dependencies, proper nouns, and idioms |
+| `examples/diagnostic_cases.jsonl` | 40 | Domain-focused cases that add medical, legal, administrative, tourism, academic, and negation examples, with additional proper-noun and number cases |
 
-둘 다 이 프로젝트용으로 새로 작성한 합성 문장이며 어떤 학습 코퍼스에도 포함되지
-않습니다. 40문장 쪽은 학습 데이터에 없는 도메인에서 품질이 어떻게 떨어지는지 보려고
-만들었으므로, in-domain holdout 점수와 함께 보면 일반화 격차를 가늠할 수 있습니다.
+Both sets contain synthetic sentences written specifically for this project and are not included in any training corpus. The 40-sentence set was designed to expose degradation in domains absent from training data. Compare it with in-domain holdout scores to estimate the generalization gap.
 
-두 파일 모두 스키마가 같으므로 `--cases` 를 바꿔 끼우면 됩니다.
+Both files use the same schema, so switch between them with `--cases`.
 
 ```bash
 sion-translate-cases --backend sion \
@@ -41,33 +35,29 @@ sion-translate-cases --backend sion \
   --output comparison_outputs/sion-diagnostic.jsonl
 ```
 
-40문장도 순위를 정하기에는 작습니다. 카테고리별로 2~4문장이므로 시스템 간 총점 차이
-보다 **어느 카테고리에서 무엇이 틀렸는지**를 보는 데 쓰십시오.
+Forty sentences are still too few to establish a ranking. Each category contains only two to four sentences, so use the set to identify what fails in each category instead of relying on the aggregate score difference between systems.
 
-## 공정한 실행 규칙
+## Rules for a fair run
 
-1. `examples/comparison_cases.jsonl`을 수정했다면 모든 시스템을 다시 실행합니다.
-2. 원문 언어와 목표 언어를 명시하고 자동 언어 감지는 끕니다.
-3. 문장별 번역을 사용하고, 어떤 시스템만 추가 문맥이나 glossary를 받지 않게 합니다.
-4. beam 수, 모델 revision, API 제품명, 호출 날짜를 함께 기록합니다.
-5. 실패한 문장도 삭제하지 말고 오류로 기록한 뒤 같은 조건으로 재시도합니다.
-6. API 키, 응답 헤더, 계정 정보는 JSONL에 넣지 않습니다.
+1. If `examples/comparison_cases.jsonl` changes, rerun every system.
+2. Specify the source and target languages and disable automatic language detection.
+3. Translate sentence by sentence, and do not give context or a glossary to only one system.
+4. Record the beam count, model revision, API product name, and request date.
+5. Do not delete failed sentences. Record the error and retry under the same conditions.
+6. Never write API keys, response headers, or account information into the JSONL output.
 
-## 사람이 볼 항목
+## Human-review criteria
 
-- 의미 누락·추가와 부정 표현 반전
-- 존댓말과 화자 관계
-- 동음이의어의 문맥 해소
-- 숫자, 통화, 날짜, 파일명, HTTP 상태 코드 보존
-- 고유명사 음역과 문서 전체 일관성
-- 일본어 조사·한국어 조사, 어순과 자연스러움
-- 장문에서 주어·조건절·인과 관계 유지
+- Missing or added meaning, including reversed negation
+- Honorific level and the relationship between speakers
+- Contextual resolution of homonyms
+- Preservation of numbers, currency, dates, filenames, and HTTP status codes
+- Transliteration and document-wide consistency of proper nouns
+- Japanese and Korean particles, word order, and naturalness
+- Preservation of subjects, conditional clauses, and causal relationships in long inputs
 
-chrF/BLEU가 높아도 정답 표현과 다른 올바른 번역이 낮게 채점될 수 있습니다. 반대로
-표면이 비슷해도 숫자나 부정이 틀릴 수 있으므로 문장별 표를 반드시 같이 검토합니다.
+chrF or BLEU can score a valid translation poorly when it differs from the reference wording. Conversely, a superficially similar output can contain incorrect numbers or negation. Always review the sentence-level table together with aggregate metrics.
 
-## 라이선스와 데이터 경계
+## Licensing and data boundaries
 
-비교 코드는 MIT이지만 각 서비스, 모델, 입력 문장과 생성 출력의 조건은 별개입니다.
-제3자 benchmark나 API 출력을 공개 커밋하기 전에는 재배포 가능 여부를 확인하세요.
-이 저장소는 `benchmarks/`, `comparison_outputs/`, `reports/`를 기본적으로 무시합니다.
+The comparison code is MIT-licensed, but each service, model, input sentence, and generated output has separate terms. Confirm redistribution rights before committing any third-party benchmark or API output publicly. This repository ignores `benchmarks/`, `comparison_outputs/`, and `reports/` by default.
