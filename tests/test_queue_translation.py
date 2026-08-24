@@ -1460,6 +1460,7 @@ def test_queue_resume_rejects_missing_committed_shard(tmp_path: Path) -> None:
 
 def test_legacy_manifest_signature_and_shards_migrate_on_resume(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = tmp_path / "queue.jsonl"
     results = tmp_path / "results"
@@ -1546,6 +1547,26 @@ def test_legacy_manifest_signature_and_shards_migrate_on_resume(
     )
     stat = source.stat()
     os.utime(source, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+
+    original_unlink = queue_translation_module._durable_unlink
+
+    def interrupt_legacy_removal(path: Path, *, missing_ok: bool = False) -> None:
+        if Path(path).resolve() == legacy_accepted_path.resolve():
+            raise OSError("simulated crash before legacy public removal")
+        original_unlink(Path(path), missing_ok=missing_ok)
+
+    monkeypatch.setattr(queue_translation_module, "_durable_unlink", interrupt_legacy_removal)
+    with pytest.raises(OSError, match="simulated crash"):
+        translate_queue(
+            source,
+            results,
+            translator,
+            accepted_dir=accepted,
+            options=_options(),
+            run_metadata=legacy_metadata,
+            max_rows=1,
+        )
+    monkeypatch.setattr(queue_translation_module, "_durable_unlink", original_unlink)
 
     migrated_partial = translate_queue(
         source,
@@ -3062,8 +3083,57 @@ def test_manifest_integer_controls_reject_bool_and_non_int_values(
 def test_unicode_script_policy_counts_letters_not_shared_marks() -> None:
     assert script_letter_count("ーー・・", "kana") == 0
     assert script_letter_count("বাংলা ১২৩।", "bengali") == 2
-    with pytest.raises(ValueError, match="too generic"):
-        script_letter_count("letters", "letter")
+    assert script_letter_count("𐌀", "old_italic") == 1
+    for generic_name in ("letter", "syllable", "ideograph"):
+        with pytest.raises(ValueError, match="too generic"):
+            script_letter_count("한글", generic_name)
+
+
+@pytest.mark.parametrize(
+    ("row_id", "error"),
+    [
+        ("x" * (queue_translation_module.MAX_QUEUE_ID_UTF8_BYTES + 1), "4096-byte"),
+        ("\ud800", "invalid Unicode scalar"),
+    ],
+)
+def test_invalid_queue_ids_do_not_enter_the_sqlite_index_or_result_ledger(
+    tmp_path: Path,
+    row_id: str,
+    error: str,
+) -> None:
+    source = tmp_path / "queue.jsonl"
+    source.write_bytes(
+        (
+            json.dumps(
+                {
+                    "id": row_id,
+                    "source_lang": "ko",
+                    "target_lang": "ja",
+                    "source": "정상 문장입니다.",
+                    "translation": None,
+                    "status": "pending",
+                }
+            )
+            + "\n"
+        ).encode("utf-8")
+    )
+    translator = FakeTranslator()
+
+    completed = translate_queue(
+        source,
+        tmp_path / "results",
+        translator,
+        accepted_dir=tmp_path / "accepted",
+        options=_options(),
+    )
+
+    index_path = Path(completed["configuration"]["source_index"]["path"])
+    with sqlite3.connect(index_path) as database:
+        assert database.execute("SELECT COUNT(*) FROM queue_ids").fetchone() == (0,)
+    result = json.loads((tmp_path / "results" / "part-000000.jsonl").read_text("utf-8"))
+    assert result["id"] is None
+    assert error in result["error"]
+    assert translator.calls == []
 
 
 def test_queue_accepts_an_explicit_unicode_name_script_for_an_arbitrary_language(

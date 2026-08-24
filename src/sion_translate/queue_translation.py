@@ -58,6 +58,9 @@ PRIVATE_ACCEPTED_DIRNAME = ".queue-runs"
 SOURCE_SNAPSHOT_FILENAME = ".queue-source.snapshot.jsonl"
 SOURCE_INDEX_FILENAME = ".queue-source.index.sqlite3"
 LEGACY_PUBLIC_MARKER = "verified-legacy-public-parts-v1"
+# Keep a single adversarial identifier from dominating the disk-backed index or
+# being copied into every diagnostic and result artifact.
+MAX_QUEUE_ID_UTF8_BYTES = 4 * 1024
 PIPELINE_VERSION = 3
 SIGNATURE_VERSION = 2
 RUN_LOCK_FILENAME = ".queue-translation.lock"
@@ -2466,6 +2469,18 @@ def _parse_queue_line(raw: bytes, source_index: int) -> tuple[dict[str, Any], bo
     if not isinstance(row_id, str) or not row_id:
         return _error_result(source_index, "invalid_record: missing id"), False
     try:
+        row_id_size = len(row_id.encode("utf-8"))
+    except UnicodeEncodeError:
+        return _error_result(
+            source_index,
+            "invalid_record: id contains an invalid Unicode scalar value",
+        ), False
+    if row_id_size > MAX_QUEUE_ID_UTF8_BYTES:
+        return _error_result(
+            source_index,
+            "invalid_record: id exceeds the 4096-byte UTF-8 limit",
+        ), False
+    try:
         source_language = canonicalize_language_tag(
             raw_source_language,
             field="queue source_lang",
@@ -3300,13 +3315,11 @@ def _validate_or_register_parts(
             )
             if accepted_path.is_file():
                 accepted_artifact = _jsonl_artifact(accepted_path)
-                if legacy_public_artifact is not None and any(
-                    accepted_artifact[field] != legacy_public_artifact[field]
-                    for field in ("size", "rows", "sha256")
-                ):
-                    raise ValueError(
-                        f"legacy accepted part {part_index:06d} differs from its private recovery"
-                    )
+                # A previous migration attempt may have normalized the private
+                # copy and crashed before removing the legacy public source.
+                # Semantic replay below authenticates the private copy against
+                # the immutable queue and model; byte equality with the older
+                # row shape is neither expected nor required for safe recovery.
             elif legacy_public_artifact is not None:
                 accepted_artifact = _copy_plain_file_no_replace(
                     legacy_public_path,

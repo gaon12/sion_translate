@@ -119,15 +119,24 @@ _SCRIPT_POLICY_NAME = re.compile(r"^[a-z][a-z0-9_-]{1,31}$")
 _UNSAFE_GENERIC_SCRIPT_NAMES = frozenset(
     {
         "alpha",
+        "capital",
         "character",
+        "consonant",
         "digit",
+        "ideograph",
         "letter",
+        "ligature",
+        "linear",
         "mark",
         "number",
+        "old",
         "sign",
         "small",
-        "capital",
+        "syllable",
         "symbol",
+        "unified",
+        "vowel",
+        "word",
     }
 )
 
@@ -152,8 +161,7 @@ def canonicalize_script_policy_name(value: object) -> str:
         raise ValueError(
             "script policy names must contain 2-32 lowercase ASCII letters, digits, or underscores"
         )
-    words = frozenset(normalized.split("_"))
-    if words & _UNSAFE_GENERIC_SCRIPT_NAMES:
+    if normalized in _UNSAFE_GENERIC_SCRIPT_NAMES:
         raise ValueError(f"script policy name is too generic to be safe: {value!r}")
     return normalized
 
@@ -176,7 +184,10 @@ def script_letter_count(text: str, script: str) -> int:
             total += 1
             continue
         unicode_name = unicodedata.name(character, "")
-        if name_words and all(word in unicode_name for word in name_words):
+        name_prefix = " ".join(name_words)
+        if name_prefix and (
+            unicode_name == name_prefix or unicode_name.startswith(f"{name_prefix} ")
+        ):
             total += 1
     return total
 
