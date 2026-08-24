@@ -1,4 +1,4 @@
-"""설정 검증 로직 확인."""
+"""Tests for configuration validation."""
 
 from __future__ import annotations
 
@@ -99,7 +99,7 @@ def test_config_from_raw_remains_permissive_for_direct_callers() -> None:
 
 
 def test_warns_when_bats_is_enabled_without_any_loss_weight() -> None:
-    # 순전파 비용과 파라미터만 늘고 학습 신호는 없는 조합이다.
+    # This combination adds forward-pass cost and parameters without a training signal.
     messages = _warnings_from(
         ExperimentalConfig(bats_enabled=True, bats_loss_weight=0.0, bats_coverage_weight=0.0)
     )
@@ -116,7 +116,7 @@ def test_no_bats_warning_when_either_weight_is_set(weights: dict[str, float]) ->
 
 
 def test_no_bats_warning_when_module_is_disabled() -> None:
-    # 꺼져 있으면 가중치가 0인 것이 정상이다.
+    # Zero weights are expected when the module is disabled.
     assert _warnings_from(ExperimentalConfig(bats_enabled=False)) == []
 
 
@@ -651,12 +651,13 @@ def test_final_export_formats_are_validated(
 
 
 def test_runnable_presets_do_not_outrun_the_corpus() -> None:
-    """`configs/` 최상위는 현재 데이터로 실제 학습할 수 있는 것만 둔다.
+    """Keep only presets that the current data can train at the top of ``configs/``.
 
-    측정: data/*.jsonl 8,978,338 레코드 = 한 번 통과에 약 0.357B 토큰.
-    32B preset 은 Chinchilla 기준의 1,790배가 부족했고, 그런 설정이 실행
-    가능한 목록에 섞여 있으면 다음 사람이 그것을 고릅니다. 용량이 데이터를
-    앞지르는 preset 은 `configs/aspirational/` 로 격리합니다.
+    A measured pass over 8,978,338 ``data/*.jsonl`` records contains about 0.357
+    billion tokens. A 32-billion-parameter preset was short of the Chinchilla
+    target by a factor of 1,790. If such a preset appears runnable, the next
+    operator may select it. Presets whose capacity exceeds the data therefore
+    belong under ``configs/aspirational/``.
     """
     config_root = Path(__file__).resolve().parents[1] / "configs"
     runnable = sorted(path.name for path in config_root.glob("*.yaml"))
@@ -665,11 +666,12 @@ def test_runnable_presets_do_not_outrun_the_corpus() -> None:
 
 
 def test_runnable_presets_use_the_documented_deep_encoder_shape() -> None:
-    """깊은 encoder / 얕은 decoder.
+    """Runnable presets use a deep encoder and a shallow decoder.
 
-    ``SionForConditionalGeneration`` docstring 의 설계이자, 자기회귀 디코딩이
-    가중치 대역폭 바운드라는 측정의 직접적 함의입니다 — decoder 층 수가 곧
-    토큰당 지연입니다. debug.yaml 은 smoke 용이라 제외합니다.
+    This is the design documented by ``SionForConditionalGeneration`` and the
+    direct consequence of measuring autoregressive decoding as weight-bandwidth
+    bound: each decoder layer adds per-token latency. ``debug.yaml`` is excluded
+    because it is only a smoke-test configuration.
     """
     config_root = Path(__file__).resolve().parents[1] / "configs"
     for path in sorted(config_root.glob("sion_*.yaml")):
@@ -698,7 +700,7 @@ def test_foundation_defaults_point_at_the_documented_layout() -> None:
     assert foundation.enabled is True
     assert foundation.corpus_dir == "data/corpus"
     assert foundation.dataset_dir == "artifacts/foundation_dataset"
-    # 병렬 데이터셋과 절대 같은 경로여서는 안 된다: record 규격도 split 규칙도 다르다.
+    # This must differ from the parallel dataset path: record and split formats differ.
     assert foundation.dataset_dir != AppConfig().data.dataset_dir
     assert foundation.tokenizer_sample_ratio == 0.4
     root_config = Path(__file__).resolve().parents[1] / "sion_translate.yaml"
@@ -706,7 +708,7 @@ def test_foundation_defaults_point_at_the_documented_layout() -> None:
 
 
 def test_the_two_stages_publish_under_different_names() -> None:
-    """foundation 산출물은 번역 모델이 아니라 그 파운데이션이다."""
+    """The foundation artifact is the translation model's base, not the model itself."""
     from sion_translate.artifacts import FOUNDATION_RELEASE_NAME, TRANSLATION_RELEASE_NAME
 
     assert FOUNDATION_RELEASE_NAME == "sion"
@@ -731,7 +733,7 @@ def test_foundation_release_name_must_be_normalized_ascii(release_name: str) -> 
 
 
 def test_foundation_languages_drop_the_source_only_varieties() -> None:
-    """단일어 복원은 그 언어를 디코더 출력으로 만드는 학습이다."""
+    """Monolingual reconstruction teaches the decoder to emit that language."""
     config = AppConfig()
     config.data.language_pairs = [
         ["kj", "ko"],

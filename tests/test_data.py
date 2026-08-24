@@ -189,7 +189,7 @@ def test_legacy_unidirectional_runtime_does_not_require_current_forward_flags(
 
 
 def test_tokenizer_prepare_dataset_and_collate(tmp_path: Path) -> None:
-    # FLORES 원천으로 쓰는 실제 파일명도 특별 취급 없이 일반 세 분할을 따른다.
+    # A filename used by the real FLORES source follows the normal three-way split.
     source = tmp_path / "data22.jsonl"
     write_tiny_jsonl(source)
     tokenizer_dir = tmp_path / "tokenizer"

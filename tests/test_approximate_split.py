@@ -24,10 +24,11 @@ from sion_translate.splitting import (
 
 
 def test_comparison_key_drops_punctuation_where_the_split_key_keeps_it() -> None:
-    """두 키는 서로 다른 질문에 답한다.
+    """The two keys answer different questions.
 
-    dedup 은 "이 두 행이 같은 행인가" 이고 구두점은 유효한 차이입니다.
-    누출 감사는 "이 문장이 이미 코퍼스에 있는가" 이고 거기서는 아닙니다.
+    Deduplication asks whether two rows are the same, where punctuation is a
+    meaningful difference. Leakage auditing asks whether a sentence is already
+    in the corpus, where punctuation alone is not a meaningful difference.
     """
 
     assert normalized_split_key("김칫국부터 마시지 마.") != normalized_split_key(
@@ -37,20 +38,21 @@ def test_comparison_key_drops_punctuation_where_the_split_key_keeps_it() -> None
 
 
 def test_comparison_key_drops_by_category_not_by_a_listed_alphabet() -> None:
-    """목록에 없는 기호가 비교를 조용히 무력화하면 안 된다."""
+    """An unlisted symbol must not silently disable a comparison."""
 
     plain = comparison_key("최고")
     for decorated in ("최고!", "「최고」", "최고～", "최고 ✨", "최고\u200b"):
         assert comparison_key(decorated) == plain, decorated
 
-    # 글자·숫자는 살아남는다. 지우면 서로 다른 문장이 같아진다.
+    # Letters and numbers survive because removing them would merge different sentences.
     assert comparison_key("가격은 1,000원") == "가격은1000원"
     assert comparison_key("ＡＢＣ") == "ABC"
 
-    # 자모 웃음은 기호가 아니라 글자다. 이것이 지워지면 `ㅋㅋㅋ` 하나로
-    # 이루어진 감탄사 challenge 가 빈 문자열이 되어 아무 행에나 일치한다.
-    # NFKC 가 호환 자모를 결합 자모로 접으므로 표기는 바뀌지만, 코퍼스와
-    # holdout 이 같은 변환을 거치므로 비교는 성립한다.
+    # Korean jamo laughter is made of letters, not symbols. Removing those
+    # letters would reduce an interjection containing only `ㅋㅋㅋ` to an empty
+    # string that matches every row. NFKC folds compatibility jamo into combining
+    # jamo, so their representation changes, but corpus and holdout text receive
+    # the same transformation and remain comparable.
     assert len(comparison_key("ㅋㅋㅋ")) == 3
     assert comparison_key("ㅋㅋㅋ!") == comparison_key("ㅋㅋㅋ")
     assert comparison_key("ㅠㅠ") == comparison_key("ㅠㅠ…")
