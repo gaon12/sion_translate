@@ -1,4 +1,4 @@
-"""JSONL 기반 다중 번역 시스템 비교 검증."""
+"""Validate JSONL comparisons across multiple translation systems."""
 
 from __future__ import annotations
 
@@ -39,7 +39,7 @@ def _write_jsonl(path: Path, rows: list[dict[str, str]]) -> None:
 
 @pytest.mark.parametrize("path", SHIPPED_CASE_FILES, ids=lambda path: path.name)
 def test_shipped_case_files_load_and_stay_balanced(path: Path) -> None:
-    """저장소가 제공하는 진단셋이 스키마를 지키고 방향이 균형인지 확인한다."""
+    """Require the bundled diagnostic set to be valid and direction-balanced."""
     cases = load_comparison_cases(path)
     assert len(cases) >= 16
 
@@ -48,11 +48,11 @@ def test_shipped_case_files_load_and_stay_balanced(path: Path) -> None:
         directions[f"{case.source_language}-{case.target_language}"] = (
             directions.get(f"{case.source_language}-{case.target_language}", 0) + 1
         )
-    # 한 방향으로 치우치면 방향별 점수를 비교할 수 없다.
+    # Direction-level scores are not comparable when the set favors one edge.
     assert set(directions) == {"ko-ja", "ja-ko"}
     assert directions["ko-ja"] == directions["ja-ko"]
 
-    # 모든 케이스에 카테고리가 있어야 카테고리별 진단이 가능하다.
+    # Every case needs a category for category-level diagnostics.
     assert all(case.category != "general" for case in cases)
 
 
@@ -100,7 +100,7 @@ def test_missing_or_duplicate_output_is_rejected(tmp_path: Path) -> None:
     cases = _cases(tmp_path / "cases.jsonl")
     missing = tmp_path / "missing.jsonl"
     _write_jsonl(missing, [{"id": "forward", "translation": "こんにちは"}])
-    with pytest.raises(ValueError, match="번역이 없는 id"):
+    with pytest.raises(ValueError, match="IDs have no translation"):
         load_system_translations(missing, cases)
 
     duplicate = tmp_path / "duplicate.jsonl"
@@ -111,7 +111,7 @@ def test_missing_or_duplicate_output_is_rejected(tmp_path: Path) -> None:
             {"id": "forward", "translation": "こんにちは"},
         ],
     )
-    with pytest.raises(ValueError, match="중복 id"):
+    with pytest.raises(ValueError, match="duplicate id"):
         load_system_translations(duplicate, cases)
 
 
@@ -265,7 +265,7 @@ def test_comparison_languages_are_canonicalized_and_alias_self_pairs_rejected(
             }
         ],
     )
-    with pytest.raises(ValueError, match="언어가 같습니다"):
+    with pytest.raises(ValueError, match="source and target languages are equal"):
         load_comparison_cases(self_pair_path)
 
 
@@ -306,7 +306,7 @@ def test_comparison_direction_labels_do_not_collide_for_private_use_tags(
 
 def test_compare_cli_system_specs_strip_labels_and_casefold_identity() -> None:
     assert parse_system_specs([" Model One = first.jsonl "]) == [("Model One", "first.jsonl")]
-    with pytest.raises(ValueError, match="중복 시스템 이름"):
+    with pytest.raises(ValueError, match="Duplicate system name"):
         parse_system_specs(
             ["Straße=first.jsonl", " STRASSE =second.jsonl"],
         )
@@ -333,5 +333,5 @@ def test_compare_cli_rejects_duplicate_label_before_opening_system_files(
         ],
     )
 
-    with pytest.raises(SystemExit, match="중복 시스템 이름"):
+    with pytest.raises(SystemExit, match="Duplicate system name"):
         compare_cli.main()

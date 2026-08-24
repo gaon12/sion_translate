@@ -1,4 +1,4 @@
-"""선택 설치형 공개 번역 모델 baseline 실행기."""
+"""Run optional public translation-model baselines."""
 
 # AutoModel/AutoTokenizer return model-specific dynamic objects.
 # pyright: reportArgumentType=false, reportAttributeAccessIssue=false, reportUnknownArgumentType=false, reportUnknownMemberType=false, reportUnknownVariableType=false
@@ -34,23 +34,21 @@ def translate_with_hf_baseline(
     num_beams: int = 4,
     max_new_tokens: int = 256,
 ) -> dict[str, str]:
-    """Hugging Face에서 가중치를 받아 비교 문장을 번역한다.
+    """Download one Hugging Face model and translate comparison cases.
 
-    가중치는 로컬 Hugging Face 캐시에만 저장되며 프로젝트에는 복사하지 않는다.
-    각 upstream 모델 라이선스는 사용자가 별도로 따라야 한다.
+    Weights remain in the local Hugging Face cache and are not copied into this
+    project. Users remain responsible for each upstream model's license.
     """
     if backend not in HF_BASELINES:
-        raise ValueError(f"지원하지 않는 baseline: {backend}")
+        raise ValueError(f"Unsupported baseline: {backend}")
     if batch_size < 1 or num_beams < 1 or max_new_tokens < 1:
-        raise ValueError("batch size, beam 수, 최대 토큰 수는 모두 1 이상이어야 합니다")
+        raise ValueError("Batch size, beam count, and maximum token count must be positive")
 
     try:
         import torch
         from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
     except ImportError as error:
-        raise RuntimeError(
-            "공개 baseline 실행에는 'pip install -e .[baselines]'가 필요합니다"
-        ) from error
+        raise RuntimeError("Public baselines require 'pip install -e .[baselines]'") from error
 
     spec = HF_BASELINES[backend]
     language_codes = spec["language_codes"]
@@ -59,13 +57,13 @@ def translate_with_hf_baseline(
     }
     unsupported = sorted(used_languages - language_codes.keys())
     if unsupported:
-        raise ValueError(f"{backend} 언어 코드가 없는 언어: {', '.join(unsupported)}")
+        raise ValueError(f"{backend} has no language code for: {', '.join(unsupported)}")
 
     resolved_device = "cuda" if device == "auto" and torch.cuda.is_available() else device
     if resolved_device == "auto":
         resolved_device = "cpu"
     if str(resolved_device).startswith("cuda") and not torch.cuda.is_available():
-        raise ValueError("CUDA를 요청했지만 사용할 수 없습니다")
+        raise ValueError("CUDA was requested but is not available")
 
     model_id = str(spec["model_id"])
     model = AutoModelForSeq2SeqLM.from_pretrained(model_id)

@@ -1,4 +1,4 @@
-"""문장 이어붙이기 증강 검증."""
+"""Validate multi-sentence concatenation augmentation."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from sion_translate.data.prepare import DEFAULT_TRAIN_ONLY_PREFIXES
 
 
 def _pairs(count: int = 40) -> list[tuple[str, str]]:
-    """공백 없는 문장. 이어붙인 결과를 공백으로 다시 쪼개 검증할 수 있게 한다."""
+    """Return no-space fixtures so joined results can be split on whitespace."""
     return [(f"한국어문장{index}번입니다.", f"日本語の文{index}番です。") for index in range(count)]
 
 
@@ -35,9 +35,9 @@ def test_concatenation_keeps_both_sides_aligned_and_ordered() -> None:
     for joined_source, joined_target in examples:
         source_parts = joined_source.split(" ")
         target_parts = joined_target.split(" ")
-        # 양쪽 문장 수가 같아야 "빠뜨리지 않고 번역"이 정답이 된다.
+        # A correct non-omitting translation keeps the same number of sentences.
         assert len(source_parts) == len(target_parts)
-        # 양쪽 순서가 같아야 정렬 유지가 정답이 된다.
+        # A correct aligned translation retains sentence order on both sides.
         chosen = [index_by_source[part] for part in source_parts]
         assert target_parts == [pairs[position][1] for position in chosen]
 
@@ -67,7 +67,7 @@ def test_seg_separator_marks_boundaries_explicitly() -> None:
 def test_examples_over_the_length_budget_are_dropped() -> None:
     long_pairs = [(f"{'가' * 300}{index}", f"{'あ' * 300}{index}") for index in range(10)]
     examples, stats = build_concatenations(long_pairs, count=20, max_chars=400, seed=2)
-    # 2문장만 이어붙여도 600자를 넘으므로 하나도 만들 수 없다.
+    # Even two rows exceed 600 characters, so no valid example can be built.
     assert examples == []
     assert stats.written == 0
     assert stats.skipped_too_long > 0
@@ -79,24 +79,24 @@ def test_token_budget_uses_the_supplied_counter() -> None:
 
     def count_tokens(text: str) -> int:
         calls.append(text)
-        return len(text)  # 글자 수를 토큰 수로 가정
+        return len(text)  # Treat each character as one token for this test.
 
     _, stats = build_concatenations(
         pairs, count=5, max_chars=10_000, max_tokens=5, count_tokens=count_tokens, seed=4
     )
-    assert calls, "count_tokens 가 호출되어야 한다"
-    assert stats.written == 0  # 토큰 상한 5 를 넘으므로 전부 버려진다
+    assert calls, "count_tokens must be called"
+    assert stats.written == 0  # Every combination exceeds the five-token limit.
 
 
 def test_invalid_arguments_are_rejected() -> None:
     pairs = _pairs(10)
-    with pytest.raises(ValueError, match="min_sentences 는 2 이상"):
+    with pytest.raises(ValueError, match="min_sentences must be at least 2"):
         build_concatenations(pairs, count=1, min_sentences=1)
-    with pytest.raises(ValueError, match="max_sentences 는 min_sentences 이상"):
+    with pytest.raises(ValueError, match="max_sentences must be at least min_sentences"):
         build_concatenations(pairs, count=1, min_sentences=4, max_sentences=3)
     with pytest.raises(ValueError, match="separator"):
         build_concatenations(pairs, count=1, separator="pipe")
-    with pytest.raises(ValueError, match="쌍이 1개뿐"):
+    with pytest.raises(ValueError, match="Only 1 pairs are available"):
         build_concatenations(pairs[:1], count=1)
 
 
@@ -366,6 +366,6 @@ def test_written_file_round_trips_and_uses_a_train_only_prefix(tmp_path: Path) -
     examples, _ = build_concatenations(_pairs(), count=5, seed=9)
     output = tmp_path / "concat_multi.jsonl"
     assert write_concatenations(output, examples, ("ko", "ja")) == 5
-    # 기본 train-only 접두어에 걸려야 holdout 으로 새지 않는다.
+    # The default train-only prefix must keep this synthetic file out of holdouts.
     assert output.name.startswith(DEFAULT_TRAIN_ONLY_PREFIXES)
     assert list(read_pairs([output], ("ko", "ja"))) == examples

@@ -1,7 +1,7 @@
-"""JSONL 기반 번역 시스템 비교 도구.
+"""Compare translation systems through a shared JSONL contract.
 
-비교 문장과 각 시스템의 번역 결과를 별도 JSONL로 유지한다. 외부 API,
-로컬 모델, 사람이 복사한 결과를 모두 같은 형식으로 채점할 수 있다.
+Cases and system outputs live in separate JSONL files so an external API, a
+local model, and manually copied results can all use the same scoring path.
 """
 
 # Comparison inputs are heterogeneous JSON rows validated by this module.
@@ -25,7 +25,7 @@ from sion_translate.language_tags import LanguageTagError, canonicalize_language
 
 @dataclass(frozen=True)
 class ComparisonCase:
-    """한 개의 번역 비교 문장."""
+    """One source/reference case in a translation comparison."""
 
     id: str
     source_language: str
@@ -58,10 +58,10 @@ class CategoryResult:
 
 def _required_text(row: object, key: str, *, location: str) -> str:
     if not isinstance(row, dict):
-        raise ValueError(f"{location}: JSON object가 필요합니다")
+        raise ValueError(f"{location}: expected a JSON object")
     value = row.get(key)
     if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{location}: '{key}'는 비어 있지 않은 문자열이어야 합니다")
+        raise ValueError(f"{location}: '{key}' must be a non-empty string")
     return value.strip()
 
 
@@ -70,7 +70,7 @@ def _optional_text(row: dict[str, object], key: str, *, location: str) -> str:
     if value is None:
         return ""
     if not isinstance(value, str):
-        raise ValueError(f"{location}: '{key}'는 문자열이어야 합니다")
+        raise ValueError(f"{location}: '{key}' must be a string")
     return value.strip()
 
 
@@ -79,7 +79,7 @@ def _optional_intensity(row: dict[str, object], *, location: str) -> int | None:
     if value is None:
         return None
     if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 5:
-        raise ValueError(f"{location}: 'intensity'는 1~5 정수여야 합니다")
+        raise ValueError(f"{location}: 'intensity' must be an integer from 1 to 5")
     return value
 
 
@@ -108,12 +108,12 @@ def _jsonl_rows(path: str | Path) -> list[tuple[int, object]]:
             try:
                 rows.append((line_number, json.loads(line)))
             except json.JSONDecodeError as error:
-                raise ValueError(f"{path}:{line_number}: 잘못된 JSON: {error.msg}") from error
+                raise ValueError(f"{path}:{line_number}: invalid JSON: {error.msg}") from error
     return rows
 
 
 def load_comparison_cases(path: str | Path) -> list[ComparisonCase]:
-    """비교 케이스 JSONL을 읽고 스키마와 ID 중복을 검사한다."""
+    """Load comparison JSONL and validate its schema and unique IDs."""
     path = Path(path)
     cases: list[ComparisonCase] = []
     seen: set[str] = set()
@@ -121,7 +121,7 @@ def load_comparison_cases(path: str | Path) -> list[ComparisonCase]:
         location = f"{path}:{line_number}"
         case_id = _required_text(row, "id", location=location)
         if case_id in seen:
-            raise ValueError(f"{location}: 중복 id: {case_id}")
+            raise ValueError(f"{location}: duplicate id: {case_id}")
         seen.add(case_id)
         source_language = _canonical_case_language(
             _required_text(row, "source_language", location=location),
@@ -134,11 +134,11 @@ def load_comparison_cases(path: str | Path) -> list[ComparisonCase]:
             location=location,
         )
         if source_language == target_language:
-            raise ValueError(f"{location}: 원문 언어와 목표 언어가 같습니다")
+            raise ValueError(f"{location}: source and target languages are equal")
         assert isinstance(row, dict)
         category = row.get("category", "general")
         if not isinstance(category, str) or not category.strip():
-            raise ValueError(f"{location}: 'category'는 문자열이어야 합니다")
+            raise ValueError(f"{location}: 'category' must be a string")
         cases.append(
             ComparisonCase(
                 id=case_id,
@@ -158,7 +158,7 @@ def load_comparison_cases(path: str | Path) -> list[ComparisonCase]:
             )
         )
     if not cases:
-        raise ValueError(f"{path}: 비교 문장이 없습니다")
+        raise ValueError(f"{path}: no comparison cases were found")
     return cases
 
 
@@ -166,7 +166,7 @@ def load_system_translations(
     path: str | Path,
     cases: Sequence[ComparisonCase],
 ) -> dict[str, str]:
-    """시스템 출력 JSONL을 읽고 모든 케이스가 정확히 한 번 있는지 검사한다."""
+    """Load system output and require every case exactly once."""
     path = Path(path)
     expected = {case.id for case in cases}
     translations: dict[str, str] = {}
@@ -174,16 +174,16 @@ def load_system_translations(
         location = f"{path}:{line_number}"
         case_id = _required_text(row, "id", location=location)
         if case_id not in expected:
-            raise ValueError(f"{location}: 비교 케이스에 없는 id: {case_id}")
+            raise ValueError(f"{location}: id is not in the comparison cases: {case_id}")
         if case_id in translations:
-            raise ValueError(f"{location}: 중복 id: {case_id}")
+            raise ValueError(f"{location}: duplicate id: {case_id}")
         translations[case_id] = _required_text(row, "translation", location=location)
 
     missing = [case.id for case in cases if case.id not in translations]
     if missing:
         preview = ", ".join(missing[:5])
         suffix = " ..." if len(missing) > 5 else ""
-        raise ValueError(f"{path}: 번역이 없는 id {len(missing)}개: {preview}{suffix}")
+        raise ValueError(f"{path}: {len(missing)} IDs have no translation: {preview}{suffix}")
     return translations
 
 
@@ -192,12 +192,12 @@ def write_system_translations(
     cases: Sequence[ComparisonCase],
     translations: Mapping[str, str],
 ) -> None:
-    """비교 CLI가 읽을 수 있는 순서 고정 JSONL을 쓴다."""
+    """Write stable-order JSONL that the comparison CLI can read."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     missing = [case.id for case in cases if not translations.get(case.id, "").strip()]
     if missing:
-        raise ValueError(f"비어 있는 번역이 있습니다: {', '.join(missing[:5])}")
+        raise ValueError(f"Empty translations are not allowed: {', '.join(missing[:5])}")
     with path.open("w", encoding="utf-8", newline="\n") as handle:
         for case in cases:
             row = {"id": case.id, "translation": translations[case.id]}
@@ -208,7 +208,7 @@ def score_systems(
     cases: Sequence[ComparisonCase],
     systems: Mapping[str, Mapping[str, str]],
 ) -> list[DirectionResult]:
-    """시스템별·번역 방향별 chrF/BLEU를 계산한다."""
+    """Compute chrF and BLEU for each system and directed language edge."""
     directions: dict[tuple[str, str], list[ComparisonCase]] = {}
     for case in cases:
         directions.setdefault((case.source_language, case.target_language), []).append(case)
@@ -287,7 +287,7 @@ def category_results_as_markdown(results: Sequence[CategoryResult]) -> str:
     """Render direction/category slices separately from aggregate direction scores."""
 
     lines = [
-        "| system | direction | category | samples | chrF | BLEU | 숫자 F1 |",
+        "| system | direction | category | samples | chrF | BLEU | number F1 |",
         "|---|---|---|---:|---:|---:|---:|",
     ]
     for result in results:
@@ -311,7 +311,7 @@ def comparison_as_markdown(
     *,
     category_results: Sequence[CategoryResult] | None = None,
 ) -> str:
-    """점수 표와 문장별 대조표를 한 Markdown 문서로 만든다."""
+    """Create one Markdown report with scores and case-level comparisons."""
     category_results = (
         list(category_results)
         if category_results is not None
@@ -362,7 +362,7 @@ def save_comparison(
     *,
     category_results: Sequence[CategoryResult] | None = None,
 ) -> None:
-    """기계용 JSON과 사람이 검토할 Markdown 결과를 저장한다."""
+    """Save machine-readable JSON and human-reviewable Markdown results."""
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     category_results = (
