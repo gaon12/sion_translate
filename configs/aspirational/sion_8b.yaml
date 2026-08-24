@@ -40,6 +40,8 @@ data:
     - [jd, ko]
     - [jd, ja]
     - [ko, ja]
+    - [ko, en]
+    - [en, ja]
   source_only_languages: [kj, kd, jd]
   max_source_length: 512
   max_target_length: 512

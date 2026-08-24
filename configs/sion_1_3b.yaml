@@ -1,7 +1,7 @@
-# 인코더 중심 배분. 파라미터 수는 20/20 구성과 정확히 같은 1,206,346,752 이지만
-# decoder 층이 20 → 12 로 줄어듭니다. 자기회귀 디코딩은 이 모델에서 가중치 대역폭
-# 바운드이고(KV cache 는 전체 바이트의 1.5%) decoder 층 수가 곧 토큰당 지연이므로,
-# 같은 용량을 encoder 쪽에 두는 편이 품질·지연 양쪽에 유리합니다.
+# Encoder-heavy allocation with the same 1,206,346,752 parameters as a 20/20
+# encoder-decoder layout, but only 12 decoder layers. Autoregressive decoding is
+# weight-bandwidth-bound here, and the KV cache is about 1.5% of total bytes, so
+# moving capacity to the encoder reduces per-token latency at the same capacity.
 model:
   d_model: 1536
   encoder_layers: 30
@@ -45,6 +45,8 @@ data:
     - [jd, ko]
     - [jd, ja]
     - [ko, ja]
+    - [ko, en]
+    - [en, ja]
   source_only_languages: [kj, kd, jd]
   max_source_length: 512
   max_target_length: 512
