@@ -1,26 +1,28 @@
-"""초안 수정(draft revision) 학습 데이터 생성.
+"""Generate training data for complete-draft sequence revision.
 
-``원문 + 초벌 번역 → 고친 번역`` 을 배우게 하면, 한 번에 맞히지 못한 문장을 두 번째
-패스에서 고칠 기회가 생깁니다. 인코더-디코더 구조를 그대로 쓸 수 있고, 학습 데이터도
-지금 있는 ``원문/번역`` 쌍만으로 만들 수 있습니다.
+Learning ``source + initial translation -> corrected translation`` gives the
+model a second pass for sentences it cannot translate correctly at once. It
+reuses the encoder-decoder structure and builds data from existing source and
+target pairs.
 
-입력을 ``원문 <draft> 초안`` 한 줄로 직렬화하므로 기존 데이터 파이프라인이 이것을
-평범한 번역쌍으로 취급합니다. 인덱싱·shard·collator 를 고칠 필요가 없습니다.
+The source and draft are serialized as ``source <draft> draft``. The existing
+pipeline can therefore process them as ordinary translation pairs without
+special indexing, shard, or collator changes.
 
-**초안은 어디서 오는가.** 학습된 모델로 뽑는 것이 이상적이지만, 그러면 모델이 있어야
-데이터를 만들 수 있는 순환이 생깁니다. 여기서는 정답 번역을 일부러 망가뜨려 초안을
-만듭니다. 손상 유형은 이 프로젝트 모델에서 실제로 관측된 오류를 모사합니다 —
-그래야 수정 모델이 배우는 것이 실제로 고칠 필요가 있는 오류가 됩니다.
+An ideal draft would come from a trained model, but requiring that model creates
+a bootstrap cycle. Instead, this module deliberately corrupts gold targets in
+ways that imitate errors observed from the project model:
 
-- ``number``: 숫자를 다른 값으로 바꿈 (250mg → 1200mg). 최대 결함이므로 기본
-  가중치가 가장 높습니다. 원문에 정답이 남아 있으므로 원문을 봐야만 고칠 수 있습니다.
-- ``drop_clause``: 절이나 문장 하나를 통째로 누락
-- ``truncate``: 뒷부분을 잘라 조기 종료를 모사
-- ``repeat``: 짧은 구절 반복(생성 붕괴)
-- ``copy_source``: 번역하지 않고 원문을 그대로 둠
-- ``swap``: 인접한 두 조각의 순서를 뒤바꿈 (정렬 붕괴)
-- ``identity``: 손상 없음. 이미 맞은 초안을 **그대로 두는** 것도 배워야 하며,
-  이것이 없으면 수정 모델이 멀쩡한 문장을 헛되게 고칩니다.
+- ``number`` changes a value, such as 250mg to 1200mg. This is the most severe
+  observed defect and receives the largest default weight. The model must read
+  the source to recover the correct value.
+- ``drop_clause`` removes a complete clause or sentence.
+- ``truncate`` imitates premature termination by removing the end.
+- ``repeat`` repeats a short fragment to imitate generation collapse.
+- ``copy_source`` leaves the source untranslated.
+- ``swap`` reverses two adjacent fragments to imitate alignment failure.
+- ``identity`` leaves the draft correct. The model must learn not to modify an
+  already correct draft, or revision itself can introduce errors.
 """
 
 # Revision rows are loaded from JSON and normalized immediately.
@@ -44,7 +46,7 @@ from sion_translate.language_tags import canonicalize_language_pair
 
 DRAFT_SEPARATOR = "<draft>"
 
-# 손상 유형별 기본 비중. identity 를 넉넉히 두는 이유는 위 docstring 참고.
+# Default corruption mix. See the module documentation for the identity share.
 DEFAULT_CORRUPTIONS: dict[str, float] = {
     "number": 0.26,
     "drop_clause": 0.16,
@@ -56,13 +58,13 @@ DEFAULT_CORRUPTIONS: dict[str, float] = {
 }
 
 _NUMBER_RUN = re.compile(r"\d+")
-# 절 경계로 쓸 구두점. 한국어·일본어 문장부호를 함께 봅니다.
+# Treat punctuation used across supported scripts as clause boundaries.
 _CLAUSE_SPLIT = re.compile(r"(?<=[。．.!?！？、,，])\s*")
 
 
 @dataclass
 class RevisionStats:
-    """생성 결과 요약. 손상 유형별 개수를 기록합니다."""
+    """Summarize generated examples by corruption type."""
 
     written: int
     by_corruption: dict[str, int]
@@ -104,13 +106,13 @@ def _validated_revision_components(source: str, draft: str) -> tuple[str, str]:
 
 
 def serialize_revision_input(source: str, draft: str) -> str:
-    """``원문 <draft> 초안`` 형태로 직렬화합니다."""
+    """Serialize a source and draft as ``source <draft> draft``."""
     normalized_source, normalized_draft = _validated_revision_components(source, draft)
     return f"{normalized_source} {DRAFT_SEPARATOR} {normalized_draft}"
 
 
 def parse_revision_input(text: str) -> tuple[str, str]:
-    """직렬화된 입력을 (원문, 초안) 으로 되돌립니다."""
+    """Parse serialized revision input into ``(source, draft)``."""
     separator_count = text.count(DRAFT_SEPARATOR)
     if separator_count != 1:
         raise ValueError(
@@ -127,14 +129,14 @@ def _clauses(text: str) -> list[str]:
 
 
 def _corrupt_number(target: str, rng: random.Random) -> str:
-    """숫자 하나를 그럴듯한 다른 값으로 바꿉니다."""
+    """Replace one number with a plausible but incorrect value."""
     normalized = unicodedata.normalize("NFKC", target)
     matches = list(_NUMBER_RUN.finditer(normalized))
     if not matches:
         return normalized
     match = rng.choice(matches)
     digits = match.group(0)
-    # 자릿수를 유지하거나 한 자리 늘려, 실제 관측된 오류(250 -> 1200)와 비슷하게.
+    # Preserve the width or add one digit to resemble observed errors such as 250 -> 1200.
     if rng.random() < 0.5 and len(digits) > 1:
         replacement = list(digits)
         position = rng.randrange(len(digits))
@@ -194,13 +196,15 @@ def corrupt_target(
     kind: str,
     rng: random.Random,
 ) -> str:
-    """정답 번역을 ``kind`` 방식으로 망가뜨려 초안을 만듭니다."""
+    """Create a draft by applying corruption ``kind`` to the gold target."""
     if kind == "identity":
         return target
     if kind == "copy_source":
         return source
     if kind not in _CORRUPTIONS:
-        raise ValueError(f"알 수 없는 손상 유형: {kind} (가능: {sorted(DEFAULT_CORRUPTIONS)})")
+        raise ValueError(
+            f"unknown corruption type: {kind} (available: {sorted(DEFAULT_CORRUPTIONS)})"
+        )
     return _CORRUPTIONS[kind](target, rng)
 
 
@@ -210,18 +214,18 @@ def build_revision_examples(
     weights: dict[str, float] | None = None,
     seed: int = 20260726,
 ) -> tuple[list[tuple[str, str]], RevisionStats]:
-    """각 쌍에서 ``(원문 <draft> 초안, 정답 번역)`` 예제를 하나씩 만듭니다.
+    """Build one ``(source <draft> draft, gold target)`` example per pair.
 
-    손상이 실제로 아무 효과가 없었던 경우(숫자 없는 문장에 number 손상 등)는
-    ``identity`` 와 같아지므로 ``unchanged`` 로 따로 셉니다. 버리지는 않습니다 —
-    맞은 초안을 그대로 두는 것도 배워야 하는 동작이기 때문입니다.
+    A no-op corruption, such as ``number`` on text without digits, is counted
+    under ``unchanged``. It remains useful because leaving a correct draft
+    unchanged is a required revision behavior.
     """
     weights = weights or DEFAULT_CORRUPTIONS
     unknown = set(weights) - set(DEFAULT_CORRUPTIONS)
     if unknown:
-        raise ValueError(f"알 수 없는 손상 유형: {sorted(unknown)}")
+        raise ValueError(f"unknown corruption types: {sorted(unknown)}")
     if not weights or sum(weights.values()) <= 0:
-        raise ValueError("손상 가중치의 합이 0보다 커야 합니다")
+        raise ValueError("the sum of corruption weights must be positive")
 
     kinds = list(weights)
     probabilities = [weights[kind] for kind in kinds]
@@ -233,7 +237,7 @@ def build_revision_examples(
         kind = rng.choices(kinds, weights=probabilities, k=1)[0]
         draft = corrupt_target(source, target, kind, rng)
         if not draft.strip():
-            # 전부 잘려 나간 초안은 수정할 단서가 없어 학습 신호가 되지 않습니다.
+            # An empty draft contains no evidence that revision can use.
             draft = target
             kind = "identity"
         if draft.strip() == target.strip():
@@ -248,11 +252,12 @@ def write_revision_examples(
     examples: Iterable[RevisionOutput],
     language_pair: Sequence[str],
 ) -> int:
-    """``prepare_dataset`` 가 읽는 형식으로 씁니다.
+    """Write examples in the authenticated format consumed by ``prepare_dataset``.
 
-    ``원문 <draft> 초안`` 이 그대로 원문 자리에 들어가므로, 데이터 파이프라인은
-    이것을 평범한 번역쌍으로 처리합니다. 파일명과 무관하게 모든 행에 revision
-    provenance를 기록해 인덱스 로더가 학습 목적을 인증할 수 있게 합니다.
+    ``source <draft> draft`` occupies the source field, so the data pipeline can
+    treat each row as an ordinary translation pair. Every row carries revision
+    provenance independently of its filename, allowing the indexed loader to
+    authenticate the training objective.
     """
     key_a, key_b = canonicalize_language_pair(
         language_pair,
@@ -320,7 +325,10 @@ def write_revision_examples(
                         provenance["input"] = provenance_input
                 handle.write(json.dumps(row, ensure_ascii=False) + "\n")
                 written += 1
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(temporary_path, output_path)
+        temporary_path = None
     except BaseException:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)

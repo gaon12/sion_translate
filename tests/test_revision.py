@@ -1,4 +1,4 @@
-"""초안 수정 학습 데이터 생성 검증."""
+"""Verify training-data generation for complete-draft sequence revision."""
 
 from __future__ import annotations
 
@@ -78,7 +78,7 @@ def test_parse_rejects_blank_or_multiple_separator_inputs(
 
 
 def test_draft_separator_is_a_reserved_control_symbol() -> None:
-    # 구분자가 여러 조각으로 쪼개지면 학습 때와 다른 입력이 된다.
+    # Splitting the reserved separator would make inference input differ from training.
     assert DRAFT_SEPARATOR in OPTIONAL_CONTROL_SYMBOLS
 
 
@@ -86,7 +86,7 @@ def test_number_corruption_changes_a_value_and_keeps_the_rest() -> None:
     target = "1回250mgずつ、48時間間隔で服用してください。"
     draft = corrupt_target("1회 250mg씩, 48시간 간격", target, "number", _rng())
     assert draft != target
-    # 숫자만 달라져야 한다 — 나머지가 함께 망가지면 무엇을 고쳐야 하는지 불분명해진다.
+    # Only the number may change, keeping the intended correction unambiguous.
     assert numeric_tokens(draft) != numeric_tokens(target)
     assert len(numeric_tokens(draft)) == len(numeric_tokens(target))
 
@@ -125,7 +125,7 @@ def test_swap_reorders_clauses_without_losing_them() -> None:
     target = "まず原因を確認する。次に対策を決める。"
     draft = corrupt_target("원문", target, "swap", _rng())
     assert draft != target
-    # 조각은 그대로 있고 순서만 바뀌어야 한다.
+    # Preserve both fragments and change only their order.
     assert sorted(draft.split("。")) == sorted(target.split("。"))
 
 
@@ -134,7 +134,7 @@ def test_identity_leaves_the_target_alone() -> None:
 
 
 def test_unknown_corruption_is_rejected() -> None:
-    with pytest.raises(ValueError, match="알 수 없는 손상 유형"):
+    with pytest.raises(ValueError, match="unknown corruption type"):
         corrupt_target("원문", "번역", "shuffle_everything", _rng())
 
 
@@ -155,14 +155,14 @@ def test_build_produces_one_example_per_pair_with_the_clean_target() -> None:
     for (serialized, target), (source, clean) in zip(examples, pairs, strict=True):
         parsed_source, _ = parse_revision_input(serialized)
         assert parsed_source == source
-        # 정답은 항상 손상되지 않은 번역이어야 한다.
+        # The target must always remain the uncorrupted translation.
         assert target == clean
 
 
 def test_identity_examples_exist_so_correct_drafts_are_left_alone() -> None:
     _, stats = build_revision_examples(_pairs(), seed=2)
     assert stats.by_corruption.get("identity", 0) > 0
-    # 손상이 실제로 통하지 않은 경우까지 포함해 "그대로 두기" 예제가 있어야 한다.
+    # Include no-op corruptions so the model learns to retain correct drafts.
     assert stats.unchanged >= stats.by_corruption.get("identity", 0)
 
 
@@ -177,9 +177,9 @@ def test_weights_can_select_a_single_corruption() -> None:
 
 
 def test_invalid_weights_are_rejected() -> None:
-    with pytest.raises(ValueError, match="알 수 없는 손상 유형"):
+    with pytest.raises(ValueError, match="unknown corruption types"):
         build_revision_examples(_pairs(4), weights={"bogus": 1.0})
-    with pytest.raises(ValueError, match="가중치의 합"):
+    with pytest.raises(ValueError, match="sum of corruption weights"):
         build_revision_examples(_pairs(4), weights={"number": 0.0})
 
 
@@ -192,7 +192,7 @@ def test_same_seed_is_reproducible() -> None:
 
 
 def test_written_file_is_a_plain_translation_pair(tmp_path: Path) -> None:
-    """데이터 파이프라인을 고치지 않고 쓸 수 있어야 한다."""
+    """The existing data pipeline must consume revision rows unchanged."""
     examples, _ = build_revision_examples(_pairs(5), seed=5)
     output = tmp_path / "revise_synthetic.jsonl"
     assert write_revision_examples(output, examples, ("ko", "ja")) == 5
@@ -204,6 +204,28 @@ def test_written_file_is_a_plain_translation_pair(tmp_path: Path) -> None:
     assert all(row["synthetic"] is True for row in rows)
     assert all(row["training_direction"] == ["ko", "ja"] for row in rows)
     assert all(row["provenance"] == {"transformation": "revision"} for row in rows)
+
+
+def test_revision_writer_flushes_staged_bytes_before_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    revision_module = importlib.import_module("sion_translate.revision")
+    fsync_calls: list[int] = []
+    monkeypatch.setattr(revision_module.os, "fsync", fsync_calls.append)
+    output = tmp_path / "durable_revision.jsonl"
+
+    assert (
+        write_revision_examples(
+            output,
+            [("source <draft> draft", "target")],
+            ("sw", "ar"),
+        )
+        == 1
+    )
+
+    assert len(fsync_calls) == 1
+    assert json.loads(output.read_text(encoding="utf-8"))["sw"] == "source <draft> draft"
 
 
 def test_written_revision_direction_and_keys_are_canonical_bcp47(tmp_path: Path) -> None:
