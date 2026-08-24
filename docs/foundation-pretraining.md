@@ -1,223 +1,226 @@
-# foundation 사전학습 (단일어 복원 + 선택적 reasoning)
+# Foundation pretraining
 
-번역 학습 **이전** 단계입니다. 언어별 단일어 텍스트의 span-corruption 복원과,
-구조화 데이터가 있을 때만 prompt→reasoning trace 보조 과제를 섞어
-encoder-decoder 를 먼저 만들고 그 위에서 번역을 학습합니다.
+Foundation pretraining runs before translation. It first teaches the encoder-decoder to
+reconstruct corrupted monolingual text and may mix a small, explicitly structured
+prompt-to-reasoning task.
 
-단계 순서:
-
-```
-foundation (복원 + reasoning) → SFT (번역) → MRT (사후학습)
+```text
+foundation reconstruction -> translation SFT -> MRT/preference posttraining
 runs/*/foundation/           runs/*/pretrain/   runs/*/posttrain/
 ```
 
-유효한 foundation 코퍼스가 없으면 첫 단계를 이름만 남겨 두고 실행하지 않습니다.
-새 `training.output_dir`에서는 fresh initialization으로 번역 SFT와 MRT를 바로
-진행하며, `runs/*/foundation/`을 만들거나 foundation release인 `sion`을 학습·export
-하지 않습니다. 이 경로의 모델 산출물은 번역 release인 **`sion_translate`만**입니다.
-같은 translation-only 분기의 호환 체크포인트가 있으면 fresh initialization 대신
-그 SFT/MRT를 안전하게 재개합니다.
+If no valid foundation corpus or prepared foundation dataset exists, a new run starts
+translation SFT from fresh initialization. It does not create a fake foundation stage or
+publish a `sion` artifact. A compatible authenticated SFT or MRT checkpoint still takes
+priority over all earlier-stage work.
 
-## 코퍼스 배치
+## Corpus layout
 
-`data/corpus/` 아래에 **언어 코드 폴더**를 만들고 그 안에 파일을 둡니다.
-하위 폴더도 훑습니다.
+Create one directory per canonical BCP 47 language tag under `data/corpus/`. Subdirectories
+inside a language directory are allowed.
 
-```
+```text
 data/corpus/
-  ko/
-    kowiki_corpus.txt          # 한 줄에 문장/문단 하나
-    2026/news.jsonl            # {"text": "..."} 한 줄에 하나
-  ja/
-    wiki.txt
-  en/
-    science.jsonl
+  de/
+    news.txt
+    2026/web.jsonl
+  fr/
+    books.txt
+  sw/
+    articles.jsonl
 ```
 
-허용 형식은 **`.txt` 와 `.jsonl` 둘뿐**입니다. 일반 `.jsonl`은 **`text` 키**를
-쓰고, 이름이 `reasoning_`으로 시작하는 `.jsonl`만 아래의 구조화 계약을 씁니다.
-다른 확장자, 언어 코드가 아닌 폴더 이름, 최상위에 떠 있는 파일은 전부
-**건너뛰고 그 사실을 출력**합니다. 조용히 무시하지 않는 이유는 이 단계가
-가장 오래 걸리는데 입력 오류는 티가 나지 않기 때문입니다 — 키 이름 하나가
-틀리면 그 파일만 0문장이 되고, 학습이 끝난 뒤에야 드러납니다.
+Supported ordinary inputs are:
 
-번역 대상이 아닌 언어를 foundation에만 추가하려면 번역
-`data.language_pairs`를 늘리지 말고 다음처럼 설정합니다.
+- `.txt`: one sentence or paragraph per line;
+- `.jsonl`: one JSON object per line with a string `text` field.
+
+Files named `reasoning_*.jsonl` use the separate reasoning schema described below. The
+scanner reports unsupported extensions, top-level files, invalid language directories,
+and malformed rows. It does not silently convert an empty or misplaced source into a
+successful corpus.
+
+To add a reconstruction-only language, set `foundation.languages` without adding a
+translation pair:
 
 ```yaml
 foundation:
-  languages: [ko, ja, en]
+  languages: [de, fr, sw]
 ```
 
-빈 목록이면 기존처럼 번역 설정에 등장하는 target 가능 언어를
-자동으로 사용합니다. 이 목록을 바꾸면 해당 `<denoise_xx>` 태그가
-필요하므로 토크나이저와 foundation dataset은 새로 만들어야 합니다.
+Changing this set changes the required `<denoise_LANGUAGE>` controls. Rebuild the
+tokenizer and foundation dataset under new artifact paths.
 
-## 구조화 reasoning 보조 과제
+## Structured reasoning task
 
-reasoning은 번역 행으로 가장하지 않고 foundation의 별도 encoder-decoder 과제로만
-학습합니다. 파일명은 `reasoning_*.jsonl`이고 각 행은 다음 필드를 가집니다.
+Reasoning examples remain a foundation-only encoder-decoder objective. They never pretend
+to be translation rows.
+
+Each `reasoning_*.jsonl` row has this form:
 
 ```json
 {
-  "prompt": "2와 3을 더하면?",
-  "think": "두 수를 순서대로 더한다.",
+  "prompt": "What is 2 plus 3?",
+  "think": "Add the two integers.",
   "answer": "5",
-  "language": "ko",
+  "language": "en",
   "source": "example/source",
   "license": "Apache-2.0"
 }
 ```
 
-encoder 입력은 `<reason_ko> + prompt`, decoder 정답은
-`<think> think </think> <answer> answer </answer>`입니다. 번역의 `<2xx>`나
-복원의 `<denoise_xx>`와 과제 태그가 다르므로 reasoning trace를 번역 출력으로
-학습하지 않습니다. foundation이 100% denoising으로 실행돼도 reasoning 행은
-손상시키지 않으며, trace delimiter가 잘리지 않도록 dataset 준비 단계에서
-내용만 예산에 맞춰 자릅니다.
+The encoder receives `<reason_en> + prompt`. The decoder target is:
 
-긴 trace는 짧은 복원 문장보다 decoder token을 많이 소비합니다. 그래서 기본
-혼합률은 행 기준 5%입니다.
+```text
+<think> Add the two integers. </think> <answer> 5 </answer>
+```
+
+Reasoning controls differ from translation `<2LANGUAGE>` and reconstruction
+`<denoise_LANGUAGE>` controls. Reasoning traces therefore do not become ordinary
+translation targets. The foundation collator also bypasses span corruption for these
+rows and truncates content without cutting the structural delimiters.
+
+Long traces contain many more target tokens than ordinary reconstruction rows. The
+default target row share is deliberately small:
 
 ```yaml
 foundation:
   reasoning_sample_share: 0.05
 ```
 
-0이면 학습 표본에서 제외하고, 현재 안전 범위는 최대 0.10입니다. reasoning 파일의
-추가·삭제나 언어 변경은 `<reason_xx>` 및 trace 토큰 계약을 바꾸므로 토크나이저와
-foundation dataset을 다시 준비합니다. reasoning 데이터는 정답 검증과 라이선스가
-확인된 자료를 우선하며, 문맥 원문 없이 답할 수 없는 grounded QA는 넣지 않습니다.
+Use `0` to disable the task. The validated range is at most `0.10`. Adding or removing
+reasoning languages changes tokenizer controls and requires new prepared artifacts. Use
+licensed, reviewed, self-contained examples; do not add grounded questions that cannot
+be answered from the supplied prompt.
 
-`python easy_run.py` 를 실행하면 학습 전에 보고가 나옵니다. 예를 들어 corpus를
-잘못 배치해 일본어가 누락된 경우에는 다음처럼 경고합니다.
+## Effective language contract
 
-```
-[easy_run] foundation(단일어 사전학습) 코퍼스를 확인합니다.
-[easy_run]   단일어 코퍼스 루트: data/corpus
-[easy_run]     ko: 파일 4개, 5.31 GB
-[easy_run]     데이터 없는 언어: ja
-[easy_run]     건너뛴 항목 3개:
-[easy_run]       - data/corpus/a.py: 언어 폴더가 아닌 최상위 파일
-[easy_run]       - data/corpus/korean_tech_corpus_130m: 언어 코드 형식이 아닌 폴더 이름
-[easy_run] [경고] 단일어 데이터가 전혀 없는 언어: ja …
-```
+If `foundation.languages` is non-empty, it defines the reserved foundation language set.
+Otherwise, the set is derived from the translation configuration. Source-only languages
+are excluded in either case.
 
-## 어떤 언어가 대상인가
+This exclusion matters because reconstruction trains a language as a decoder output.
+A source-only language is explicitly forbidden as a translation output; foundation
+training must not teach the opposite contract.
 
-`foundation.languages`가 있으면 그 목록에서 source-only 언어를 뺀 것입니다.
-비어 있으면 번역 설정의 언어에서 source-only 언어를 뺁니다. 현재
-설정은 `kj`/`kd`/`jd`를 빼고 `ko`, `ja`, `en`을 학습합니다.
+The published foundation capability is narrower than the reservation. It contains only
+languages with positive sampling mass in the finalized train split. A configured but
+empty language cannot appear in the model metadata merely because its directory was
+reserved.
 
-이유는 데이터 계약입니다. 복원 과제는 그 언어를 **디코더 출력**으로 만드는
-학습인데, source-only 는 "번역 결과로 나오면 안 되는 언어" 라는 뜻입니다.
-걸러 두지 않으면 foundation 이 이후 번역 단계가 금지하는 것을 먼저 가르칩니다.
+## Language balance
 
-## 언어 불균형
+Temperature sampling uses `foundation.language_sampling_alpha` (default `0.7`) to reduce
+large corpus imbalances. It cannot manufacture missing data. A zero-row language receives
+zero probability and is reported as a data gap.
 
-언어별 분량 차이는 온도 샘플링(`foundation.language_sampling_alpha`, 기본 0.7)
-으로 눕히지만, **없는 데이터를 만들어 내지는 못합니다.** 분량이 0 인 언어는
-가중치도 0 이고, 그건 가중치가 아니라 경고로 다뤄야 할 문제입니다.
-
-한쪽 언어만 학습하면 그 언어를 목표로 하는 번역 방향만 강해집니다. 이
-저장소는 이미 ko→ja 59.81 대 ja→ko 49.87 로 그 증상을 갖고 있으므로,
-한국어만 있는 상태로 foundation 을 돌리면 격차가 벌어질 수 있습니다.
-그래도 기본은 **경고 후 진행** 입니다 — 언어를 나중에 채우는 것이 정상적인
-작업 흐름이기 때문입니다. 막으려면:
+By default, the pipeline warns and continues with available languages. Use a fail-closed
+policy when the experiment requires every reserved language:
 
 ```yaml
 foundation:
   require_all_languages: true
 ```
 
-## 토크나이저
+Record per-language rows, characters, sampled probability, and effective train-split mass
+with every run. A global reconstruction loss can hide a language that is never sampled.
 
-단일어 코퍼스도 토크나이저 학습에 들어갑니다. 넣지 않으면 foundation 단계가
-자기 코퍼스에 없는 어휘로 학습하게 됩니다 — 실측으로, 단일어에만 있는 낱말이
-19 조각(byte fallback 18 개)이 됐다가 넣으면 1 조각이 됩니다.
+## Tokenizer sampling
 
-전량 넣지도 않습니다. 언어별로 **그 언어의 병렬 코퍼스 문장 수 ×
-`foundation.tokenizer_sample_ratio`**(기본 0.4)까지만 뽑습니다. 전량 넣으면
-분량이 큰 언어가 vocab 을 독식합니다. 2026-08-08 production 실행은 해시 표본으로
-ja 3,445,471문장과 ko 3,308,940문장을 골라 두 언어를 함께 반영했습니다.
-
-표본은 파일 앞에서 자르지 않고 해시로 고르게 뽑습니다. 단일어 파일은 출처별로
-나뉘어 있어(위키 → 뉴스 → 커뮤니티) 앞을 자르면 한 출처만 뽑히고 그 편향이
-그대로 어휘에 박힙니다.
-
-0.4는 어휘 균형을 위한 값입니다. 예전 0.13은 SentencePiece 0.2.2의 native
-crash를 우연히 피하려고 낮춘 값이었고 안전 경계가 아니었습니다. 원인을 고친
-버전 정책과 실측은 [`sentencepiece-sigsegv.md`](sentencepiece-sigsegv.md)에
-남겼습니다. 이 비율은 토크나이저 학습 문장뿐 아니라 `required_chars` 문자 빈도
-스캔에도 동일하게 적용됩니다.
-
-## 산출물은 번역 모델이 아닙니다
-
-이 단계의 결과물은 **`sion`** 이라는 별도 이름으로 나갑니다. 번역 모델은
-그것에서 파생된 **`sion_translate`** 입니다.
-
-이름만 다른 것이 아닙니다. foundation 체크포인트는 번역 체크포인트와
-아키텍처가 완전히 같아서, 막지 않으면 `Translator` 가 그대로 싣고 방향 태그를
-받아들여 **유창한 헛소리**를 냅니다 — 번역쌍을 한 번도 본 적 없는 가중치인데도
-그렇습니다. 그래서 export metadata 에 능력 계약을 적습니다.
-
-```json
-{"release_name": "sion", "translation_capable": false, "languages": ["ko", "ja", "en"]}
-```
-
-`language_pairs` 와 `translation_directions` 는 **적지 않습니다.** 복원 모델에게
-쌍과 방향은 존재하지 않습니다. `Translator` 는 `translation_capable: false` 인
-export 를 거부하고 `runs/*/pretrain` 이나 `posttrain` 을 가리킵니다.
-
-## 다시 돌리지 않는다
-
-foundation 이 끝나면 `runs/*/foundation/stage_complete.json` 이 남습니다. 이후
-실행은 학습을 건너뛰고 best 가중치만 물려받습니다.
-
-이미 SFT `checkpoints/latest`가 있으면 우선순위는 더 뒤 단계인 **SFT resume**입니다.
-체크포인트의 pipeline identity가 현재 `translation-only` 또는
-`foundation-then-translation` 분기와 같은지 foundation 비용 전에 검증하고, 맞으면
-foundation을 다시 학습하거나 로드하지 않습니다. 분기가 다르거나 이 provenance가
-없는 구버전 체크포인트는 자동으로 추측하지 않고 새 `training.output_dir`을 요구합니다.
-
-이 표시가 필요한 이유는 번역 학습이 실패해 재실행되기 때문입니다 — 코퍼스
-지문 변경, export 의존성 누락, 용량 검사 실패. 표시가 없으면 그때마다 며칠짜리
-사전학습을 반복합니다. **중단된** 실행은 표시가 없으므로 정상적으로 재개됩니다
-(표시는 학습이 끝난 뒤에만 씁니다).
-
-가중치 인계는 재개가 아닙니다. optimizer moment·scheduler·step 을 물려받지
-않습니다 — 두 단계는 목적함수가 다르므로 momentum 이 다른 loss 표면을 가리키고,
-step 을 물려받으면 warmup 이 통째로 건너뛰어집니다. 대신 **토크나이저와 model
-config 가 같은지 검증**합니다. 토크나이저가 다르면 텐서 모양은 맞아서
-`load_state_dict` 가 성공하고 모든 임베딩 행이 조용히 다른 것을 가리킵니다.
-
-## 설정
+Monolingual text contributes to tokenizer training so foundation-only vocabulary does not
+collapse into byte fallback. It is not included without a bound: each language receives a
+sample cap derived from its parallel-corpus exposure and
+`foundation.tokenizer_sample_ratio`.
 
 ```yaml
 foundation:
-  enabled: true                  # 코퍼스가 있으면 자동 실행. false 면 데이터가 있어도 건너뜀
+  tokenizer_sample_ratio: 0.40
+```
+
+Sampling is deterministic and spread across files rather than taking a source prefix.
+Prefix truncation can select only the first domain in a source collection and encode that
+bias into the vocabulary. The same bounded sample contract applies to required-character
+frequency analysis.
+
+The project pins SentencePiece `0.2.1`. The reason and reproducer are documented in
+[`sentencepiece-sigsegv.md`](sentencepiece-sigsegv.md).
+
+## The output is not a translation model
+
+The foundation release uses the separate name `sion`. The derived translation release is
+`sion_translate`.
+
+Foundation and translation checkpoints share an architecture, so tensor shapes alone
+cannot prove capability. Foundation export metadata therefore states:
+
+```json
+{
+  "release_name": "sion",
+  "release_version": "1.5",
+  "translation_capable": false,
+  "languages": ["de", "fr", "sw"]
+}
+```
+
+It contains no `language_pairs` and no `translation_directions`; those concepts do not
+exist for monolingual reconstruction weights. `Translator` rejects the artifact and
+directs the user to an SFT or MRT export.
+
+After real training and evaluation finish, the foundation artifact belongs in a new
+Hugging Face repository, separate from `gaon12/sion_translate`. The repository name and
+model card are not created speculatively before that artifact exists.
+
+## Completion, reuse, and stage transfer
+
+A successful run publishes `runs/*/foundation/stage_complete.json`. Later runs verify the
+marker, tokenizer, dataset manifest, checkpoint generation, exact state digest, export,
+release identity, and effective language list before reusing the stage.
+
+An authenticated downstream checkpoint takes priority:
+
+- valid MRT resume skips foundation and SFT;
+- valid SFT resume skips foundation;
+- a completed foundation stage transfers only its selected weights into a new SFT
+  optimizer.
+
+Stage transfer is not optimizer resume. SFT receives no foundation optimizer moments,
+scheduler position, or step counter because its objective and loss surface differ. The
+tokenizer and model configuration must still match exactly; equal tensor shapes do not
+protect against vocabulary rows that refer to different pieces.
+
+An interrupted foundation run has no completion marker and resumes through its own
+authenticated checkpoint generation. A completed stage is not repeated merely because a
+later translation run failed.
+
+## Configuration reference
+
+```yaml
+foundation:
+  enabled: true
   corpus_dir: data/corpus
   dataset_dir: artifacts/foundation_dataset
   release_name: sion
 
-  language_sampling_alpha: 0.7   # 1.0 = 분량 정비례, 낮출수록 균등
-  minimum_language_share: 0.05   # 이 비중 미만이면 경고
+  languages: [de, fr, sw]
+  language_sampling_alpha: 0.7
+  minimum_language_share: 0.05
   require_all_languages: false
   minimum_characters: 8
   maximum_characters: 4000
   deduplicate: true
-  reasoning_sample_share: 0.05 # reasoning_*.jsonl 행의 목표 비중(0~0.10)
+  reasoning_sample_share: 0.05
 
-  noise_density: 0.15            # 복원 과제의 손상 비율
+  noise_density: 0.15
   mean_span: 3.0
-  tokenizer_sample_ratio: 0.4    # 0 이면 토크나이저 학습에서 단일어 제외
+  tokenizer_sample_ratio: 0.40
 
-  num_train_epochs: 3             # 전체 단일어 dataset을 3회 완주
-  early_stopping_min_epochs: 2    # 이 전에는 validation 정체로 종료하지 않음
+  num_train_epochs: 3
+  early_stopping_min_epochs: 2
   batch_size_per_gpu: 16
   learning_rate: 0.0003
   warmup_steps: 2000
   final_export_formats: [fp32, bf16, transformers]
 ```
 
-`enabled: true` 가 기본이지만 코퍼스가 없으면 이유를 출력하고 건너뜁니다.
+`enabled: true` means "run when a valid corpus is available." It does not turn an absent
+corpus into a foundation model.
