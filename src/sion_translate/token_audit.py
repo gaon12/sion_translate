@@ -32,6 +32,7 @@ from sion_translate.data.prepare import (
     PREPARE_COMPLETION_FILENAME,
     PREPARE_COMPLETION_SCHEMA,
     RAW_FINGERPRINT_FILENAME,
+    SHARED_TARGET_INDEX_DTYPE,
     PrepareStats,
 )
 from sion_translate.data.quality import QualityPolicy, assess_pair, canonical_text
@@ -336,6 +337,30 @@ def _indexed_direction_contract(
                     field="legacy indexed manifest language_pair",
                 ),
             )
+        elif manifest.get("stage") == "foundation":
+            if not isinstance(raw_pairs, list) or not raw_pairs:
+                raise ValueError("Foundation indexed manifest has no language tasks")
+            foundation_pairs: list[tuple[str, str]] = []
+            seen_foundation_languages: set[str] = set()
+            for index, raw_pair in enumerate(cast(list[object], raw_pairs)):
+                if not isinstance(raw_pair, list) or len(raw_pair) != 2:
+                    raise ValueError("Foundation indexed language tasks must be self-pairs")
+                pair_values = cast(list[object], raw_pair)
+                source = canonicalize_language_tag(
+                    pair_values[0],
+                    field=f"indexed manifest language_pairs[{index}][0]",
+                )
+                target = canonicalize_language_tag(
+                    pair_values[1],
+                    field=f"indexed manifest language_pairs[{index}][1]",
+                )
+                if source != target or source in seen_foundation_languages:
+                    raise ValueError(
+                        "Foundation indexed language tasks must be unique canonical self-pairs"
+                    )
+                seen_foundation_languages.add(source)
+                foundation_pairs.append((source, target))
+            pairs = tuple(foundation_pairs)
         else:
             pairs = _normalize_explicit_language_pairs(
                 raw_pairs,
@@ -353,7 +378,10 @@ def _indexed_direction_contract(
                     f"entry: {primary!r} != {pairs[0]!r}"
                 )
 
-    expected_languages = languages_from_pairs(pairs)
+    if manifest.get("stage") == "foundation":
+        expected_languages = tuple(source for source, _target in pairs)
+    else:
+        expected_languages = languages_from_pairs(pairs)
     raw_languages = manifest.get("languages")
     if raw_languages is None and not current_schema:
         languages = expected_languages
@@ -377,20 +405,23 @@ def _indexed_direction_contract(
     source_only = _indexed_source_only_languages(manifest, languages)
     raw_directions = manifest.get("translation_directions")
     if raw_directions is None:
-        if current_schema:
-            raise ValueError("Current indexed dataset requires manifest.translation_directions")
-        if legacy_bidirectional is not None:
-            compatibility_bidirectional = legacy_bidirectional
+        if manifest.get("stage") == "foundation":
+            if any(source != target for source, target in pairs):
+                raise ValueError("Foundation indexed datasets require self-pair tasks")
+            directions = pairs
         else:
-            raise ValueError(
-                "Legacy indexed dataset without translation_directions requires an explicit "
-                "bidirectional=True or bidirectional=False audit policy"
+            if current_schema:
+                raise ValueError("Current indexed dataset requires manifest.translation_directions")
+            if legacy_bidirectional is None:
+                raise ValueError(
+                    "Legacy indexed dataset without translation_directions requires an explicit "
+                    "bidirectional=True or bidirectional=False audit policy"
+                )
+            directions = normalize_translation_directions(
+                pairs,
+                bidirectional=legacy_bidirectional,
+                source_only_languages=source_only,
             )
-        directions = normalize_translation_directions(
-            pairs,
-            bidirectional=compatibility_bidirectional,
-            source_only_languages=source_only,
-        )
     else:
         if isinstance(raw_directions, (str, bytes)) or not isinstance(raw_directions, Sequence):
             raise ValueError("Indexed dataset translation_directions must be a sequence")
@@ -461,6 +492,10 @@ def _validate_legacy_indexed_identity(
     """Accept named legacy generations without treating a bare v6 label as proof."""
 
     dataset_format = manifest.get("format")
+    if dataset_format in {"sion-foundation-indexed-v2", "sion-foundation-indexed-v3"}:
+        if manifest.get("stage") != "foundation":
+            raise ValueError("Foundation indexed dataset has an invalid stage identity")
+        return
     if dataset_format in {
         "sion-indexed-parallel-v1",
         "sion-indexed-parallel-v2",
@@ -513,6 +548,46 @@ def _canonical_json_bytes(value: object) -> bytes:
 
 def _manifest_dtype(dtype: np.dtype[Any]) -> object:
     return json.loads(json.dumps(dtype.descr))
+
+
+def _uses_shared_foundation_storage(manifest: Mapping[str, object]) -> bool:
+    """Authenticate the v3 foundation row-alias contract before reading it."""
+
+    enabled = manifest.get("format") == "sion-foundation-indexed-v3"
+    target_storage = manifest.get("target_storage")
+    if not enabled:
+        if target_storage is not None:
+            raise ValueError("Only foundation indexed v3 may declare shared-target storage")
+        return False
+    if manifest.get("stage") != "foundation":
+        raise ValueError("Shared-target storage requires the foundation stage")
+    if target_storage != "row-shared-source-v1":
+        raise ValueError("Foundation shared-target storage contract is invalid")
+    if manifest.get("preprocessing_schema") != "foundation-mixed-objectives-v6":
+        raise ValueError("Foundation shared-target preprocessing schema is invalid")
+    if manifest.get("index_dtype") != _manifest_dtype(SHARED_TARGET_INDEX_DTYPE):
+        raise ValueError("Foundation shared-target index dtype is invalid")
+    if manifest.get("storage_sides") != ["src", "tgt"]:
+        raise ValueError("Foundation shared-target storage sides are invalid")
+    return True
+
+
+def _shared_foundation_source_tasks(manifest: Mapping[str, object]) -> tuple[str, ...]:
+    """Return the authenticated task of each v3 foundation source id."""
+
+    raw_sources = manifest.get("sources")
+    if not isinstance(raw_sources, list) or not raw_sources:
+        raise ValueError("Foundation shared-target manifest has no source tasks")
+    tasks: list[str] = []
+    for source_id, raw_source in enumerate(cast(list[object], raw_sources)):
+        if not isinstance(raw_source, dict):
+            raise ValueError("Foundation shared-target source metadata must be objects")
+        source = cast(dict[object, object], raw_source)
+        task = source.get("task")
+        if source.get("id") != source_id or task not in {"denoising", "reasoning"}:
+            raise ValueError("Foundation shared-target source metadata is invalid")
+        tasks.append(cast(str, task))
+    return tuple(tasks)
 
 
 _LEGACY_GENERIC_REQUIRED_DTYPES = {
@@ -1444,6 +1519,83 @@ def _accumulate_indexed_side(
                 ).astype(np.uint64, copy=False)
 
 
+def _accumulate_shared_target_sides(
+    source_store: np.ndarray,
+    target_store: np.ndarray,
+    source_lengths: np.ndarray,
+    target_lengths: np.ndarray,
+    target_shared: np.ndarray,
+    source_languages: np.ndarray,
+    target_languages: np.ndarray,
+    source_target_rows: np.ndarray,
+    target_target_rows: np.ndarray,
+    physical_counts: list[np.ndarray],
+    target_counts: list[np.ndarray],
+    *,
+    vocab_size: int,
+) -> None:
+    """Audit logical source/target rows while keeping aliased targets memory-bounded."""
+
+    source_token_offset = 0
+    stored_target_offset = 0
+    logical_sizes = source_lengths.astype(np.uint64) + target_lengths.astype(np.uint64)
+    for block in _row_blocks(logical_sizes):
+        block_source_lengths = source_lengths[block].astype(np.int64, copy=False)
+        block_target_lengths = target_lengths[block].astype(np.int64, copy=False)
+        block_shared = target_shared[block].astype(np.bool_, copy=False)
+        source_size = int(block_source_lengths.sum(dtype=np.int64))
+        block_source = np.asarray(
+            source_store[source_token_offset : source_token_offset + source_size]
+        )
+        source_token_offset += source_size
+        source_row_offsets = np.cumsum(
+            np.concatenate((np.zeros(1, dtype=np.int64), block_source_lengths[:-1])),
+            dtype=np.int64,
+        )
+        target_chunks: list[np.ndarray] = []
+        for row_offset, source_length, target_length, shared in zip(
+            source_row_offsets,
+            block_source_lengths,
+            block_target_lengths,
+            block_shared,
+            strict=True,
+        ):
+            if bool(shared):
+                if int(source_length) != int(target_length):
+                    raise ValueError("Shared foundation target length differs from its source")
+                target_chunks.append(
+                    block_source[int(row_offset) : int(row_offset + source_length)]
+                )
+                continue
+            target_chunks.append(
+                np.asarray(
+                    target_store[stored_target_offset : stored_target_offset + int(target_length)]
+                )
+            )
+            stored_target_offset += int(target_length)
+        logical_target = (
+            np.concatenate(target_chunks) if target_chunks else np.empty(0, dtype=np.uint32)
+        )
+        _accumulate_indexed_side(
+            block_source,
+            block_source_lengths,
+            source_languages[block],
+            source_target_rows[block],
+            physical_counts,
+            target_counts,
+            vocab_size=vocab_size,
+        )
+        _accumulate_indexed_side(
+            logical_target,
+            block_target_lengths,
+            target_languages[block],
+            target_target_rows[block],
+            physical_counts,
+            target_counts,
+            vocab_size=vocab_size,
+        )
+
+
 def _add_direction_totals(
     totals: dict[str, Counter[str]],
     source_languages: np.ndarray,
@@ -2018,6 +2170,10 @@ def audit_indexed_token_exposure(
     if file_sha256(manifest_path) != manifest_sha256:
         raise RuntimeError("Indexed dataset manifest changed while it was read")
     current_schema = _uses_current_indexed_schema(root, manifest)
+    shared_foundation_storage = _uses_shared_foundation_storage(manifest)
+    shared_foundation_tasks = (
+        _shared_foundation_source_tasks(manifest) if shared_foundation_storage else ()
+    )
     if not current_schema:
         _validate_legacy_indexed_identity(root, manifest)
     split_root = root / split
@@ -2037,12 +2193,14 @@ def audit_indexed_token_exposure(
         )
     if current_schema and not src_tgt_layout:
         raise ValueError("Current indexed dataset must use the src/tgt storage layout")
-    if not current_schema:
+    if not current_schema and not shared_foundation_storage:
         _validate_legacy_index_dtype(
             first_index,
             index_paths[0],
             generic=src_tgt_layout,
         )
+    elif shared_foundation_storage and first_index.dtype != SHARED_TARGET_INDEX_DTYPE:
+        raise ValueError("Foundation shared-target index dtype is invalid")
 
     (
         languages,
@@ -2079,6 +2237,8 @@ def audit_indexed_token_exposure(
         ]
         | None
     ) = None
+    if shared_foundation_storage:
+        current_inventory_digest = validate_dataset_artifact_inventory(root, manifest)
     if current_schema:
         current_metadata_sha256 = {
             root / RAW_FINGERPRINT_FILENAME: file_sha256(root / RAW_FINGERPRINT_FILENAME),
@@ -2165,12 +2325,14 @@ def audit_indexed_token_exposure(
         }.issubset(fields)
         if shard_src_tgt != src_tgt_layout or shard_legacy_storage != legacy_storage_layout:
             raise ValueError(f"Indexed shard layouts are inconsistent at {index_path}")
-        if not current_schema:
+        if not current_schema and not shared_foundation_storage:
             _validate_legacy_index_dtype(
                 index,
                 index_path,
                 generic=src_tgt_layout,
             )
+        elif shared_foundation_storage and index.dtype != SHARED_TARGET_INDEX_DTYPE:
+            raise ValueError(f"Foundation shared-target index dtype is invalid: {index_path}")
 
         row_count = len(index)
         physical_pairs += row_count
@@ -2187,6 +2349,62 @@ def audit_indexed_token_exposure(
             prefix = index_path.name.removesuffix(".idx.npy")
             side_a_path = split_root / f"{prefix}.src.bin"
             side_b_path = split_root / f"{prefix}.tgt.bin"
+            if shared_foundation_storage:
+                if "target_shared" not in fields:
+                    raise ValueError(f"Foundation shard lacks target_shared: {index_path}")
+                raw_target_shared = np.asarray(index["target_shared"])
+                if not bool(np.isin(raw_target_shared, (0, 1)).all()):
+                    raise ValueError(f"Foundation target_shared flags are invalid: {index_path}")
+                target_shared = raw_target_shared.astype(np.bool_)
+                source_ids = np.asarray(index["source_id"], dtype=np.int64)
+                if source_ids.size and (
+                    int(source_ids.min()) < 0
+                    or int(source_ids.max()) >= len(shared_foundation_tasks)
+                ):
+                    raise ValueError(f"Foundation source ids are invalid: {index_path}")
+                expected_shared = np.fromiter(
+                    (
+                        shared_foundation_tasks[int(source_id)] == "denoising"
+                        for source_id in source_ids
+                    ),
+                    dtype=np.bool_,
+                    count=len(source_ids),
+                )
+                if not np.array_equal(target_shared, expected_shared):
+                    raise ValueError(
+                        f"Foundation shared targets disagree with source tasks: {index_path}"
+                    )
+                if bool(target_shared.any()) and (
+                    not np.array_equal(
+                        side_a_lengths[target_shared],
+                        side_b_lengths[target_shared],
+                    )
+                    or not np.array_equal(
+                        side_a_languages[target_shared],
+                        side_b_languages[target_shared],
+                    )
+                    or not np.array_equal(
+                        np.asarray(index["src_register"])[target_shared],
+                        np.asarray(index["tgt_register"])[target_shared],
+                    )
+                    or not bool(
+                        (np.asarray(index["synthetic"], dtype=np.uint8)[target_shared] == 0).all()
+                    )
+                    or not bool(
+                        (
+                            np.asarray(index["forward_only"], dtype=np.uint8)[target_shared] == 1
+                        ).all()
+                    )
+                ):
+                    raise ValueError(
+                        f"Foundation shared targets contradict source rows: {index_path}"
+                    )
+            else:
+                if "target_shared" in fields:
+                    raise ValueError(
+                        f"Unauthenticated dataset declares shared target rows: {index_path}"
+                    )
+                target_shared = np.zeros(row_count, dtype=np.bool_)
         else:
             assert legacy_storage_pair is not None
             legacy_pair = language_pairs[0]
@@ -2207,6 +2425,7 @@ def audit_indexed_token_exposure(
             prefix = index_path.name.removesuffix(".idx.npy")
             side_a_path = split_root / f"{prefix}.{legacy_storage_pair[0]}.bin"
             side_b_path = split_root / f"{prefix}.{legacy_storage_pair[1]}.bin"
+            target_shared = np.zeros(row_count, dtype=np.bool_)
 
         if row_count:
             minimum_language_id = min(
@@ -2270,26 +2489,42 @@ def audit_indexed_token_exposure(
         side_b_store = _open_indexed_token_store(
             side_b_path,
             side_b_offsets,
-            side_b_lengths,
+            np.where(target_shared, 0, side_b_lengths),
         )
-        _accumulate_indexed_side(
-            side_a_store,
-            side_a_lengths,
-            side_a_languages,
-            reverse_enabled,
-            physical_counts,
-            target_counts,
-            vocab_size=vocab_size,
-        )
-        _accumulate_indexed_side(
-            side_b_store,
-            side_b_lengths,
-            side_b_languages,
-            forward_enabled,
-            physical_counts,
-            target_counts,
-            vocab_size=vocab_size,
-        )
+        if bool(target_shared.any()):
+            _accumulate_shared_target_sides(
+                side_a_store,
+                side_b_store,
+                side_a_lengths,
+                side_b_lengths,
+                target_shared,
+                side_a_languages,
+                side_b_languages,
+                reverse_enabled,
+                forward_enabled,
+                physical_counts,
+                target_counts,
+                vocab_size=vocab_size,
+            )
+        else:
+            _accumulate_indexed_side(
+                side_a_store,
+                side_a_lengths,
+                side_a_languages,
+                reverse_enabled,
+                physical_counts,
+                target_counts,
+                vocab_size=vocab_size,
+            )
+            _accumulate_indexed_side(
+                side_b_store,
+                side_b_lengths,
+                side_b_languages,
+                forward_enabled,
+                physical_counts,
+                target_counts,
+                vocab_size=vocab_size,
+            )
 
         physical_sentences += np.bincount(
             np.concatenate((side_a_languages, side_b_languages)).astype(np.int64),
@@ -2384,6 +2619,7 @@ def audit_indexed_token_exposure(
     global_summary["below_threshold_pieces"] = int(
         global_summary["unused_pieces"] + global_summary["rare_observed_pieces"]
     )
+    authenticated_indexed = current_schema or shared_foundation_storage
     report = {
         "schema": "sion-indexed-token-exposure-audit-v2",
         "complete_scan": True,
@@ -2394,16 +2630,16 @@ def audit_indexed_token_exposure(
             "dataset_format": str(manifest.get("format", "unknown")),
             "dataset_contract": (
                 "current-integrity-verified"
-                if current_schema
+                if authenticated_indexed
                 else "legacy-unverified-explicit-policy"
             ),
             "integrity_assurance": {
                 "level": (
                     "self-consistent-hashes-not-signed"
-                    if current_schema
+                    if authenticated_indexed
                     else "legacy-payload-unverified"
                 ),
-                "payload_sha256_reverified_after_scan": current_schema,
+                "payload_sha256_reverified_after_scan": authenticated_indexed,
                 "manifest_sha256_reverified_after_scan": True,
                 "tokenizer_sha256_reverified_after_scan": True,
                 "cryptographically_signed": False,
@@ -2417,7 +2653,7 @@ def audit_indexed_token_exposure(
             "language_pairs": [list(pair) for pair in language_pairs],
             "translation_directions": [list(direction) for direction in translation_directions],
             "source_only_languages": list(source_only_languages),
-            "legacy_bidirectional_override": bidirectional if not current_schema else None,
+            "legacy_bidirectional_override": bidirectional if not authenticated_indexed else None,
             "rare_threshold": rare_threshold,
         },
         "vocab_size": vocab_size,
@@ -2454,6 +2690,10 @@ def audit_indexed_token_exposure(
                 raise RuntimeError(
                     f"Current dataset metadata changed during token audit: {metadata_path}"
                 )
+    if shared_foundation_storage:
+        post_inventory_digest = validate_dataset_artifact_inventory(root, manifest)
+        if post_inventory_digest != current_inventory_digest:
+            raise RuntimeError("Foundation dataset payload changed during token audit")
     if file_sha256(manifest_path) != manifest_sha256:
         raise RuntimeError("Indexed dataset manifest changed during token audit")
     if file_sha256(tokenizer_path) != tokenizer_identity["sha256"]:

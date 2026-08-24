@@ -49,7 +49,7 @@ from sion_translate.data.monolingual import (
     iter_monolingual_lines,
     segment_text,
 )
-from sion_translate.data.prepare import INDEX_DTYPE, ShardWriter, infer_register
+from sion_translate.data.prepare import SHARED_TARGET_INDEX_DTYPE, ShardWriter, infer_register
 from sion_translate.data.integrity import (
     build_dataset_artifact_inventory,
     dataset_artifact_problem,
@@ -65,8 +65,8 @@ from sion_translate.fingerprint import file_sha256
 from sion_translate.splitting import choose_split_for_key
 from sion_translate.tokenizer import SionTokenizer, normalize_text
 
-FOUNDATION_INDEX_FORMAT = "sion-foundation-indexed-v2"
-FOUNDATION_PREPROCESSING_SCHEMA = "foundation-mixed-objectives-v5"
+FOUNDATION_INDEX_FORMAT = "sion-foundation-indexed-v3"
+FOUNDATION_PREPROCESSING_SCHEMA = "foundation-mixed-objectives-v6"
 FOUNDATION_SOURCE_IDENTITY_SCHEMA = "corpus-relative-posix-sha256-v1"
 FOUNDATION_TOKENIZER_IDENTITY_SCHEMA = "content-sha256-v1"
 FOUNDATION_DEDUPLICATION_BACKEND = "sqlite-blake2b-128-v1"
@@ -985,7 +985,9 @@ def _foundation_manifest_semantic_problem(
         return "foundation manifest source_only_languages가 잘못되었습니다"
     if manifest.get("storage_sides") != ["src", "tgt"]:
         return "foundation manifest storage_sides가 잘못되었습니다"
-    expected_index_dtype = json.loads(json.dumps(INDEX_DTYPE.descr))
+    if manifest.get("target_storage") != "row-shared-source-v1":
+        return "foundation manifest target_storage contract is invalid"
+    expected_index_dtype = json.loads(json.dumps(SHARED_TARGET_INDEX_DTYPE.descr))
     if manifest.get("index_dtype") != expected_index_dtype:
         return "foundation manifest index_dtype이 잘못되었습니다"
 
@@ -1065,6 +1067,7 @@ def _foundation_manifest_semantic_problem(
         return "foundation manifest source 개수가 잘못되었습니다"
     source_records: list[int] = []
     source_language_ids: list[int] = []
+    source_tasks: list[str] = []
     for source_id, (raw_source, expected_source) in enumerate(
         zip(source_values, discovery.sources, strict=True)
     ):
@@ -1117,6 +1120,7 @@ def _foundation_manifest_semantic_problem(
         expected_task = "reasoning" if is_reasoning_jsonl(expected_source.path) else "denoising"
         if source.get("task") != expected_task:
             return f"foundation manifest source task가 잘못되었습니다: {source_id}"
+        source_tasks.append(expected_task)
         records = source.get("records")
         if isinstance(records, bool) or not isinstance(records, int) or records < 0:
             return f"foundation manifest source records가 잘못되었습니다: {source_id}"
@@ -1127,6 +1131,7 @@ def _foundation_manifest_semantic_problem(
     split_totals: dict[str, int] = {}
     for split in ("train", "validation"):
         split_total = 0
+        expected_artifacts: set[str] = set()
         for index_path in sorted((output_dir / split).glob("*.idx.npy")):
             try:
                 index = np.load(index_path, mmap_mode="r", allow_pickle=False)
@@ -1135,13 +1140,20 @@ def _foundation_manifest_semantic_problem(
             names = index.dtype.names
             required_fields = {
                 "source_id",
+                "src_offset",
+                "src_length",
+                "tgt_offset",
+                "tgt_length",
                 "src_language_id",
                 "tgt_language_id",
+                "src_register",
+                "tgt_register",
                 "forward_only",
+                "target_shared",
             }
             if names is None or not required_fields.issubset(names):
                 return f"foundation index metadata schema가 잘못되었습니다: {index_path}"
-            if index.dtype != INDEX_DTYPE:
+            if index.dtype != SHARED_TARGET_INDEX_DTYPE:
                 return f"foundation index dtype이 잘못되었습니다: {index_path}"
             source_ids = np.asarray(index["source_id"], dtype=np.int64)
             if source_ids.size and (
@@ -1163,7 +1175,60 @@ def _foundation_manifest_semantic_problem(
                 return f"foundation index language/source mapping이 잘못되었습니다: {index_path}"
             if not bool((np.asarray(index["forward_only"], dtype=np.uint8) == 1).all()):
                 return f"foundation index forward_only 계약이 잘못되었습니다: {index_path}"
+            shared = np.asarray(index["target_shared"], dtype=np.uint8)
+            if not bool(np.isin(shared, (0, 1)).all()):
+                return f"foundation index target_shared flag is invalid: {index_path}"
+            expected_shared = np.asarray(
+                [source_tasks[source_id] == "denoising" for source_id in source_ids],
+                dtype=np.bool_,
+            )
+            if not np.array_equal(shared.astype(np.bool_), expected_shared):
+                return f"foundation index target storage disagrees with source tasks: {index_path}"
+
+            src_offsets = np.asarray(index["src_offset"], dtype=np.uint64)
+            src_lengths = np.asarray(index["src_length"], dtype=np.uint64)
+            tgt_offsets = np.asarray(index["tgt_offset"], dtype=np.uint64)
+            tgt_lengths = np.asarray(index["tgt_length"], dtype=np.uint64)
+            expected_src_offsets = np.concatenate(
+                (np.zeros(1, dtype=np.uint64), np.cumsum(src_lengths[:-1], dtype=np.uint64))
+            )
+            stored_tgt_lengths = np.where(shared.astype(np.bool_), 0, tgt_lengths)
+            expected_tgt_offsets = np.concatenate(
+                (
+                    np.zeros(1, dtype=np.uint64),
+                    np.cumsum(stored_tgt_lengths[:-1], dtype=np.uint64),
+                )
+            )
+            if not np.array_equal(src_offsets, expected_src_offsets) or not np.array_equal(
+                tgt_offsets,
+                expected_tgt_offsets,
+            ):
+                return f"foundation token offsets are not contiguous: {index_path}"
+            shared_mask = shared.astype(np.bool_)
+            if bool(shared_mask.any()) and (
+                not np.array_equal(src_lengths[shared_mask], tgt_lengths[shared_mask])
+                or not np.array_equal(
+                    np.asarray(index["src_register"])[shared_mask],
+                    np.asarray(index["tgt_register"])[shared_mask],
+                )
+            ):
+                return f"foundation shared targets contradict their source rows: {index_path}"
+            prefix = index_path.name.removesuffix(".idx.npy")
+            src_path = index_path.with_name(f"{prefix}.src.bin")
+            tgt_path = index_path.with_name(f"{prefix}.tgt.bin")
+            expected_artifacts.update({index_path.name, src_path.name, tgt_path.name})
+            if src_path.stat().st_size != int(src_lengths.sum(dtype=np.uint64)) * 4:
+                return f"foundation source token payload length is invalid: {src_path}"
+            if tgt_path.stat().st_size != int(stored_tgt_lengths.sum(dtype=np.uint64)) * 4:
+                return f"foundation target token payload length is invalid: {tgt_path}"
             split_total += len(index)
+        actual_artifacts = {path.name for path in (output_dir / split).iterdir()}
+        if actual_artifacts != expected_artifacts:
+            return (
+                f"foundation {split} artifacts are incomplete or unexpected: "
+                f"missing={sorted(expected_artifacts - actual_artifacts)}, "
+                f"unexpected={sorted(actual_artifacts - expected_artifacts)}"
+            )
         split_totals[split] = split_total
 
     if indexed_counts.tolist() != source_records:
@@ -1363,7 +1428,13 @@ def _prepare_foundation_dataset_in_staging(
     writers: dict[str, ShardWriter] = {}
     try:
         for split in ("train", "validation"):
-            writers[split] = ShardWriter(output_dir, split, shard_size, language_to_id)
+            writers[split] = ShardWriter(
+                output_dir,
+                split,
+                shard_size,
+                language_to_id,
+                shared_targets=True,
+            )
     except BaseException:
         _close_shard_writers(writers, suppress_errors=True)
         if deduplication_index is not None:
@@ -1410,6 +1481,10 @@ def _prepare_foundation_dataset_in_staging(
             # 양방향 확장을 끕니다. 복원 과제는 두 방향이 같은 예제라
             # 켜 두면 모든 문장이 정확히 두 번 학습됩니다.
             forward_only=True,
+            # Denoising reconstructs the exact source token sequence. The v3
+            # foundation format authenticates that invariant per row and stores
+            # those bytes once. Reasoning rows keep an independent target.
+            shared_target=True,
         )
         language_stats.accepted += 1
         if split == "train":
@@ -1577,7 +1652,8 @@ def _prepare_foundation_dataset_in_staging(
         "language_pairs": [[language, language] for language in languages],
         "source_only_languages": [],
         "storage_sides": ["src", "tgt"],
-        "index_dtype": INDEX_DTYPE.descr,
+        "index_dtype": SHARED_TARGET_INDEX_DTYPE.descr,
+        "target_storage": "row-shared-source-v1",
         # This is a display label, not a filesystem identity. The adjacent
         # content-addressed object authenticates a tokenizer after relocation.
         "tokenizer_model": Path(tokenizer_snapshot.resolved_path).name,

@@ -170,6 +170,7 @@ def validate_dataset_artifact_inventory(
         authenticated_format = manifest.get("format") in {
             "sion-indexed-parallel-v6",
             "sion-foundation-indexed-v2",
+            "sion-foundation-indexed-v3",
         }
         if not require_manifest and not authenticated_format:
             return None

@@ -15,6 +15,7 @@ import shutil
 import stat
 from pathlib import Path, PurePosixPath
 
+import numpy as np
 import pytest
 
 import sion_translate.data.prepare_foundation as foundation_prepare
@@ -26,6 +27,7 @@ from sion_translate.data.prepare_foundation import (
     prepare_foundation_dataset,
     render_prepare_report,
 )
+from sion_translate.token_audit import audit_indexed_token_exposure
 from sion_translate.tokenizer import SionTokenizer, train_tokenizer
 
 
@@ -128,6 +130,8 @@ def test_the_manifest_records_the_stage_identity(tmp_path, tokenizer_model) -> N
     assert manifest["stage"] == "foundation"
     assert manifest["release_name"] == "sion"
     assert manifest["objective"] == "span-corruption-denoising"
+    assert manifest["format"] == "sion-foundation-indexed-v3"
+    assert manifest["target_storage"] == "row-shared-source-v1"
     # 순서는 폴더 정렬 순서를 따른다. 각 언어가 자기 자신과 짝지어지는 것이 요점.
     assert sorted(manifest["language_pairs"]) == [["ja", "ja"], ["ko", "ko"]]
     assert all(pair[0] == pair[1] for pair in manifest["language_pairs"])
@@ -145,6 +149,79 @@ def test_the_manifest_records_the_stage_identity(tmp_path, tokenizer_model) -> N
         assert "\\" not in source["logical_path"]
         path = discovery.root.joinpath(*PurePosixPath(source["logical_path"]).parts)
         assert source["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+
+    source_bytes = 0
+    target_bytes = 0
+    for index_path in (tmp_path / "dataset").glob("*/*.idx.npy"):
+        index = np.load(index_path, allow_pickle=False)
+        assert (index["target_shared"] == 1).all()
+        prefix = index_path.name.removesuffix(".idx.npy")
+        source_bytes += index_path.with_name(f"{prefix}.src.bin").stat().st_size
+        target_bytes += index_path.with_name(f"{prefix}.tgt.bin").stat().st_size
+    assert source_bytes > 0
+    assert target_bytes == 0
+
+    audit = audit_indexed_token_exposure(
+        tmp_path / "dataset",
+        tokenizer_model,
+        split="train",
+    )
+    assert audit["parameters"]["dataset_contract"] == "current-integrity-verified"
+    assert audit["global_target_frequency"]["all_target_tokens"] > 0
+
+
+def test_reader_rejects_shared_targets_without_the_v3_storage_marker(
+    tmp_path,
+    tokenizer_model,
+) -> None:
+    _prepare(tmp_path, tokenizer_model)
+    manifest_path = tmp_path / "dataset" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    del manifest["target_storage"]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="authenticated foundation manifest"):
+        IndexedParallelDataset(
+            tmp_path / "dataset",
+            split="train",
+            verify_integrity=False,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement", "message"),
+    [
+        ("target_shared", 0, "source tasks"),
+        ("src_offset", 1, "stored token bytes"),
+        ("tgt_offset", 1, "stored token bytes"),
+        ("tgt_length", 1, "source alias contract"),
+        ("tgt_register", 255, "source alias contract"),
+        ("tgt_language_id", 255, "source alias contract"),
+    ],
+)
+def test_reader_rejects_invalid_shared_target_aliases(
+    tmp_path,
+    tokenizer_model,
+    field,
+    replacement,
+    message,
+) -> None:
+    _prepare(tmp_path, tokenizer_model)
+    index_path = next(
+        path
+        for path in sorted((tmp_path / "dataset" / "train").glob("*.idx.npy"))
+        if len(np.load(path, allow_pickle=False))
+    )
+    index = np.load(index_path, allow_pickle=False)
+    index[field][0] = replacement
+    np.save(index_path, index, allow_pickle=False)
+
+    with pytest.raises(ValueError, match=message):
+        IndexedParallelDataset(
+            tmp_path / "dataset",
+            split="train",
+            verify_integrity=False,
+        )
 
 
 def test_manifest_source_identities_survive_corpus_relocation(
@@ -923,6 +1000,16 @@ def test_reasoning_rows_bypass_forced_denoising_and_keep_trace_markers(
         tokenizer.reasoning_trace_ids["</answer>"] in row.tolist() for row in batch["labels"]
     )
     assert stats.languages["ja"].reasoning_records == 12
+
+    shared_flags = []
+    target_payload_bytes = 0
+    for index_path in (tmp_path / "dataset").glob("*/*.idx.npy"):
+        index = np.load(index_path, allow_pickle=False)
+        shared_flags.extend(np.asarray(index["target_shared"], dtype=np.uint8).tolist())
+        prefix = index_path.name.removesuffix(".idx.npy")
+        target_payload_bytes += index_path.with_name(f"{prefix}.tgt.bin").stat().st_size
+    assert 0 in shared_flags and 1 in shared_flags
+    assert target_payload_bytes > 0
 
     manifest = json.loads((tmp_path / "dataset" / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["objective"] == "span-corruption-denoising+structured-reasoning"

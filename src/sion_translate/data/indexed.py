@@ -15,6 +15,7 @@ from sion_translate.fingerprint import PREPROCESSING_SCHEMA
 from sion_translate.language_tags import canonicalize_language_tag
 
 from .integrity import validate_dataset_artifact_inventory
+from .prepare import SHARED_TARGET_INDEX_DTYPE
 from .records import (
     languages_from_pairs,
     normalize_language_pairs,
@@ -70,6 +71,7 @@ class IndexedParallelDataset(Dataset[dict[str, object]]):
         if not self.index_paths:
             raise FileNotFoundError(f"No index shards found under {self.root}")
         self.indices = self._open_indices()
+        self._shared_target_storage = self._validate_shared_target_storage()
         self.record_metadata_indices = self._open_record_metadata_indices()
         self._record_metadata_cache: dict[int, np.memmap] = {}
         self.has_record_metadata = any(index is not None for index in self.record_metadata_indices)
@@ -177,6 +179,132 @@ class IndexedParallelDataset(Dataset[dict[str, object]]):
 
     def _open_indices(self) -> list[np.ndarray]:
         return [np.load(path, mmap_mode="r", allow_pickle=False) for path in self.index_paths]
+
+    def _validate_shared_target_storage(self) -> bool:
+        """Bind per-row target aliasing to an authenticated foundation manifest."""
+
+        field_presence = [
+            bool(index.dtype.names and "target_shared" in index.dtype.names)
+            for index in self.indices
+        ]
+        manifest_enabled = self._manifest.get("target_storage") == "row-shared-source-v1"
+        if any(field_presence) != all(field_presence):
+            raise ValueError("dataset shards disagree about shared-target storage")
+        if any(field_presence) and (
+            self._manifest.get("stage") != "foundation" or not manifest_enabled
+        ):
+            raise ValueError("shared-target rows require an authenticated foundation manifest")
+        if manifest_enabled and not all(field_presence):
+            raise ValueError("foundation manifest requires missing shared-target index fields")
+        if not manifest_enabled:
+            return False
+
+        expected_dtype = json.loads(json.dumps(SHARED_TARGET_INDEX_DTYPE.descr))
+        if (
+            self._manifest.get("format") != "sion-foundation-indexed-v3"
+            or self._manifest.get("preprocessing_schema") != "foundation-mixed-objectives-v6"
+            or self._manifest.get("storage_sides") != ["src", "tgt"]
+            or self._manifest.get("index_dtype") != expected_dtype
+        ):
+            raise ValueError(
+                "shared-target storage markers do not match the foundation v3 contract"
+            )
+
+        raw_sources: object = self._manifest.get("sources")
+        if not isinstance(raw_sources, list) or not raw_sources:
+            raise ValueError("shared-target foundation manifest has no source tasks")
+        source_tasks: list[str] = []
+        for source_id, raw_source in enumerate(cast(list[object], raw_sources)):
+            if not isinstance(raw_source, dict):
+                raise ValueError("shared-target foundation source metadata must be objects")
+            source = cast(dict[object, object], raw_source)
+            task = source.get("task")
+            if source.get("id") != source_id or task not in {"denoising", "reasoning"}:
+                raise ValueError("shared-target foundation source metadata is invalid")
+            source_tasks.append(cast(str, task))
+
+        required = {
+            "src_offset",
+            "src_length",
+            "tgt_offset",
+            "tgt_length",
+            "src_register",
+            "tgt_register",
+            "src_language_id",
+            "tgt_language_id",
+            "synthetic",
+            "forward_only",
+            "target_shared",
+        }
+        for index_path, index in zip(self.index_paths, self.indices, strict=True):
+            if index.dtype != SHARED_TARGET_INDEX_DTYPE:
+                raise ValueError("shared-target foundation shard dtype is invalid")
+            names = set(index.dtype.names or ())
+            if not required <= names:
+                raise ValueError("shared-target index lacks required row fields")
+            shared = np.asarray(index["target_shared"], dtype=np.uint8)
+            if not bool(np.isin(shared, (0, 1)).all()):
+                raise ValueError("shared-target index flag must contain only zero or one")
+            shared_mask = shared.astype(np.bool_)
+            source_ids = np.asarray(index["source_id"], dtype=np.int64)
+            if source_ids.size and (
+                int(source_ids.min()) < 0 or int(source_ids.max()) >= len(source_tasks)
+            ):
+                raise ValueError("shared-target foundation source id is out of range")
+            expected_shared = np.fromiter(
+                (source_tasks[int(source_id)] == "denoising" for source_id in source_ids),
+                dtype=np.bool_,
+                count=len(source_ids),
+            )
+            if not np.array_equal(shared_mask, expected_shared):
+                raise ValueError("shared-target rows disagree with foundation source tasks")
+            src_lengths = np.asarray(index["src_length"], dtype=np.uint64)
+            tgt_lengths = np.asarray(index["tgt_length"], dtype=np.uint64)
+            src_offsets = np.asarray(index["src_offset"], dtype=np.uint64)
+            stored_tgt_lengths = np.where(shared_mask, 0, tgt_lengths)
+            tgt_offsets = np.asarray(index["tgt_offset"], dtype=np.uint64)
+            expected_src_offsets = np.concatenate(
+                (
+                    np.zeros(1, dtype=np.uint64),
+                    np.cumsum(src_lengths[:-1], dtype=np.uint64),
+                )
+            )
+            expected_tgt_offsets = np.concatenate(
+                (
+                    np.zeros(1, dtype=np.uint64),
+                    np.cumsum(stored_tgt_lengths[:-1], dtype=np.uint64),
+                )
+            )
+            if not np.array_equal(src_offsets, expected_src_offsets) or not np.array_equal(
+                tgt_offsets, expected_tgt_offsets
+            ):
+                raise ValueError("shared-target offsets do not match stored token bytes")
+            if bool(shared_mask.any()) and (
+                not np.array_equal(src_lengths[shared_mask], tgt_lengths[shared_mask])
+                or not np.array_equal(
+                    np.asarray(index["src_register"])[shared_mask],
+                    np.asarray(index["tgt_register"])[shared_mask],
+                )
+                or not np.array_equal(
+                    np.asarray(index["src_language_id"])[shared_mask],
+                    np.asarray(index["tgt_language_id"])[shared_mask],
+                )
+                or not bool(
+                    (np.asarray(index["synthetic"], dtype=np.uint8)[shared_mask] == 0).all()
+                )
+                or not bool(
+                    (np.asarray(index["forward_only"], dtype=np.uint8)[shared_mask] == 1).all()
+                )
+            ):
+                raise ValueError("shared-target rows contradict their source alias contract")
+            prefix = index_path.name.removesuffix(".idx.npy")
+            source_path = self.root / f"{prefix}.src.bin"
+            target_path = self.root / f"{prefix}.tgt.bin"
+            if source_path.stat().st_size != int(src_lengths.sum(dtype=np.uint64)) * 4:
+                raise ValueError("shared-target source payload length disagrees with index offsets")
+            if target_path.stat().st_size != int(stored_tgt_lengths.sum(dtype=np.uint64)) * 4:
+                raise ValueError("shared-target payload length disagrees with index offsets")
+        return manifest_enabled
 
     def _open_record_metadata_indices(self) -> list[np.ndarray | None]:
         result: list[np.ndarray | None] = []
@@ -644,13 +772,16 @@ class IndexedParallelDataset(Dataset[dict[str, object]]):
                         dtype=np.int64,
                     )
                     draft_positions = np.flatnonzero(source_tokens == draft_token_id)
-                    target_start = int(row["tgt_offset"])
-                    target_length = int(row["tgt_length"])
-                    target_store = self._tokens(shard, "tgt")
-                    target_tokens = np.asarray(
-                        target_store[target_start : target_start + target_length],
-                        dtype=np.int64,
-                    )
+                    if "target_shared" in names and bool(row["target_shared"]):
+                        target_tokens = source_tokens
+                    else:
+                        target_start = int(row["tgt_offset"])
+                        target_length = int(row["tgt_length"])
+                        target_store = self._tokens(shard, "tgt")
+                        target_tokens = np.asarray(
+                            target_store[target_start : target_start + target_length],
+                            dtype=np.int64,
+                        )
                     target_draft_positions = np.flatnonzero(target_tokens == draft_token_id)
                 if target_draft_positions is not None and len(target_draft_positions):
                     raise ValueError(
@@ -935,17 +1066,27 @@ class IndexedParallelDataset(Dataset[dict[str, object]]):
             language_a = self.languages[int(row["src_language_id"])]
             language_b = self.languages[int(row["tgt_language_id"])]
             src_store = self._tokens(shard, "src")
-            tgt_store = self._tokens(shard, "tgt")
             src_start, src_length = int(row["src_offset"]), int(row["src_length"])
             tgt_start, tgt_length = int(row["tgt_offset"]), int(row["tgt_length"])
             side_a = np.asarray(
                 src_store[src_start : src_start + src_length],
                 dtype=np.int64,
             )
-            side_b = np.asarray(
-                tgt_store[tgt_start : tgt_start + tgt_length],
-                dtype=np.int64,
+            target_shared = bool(
+                row["target_shared"]
+                if row.dtype.names is not None and "target_shared" in row.dtype.names
+                else False
             )
+            if target_shared:
+                if not self._shared_target_storage or tgt_length != src_length:
+                    raise ValueError("shared target row contradicts its authenticated contract")
+                side_b = side_a
+            else:
+                tgt_store = self._tokens(shard, "tgt")
+                side_b = np.asarray(
+                    tgt_store[tgt_start : tgt_start + tgt_length],
+                    dtype=np.int64,
+                )
             register_a = int(row["src_register"])
             register_b = int(row["tgt_register"])
         else:

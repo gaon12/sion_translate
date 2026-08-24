@@ -94,6 +94,7 @@ INDEX_DTYPE = np.dtype(
         ("forward_only", "u1"),
     ]
 )
+SHARED_TARGET_INDEX_DTYPE = np.dtype([*INDEX_DTYPE.descr, ("target_shared", "u1")])
 
 
 @dataclass
@@ -178,12 +179,16 @@ class ShardWriter:
         split: str,
         shard_size: int,
         language_to_id: dict[str, int],
+        *,
+        shared_targets: bool = False,
     ):
         self.root = root / split
         self.root.mkdir(parents=True, exist_ok=True)
         self.split = split
         self.shard_size = shard_size
         self.language_to_id = language_to_id
+        self.shared_targets = shared_targets
+        self.index_dtype = SHARED_TARGET_INDEX_DTYPE if shared_targets else INDEX_DTYPE
         self.shard_index = 0
         self.records: list[tuple[int, ...]] = []
         self.record_metadata: list[bytes] = []
@@ -218,32 +223,43 @@ class ShardWriter:
         synthetic: bool,
         forward_only: bool = False,
         metadata: dict[str, object] | None = None,
+        shared_target: bool = False,
     ) -> None:
         assert self._src_handle is not None and self._tgt_handle is not None
         metadata_payload = encode_record_metadata(metadata)
         src_array = np.asarray(src_ids, dtype=np.uint32)
         tgt_array = np.asarray(tgt_ids, dtype=np.uint32)
+        if shared_target:
+            if not self.shared_targets:
+                raise ValueError("shared targets require a shared-target shard writer")
+            if (
+                src_language != tgt_language
+                or src_register != tgt_register
+                or not np.array_equal(src_array, tgt_array)
+            ):
+                raise ValueError("a shared target must be identical to its source contract")
         src_array.tofile(self._src_handle)
-        tgt_array.tofile(self._tgt_handle)
-        self.records.append(
-            (
-                self.src_offset,
-                len(src_array),
-                self.tgt_offset,
-                len(tgt_array),
-                src_register,
-                tgt_register,
-                self.language_to_id[src_language],
-                self.language_to_id[tgt_language],
-                source_id,
-                quality_score,
-                int(synthetic),
-                int(forward_only),
-            )
+        if not shared_target:
+            tgt_array.tofile(self._tgt_handle)
+        record = (
+            self.src_offset,
+            len(src_array),
+            self.tgt_offset,
+            len(tgt_array),
+            src_register,
+            tgt_register,
+            self.language_to_id[src_language],
+            self.language_to_id[tgt_language],
+            source_id,
+            quality_score,
+            int(synthetic),
+            int(forward_only),
         )
+        self.records.append((*record, int(shared_target)) if self.shared_targets else record)
         self.record_metadata.append(metadata_payload)
         self.src_offset += len(src_array)
-        self.tgt_offset += len(tgt_array)
+        if not shared_target:
+            self.tgt_offset += len(tgt_array)
         self.total_records += 1
         if len(self.records) >= self.shard_size:
             self._finish_shard()
@@ -257,7 +273,7 @@ class ShardWriter:
         if self.records:
             np.save(
                 self.root / f"{self._prefix()}.idx.npy",
-                np.asarray(self.records, dtype=INDEX_DTYPE),
+                np.asarray(self.records, dtype=self.index_dtype),
                 allow_pickle=False,
             )
             if any(self.record_metadata):
