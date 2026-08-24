@@ -356,6 +356,264 @@ def test_row_scoped_direction_is_canonicalized_before_dataset_persistence(
     ) == ("pt-BR", "en")
 
 
+def test_revision_direction_detection_authenticates_exact_bcp47_row_edge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepare_module = importlib.import_module("sion_translate.data.prepare")
+
+    class StubTokenizer:
+        languages = ("pt-BR", "zh-Hant")
+        draft_id = 1_000_001
+
+        def __init__(self, _model_path: str | Path):
+            pass
+
+        @staticmethod
+        def encode(text: str) -> list[int]:
+            source, separator, draft = text.partition("<draft>")
+            if not separator:
+                return [ord(character) for character in text]
+            return [
+                *[ord(character) for character in source.strip()],
+                StubTokenizer.draft_id,
+                *[ord(character) for character in draft.strip()],
+            ]
+
+    monkeypatch.setattr(prepare_module, "SionTokenizer", StubTokenizer)
+    tokenizer_path = tmp_path / "tokenizer.model"
+    tokenizer_path.write_bytes(b"stub tokenizer")
+    source_path = tmp_path / "custom_revision_source.jsonl"
+    source_path.write_text(
+        json.dumps(
+            {
+                "pt-BR": "Esta fonte precisa de revisão. <draft> Um rascunho imperfeito.",
+                "zh-Hant": "這個翻譯需要仔細修訂。",
+                "training_direction": ["PT-br", "zh-hant"],
+                "provenance": {"transformation": "revision"},
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    dataset_root = tmp_path / "dataset"
+    prepare_dataset(
+        [str(source_path)],
+        tokenizer_path,
+        dataset_root,
+        language_pairs=(("pt-br", "zh-hant"),),
+        translation_directions=(("pt-BR", "zh-Hant"), ("zh-Hant", "pt-BR")),
+        validation_fraction=0.0,
+        test_fraction=0.0,
+        filter_quality=False,
+        dedup_backend="memory",
+        num_workers=1,
+    )
+
+    dataset = IndexedParallelDataset(dataset_root, "train", bidirectional=True)
+
+    assert dataset.detect_revision_directions(
+        draft_token_id=StubTokenizer.draft_id,
+        max_source_tokens=10_000,
+    ) == (("pt-BR", "zh-Hant"),)
+    assert (
+        dataset.detect_revision_directions(
+            draft_token_id=StubTokenizer.draft_id,
+            max_source_tokens=10_000,
+            physical_mask=np.array([False], dtype=np.bool_),
+        )
+        == ()
+    )
+    with pytest.raises(ValueError, match="physical pair mask"):
+        dataset.detect_revision_directions(
+            draft_token_id=StubTokenizer.draft_id,
+            max_source_tokens=10_000,
+            physical_mask=np.array([True, False], dtype=np.bool_),
+        )
+    source_tokens = np.asarray(dataset[0]["src"], dtype=np.int64)
+    separator_position = int(np.flatnonzero(source_tokens == StubTokenizer.draft_id)[0])
+    with pytest.raises(ValueError, match="after the training collator's source truncation"):
+        dataset.detect_revision_directions(
+            draft_token_id=StubTokenizer.draft_id,
+            max_source_tokens=separator_position + 1,
+        )
+
+
+def test_revision_provenance_cannot_relabel_an_ordinary_translation_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepare_module = importlib.import_module("sion_translate.data.prepare")
+
+    class StubTokenizer:
+        languages = ("pt-BR", "zh-Hant")
+        draft_id = 1_000_001
+
+        def __init__(self, _model_path: str | Path):
+            pass
+
+        @staticmethod
+        def encode(text: str) -> list[int]:
+            return [ord(character) for character in text]
+
+    monkeypatch.setattr(prepare_module, "SionTokenizer", StubTokenizer)
+    tokenizer_path = tmp_path / "tokenizer.model"
+    tokenizer_path.write_bytes(b"stub tokenizer")
+    source_path = tmp_path / "ordinary_with_revision_claim.jsonl"
+    source_path.write_text(
+        json.dumps(
+            {
+                "pt-BR": "Uma tradução comum sem qualquer rascunho.",
+                "zh-Hant": "這是沒有草稿的一般翻譯。",
+                "training_direction": ["pt-BR", "zh-Hant"],
+                "provenance": {"transformation": "revision"},
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    dataset_root = tmp_path / "dataset"
+    prepare_dataset(
+        [str(source_path)],
+        tokenizer_path,
+        dataset_root,
+        language_pairs=(("pt-BR", "zh-Hant"),),
+        translation_directions=(("pt-BR", "zh-Hant"),),
+        validation_fraction=0.0,
+        test_fraction=0.0,
+        filter_quality=False,
+        dedup_backend="memory",
+        num_workers=1,
+    )
+    dataset = IndexedParallelDataset(dataset_root, "train", bidirectional=True)
+
+    with pytest.raises(ValueError, match="exactly one <draft> token"):
+        dataset.detect_revision_directions(
+            draft_token_id=StubTokenizer.draft_id,
+            max_source_tokens=10_000,
+        )
+
+
+def test_unmarked_draft_structure_is_rejected_even_when_row_is_not_selected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepare_module = importlib.import_module("sion_translate.data.prepare")
+
+    class StubTokenizer:
+        languages = ("pt-BR", "zh-Hant")
+        draft_id = 1_000_001
+
+        def __init__(self, _model_path: str | Path):
+            pass
+
+        @staticmethod
+        def encode(text: str) -> list[int]:
+            source, separator, draft = text.partition("<draft>")
+            if not separator:
+                return [ord(character) for character in text]
+            return [
+                *[ord(character) for character in source.strip()],
+                StubTokenizer.draft_id,
+                *[ord(character) for character in draft.strip()],
+            ]
+
+    monkeypatch.setattr(prepare_module, "SionTokenizer", StubTokenizer)
+    tokenizer_path = tmp_path / "tokenizer.model"
+    tokenizer_path.write_bytes(b"stub tokenizer")
+    source_path = tmp_path / "ordinary_parallel.jsonl"
+    source_path.write_text(
+        json.dumps(
+            {
+                "pt-BR": "Esta fonte esconde uma revisão. <draft> Rascunho oculto.",
+                "zh-Hant": "這筆資料隱藏了修訂結構。",
+                "training_direction": ["pt-BR", "zh-Hant"],
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    dataset_root = tmp_path / "dataset"
+    prepare_dataset(
+        [str(source_path)],
+        tokenizer_path,
+        dataset_root,
+        language_pairs=(("pt-BR", "zh-Hant"),),
+        translation_directions=(("pt-BR", "zh-Hant"),),
+        validation_fraction=0.0,
+        test_fraction=0.0,
+        filter_quality=False,
+        dedup_backend="memory",
+        num_workers=1,
+    )
+    dataset = IndexedParallelDataset(dataset_root, "train", bidirectional=True)
+
+    with pytest.raises(ValueError, match="lacks a revision filename or provenance marker"):
+        dataset.detect_revision_directions(
+            draft_token_id=StubTokenizer.draft_id,
+            max_source_tokens=10_000,
+            physical_mask=np.array([False], dtype=np.bool_),
+        )
+
+
+def test_revision_source_rejects_conflicting_provenance_label(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepare_module = importlib.import_module("sion_translate.data.prepare")
+
+    class StubTokenizer:
+        languages = ("pt-BR", "zh-Hant")
+
+        def __init__(self, _model_path: str | Path):
+            pass
+
+        @staticmethod
+        def encode(text: str) -> list[int]:
+            return [ord(character) for character in text]
+
+    monkeypatch.setattr(prepare_module, "SionTokenizer", StubTokenizer)
+    tokenizer_path = tmp_path / "tokenizer.model"
+    tokenizer_path.write_bytes(b"stub tokenizer")
+    source_path = tmp_path / "revise_conflict.jsonl"
+    source_path.write_text(
+        json.dumps(
+            {
+                "pt-BR": "Esta tradução tem provenance conflitante.",
+                "zh-Hant": "這筆翻譯的來源標記互相衝突。",
+                "training_direction": ["pt-BR", "zh-Hant"],
+                "provenance": {"transformation": "backtranslation"},
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    dataset_root = tmp_path / "dataset"
+    prepare_dataset(
+        [str(source_path)],
+        tokenizer_path,
+        dataset_root,
+        language_pairs=(("pt-BR", "zh-Hant"),),
+        translation_directions=(("pt-BR", "zh-Hant"),),
+        validation_fraction=0.0,
+        test_fraction=0.0,
+        filter_quality=False,
+        dedup_backend="memory",
+        num_workers=1,
+    )
+    dataset = IndexedParallelDataset(dataset_root, "train", bidirectional=True)
+
+    with pytest.raises(ValueError, match="conflicting provenance transformation"):
+        dataset.detect_revision_directions(
+            draft_token_id=1_000_001,
+            max_source_tokens=10_000,
+        )
+
+
 def test_real_duplicate_precedes_a_row_scoped_synthetic_copy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

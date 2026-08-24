@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import bisect
+from collections.abc import Mapping, Sequence
 import json
 import math
 from pathlib import Path
@@ -11,6 +12,7 @@ from torch.utils.data import Dataset, Sampler
 
 from sion_translate.synthetic import DEFAULT_SYNTHETIC_SAMPLING_WEIGHT
 from sion_translate.fingerprint import PREPROCESSING_SCHEMA
+from sion_translate.language_tags import canonicalize_language_tag
 
 from .integrity import validate_dataset_artifact_inventory
 from .records import (
@@ -23,6 +25,7 @@ from .record_metadata import (
     RECORD_METADATA_INDEX_DTYPE,
     RECORD_METADATA_INDEX_SUFFIX,
     decode_record_metadata,
+    resolve_record_training_direction,
 )
 
 
@@ -34,6 +37,7 @@ class IndexedParallelDataset(Dataset[dict[str, object]]):
         *,
         bidirectional: bool = True,
         legacy_bidirectional: bool | None = None,
+        legacy_language_pairs: Sequence[Sequence[str]] | None = None,
         include_metadata: bool = False,
         verify_integrity: bool = True,
         allow_unverified_legacy: bool = False,
@@ -52,6 +56,14 @@ class IndexedParallelDataset(Dataset[dict[str, object]]):
         self._manifest = self._read_dataset_manifest()
         self._current_translation_schema = self._detect_current_translation_schema()
         self.legacy_bidirectional = legacy_bidirectional
+        try:
+            self.legacy_language_pairs = (
+                None
+                if legacy_language_pairs is None
+                else normalize_language_pairs(language_pairs=legacy_language_pairs)
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError("legacy_language_pairs are invalid") from error
         if not self._current_translation_schema and legacy_bidirectional is not None:
             self.bidirectional = legacy_bidirectional
         self.index_paths = sorted(self.root.glob("*.idx.npy"))
@@ -246,6 +258,7 @@ class IndexedParallelDataset(Dataset[dict[str, object]]):
         self.verify_integrity = bool(getattr(self, "verify_integrity", True))
         self.allow_unverified_legacy = bool(getattr(self, "allow_unverified_legacy", False))
         self.legacy_bidirectional = getattr(self, "legacy_bidirectional", None)
+        self.legacy_language_pairs = getattr(self, "legacy_language_pairs", None)
         self.indices = self._open_indices()
         self.record_metadata_indices = self._open_record_metadata_indices()
         self._token_cache = {}
@@ -260,6 +273,50 @@ class IndexedParallelDataset(Dataset[dict[str, object]]):
         if self._manifest:
             manifest = self._manifest
             raw_pairs: object = manifest.get("language_pairs")
+            if manifest.get("stage") == "foundation":
+                if not isinstance(raw_pairs, list) or not raw_pairs:
+                    raise ValueError("foundation dataset manifest language_pairs are missing")
+                foundation_pairs: list[tuple[str, str]] = []
+                seen_languages: set[str] = set()
+                for index, raw_pair in enumerate(cast(list[object], raw_pairs)):
+                    if not isinstance(raw_pair, list):
+                        raise ValueError(
+                            "foundation dataset language pairs must be two-item self-pairs"
+                        )
+                    pair_values = cast(list[object], raw_pair)
+                    if len(pair_values) != 2:
+                        raise ValueError(
+                            "foundation dataset language pairs must be two-item self-pairs"
+                        )
+                    try:
+                        source = canonicalize_language_tag(
+                            pair_values[0],
+                            field=f"foundation language_pairs[{index}][0]",
+                        )
+                        target = canonicalize_language_tag(
+                            pair_values[1],
+                            field=f"foundation language_pairs[{index}][1]",
+                        )
+                    except (TypeError, ValueError) as error:
+                        raise ValueError(
+                            "foundation dataset manifest language_pairs are invalid"
+                        ) from error
+                    if source != target:
+                        raise ValueError("foundation dataset language pairs must be self-pairs")
+                    if source in seen_languages:
+                        raise ValueError(
+                            "foundation dataset manifest language_pairs contain duplicates"
+                        )
+                    seen_languages.add(source)
+                    foundation_pairs.append((source, target))
+                expected_languages = tuple(pair[0] for pair in foundation_pairs)
+                raw_languages = manifest.get("languages")
+                if (
+                    not isinstance(raw_languages, list)
+                    or tuple(cast(list[object], raw_languages)) != expected_languages
+                ):
+                    raise ValueError("foundation dataset manifest languages are invalid")
+                return tuple(foundation_pairs), expected_languages
             if self._current_translation_schema:
                 if not isinstance(raw_pairs, list) or not raw_pairs:
                     raise ValueError("current dataset manifest language_pairs are missing")
@@ -288,27 +345,47 @@ class IndexedParallelDataset(Dataset[dict[str, object]]):
                 return pairs, expected_languages
             if isinstance(raw_pairs, list) and raw_pairs:
                 pair_values = cast(list[object], raw_pairs)
-                pairs = tuple(
-                    (str(pair_values[0]), str(pair_values[1]))
-                    for raw_pair in pair_values
-                    if isinstance(raw_pair, list)
-                    and len(pair_values := cast(list[object], raw_pair)) == 2
-                )
+                try:
+                    pairs = normalize_language_pairs(
+                        language_pairs=cast(list[list[str]], pair_values)
+                    )
+                except (TypeError, ValueError) as error:
+                    raise ValueError(
+                        "legacy dataset manifest language_pairs are invalid"
+                    ) from error
+                if len(pairs) != len(pair_values):
+                    raise ValueError("legacy dataset manifest language_pairs contain duplicates")
                 raw_languages: object = manifest.get("languages")
-                languages = (
-                    tuple(map(str, cast(list[object], raw_languages)))
-                    if isinstance(raw_languages, list)
-                    else tuple(dict.fromkeys(language for pair in pairs for language in pair))
-                )
-                if pairs and languages:
-                    return pairs, languages
+                expected_languages = languages_from_pairs(pairs)
+                if raw_languages is not None:
+                    language_values = (
+                        cast(list[object], raw_languages) if isinstance(raw_languages, list) else []
+                    )
+                    if (
+                        not isinstance(raw_languages, list)
+                        or not all(isinstance(language, str) for language in language_values)
+                        or tuple(cast(list[str], language_values)) != expected_languages
+                    ):
+                        raise ValueError("legacy dataset manifest languages are invalid")
+                return pairs, expected_languages
             pair: object = manifest.get("language_pair")
-            if isinstance(pair, list):
+            if pair is not None:
+                if not isinstance(pair, list):
+                    raise ValueError("legacy dataset manifest language_pair is invalid")
                 pair_items = cast(list[object], pair)
-                if len(pair_items) == 2:
-                    normalized = (str(pair_items[0]), str(pair_items[1]))
-                    return (normalized,), normalized
-        return (("ko", "ja"),), ("ko", "ja")
+                try:
+                    pairs = normalize_language_pairs(language_pair=cast(list[str], pair_items))
+                except (TypeError, ValueError) as error:
+                    raise ValueError("legacy dataset manifest language_pair is invalid") from error
+                return pairs, languages_from_pairs(pairs)
+        if self.legacy_language_pairs is None:
+            raise ValueError(
+                "legacy dataset has no authenticated language identity; "
+                "pass legacy_language_pairs explicitly"
+            )
+        if not self.is_v3 and len(self.legacy_language_pairs) != 1:
+            raise ValueError("legacy v2 datasets require exactly one legacy language pair")
+        return self.legacy_language_pairs, languages_from_pairs(self.legacy_language_pairs)
 
     def _load_source_names(self) -> list[str]:
         if not self._manifest:
@@ -383,6 +460,36 @@ class IndexedParallelDataset(Dataset[dict[str, object]]):
                 )
         return tuple(pair for pair in self.language_pairs if frozenset(pair) in observed_edges)
 
+    def observed_translation_directions_for_physical_mask(
+        self,
+        mask: np.ndarray,
+    ) -> tuple[tuple[str, str], ...]:
+        """Return directed edges that selected physical rows can actually emit."""
+
+        selected = np.asarray(mask, dtype=np.bool_)
+        if selected.ndim != 1 or len(selected) != self.pair_count:
+            raise ValueError("physical pair mask must match the dataset pair count")
+        if not bool(selected.any()):
+            return ()
+        if not self.is_v3:
+            # Legacy dense rows have no row-scoped direction identity; their
+            # caller-authenticated global policy is the only available graph.
+            return self.translation_directions
+        observed: set[tuple[str, str]] = set()
+        offset = 0
+        for index in self.indices:
+            local_mask = selected[offset : offset + len(index)]
+            offset += len(index)
+            for row in index[local_mask]:
+                source_language = self.languages[int(row["src_language_id"])]
+                target_language = self.languages[int(row["tgt_language_id"])]
+                observed.add((source_language, target_language))
+                if not bool(row["forward_only"]):
+                    observed.add((target_language, source_language))
+        return tuple(
+            direction for direction in self.translation_directions if direction in observed
+        )
+
     def _load_translation_directions(self) -> tuple[tuple[str, str], ...]:
         if self._manifest:
             manifest = self._manifest
@@ -454,6 +561,158 @@ class IndexedParallelDataset(Dataset[dict[str, object]]):
                             "dataset index direction rows disagree with the manifest graph: "
                             "row-scoped direction lacks matching metadata"
                         )
+
+    def detect_revision_directions(
+        self,
+        *,
+        draft_token_id: int | None,
+        max_source_tokens: int,
+        physical_mask: np.ndarray | None = None,
+    ) -> tuple[tuple[str, str], ...]:
+        """Authenticate directed revision edges from row source/provenance metadata.
+
+        A filename marker alone identifies candidate rows, but it cannot prove
+        their direction. Revision rows therefore need current index fields, a
+        forward-only physical orientation, and matching row-scoped
+        ``training_direction`` metadata. Provenance-marked rows use the same
+        contract, so custom filenames remain supported without guessing.
+        """
+
+        selected = (
+            np.ones(self.pair_count, dtype=np.bool_)
+            if physical_mask is None
+            else np.asarray(physical_mask, dtype=np.bool_)
+        )
+        if selected.ndim != 1 or len(selected) != self.pair_count:
+            raise ValueError("physical pair mask must match the dataset pair count")
+        trained = set(self.translation_directions)
+        detected: set[tuple[str, str]] = set()
+        required_fields = {
+            "source_id",
+            "src_language_id",
+            "tgt_language_id",
+            "src_offset",
+            "src_length",
+            "forward_only",
+        }
+        physical_index = 0
+        for shard, index in enumerate(self.indices):
+            names = set(index.dtype.names or ())
+            for local, row in enumerate(index):
+                row_selected = bool(selected[physical_index])
+                physical_index += 1
+                source_id = int(row["source_id"]) if "source_id" in names else -1
+                source_name = (
+                    Path(self.source_names[source_id]).name
+                    if 0 <= source_id < len(self.source_names)
+                    else ""
+                )
+                source_marked = source_name.startswith("revise_")
+                metadata = self._metadata_for_physical_pair(shard, local)
+                raw_provenance = metadata.get("provenance")
+                provenance = (
+                    cast(Mapping[object, object], raw_provenance)
+                    if isinstance(raw_provenance, Mapping)
+                    else None
+                )
+                transformation = (
+                    provenance.get("transformation") if provenance is not None else None
+                )
+                provenance_marked = transformation == "revision"
+                if source_marked and transformation is not None and not provenance_marked:
+                    raise ValueError(
+                        "revision source row has conflicting provenance transformation: "
+                        f"source={source_name!r}, transformation={transformation!r}"
+                    )
+                revision_marked = source_marked or provenance_marked
+                source_tokens: np.ndarray | None = None
+                draft_positions: np.ndarray | None = None
+                source_length = -1
+                if (
+                    draft_token_id is not None
+                    and self.is_v3
+                    and {"src_offset", "src_length"} <= names
+                ):
+                    source_start = int(row["src_offset"])
+                    source_length = int(row["src_length"])
+                    source_store = self._tokens(shard, "src")
+                    source_tokens = np.asarray(
+                        source_store[source_start : source_start + source_length],
+                        dtype=np.int64,
+                    )
+                    draft_positions = np.flatnonzero(source_tokens == draft_token_id)
+                if not revision_marked:
+                    if draft_positions is not None and len(draft_positions):
+                        raise ValueError(
+                            "row contains a reserved <draft> token but lacks a revision "
+                            f"filename or provenance marker: source={source_name!r}"
+                        )
+                    continue
+                if not self._current_translation_schema or not self.is_v3:
+                    raise ValueError(
+                        "revision rows require a current indexed dataset with authenticated "
+                        "direction metadata"
+                    )
+                if not required_fields <= names:
+                    raise ValueError("revision row index lacks authenticated direction fields")
+                if source_id < 0 or source_id >= len(self.source_names):
+                    raise ValueError("revision row source_id is outside the source manifest")
+                if draft_token_id is None:
+                    raise ValueError(
+                        "revision rows require a tokenizer with an authenticated <draft> token"
+                    )
+                assert source_tokens is not None
+                assert draft_positions is not None
+                if (
+                    len(draft_positions) != 1
+                    or int(draft_positions[0]) == 0
+                    or int(draft_positions[0]) == source_length - 1
+                ):
+                    raise ValueError(
+                        "revision row source must contain exactly one <draft> token with "
+                        "non-empty source and draft segments"
+                    )
+                effective_source = source_tokens[:max_source_tokens]
+                effective_draft_positions = np.flatnonzero(effective_source == draft_token_id)
+                if (
+                    len(effective_draft_positions) != 1
+                    or int(effective_draft_positions[0]) == 0
+                    or int(effective_draft_positions[0]) == len(effective_source) - 1
+                ):
+                    raise ValueError(
+                        "revision row loses its <draft> structure after the training "
+                        "collator's source truncation"
+                    )
+                source_language_id = int(row["src_language_id"])
+                target_language_id = int(row["tgt_language_id"])
+                if not (
+                    0 <= source_language_id < len(self.languages)
+                    and 0 <= target_language_id < len(self.languages)
+                ):
+                    raise ValueError("revision row language ID is outside the language manifest")
+                if not bool(row["forward_only"]):
+                    raise ValueError(
+                        "revision rows must be forward-only so their training direction is exact"
+                    )
+                physical_direction = (
+                    self.languages[source_language_id],
+                    self.languages[target_language_id],
+                )
+                resolved = resolve_record_training_direction(
+                    metadata,
+                    physical_direction,
+                    trained,
+                )
+                if resolved is None or resolved != physical_direction:
+                    raise ValueError(
+                        "revision row training_direction must exactly match its stored forward "
+                        f"orientation: source={source_name!r}, stored={physical_direction!r}"
+                    )
+                if row_selected:
+                    detected.add(resolved)
+        return tuple(
+            direction for direction in self.translation_directions if direction in detected
+        )
 
     def _load_synthetic_sampling_weight(self) -> float:
         if not self._manifest:

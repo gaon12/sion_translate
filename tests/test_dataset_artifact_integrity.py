@@ -86,9 +86,18 @@ def test_dataset_constructor_requires_explicit_legacy_opt_in(tmp_path: Path) -> 
     with pytest.raises(FileNotFoundError, match="manifest is missing"):
         IndexedParallelDataset(tmp_path, "train")
 
+    with pytest.raises(ValueError, match="pass legacy_language_pairs explicitly"):
+        IndexedParallelDataset(
+            tmp_path,
+            "train",
+            allow_unverified_legacy=True,
+        )
+
     legacy = IndexedParallelDataset(
         tmp_path,
         "train",
         allow_unverified_legacy=True,
+        legacy_language_pairs=(("fr", "de"),),
     )
     assert legacy.pair_count == 1
+    assert legacy.language_pairs == (("fr", "de"),)
