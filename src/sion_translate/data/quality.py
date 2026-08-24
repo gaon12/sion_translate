@@ -30,7 +30,7 @@ _EXPRESSIVE_ALLOWED_REJECTIONS = frozenset({"too_short", "excessive_repetition"}
 
 @dataclass(frozen=True)
 class QualityPolicy:
-    """Conservative, language-aware filters for raw Korean-Japanese pairs.
+    """Conservative, language-aware filters for arbitrary raw parallel pairs.
 
     These checks intentionally target obvious corpus damage rather than trying to
     judge translation fluency. Borderline pairs remain in the corpus with a lower
@@ -201,9 +201,12 @@ def assess_pair(
     *,
     languages: tuple[str, str] | list[str],
 ) -> PairAssessment:
-    """번역쌍 품질 평가. ``languages`` 로 다른 언어쌍(en-de 등)도 검사할 수
-    있으며, 문자 기반 판별이 불가능한 언어는 script 검사만 건너뜁니다.
-    (필드 이름의 ko/ja 는 '첫 번째/두 번째 언어'라는 의미의 내부 명칭입니다.)"""
+    """Assess one parallel pair under explicit source and target identities.
+
+    Languages without a known script profile skip only the script-fraction
+    check. The legacy ``ko`` and ``ja`` variable names mean the first and second
+    sides internally; they do not restrict the accepted language graph.
+    """
     policy = policy or QualityPolicy()
     policy.validate()
     language_a, language_b = languages
@@ -246,8 +249,8 @@ def assess_pair(
         and ja_fraction < policy.min_language_fraction
     ):
         rejections.append("ja_script_mismatch")
-    # 일본어 특화 경고: 어느 물리 방향에 있든 긴 문장에 가나가 전혀 없으면
-    # 중국어 혼입을 의심합니다. 지역/스크립트 변형 태그도 primary를 상속합니다.
+    # A long Japanese side with Han characters but no kana can indicate Chinese
+    # contamination. Region and script variants inherit the primary language.
     for text, language, letter_count in (
         (ko, language_a, ko_letters),
         (ja, language_b, ja_letters),
@@ -267,7 +270,9 @@ def assess_pair(
         rejections.append("excessive_repetition")
 
     structured_score, critical_mismatch = structured_similarity(ko, ja)
-    if critical_mismatch or structured_score < 0.5:
+    if critical_mismatch:
+        rejections.append("structured_span_mismatch")
+    elif structured_score < 0.5:
         warnings.append("structured_span_mismatch")
 
     score = max(

@@ -700,6 +700,43 @@ def test_pair_quality_rejects_obvious_damage() -> None:
     assert "excessive_repetition" in repeated.rejection_reasons
 
 
+def test_pair_quality_rejects_critical_structured_token_corruption() -> None:
+    assessment = assess_pair(
+        "Pay {amount} to user@example.com",
+        "{total} を user@example.com に支払う",
+        languages=("en", "ja"),
+    )
+
+    assert not assessment.accepted
+    assert assessment.score == 90
+    assert assessment.rejection_reasons == ("structured_span_mismatch",)
+    assert assessment.warning_reasons == ()
+
+
+def test_prepare_rejects_critical_structured_corruption_when_quality_filter_is_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        prepare_module, "_PREPARE_WORKER_TOKENIZER", _FakePrepareTokenizer("unused")
+    )
+    row = json.dumps(
+        {
+            "en": "Pay {amount} to user@example.com",
+            "ja": "{total} を user@example.com に支払う",
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+    events = prepare_module._process_prepare_batch(  # pyright: ignore[reportPrivateUsage]
+        (0, [row], QualityPolicy(), False, (("en", "ja"),))
+    )
+
+    quality_events = [event for event in events if event[0] == "quality_filtered"]
+    assert len(quality_events) == 1
+    assert quality_events[0][1][1] == ("structured_span_mismatch",)
+    assert not any(event[0] == "candidate" for event in events)
+
+
 def test_pair_quality_requires_explicit_language_identity() -> None:
     with pytest.raises(TypeError, match="languages"):
         assess_pair("source", "target")  # type: ignore[call-arg]
@@ -752,6 +789,15 @@ def test_expressive_quality_profile_only_waives_short_and_repeated_reactions() -
     profiled_unsafe = apply_record_quality_profile(unsafe, "expressive_v1")
     assert not profiled_unsafe.accepted
     assert profiled_unsafe.rejection_reasons == ("control_characters",)
+
+    structured = assess_pair(
+        "Use {account} now",
+        "今すぐ {user} を使用します",
+        languages=("en", "ja"),
+    )
+    profiled_structured = apply_record_quality_profile(structured, "expressive_v1")
+    assert not profiled_structured.accepted
+    assert profiled_structured.rejection_reasons == ("structured_span_mismatch",)
 
 
 def test_source_temperature_sampling_is_deterministic_and_balanced() -> None:

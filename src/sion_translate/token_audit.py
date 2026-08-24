@@ -76,6 +76,7 @@ _KNOWN_LEGACY_PREPROCESSING_SCHEMAS = frozenset(
         "sion-prepare-v6",
         "sion-prepare-v7",
         "sion-prepare-v8",
+        "sion-prepare-v9",
     }
 )
 _SYNTHETIC_AUDIT_MARKER = "_sion_token_audit_synthetic_v1"
@@ -1501,19 +1502,19 @@ def audit_monolingual_token_exposure(
     max_piece_examples: int = 50,
     max_lines_per_language: int = 0,
 ) -> dict[str, Any]:
-    """foundation 코퍼스가 각 조각을 디코더 타깃으로 몇 번 보여 주는지 센다.
+    """Count decoder-target exposure contributed by the foundation corpus.
 
-    복원 과제의 정답은 손상되지 않은 원문 전체입니다. 즉 단일어 코퍼스의
-    **모든 토큰이 디코더 타깃**이고, 그래서 이 단계는 병렬 코퍼스가 한 번도
-    출력으로 만들어 본 적 없는 조각에도 출력 임베딩 학습 신호를 줍니다.
+    Reconstruction targets contain the complete clean monolingual sentence, so
+    every corpus token becomes a decoder target. This stage can therefore train
+    output embeddings for pieces that never appear as parallel targets.
 
-    병렬 감사만 보고 어휘를 판단하면 두 방향으로 틀립니다. foundation 이
-    충분히 노출시키는 조각을 위험하다고 하거나, 반대로 단일어 코퍼스가 어휘에
-    밀어 넣은 조각이 번역 학습에서 전혀 나오지 않는 것을 놓칩니다.
+    A parallel-only audit can both overstate risk for pieces covered by
+    foundation training and miss pieces introduced by monolingual vocabulary
+    pressure but absent from translation targets.
 
-    ``max_lines_per_language=0`` 이 전량 스캔이고, 양수는 결정적 prefix 표본
-    이라 보고서에 그렇게 표시됩니다 — 빠른 preflight 용이지 어휘가 안전하다고
-    선언할 근거는 아닙니다.
+    ``max_lines_per_language=0`` scans the complete corpus. A positive value is
+    a deterministic prefix sample recorded as such in the report; it is useful
+    for preflight but cannot establish vocabulary safety.
     """
 
     if minimum_characters < 1:
@@ -1525,7 +1526,7 @@ def audit_monolingual_token_exposure(
     if max_lines_per_language < 0:
         raise ValueError("max_lines_per_language must be non-negative")
     if not discovery.sources:
-        raise ValueError(f"단일어 코퍼스에 읽을 수 있는 파일이 없습니다: {discovery.root}")
+        raise ValueError(f"The monolingual corpus has no readable files: {discovery.root}")
 
     tokenizer = SionTokenizer(tokenizer_model)
     vocab_size = len(tokenizer)
@@ -1597,10 +1598,11 @@ def combine_target_exposure(
     rare_threshold: int = 25,
     max_piece_examples: int = 50,
 ) -> dict[str, Any]:
-    """두 단계를 합쳐야 비로소 "이 조각이 학습되는가"에 답할 수 있다.
+    """Combine both stages before deciding whether a piece receives training.
 
-    foundation 이 먼저 돌면 출력 임베딩은 두 단계 모두에서 신호를 받습니다.
-    한쪽만 보고 판정하면 조각을 잘못 살리거나 잘못 죽입니다.
+    When foundation training runs first, output embeddings receive signal from
+    both stages. Judging either stage alone can retain unsafe pieces or remove
+    pieces that are adequately trained by the other stage.
     """
 
     if parallel_counts.shape != monolingual_counts.shape:
@@ -1626,7 +1628,8 @@ def combine_target_exposure(
         "scan": "combined-stages",
         "rare_threshold": rare_threshold,
         "totals": _frequency_summary(combined, eligible),
-        # foundation 이 병렬 코퍼스만으로는 부족했던 조각을 몇 개 구제했는가.
+        # Count pieces whose insufficient parallel exposure is repaired by the
+        # foundation stage.
         "rescued_by_foundation": rescued,
         "still_below_threshold": still_rare,
         "lowest_target_exposure": _rare_piece_examples(

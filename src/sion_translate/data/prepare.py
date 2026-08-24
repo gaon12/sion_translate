@@ -115,6 +115,7 @@ class PrepareStats:
     language_mismatch: int = 0
     control_characters: int = 0
     excessive_repetition: int = 0
+    structured_span_rejections: int = 0
     structured_span_warnings: int = 0
     ja_no_kana_warnings: int = 0
     split_conflicts: int = 0
@@ -130,9 +131,10 @@ class PrepareStats:
 
 
 def infer_register(text: str, language: str) -> int:
-    """문말 표현으로 존댓말 단계(register)를 추정합니다.
+    """Infer a coarse politeness register from sentence-final expressions.
 
-    한국어/일본어에만 규칙이 있으며, 그 외 언어는 0(미상)을 반환합니다.
+    Rules currently cover Korean and Japanese. Every other language returns
+    zero, which means unknown rather than neutral.
     """
     primary_language = parse_language_tag(language, field="register language").language
     stripped = text.rstrip(" \t\r\n.!?。！？\"'“”‘’")
@@ -291,6 +293,7 @@ _QUALITY_REASON_FIELDS = {
     "ja_script_mismatch": "language_mismatch",
     "control_characters": "control_characters",
     "excessive_repetition": "excessive_repetition",
+    "structured_span_mismatch": "structured_span_rejections",
 }
 
 
@@ -351,7 +354,8 @@ def _process_prepare_batch(args: _PrepareBatchInput) -> list[_PrepareEvent]:
                 assessment,
                 pair.metadata.get("quality_profile"),
             )
-            unsafe = "control_characters" in assessment.rejection_reasons
+            unsafe_reasons = {"control_characters", "structured_span_mismatch"}
+            unsafe = bool(unsafe_reasons.intersection(assessment.rejection_reasons))
             if not assessment.accepted and (filter_quality or unsafe):
                 output.append(
                     (
@@ -485,9 +489,9 @@ class _SqliteDigestSet:
             self.connection = None
 
 
-# 합성 데이터가 든 입력 파일의 접두어. 이런 파일은 train split 에만 넣습니다 —
-# 역번역이나 이어붙이기로 만든 예제가 holdout 에 들어가면 점수가 실제 번역 품질이
-# 아니라 합성 규칙을 재게 됩니다.
+# Input prefixes that identify synthetic examples. Keep these sources in the
+# training split because placing backtranslations or concatenations in a
+# holdout would measure the generation rule instead of translation quality.
 DEFAULT_TRAIN_ONLY_PREFIXES: tuple[str, ...] = DEFAULT_SYNTHETIC_PREFIXES
 
 

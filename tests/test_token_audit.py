@@ -1127,6 +1127,7 @@ def test_indexed_audit_rejects_a_tokenizer_identity_mismatch(
     ("generation", "accepted"),
     [
         ("sion-prepare-v8", True),
+        ("sion-prepare-v9", True),
         ("sion-prepare-v999-forged", False),
     ],
 )
