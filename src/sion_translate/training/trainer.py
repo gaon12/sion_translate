@@ -39,6 +39,7 @@ from tqdm.auto import tqdm
 
 from sion_translate.artifacts import TRANSLATION_RELEASE_NAME
 from sion_translate.config import AppConfig, TrainingConfig
+from sion_translate.language_tags import canonicalize_language_pair
 
 from .checkpoint import (
     build_checkpoint_identity,
@@ -709,10 +710,50 @@ def train(
     export_release_name: str = TRANSLATION_RELEASE_NAME,
     export_translation_capable: bool = True,
     export_languages: Sequence[str] | None = None,
+    authenticated_revision_directions: Sequence[Sequence[str]] | None = None,
     pipeline_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, float | int | bool | str]:
     """sion_translate 학습의 본체. 반환값은 진행 상태와 best 선택 지표 요약입니다."""
     config.validate()
+    configured_revision_directions = config.data.configured_revision_directions()
+    if not export_translation_capable:
+        if authenticated_revision_directions:
+            raise ValueError(
+                "foundation training cannot authenticate translation revision directions"
+            )
+        export_revision_directions: tuple[tuple[str, str], ...] = ()
+    elif authenticated_revision_directions is None:
+        if configured_revision_directions or config.data.revision_examples:
+            raise ValueError(
+                "revision-capable training requires authenticated_revision_directions from "
+                "indexed provenance and the positive sampling graph"
+            )
+        export_revision_directions = ()
+    else:
+        normalized_revision_directions: list[tuple[str, str]] = []
+        seen_revision_directions: set[tuple[str, str]] = set()
+        for index, raw_direction in enumerate(authenticated_revision_directions):
+            direction = canonicalize_language_pair(
+                raw_direction,
+                field=f"authenticated revision direction[{index}]",
+            )
+            if direction in seen_revision_directions:
+                raise ValueError(
+                    "authenticated_revision_directions contains a duplicate canonical edge: "
+                    f"{direction!r}"
+                )
+            seen_revision_directions.add(direction)
+            normalized_revision_directions.append(direction)
+        export_revision_directions = tuple(normalized_revision_directions)
+        if export_revision_directions != configured_revision_directions:
+            raise ValueError(
+                "authenticated_revision_directions must exactly match the resolved data "
+                "revision graph"
+            )
+        if config.data.revision_examples is not bool(export_revision_directions):
+            raise ValueError(
+                "data.revision_examples must exactly reflect authenticated_revision_directions"
+            )
     # Export role/ancestry is part of the training contract, not a late
     # serialization detail. Reject a missing or malformed 1.5 pipeline before
     # optimizer allocation or the first expensive training step.
@@ -732,7 +773,8 @@ def train(
             config.data.configured_translation_directions() if export_translation_capable else None
         ),
         bidirectional=config.data.bidirectional,
-        revision_trained=config.data.revision_examples,
+        revision_directions=export_revision_directions,
+        revision_trained=bool(export_revision_directions),
         release_name=export_release_name,
         translation_capable=export_translation_capable,
         pipeline_identity=pipeline_identity,
@@ -996,7 +1038,8 @@ def train(
                 else None
             ),
             bidirectional=config.data.bidirectional,
-            revision_trained=config.data.revision_examples,
+            revision_directions=export_revision_directions,
+            revision_trained=bool(export_revision_directions),
             release_name=export_release_name,
             translation_capable=export_translation_capable,
             pipeline_identity=pipeline_identity,

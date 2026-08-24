@@ -88,6 +88,7 @@ from sion_translate.foundation import (
 )
 from sion_translate.fingerprint import DatasetFingerprint, file_sha256
 from sion_translate.data.prepare_foundation import foundation_dataset_problem
+from sion_translate.language_tags import canonicalize_language_pair
 from sion_translate.model import SionForConditionalGeneration
 from sion_translate.tokenizer import (
     SionTokenizer,
@@ -307,11 +308,18 @@ def preflight_dataset_direction_contract(
 def preflight_effective_translation_training(
     config: AppConfig,
     sampler: DistributedBucketBatchSampler,
+    *,
+    authenticated_revision_directions: Sequence[Sequence[str]] = (),
 ) -> None:
-    """Refuse advertised edges that have zero effective translation probability."""
+    """Refuse advertised edges that have zero effective translation probability.
+
+    Exact revision rows retain a translation objective even at full denoising because
+    the collator excludes their authenticated ``<draft>`` structure from denoising.
+    """
 
     dataset = sampler.dataset
     positive_mask = sampler.positive_sampling_pair_mask()
+    configured_directions = config.data.configured_translation_directions()
     observed = set(dataset.observed_language_pairs_for_physical_mask(positive_mask))
     missing_pairs = [
         pair for pair in config.data.configured_language_pairs() if pair not in observed
@@ -321,19 +329,153 @@ def preflight_effective_translation_training(
             "sampling policy assigns zero probability to every training row for configured "
             f"language pairs: missing={missing_pairs!r}"
         )
-
+    observed_directions = set(
+        dataset.observed_translation_directions_for_physical_mask(positive_mask)
+    )
+    missing_directions = [
+        direction for direction in configured_directions if direction not in observed_directions
+    ]
+    if missing_directions:
+        raise ValueError(
+            "sampling policy and row-scoped direction metadata provide zero effective "
+            f"examples for configured translation directions: missing={missing_directions!r}"
+        )
+    revision_edges = tuple(
+        canonicalize_language_pair(
+            direction,
+            field=f"authenticated revision direction[{index}]",
+        )
+        for index, direction in enumerate(authenticated_revision_directions)
+    )
+    if len(revision_edges) != len(set(revision_edges)):
+        raise ValueError("authenticated revision directions contain duplicate edges")
+    configured_edges = set(configured_directions)
+    unexpected_revision_edges = [
+        direction for direction in revision_edges if direction not in configured_edges
+    ]
+    if unexpected_revision_edges:
+        raise ValueError(
+            "authenticated revision directions are outside the configured translation graph: "
+            f"unexpected={unexpected_revision_edges!r}"
+        )
     if config.data.denoise_probability >= 1.0:
         source_only = set(config.data.configured_source_only_languages())
+        revision_edge_set = set(revision_edges)
         zero_translation_edges = [
             direction
-            for direction in config.data.configured_translation_directions()
-            if direction[0] not in source_only
+            for direction in configured_directions
+            if direction[0] not in source_only and direction not in revision_edge_set
         ]
         if zero_translation_edges:
             raise ValueError(
                 "denoise_probability=1.0 leaves no translation objective for configured "
                 f"directions: {zero_translation_edges!r}"
             )
+
+
+def _foundation_languages_with_positive_sampling_mass(
+    dataset: IndexedParallelDataset,
+    sampler: DistributedBucketBatchSampler,
+    planned_languages: Sequence[str],
+) -> tuple[str, ...]:
+    """Return only self-pair languages the finalized foundation sampler can select."""
+
+    if sampler.dataset is not dataset:
+        raise ValueError("foundation sampler must describe the inspected training dataset")
+    positive_mask = sampler.positive_sampling_pair_mask()
+    observed_pairs = dataset.observed_language_pairs_for_physical_mask(positive_mask)
+    non_self_pairs = [pair for pair in observed_pairs if pair[0] != pair[1]]
+    if non_self_pairs:
+        raise ValueError(
+            f"foundation training rows must be self-pairs: observed={non_self_pairs!r}"
+        )
+    observed_languages = {source for source, _ in observed_pairs}
+    planned = tuple(planned_languages)
+    if len(planned) != len(set(planned)):
+        raise ValueError("configured foundation language reservation contains duplicates")
+    unexpected = sorted(observed_languages - set(planned))
+    if unexpected:
+        raise ValueError(
+            "foundation training rows contain languages outside the configured reservation: "
+            f"{unexpected!r}"
+        )
+    languages = tuple(language for language in planned if language in observed_languages)
+    if not languages:
+        raise ValueError(
+            "foundation sampling policy assigns zero probability to every self-pair language"
+        )
+    return languages
+
+
+def _foundation_plan_for_lineage(
+    foundation_plan: Any,
+    foundation_lineage: dict[str, Any],
+) -> FoundationPlan:
+    """Build the narrow plan view expected by the pipeline identity validator.
+
+    The discovery plan remains the tokenizer/reservation contract. Published
+    lineage is narrower: it may name only languages with positive train-split
+    sampling mass.
+    """
+
+    raw_languages = foundation_lineage.get("languages")
+    if not isinstance(raw_languages, list) or not all(
+        isinstance(language, str) for language in raw_languages
+    ):
+        raise ValueError("foundation lineage has no valid effective language list")
+    effective = tuple(cast(list[str], raw_languages))
+    configured = tuple(cast(Sequence[str], foundation_plan.languages))
+    effective_set = set(effective)
+    if not effective or len(effective) != len(effective_set):
+        raise ValueError("foundation lineage effective languages must be non-empty and unique")
+    if effective != tuple(language for language in configured if language in effective_set):
+        raise ValueError(
+            "foundation lineage effective languages must be an ordered subset of the "
+            "configured foundation reservation"
+        )
+    return cast(
+        FoundationPlan,
+        SimpleNamespace(enabled=True, languages=effective),
+    )
+
+
+def resolve_training_revision_directions(
+    config: AppConfig,
+    dataset: IndexedParallelDataset,
+    *,
+    draft_token_id: int | None,
+    max_source_tokens: int,
+    physical_mask: np.ndarray | None = None,
+) -> tuple[tuple[str, str], ...]:
+    """Resolve revision capability without widening it beyond authenticated rows."""
+
+    explicit = config.data.configured_revision_directions()
+    derived = dataset.detect_revision_directions(
+        draft_token_id=draft_token_id,
+        max_source_tokens=max_source_tokens,
+        physical_mask=physical_mask,
+    )
+    if explicit:
+        explicit_set = set(explicit)
+        derived_set = set(derived)
+        missing = [direction for direction in derived if direction not in explicit_set]
+        unsupported = [direction for direction in explicit if direction not in derived_set]
+        if missing or unsupported:
+            raise ValueError(
+                "data.revision_directions must exactly match revision-marked indexed rows; "
+                f"missing={missing!r}; unsupported={unsupported!r}"
+            )
+        resolved = explicit
+    else:
+        resolved = derived
+    if config.data.revision_examples and not resolved:
+        raise ValueError(
+            "data.revision_examples=true has no revision-marked indexed rows; "
+            "ingest authenticated revision provenance before enabling it"
+        )
+    config.data.revision_directions = [list(direction) for direction in resolved]
+    config.data.revision_examples = bool(resolved)
+    return resolved
 
 
 def dataloader_runtime_kwargs(
@@ -688,6 +830,7 @@ def export_final_model(
     translation_capable: bool = True,
     languages: Sequence[str] | None = None,
     translation_directions: Sequence[Sequence[str]] | None = None,
+    authenticated_revision_directions: Sequence[Sequence[str]] | None = None,
     pipeline_identity: dict[str, Any] | None = None,
 ) -> Path:
     """Create the required final format set from the restored best weights."""
@@ -699,6 +842,38 @@ def export_final_model(
     )
     if translation_capable and translation_directions is None:
         translation_directions = config.data.configured_translation_directions()
+    if not translation_capable:
+        if authenticated_revision_directions:
+            raise ValueError("foundation exports cannot contain revision directions")
+        export_revision_directions: tuple[tuple[str, str], ...] = ()
+    else:
+        configured_revision_directions = config.data.configured_revision_directions()
+        if authenticated_revision_directions is None:
+            if configured_revision_directions or config.data.revision_examples:
+                raise ValueError(
+                    "translation final export requires authenticated_revision_directions "
+                    "from the indexed training provenance"
+                )
+            export_revision_directions = ()
+        else:
+            export_revision_directions = tuple(
+                canonicalize_language_pair(
+                    direction,
+                    field=f"authenticated revision direction[{index}]",
+                )
+                for index, direction in enumerate(authenticated_revision_directions)
+            )
+            if len(set(export_revision_directions)) != len(export_revision_directions):
+                raise ValueError("authenticated_revision_directions contains duplicate edges")
+            if export_revision_directions != configured_revision_directions:
+                raise ValueError(
+                    "authenticated_revision_directions must exactly match the resolved data "
+                    "revision graph"
+                )
+            if config.data.revision_examples is not bool(export_revision_directions):
+                raise ValueError(
+                    "data.revision_examples must exactly reflect authenticated_revision_directions"
+                )
     status_handles: tuple[BinaryIO, BinaryIO] | None = None
     invocation = "single-process"
     if context.distributed:
@@ -760,7 +935,8 @@ def export_final_model(
             languages=languages,
             translation_directions=translation_directions,
             bidirectional=config.data.bidirectional,
-            revision_trained=config.data.revision_examples,
+            revision_directions=export_revision_directions,
+            revision_trained=bool(export_revision_directions),
             strict=True,
         )
     except BaseException as error:
@@ -2128,7 +2304,7 @@ def _foundation_export_is_complete(
 def _foundation_completion_marker(
     *,
     config: AppConfig,
-    foundation_plan: Any,
+    foundation_languages: Sequence[str],
     foundation_config: AppConfig,
     checkpoint_identity: dict[str, Any],
     checkpoint_source: Path,
@@ -2142,7 +2318,7 @@ def _foundation_completion_marker(
         "stage": "foundation",
         "release_name": config.foundation.release_name,
         "release_version": MODEL_RELEASE_VERSION,
-        "languages": list(foundation_plan.languages),
+        "languages": list(foundation_languages),
         "selected_step": selected_step,
         "foundation_manifest_sha256": file_sha256(
             Path(foundation_config.data.dataset_dir) / "manifest.json"
@@ -2202,7 +2378,7 @@ def _foundation_marker_contract_matches(
     marker: dict[str, Any],
     *,
     config: AppConfig,
-    foundation_plan: Any,
+    foundation_languages: Sequence[str],
     checkpoint_identity: dict[str, Any],
 ) -> bool:
     return bool(
@@ -2210,7 +2386,7 @@ def _foundation_marker_contract_matches(
         and marker.get("stage") == "foundation"
         and marker.get("release_name") == config.foundation.release_name
         and marker.get("release_version") == MODEL_RELEASE_VERSION
-        and marker.get("languages") == list(foundation_plan.languages)
+        and marker.get("languages") == list(foundation_languages)
         and marker.get("checkpoint_identity_sha256") == _mapping_sha256(checkpoint_identity)
         and all(
             isinstance(marker.get(field), str) and len(cast(str, marker.get(field))) == 64
@@ -2268,6 +2444,12 @@ def _inspect_foundation_lineage(
         # do not reinterpret missing raw files as proof that its lineage changed.
         validate_dataset_artifact_inventory(config.foundation.dataset_dir)
     foundation_config = build_foundation_config(config)
+    _, _, foundation_languages = _foundation_training_contract(
+        foundation_config,
+        context,
+        planned_languages=foundation_plan.languages,
+        verify_integrity=False,
+    )
     checkpoint_identity = _foundation_checkpoint_identity(foundation_config, context)
     run_root = foundation_run_directory(config)
     completion = run_root / FOUNDATION_COMPLETION_FILENAME
@@ -2275,7 +2457,7 @@ def _inspect_foundation_lineage(
     if marker is None or not _foundation_marker_contract_matches(
         marker,
         config=config,
-        foundation_plan=foundation_plan,
+        foundation_languages=foundation_languages,
         checkpoint_identity=checkpoint_identity,
     ):
         raise RuntimeError("foundation completion marker does not match the current base contract")
@@ -2486,6 +2668,47 @@ def _foundation_source_sampling_weights(
     return {source_id: value / maximum for source_id, value in multipliers.items()}
 
 
+def _foundation_training_contract(
+    foundation_config: AppConfig,
+    context: DistributedContext,
+    *,
+    planned_languages: Sequence[str],
+    verify_integrity: bool,
+) -> tuple[
+    IndexedParallelDataset,
+    DistributedBucketBatchSampler,
+    tuple[str, ...],
+]:
+    """Open the train split and resolve its effective sampled language contract."""
+
+    train_dataset = IndexedParallelDataset(
+        foundation_config.data.dataset_dir,
+        foundation_config.data.train_split,
+        bidirectional=foundation_config.data.bidirectional,
+        legacy_language_pairs=foundation_config.data.configured_language_pairs(),
+        verify_integrity=verify_integrity,
+    )
+    train_sampler = DistributedBucketBatchSampler(
+        train_dataset,
+        foundation_config.training.batch_size_per_gpu,
+        rank=context.rank,
+        world_size=context.world_size,
+        bucket_size=foundation_config.data.bucket_size,
+        seed=foundation_config.training.seed,
+        source_sampling_weights_by_id=_foundation_source_sampling_weights(train_dataset),
+        # The prepared manifest already defines the intended alpha-tempered
+        # language distribution. The generic sampler's 3x safety cap would
+        # silently alter that policy for sufficiently imbalanced corpora.
+        max_source_upsampling=math.inf,
+    )
+    languages = _foundation_languages_with_positive_sampling_mass(
+        train_dataset,
+        train_sampler,
+        planned_languages,
+    )
+    return train_dataset, train_sampler, languages
+
+
 def run_foundation_stage(
     config: AppConfig,
     foundation_plan: Any,
@@ -2519,6 +2742,12 @@ def run_foundation_stage(
             )
 
     foundation_config = build_foundation_config(config)
+    train_dataset, train_sampler, foundation_languages = _foundation_training_contract(
+        foundation_config,
+        context,
+        planned_languages=foundation_plan.languages,
+        verify_integrity=not artifacts_verified,
+    )
     run_root = foundation_run_directory(config)
     completion = run_root / FOUNDATION_COMPLETION_FILENAME
     best_checkpoint = run_root / "checkpoints" / "best"
@@ -2545,7 +2774,7 @@ def run_foundation_stage(
         and _foundation_marker_contract_matches(
             marker,
             config=config,
-            foundation_plan=foundation_plan,
+            foundation_languages=foundation_languages,
             checkpoint_identity=checkpoint_identity,
         )
     )
@@ -2702,7 +2931,8 @@ def run_foundation_stage(
                 formats=config.foundation.final_export_formats,
                 release_name=config.foundation.release_name,
                 translation_capable=False,
-                languages=foundation_plan.languages,
+                languages=foundation_languages,
+                authenticated_revision_directions=(),
             )
             repaired_export = True
         if repaired_export:
@@ -2729,7 +2959,7 @@ def run_foundation_stage(
             reason="이미 완료된 foundation 단계의 가중치를 재사용했습니다.",
             best_checkpoint=str(checkpoint_source),
             selected_step=provenance["step"],
-            languages=foundation_plan.languages,
+            languages=foundation_languages,
             warnings=foundation_plan.warnings,
         )
 
@@ -2883,21 +3113,16 @@ def run_foundation_stage(
             )
 
     preflight_final_export_dependencies(config.foundation.final_export_formats)
-    train_dataset = IndexedParallelDataset(
-        foundation_config.data.dataset_dir,
-        foundation_config.data.train_split,
-        bidirectional=foundation_config.data.bidirectional,
-        verify_integrity=not artifacts_verified,
-    )
     validation_dataset = IndexedParallelDataset(
         foundation_config.data.dataset_dir,
         foundation_config.data.validation_split,
         bidirectional=foundation_config.data.bidirectional,
+        legacy_language_pairs=foundation_config.data.configured_language_pairs(),
         verify_integrity=not artifacts_verified,
     )
     announce(
         f"foundation 데이터 규모: 학습 {len(train_dataset):,}개 / "
-        f"검증 {len(validation_dataset):,}개 (언어: {', '.join(foundation_plan.languages)})",
+        f"검증 {len(validation_dataset):,}개 (언어: {', '.join(foundation_languages)})",
         context,
     )
 
@@ -2913,19 +3138,6 @@ def run_foundation_stage(
         denoise_probability=foundation_config.data.validation_denoise_probability,
         source_token_dropout=0.0,
         decoder_input_noise=0.0,
-    )
-    train_sampler = DistributedBucketBatchSampler(
-        train_dataset,
-        foundation_config.training.batch_size_per_gpu,
-        rank=context.rank,
-        world_size=context.world_size,
-        bucket_size=foundation_config.data.bucket_size,
-        seed=foundation_config.training.seed,
-        source_sampling_weights_by_id=_foundation_source_sampling_weights(train_dataset),
-        # The prepared manifest already defines the intended alpha-tempered
-        # language distribution. The generic sampler's 3x safety cap would
-        # silently alter that policy for sufficiently imbalanced corpora.
-        max_source_upsampling=math.inf,
     )
     validation_sampler = DistributedBucketBatchSampler(
         validation_dataset,
@@ -2966,7 +3178,8 @@ def run_foundation_stage(
         stage_name="foundation/denoising",
         export_release_name=config.foundation.release_name,
         export_translation_capable=False,
-        export_languages=foundation_plan.languages,
+        export_languages=foundation_languages,
+        authenticated_revision_directions=(),
     )
     selected_checkpoint = Path(str(result["selected_checkpoint_source"]))
     selected_checkpoint_digest = str(result["selected_checkpoint_artifact_sha256"])
@@ -3009,7 +3222,8 @@ def run_foundation_stage(
         # 받아들이고 그럴듯한 쓰레기를 냅니다.
         release_name=config.foundation.release_name,
         translation_capable=False,
-        languages=foundation_plan.languages,
+        languages=foundation_languages,
+        authenticated_revision_directions=(),
     )
     _run_rank_zero_action(
         context,
@@ -3017,7 +3231,7 @@ def run_foundation_stage(
             completion,
             _foundation_completion_marker(
                 config=config,
-                foundation_plan=foundation_plan,
+                foundation_languages=foundation_languages,
                 foundation_config=foundation_config,
                 checkpoint_identity=checkpoint_identity,
                 checkpoint_source=selected_checkpoint,
@@ -3033,7 +3247,7 @@ def run_foundation_stage(
         reason=foundation_plan.reason,
         best_checkpoint=str(selected_checkpoint),
         selected_step=int(result["selected_step"]),
-        languages=foundation_plan.languages,
+        languages=foundation_languages,
         warnings=foundation_plan.warnings,
     )
 
@@ -3133,12 +3347,13 @@ def _checkpoint_pipeline_identity(
         # when the raw monolingual corpus is temporarily offline. Reconstruct
         # the configured branch from its authenticated lineage instead of from
         # whether this machine can launch a fresh foundation run today.
-        lineage_plan = cast(
+        configured_lineage_plan = cast(
             FoundationPlan,
-            SimpleNamespace(
-                enabled=True,
-                languages=config.foundation_languages(),
-            ),
+            SimpleNamespace(enabled=True, languages=config.foundation_languages()),
+        )
+        lineage_plan = _foundation_plan_for_lineage(
+            configured_lineage_plan,
+            cast(dict[str, Any], raw_foundation),
         )
         pipeline = build_translation_pipeline_identity(
             lineage_plan,
@@ -3556,6 +3771,7 @@ def main() -> None:
             config.data.train_split,
             bidirectional=True,
             legacy_bidirectional=config.data.bidirectional,
+            legacy_language_pairs=config.data.configured_language_pairs(),
             verify_integrity=False,
         )
         validation_dataset = IndexedParallelDataset(
@@ -3563,23 +3779,11 @@ def main() -> None:
             config.data.validation_split,
             bidirectional=True,
             legacy_bidirectional=config.data.bidirectional,
+            legacy_language_pairs=config.data.configured_language_pairs(),
             verify_integrity=False,
         )
         preflight_dataset_direction_contract(config, train_dataset, require_all_pairs=True)
         preflight_dataset_direction_contract(config, validation_dataset)
-        revision_sources = [
-            source
-            for source in train_dataset.source_names
-            if Path(source).name.startswith("revise_")
-        ]
-        if revision_sources and not config.data.revision_examples:
-            config.data.revision_examples = True
-            announce(
-                "revision 예제 원천을 자동 감지했습니다: "
-                + ", ".join(revision_sources[:3])
-                + (" …" if len(revision_sources) > 3 else ""),
-                context,
-            )
         announce(
             f"데이터 규모: 학습 {len(train_dataset):,}개 / 검증 {len(validation_dataset):,}개 "
             f"(설정된 번역 방향 포함)",
@@ -3601,6 +3805,39 @@ def main() -> None:
             for line in decisions:
                 announce(f"  · {line}", context)
         config.validate()
+
+        # Exported capabilities must reflect rows that the finalized sampling
+        # policy can actually select. Resolve this before copying stage configs.
+        train_sampler = DistributedBucketBatchSampler(
+            train_dataset,
+            config.training.batch_size_per_gpu,
+            rank=context.rank,
+            world_size=context.world_size,
+            bucket_size=config.data.bucket_size,
+            seed=config.training.seed,
+            source_sampling_alpha=config.data.source_sampling_alpha,
+            source_sampling_weights=config.data.source_sampling_weights,
+            max_source_upsampling=config.data.max_source_upsampling,
+        )
+        positive_sampling_mask = train_sampler.positive_sampling_pair_mask()
+        revision_directions = resolve_training_revision_directions(
+            config,
+            train_dataset,
+            draft_token_id=tokenizer.draft_id,
+            max_source_tokens=config.data.max_source_length - 2,
+            physical_mask=positive_sampling_mask,
+        )
+        preflight_effective_translation_training(
+            config,
+            train_sampler,
+            authenticated_revision_directions=revision_directions,
+        )
+        if revision_directions:
+            announce(
+                "양의 샘플링 확률로 인증된 revision 학습 방향: "
+                + ", ".join(f"{source}→{target}" for source, target in revision_directions),
+                context,
+            )
 
         if not foundation_plan.enabled:
             pipeline_identity = build_translation_pipeline_identity(foundation_plan)
@@ -3645,18 +3882,6 @@ def main() -> None:
         )
         # sampler: 비슷한 길이끼리 묶어(bucket) 패딩 낭비를 줄이고,
         # 분산 학습에서 rank 별로 겹치지 않게 배치를 나눕니다.
-        train_sampler = DistributedBucketBatchSampler(
-            train_dataset,
-            config.training.batch_size_per_gpu,
-            rank=context.rank,
-            world_size=context.world_size,
-            bucket_size=config.data.bucket_size,
-            seed=config.training.seed,
-            source_sampling_alpha=config.data.source_sampling_alpha,
-            source_sampling_weights=config.data.source_sampling_weights,
-            max_source_upsampling=config.data.max_source_upsampling,
-        )
-        preflight_effective_translation_training(config, train_sampler)
         post_sampler: DistributedBucketBatchSampler | None = None
         post_validation_sampler: DistributedBucketBatchSampler | None = None
         if post_config is not None:
@@ -3866,8 +4091,12 @@ def main() -> None:
                 foundation_plan,
                 context,
             )
-            pipeline_identity = build_translation_pipeline_identity(
+            effective_foundation_plan = _foundation_plan_for_lineage(
                 foundation_plan,
+                foundation_lineage,
+            )
+            pipeline_identity = build_translation_pipeline_identity(
+                effective_foundation_plan,
                 foundation_lineage=foundation_lineage,
             )
         if validated_posttrain_resume:
@@ -3917,6 +4146,7 @@ def main() -> None:
                 context,
                 stage_name="pretrain/SFT",
                 language_tags=tokenizer.language_tags,
+                authenticated_revision_directions=revision_directions,
                 pipeline_identity=pipeline_identity,
             )
             barrier(context)
@@ -3976,6 +4206,7 @@ def main() -> None:
                 objective=objective,
                 stage_name="posttrain/composite-MRT+preference",
                 language_tags=tokenizer.language_tags,
+                authenticated_revision_directions=revision_directions,
                 pipeline_identity=pipeline_identity,
             )
             barrier(context)
@@ -4014,6 +4245,7 @@ def main() -> None:
             run_root,
             stage=final_stage,
             step=final_step,
+            authenticated_revision_directions=revision_directions,
             pipeline_identity=pipeline_identity,
         )
         announce(f"최종 모델 내보내기 검증 완료: {final_export_dir}", context)

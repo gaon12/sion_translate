@@ -152,6 +152,7 @@ def tiny_app_config(tmp_path: Path, **training_overrides) -> AppConfig:
     return AppConfig(
         model=tiny_model_config(),
         data=DataConfig(
+            language_pair=["ko", "ja"],
             tokenizer_model=str(tokenizer_path),
             max_source_length=16,
             max_target_length=16,
@@ -192,6 +193,34 @@ def test_translation_training_rejects_invalid_ancestry_before_optimizer_allocati
             config,
             context,
             pipeline_identity=pipeline_identity,
+        )
+
+
+def test_programmatic_training_rejects_an_unauthenticated_revision_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tiny_app_config(tmp_path)
+    config.data.revision_directions = [["ko", "ja"]]
+    config.data.revision_examples = True
+    model = SionForConditionalGeneration(config.model)
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+    monkeypatch.setattr(
+        trainer_module.torch.optim,
+        "AdamW",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("optimizer must not be allocated")
+        ),
+    )
+
+    with pytest.raises(ValueError, match="authenticated_revision_directions"):
+        _train(
+            model,
+            [tiny_batch()],
+            [tiny_batch()],
+            config,
+            context,
+            pipeline_identity=TRANSLATION_PIPELINE_IDENTITY,
         )
 
 
@@ -393,6 +422,7 @@ def test_intermediate_exports_advertise_only_trained_directions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = tiny_app_config(tmp_path, ema_decay=0.0)
+    config.data.language_pair = []
     config.data.language_pairs = [
         ["kj", "ko"],
         ["kj", "ja"],

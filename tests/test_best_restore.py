@@ -17,6 +17,8 @@ from sion_translate.training.trainer import train
 
 
 def _config(tmp_path: Path) -> AppConfig:
+    tokenizer_model = tmp_path / "tokenizer.model"
+    tokenizer_model.write_bytes(b"best-restore-test-tokenizer")
     model = ModelConfig(
         vocab_size=48,
         d_model=24,
@@ -52,7 +54,12 @@ def _config(tmp_path: Path) -> AppConfig:
     )
     return AppConfig(
         model=model,
-        data=DataConfig(max_source_length=12, max_target_length=12),
+        data=DataConfig(
+            language_pair=["de", "fr"],
+            tokenizer_model=str(tokenizer_model),
+            max_source_length=12,
+            max_target_length=12,
+        ),
         training=training,
     )
 
@@ -99,7 +106,17 @@ def test_training_returns_best_ema_weights_for_the_next_stage(
     config = _config(tmp_path)
     model = SionForConditionalGeneration(config.model)
     context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
-    train(model, [_batch()], [_batch()], config, context)
+    train(
+        model,
+        [_batch()],
+        [_batch()],
+        config,
+        context,
+        pipeline_identity={
+            "schema": "sion-translation-pipeline-v2",
+            "branch": "translation-only",
+        },
+    )
 
     best = torch.load(
         tmp_path / "run" / "checkpoints" / "best" / "checkpoint.pt",

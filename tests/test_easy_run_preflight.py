@@ -177,6 +177,7 @@ def test_the_foundation_corpus_is_reported_before_training(tmp_path, capsys) -> 
 
     config = tmp_path / "config.yaml"
     config.write_text(
+        "data:\n  language_pair: [ko, ja]\n"
         f"foundation:\n  corpus_dir: {(tmp_path / 'corpus').as_posix()}\n",
         encoding="utf-8",
     )
@@ -201,7 +202,7 @@ def test_a_usable_corpus_is_announced_with_its_languages(tmp_path, capsys) -> No
         )
     config = tmp_path / "config.yaml"
     config.write_text(
-        f"foundation:\n  corpus_dir: {corpus.as_posix()}\n",
+        f"data:\n  language_pair: [ko, ja]\nfoundation:\n  corpus_dir: {corpus.as_posix()}\n",
         encoding="utf-8",
     )
 
@@ -224,7 +225,10 @@ def test_a_skipped_directory_is_named_in_the_preflight(tmp_path, capsys) -> None
     (corpus / "korean_tech_corpus_130m").mkdir()
     (corpus / "korean_tech_corpus_130m" / "ui.txt").write_text("기술 문장\n", encoding="utf-8")
     config = tmp_path / "config.yaml"
-    config.write_text(f"foundation:\n  corpus_dir: {corpus.as_posix()}\n", encoding="utf-8")
+    config.write_text(
+        f"data:\n  language_pair: [ko, ja]\nfoundation:\n  corpus_dir: {corpus.as_posix()}\n",
+        encoding="utf-8",
+    )
 
     easy_run._report_foundation_corpus(config)
 

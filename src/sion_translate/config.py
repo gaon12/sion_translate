@@ -31,7 +31,7 @@ from sion_translate.data.records import (
     normalize_language_pairs,
     normalize_translation_directions,
 )
-from sion_translate.language_tags import canonicalize_language_tags
+from sion_translate.language_tags import canonicalize_language_pair, canonicalize_language_tags
 from sion_translate.synthetic import (
     DEFAULT_SYNTHETIC_PREFIXES,
     DEFAULT_SYNTHETIC_SAMPLING_WEIGHT,
@@ -264,7 +264,7 @@ class DataConfig:
     # 학습할 언어쌍 = JSONL 의 키 이름. 예: ["ko", "ja"] 또는 ["en", "de"].
     # 토크나이저의 <2xx>/<denoise_xx> 제어 토큰, 전처리, 방향 태그가
     # 모두 이 값을 따라가므로 다른 언어쌍도 설정만 바꾸면 학습됩니다.
-    language_pair: list[str] = field(default_factory=lambda: ["ko", "ja"])
+    language_pair: list[str] = field(default_factory=list)
     # 여러 언어쌍을 한 모델에서 학습할 때 사용합니다. 비어 있으면 위의
     # language_pair 한 쌍만 사용합니다. YAML에서는 둘 중 하나만 적습니다.
     language_pairs: list[list[str]] = field(default_factory=list)
@@ -272,6 +272,11 @@ class DataConfig:
     # 함께 학습하려면 [[de, fr], [fr, de], [sw, ar]]로 둡니다. 비어 있으면
     # 기존 bidirectional/source_only_languages 정책에서 자동으로 계산합니다.
     translation_directions: list[list[str]] = field(default_factory=list)
+    # ``원문 <draft> 초안 -> 정답`` revision 학습이 실제로 이루어진 directed
+    # edge 목록입니다. 비어 있으면 indexed row provenance에서 자동 검출합니다.
+    # translation_directions와 별개로 기록해 revision 능력을 다른 edge로
+    # 확장해 버리는 것을 막습니다.
+    revision_directions: list[list[str]] = field(default_factory=list)
     # 원문으로만 등장하고 번역 결과로는 절대 나오면 안 되는 언어입니다.
     # 한본어(kj)처럼 "한국어와 일본어가 섞인 입력"을 받아 각각 단일어로
     # 번역하는 경우에 씁니다. 여기 등재된 언어가 포함된 쌍은 단방향으로만
@@ -337,7 +342,11 @@ class DataConfig:
     max_source_upsampling: float = 3.0
 
     def configured_language_pairs(self) -> tuple[tuple[str, str], ...]:
-        raw_pairs = self.language_pairs or [self.language_pair]
+        has_single = bool(self.language_pair)
+        has_multiple = bool(self.language_pairs)
+        if has_single == has_multiple:
+            raise ValueError("configure exactly one of data.language_pair or data.language_pairs")
+        raw_pairs = self.language_pairs if has_multiple else [self.language_pair]
         return normalize_language_pairs(language_pairs=raw_pairs)
 
     def configured_synthetic_prefixes(self) -> tuple[str, ...]:
@@ -362,6 +371,31 @@ class DataConfig:
             bidirectional=self.bidirectional,
             source_only_languages=self.configured_source_only_languages(),
         )
+
+    def configured_revision_directions(self) -> tuple[tuple[str, str], ...]:
+        """Return explicitly authenticated revision edges, if configured."""
+
+        trained = set(self.configured_translation_directions())
+        directions: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for index, raw_direction in enumerate(self.revision_directions):
+            direction = canonicalize_language_pair(
+                raw_direction,
+                field=f"data.revision_directions[{index}]",
+            )
+            if direction in seen:
+                raise ValueError(
+                    "duplicate data.revision_directions after BCP 47 canonicalization: "
+                    f"{raw_direction!r}"
+                )
+            if direction not in trained:
+                raise ValueError(
+                    "data.revision_directions must be a subset of "
+                    f"data.translation_directions; got {direction!r}"
+                )
+            seen.add(direction)
+            directions.append(direction)
+        return tuple(directions)
 
     @property
     def languages(self) -> tuple[str, ...]:
@@ -704,40 +738,6 @@ class AppConfig:
 
     def validate(self) -> None:
         self.model.validate()
-        raw_pairs = self.data.language_pairs or [self.data.language_pair]
-        pairs = self.data.configured_language_pairs()
-        if len(pairs) != len(raw_pairs):
-            raise ValueError("duplicate or reversed language pair after BCP 47 canonicalization")
-        if self.data.language_pairs:
-            self.data.language_pairs = [list(pair) for pair in pairs]
-        else:
-            self.data.language_pair = list(pairs[0])
-        source_only = self.data.configured_source_only_languages()
-        self.data.source_only_languages = list(source_only)
-        if source_only:
-            known = set(self.data.languages)
-            unknown = sorted(set(source_only) - known)
-            if unknown:
-                raise ValueError(
-                    "data.source_only_languages must appear in the configured language "
-                    f"pairs; {unknown} do not (configured languages: {sorted(known)})"
-                )
-            # A pair whose both sides are source-only can be trained in neither
-            # direction, so it would silently contribute nothing. This also
-            # covers "every language is source-only", because any pair then has
-            # two source-only sides.
-            for pair in pairs:
-                if pair[0] in source_only and pair[1] in source_only:
-                    raise ValueError(
-                        "at most one side of a language pair may be source-only; "
-                        f"both sides of {list(pair)!r} are listed in "
-                        "data.source_only_languages"
-                    )
-        # This also verifies explicit directions are connected to configured
-        # pairs, cover every pair, and never target a source-only language.
-        directions = self.data.configured_translation_directions()
-        if self.data.translation_directions:
-            self.data.translation_directions = [list(direction) for direction in directions]
         if not 0.0 <= self.data.source_token_dropout < 0.5:
             raise ValueError("source_token_dropout must be in [0, 0.5)")
         if not 0.0 <= self.data.decoder_input_noise < 0.5:
@@ -934,6 +934,40 @@ class AppConfig:
             raise ValueError(
                 "posttraining.early_stopping_min_epochs cannot exceed num_train_epochs"
             )
+        raw_pairs = (
+            self.data.language_pairs if self.data.language_pairs else [self.data.language_pair]
+        )
+        pairs = self.data.configured_language_pairs()
+        if len(pairs) != len(raw_pairs):
+            raise ValueError("duplicate or reversed language pair after BCP 47 canonicalization")
+        if self.data.language_pairs:
+            self.data.language_pairs = [list(pair) for pair in pairs]
+        else:
+            self.data.language_pair = list(pairs[0])
+        source_only = self.data.configured_source_only_languages()
+        self.data.source_only_languages = list(source_only)
+        if source_only:
+            known = set(self.data.languages)
+            unknown = sorted(set(source_only) - known)
+            if unknown:
+                raise ValueError(
+                    "data.source_only_languages must appear in the configured language "
+                    f"pairs; {unknown} do not (configured languages: {sorted(known)})"
+                )
+            for pair in pairs:
+                if pair[0] in source_only and pair[1] in source_only:
+                    raise ValueError(
+                        "at most one side of a language pair may be source-only; "
+                        f"both sides of {list(pair)!r} are listed in "
+                        "data.source_only_languages"
+                    )
+        directions = self.data.configured_translation_directions()
+        if self.data.translation_directions:
+            self.data.translation_directions = [list(direction) for direction in directions]
+        revision_directions = self.data.configured_revision_directions()
+        if self.data.revision_directions:
+            self.data.revision_directions = [list(direction) for direction in revision_directions]
+            self.data.revision_examples = True
 
     def validate_training_supervision(
         self,

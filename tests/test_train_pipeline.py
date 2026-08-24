@@ -113,6 +113,7 @@ def test_configured_raw_scan_uses_the_complete_prepare_contract(tmp_path: Path) 
     tokenizer = tmp_path / "sion.model"
     tokenizer.write_bytes(b"tokenizer")
     config = AppConfig()
+    config.data.language_pair = ["ko", "ja"]
     config.data.raw_dir = str(tmp_path / "raw")
     config.data.approximate_split = True
     config.data.source_only_languages = ["ko"]
@@ -161,6 +162,99 @@ def test_preflight_rejects_a_prepared_direction_graph_from_another_run() -> None
             config,
             incomplete,
             require_all_pairs=True,
+        )
+
+
+def test_training_resolves_revision_rows_to_an_exact_asymmetric_subgraph() -> None:
+    config = AppConfig()
+    config.data.language_pairs = [["pt-BR", "zh-Hant"]]
+    config.data.translation_directions = [["pt-BR", "zh-Hant"], ["zh-Hant", "pt-BR"]]
+    dataset = SimpleNamespace(
+        detect_revision_directions=lambda **_kwargs: (("pt-BR", "zh-Hant"),),
+    )
+
+    resolved = train_module.resolve_training_revision_directions(  # type: ignore[arg-type]
+        config,
+        dataset,
+        draft_token_id=9,
+        max_source_tokens=510,
+    )
+
+    assert resolved == (("pt-BR", "zh-Hant"),)
+    assert config.data.revision_directions == [["pt-BR", "zh-Hant"]]
+    assert config.data.revision_examples is True
+
+
+def test_bare_revision_examples_flag_fails_without_direction_evidence() -> None:
+    config = AppConfig()
+    config.data.language_pair = ["ko", "ja"]
+    config.data.revision_examples = True
+    dataset = SimpleNamespace(detect_revision_directions=lambda **_kwargs: ())
+
+    with pytest.raises(ValueError, match="no revision-marked indexed rows"):
+        train_module.resolve_training_revision_directions(  # type: ignore[arg-type]
+            config,
+            dataset,
+            draft_token_id=9,
+            max_source_tokens=510,
+        )
+
+
+def test_explicit_revision_graph_cannot_hide_detected_revision_rows() -> None:
+    config = AppConfig()
+    config.data.language_pairs = [["pt-BR", "zh-Hant"]]
+    config.data.translation_directions = [["pt-BR", "zh-Hant"], ["zh-Hant", "pt-BR"]]
+    config.data.revision_directions = [["pt-BR", "zh-Hant"]]
+    dataset = SimpleNamespace(
+        detect_revision_directions=lambda **_kwargs: (("zh-Hant", "pt-BR"),),
+    )
+
+    with pytest.raises(ValueError, match="must exactly match revision-marked indexed rows"):
+        train_module.resolve_training_revision_directions(  # type: ignore[arg-type]
+            config,
+            dataset,
+            draft_token_id=9,
+            max_source_tokens=510,
+        )
+
+
+def test_explicit_revision_graph_cannot_claim_unobserved_reverse_direction() -> None:
+    config = AppConfig()
+    config.data.language_pairs = [["pt-BR", "zh-Hant"]]
+    config.data.translation_directions = [["pt-BR", "zh-Hant"], ["zh-Hant", "pt-BR"]]
+    config.data.revision_directions = [["pt-BR", "zh-Hant"], ["zh-Hant", "pt-BR"]]
+    dataset = SimpleNamespace(
+        detect_revision_directions=lambda **_kwargs: (("pt-BR", "zh-Hant"),),
+    )
+
+    with pytest.raises(ValueError, match="unsupported=.*zh-Hant.*pt-BR"):
+        train_module.resolve_training_revision_directions(  # type: ignore[arg-type]
+            config,
+            dataset,
+            draft_token_id=9,
+            max_source_tokens=510,
+        )
+
+
+def test_revision_capability_rejects_rows_with_zero_effective_sampling_mass() -> None:
+    config = AppConfig()
+    config.data.language_pair = ["pt-BR", "zh-Hant"]
+    config.data.translation_directions = [["pt-BR", "zh-Hant"]]
+    config.data.revision_directions = [["pt-BR", "zh-Hant"]]
+    positive_mask = object()
+    dataset = SimpleNamespace(
+        detect_revision_directions=lambda **kwargs: (
+            (("pt-BR", "zh-Hant"),) if kwargs.get("physical_mask") is None else ()
+        ),
+    )
+
+    with pytest.raises(ValueError, match="unsupported=.*pt-BR.*zh-Hant"):
+        train_module.resolve_training_revision_directions(  # type: ignore[arg-type]
+            config,
+            dataset,
+            draft_token_id=9,
+            max_source_tokens=510,
+            physical_mask=positive_mask,  # type: ignore[arg-type]
         )
 
 
@@ -252,6 +346,7 @@ def test_artifact_run_leases_remain_held_until_the_run_scope_exits(
 
 def test_prepared_artifact_identity_binds_control_file_contents(tmp_path: Path) -> None:
     config = AppConfig()
+    config.data.language_pair = ["ko", "ja"]
     tokenizer = tmp_path / "tokenizer" / "sion.model"
     dataset = tmp_path / "translation" / "dataset"
     foundation_dataset = tmp_path / "foundation" / "dataset"
@@ -314,6 +409,7 @@ def test_foundation_preparation_backs_up_a_file_at_the_dataset_path(
     import sion_translate.data.prepare_foundation as foundation_prepare
 
     config = AppConfig()
+    config.data.language_pair = ["ko", "ja"]
     tokenizer = tmp_path / "tokenizer" / "sion.model"
     tokenizer.parent.mkdir(parents=True)
     tokenizer.write_bytes(b"tokenizer")
@@ -425,6 +521,7 @@ def test_final_export_wires_all_formats_and_model_sidecars(
     config.data.language_pairs = [["ko", "ja"], ["en", "ru"]]
     config.data.bidirectional = False
     config.data.revision_examples = True
+    config.data.revision_directions = [["ko", "ja"]]
     config.model.experimental.morphoscript_enabled = True
     context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
     calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
@@ -443,6 +540,7 @@ def test_final_export_wires_all_formats_and_model_sidecars(
         tmp_path / "run",
         stage="posttrain",
         step=17,
+        authenticated_revision_directions=(("ko", "ja"),),
         pipeline_identity={
             "schema": "sion-translation-pipeline-v2",
             "branch": "translation-only",
@@ -459,6 +557,7 @@ def test_final_export_wires_all_formats_and_model_sidecars(
     assert kwargs["language_pairs"] == (("ko", "ja"), ("en", "ru"))
     assert kwargs["bidirectional"] is False
     assert kwargs["revision_trained"] is True
+    assert kwargs["revision_directions"] == (("ko", "ja"),)
     assert kwargs["pipeline_identity"] == {
         "schema": "sion-translation-pipeline-v2",
         "branch": "translation-only",
@@ -1148,6 +1247,7 @@ def test_translation_only_resume_conflicts_with_configured_offline_foundation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = AppConfig()
+    config.data.language_pair = ["ko", "ja"]
     offline_plan = SimpleNamespace(enabled=False, languages=config.foundation_languages())
     monkeypatch.setattr(
         train_module,
@@ -1174,6 +1274,7 @@ def test_sft_resume_uses_its_authenticated_lineage_without_base_artifacts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = AppConfig()
+    config.data.language_pair = ["ko", "ja"]
     config.foundation.release_name = "my_base"
     plan = SimpleNamespace(enabled=True, languages=("ko", "ja"))
     pipeline = {
@@ -1215,6 +1316,7 @@ def test_sft_resume_keeps_foundation_lineage_when_raw_base_corpus_is_offline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = AppConfig()
+    config.data.language_pair = ["ko", "ja"]
     config.foundation.release_name = "my_base"
     offline_plan = SimpleNamespace(enabled=False, languages=("ko", "ja"))
     pipeline = {
@@ -1478,10 +1580,11 @@ def test_distributed_bf16_support_is_resolved_collectively(monkeypatch) -> None:
 def test_parallel_strategy_config_rejects_ambiguous_legacy_override() -> None:
     config = config_from_raw(
         {
+            "data": {"language_pair": ["ko", "ja"]},
             "training": {
                 "parallel_strategy": "fsdp2",
                 "fsdp_reduce_dtype": "bf16",
-            }
+            },
         }
     )
     config.validate()
@@ -2041,6 +2144,7 @@ def test_explicit_direction_graph_cannot_be_backfilled_onto_a_legacy_tokenizer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = AppConfig()
+    config.data.language_pair = ["ko", "ja"]
     config.data.raw_dir = str(tmp_path / "raw")
     config.data.tokenizer_model = str(tmp_path / "tokenizer" / "sion.model")
     config.data.dataset_dir = str(tmp_path / "dataset")

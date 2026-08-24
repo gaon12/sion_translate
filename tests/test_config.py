@@ -348,6 +348,27 @@ def test_single_and_multi_pair_keys_cannot_be_configured_together() -> None:
         )
 
 
+def test_language_graph_has_no_implicit_korean_japanese_default() -> None:
+    data = DataConfig()
+
+    assert data.language_pair == []
+    assert data.language_pairs == []
+    with pytest.raises(ValueError, match="exactly one of data.language_pair"):
+        data.configured_language_pairs()
+    with pytest.raises(ValueError, match="exactly one of data.language_pair"):
+        AppConfig().validate()
+
+
+def test_direct_data_config_rejects_both_language_pair_shapes() -> None:
+    data = DataConfig(
+        language_pair=["ko", "ja"],
+        language_pairs=[["en", "ru"]],
+    )
+
+    with pytest.raises(ValueError, match="exactly one of data.language_pair"):
+        data.configured_language_pairs()
+
+
 def test_reversed_multilingual_pair_is_rejected() -> None:
     config = AppConfig(data=DataConfig(language_pairs=[["ko", "ja"], ["ja", "ko"]]))
     with pytest.raises(ValueError, match="duplicate or reversed"):
@@ -439,6 +460,59 @@ def test_language_graph_is_canonicalized_as_one_bcp47_identity() -> None:
     assert config.foundation.languages == ["pt-BR", "zh-Hant", "sr-Latn-RS"]
 
 
+def test_language_graph_uses_preferred_values_for_deprecated_identities() -> None:
+    config = AppConfig(
+        data=DataConfig(
+            language_pairs=[["IW", "in"], ["i-klingon", "en"]],
+            translation_directions=[["he", "id"], ["TLH", "EN"]],
+            source_only_languages=["jw"],
+        )
+    )
+    # Source-only languages still have to belong to a pair; use a separate
+    # graph here to exercise the same canonical config boundary.
+    config.data.language_pairs.append(["jw", "fr"])
+    config.data.translation_directions.append(["jv", "fr"])
+    config.foundation.languages = ["iw", "IN", "i-klingon", "JW"]
+
+    config.validate()
+
+    assert config.data.language_pairs == [["he", "id"], ["tlh", "en"], ["jv", "fr"]]
+    assert config.data.translation_directions == [
+        ["he", "id"],
+        ["tlh", "en"],
+        ["jv", "fr"],
+    ]
+    assert config.data.source_only_languages == ["jv"]
+    assert config.foundation.languages == ["he", "id", "tlh", "jv"]
+
+
+def test_config_rejects_alias_duplicate_pairs_and_directions() -> None:
+    duplicate_pairs = AppConfig(data=DataConfig(language_pairs=[["iw", "in"], ["ID", "he"]]))
+    with pytest.raises(ValueError, match="duplicate or reversed language pair"):
+        duplicate_pairs.validate()
+
+    duplicate_directions = AppConfig(
+        data=DataConfig(
+            language_pairs=[["he", "id"]],
+            translation_directions=[["iw", "in"], ["HE", "ID"]],
+        )
+    )
+    with pytest.raises(ValueError, match="duplicate translation direction"):
+        duplicate_directions.validate()
+
+    registry_duplicate_directions = AppConfig(
+        data=DataConfig(
+            language_pairs=[["en-MM", "cmn"]],
+            translation_directions=[
+                ["en-BU", "zh-cmn"],
+                ["EN-mm", "CMN"],
+            ],
+        )
+    )
+    with pytest.raises(ValueError, match="duplicate translation direction"):
+        registry_duplicate_directions.validate()
+
+
 def test_language_graph_rejects_duplicates_after_bcp47_canonicalization() -> None:
     config = AppConfig(
         data=DataConfig(
@@ -499,6 +573,7 @@ def test_padding_multiple_must_be_positive() -> None:
 )
 def test_supported_sft_selection_metrics_are_valid(metric: str) -> None:
     config = AppConfig()
+    config.data.language_pair = ["ko", "ja"]
     config.training.sft_selection_metric = metric
     config.validate()
 
@@ -512,6 +587,7 @@ def test_unknown_sft_selection_metric_is_rejected() -> None:
 
 def test_final_export_formats_cover_all_requested_deployment_precisions() -> None:
     config = AppConfig()
+    config.data.language_pair = ["ko", "ja"]
     assert config.training.final_export_formats == [
         "fp32",
         "fp16",
@@ -576,6 +652,7 @@ def test_runnable_presets_use_the_documented_deep_encoder_shape() -> None:
 def test_foundation_stage_is_a_top_level_config_section(tmp_path: Path) -> None:
     config_path = tmp_path / "with_foundation.yaml"
     config_path.write_text(
+        "data:\n  language_pair: [ko, ja]\n"
         "foundation:\n  enabled: false\n  max_steps: 25\n  warmup_steps: 5\n",
         encoding="utf-8",
     )
@@ -638,6 +715,7 @@ def test_foundation_languages_drop_the_source_only_varieties() -> None:
 
 def test_foundation_can_add_a_non_translation_language() -> None:
     config = AppConfig()
+    config.data.language_pair = ["ko", "ja"]
     config.foundation.languages = ["ko", "ja", "en"]
     config.validate()
 
@@ -700,6 +778,7 @@ def test_foundation_warmup_cannot_exceed_its_own_step_budget() -> None:
 
 def test_epoch_training_does_not_require_a_fixed_step_budget() -> None:
     config = AppConfig()
+    config.data.language_pair = ["ko", "ja"]
     config.training.max_steps = None
     config.foundation.max_steps = None
     config.posttraining.max_steps = None
@@ -723,4 +802,33 @@ def test_foundation_export_formats_share_the_training_validator() -> None:
     config = AppConfig()
     config.foundation.final_export_formats = ["onnx"]
     with pytest.raises(ValueError, match="unsupported foundation.final_export_formats"):
+        config.validate()
+
+
+def test_revision_directions_are_canonical_exact_translation_subgraph() -> None:
+    config = AppConfig()
+    config.data.language_pairs = [["pt-br", "zh-hant"]]
+    config.data.translation_directions = [["PT-br", "ZH-hant"], ["zh-Hant", "pt-BR"]]
+    config.data.revision_directions = [["PT-BR", "zh-hant"]]
+
+    config.validate()
+
+    assert config.data.revision_directions == [["pt-BR", "zh-Hant"]]
+    assert config.data.configured_revision_directions() == (("pt-BR", "zh-Hant"),)
+    assert config.data.revision_examples is True
+
+
+def test_revision_directions_reject_alias_duplicates_and_untrained_edges() -> None:
+    config = AppConfig()
+    config.data.language_pairs = [["pt-BR", "zh-Hant"]]
+    config.data.translation_directions = [["pt-BR", "zh-Hant"]]
+    config.data.revision_directions = [
+        ["pt-br", "ZH-hant"],
+        ["PT-BR", "zh-Hant"],
+    ]
+    with pytest.raises(ValueError, match="duplicate data.revision_directions"):
+        config.validate()
+
+    config.data.revision_directions = [["zh-Hant", "pt-BR"]]
+    with pytest.raises(ValueError, match="subset of data.translation_directions"):
         config.validate()

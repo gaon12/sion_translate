@@ -9,10 +9,13 @@ import numpy as np
 import pytest
 
 from sion_translate.data import DistributedBucketBatchSampler, IndexedParallelDataset
-from sion_translate.cli.train import preflight_effective_translation_training
+from sion_translate.cli.train import (
+    preflight_effective_translation_training,
+    resolve_training_revision_directions,
+)
 from sion_translate.config import AppConfig, DataConfig
 from sion_translate.data.prepare import prepare_dataset
-from sion_translate.tokenizer import load_tokenizer_metadata, train_tokenizer
+from sion_translate.tokenizer import SionTokenizer, load_tokenizer_metadata, train_tokenizer
 
 
 LANGUAGE_PAIRS = (("de", "fr"), ("ar", "sw"))
@@ -93,6 +96,12 @@ def test_mixed_direction_graph_is_materialized_exactly(tmp_path: Path) -> None:
     )
 
     assert dataset.translation_directions == TRANSLATION_DIRECTIONS
+    assert (
+        dataset.observed_translation_directions_for_physical_mask(
+            np.ones(dataset.pair_count, dtype=np.bool_)
+        )
+        == TRANSLATION_DIRECTIONS
+    )
     assert len(current_with_legacy_one_way) == len(dataset)
     assert dataset.observed_language_pairs == LANGUAGE_PAIRS
     assert dataset.direction_count == 3
@@ -210,3 +219,145 @@ def test_balanced_sampling_preserves_mixed_graph_virtual_direction_mass(
     denoise_only_sampler = DistributedBucketBatchSampler(dataset, batch_size=8)
     with pytest.raises(ValueError, match="no translation objective"):
         preflight_effective_translation_training(config, denoise_only_sampler)
+
+
+def test_preflight_rejects_an_advertised_reverse_edge_with_no_emittable_rows(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "forward_only.jsonl"
+    source.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "pt-BR": f"Exemplo de origem número {index} para treinamento.",
+                    "zh-Hant": f"用於訓練的目標範例編號 {index}。",
+                    "training_direction": ["pt-BR", "zh-Hant"],
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+            for index in range(12)
+        ),
+        encoding="utf-8",
+    )
+    pairs = (("pt-BR", "zh-Hant"),)
+    directions = (("pt-BR", "zh-Hant"), ("zh-Hant", "pt-BR"))
+    tokenizer_path = train_tokenizer(
+        [str(source)],
+        tmp_path / "tokenizer",
+        vocab_size=384,
+        input_sentence_size=1000,
+        seed_sentencepiece_size=1000,
+        validation_fraction=0.0,
+        test_fraction=0.0,
+        language_pairs=pairs,
+        translation_directions=directions,
+        num_workers=1,
+        num_threads=1,
+    )
+    dataset_dir = tmp_path / "dataset"
+    prepare_dataset(
+        [str(source)],
+        tokenizer_path,
+        dataset_dir,
+        validation_fraction=0.0,
+        test_fraction=0.0,
+        filter_quality=False,
+        dedup_backend="memory",
+        language_pairs=pairs,
+        translation_directions=directions,
+        num_workers=1,
+    )
+    dataset = IndexedParallelDataset(dataset_dir, "train", bidirectional=True)
+    sampler = DistributedBucketBatchSampler(dataset, batch_size=4)
+    config = AppConfig(
+        data=DataConfig(
+            language_pair=list(pairs[0]),
+            translation_directions=[list(direction) for direction in directions],
+        )
+    )
+
+    assert dataset.observed_translation_directions_for_physical_mask(
+        sampler.positive_sampling_pair_mask()
+    ) == (("pt-BR", "zh-Hant"),)
+    with pytest.raises(ValueError, match="zero effective examples.*zh-Hant.*pt-BR"):
+        preflight_effective_translation_training(config, sampler)
+
+
+def test_revision_only_arbitrary_language_edge_survives_full_denoising_preflight(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "revision_only.jsonl"
+    source.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "pt-BR": (
+                        f"Fonte portuguesa número {index}. "
+                        f"<draft> Rascunho imperfeito número {index}."
+                    ),
+                    "zh-Hant": f"修訂後的繁體中文句子編號 {index}。",
+                    "training_direction": ["pt-BR", "zh-Hant"],
+                    "provenance": {"transformation": "revision"},
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+            for index in range(12)
+        ),
+        encoding="utf-8",
+    )
+    pairs = (("pt-BR", "zh-Hant"),)
+    directions = (("pt-BR", "zh-Hant"),)
+    tokenizer_path = train_tokenizer(
+        [str(source)],
+        tmp_path / "tokenizer",
+        vocab_size=384,
+        input_sentence_size=1000,
+        seed_sentencepiece_size=1000,
+        validation_fraction=0.0,
+        test_fraction=0.0,
+        language_pairs=pairs,
+        translation_directions=directions,
+        num_workers=1,
+        num_threads=1,
+    )
+    dataset_dir = tmp_path / "dataset"
+    prepare_dataset(
+        [str(source)],
+        tokenizer_path,
+        dataset_dir,
+        validation_fraction=0.0,
+        test_fraction=0.0,
+        filter_quality=False,
+        dedup_backend="memory",
+        language_pairs=pairs,
+        translation_directions=directions,
+        num_workers=1,
+    )
+    dataset = IndexedParallelDataset(dataset_dir, "train", bidirectional=True)
+    sampler = DistributedBucketBatchSampler(dataset, batch_size=4)
+    tokenizer = SionTokenizer(tokenizer_path)
+    config = AppConfig(
+        data=DataConfig(
+            language_pair=list(pairs[0]),
+            translation_directions=[list(direction) for direction in directions],
+            denoise_probability=1.0,
+        )
+    )
+    positive_mask = sampler.positive_sampling_pair_mask()
+
+    revision_directions = resolve_training_revision_directions(
+        config,
+        dataset,
+        draft_token_id=tokenizer.draft_id,
+        max_source_tokens=config.data.max_source_length - 2,
+        physical_mask=positive_mask,
+    )
+
+    assert revision_directions == directions
+    preflight_effective_translation_training(
+        config,
+        sampler,
+        authenticated_revision_directions=revision_directions,
+    )

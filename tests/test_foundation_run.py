@@ -27,6 +27,7 @@ from sion_translate.cli.train import (
     FOUNDATION_COMPLETION_FILENAME,
     _foundation_checkpoint_artifact_sha256,
     _foundation_completion_matches_inputs,
+    _foundation_plan_for_lineage,
     _foundation_source_sampling_weights,
     resolve_foundation_lineage,
     run_foundation_stage,
@@ -72,7 +73,7 @@ def tokenizer_model(tmp_path_factory):
     )
 
 
-def _prepared(tmp_path, tokenizer_model):
+def _prepared(tmp_path, tokenizer_model, *, empty_language: str | None = None):
     """토크나이저·코퍼스·데이터셋이 준비된 설정과 모델을 만든다."""
 
     corpus = tmp_path / "corpus"
@@ -81,10 +82,12 @@ def _prepared(tmp_path, tokenizer_model):
         ("ja", "日本語の単言語文 {} です もう少し長いです"),
     ):
         (corpus / language).mkdir(parents=True)
-        (corpus / language / "a.txt").write_text(
-            "\n".join(template.format(index) for index in range(240)) + "\n",
-            encoding="utf-8",
+        lines = (
+            ["짧음" if language == "ko" else "短い"] * 240
+            if language == empty_language
+            else [template.format(index) for index in range(240)]
         )
+        (corpus / language / "a.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     config = AppConfig()
     config.data.language_pairs = [["ko", "ja"]]
@@ -229,6 +232,81 @@ def test_the_stage_trains_and_marks_itself_complete(
     assert sampler_arguments[0]["source_sampling_weights_by_id"]
     assert math.isinf(sampler_arguments[0]["max_source_upsampling"])
     assert "source_sampling_weights_by_id" not in sampler_arguments[1]
+
+
+def test_foundation_publishes_only_positive_mass_train_languages(
+    tmp_path: Path,
+    tokenizer_model: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, plan, model, tokenizer, context = _prepared(
+        tmp_path,
+        tokenizer_model,
+        empty_language="ja",
+    )
+    assert plan.languages == ("ko", "ja")
+
+    outcome = run_foundation_stage(config, plan, model, tokenizer, context)
+
+    assert outcome.ran
+    assert outcome.languages == ("ko",)
+    run_root = foundation_run_directory(config)
+    completion = run_root / FOUNDATION_COMPLETION_FILENAME
+    marker = json.loads(completion.read_text(encoding="utf-8"))
+    assert marker["languages"] == ["ko"]
+    lineage = resolve_foundation_lineage(config, plan, context)
+    assert lineage["languages"] == ["ko"]
+    effective_plan = _foundation_plan_for_lineage(plan, lineage)
+    pipeline = build_translation_pipeline_identity(
+        effective_plan,
+        foundation_lineage=lineage,
+    )
+    assert pipeline["foundation"]["languages"] == ["ko"]
+
+    latest_payload = torch.load(
+        run_root / "exports" / "latest" / "model.pt",
+        map_location="cpu",
+        weights_only=True,
+    )
+    final_payload = torch.load(
+        run_root / "exports" / "best" / "model.pt",
+        map_location="cpu",
+        weights_only=True,
+    )
+    assert latest_payload["metadata"]["languages"] == ["ko"]
+    assert final_payload["metadata"]["languages"] == ["ko"]
+
+    import sion_translate.cli.train as train_module
+
+    shutil.rmtree(run_root / "exports" / "best")
+    original_export = train_module.export_final_model
+    repaired_languages: list[tuple[str, ...]] = []
+
+    def recording_export(*args, **kwargs):
+        repaired_languages.append(tuple(kwargs["languages"]))
+        return original_export(*args, **kwargs)
+
+    monkeypatch.setattr(train_module, "export_final_model", recording_export)
+    monkeypatch.setattr(
+        train_module,
+        "train",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("effective-language export repair must not retrain foundation")
+        ),
+    )
+    fresh = SionForConditionalGeneration(config.model, pad_id=tokenizer.pad_id)
+
+    reused = run_foundation_stage(config, plan, fresh, tokenizer, context)
+
+    assert not reused.ran
+    assert reused.languages == ("ko",)
+    assert repaired_languages == [("ko",)]
+    repaired_payload = torch.load(
+        run_root / "exports" / "best" / "model.pt",
+        map_location="cpu",
+        weights_only=True,
+    )
+    assert repaired_payload["metadata"]["languages"] == ["ko"]
 
 
 def test_empty_prepared_language_has_zero_sampling_mass(tmp_path) -> None:
@@ -1092,7 +1170,7 @@ def test_the_stage_publishes_under_the_foundation_release_name(tmp_path, tokeniz
 
 
 def test_a_foundation_export_is_refused_by_the_translator(tmp_path, tokenizer_model) -> None:
-    """막지 않으면 방향 태그를 받아들이고 그럴듯한 쓰레기를 낸다."""
+    """A foundation artifact must not accept translation direction tags."""
     from sion_translate.inference import Translator
 
     config, plan, model, tokenizer, context = _prepared(tmp_path, tokenizer_model)
@@ -1100,5 +1178,5 @@ def test_a_foundation_export_is_refused_by_the_translator(tmp_path, tokenizer_mo
     run_foundation_stage(config, plan, model, tokenizer, context)
     export = foundation_run_directory(config) / "exports" / "best" / "model.pt"
 
-    with pytest.raises(ValueError, match="번역 모델이 아닙니다"):
+    with pytest.raises(ValueError, match="not a translation model"):
         Translator(str(export), str(tokenizer_model))
