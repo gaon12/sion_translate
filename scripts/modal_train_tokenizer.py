@@ -93,6 +93,23 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _stable_file_identity(path: Path, *, role: str) -> tuple[int, str]:
+    """Hash one regular file and reject replacement or mutation during the read."""
+
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"{role} must be a regular non-symlink file: {path}")
+    before = path.stat()
+    digest = _file_sha256(path)
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError(f"{role} changed while it was hashed: {path}")
+    after = path.stat()
+    before_identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+    after_identity = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+    if before_identity != after_identity:
+        raise RuntimeError(f"{role} changed while it was hashed: {path}")
+    return after.st_size, digest
+
+
 def _safe_relative_path(value: str) -> PurePosixPath:
     if not value or "\\" in value:
         raise ValueError(f"manifest path must be non-empty POSIX text: {value!r}")
@@ -145,9 +162,8 @@ def _hash_source(path: Path, input_root: Path) -> SourceRecord:
         relative = resolved_path.relative_to(resolved_root).as_posix()
     except ValueError as error:
         raise ValueError(f"source escapes the input root: {path}") from error
-    if path.is_symlink() or not path.is_file():
-        raise ValueError(f"source must be a regular non-symlink file: {relative}")
-    return SourceRecord(relative, path.stat().st_size, _file_sha256(path))
+    size, digest = _stable_file_identity(path, role=f"source {relative}")
+    return SourceRecord(relative, size, digest)
 
 
 def _records_digest(records: Sequence[SourceRecord]) -> str:
@@ -178,6 +194,7 @@ def build_source_manifest(
     if COMMIT_PATTERN.fullmatch(git_commit) is None:
         raise ValueError(f"invalid Git commit: {git_commit!r}")
     config_path = repository_root / "sion_translate.yaml"
+    _, config_digest = _stable_file_identity(config_path, role="production configuration")
     paths, config = _source_paths(
         repository_root,
         config_path,
@@ -190,6 +207,19 @@ def build_source_manifest(
     with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
         records = list(executor.map(hash_source, paths))
     records.sort(key=lambda record: record.path)
+    selected_after, _ = _source_paths(
+        repository_root,
+        config_path,
+        source_root=repository_root,
+    )
+    if [path.resolve() for path in selected_after] != [path.resolve() for path in paths]:
+        raise RuntimeError("production source selection changed while the manifest was built")
+    _, config_digest_after = _stable_file_identity(
+        config_path,
+        role="production configuration",
+    )
+    if config_digest_after != config_digest:
+        raise RuntimeError("production configuration changed while the manifest was built")
     ratio = float(config.foundation.tokenizer_sample_ratio)
     if not math.isfinite(ratio) or ratio < 0:
         raise RuntimeError("configured tokenizer sample ratio must be finite and non-negative")
@@ -197,7 +227,7 @@ def build_source_manifest(
         "version": SOURCE_MANIFEST_VERSION,
         "git_commit": git_commit,
         "config_path": "sion_translate.yaml",
-        "config_sha256": _file_sha256(config_path),
+        "config_sha256": config_digest,
         "tokenizer_sample_ratio": ratio,
         "file_count": len(records),
         "total_bytes": sum(record.size for record in records),
@@ -264,7 +294,11 @@ def verify_source_manifest(
 
     records = _parse_source_manifest(manifest)
     config_digest = manifest.get("config_sha256")
-    if not isinstance(config_digest, str) or config_digest != _file_sha256(config_path):
+    _, observed_config_digest = _stable_file_identity(
+        config_path,
+        role="remote production configuration",
+    )
+    if not isinstance(config_digest, str) or config_digest != observed_config_digest:
         raise RuntimeError("remote production configuration differs from the local manifest")
     paths, config = _source_paths(input_root, config_path, source_root=source_root)
     selected = {path.relative_to(input_root).as_posix(): path for path in paths}
@@ -288,6 +322,15 @@ def verify_source_manifest(
 
     with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
         list(executor.map(verify, records))
+    selected_after, _ = _source_paths(input_root, config_path, source_root=source_root)
+    if [path.resolve() for path in selected_after] != [path.resolve() for path in paths]:
+        raise RuntimeError("remote production source selection changed during verification")
+    _, config_digest_after = _stable_file_identity(
+        config_path,
+        role="remote production configuration",
+    )
+    if config_digest_after != config_digest:
+        raise RuntimeError("remote production configuration changed during verification")
     return paths, config
 
 
@@ -383,6 +426,36 @@ def _validate_training_metadata(
             if recorded_digest != artifacts[name]["sha256"]:
                 raise RuntimeError(f"tokenizer metadata identity differs for {name}")
     return metadata
+
+
+def _validate_training_source_identities(
+    metadata: Mapping[str, object],
+    expected_sources: Sequence[SourceRecord],
+) -> None:
+    """Prove that the child trained on the bytes authenticated by its parent."""
+
+    contract = metadata.get("training_contract")
+    if not isinstance(contract, Mapping):
+        raise RuntimeError("tokenizer metadata has no training contract")
+    raw_sources = contract.get("sources")
+    if not isinstance(raw_sources, list):
+        raise RuntimeError("tokenizer training contract has no source identities")
+    observed: list[tuple[int, str]] = []
+    for raw_source in raw_sources:
+        if not isinstance(raw_source, Mapping):
+            raise RuntimeError("tokenizer training contract has an invalid source entry")
+        size = raw_source.get("size")
+        digest = raw_source.get("sha256")
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            raise RuntimeError("tokenizer training contract has an invalid source size")
+        if not isinstance(digest, str) or SHA256_PATTERN.fullmatch(digest) is None:
+            raise RuntimeError("tokenizer training contract has an invalid source digest")
+        observed.append((size, digest))
+    expected = sorted((source.size, source.sha256) for source in expected_sources)
+    if sorted(observed) != expected:
+        raise RuntimeError(
+            "tokenizer child trained on source bytes that differ from the parent manifest"
+        )
 
 
 def _publish_candidate(build_directory: Path, output_root: Path, candidate_name: str) -> Path:
@@ -694,6 +767,10 @@ def _train_remote(source_manifest: Mapping[str, object], run_id: str) -> dict[st
             )
         artifacts = _artifact_records(build_directory)
         metadata = _validate_training_metadata(build_directory, ratio, artifacts)
+        _validate_training_source_identities(
+            metadata,
+            _parse_source_manifest(source_manifest),
+        )
         training_manifest: dict[str, object] = {
             "version": TRAINING_MANIFEST_VERSION,
             "run_id": run_id,

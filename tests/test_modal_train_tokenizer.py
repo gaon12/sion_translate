@@ -29,6 +29,7 @@ from scripts.modal_train_tokenizer import (
     _records_digest,
     _run_training_subprocess,
     _validate_training_metadata,
+    _validate_training_source_identities,
 )
 
 SAMPLE_RATIO = 0.37
@@ -121,6 +122,44 @@ def test_file_hash_uses_file_bytes(tmp_path: Path) -> None:
     path = tmp_path / "artifact"
     path.write_bytes(b"tokenizer")
     assert _file_sha256(path) == hashlib.sha256(b"tokenizer").hexdigest()
+
+
+def test_source_hash_rejects_mutation_during_the_hash_pass(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "data" / "parallel.jsonl"
+    source.parent.mkdir()
+    source.write_bytes(b"original")
+    actual_hash = modal_tokenizer_script._file_sha256
+
+    def mutate_after_read(path: Path) -> str:
+        digest = actual_hash(path)
+        path.write_bytes(b"replacement with a different size")
+        return digest
+
+    monkeypatch.setattr(modal_tokenizer_script, "_file_sha256", mutate_after_read)
+    with pytest.raises(RuntimeError, match="changed while it was hashed"):
+        modal_tokenizer_script._hash_source(source, tmp_path)
+
+
+def test_child_training_sources_must_match_the_parent_manifest() -> None:
+    expected_digest = hashlib.sha256(b"expected").hexdigest()
+    changed_digest = hashlib.sha256(b"changed").hexdigest()
+    expected = [SourceRecord("data/parallel.jsonl", 8, expected_digest)]
+    metadata: dict[str, object] = {
+        "training_contract": {
+            "sources": [{"path": "parallel.jsonl", "size": 8, "sha256": expected_digest}]
+        }
+    }
+
+    _validate_training_source_identities(metadata, expected)
+
+    metadata["training_contract"] = {
+        "sources": [{"path": "parallel.jsonl", "size": 7, "sha256": changed_digest}]
+    }
+    with pytest.raises(RuntimeError, match="differ from the parent manifest"):
+        _validate_training_source_identities(metadata, expected)
 
 
 def test_parent_heartbeats_while_mock_child_holds_the_gil(
