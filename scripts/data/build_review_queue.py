@@ -18,9 +18,14 @@ number so a reviewer can repair the pair and place it back in the corpus.
 from __future__ import annotations
 
 import argparse
+from collections.abc import Generator
+from contextlib import contextmanager
 import json
+import os
 from collections import Counter
 from pathlib import Path
+import tempfile
+from typing import cast, TextIO
 
 from sion_translate.console import configure_stdio
 from sion_translate.contamination import (
@@ -31,6 +36,64 @@ from sion_translate.contamination import (
 from sion_translate.data.quality import canonical_text
 from sion_translate.data.records import expand_parallel_record, normalize_language_pairs
 from sion_translate.tokenizer import expand_inputs
+
+
+def _paths_alias(left: Path, right: Path) -> bool:
+    """Return whether two paths resolve to the same file, including hard links."""
+
+    try:
+        if left.resolve() == right.resolve():
+            return True
+    except OSError:
+        pass
+    try:
+        return left.exists() and right.exists() and left.samefile(right)
+    except OSError:
+        return False
+
+
+def _fsync_directory(path: Path) -> None:
+    """Persist a directory replacement on platforms that permit directory fsync."""
+
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def _atomic_text_sink(path: Path) -> Generator[TextIO, None, None]:
+    """Yield a private sibling file and publish it only after a complete sync."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".part",
+            delete=False,
+        ) as sink:
+            temporary = Path(sink.name)
+            yield cast(TextIO, sink)
+            sink.flush()
+            os.fsync(sink.fileno())
+        temporary.replace(path)
+        _fsync_directory(path.parent)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    with _atomic_text_sink(path) as sink:
+        sink.write(text)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -75,13 +138,22 @@ def main() -> None:
         raise SystemExit(f"No JSONL files matched the requested inputs: {args.input}")
 
     output = Path(args.output)
-    output.parent.mkdir(parents=True, exist_ok=True)
+    summary_path = Path(args.summary) if args.summary else None
+    for label, candidate in (("output", output), ("summary", summary_path)):
+        if candidate is not None and any(_paths_alias(candidate, path) for path in paths):
+            raise SystemExit(
+                f"The {label} path must not refer to an input shard. Choose a separate "
+                f"destination: {candidate}"
+            )
+    if summary_path is not None and _paths_alias(output, summary_path):
+        raise SystemExit("The review queue output and summary must use different paths.")
+
     by_rule: Counter[str] = Counter()
     by_source: Counter[str] = Counter()
     scanned = 0
     queued = 0
 
-    with output.open("w", encoding="utf-8") as sink:
+    with _atomic_text_sink(output) as sink:
         for path in paths:
             with path.open("rb") as handle:
                 for line_number, raw_line in enumerate(handle, start=1):
@@ -143,11 +215,10 @@ def main() -> None:
             "for automatic deletion."
         ),
     }
-    if args.summary:
-        summary_path = Path(args.summary)
-        summary_path.parent.mkdir(parents=True, exist_ok=True)
-        summary_path.write_text(
-            json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    if summary_path is not None:
+        _atomic_write_text(
+            summary_path,
+            json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
         )
     print(
         f"Scanned pairs: {scanned:,} / queued for review: {queued:,} ({summary['queued_rate']:.3%})"

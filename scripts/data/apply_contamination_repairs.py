@@ -22,18 +22,23 @@ default because applying a repair modifies the corpus in place.
 
 The original shard is preserved under
 ``data/excluded/contamination_repair_<date>/``. The report counts every repair
-and includes original and repaired text for a bounded review sample. Restore the
-preserved shard to undo an applied repair.
+and includes original and repaired text for a bounded review sample. Its
+``backup_files`` mapping identifies the exact immutable snapshot for each input;
+an existing snapshot is never overwritten. Restore that snapshot to undo an
+applied repair.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 from collections import Counter
 from datetime import date
+from hashlib import sha256
 from pathlib import Path
+import tempfile
 from typing import cast
 
 from sion_translate.console import configure_stdio
@@ -44,6 +49,100 @@ from sion_translate.tokenizer import expand_inputs
 # Keep the report compact enough for a person to inspect. The review queue holds
 # the complete set of candidates.
 SAMPLE_LIMIT = 20
+
+
+def _paths_alias(left: Path, right: Path) -> bool:
+    """Return whether two paths resolve to the same file, including hard links."""
+
+    try:
+        if left.resolve() == right.resolve():
+            return True
+    except OSError:
+        pass
+    try:
+        return left.exists() and right.exists() and left.samefile(right)
+    except OSError:
+        return False
+
+
+def _fsync_directory(path: Path) -> None:
+    """Persist a directory replacement on platforms that permit directory fsync."""
+
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _atomic_write_text(
+    path: Path,
+    text: str,
+    *,
+    preserve_metadata_from: Path | None = None,
+) -> None:
+    """Write complete text beside its destination, sync it, and replace atomically."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".part",
+            delete=False,
+        ) as sink:
+            temporary = Path(sink.name)
+            sink.write(text)
+            sink.flush()
+            os.fsync(sink.fileno())
+        if preserve_metadata_from is not None:
+            shutil.copystat(preserve_metadata_from, temporary)
+        temporary.replace(path)
+        _fsync_directory(path.parent)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _copy_backup(source: Path, backup_root: Path) -> Path:
+    """Publish one immutable backup without colliding on duplicate basenames."""
+
+    identity = sha256(os.path.normcase(str(source.resolve())).encode("utf-8")).hexdigest()[:32]
+    directory = backup_root / identity
+    directory.mkdir(parents=True, exist_ok=True)
+    destination = directory / source.name
+    temporary: Path | None = None
+    try:
+        with source.open("rb") as input_handle:
+            with tempfile.NamedTemporaryFile(
+                mode="w+b",
+                dir=directory,
+                prefix=f".{source.name}.",
+                suffix=".part",
+                delete=False,
+            ) as sink:
+                temporary = Path(sink.name)
+                shutil.copyfileobj(input_handle, sink)
+                sink.flush()
+                os.fsync(sink.fileno())
+        shutil.copystat(source, temporary)
+        try:
+            os.link(temporary, destination)
+        except FileExistsError as error:
+            raise FileExistsError(
+                f"Refusing to overwrite an existing immutable backup: {destination}"
+            ) from error
+        _fsync_directory(directory)
+        return destination
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -90,9 +189,16 @@ def main() -> None:
     paths = expand_inputs(args.input)
     if not paths:
         raise SystemExit(f"No JSONL files matched the requested inputs: {args.input}")
+    report_path = Path(args.report) if args.report else None
+    if report_path is not None and any(_paths_alias(report_path, path) for path in paths):
+        raise SystemExit(
+            "The report path must not refer to an input shard. Choose a separate "
+            f"destination: {report_path}"
+        )
 
     backup_root = Path(args.backup_root) if args.backup_root else _default_backup_root()
     by_file: Counter[str] = Counter()
+    backup_files: dict[str, str] = {}
     samples: list[dict[str, object]] = []
     scanned = 0
     repaired_rows = 0
@@ -155,9 +261,13 @@ def main() -> None:
             rewritten.append(json.dumps(row, ensure_ascii=False))
 
         if changed_here and args.apply:
-            backup_root.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(path, backup_root / path.name)
-            path.write_text("\n".join(rewritten) + "\n", encoding="utf-8")
+            backup_path = _copy_backup(path, backup_root)
+            backup_files[str(path)] = str(backup_path)
+            _atomic_write_text(
+                path,
+                "\n".join(rewritten) + "\n",
+                preserve_metadata_from=path,
+            )
 
     report = {
         "applied": bool(args.apply),
@@ -165,6 +275,7 @@ def main() -> None:
         "repaired_rows": repaired_rows,
         "by_file": dict(by_file.most_common()),
         "backup_root": str(backup_root) if args.apply and repaired_rows else None,
+        "backup_files": backup_files,
         "samples": samples,
         "note": (
             "This report counts only rows repaired by deterministic rules. Literal "
@@ -172,11 +283,10 @@ def main() -> None:
             "output because a person must write their replacements."
         ),
     }
-    if args.report:
-        report_path = Path(args.report)
-        report_path.parent.mkdir(parents=True, exist_ok=True)
-        report_path.write_text(
-            json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    if report_path is not None:
+        _atomic_write_text(
+            report_path,
+            json.dumps(report, ensure_ascii=False, indent=2) + "\n",
         )
 
     print(f"Scanned pairs: {scanned:,} / repaired rows: {repaired_rows:,}")
