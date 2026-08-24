@@ -4,20 +4,32 @@ import hashlib
 import json
 import multiprocessing
 import os
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 import sion_translate.queue_translation as queue_translation_module
+from sion_translate.cli.translate_queue import (
+    _resolve_run_metadata_seed,
+    _validate_resume_runtime_metadata,
+    build_parser,
+)
+from sion_translate.data.records import expand_parallel_record
 from sion_translate.queue_translation import (
     QueueTranslationOptions,
+    RetryableQueueTranslationError,
     _accepted_run_lock,
     _queue_run_lock,
-    translate_queue,
+    translate_queue as _translate_queue,
 )
 
 
 class FakeTokenizer:
+    def __init__(self, model_path: str | Path | None = None) -> None:
+        self.model_path = str(model_path) if model_path is not None else None
+
     @staticmethod
     def encode(text: str) -> list[str]:
         return [character for character in text if not character.isspace()]
@@ -35,7 +47,7 @@ def test_queue_quality_marks_unprofiled_languages_as_unchecked() -> None:
     assert not {"ko_script_mismatch", "ja_script_mismatch"} & set(reasons)
 
 
-def test_queue_quality_inherits_japanese_kana_policy_for_variants() -> None:
+def test_queue_quality_reports_language_independent_script_counts() -> None:
     quality, _reasons = queue_translation_module._forward_quality(
         "한국어 원문 문장입니다.",
         "人工知能研究社会文化交流発展",
@@ -43,7 +55,7 @@ def test_queue_quality_inherits_japanese_kana_policy_for_variants() -> None:
         target_language="ja-JP",
     )
 
-    assert quality["target_japanese_kana_chars"] == 0
+    assert quality["target_script_characters"] == {"han": 14}
     assert "ja_no_kana" in quality["pair_warnings"]
 
 
@@ -54,10 +66,19 @@ def _hold_queue_lock(path: str, ready, release) -> None:
 
 
 class FakeTranslator:
-    tokenizer = FakeTokenizer()
-
     def __init__(self) -> None:
+        self.tokenizer = FakeTokenizer()
+        self.translation_model_path: str | None = None
+        self.tokenizer_model_path: str | None = None
+        self.tokenizer_metadata_path: str | None = None
+        self.token_features_path: str | None = None
         self.calls: list[tuple[str, str, tuple[str, ...]]] = []
+        self.export_metadata: dict[str, object] = {}
+        self.tokenizer_metadata: dict[str, object] | None = None
+        self.translation_directions = (
+            ("ko", "ja"),
+            ("ja", "ko"),
+        )
         self.mapping = {
             ("ko", "ja", "안녕하세요."): "こんにちは。",
             ("ja", "ko", "こんにちは。"): "안녕하세요.",
@@ -66,6 +87,15 @@ class FakeTranslator:
             ("ko", "ja", "정상 문장입니다."): "正常な文です。",
             ("ja", "ko", "正常な文です。"): "정상 문장입니다.",
         }
+
+    @property
+    def translation_directions(self) -> tuple[tuple[str, str], ...]:
+        return self._translation_directions
+
+    @translation_directions.setter
+    def translation_directions(self, value: tuple[tuple[str, str], ...]) -> None:
+        self._translation_directions = value
+        self.export_metadata["translation_directions"] = [list(item) for item in value]
 
     def translate(
         self,
@@ -88,8 +118,86 @@ class FakeTranslator:
         )
         self.calls.append((source_language, target_language, tuple(texts)))
         if "고장 문장입니다." in texts:
-            raise RuntimeError("synthetic failure")
+            raise ValueError("synthetic row failure")
         return [self.mapping[(source_language, target_language, text)] for text in texts]
+
+
+def _identity(path: Path) -> dict[str, object]:
+    return {
+        "path": str(path.resolve()),
+        "size": path.stat().st_size,
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    }
+
+
+def _run_metadata(
+    translator: FakeTranslator,
+    artifact_dir: Path,
+    *,
+    model: str = "fake-v1",
+) -> dict[str, object]:
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    model_path = artifact_dir / f"{model}.pt"
+    model_path.write_text(
+        json.dumps(
+            {
+                "model": model,
+                "translation_directions": [
+                    list(item) for item in translator.translation_directions
+                ],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    tokenizer_path = artifact_dir / "fake-tokenizer.model"
+    tokenizer_path.write_bytes(b"recorded fake tokenizer")
+    translator.translation_model_path = str(model_path.resolve())
+    translator.tokenizer_model_path = str(tokenizer_path.resolve())
+    translator.tokenizer_metadata_path = None
+    translator.token_features_path = None
+    translator.tokenizer = FakeTokenizer(tokenizer_path)
+    return {
+        "source_dataset": "tests/queue-corpus",
+        "source_revision": "sha256:" + hashlib.sha256(b"queue-corpus").hexdigest(),
+        "source_license": "LicenseRef-Test-Fixture",
+        "translation_model": _identity(model_path),
+        "tokenizer": _identity(tokenizer_path),
+        "tokenizer_metadata": None,
+        "token_features": None,
+        "translation_directions": [list(item) for item in translator.translation_directions],
+        "translation_graph_source": "translation_model",
+    }
+
+
+def translate_queue(
+    input_path: str | Path,
+    output_dir: str | Path,
+    translator: FakeTranslator,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    artifact_dir = Path(output_dir).parent / ".queue-runtime-artifacts"
+    if "run_metadata" not in kwargs:
+        kwargs["run_metadata"] = _run_metadata(translator, artifact_dir)
+    kwargs.setdefault("allow_unverified_translator", True)
+    return _translate_queue(input_path, output_dir, translator, **kwargs)
+
+
+def _published_accepted_paths(manifest: Mapping[str, Any]) -> list[Path]:
+    return [
+        Path(part["accepted"]["path"])
+        for part in manifest["parts"]
+        if part.get("published") is True
+    ]
+
+
+def _training_paths(manifest: Mapping[str, Any]) -> list[Path]:
+    return [
+        Path(part["training"]["path"])
+        for part in manifest["parts"]
+        if isinstance(part.get("training"), Mapping)
+    ]
 
 
 def _write_queue(path: Path) -> None:
@@ -166,7 +274,11 @@ def test_queue_translation_is_resumable_audited_and_failure_isolated(
         translator,
         accepted_dir=accepted,
         options=_options(),
-        run_metadata={"model": "fake-v1"},
+        run_metadata=_run_metadata(
+            translator,
+            tmp_path / ".queue-runtime-artifacts",
+            model="fake-v1",
+        ),
         max_rows=4,
     )
 
@@ -188,26 +300,62 @@ def test_queue_translation_is_resumable_audited_and_failure_isolated(
     assert first_rows[1]["status"] == "rejected"
     assert first_rows[1]["rejection_reasons"] == ["roundtrip_score"]
 
+    translator.calls.clear()
     completed = translate_queue(
         source,
         results,
         translator,
         accepted_dir=accepted,
         options=_options(),
-        run_metadata={"model": "fake-v1"},
+        run_metadata=_run_metadata(
+            translator,
+            tmp_path / ".queue-runtime-artifacts",
+            model="fake-v1",
+        ),
     )
 
     assert completed["progress"]["complete"]
     assert completed["progress"]["completed_rows"] == 5
     assert completed["stats"]["accepted"] == 2
+    replayed_inputs = {text for _source, _target, texts in translator.calls for text in texts}
+    assert "안녕하세요." not in replayed_inputs
+    assert "원래 문장입니다." not in replayed_inputs
     accepted_rows = [
         json.loads(line)
-        for path in sorted(accepted.glob("*.jsonl"))
+        for path in _published_accepted_paths(completed)
         for line in path.read_text(encoding="utf-8").splitlines()
     ]
     assert [row["id"] for row in accepted_rows] == ["one", "two"]
     assert all(row["synthetic"] is True for row in accepted_rows)
+    assert all(row["training_direction"] == ["ko", "ja"] for row in accepted_rows)
+    assert all(row["source_language"] == "ko" for row in accepted_rows)
+    assert all(row["target_language"] == "ja" for row in accepted_rows)
+    assert all(row["source"] and row["translation"] for row in accepted_rows)
     assert all(row["provenance"]["run_id"] == completed["run_id"] for row in accepted_rows)
+    assert [row["provenance"]["source_index"] for row in accepted_rows] == [0, 4]
+    assert all(
+        row["provenance"]["source_queue"]["sha256"]
+        == hashlib.sha256(source.read_bytes()).hexdigest()
+        for row in accepted_rows
+    )
+    assert all(
+        row["provenance"]["translation_model"]
+        == completed["configuration"]["run_metadata"]["translation_model"]
+        and row["provenance"]["tokenizer"]
+        == completed["configuration"]["run_metadata"]["tokenizer"]
+        and row["provenance"]["token_features"] is None
+        and row["provenance"]["translation_directions"] == [["ko", "ja"], ["ja", "ko"]]
+        and row["provenance"]["translation_graph_source"] == "translation_model"
+        for row in accepted_rows
+    )
+    assert all(
+        path.name.endswith(".jsonl.private") for path in _published_accepted_paths(completed)
+    )
+    assert _training_paths(completed) == sorted(accepted.glob("*.jsonl"))
+    assert len(_training_paths(completed)) == 2
+    expanded = expand_parallel_record(accepted_rows[0], (("ko", "ja"),))
+    assert len(expanded.pairs) == 1
+    assert expanded.pairs[0].metadata["training_direction"] == ["ko", "ja"]
 
     call_count = len(translator.calls)
     unchanged = translate_queue(
@@ -216,10 +364,671 @@ def test_queue_translation_is_resumable_audited_and_failure_isolated(
         translator,
         accepted_dir=accepted,
         options=_options(),
-        run_metadata={"model": "fake-v1"},
+        run_metadata=_run_metadata(
+            translator,
+            tmp_path / ".queue-runtime-artifacts",
+            model="fake-v1",
+        ),
     )
     assert unchanged["stats"] == completed["stats"]
     assert len(translator.calls) == call_count
+
+
+def test_transient_runtime_failure_leaves_the_shard_retryable(tmp_path: Path) -> None:
+    class FailOnceTranslator(FakeTranslator):
+        failed = False
+
+        def translate(self, texts, **kwargs):
+            if not self.failed:
+                self.failed = True
+                self.calls.append(
+                    (kwargs["source_language"], kwargs["target_language"], tuple(texts))
+                )
+                raise RuntimeError("temporary device failure")
+            return super().translate(texts, **kwargs)
+
+    source = tmp_path / "queue.jsonl"
+    source.write_text(
+        json.dumps(
+            {
+                "id": "retryable",
+                "source_lang": "ko",
+                "target_lang": "ja",
+                "source": "안녕하세요.",
+                "translation": None,
+                "status": "pending",
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    results = tmp_path / "results"
+    accepted = tmp_path / "accepted"
+    translator = FailOnceTranslator()
+
+    with pytest.raises(RetryableQueueTranslationError, match="was not committed"):
+        translate_queue(
+            source,
+            results,
+            translator,
+            accepted_dir=accepted,
+            options=_options(),
+        )
+
+    failed_manifest = json.loads((results / "manifest.json").read_text(encoding="utf-8"))
+    assert failed_manifest["progress"]["completed_rows"] == 0
+    assert failed_manifest["parts"] == []
+    assert not (results / "part-000000.jsonl").exists()
+    assert list(accepted.glob("*.jsonl")) == []
+
+    completed = translate_queue(
+        source,
+        results,
+        translator,
+        accepted_dir=accepted,
+        options=_options(),
+    )
+    assert completed["progress"]["complete"] is True
+    assert completed["stats"]["accepted"] == 1
+    assert len(_training_paths(completed)) == 1
+
+
+def test_queue_canonicalizes_bcp47_aliases_before_translation(tmp_path: Path) -> None:
+    source = tmp_path / "queue.jsonl"
+    source.write_text(
+        json.dumps(
+            {
+                "id": "bcp47",
+                "source_lang": "PT-br",
+                "target_lang": "ZH-hant",
+                "source": "Este texto de origem possui conteúdo suficiente.",
+                "translation": None,
+                "status": "pending",
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    translator = FakeTranslator()
+    translator.translation_directions = (("pt-BR", "zh-Hant"),)
+    translator.mapping[
+        (
+            "pt-BR",
+            "zh-Hant",
+            "Este texto de origem possui conteúdo suficiente.",
+        )
+    ] = "這段來源文本包含足夠的內容。"
+
+    translate_queue(
+        source,
+        tmp_path / "results",
+        translator,
+        accepted_dir=tmp_path / "accepted",
+        options=_options(roundtrip_enabled=False),
+    )
+
+    assert translator.calls == [
+        (
+            "pt-BR",
+            "zh-Hant",
+            ("Este texto de origem possui conteúdo suficiente.",),
+        )
+    ]
+    result = json.loads((tmp_path / "results" / "part-000000.jsonl").read_text("utf-8"))
+    assert (result["source_lang"], result["target_lang"]) == ("pt-BR", "zh-Hant")
+
+
+def test_queue_rejects_missing_reverse_direction_before_model_work(tmp_path: Path) -> None:
+    source = tmp_path / "queue.jsonl"
+    _write_queue(source)
+    translator = FakeTranslator()
+    translator.translation_directions = (("ko", "ja"),)
+
+    with pytest.raises(ValueError, match="--no-roundtrip"):
+        translate_queue(
+            source,
+            tmp_path / "results",
+            translator,
+            accepted_dir=tmp_path / "accepted",
+            options=_options(),
+        )
+
+    assert translator.calls == []
+    assert not (tmp_path / "results" / "manifest.json").exists()
+
+
+def test_queue_allows_artifact_bound_forward_only_model_when_roundtrip_is_disabled(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "queue.jsonl"
+    _write_queue(source)
+    translator = FakeTranslator()
+    translator.translation_directions = (("ko", "ja"),)
+
+    manifest = translate_queue(
+        source,
+        tmp_path / "results",
+        translator,
+        accepted_dir=tmp_path / "accepted",
+        options=_options(roundtrip_enabled=False),
+        max_rows=1,
+    )
+
+    assert manifest["stats"]["accepted"] == 1
+    assert translator.calls == [("ko", "ja", ("안녕하세요.",))]
+
+
+def test_queue_rejects_translator_without_artifact_direction_graph(tmp_path: Path) -> None:
+    source = tmp_path / "queue.jsonl"
+    _write_queue(source)
+    translator = FakeTranslator()
+    translator.translation_directions = ()
+
+    with pytest.raises(ValueError, match="no artifact-bound translation_directions"):
+        translate_queue(
+            source,
+            tmp_path / "results",
+            translator,
+            accepted_dir=tmp_path / "accepted",
+            options=_options(roundtrip_enabled=False),
+        )
+
+    assert translator.calls == []
+
+
+def test_queue_rejects_duplicate_ids_before_model_work(tmp_path: Path) -> None:
+    source = tmp_path / "queue.jsonl"
+    duplicate = {
+        "id": "duplicate",
+        "source_lang": "ko",
+        "target_lang": "ja",
+        "source": "안녕하세요.",
+        "translation": None,
+        "status": "pending",
+    }
+    source.write_text(
+        "\n".join(json.dumps(duplicate, ensure_ascii=False) for _ in range(2)) + "\n",
+        encoding="utf-8",
+    )
+    translator = FakeTranslator()
+
+    with pytest.raises(ValueError, match="duplicate queue id 'duplicate'"):
+        translate_queue(
+            source,
+            tmp_path / "results",
+            translator,
+            accepted_dir=tmp_path / "accepted",
+            options=_options(),
+        )
+
+    assert translator.calls == []
+    assert not (tmp_path / "results" / "manifest.json").exists()
+
+
+def test_processing_stream_rejects_duplicate_ids_seeded_by_committed_parts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "queue.jsonl"
+    results = tmp_path / "results"
+    accepted = tmp_path / "accepted"
+    rows = [
+        {
+            "id": row_id,
+            "source_lang": "ko",
+            "target_lang": "ja",
+            "source": "안녕하세요.",
+            "translation": None,
+            "status": "pending",
+        }
+        for row_id in ("one", "two")
+    ]
+    source.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+    original_process = queue_translation_module._process_raw_rows
+    processing_calls = 0
+
+    def substitute_duplicate_in_second_processing_batch(raw_rows, **kwargs):
+        nonlocal processing_calls
+        if kwargs.get("seen_ids") is not None:
+            processing_calls += 1
+        if processing_calls == 2:
+            duplicate = json.loads(raw_rows[0])
+            duplicate["id"] = "one"
+            raw_rows = [json.dumps(duplicate, ensure_ascii=False).encode() + b"\n"]
+        return original_process(raw_rows, **kwargs)
+
+    monkeypatch.setattr(
+        queue_translation_module,
+        "_process_raw_rows",
+        substitute_duplicate_in_second_processing_batch,
+    )
+
+    with pytest.raises(ValueError, match="duplicate queue id in processing stream: 'one'"):
+        translate_queue(
+            source,
+            results,
+            FakeTranslator(),
+            accepted_dir=accepted,
+            options=_options(shard_size=1),
+        )
+
+    persisted = json.loads((results / "manifest.json").read_text(encoding="utf-8"))
+    assert persisted["progress"]["next_part"] == 1
+    assert len(_published_accepted_paths(persisted)) == 1
+    assert not (results / "part-000001.jsonl").exists()
+    assert len(list(accepted.glob("*.jsonl"))) == 1
+
+
+def test_library_new_run_requires_complete_immutable_lineage(tmp_path: Path) -> None:
+    source = tmp_path / "queue.jsonl"
+    _write_queue(source)
+    translator = FakeTranslator()
+
+    with pytest.raises(ValueError, match="explicit immutable run_metadata"):
+        _translate_queue(
+            source,
+            tmp_path / "missing-metadata",
+            translator,
+            accepted_dir=tmp_path / "missing-accepted",
+            options=_options(),
+            allow_unverified_translator=True,
+        )
+
+    missing_artifact = _run_metadata(translator, tmp_path / ".queue-runtime-artifacts")
+    missing_artifact["translation_model"] = {
+        "path": str(tmp_path / "missing-model.pt"),
+        "size": 1,
+        "sha256": "0" * 64,
+    }
+    with pytest.raises(FileNotFoundError, match="does not exist"):
+        _translate_queue(
+            source,
+            tmp_path / "missing-artifact",
+            translator,
+            accepted_dir=tmp_path / "missing-artifact-accepted",
+            options=_options(),
+            run_metadata=missing_artifact,
+            allow_unverified_translator=True,
+        )
+
+    stale_hash = _run_metadata(translator, tmp_path / ".queue-runtime-artifacts")
+    Path(str(stale_hash["translation_model"]["path"])).write_bytes(b"tampered model bytes")
+    with pytest.raises(ValueError, match="does not match the current artifact bytes"):
+        _translate_queue(
+            source,
+            tmp_path / "stale-artifact-hash",
+            translator,
+            accepted_dir=tmp_path / "stale-artifact-hash-accepted",
+            options=_options(),
+            run_metadata=stale_hash,
+            allow_unverified_translator=True,
+        )
+
+    wrong_artifact = _run_metadata(translator, tmp_path / ".queue-runtime-artifacts")
+    decoy_path = tmp_path / ".queue-runtime-artifacts" / "decoy-model.pt"
+    decoy_path.write_bytes(b"different but real model artifact")
+    wrong_artifact["translation_model"] = _identity(decoy_path)
+    with pytest.raises(ValueError, match="differs from the artifact loaded by the translator"):
+        _translate_queue(
+            source,
+            tmp_path / "wrong-runtime-binding",
+            translator,
+            accepted_dir=tmp_path / "wrong-runtime-binding-accepted",
+            options=_options(),
+            run_metadata=wrong_artifact,
+            allow_unverified_translator=True,
+        )
+
+    placeholder = _run_metadata(translator, tmp_path / ".queue-runtime-artifacts")
+    placeholder["source_revision"] = "unknown"
+    with pytest.raises(ValueError, match="unknown placeholder"):
+        _translate_queue(
+            source,
+            tmp_path / "placeholder-metadata",
+            translator,
+            accepted_dir=tmp_path / "placeholder-accepted",
+            options=_options(),
+            run_metadata=placeholder,
+            allow_unverified_translator=True,
+        )
+
+    mutable_graph = _run_metadata(translator, tmp_path / ".queue-runtime-artifacts")
+    mutable_graph["translation_graph_source"] = "tokenizer_metadata"
+    translator.export_metadata = {}
+    translator.tokenizer_metadata = {"translation_directions": [["ko", "ja"], ["ja", "ko"]]}
+    with pytest.raises(ValueError, match="records it as absent"):
+        _translate_queue(
+            source,
+            tmp_path / "unrecorded-sidecar",
+            translator,
+            accepted_dir=tmp_path / "unrecorded-sidecar-accepted",
+            options=_options(),
+            run_metadata=mutable_graph,
+            allow_unverified_translator=True,
+        )
+    assert translator.calls == []
+
+    recorded_sidecar = dict(mutable_graph)
+    sidecar_path = tmp_path / ".queue-runtime-artifacts" / "tokenizer_metadata.json"
+    sidecar_path.write_text(
+        json.dumps(translator.tokenizer_metadata, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    translator.tokenizer_metadata_path = str(sidecar_path.resolve())
+    recorded_sidecar["tokenizer_metadata"] = _identity(sidecar_path)
+    manifest = _translate_queue(
+        source,
+        tmp_path / "recorded-sidecar",
+        translator,
+        accepted_dir=tmp_path / "recorded-sidecar-accepted",
+        options=_options(roundtrip_enabled=False),
+        run_metadata=recorded_sidecar,
+        max_rows=1,
+        allow_unverified_translator=True,
+    )
+    assert manifest["stats"]["accepted"] == 1
+
+
+def test_custom_translator_requires_an_explicit_unverified_boundary(tmp_path: Path) -> None:
+    source = tmp_path / "queue.jsonl"
+    first_row = {
+        "id": "one",
+        "source_lang": "ko",
+        "target_lang": "ja",
+        "source": "안녕하세요.",
+        "translation": None,
+        "status": "pending",
+    }
+    source.write_text(json.dumps(first_row, ensure_ascii=False) + "\n", encoding="utf-8")
+    translator = FakeTranslator()
+    run_metadata = _run_metadata(translator, tmp_path / ".queue-runtime-artifacts")
+
+    with pytest.raises(TypeError, match="allow_unverified_translator=True"):
+        _translate_queue(
+            source,
+            tmp_path / "rejected-results",
+            translator,
+            accepted_dir=tmp_path / "rejected-accepted",
+            options=_options(roundtrip_enabled=False),
+            run_metadata=run_metadata,
+        )
+
+    manifest = _translate_queue(
+        source,
+        tmp_path / "explicit-results",
+        translator,
+        accepted_dir=tmp_path / "explicit-accepted",
+        options=_options(roundtrip_enabled=False),
+        run_metadata=run_metadata,
+        allow_unverified_translator=True,
+    )
+    row = json.loads(_published_accepted_paths(manifest)[0].read_text(encoding="utf-8"))
+    assert manifest["configuration"]["runtime_verification"] == "unverified_custom_translator"
+    assert row["provenance"]["runtime_verification"] == "unverified_custom_translator"
+
+
+def test_load_identity_binding_rejects_a_post_load_artifact_replacement(tmp_path: Path) -> None:
+    translator = FakeTranslator()
+    run_metadata = _run_metadata(translator, tmp_path / "artifacts")
+    model_metadata = run_metadata["translation_model"]
+    assert isinstance(model_metadata, Mapping)
+    model_path = Path(str(model_metadata["path"]))
+    loaded_identity = {
+        **_identity(model_path),
+        "device": model_path.stat().st_dev,
+        "inode": model_path.stat().st_ino,
+        "mtime_ns": model_path.stat().st_mtime_ns,
+    }
+    translator.translation_model_identity = loaded_identity
+    model_path.write_bytes(b"replacement bytes not loaded by Translator")
+    replacement = queue_translation_module._content_identity(
+        {
+            **_identity(model_path),
+            "device": model_path.stat().st_dev,
+            "inode": model_path.stat().st_ino,
+            "mtime_ns": model_path.stat().st_mtime_ns,
+        },
+        field="translation_model",
+    )
+
+    with pytest.raises(ValueError, match="differs from the artifact identity loaded"):
+        queue_translation_module._bind_translator_artifact(
+            translator,
+            field="translation_model",
+            identity=replacement,
+            verify_load_identity=True,
+        )
+
+
+def test_legacy_resume_rejects_an_unrecorded_graph_bearing_tokenizer_sidecar(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "queue.jsonl"
+    results = tmp_path / "results"
+    accepted = tmp_path / "accepted"
+    _write_queue(source)
+    translator = FakeTranslator()
+    current_metadata = _run_metadata(translator, tmp_path / ".queue-runtime-artifacts")
+    legacy_metadata = {
+        "source_dataset": "legacy/corpus",
+        "source_revision": "legacy-snapshot-1",
+        "source_license": "CC-BY-4.0",
+        "translation_model": current_metadata["translation_model"],
+        "tokenizer": current_metadata["tokenizer"],
+        "token_features": None,
+    }
+    manifest = queue_translation_module._new_manifest(
+        source=queue_translation_module._source_identity(source, None, force_hash=True),
+        options=_options(roundtrip_enabled=False),
+        run_metadata=legacy_metadata,
+        accepted_dir=accepted,
+        accepted_shard_prefix=None,
+        teacher_pilot_rows=None,
+    )
+    manifest.pop("signature_version")
+    manifest.pop("parts")
+    manifest.pop("integrity")
+    legacy_signature = queue_translation_module._stable_digest(manifest["configuration"])
+    manifest["run_signature"] = legacy_signature
+    manifest["run_id"] = legacy_signature[:16]
+    results.mkdir()
+    queue_translation_module._atomic_write_json(results / "manifest.json", manifest)
+    translator.export_metadata = {}
+    translator.tokenizer_metadata = {"translation_directions": [["ko", "ja"], ["ja", "ko"]]}
+
+    with pytest.raises(ValueError, match="records it as absent"):
+        _translate_queue(
+            source,
+            results,
+            translator,
+            accepted_dir=accepted,
+            options=_options(roundtrip_enabled=False),
+            run_metadata=legacy_metadata,
+            allow_unverified_translator=True,
+        )
+
+    assert translator.calls == []
+
+
+def test_authentic_legacy_resume_still_rejects_placeholder_provenance(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "queue.jsonl"
+    results = tmp_path / "results"
+    accepted = tmp_path / "accepted"
+    _write_queue(source)
+    translator = FakeTranslator()
+    current_metadata = _run_metadata(translator, tmp_path / ".queue-runtime-artifacts")
+    legacy_metadata = {
+        "source_dataset": "legacy/corpus",
+        "source_revision": "unknown",
+        "source_license": "CC-BY-4.0",
+        "translation_model": current_metadata["translation_model"],
+        "tokenizer": current_metadata["tokenizer"],
+        "token_features": None,
+    }
+    manifest = queue_translation_module._new_manifest(
+        source=queue_translation_module._source_identity(source, None, force_hash=True),
+        options=_options(roundtrip_enabled=False),
+        run_metadata=legacy_metadata,
+        accepted_dir=accepted,
+        accepted_shard_prefix=None,
+        teacher_pilot_rows=None,
+    )
+    manifest.pop("signature_version")
+    manifest.pop("parts")
+    manifest.pop("integrity")
+    legacy_signature = queue_translation_module._stable_digest(manifest["configuration"])
+    manifest["run_signature"] = legacy_signature
+    manifest["run_id"] = legacy_signature[:16]
+    results.mkdir()
+    queue_translation_module._atomic_write_json(results / "manifest.json", manifest)
+
+    with pytest.raises(ValueError, match="cannot use an unknown placeholder"):
+        _translate_queue(
+            source,
+            results,
+            translator,
+            accepted_dir=accepted,
+            options=_options(roundtrip_enabled=False),
+            run_metadata=legacy_metadata,
+            allow_unverified_translator=True,
+        )
+
+    assert translator.calls == []
+
+
+def test_queue_cli_requires_explicit_non_placeholder_provenance_for_new_runs(
+    tmp_path: Path,
+) -> None:
+    parser = build_parser()
+    parsed_without_provenance = parser.parse_args(["--input", "queue.jsonl"])
+    with pytest.raises(SystemExit, match="new queue runs require explicit provenance"):
+        _resolve_run_metadata_seed(
+            tmp_path / "new-results",
+            source_dataset=parsed_without_provenance.source_dataset,
+            source_revision=parsed_without_provenance.source_revision,
+            source_license=parsed_without_provenance.source_license,
+        )
+
+    required = [
+        "--input",
+        "queue.jsonl",
+        "--source-dataset",
+        "local/corpus",
+        "--source-revision",
+        "sha256:abc123",
+        "--source-license",
+        "CC-BY-4.0",
+    ]
+    parsed = parser.parse_args(required)
+    metadata, resuming = _resolve_run_metadata_seed(
+        tmp_path / "new-results",
+        source_dataset=parsed.source_dataset,
+        source_revision=parsed.source_revision,
+        source_license=parsed.source_license,
+    )
+    assert not resuming
+    assert metadata == {
+        "source_dataset": "local/corpus",
+        "source_revision": "sha256:abc123",
+        "source_license": "CC-BY-4.0",
+    }
+    placeholder = required.copy()
+    placeholder[5] = "unknown"
+    with pytest.raises(SystemExit):
+        parser.parse_args(placeholder)
+
+
+def test_legacy_cli_metadata_resumes_without_signature_drift(tmp_path: Path) -> None:
+    source = tmp_path / "queue.jsonl"
+    results = tmp_path / "results"
+    accepted = tmp_path / "accepted"
+    _write_queue(source)
+    translator = FakeTranslator()
+    current_metadata = _run_metadata(translator, tmp_path / ".queue-runtime-artifacts")
+    runtime_metadata = {
+        "translation_model": current_metadata["translation_model"],
+        "tokenizer": current_metadata["tokenizer"],
+        "tokenizer_metadata": None,
+        "token_features": None,
+        "translation_directions": [["ko", "ja"], ["ja", "ko"]],
+        "translation_graph_source": "translation_model",
+    }
+    legacy_metadata = {
+        "source_dataset": "heegyu/namuwiki",
+        "source_revision": "legacy-snapshot-1",
+        "source_license": "CC-BY-NC-SA-2.0",
+        "translation_model": runtime_metadata["translation_model"],
+        "tokenizer": runtime_metadata["tokenizer"],
+        "token_features": None,
+    }
+    partial = queue_translation_module._new_manifest(
+        source=queue_translation_module._source_identity(source, None, force_hash=True),
+        options=_options(),
+        run_metadata=legacy_metadata,
+        accepted_dir=accepted,
+        accepted_shard_prefix=None,
+        teacher_pilot_rows=None,
+    )
+    partial.pop("signature_version")
+    partial.pop("parts")
+    partial.pop("integrity")
+    legacy_signature = queue_translation_module._stable_digest(partial["configuration"])
+    partial["run_signature"] = legacy_signature
+    partial["run_id"] = legacy_signature[:16]
+    results.mkdir()
+    queue_translation_module._atomic_write_json(results / "manifest.json", partial)
+
+    resolved, resuming = _resolve_run_metadata_seed(
+        results,
+        source_dataset=None,
+        source_revision=None,
+        source_license=None,
+    )
+    assert resuming
+    assert resolved == legacy_metadata
+    _validate_resume_runtime_metadata(
+        resolved,
+        runtime_metadata,
+    )
+    with pytest.raises(SystemExit, match="cannot change recorded source_dataset"):
+        _resolve_run_metadata_seed(
+            results,
+            source_dataset="different/corpus",
+            source_revision=None,
+            source_license=None,
+        )
+
+    completed = translate_queue(
+        source,
+        results,
+        translator,
+        accepted_dir=accepted,
+        options=_options(),
+        run_metadata=resolved,
+    )
+
+    assert completed["run_signature"] != legacy_signature
+    assert completed["configuration"]["run_metadata"] == legacy_metadata
+    tampered = json.loads((results / "manifest.json").read_text(encoding="utf-8"))
+    tampered["configuration"]["run_metadata"]["source_revision"] = "forged"
+    (results / "manifest.json").write_text(
+        json.dumps(tampered, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit, match="configuration digest is invalid"):
+        _resolve_run_metadata_seed(
+            results,
+            source_dataset=None,
+            source_revision=None,
+            source_license=None,
+        )
 
 
 def test_queue_resume_rejects_quality_or_model_changes(tmp_path: Path) -> None:
@@ -234,7 +1043,11 @@ def test_queue_resume_rejects_quality_or_model_changes(tmp_path: Path) -> None:
         translator,
         accepted_dir=accepted,
         options=_options(),
-        run_metadata={"model": "fake-v1"},
+        run_metadata=_run_metadata(
+            translator,
+            tmp_path / ".queue-runtime-artifacts",
+            model="fake-v1",
+        ),
         max_rows=1,
     )
 
@@ -245,7 +1058,11 @@ def test_queue_resume_rejects_quality_or_model_changes(tmp_path: Path) -> None:
             translator,
             accepted_dir=accepted,
             options=_options(min_roundtrip_score=0.10),
-            run_metadata={"model": "fake-v1"},
+            run_metadata=_run_metadata(
+                translator,
+                tmp_path / ".queue-runtime-artifacts",
+                model="fake-v1",
+            ),
         )
     with pytest.raises(ValueError, match="resume configuration changed"):
         translate_queue(
@@ -254,7 +1071,11 @@ def test_queue_resume_rejects_quality_or_model_changes(tmp_path: Path) -> None:
             translator,
             accepted_dir=accepted,
             options=_options(),
-            run_metadata={"model": "fake-v2"},
+            run_metadata=_run_metadata(
+                translator,
+                tmp_path / ".queue-runtime-artifacts",
+                model="fake-v2",
+            ),
         )
 
 
@@ -270,13 +1091,45 @@ def test_queue_resume_rejects_quality_or_model_changes(tmp_path: Path) -> None:
         ("min_roundtrip_score", 1.1),
         ("min_pair_score", 101),
         ("min_target_language_fraction", -0.1),
-        ("min_japanese_kana_chars", -1),
+        ("required_target_scripts", (("ja", "kana", 0),)),
     ],
 )
 def test_queue_options_validate(field: str, value: object) -> None:
     options = _options(**{field: value})
     with pytest.raises(ValueError):
         options.validate()
+
+
+def test_target_script_requirements_support_arbitrary_bcp47_languages() -> None:
+    options = _options(
+        required_target_scripts=(
+            ("sr-Cyrl", "cyrillic", 3),
+            ("az-Arab", "arabic", 2),
+        )
+    )
+
+    options.validate()
+    assert options.target_script_requirements("sr-Cyrl") == {"cyrillic": 3}
+    assert options.target_script_requirements("az-Arab") == {"arabic": 2}
+    assert options.target_script_requirements("en") == {}
+
+
+def test_cli_parses_repeatable_target_script_requirements() -> None:
+    args = build_parser().parse_args(
+        [
+            "--input",
+            "queue.jsonl",
+            "--require-target-script",
+            "SR-cyrl=CYRILLIC:3",
+            "--require-target-script",
+            "az-Arab=arabic:2",
+        ]
+    )
+
+    assert args.require_target_script == [
+        ("sr-Cyrl", "cyrillic", 3),
+        ("az-Arab", "arabic", 2),
+    ]
 
 
 def test_teacher_pilot_requires_review_before_approval(
@@ -317,6 +1170,7 @@ def test_teacher_pilot_requires_review_before_approval(
         "approved_at": None,
         "approved_by": None,
     }
+    assert list(accepted.glob("*.jsonl")) == []
 
     with pytest.raises(ValueError, match="pilot size is fixed"):
         translate_queue(
@@ -342,6 +1196,74 @@ def test_teacher_pilot_requires_review_before_approval(
     assert completed["teacher_review"]["approved"]
     assert completed["teacher_review"]["approved_by"] == "reviewer"
     assert completed["teacher_review"]["approved_at"]
+    assert _training_paths(completed) == sorted(accepted.glob("*.jsonl"))
+    assert len(_training_paths(completed)) == sum(
+        part["accepted"]["rows"] > 0 for part in completed["parts"]
+    )
+
+
+def test_manifest_rejects_truthy_string_completion_before_resume(tmp_path: Path) -> None:
+    source = tmp_path / "queue.jsonl"
+    results = tmp_path / "results"
+    accepted = tmp_path / "accepted"
+    _write_queue(source)
+    translator = FakeTranslator()
+    translate_queue(
+        source,
+        results,
+        translator,
+        accepted_dir=accepted,
+        options=_options(),
+        max_rows=1,
+    )
+    manifest_path = results / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["progress"]["complete"] = "yes"
+    queue_translation_module._atomic_write_json(manifest_path, manifest)
+    translator.calls.clear()
+
+    with pytest.raises(ValueError, match=r"progress\.complete must be a boolean"):
+        translate_queue(
+            source,
+            results,
+            translator,
+            accepted_dir=accepted,
+            options=_options(),
+        )
+    assert translator.calls == []
+
+
+def test_manifest_rejects_truthy_string_teacher_approval(tmp_path: Path) -> None:
+    source = tmp_path / "queue.jsonl"
+    results = tmp_path / "results"
+    accepted = tmp_path / "accepted"
+    _write_queue(source)
+    translator = FakeTranslator()
+    translate_queue(
+        source,
+        results,
+        translator,
+        accepted_dir=accepted,
+        options=_options(),
+        teacher_pilot_rows=1,
+    )
+    manifest_path = results / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["teacher_review"]["approved"] = "yes"
+    queue_translation_module._atomic_write_json(manifest_path, manifest)
+    translator.calls.clear()
+
+    with pytest.raises(ValueError, match=r"teacher_review\.approved must be a boolean"):
+        translate_queue(
+            source,
+            results,
+            translator,
+            accepted_dir=accepted,
+            options=_options(),
+            teacher_pilot_rows=1,
+        )
+    assert translator.calls == []
+    assert list(accepted.glob("*.jsonl")) == []
 
 
 def test_existing_manifest_can_adopt_a_frozen_teacher_review_policy(
@@ -453,7 +1375,7 @@ def test_completed_queue_rehashes_source_even_if_size_and_mtime_match(
     source.write_bytes(tampered)
     os.utime(source, ns=(stat.st_atime_ns, stat.st_mtime_ns))
 
-    with pytest.raises(ValueError, match="resume configuration changed"):
+    with pytest.raises(ValueError, match="input source content changed"):
         translate_queue(
             source,
             results,
@@ -524,14 +1446,36 @@ def test_legacy_manifest_signature_and_shards_migrate_on_resume(
     accepted = tmp_path / "accepted"
     _write_queue(source)
     translator = FakeTranslator()
+    recorded_metadata = _run_metadata(
+        translator,
+        tmp_path / ".queue-runtime-artifacts",
+    )
+    legacy_metadata = {
+        "source_dataset": "legacy/corpus",
+        "source_revision": "legacy-snapshot-1",
+        "source_license": "CC-BY-4.0",
+        "translation_model": recorded_metadata["translation_model"],
+        "tokenizer": recorded_metadata["tokenizer"],
+        "token_features": None,
+    }
+    initial_metadata = {
+        **legacy_metadata,
+        "source_revision": "legacy-snapshot-1",
+        "tokenizer_metadata": None,
+        "translation_directions": [["ko", "ja"], ["ja", "ko"]],
+        "translation_graph_source": "translation_model",
+    }
     manifest = translate_queue(
         source,
         results,
         translator,
         accepted_dir=accepted,
         options=_options(),
+        run_metadata=initial_metadata,
         max_rows=1,
     )
+    manifest["configuration"].pop("accepted_shard_prefix")
+    manifest["configuration"]["run_metadata"] = legacy_metadata
     configuration_bytes = json.dumps(
         manifest["configuration"],
         ensure_ascii=False,
@@ -547,9 +1491,20 @@ def test_legacy_manifest_signature_and_shards_migrate_on_resume(
     result["run_id"] = legacy_run_id
     result_path.write_text(json.dumps(result, ensure_ascii=False) + "\n", encoding="utf-8")
     accepted_row = json.loads(old_accepted_path.read_text(encoding="utf-8"))
-    accepted_row["provenance"]["run_id"] = legacy_run_id
+    old_shape = {
+        "KO": accepted_row["source"],
+        "JA": accepted_row["translation"],
+        "id": accepted_row["id"],
+        "synthetic": True,
+        "provenance": {
+            "type": "machine_translation",
+            "queue_id": accepted_row["id"],
+            "run_id": legacy_run_id,
+            "roundtrip_score": accepted_row["provenance"]["roundtrip_score"],
+        },
+    }
     old_accepted_path.write_text(
-        json.dumps(accepted_row, ensure_ascii=False) + "\n",
+        json.dumps(old_shape, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
     old_accepted_path.rename(legacy_accepted_path)
@@ -557,6 +1512,7 @@ def test_legacy_manifest_signature_and_shards_migrate_on_resume(
     manifest["run_signature"] = legacy_signature
     manifest.pop("signature_version")
     manifest.pop("parts")
+    manifest.pop("integrity")
     (results / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False),
         encoding="utf-8",
@@ -570,6 +1526,7 @@ def test_legacy_manifest_signature_and_shards_migrate_on_resume(
         translator,
         accepted_dir=accepted,
         options=_options(),
+        run_metadata=legacy_metadata,
     )
 
     assert migrated["progress"]["complete"]
@@ -577,9 +1534,276 @@ def test_legacy_manifest_signature_and_shards_migrate_on_resume(
     assert migrated["run_signature"] != legacy_signature
     assert migrated["signature_version"] == 2
     assert len(migrated["parts"]) == migrated["progress"]["next_part"]
+    migrated_row = json.loads(legacy_accepted_path.read_text(encoding="utf-8"))
+    assert migrated_row["source_language"] == "ko"
+    assert migrated_row["target_language"] == "ja"
+    assert migrated_row["training_direction"] == ["ko", "ja"]
+    assert migrated_row["provenance"]["source_dataset"] == "legacy/corpus"
+    assert migrated_row["provenance"]["source_revision"] == "legacy-snapshot-1"
+    assert migrated_row["provenance"]["translation_model"] == recorded_metadata["translation_model"]
+    assert migrated_row["provenance"]["tokenizer"] == recorded_metadata["tokenizer"]
+    assert migrated_row["provenance"]["translation_directions"] == [
+        ["ko", "ja"],
+        ["ja", "ko"],
+    ]
+    assert migrated_row["provenance"]["translation_graph_source"] == "translation_model"
+    assert (
+        migrated_row["provenance"]["source_queue"]["sha256"]
+        == hashlib.sha256(source.read_bytes()).hexdigest()
+    )
 
 
-def test_legacy_shard_registration_rejects_broken_source_sequence(
+def test_legacy_accepted_row_rejects_text_that_disagrees_with_result(tmp_path: Path) -> None:
+    source = tmp_path / "queue.jsonl"
+    results = tmp_path / "results"
+    accepted = tmp_path / "accepted"
+    _write_queue(source)
+    manifest = translate_queue(
+        source,
+        results,
+        FakeTranslator(),
+        accepted_dir=accepted,
+        options=_options(),
+        max_rows=1,
+    )
+    accepted_path = Path(manifest["parts"][0]["accepted"]["path"])
+    current = json.loads(accepted_path.read_text(encoding="utf-8"))
+    old_shape = {
+        "KO": current["source"],
+        "JA": "結果シャードと一致しない改ざん文です。",
+        "id": current["id"],
+        "synthetic": True,
+        "provenance": {
+            key: value
+            for key, value in current["provenance"].items()
+            if key in {"type", "queue_id", "run_id", "roundtrip_score"}
+        },
+    }
+    accepted_path.write_text(
+        json.dumps(old_shape, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    manifest["parts"][0]["accepted"] = queue_translation_module._jsonl_artifact(accepted_path)
+    (results / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    resumed_translator = FakeTranslator()
+
+    with pytest.raises(ValueError, match="source/translation mismatch"):
+        translate_queue(
+            source,
+            results,
+            resumed_translator,
+            accepted_dir=accepted,
+            options=_options(),
+        )
+
+    assert resumed_translator.calls == []
+
+
+def test_accepted_migration_recovers_after_rewrite_before_manifest_commit(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "queue.jsonl"
+    results = tmp_path / "results"
+    accepted = tmp_path / "accepted"
+    _write_queue(source)
+    manifest = translate_queue(
+        source,
+        results,
+        FakeTranslator(),
+        accepted_dir=accepted,
+        options=_options(),
+        max_rows=1,
+    )
+    accepted_path = Path(manifest["parts"][0]["accepted"]["path"])
+    canonical_row = json.loads(accepted_path.read_text(encoding="utf-8"))
+    old_shape = {
+        "ko": canonical_row["source"],
+        "ja": canonical_row["translation"],
+        "id": canonical_row["id"],
+        "synthetic": True,
+        "provenance": {
+            key: value
+            for key, value in canonical_row["provenance"].items()
+            if key in {"type", "queue_id", "run_id", "roundtrip_score"}
+        },
+    }
+    accepted_path.write_text(
+        json.dumps(old_shape, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    manifest["parts"][0]["accepted"] = queue_translation_module._jsonl_artifact(accepted_path)
+    (results / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    # Simulate the process stopping after the atomic accepted-row rewrite but
+    # before the updated artifact digest reaches manifest.json.
+    accepted_path.write_text(
+        json.dumps(canonical_row, ensure_ascii=False, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    recovered = translate_queue(
+        source,
+        results,
+        FakeTranslator(),
+        accepted_dir=accepted,
+        options=_options(),
+    )
+
+    assert recovered["parts"][0]["accepted"] == queue_translation_module._jsonl_artifact(
+        accepted_path
+    )
+    assert json.loads(accepted_path.read_text(encoding="utf-8")) == canonical_row
+
+
+@pytest.mark.parametrize("parts_as_null", [False, True])
+def test_current_manifest_cannot_drop_parts_to_rebaseline_target_tampering(
+    tmp_path: Path,
+    parts_as_null: bool,
+) -> None:
+    source = tmp_path / "queue.jsonl"
+    results = tmp_path / "results"
+    accepted = tmp_path / "accepted"
+    _write_queue(source)
+    translator = FakeTranslator()
+    manifest = translate_queue(
+        source,
+        results,
+        translator,
+        accepted_dir=accepted,
+        options=_options(),
+        max_rows=1,
+    )
+    calls_before_resume = list(translator.calls)
+    result_path = results / "part-000000.jsonl"
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result["translation"] = "poisoned training target"
+    result_path.write_text(
+        json.dumps(result, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    accepted_path = Path(manifest["parts"][0]["accepted"]["path"])
+    accepted_row = json.loads(accepted_path.read_text(encoding="utf-8"))
+    accepted_row["translation"] = result["translation"]
+    accepted_path.write_text(
+        json.dumps(accepted_row, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    if parts_as_null:
+        manifest["parts"] = None
+    else:
+        manifest.pop("parts")
+    (results / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="refusing legacy downgrade"):
+        translate_queue(
+            source,
+            results,
+            translator,
+            accepted_dir=accepted,
+            options=_options(),
+        )
+    assert translator.calls == calls_before_resume
+
+
+def test_public_training_copy_rejects_manifest_attested_poisoned_target(tmp_path: Path) -> None:
+    source = tmp_path / "queue.jsonl"
+    results = tmp_path / "results"
+    accepted = tmp_path / "accepted"
+    _write_queue(source)
+    translator = FakeTranslator()
+    manifest = translate_queue(
+        source,
+        results,
+        translator,
+        accepted_dir=accepted,
+        options=_options(),
+        max_rows=1,
+    )
+    result_path = results / "part-000000.jsonl"
+    accepted_path = Path(manifest["parts"][0]["accepted"]["path"])
+    training_path = Path(manifest["parts"][0]["training"]["path"])
+    original_training_bytes = training_path.read_bytes()
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    accepted_row = json.loads(accepted_path.read_text(encoding="utf-8"))
+    result["translation"] = "POISONED TARGET THAT THE MODEL NEVER GENERATED"
+    accepted_row["translation"] = result["translation"]
+    result_path.write_text(json.dumps(result, ensure_ascii=False) + "\n", encoding="utf-8")
+    accepted_path.write_text(
+        json.dumps(accepted_row, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    manifest["parts"][0]["result"] = queue_translation_module._jsonl_artifact(result_path)
+    manifest["parts"][0]["accepted"] = queue_translation_module._jsonl_artifact(accepted_path)
+    (results / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    calls_before_resume = len(translator.calls)
+
+    with pytest.raises(FileExistsError, match="public training part collision"):
+        translate_queue(
+            source,
+            results,
+            translator,
+            accepted_dir=accepted,
+            options=_options(),
+        )
+
+    assert len(translator.calls) == calls_before_resume
+    assert training_path.read_bytes() == original_training_bytes
+
+
+def test_current_multi_part_manifest_cannot_drop_its_committed_ledger(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "queue.jsonl"
+    results = tmp_path / "results"
+    accepted = tmp_path / "accepted"
+    _write_queue(source)
+    translator = FakeTranslator()
+    manifest = translate_queue(
+        source,
+        results,
+        translator,
+        accepted_dir=accepted,
+        options=_options(shard_size=1),
+        max_rows=2,
+    )
+    calls_before_resume = list(translator.calls)
+    second_result_path = results / "part-000001.jsonl"
+    second_result = json.loads(second_result_path.read_text(encoding="utf-8"))
+    second_result["id"] = "one"
+    second_result_path.write_text(
+        json.dumps(second_result, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    manifest.pop("parts")
+    (results / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="refusing legacy downgrade"):
+        translate_queue(
+            source,
+            results,
+            translator,
+            accepted_dir=accepted,
+            options=_options(shard_size=1),
+        )
+
+    assert translator.calls == calls_before_resume
+
+
+def test_current_manifest_missing_parts_fails_before_source_substitution_migration(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "queue.jsonl"
@@ -595,11 +1819,22 @@ def test_legacy_shard_registration_rejects_broken_source_sequence(
         options=_options(),
         max_rows=1,
     )
+    calls_before_resume = list(translator.calls)
     result_path = results / "part-000000.jsonl"
     result = json.loads(result_path.read_text(encoding="utf-8"))
-    result["source_index"] = 99
+    result["id"] = "substituted"
+    result["source"] = "바꿔치기한 원문입니다."
     result_path.write_text(
         json.dumps(result, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    accepted_path = Path(manifest["parts"][0]["accepted"]["path"])
+    accepted_row = json.loads(accepted_path.read_text(encoding="utf-8"))
+    accepted_row["id"] = "substituted"
+    accepted_row["source"] = result["source"]
+    accepted_row["provenance"]["queue_id"] = "substituted"
+    accepted_path.write_text(
+        json.dumps(accepted_row, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
     manifest.pop("parts")
@@ -608,7 +1843,7 @@ def test_legacy_shard_registration_rejects_broken_source_sequence(
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="non-contiguous source_index"):
+    with pytest.raises(ValueError, match="refusing legacy downgrade"):
         translate_queue(
             source,
             results,
@@ -616,6 +1851,159 @@ def test_legacy_shard_registration_rejects_broken_source_sequence(
             accepted_dir=accepted,
             options=_options(),
         )
+
+    assert translator.calls == calls_before_resume
+
+
+def test_current_manifest_missing_parts_fails_before_status_migration(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "queue.jsonl"
+    results = tmp_path / "results"
+    accepted = tmp_path / "accepted"
+    _write_queue(source)
+    translator = FakeTranslator()
+    manifest = translate_queue(
+        source,
+        results,
+        translator,
+        accepted_dir=accepted,
+        options=_options(shard_size=4),
+        max_rows=4,
+    )
+    calls_before_resume = list(translator.calls)
+    result_path = results / "part-000000.jsonl"
+    result_rows = [
+        json.loads(line) for line in result_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert result_rows[3]["status"] == "skipped_existing"
+    result_rows[3]["status"] = "accepted"
+    result_path.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in result_rows) + "\n",
+        encoding="utf-8",
+    )
+    manifest.pop("parts")
+    (results / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="refusing legacy downgrade"):
+        translate_queue(
+            source,
+            results,
+            translator,
+            accepted_dir=accepted,
+            options=_options(shard_size=4),
+        )
+
+    assert translator.calls == calls_before_resume
+
+
+def test_manifest_cannot_mark_an_uncommitted_source_tail_complete(tmp_path: Path) -> None:
+    source = tmp_path / "queue.jsonl"
+    results = tmp_path / "results"
+    accepted = tmp_path / "accepted"
+    _write_queue(source)
+    translator = FakeTranslator()
+    translate_queue(
+        source,
+        results,
+        translator,
+        accepted_dir=accepted,
+        options=_options(shard_size=1),
+        max_rows=1,
+    )
+    manifest_path = results / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["progress"]["complete"] = True
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="unconsumed source tail"):
+        translate_queue(
+            source,
+            results,
+            translator,
+            accepted_dir=accepted,
+            options=_options(shard_size=1),
+        )
+
+
+def test_private_source_snapshot_isolates_processing_from_later_input_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "queue.jsonl"
+    results = tmp_path / "results"
+    accepted = tmp_path / "accepted"
+    _write_queue(source)
+    original_bytes = source.read_bytes()
+    translator = FakeTranslator()
+    run_metadata = _run_metadata(translator, tmp_path / ".queue-runtime-artifacts")
+    original_validate = queue_translation_module._validated_run_lineage
+
+    def mutate_after_initial_source_hash(*args, **kwargs):
+        lineage = original_validate(*args, **kwargs)
+        rows = source.read_text(encoding="utf-8").splitlines()
+        first = json.loads(rows[0])
+        first["source"] = "정상 문장입니다."
+        rows[0] = json.dumps(first, ensure_ascii=False)
+        source.write_text("\n".join(rows) + "\n", encoding="utf-8")
+        return lineage
+
+    monkeypatch.setattr(
+        queue_translation_module,
+        "_validated_run_lineage",
+        mutate_after_initial_source_hash,
+    )
+
+    manifest = _translate_queue(
+        source,
+        results,
+        translator,
+        accepted_dir=accepted,
+        options=_options(),
+        run_metadata=run_metadata,
+        max_rows=1,
+        allow_unverified_translator=True,
+    )
+
+    assert source.read_bytes() != original_bytes
+    assert translator.calls
+    assert manifest["progress"]["next_part"] == 1
+    result = json.loads((results / "part-000000.jsonl").read_text(encoding="utf-8"))
+    assert result["source"] == "안녕하세요."
+    assert (
+        manifest["configuration"]["source"]["sha256"] == hashlib.sha256(original_bytes).hexdigest()
+    )
+    assert _published_accepted_paths(manifest)[0].is_file()
+    assert len(list(accepted.glob("*.jsonl"))) == 1
+
+
+def test_new_run_recovers_queue_owned_snapshot_and_manifest_temp_files(tmp_path: Path) -> None:
+    source = tmp_path / "queue.jsonl"
+    results = tmp_path / "results"
+    _write_queue(source)
+    results.mkdir()
+    stale_snapshot_temp = results / (
+        f".{queue_translation_module.SOURCE_SNAPSHOT_FILENAME}.999999.tmp"
+    )
+    stale_manifest_temp = results / ".manifest.json.999999.tmp"
+    stale_snapshot_temp.write_bytes(b"partial snapshot")
+    stale_manifest_temp.write_bytes(b"partial manifest")
+
+    manifest = translate_queue(
+        source,
+        results,
+        FakeTranslator(),
+        accepted_dir=tmp_path / "accepted",
+        options=_options(),
+        max_rows=1,
+    )
+
+    assert manifest["progress"]["next_part"] == 1
+    assert not stale_snapshot_temp.exists()
+    assert not stale_manifest_temp.exists()
 
 
 def test_queue_output_allows_only_one_writer(tmp_path: Path) -> None:
@@ -674,13 +2062,13 @@ def test_shared_accepted_namespace_allows_only_one_publisher(tmp_path: Path) -> 
             )
 
 
-def test_new_output_refuses_to_overwrite_existing_accepted_shard(
+def test_distinct_outputs_publish_to_distinct_private_run_namespaces(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "queue.jsonl"
     accepted = tmp_path / "accepted"
     _write_queue(source)
-    translate_queue(
+    first = translate_queue(
         source,
         tmp_path / "first-results",
         FakeTranslator(),
@@ -689,15 +2077,20 @@ def test_new_output_refuses_to_overwrite_existing_accepted_shard(
         max_rows=1,
     )
 
-    with pytest.raises(FileExistsError, match="already owned"):
-        translate_queue(
-            source,
-            tmp_path / "second-results",
-            FakeTranslator(),
-            accepted_dir=accepted,
-            options=_options(),
-            max_rows=1,
-        )
+    second = translate_queue(
+        source,
+        tmp_path / "second-results",
+        FakeTranslator(),
+        accepted_dir=accepted,
+        options=_options(),
+        max_rows=1,
+    )
+
+    first_path = _published_accepted_paths(first)[0]
+    second_path = _published_accepted_paths(second)[0]
+    assert first_path != second_path
+    assert first_path.is_file() and second_path.is_file()
+    assert len(list(accepted.glob("*.jsonl"))) == 2
 
 
 def test_committed_pending_accepted_shard_is_recovered(tmp_path: Path) -> None:
@@ -762,6 +2155,42 @@ def test_published_final_wins_over_stale_pending(tmp_path: Path) -> None:
     assert not pending_path.exists()
 
 
+def test_published_manifest_quarantines_an_unrecoverable_pending_replacement(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "queue.jsonl"
+    results = tmp_path / "results"
+    accepted = tmp_path / "accepted"
+    _write_queue(source)
+    translator = FakeTranslator()
+    manifest = translate_queue(
+        source,
+        results,
+        translator,
+        accepted_dir=accepted,
+        options=_options(),
+        max_rows=1,
+    )
+    accepted_path = Path(manifest["parts"][0]["accepted"]["path"])
+    pending_path = accepted_path.with_name(f".{accepted_path.name}.pending")
+    pending_path.write_bytes(b"foreign\n")
+    accepted_path.unlink()
+
+    with pytest.raises(ValueError, match="were quarantined"):
+        translate_queue(
+            source,
+            results,
+            translator,
+            accepted_dir=accepted,
+            options=_options(),
+        )
+
+    assert not accepted_path.exists()
+    assert pending_path.exists()
+    persisted = json.loads((results / "manifest.json").read_text(encoding="utf-8"))
+    assert persisted["parts"][0]["published"] is False
+
+
 def test_accepted_shard_is_not_published_before_manifest_commit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -799,7 +2228,7 @@ def test_accepted_shard_is_not_published_before_manifest_commit(
     disk_manifest = json.loads((results / "manifest.json").read_text(encoding="utf-8"))
     assert disk_manifest["progress"]["next_part"] == 0
     assert list(accepted.glob("*.jsonl")) == []
-    assert len(list(accepted.glob("*.pending"))) == 1
+    assert len(list(accepted.rglob("*.pending"))) == 1
 
     monkeypatch.setattr(
         queue_translation_module,
@@ -815,11 +2244,66 @@ def test_accepted_shard_is_not_published_before_manifest_commit(
         max_rows=1,
     )
     assert resumed["progress"]["next_part"] == 1
+    assert len(_published_accepted_paths(resumed)) == 1
+    assert _published_accepted_paths(resumed)[0].is_file()
     assert len(list(accepted.glob("*.jsonl"))) == 1
-    assert list(accepted.glob("*.pending")) == []
+    assert list(accepted.rglob("*.pending")) == []
 
 
-def test_unpublished_manifest_part_recovers_after_final_rename(
+def test_atomic_json_write_ignores_the_old_predictable_hardlink_name(tmp_path: Path) -> None:
+    victim = tmp_path / "victim.txt"
+    victim.write_text("preserve me\n", encoding="utf-8")
+    target = tmp_path / "manifest.json"
+    predictable = tmp_path / f".manifest.json.{os.getpid()}.tmp"
+    os.link(victim, predictable)
+
+    queue_translation_module._atomic_write_json(target, {"safe": True})
+
+    assert victim.read_text(encoding="utf-8") == "preserve me\n"
+    assert predictable.read_text(encoding="utf-8") == "preserve me\n"
+    assert json.loads(target.read_text(encoding="utf-8")) == {"safe": True}
+
+
+def test_training_materialization_never_overwrites_a_public_collision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "queue.jsonl"
+    results = tmp_path / "results"
+    accepted = tmp_path / "accepted"
+    _write_queue(source)
+    original_copy = queue_translation_module._copy_plain_file_no_replace
+    collided: Path | None = None
+
+    def collide_then_copy(private_path: Path, public_path: Path) -> None:
+        nonlocal collided
+        collided = public_path
+        public_path.write_text("foreign training data\n", encoding="utf-8")
+        original_copy(private_path, public_path)
+
+    monkeypatch.setattr(
+        queue_translation_module,
+        "_copy_plain_file_no_replace",
+        collide_then_copy,
+    )
+    with pytest.raises(FileExistsError):
+        translate_queue(
+            source,
+            results,
+            FakeTranslator(),
+            accepted_dir=accepted,
+            options=_options(),
+            max_rows=1,
+        )
+
+    assert collided is not None
+    assert collided.read_text(encoding="utf-8") == "foreign training data\n"
+    persisted = json.loads((results / "manifest.json").read_text(encoding="utf-8"))
+    assert persisted["parts"][0]["published"] is True
+    assert "training" not in persisted["parts"][0]
+
+
+def test_committed_part_is_not_glob_visible_when_final_publish_crashes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -830,22 +2314,19 @@ def test_unpublished_manifest_part_recovers_after_final_rename(
     first_row = source.read_text(encoding="utf-8").splitlines()[0]
     source.write_text(first_row + "\n", encoding="utf-8")
     translator = FakeTranslator()
-    original_write = queue_translation_module._atomic_write_json
-    writes = 0
+    original_publish = queue_translation_module._publish_no_replace
 
-    def fail_published_commit(path: Path, value) -> None:
-        nonlocal writes
-        writes += 1
-        if writes == 3:
-            raise OSError("simulated published-manifest failure")
-        original_write(path, value)
+    def fail_shard_publish(pending_path: Path, accepted_path: Path) -> None:
+        if accepted_path.name.endswith(".jsonl.private"):
+            raise OSError("simulated final-shard publish failure")
+        original_publish(pending_path, accepted_path)
 
     monkeypatch.setattr(
         queue_translation_module,
-        "_atomic_write_json",
-        fail_published_commit,
+        "_publish_no_replace",
+        fail_shard_publish,
     )
-    with pytest.raises(OSError, match="published-manifest failure"):
+    with pytest.raises(OSError, match="final-shard publish failure"):
         translate_queue(
             source,
             results,
@@ -857,14 +2338,15 @@ def test_unpublished_manifest_part_recovers_after_final_rename(
 
     disk_manifest = json.loads((results / "manifest.json").read_text(encoding="utf-8"))
     assert disk_manifest["progress"]["next_part"] == 1
-    assert disk_manifest["progress"]["complete"] is False
+    assert disk_manifest["progress"]["complete"] is True
     assert disk_manifest["parts"][0]["published"] is False
-    assert len(list(accepted.glob("*.jsonl"))) == 1
+    assert list(accepted.glob("*.jsonl")) == []
+    assert len(list(accepted.rglob("*.pending"))) == 1
 
     monkeypatch.setattr(
         queue_translation_module,
-        "_atomic_write_json",
-        original_write,
+        "_publish_no_replace",
+        original_publish,
     )
     recovered = translate_queue(
         source,
@@ -892,7 +2374,7 @@ def test_atomic_publish_never_overwrites_external_target(
     original_link = queue_translation_module.os.link
 
     def create_foreign_target_then_link(source_path, target_path) -> None:
-        if str(target_path).endswith(".jsonl"):
+        if str(target_path).endswith(".jsonl.private"):
             Path(target_path).write_text("foreign\n", encoding="utf-8")
         original_link(source_path, target_path)
 
@@ -916,6 +2398,150 @@ def test_atomic_publish_never_overwrites_external_target(
     assert accepted_path.read_text(encoding="utf-8") == "foreign\n"
     assert disk_manifest["parts"][0]["published"] is False
     assert disk_manifest["progress"]["complete"] is False
+    assert list(accepted.glob("*.jsonl")) == []
+    assert accepted_path.parent.parent.name == ".queue-runs"
+
+
+def test_manifest_run_id_cannot_escape_the_private_namespace(tmp_path: Path) -> None:
+    source = tmp_path / "queue.jsonl"
+    results = tmp_path / "results"
+    accepted = tmp_path / "accepted"
+    _write_queue(source)
+    translator = FakeTranslator()
+    translate_queue(
+        source,
+        results,
+        translator,
+        accepted_dir=accepted,
+        options=_options(),
+        max_rows=1,
+    )
+    manifest_path = results / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["run_id"] = "../../outside"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="run_id must be 16 lowercase hexadecimal"):
+        translate_queue(
+            source,
+            results,
+            translator,
+            accepted_dir=accepted,
+            options=_options(),
+        )
+
+    assert not (tmp_path / "outside").exists()
+
+
+@pytest.mark.parametrize("accepted_name", ("results", "results/accepted"))
+def test_accepted_namespace_cannot_overlap_audit_outputs(
+    tmp_path: Path,
+    accepted_name: str,
+) -> None:
+    source = tmp_path / "queue.jsonl"
+    results = tmp_path / "results"
+    _write_queue(source)
+
+    with pytest.raises(ValueError, match="separate, non-nested directories"):
+        translate_queue(
+            source,
+            results,
+            FakeTranslator(),
+            accepted_dir=tmp_path / accepted_name,
+            options=_options(),
+        )
+
+    assert not results.exists()
+
+
+def test_snapshot_swap_before_publication_is_detected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "queue.jsonl"
+    results = tmp_path / "results"
+    accepted = tmp_path / "accepted"
+    _write_queue(source)
+    original_publish = queue_translation_module._publish_no_replace
+
+    def publish_with_swapped_snapshot(source_path: Path, target_path: Path) -> None:
+        if Path(target_path).name == queue_translation_module.SOURCE_SNAPSHOT_FILENAME:
+            Path(source_path).write_text('{"id":"swapped"}\n', encoding="utf-8")
+        original_publish(source_path, target_path)
+
+    monkeypatch.setattr(
+        queue_translation_module,
+        "_publish_no_replace",
+        publish_with_swapped_snapshot,
+    )
+    with pytest.raises(ValueError, match="published private queue source snapshot"):
+        translate_queue(
+            source,
+            results,
+            FakeTranslator(),
+            accepted_dir=accepted,
+            options=_options(),
+        )
+
+    assert not (results / "manifest.json").exists()
+
+
+def test_preexisting_source_snapshot_cannot_be_a_hard_link(tmp_path: Path) -> None:
+    source = tmp_path / "queue.jsonl"
+    results = tmp_path / "results"
+    accepted = tmp_path / "accepted"
+    _write_queue(source)
+    results.mkdir()
+    snapshot = results / queue_translation_module.SOURCE_SNAPSHOT_FILENAME
+    os.link(source, snapshot)
+
+    with pytest.raises(ValueError, match="must not have hard-link aliases"):
+        translate_queue(
+            source,
+            results,
+            FakeTranslator(),
+            accepted_dir=accepted,
+            options=_options(),
+        )
+
+    assert not (results / "manifest.json").exists()
+
+
+def test_private_accepted_namespace_rejects_a_directory_reparse_point(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "queue.jsonl"
+    results = tmp_path / "results"
+    accepted = tmp_path / "accepted"
+    _write_queue(source)
+    original_lstat = queue_translation_module.os.lstat
+
+    class ReparseMetadata:
+        def __init__(self, wrapped) -> None:
+            self._wrapped = wrapped
+            self.st_file_attributes = getattr(wrapped, "st_file_attributes", 0) | 0x400
+
+        def __getattr__(self, name: str):
+            return getattr(self._wrapped, name)
+
+    def mark_private_root_as_reparse(path):
+        observed = original_lstat(path)
+        if Path(path).name == queue_translation_module.PRIVATE_ACCEPTED_DIRNAME:
+            return ReparseMetadata(observed)
+        return observed
+
+    monkeypatch.setattr(queue_translation_module.os, "lstat", mark_private_root_as_reparse)
+
+    with pytest.raises(ValueError, match="symbolic link or reparse point"):
+        translate_queue(
+            source,
+            results,
+            FakeTranslator(),
+            accepted_dir=accepted,
+            options=_options(),
+            max_rows=1,
+        )
 
 
 def test_owner_claim_never_overwrites_external_owner(
@@ -983,11 +2609,11 @@ def test_han_only_candidate_cannot_pass_as_japanese(tmp_path: Path) -> None:
         tmp_path / "results",
         translator,
         accepted_dir=tmp_path / "accepted",
-        options=_options(),
+        options=_options(required_target_scripts=(("ja", "kana", 1),)),
     )
 
     assert manifest["stats"]["accepted"] == 0
     result = json.loads((tmp_path / "results" / "part-000000.jsonl").read_text(encoding="utf-8"))
     assert result["quality"]["forward"]["target_language_fraction"] == 1.0
-    assert result["quality"]["forward"]["target_japanese_kana_chars"] == 0
-    assert result["rejection_reasons"] == ["target_japanese_kana"]
+    assert result["quality"]["forward"]["target_script_characters"] == {"han": 4}
+    assert result["rejection_reasons"] == ["target_script:kana"]
