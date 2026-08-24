@@ -5,12 +5,17 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 import re
 from typing import Any
 
 from transformers import PretrainedConfig
+
+
+_TRANSLATION_PIPELINE_SCHEMA = "sion-translation-pipeline-v2"
+_FOUNDATION_LINEAGE_SCHEMA = "sion-foundation-lineage-v1"
+_LOWERCASE_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 try:
     from sion_translate.config import ExperimentalConfig, ModelConfig
@@ -72,6 +77,7 @@ class SionConfig(PretrainedConfig):
         languages: list[str] | tuple[str, ...] | None = None,
         language_pairs: list[list[str]] | tuple[tuple[str, str], ...] | None = None,
         translation_directions: list[list[str]] | tuple[tuple[str, str], ...] | None = None,
+        revision_directions: list[list[str]] | tuple[tuple[str, str], ...] | None = None,
         release_name: str | None = None,
         release_version: str | None = None,
         translation_capable: bool = True,
@@ -151,25 +157,13 @@ class SionConfig(PretrainedConfig):
         )
         self.release_name = release_name
         self.release_version = release_version
-        current_direction_contract = bool(
-            kwargs.get("pipeline") is not None
-            or (
-                isinstance(release_version, str)
-                and re.fullmatch(r"[0-9]+\.[0-9]+(?:\.[0-9]+)?", release_version)
-                and tuple(int(part) for part in release_version.split("."))[:2] >= (1, 5)
-            )
-        )
-        if translation_directions is None and self.language_pairs and current_direction_contract:
+        if translation_directions is None and self.language_pairs:
             raise ValueError(
-                "current translation configs with language pairs require explicit "
-                "translation_directions"
+                "translation configs with language pairs require explicit "
+                "translation_directions; legacy directionality is unknown"
             )
         if translation_directions is None:
-            self.translation_directions = [
-                list(direction)
-                for pair in self.language_pairs
-                for direction in (pair, list(reversed(pair)))
-            ]
+            self.translation_directions = []
         else:
             self.translation_directions = []
             for raw_direction in translation_directions:
@@ -190,11 +184,36 @@ class SionConfig(PretrainedConfig):
         if not isinstance(translation_capable, bool):  # pyright: ignore[reportUnnecessaryIsInstance]
             raise ValueError("translation_capable must be a boolean")
         self.translation_capable = translation_capable
+        self.revision_directions: list[list[str]] | None = (
+            None if revision_directions is None else []
+        )
+        for raw_direction in revision_directions or ():
+            if isinstance(raw_direction, (str, bytes)) or not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
+                raw_direction, Sequence
+            ):
+                raise ValueError("each revision direction must be a two-item language sequence")
+            assert self.revision_directions is not None
+            self.revision_directions.append(
+                list(
+                    canonicalize_language_pair(
+                        raw_direction,
+                        field="config revision direction",
+                    )
+                )
+            )
         if revision_trained is not None and not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
             revision_trained, bool
         ):
             raise ValueError("revision_trained must be a boolean or null")
-        self.revision_trained = revision_trained
+        if self.revision_directions is not None:
+            expected_revision_trained = bool(self.revision_directions)
+            if revision_trained is not None and revision_trained is not expected_revision_trained:
+                raise ValueError("revision_trained disagrees with revision_directions")
+            self.revision_trained = expected_revision_trained
+        else:
+            # Bool-only configs are legacy. Keep the uncertainty visible so a
+            # multi-edge checkpoint cannot silently authorize every edge.
+            self.revision_trained = revision_trained
         if default_reasoning_level is None:
             default_reasoning_level = (
                 9
@@ -244,6 +263,33 @@ class SionConfig(PretrainedConfig):
             raise ValueError("the sion foundation release cannot be translation-capable")
         if self.release_name == "sion_translate" and not self.translation_capable:
             raise ValueError("the sion_translate release must be translation-capable")
+        self._validate_pipeline_identity()
+        if not self.translation_capable and (
+            self.revision_trained is True or bool(self.revision_directions)
+        ):
+            raise ValueError("translation-incapable configs cannot advertise revision capability")
+        current_capability_contract = bool(
+            getattr(self, "pipeline", None) is not None
+            or (
+                isinstance(self.release_version, str)
+                and re.fullmatch(
+                    r"[0-9]+\.[0-9]+(?:\.[0-9]+)?",
+                    self.release_version,
+                )
+                and tuple(int(part) for part in self.release_version.split("."))[:2] >= (1, 5)
+            )
+        )
+        if current_capability_contract and self.revision_directions is None:
+            raise ValueError(
+                "current configs require explicit revision_directions; use an empty list "
+                "when revision was not trained"
+            )
+        if current_capability_contract and self.translation_capable and not self.language_pairs:
+            raise ValueError(
+                "current translation-capable configs require a non-empty language-pair graph"
+            )
+        if current_capability_contract and not self.translation_capable and not self.languages:
+            raise ValueError("current foundation configs require a non-empty trained language list")
         if isinstance(self.default_reasoning_level, bool) or not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
             self.default_reasoning_level,
             int,
@@ -287,6 +333,13 @@ class SionConfig(PretrainedConfig):
                     f"duplicate or reversed language pair after BCP 47 canonicalization: {pair!r}"
                 )
             allowed_edges.add(edge)
+        if current_capability_contract and self.translation_capable:
+            pair_languages = {language for pair in self.language_pairs for language in pair}
+            if set(self.languages) != pair_languages:
+                raise ValueError(
+                    "current translation config languages must exactly match the "
+                    "language-pair graph"
+                )
         seen_directions: set[tuple[str, str]] = set()
         if self.language_pairs and not self.translation_directions:
             raise ValueError(
@@ -307,6 +360,18 @@ class SionConfig(PretrainedConfig):
             if key in seen_directions:
                 raise ValueError(f"duplicate translation direction: {direction!r}")
             seen_directions.add(key)
+        if self.revision_directions is not None:
+            seen_revision_directions: set[tuple[str, str]] = set()
+            for direction in self.revision_directions:
+                key = tuple(direction)
+                if key in seen_revision_directions:
+                    raise ValueError(f"duplicate revision direction: {direction!r}")
+                if key not in seen_directions:
+                    raise ValueError(
+                        "revision_directions must be a subset of translation_directions: "
+                        f"{direction!r}"
+                    )
+                seen_revision_directions.add(key)
         covered_edges = {frozenset(direction) for direction in seen_directions}
         missing_pairs = [
             pair for pair in self.language_pairs if frozenset(pair) not in covered_edges
@@ -315,6 +380,131 @@ class SionConfig(PretrainedConfig):
             raise ValueError(
                 "every language pair must have at least one translation direction: "
                 f"missing={missing_pairs!r}"
+            )
+
+    def _validate_pipeline_identity(self) -> None:
+        pipeline = getattr(self, "pipeline", None)
+        if pipeline is None:
+            if (
+                self.translation_capable
+                and isinstance(self.release_version, str)
+                and re.fullmatch(
+                    r"[0-9]+\.[0-9]+(?:\.[0-9]+)?",
+                    self.release_version,
+                )
+                and tuple(int(part) for part in self.release_version.split("."))[:2] >= (1, 5)
+            ):
+                raise ValueError(
+                    "translation-capable release 1.5 or newer requires pipeline identity"
+                )
+            return
+        if self.release_name is None or self.release_version is None:
+            raise ValueError("pipeline identity requires an explicit release identity")
+        if not self.translation_capable:
+            raise ValueError("foundation-only configs must not contain pipeline identity")
+        if not isinstance(pipeline, Mapping):
+            raise ValueError("pipeline identity must be a JSON object")
+        if pipeline.get("schema") != _TRANSLATION_PIPELINE_SCHEMA:
+            raise ValueError(f"pipeline.schema must be {_TRANSLATION_PIPELINE_SCHEMA!r}")
+        branch = pipeline.get("branch")
+        if branch == "translation-only":
+            if set(pipeline) != {"schema", "branch"}:
+                raise ValueError(
+                    "translation-only pipeline identity must contain exactly schema and branch"
+                )
+            return
+        if branch != "foundation-then-translation":
+            raise ValueError("pipeline.branch is unsupported")
+        if set(pipeline) != {"schema", "branch", "foundation"}:
+            raise ValueError(
+                "foundation pipeline identity must contain exactly schema, branch, and foundation"
+            )
+        foundation = pipeline.get("foundation")
+        if not isinstance(foundation, Mapping):
+            raise ValueError("pipeline.foundation must be a JSON object")
+        expected_fields = {
+            "schema",
+            "release_name",
+            "release_version",
+            "languages",
+            "selected_step",
+            "foundation_manifest_sha256",
+            "tokenizer_sha256",
+            "checkpoint_identity_sha256",
+            "checkpoint_artifact_sha256",
+        }
+        if set(foundation) != expected_fields:
+            raise ValueError(
+                "foundation lineage must contain exactly its schema, release identity, "
+                "languages, selected step, and four SHA-256 digests"
+            )
+        if foundation.get("schema") != _FOUNDATION_LINEAGE_SCHEMA:
+            raise ValueError(f"foundation lineage schema must be {_FOUNDATION_LINEAGE_SCHEMA!r}")
+        foundation_release_name = foundation.get("release_name")
+        if (
+            not isinstance(foundation_release_name, str)
+            or not foundation_release_name
+            or foundation_release_name != foundation_release_name.strip()
+            or not foundation_release_name.isascii()
+        ):
+            raise ValueError("foundation lineage release_name must be normalized non-empty ASCII")
+        if foundation_release_name == self.release_name:
+            raise ValueError(
+                "foundation lineage release_name must differ from the translation release name"
+            )
+        if foundation.get("release_version") != self.release_version:
+            raise ValueError(
+                "foundation lineage release_version must match the translation release"
+            )
+        raw_languages = foundation.get("languages")
+        if (
+            not isinstance(raw_languages, list)
+            or not raw_languages
+            or any(not isinstance(language, str) for language in raw_languages)
+        ):
+            raise ValueError(
+                "foundation lineage languages must be a non-empty list of unique "
+                "normalized BCP 47 tags"
+            )
+        try:
+            canonical_languages = list(
+                canonicalize_language_tags(
+                    raw_languages,
+                    field="foundation lineage languages",
+                    reject_duplicates=True,
+                )
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "foundation lineage languages must be a non-empty list of unique "
+                "normalized BCP 47 tags"
+            ) from error
+        if raw_languages != canonical_languages:
+            raise ValueError(
+                "foundation lineage languages must be a non-empty list of unique "
+                "normalized BCP 47 tags"
+            )
+        selected_step = foundation.get("selected_step")
+        if (
+            isinstance(selected_step, bool)
+            or not isinstance(selected_step, int)
+            or selected_step < 0
+        ):
+            raise ValueError("foundation lineage selected_step must be a non-negative integer")
+        for field_name in (
+            "foundation_manifest_sha256",
+            "tokenizer_sha256",
+            "checkpoint_identity_sha256",
+            "checkpoint_artifact_sha256",
+        ):
+            digest = foundation.get(field_name)
+            if not isinstance(digest, str) or _LOWERCASE_SHA256_PATTERN.fullmatch(digest) is None:
+                raise ValueError(
+                    f"foundation lineage {field_name} must be a lowercase SHA-256 digest"
+                )
+        if self.tokenizer_sha256 != foundation.get("tokenizer_sha256"):
+            raise ValueError(
+                "foundation lineage tokenizer_sha256 must exactly match tokenizer_sha256"
             )
 
     def to_model_config(self) -> ModelConfig:
@@ -350,6 +540,7 @@ class SionConfig(PretrainedConfig):
         languages: list[str] | tuple[str, ...] | None = None,
         language_pairs: list[list[str]] | tuple[tuple[str, str], ...] | None = None,
         translation_directions: list[list[str]] | tuple[tuple[str, str], ...] | None = None,
+        revision_directions: list[list[str]] | tuple[tuple[str, str], ...] | None = None,
         release_name: str | None = None,
         release_version: str | None = None,
         translation_capable: bool = True,
@@ -370,6 +561,7 @@ class SionConfig(PretrainedConfig):
             languages=languages,
             language_pairs=language_pairs,
             translation_directions=translation_directions,
+            revision_directions=revision_directions,
             release_name=release_name,
             release_version=release_version,
             translation_capable=translation_capable,

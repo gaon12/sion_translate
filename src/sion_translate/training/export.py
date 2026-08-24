@@ -418,10 +418,17 @@ def _normalize_translation_directions(
     language_pairs: Sequence[Sequence[str]],
     *,
     translation_directions: Sequence[Sequence[str]] | None = None,
-    bidirectional: bool = True,
+    bidirectional: bool | None = None,
 ) -> list[list[str]]:
     pairs = _normalize_language_pairs(language_pairs=language_pairs)
+    if bidirectional is not None and type(bidirectional) is not bool:
+        raise ValueError("bidirectional must be a boolean or None")
     if translation_directions is None:
+        if pairs and bidirectional is None:
+            raise ValueError(
+                "language pairs require explicit translation_directions or an explicit "
+                "bidirectional policy"
+            )
         directions: list[list[str]] = []
         for source, target in pairs:
             directions.append([source, target])
@@ -520,6 +527,66 @@ def _default_reasoning_level(model_config: ModelConfig) -> int:
     )
 
 
+def _expected_feature_flags(model_config: ModelConfig) -> dict[str, bool]:
+    """Return the exact architecture capabilities encoded by one model config."""
+
+    experimental = model_config.experimental
+    return {
+        "bats": bool(experimental.bats_enabled),
+        "core": bool(experimental.core_enabled),
+        "tetm": bool(experimental.tetm_enabled),
+        "morphoscript": bool(experimental.morphoscript_enabled),
+        "evidence_repair": bool(experimental.evidence_repair_enabled),
+        "candidate_refinement": bool(experimental.candidate_refinement_enabled),
+        "semantic_parity": bool(experimental.semantic_parity_enabled),
+        "situglu": bool(experimental.situglu_enabled),
+        "recurrent_block": bool(experimental.recurrent_block_layers),
+    }
+
+
+def _validate_feature_flags(
+    metadata: Mapping[str, Any],
+    model_config: ModelConfig,
+    *,
+    required: bool,
+) -> dict[str, bool]:
+    """Authenticate every advertised feature against the serialized architecture."""
+
+    expected = _expected_feature_flags(model_config)
+    raw_flags = metadata.get("feature_flags")
+    if raw_flags is None and not required:
+        return expected
+    if not isinstance(raw_flags, Mapping):
+        raise ValueError("feature_flags must be an object")
+    observed = dict(raw_flags)
+    if set(observed) != set(expected):
+        missing = sorted(set(expected) - set(observed))
+        extra = sorted(set(observed) - set(expected))
+        raise ValueError(
+            "feature_flags must contain the exact architecture capability set: "
+            f"missing={missing}, extra={extra}"
+        )
+    invalid_types = sorted(name for name, value in observed.items() if type(value) is not bool)
+    if invalid_types:
+        raise ValueError(f"feature_flags values must be booleans: {invalid_types}")
+    mismatches = {
+        name: {"stored": observed[name], "expected": enabled}
+        for name, enabled in expected.items()
+        if observed[name] is not enabled
+    }
+    if mismatches:
+        raise ValueError(f"feature_flags do not match model_config.experimental: {mismatches}")
+    return expected
+
+
+def _validated_export_step(value: object, *, field: str) -> int:
+    """Return a canonical nonnegative training step without accepting booleans."""
+
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{field} must be a non-negative integer")
+    return value
+
+
 def _validate_generation_defaults(
     metadata: Mapping[str, Any],
     model_config: ModelConfig,
@@ -543,16 +610,82 @@ def _validate_generation_defaults(
     return expected
 
 
-def _metadata_revision_capability(metadata: Mapping[str, Any]) -> bool | None:
+def _normalize_revision_directions(
+    translation_directions: Sequence[Sequence[str]],
+    revision_directions: Sequence[Sequence[str]],
+) -> list[list[str]]:
+    allowed = {
+        canonicalize_language_pair(direction, field="authenticated translation direction")
+        for direction in translation_directions
+    }
+    normalized: list[list[str]] = []
+    seen: set[tuple[str, str]] = set()
+    for index, raw_direction in enumerate(revision_directions):
+        direction = canonicalize_language_pair(
+            raw_direction,
+            field=f"revision direction[{index}]",
+        )
+        if direction in seen:
+            raise ValueError(
+                f"duplicate revision direction after BCP 47 canonicalization: {raw_direction!r}"
+            )
+        if direction not in allowed:
+            raise ValueError(
+                "revision_directions must be a subset of authenticated "
+                f"translation_directions; got {direction!r}"
+            )
+        seen.add(direction)
+        normalized.append(list(direction))
+    return normalized
+
+
+def _metadata_revision_directions(
+    metadata: Mapping[str, Any],
+) -> list[list[str]] | None:
     capabilities = metadata.get("capabilities")
     if capabilities is None:
+        if metadata_requires_explicit_direction_graph(metadata):
+            raise ValueError("current metadata requires explicit capabilities.revision_directions")
         return None
     if not isinstance(capabilities, Mapping):
         raise ValueError("metadata.capabilities must be an object")
+    has_summary = "revision_trained" in capabilities
     value = capabilities.get("revision_trained")
-    if value is not None and not isinstance(value, bool):
+    if has_summary and not isinstance(value, bool):
         raise ValueError("metadata.capabilities.revision_trained must be a boolean")
-    return value
+    raw_directions = capabilities.get("revision_directions")
+    if "revision_directions" not in capabilities and metadata_requires_explicit_direction_graph(
+        metadata
+    ):
+        raise ValueError("current metadata requires explicit capabilities.revision_directions")
+    if "revision_directions" in capabilities:
+        if not isinstance(raw_directions, Sequence) or isinstance(raw_directions, (str, bytes)):
+            raise ValueError("metadata.capabilities.revision_directions must be a sequence")
+        directions = _normalize_revision_directions(
+            _metadata_translation_directions(metadata),
+            cast(Sequence[Sequence[str]], raw_directions),
+        )
+        if has_summary and value is not bool(directions):
+            raise ValueError(
+                "metadata capabilities revision_trained disagrees with revision_directions"
+            )
+        return directions
+    if value is False:
+        return []
+    if value is True:
+        directions = _metadata_translation_directions(metadata)
+        if len(directions) != 1:
+            raise ValueError(
+                "legacy revision_trained=true is ambiguous unless the model has exactly one "
+                "authenticated translation direction; re-export with revision_directions"
+            )
+        return [list(directions[0])]
+    return None
+
+
+def _metadata_revision_capability(metadata: Mapping[str, Any]) -> bool | None:
+    directions = _metadata_revision_directions(metadata)
+    return None if directions is None else bool(directions)
 
 
 def _json_safe_pipeline_identity(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -594,6 +727,42 @@ def _validated_pipeline_identity_contract(
     if not translation_capable:
         if "pipeline" in metadata:
             raise ValueError("foundation-only export metadata must not contain pipeline identity")
+        if any(
+            field in metadata
+            for field in ("language_pair", "language_pairs", "translation_directions")
+        ):
+            raise ValueError(
+                "foundation-only export metadata must not contain translation pairs or directions"
+            )
+        if _release_version_at_least(release_version, (1, 5)):
+            raw_languages = metadata.get("languages")
+            if (
+                not isinstance(raw_languages, list)
+                or not raw_languages
+                or any(not isinstance(language, str) for language in raw_languages)
+            ):
+                raise ValueError(
+                    "current foundation metadata requires a non-empty trained language list"
+                )
+            try:
+                canonical_languages = list(
+                    canonicalize_language_tags(
+                        raw_languages,
+                        field="foundation trained languages",
+                        reject_duplicates=True,
+                    )
+                )
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    "current foundation metadata requires a non-empty canonical trained "
+                    "language list"
+                ) from error
+            if raw_languages != canonical_languages:
+                raise ValueError(
+                    "current foundation metadata requires a non-empty canonical trained "
+                    "language list"
+                )
+            _metadata_revision_directions(metadata)
         return None
 
     pipeline = _metadata_pipeline_identity(metadata)
@@ -601,6 +770,22 @@ def _validated_pipeline_identity_contract(
         if _release_version_at_least(release_version, (1, 5)):
             raise ValueError("translation-capable release 1.5 or newer requires pipeline identity")
         return None
+
+    # The v2 pipeline marker itself opts into the current capability contract,
+    # even when a caller supplies an older release label.  Otherwise a native
+    # export could accept metadata that the HF/GGUF representations reject.
+    pairs = _metadata_language_pairs(metadata)
+    if not pairs:
+        raise ValueError("translation pipeline metadata requires a non-empty language-pair graph")
+    _metadata_translation_directions(metadata)
+    _metadata_revision_directions(metadata)
+    pair_languages = _languages_from_pairs(pairs)
+    declared_languages = _metadata_languages(metadata)
+    if declared_languages is None or set(declared_languages) != set(pair_languages):
+        raise ValueError(
+            "translation pipeline languages must exactly match the language-pair graph: "
+            f"languages={declared_languages!r}, pair_languages={pair_languages!r}"
+        )
 
     if pipeline.get("schema") != _TRANSLATION_PIPELINE_SCHEMA:
         raise ValueError(f"metadata.pipeline.schema must be {_TRANSLATION_PIPELINE_SCHEMA!r}")
@@ -665,6 +850,22 @@ def _validated_pipeline_identity_contract(
         raise ValueError(
             "foundation lineage languages must be a non-empty list of unique normalized strings"
         )
+    try:
+        canonical_foundation_languages = list(
+            canonicalize_language_tags(
+                cast(list[str], languages),
+                field="foundation lineage languages",
+                reject_duplicates=True,
+            )
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "foundation lineage languages must be a non-empty list of unique normalized BCP 47 tags"
+        ) from error
+    if languages != canonical_foundation_languages:
+        raise ValueError(
+            "foundation lineage languages must be a non-empty list of unique normalized BCP 47 tags"
+        )
     selected_step = foundation.get("selected_step")
     if isinstance(selected_step, bool) or not isinstance(selected_step, int) or selected_step < 0:
         raise ValueError("foundation lineage selected_step must be a non-negative integer")
@@ -710,6 +911,12 @@ def _metadata_compatibility_id(metadata: Mapping[str, Any]) -> str:
         material.pop("language_pair", None)
         material["language_pairs"] = pairs
         material["translation_directions"] = _metadata_translation_directions(metadata)
+    revision_directions = _metadata_revision_directions(metadata)
+    if revision_directions is not None:
+        material["capabilities"] = {
+            "revision_directions": revision_directions,
+            "revision_trained": bool(revision_directions),
+        }
     languages = _metadata_languages(metadata)
     if languages is None:
         material.pop("languages", None)
@@ -733,7 +940,8 @@ def build_export_metadata(
     language_pairs: Sequence[Sequence[str]] | None = None,
     languages: Sequence[str] | None = None,
     translation_directions: Sequence[Sequence[str]] | None = None,
-    bidirectional: bool = True,
+    bidirectional: bool | None = None,
+    revision_directions: Sequence[Sequence[str]] | None = None,
     revision_trained: bool | None = None,
     step: int | None = None,
     source: str | Path | None = None,
@@ -744,9 +952,10 @@ def build_export_metadata(
 ) -> dict[str, Any]:
     """Build provenance and compatibility metadata shared by every format.
 
-    ``translation_capable`` 은 이름표가 아니라 계약입니다. foundation 단계의
-    산출물은 번역쌍을 한 번도 보지 않았지만 구조가 번역 모델과 완전히 같아서,
-    그대로 실으면 방향 태그를 받아들이고 그럴듯한 쓰레기를 냅니다.
+    ``translation_capable`` is a behavioral contract, not a display label.
+    Foundation weights have the same architecture as translation weights but
+    have never seen a translation pair. Advertising translation directions for
+    them would accept direction tags and produce plausible-looking nonsense.
     """
 
     release_name, release_version, translation_capable = _validated_release_identity(
@@ -755,7 +964,6 @@ def build_export_metadata(
         translation_capable=translation_capable,
     )
 
-    experimental = model_config.experimental
     metadata: dict[str, Any] = {
         "created_unix": time.time(),
         "release_name": release_name,
@@ -767,7 +975,7 @@ def build_export_metadata(
         # identity without leaking a workstation or mounted-volume path.
         metadata["source"] = _file_identity(source)
     if step is not None:
-        metadata["step"] = int(step)
+        metadata["step"] = _validated_export_step(step, field="step")
     if pipeline_identity is not None:
         metadata["pipeline"] = _json_safe_pipeline_identity(pipeline_identity)
     if tokenizer_path is not None:
@@ -799,47 +1007,62 @@ def build_export_metadata(
                 "languages must include every configured language-pair member: "
                 f"{missing_pair_languages}"
             )
+    resolved_translation_directions: list[list[str]] = []
     if pairs and not translation_capable:
-        # 파운데이션 모델에는 언어쌍이 없습니다. 단일어 복원만 학습했으므로
-        # 다룰 줄 아는 것은 **언어**이고, 쌍도 방향도 존재하지 않습니다.
-        # 쌍을 적어 두면 아래 검증이 방향을 요구하고, 그 방향은 거짓입니다.
+        # A foundation model has languages, but no language pairs or directed
+        # edges: it learned only monolingual reconstruction. Recording pairs
+        # would force the validators to authorize translation it never learned.
         metadata["languages"] = explicit_languages or pair_languages
     elif pairs:
         metadata["language_pairs"] = pairs
         metadata["languages"] = explicit_languages or pair_languages
-        metadata["translation_directions"] = _normalize_translation_directions(
+        resolved_translation_directions = _normalize_translation_directions(
             pairs,
             translation_directions=translation_directions,
             bidirectional=bidirectional,
         )
+        metadata["translation_directions"] = resolved_translation_directions
         if len(pairs) == 1:
             metadata["language_pair"] = pairs[0]
     elif explicit_languages is not None:
         metadata["languages"] = explicit_languages
     elif translation_directions is not None:
         raise ValueError("translation_directions require at least one language pair")
-    metadata["feature_flags"] = {
-        "bats": bool(experimental.bats_enabled),
-        "core": bool(experimental.core_enabled),
-        "tetm": bool(experimental.tetm_enabled),
-        "morphoscript": bool(experimental.morphoscript_enabled),
-        "evidence_repair": bool(experimental.evidence_repair_enabled),
-        "candidate_refinement": bool(experimental.candidate_refinement_enabled),
-        "semantic_parity": bool(experimental.semantic_parity_enabled),
-        "situglu": bool(experimental.situglu_enabled),
-        "recurrent_block": bool(
-            getattr(
-                model_config,
-                "recurrent_block_layers",
-                getattr(experimental, "recurrent_block_layers", 0),
+    if revision_directions is not None:
+        normalized_revision_directions = _normalize_revision_directions(
+            resolved_translation_directions,
+            revision_directions,
+        )
+        if revision_trained is not None and revision_trained is not bool(
+            normalized_revision_directions
+        ):
+            raise ValueError("revision_trained disagrees with revision_directions")
+    elif revision_trained is True:
+        if len(resolved_translation_directions) != 1:
+            raise ValueError(
+                "revision_trained=true is ambiguous unless exactly one authenticated "
+                "translation direction exists; pass revision_directions"
             )
-        ),
-    }
+        normalized_revision_directions = [list(resolved_translation_directions[0])]
+    elif revision_trained is False:
+        normalized_revision_directions = []
+    else:
+        normalized_revision_directions = None
+    if normalized_revision_directions is None and (
+        _release_version_at_least(release_version, (1, 5)) or pipeline_identity is not None
+    ):
+        # New exports may safely underclaim an omitted optional capability, but
+        # current artifacts must make that empty graph explicit and durable.
+        normalized_revision_directions = []
+    metadata["feature_flags"] = _expected_feature_flags(model_config)
     metadata["generation_defaults"] = {
         "reasoning_level": _default_reasoning_level(model_config),
     }
-    if revision_trained is not None:
-        metadata["capabilities"] = {"revision_trained": bool(revision_trained)}
+    if normalized_revision_directions is not None:
+        metadata["capabilities"] = {
+            "revision_directions": normalized_revision_directions,
+            "revision_trained": bool(normalized_revision_directions),
+        }
     _validated_pipeline_identity_contract(metadata)
     return metadata
 
@@ -878,23 +1101,19 @@ def _export_publish_lock_root(destination: Path) -> Path:
 
 
 def _install_directory(temporary: Path, destination: Path) -> None:
-    """staging 디렉터리를 목적지 자리에 설치한다.
+    """Install a staging directory at its canonical destination.
 
-    보통은 rename 한 번이면 끝나고, 그것이 원자적이라 선호합니다.
+    A single rename is preferred because it is atomic. On Windows, Transformers
+    remote-code validation can leave an import-system handle on the staging
+    directory itself. In that observed state, the directory cannot be renamed,
+    but each child can be renamed and a new destination directory can be made.
+    Garbage collection does not release an import-system handle.
 
-    Windows 에서는 그 rename 이 실패할 수 있습니다. Transformers export 를
-    검증할 때 원격 코드를 ``transformers_modules.*`` 로 import 하는데, 그
-    과정에서 staging 디렉터리 **자체**에 핸들이 남습니다. 실측으로 확인한
-    상태는 이렇습니다.
-
-    - staging 디렉터리를 어떤 이름으로도 rename 할 수 없다
-    - 그 안의 **모든 자식**(파일과 하위 디렉터리)은 개별적으로 rename 된다
-    - 목적지 자리에는 새로 mkdir 할 수 있다
-    - ``gc.collect()`` 로는 풀리지 않는다 (import 시스템이 잡고 있으므로)
-
-    그래서 자식을 하나씩 옮기는 것으로 물러섭니다. Windows 에는 애초에
-    디렉터리의 원자적 교체가 없으므로 이것이 잃는 보장은 없습니다. 호출자가
-    이전 판을 backup 으로 들고 있어 실패 시 되돌릴 수 있다는 점도 그대로입니다.
+    The fallback therefore moves every child into a fresh handoff directory and
+    publishes that directory only after all moves succeed. Windows does not
+    provide atomic replacement for a non-empty directory, so this fallback does
+    not weaken an available guarantee. The caller still retains the previous
+    installation as a backup for rollback.
     """
 
     try:
@@ -915,8 +1134,8 @@ def _install_directory(temporary: Path, destination: Path) -> None:
         try:
             temporary.rmdir()
         except OSError:
-            # 내용은 전부 옮겼습니다. 잠긴 빈 껍데기 때문에 성공한 export 를
-            # 실패로 만들지 않습니다.
+            # Every child was moved successfully. A locked empty shell must not
+            # turn a valid export into a failed publication.
             pass
         os.replace(handoff, destination)
     except BaseException:
@@ -1183,9 +1402,19 @@ def _inspect_transformers_checkpoint_in_process(  # pyright: ignore[reportUnused
         raise RuntimeError(
             "Transformers config and sion_export.json disagree about translation_capable"
         )
-    expected_capabilities = (
-        {"revision_trained": config.revision_trained} if config.revision_trained is not None else {}
-    )
+    config_revision_directions = getattr(config, "revision_directions", None)
+    if config_revision_directions is not None:
+        config_revision_directions = [list(direction) for direction in config_revision_directions]
+        expected_capabilities = {
+            "revision_directions": config_revision_directions,
+            "revision_trained": bool(config_revision_directions),
+        }
+    else:
+        expected_capabilities = (
+            {"revision_trained": config.revision_trained}
+            if config.revision_trained is not None
+            else {}
+        )
     if export_payload.get("capabilities") != expected_capabilities:
         raise RuntimeError("Transformers config and sion_export.json disagree about capabilities")
     transformers_identity: dict[str, Any] = {
@@ -1194,6 +1423,14 @@ def _inspect_transformers_checkpoint_in_process(  # pyright: ignore[reportUnused
         "translation_capable": config_translation_capable,
         "languages": list(config.languages),
     }
+    if config.language_pairs:
+        transformers_identity["language_pairs"] = [list(pair) for pair in config.language_pairs]
+    if config.translation_directions:
+        transformers_identity["translation_directions"] = [
+            list(direction) for direction in config.translation_directions
+        ]
+    if expected_capabilities:
+        transformers_identity["capabilities"] = expected_capabilities
     if config_tokenizer_sha256 is not None:
         transformers_identity["tokenizer"] = {"sha256": config_tokenizer_sha256}
     if pipeline_identity is not None:
@@ -1328,6 +1565,7 @@ def _inspect_transformers_checkpoint_in_process(  # pyright: ignore[reportUnused
         "language_pairs": [list(pair) for pair in config.language_pairs],
         "translation_directions": [list(direction) for direction in config.translation_directions],
         "translation_capable": config_translation_capable,
+        "revision_directions": config_revision_directions,
         "revision_trained": config.revision_trained,
         "tokenizer_sha256": config_tokenizer_sha256,
         "pipeline": pipeline_identity,
@@ -1437,6 +1675,7 @@ def _write_transformers_checkpoint(
     language_pairs: Sequence[Sequence[str]],
     translation_directions: Sequence[Sequence[str]],
     translation_capable: bool,
+    revision_directions: Sequence[Sequence[str]] | None,
     revision_trained: bool | None,
     release_name: str,
     release_version: str,
@@ -1457,9 +1696,11 @@ def _write_transformers_checkpoint(
             language_pairs=language_pairs or None,
             translation_directions=translation_directions or None,
             translation_capable=translation_capable,
+            revision_directions=revision_directions,
             revision_trained=revision_trained,
             release_name=release_name,
             release_version=release_version,
+            pipeline_identity=pipeline_identity,
             allow_language_subset=not bool(language_pairs),
             _atomic_publish=False,
         )
@@ -1606,17 +1847,17 @@ def _pack_fp8_state(
     state_dict: Mapping[str, torch.Tensor],
     policy: Fp8Policy,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
-    """가중치 전용 FP8. 정책이 허용한 projection 만 내리고 나머지는 그대로 둡니다.
+    """Pack only policy-approved projections into weight-only FP8.
 
-    활성값은 건드리지 않습니다. 가중치만 내리면 저장·상주 바이트를 줄이면서
-    실측 출력 오차도 더 작습니다 — 2.57% 대 3.63%. 기본 runtime 은 FP8
-    가중치를 매 forward 에서 BF16(BF16 미지원 CUDA에서는 FP16)으로
-    역양자화한 뒤 dense GEMM 을 사용하므로 실행 대역폭·연산량 이득을
-    보장하지 않습니다.
+    Activations remain unchanged. Weight-only packing reduces storage and
+    resident bytes and produced lower measured output error than activation
+    quantization (2.57% versus 3.63%). The default runtime dequantizes weights
+    to BF16, or FP16 when BF16 CUDA is unavailable, before dense GEMM. It does
+    not promise runtime bandwidth or compute savings.
 
-    무엇을 내리지 않는지가 더 중요합니다. ``Fp8Policy`` 의 기본 범위는 FFN
-    뿐이고, 어휘 projection 은 어떤 범위에서도 제외됩니다. 자세한 실측 근거는
-    ``sion_translate.fp8`` 모듈 문서에 있습니다.
+    Exclusions matter most: the default ``Fp8Policy`` covers only FFN weights,
+    and vocabulary projections are excluded from every scope. See the
+    ``sion_translate.fp8`` module documentation for the measurements.
     """
 
     policy.validate()
@@ -1643,8 +1884,8 @@ def _pack_fp8_state(
             "shape": list(tensor.shape),
             "block": policy.block,
             "dtype": str(tensor.dtype).removeprefix("torch."),
-            # 스케일은 fp32 로 둡니다. 개수가 값의 1/block 이라 용량이 무의미하고,
-            # fp16 으로 낮추면 스케일 자체가 양자화 오차를 더합니다.
+            # Keep scales in FP32. There is only one per block, so their storage
+            # cost is negligible, while FP16 scales add avoidable quantization error.
             "scales": scales.squeeze(-1).contiguous(),
             "values": (grouped / scales).to(FORWARD_DTYPE).reshape(tensor.shape).contiguous(),
         }
@@ -1880,6 +2121,17 @@ def _write_sion_gguf(
                     separators=(",", ":"),
                 ),
             )
+        revision_directions = _metadata_revision_directions(metadata)
+        if revision_directions is not None:
+            writer.add_string(
+                "sion.revision_directions",
+                json.dumps(
+                    revision_directions,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            )
+            writer.add_bool("sion.revision_trained", bool(revision_directions))
         tokenizer = metadata.get("tokenizer")
         if isinstance(tokenizer, Mapping) and tokenizer.get("sha256"):
             writer.add_string("sion.tokenizer.sha256", str(tokenizer["sha256"]))
@@ -2016,6 +2268,25 @@ def _inspect_sion_gguf(
 
         language_pairs = pair_list_field("sion.language_pairs")
         translation_directions = pair_list_field("sion.translation_directions")
+        revision_directions = pair_list_field("sion.revision_directions")
+        revision_trained_field = reader_fields.get("sion.revision_trained")
+        revision_trained = (
+            revision_trained_field.contents() if revision_trained_field is not None else None
+        )
+        if revision_trained is not None and not isinstance(revision_trained, bool):
+            raise RuntimeError("GGUF sion.revision_trained must be a boolean")
+        if revision_directions is not None:
+            try:
+                revision_directions = _normalize_revision_directions(
+                    translation_directions or (),
+                    revision_directions,
+                )
+            except ValueError as error:
+                raise RuntimeError(f"GGUF revision directions are invalid: {error}") from error
+            if revision_trained is not bool(revision_directions):
+                raise RuntimeError(
+                    "GGUF sion.revision_trained disagrees with sion.revision_directions"
+                )
 
         def string_field(name: str) -> str:
             field = reader_fields.get(name)
@@ -2039,6 +2310,8 @@ def _inspect_sion_gguf(
             "sion.pipeline",
             "sion.languages",
             "sion.translation_directions",
+            "sion.revision_directions",
+            "sion.revision_trained",
         )
         legacy_fields = legacy_identity is not None and not any(
             name in reader_fields for name in modern_identity_fields
@@ -2090,6 +2363,86 @@ def _inspect_sion_gguf(
             pad_token_id = int(raw_pad_token_id)
             if pad_token_id < 0 or pad_token_id >= parsed_model_config.vocab_size:
                 raise RuntimeError("GGUF sion.pad_token_id is outside the vocabulary")
+        try:
+            _validated_release_identity(
+                release_name,
+                release_version,
+                translation_capable=translation_capable,
+            )
+            current_graph_contract = bool(
+                pipeline_identity is not None or _release_version_at_least(release_version, (1, 5))
+            )
+            if languages is not None:
+                languages = list(
+                    canonicalize_language_tags(
+                        languages,
+                        field="GGUF sion.languages",
+                        reject_duplicates=True,
+                    )
+                )
+            if language_pairs is not None:
+                language_pairs = _normalize_language_pairs(language_pairs=language_pairs)
+            normalized_pairs = language_pairs or []
+            if translation_directions is None:
+                if current_graph_contract and normalized_pairs:
+                    raise ValueError(
+                        "current GGUF language pairs require explicit translation_directions"
+                    )
+            else:
+                translation_directions = _normalize_translation_directions(
+                    normalized_pairs,
+                    translation_directions=translation_directions,
+                )
+            normalized_translation_directions = translation_directions or []
+            if not translation_capable and (normalized_pairs or normalized_translation_directions):
+                raise ValueError(
+                    "translation-incapable GGUF cannot advertise language pairs or directions"
+                )
+            if current_graph_contract and translation_capable and not normalized_pairs:
+                raise ValueError(
+                    "current translation-capable GGUF requires a non-empty language-pair graph"
+                )
+            if languages is not None:
+                unknown_pair_languages = sorted(
+                    {
+                        language
+                        for pair in normalized_pairs
+                        for language in pair
+                        if language not in languages
+                    }
+                )
+                if unknown_pair_languages:
+                    raise ValueError(
+                        "GGUF language pairs contain languages absent from sion.languages: "
+                        f"{unknown_pair_languages!r}"
+                    )
+            if revision_directions is None:
+                if current_graph_contract:
+                    raise ValueError("current GGUF requires explicit sion.revision_directions")
+                if revision_trained is False:
+                    revision_directions = []
+                elif revision_trained is True:
+                    if len(normalized_translation_directions) != 1:
+                        raise ValueError(
+                            "legacy GGUF revision_trained=true is ambiguous without exactly "
+                            "one translation direction"
+                        )
+                    revision_directions = [list(normalized_translation_directions[0])]
+            else:
+                revision_directions = _normalize_revision_directions(
+                    normalized_translation_directions,
+                    revision_directions,
+                )
+            if current_graph_contract and not isinstance(revision_trained, bool):
+                raise ValueError("current GGUF requires explicit boolean sion.revision_trained")
+            if revision_directions is not None and revision_trained is not bool(
+                revision_directions
+            ):
+                raise ValueError("sion.revision_trained disagrees with sion.revision_directions")
+            if not translation_capable and bool(revision_directions):
+                raise ValueError("translation-incapable GGUF cannot advertise revision capability")
+        except ValueError as error:
+            raise RuntimeError(f"GGUF language capability graph is invalid: {error}") from error
         if general_name != release_name:
             raise RuntimeError("GGUF general.name and sion.release_name disagree")
         gguf_identity: dict[str, Any] = {
@@ -2099,6 +2452,15 @@ def _inspect_sion_gguf(
         }
         if languages is not None:
             gguf_identity["languages"] = languages
+        if language_pairs is not None:
+            gguf_identity["language_pairs"] = language_pairs
+        if translation_directions is not None:
+            gguf_identity["translation_directions"] = translation_directions
+        if revision_directions is not None:
+            gguf_identity["capabilities"] = {
+                "revision_directions": revision_directions,
+                "revision_trained": revision_trained,
+            }
         tokenizer_sha256: str | None = None
         tokenizer_field = reader_fields.get("sion.tokenizer.sha256")
         if tokenizer_field is not None:
@@ -2122,6 +2484,8 @@ def _inspect_sion_gguf(
             "languages": languages,
             "language_pairs": language_pairs,
             "translation_directions": translation_directions,
+            "revision_directions": revision_directions,
+            "revision_trained": revision_trained,
             "tokenizer_sha256": tokenizer_sha256,
             "pipeline": pipeline_identity,
             "model_config": model_config_payload,
@@ -2300,11 +2664,12 @@ def _export_state_dict_formats_unlocked(
     """
 
     del llama_quantize  # Custom Sion K-quant is deterministic and needs no subprocess.
+    step = _validated_export_step(step, field="step")
     requested = _normalize_formats(formats)
     if int4_backend not in {"auto", "torchao", "packed"}:
         raise ValueError("int4_backend must be one of: auto, torchao, packed")
-    # FP8 export 는 그 자체가 "FP8 로 내보내라"는 요청이므로 여기서는 켠 정책이
-    # 기본입니다. 무엇을 내릴지는 여전히 정책이 정합니다 (기본 범위 = FFN).
+    # Requesting the FP8 format enables packing by default. The policy still
+    # decides which weights are eligible; its default scope is FFN only.
     fp8_policy = fp8_policy or Fp8Policy(enabled=True)
     fp8_policy.validate()
     directory = Path(directory)
@@ -2320,7 +2685,28 @@ def _export_state_dict_formats_unlocked(
         previous_manifest is not None and previous_manifest.get("artifact_set_id") == artifact_id
     )
     if metadata is None and previous_manifest is not None and same_weights:
-        export_metadata = copy.deepcopy(previous_manifest.get("metadata") or {})
+        previous_metadata = previous_manifest.get("metadata")
+        if not isinstance(previous_metadata, Mapping):
+            raise ValueError("the existing same-weight manifest has no reusable metadata object")
+        previous_step = _validated_export_step(
+            previous_manifest.get("step"),
+            field="existing manifest.step",
+        )
+        previous_metadata_step = _validated_export_step(
+            previous_metadata.get("step"),
+            field="existing manifest.metadata.step",
+        )
+        if previous_step != previous_metadata_step:
+            raise ValueError(
+                "the existing same-weight manifest has contradictory step provenance: "
+                f"{previous_step} != {previous_metadata_step}"
+            )
+        export_metadata = copy.deepcopy(dict(previous_metadata))
+        # The requested step identifies this export generation even when the
+        # tensors are byte-identical to an earlier checkpoint. Changing it also
+        # changes metadata_compatibility_id below, so artifacts carrying the old
+        # embedded step cannot be merged into the new generation.
+        export_metadata["step"] = step
     else:
         export_metadata = copy.deepcopy(
             dict(metadata)
@@ -2349,7 +2735,14 @@ def _export_state_dict_formats_unlocked(
             "reasoning_level": _default_reasoning_level(model_config),
         }
     _validate_generation_defaults(export_metadata, model_config, required=True)
-    export_metadata.setdefault("step", int(step))
+    _validate_feature_flags(export_metadata, model_config, required=True)
+    if "step" not in export_metadata:
+        export_metadata["step"] = step
+    metadata_step = _validated_export_step(export_metadata["step"], field="metadata.step")
+    if metadata_step != step:
+        raise ValueError(
+            f"metadata.step must match the exported checkpoint step: {metadata_step} != {step}"
+        )
     if tokenizer_path is not None:
         export_metadata["tokenizer"] = _file_identity(tokenizer_path)
     if token_features_path is not None:
@@ -2401,7 +2794,12 @@ def _export_state_dict_formats_unlocked(
             "translation-capable exports cannot explicitly erase the authenticated "
             "language graph with empty language_pairs"
         )
-    if language_pairs is None and not resolved_language_pairs and tokenizer_path is not None:
+    if (
+        resolved_translation_capable
+        and language_pairs is None
+        and not resolved_language_pairs
+        and tokenizer_path is not None
+    ):
         from sion_translate.tokenizer import load_tokenizer_metadata
 
         tokenizer_metadata = load_tokenizer_metadata(tokenizer_path)
@@ -2430,9 +2828,8 @@ def _export_state_dict_formats_unlocked(
         )
         if discovered_languages:
             export_metadata["languages"] = discovered_languages
-    # 번역 불가 산출물(foundation)에는 방향을 유도해 넣지 않습니다. 이 함수는
-    # 방향이 비어 있으면 language_pairs 에서 만들어 채우는데, 그 가중치는
-    # 어떤 방향으로도 번역할 수 없습니다.
+    # Never infer directions for a foundation-only artifact. These weights
+    # cannot translate even when a tokenizer happens to describe language pairs.
     resolved_translation_directions: list[list[str]] = []
     if resolved_translation_capable:
         resolved_translation_directions = _metadata_translation_directions(export_metadata)
@@ -2574,6 +2971,7 @@ def _export_state_dict_formats_unlocked(
                     language_pairs=resolved_language_pairs,
                     translation_directions=resolved_translation_directions,
                     translation_capable=resolved_translation_capable,
+                    revision_directions=_metadata_revision_directions(export_metadata),
                     revision_trained=_metadata_revision_capability(export_metadata),
                     release_name=str(export_metadata["release_name"]),
                     release_version=str(export_metadata["release_version"]),
@@ -2630,6 +3028,7 @@ def _export_state_dict_formats_unlocked(
         ),
         "state_sha256": state_hash,
         "artifact_set_id": artifact_id,
+        "step": step,
         "model_config": asdict(model_config),
         "pad_id": int(pad_id),
         "metadata_compatibility_id": metadata_compatibility_id,
@@ -2752,6 +3151,7 @@ def convert_export(
     language_pairs: Sequence[Sequence[str]] | None = None,
     translation_directions: Sequence[Sequence[str]] | None = None,
     bidirectional: bool | None = None,
+    revision_directions: Sequence[Sequence[str]] | None = None,
     revision_trained: bool | None = None,
     int4_backend: str = "auto",
     fp8_policy: Fp8Policy | None = None,
@@ -2770,6 +3170,9 @@ def convert_export(
         raise ValueError(f"{source} cannot be read as a safe weights-only Sion export") from error
     if not isinstance(payload, dict) or "model_config" not in payload:
         raise ValueError(f"{source} is not a Sion inference export")
+    source_schema = payload.get("schema")
+    if source_schema is not None and source_schema != EXPORT_SCHEMA:
+        raise ValueError(f"unsupported export schema: {source_schema}")
     stored = payload.get("model")
     if not isinstance(stored, Mapping) or stored.get("kind") == "packed_int4":
         raise ValueError("conversion source must contain a stable state dict")
@@ -2781,7 +3184,35 @@ def convert_export(
     config = _model_config_from_dict(payload["model_config"])
     step = int(payload.get("step", 0))
     pad_id = int(payload.get("pad_id", 0))
-    inherited = copy.deepcopy(payload.get("metadata") or {})
+    raw_inherited = payload.get("metadata")
+    if raw_inherited is None and source_schema is None:
+        raw_inherited = {}
+    if not isinstance(raw_inherited, Mapping):
+        raise ValueError("conversion source metadata must be an object")
+    inherited = copy.deepcopy(dict(raw_inherited))
+    # Only the top-level export schema authenticates a current Sion artifact.
+    # Mutable metadata inside a schema-less payload cannot promote legacy
+    # weights into the 1.5/pipeline trust domain.
+    authoritative_source_contract = source_schema == EXPORT_SCHEMA
+    if authoritative_source_contract:
+        step = _validated_export_step(payload.get("step"), field="payload.step")
+        metadata_step = _validated_export_step(inherited.get("step"), field="metadata.step")
+        if step != metadata_step:
+            raise ValueError(
+                "native export payload.step does not match metadata.step: "
+                f"{step} != {metadata_step}"
+            )
+        _validate_feature_flags(inherited, config, required=True)
+        _validate_generation_defaults(inherited, config, required=True)
+        _validated_release_identity(
+            inherited.get("release_name"),
+            inherited.get("release_version"),
+            translation_capable=inherited.get("translation_capable"),
+        )
+        _validated_pipeline_identity_contract(inherited)
+        if _metadata_translation_capable(inherited) and _metadata_language_pairs(inherited):
+            _metadata_translation_directions(inherited)
+        _metadata_revision_directions(inherited)
 
     def resolve_release_identity(explicit: str | None, metadata_name: str) -> str:
         inherited_value: object = inherited.get(metadata_name)
@@ -2805,6 +3236,16 @@ def convert_export(
 
     resolved_release_name = resolve_release_identity(release_name, "release_name")
     resolved_release_version = resolve_release_identity(release_version, "release_version")
+    resolved_version_is_current = bool(
+        _MODEL_VERSION_PATTERN.fullmatch(resolved_release_version)
+        and _release_version_at_least(resolved_release_version, (1, 5))
+    )
+    if source_schema is None and (
+        resolved_version_is_current or inherited.get("pipeline") is not None
+    ):
+        raise ValueError(
+            "legacy identity recovery is restricted to pre-1.5 exports without a pipeline"
+        )
     inherited_translation_capable = inherited.get("translation_capable")
     if (
         translation_capable is not None
@@ -2916,17 +3357,41 @@ def convert_export(
             "legacy source export has language pairs but no authenticated direction graph; "
             "pass translation_directions or an explicit bidirectional policy"
         )
-    inherited_revision = _metadata_revision_capability(inherited)
+    inherited_revision_directions = _metadata_revision_directions(inherited)
+    if revision_directions is not None:
+        explicit_revision_directions = _normalize_revision_directions(
+            resolved_directions,
+            revision_directions,
+        )
+        if revision_trained is not None and revision_trained is not bool(
+            explicit_revision_directions
+        ):
+            raise ValueError("revision_trained disagrees with revision_directions")
+    elif revision_trained is True:
+        if len(resolved_directions) != 1:
+            raise ValueError(
+                "legacy --revision-trained is ambiguous unless exactly one authenticated "
+                "translation direction exists; pass --revision-direction SOURCE TARGET"
+            )
+        explicit_revision_directions = [list(resolved_directions[0])]
+    elif revision_trained is False:
+        explicit_revision_directions = []
+    else:
+        explicit_revision_directions = None
     if (
-        revision_trained is not None
-        and inherited_revision is not None
-        and revision_trained is not inherited_revision
+        explicit_revision_directions is not None
+        and inherited_revision_directions is not None
+        and explicit_revision_directions != inherited_revision_directions
     ):
         raise ValueError(
-            "explicit revision_trained conflicts with source metadata; "
+            "explicit revision directions conflict with source metadata; "
             "conversion cannot relabel weights"
         )
-    resolved_revision = revision_trained if revision_trained is not None else inherited_revision
+    resolved_revision_directions = (
+        explicit_revision_directions
+        if explicit_revision_directions is not None
+        else inherited_revision_directions
+    )
     metadata = build_export_metadata(
         config,
         tokenizer_path=tokenizer_path,
@@ -2934,8 +3399,8 @@ def convert_export(
         language_pairs=resolved_pairs,
         languages=_metadata_languages(inherited),
         translation_directions=resolved_directions or None,
-        bidirectional=True if bidirectional is None else bidirectional,
-        revision_trained=resolved_revision,
+        bidirectional=bidirectional,
+        revision_directions=resolved_revision_directions,
         step=step,
         source=source,
         release_name=resolved_release_name,
@@ -2947,8 +3412,6 @@ def convert_export(
         metadata["tokenizer"] = inherited["tokenizer"]
     if token_features_path is None and inherited.get("token_features"):
         metadata["token_features"] = inherited["token_features"]
-    if revision_trained is None and inherited.get("capabilities"):
-        metadata["capabilities"] = copy.deepcopy(inherited["capabilities"])
     return export_state_dict_formats(
         directory,
         dict(stored),
@@ -2959,7 +3422,7 @@ def convert_export(
         metadata=metadata,
         tokenizer_path=tokenizer_path,
         token_features_path=token_features_path,
-        language_pairs=_metadata_language_pairs(metadata),
+        language_pairs=_metadata_language_pairs(metadata) or None,
         int4_backend=int4_backend,
         fp8_policy=fp8_policy,
         release_name=resolved_release_name,
@@ -3025,7 +3488,19 @@ def load_exported_model(
         _validated_pipeline_identity_contract(metadata)
         if _metadata_translation_capable(metadata) and _metadata_language_pairs(metadata):
             _metadata_translation_directions(metadata)
+        _metadata_revision_directions(metadata)
     config = _model_config_from_dict(payload["model_config"])
+    if schema == EXPORT_SCHEMA:
+        payload_step = _validated_export_step(payload.get("step"), field="payload.step")
+        metadata_step = _validated_export_step(metadata.get("step"), field="metadata.step")
+        if payload_step != metadata_step:
+            raise ValueError(
+                "native export payload.step does not match metadata.step: "
+                f"{payload_step} != {metadata_step}"
+            )
+        _validate_feature_flags(metadata, config, required=True)
+    elif "feature_flags" in metadata:
+        _validate_feature_flags(metadata, config, required=False)
     pad_id = int(payload["pad_id"])
     stored = payload["model"]
     quantization = payload.get("quantization")
@@ -3040,9 +3515,8 @@ def load_exported_model(
             and isinstance(stored, Mapping)
         )
         if fp8_packed:
-            # 먼저 고정밀도로 실은 뒤 아래에서 FP8 모듈로 바꿔 끼웁니다. 이렇게
-            # 하는 이유는 모듈 구조와 키를 그대로 검증받기 위해서이고, 교체가
-            # 끝나면 상주 가중치는 FP8 입니다.
+            # Load a high-precision view first so the ordinary module structure
+            # and state keys receive strict validation. FP8 modules replace it below.
             state = _unpack_fp8_state(stored)
         elif isinstance(quantization, Mapping) and quantization.get("format") == "fp8":
             raise ValueError("FP8 export has no packed state dictionary")
@@ -3064,14 +3538,14 @@ def load_exported_model(
         # 32B FP32 artifact near one model's host-memory footprint rather than two.
         model.load_state_dict(state, assign=True)
         if fp8_packed:
-            # 되돌린 가중치를 버리고 FP8 을 상주시킵니다. 현재 계산은 forward
-            # 마다 BF16(미지원 CUDA는 FP16)으로 역양자화하지만, 모델의 상주
-            # 메모리는 FP8 로 줄입니다.
+            # Discard the unpacked view and retain FP8 weights. Each forward
+            # dequantizes to BF16, or FP16 on CUDA without BF16 support, while
+            # resident model weights remain FP8.
             replaced = apply_fp8_weights(model, dict(stored))
             if not replaced:
                 raise ValueError("FP8 export contains no quantized weights")
     model.eval()
-    _validate_generation_defaults(metadata, config, required=False)
+    _validate_generation_defaults(metadata, config, required=schema == EXPORT_SCHEMA)
     if isinstance(quantization, Mapping):
         metadata.setdefault("quantization", copy.deepcopy(dict(quantization)))
     if return_metadata:
@@ -3147,6 +3621,25 @@ def validate_export_directory(
             }
         )
         return report
+    manifest_step: int | None = None
+    try:
+        manifest_step = _validated_export_step(manifest.get("step"), field="manifest.step")
+        metadata_step = _validated_export_step(
+            manifest_metadata.get("step"),
+            field="manifest.metadata.step",
+        )
+        if manifest_step != metadata_step:
+            raise ValueError(
+                "manifest.step does not match manifest.metadata.step: "
+                f"{manifest_step} != {metadata_step}"
+            )
+    except ValueError as error:
+        report["errors"].append(
+            {
+                "error_type": "InvalidTrainingStep",
+                "message": str(error),
+            }
+        )
     legacy_release_identity: dict[str, Any] | None = None
     try:
         validated_name, validated_version, validated_capability = _validated_release_identity(
@@ -3208,6 +3701,20 @@ def validate_export_directory(
             report["errors"].append(
                 {
                     "error_type": "InvalidModelConfig",
+                    "message": str(error),
+                }
+            )
+    if manifest_model_config is not None:
+        try:
+            _validate_feature_flags(
+                manifest_metadata,
+                manifest_model_config,
+                required=True,
+            )
+        except ValueError as error:
+            report["errors"].append(
+                {
+                    "error_type": "InvalidFeatureFlags",
                     "message": str(error),
                 }
             )
@@ -3360,6 +3867,8 @@ def validate_export_directory(
                     )
                 if _metadata_compatibility_id(artifact_metadata) != metadata_compatibility_id:
                     raise RuntimeError("native payload metadata does not match the manifest")
+                if manifest_step is None or artifact_metadata.get("step") != manifest_step:
+                    raise RuntimeError("native payload step does not match the manifest")
                 validation["inspection"] = {
                     "loader": "load_exported_model",
                     "model_class": type(model).__name__,
@@ -3415,6 +3924,14 @@ def validate_export_directory(
                     expected_gguf_directions = _metadata_translation_directions(manifest_metadata)
                     if inspection["translation_directions"] != (expected_gguf_directions or None):
                         raise RuntimeError("GGUF translation directions do not match the manifest")
+                    expected_gguf_revision = _metadata_revision_directions(manifest_metadata)
+                    if inspection["revision_directions"] != expected_gguf_revision:
+                        raise RuntimeError("GGUF revision directions do not match the manifest")
+                    expected_gguf_revision_trained = (
+                        None if expected_gguf_revision is None else bool(expected_gguf_revision)
+                    )
+                    if inspection["revision_trained"] is not expected_gguf_revision_trained:
+                        raise RuntimeError("GGUF revision capability does not match the manifest")
                     if inspection["pipeline"] != _metadata_pipeline_identity(manifest_metadata):
                         raise RuntimeError("GGUF pipeline identity does not match the manifest")
                 validation["inspection"] = inspection
@@ -3487,6 +4004,14 @@ def validate_export_directory(
                     raise RuntimeError(
                         "Transformers revision capability does not match the manifest"
                     )
+                manifest_capabilities = manifest_metadata.get("capabilities")
+                if (
+                    isinstance(manifest_capabilities, Mapping)
+                    and "revision_directions" in manifest_capabilities
+                    and inspection["revision_directions"]
+                    != _metadata_revision_directions(manifest_metadata)
+                ):
+                    raise RuntimeError("Transformers revision directions do not match the manifest")
                 if inspection["pipeline"] != _metadata_pipeline_identity(manifest_metadata):
                     raise RuntimeError("Transformers pipeline identity does not match the manifest")
                 validation["inspection"] = inspection
@@ -3996,7 +4521,8 @@ def export_inference_models(
     language_pairs: Sequence[Sequence[str]] | None = None,
     languages: Sequence[str] | None = None,
     translation_directions: Sequence[Sequence[str]] | None = None,
-    bidirectional: bool = True,
+    bidirectional: bool | None = None,
+    revision_directions: Sequence[Sequence[str]] | None = None,
     revision_trained: bool | None = None,
     pipeline_identity: Mapping[str, Any] | None = None,
     int4_backend: str = "auto",
@@ -4026,6 +4552,7 @@ def export_inference_models(
                 languages=languages,
                 translation_directions=translation_directions,
                 bidirectional=bidirectional,
+                revision_directions=revision_directions,
                 revision_trained=revision_trained,
                 step=step,
                 release_name=release_name,
@@ -4158,7 +4685,7 @@ def export_inference_models(
                 metadata=metadata,
                 tokenizer_path=tokenizer_path,
                 token_features_path=token_features_path,
-                language_pairs=_metadata_language_pairs(metadata),
+                language_pairs=_metadata_language_pairs(metadata) or None,
                 int4_backend=int4_backend,
                 fp8_policy=fp8_policy,
                 release_name=release_name,
@@ -4190,11 +4717,10 @@ def export_inference_models(
                         "final export validation failed: "
                         + json.dumps(validation["errors"], ensure_ascii=False)
                     )
-                # 검증은 방금 쓴 산출물을 mmap 으로 다시 읽습니다. 그 핸들이
-                # 살아 있으면 Windows 는 그 파일을 품은 staging 디렉터리의
-                # rename 을 거부합니다(POSIX 는 허용하므로 지금까지 드러나지
-                # 않았습니다). 위쪽 gc.collect() 는 검증 *이전* 것이라 검증이
-                # 새로 만든 핸들은 잡지 못합니다.
+                # Validation rereads the new artifacts through mmap. A live mmap
+                # prevents Windows from renaming the containing staging directory;
+                # POSIX permits it. Collect again here because the earlier call
+                # happened before validation created these mappings.
                 gc.collect()
                 _atomic_replace_directory(working_directory, directory)
         except BaseException as error:

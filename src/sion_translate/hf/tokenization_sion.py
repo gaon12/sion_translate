@@ -259,20 +259,12 @@ class SionTokenizer(PreTrainedTokenizer):
                 and tuple(int(part) for part in release_version.split("."))[:2] >= (1, 5)
             )
         )
-        if translation_directions is None and self.language_pairs and current_direction_contract:
+        if translation_directions is None and self.language_pairs:
             raise ValueError(
-                "current translation tokenizers with language pairs require explicit "
-                "translation_directions"
+                "translation tokenizers with language pairs require explicit "
+                "translation_directions; legacy directionality is unknown"
             )
-        raw_directions = (
-            translation_directions
-            if translation_directions is not None
-            else [
-                direction
-                for pair in self.language_pairs
-                for direction in (pair, list(reversed(pair)))
-            ]
-        )
+        raw_directions = translation_directions if translation_directions is not None else []
         self.translation_directions: list[list[str]] = []
         seen_directions: set[tuple[str, str]] = set()
         if self.language_pairs and not raw_directions:

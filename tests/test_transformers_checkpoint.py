@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+from typing import Any
 
 import numpy as np
 import pytest
@@ -28,7 +29,7 @@ from sion_translate.hf import (
     SionForConditionalGeneration,
     SionTokenizer as HFSionTokenizer,
     register_sion_auto_classes,
-    save_transformers_checkpoint,
+    save_transformers_checkpoint as _save_transformers_checkpoint,
 )
 from sion_translate.model import (
     SionForConditionalGeneration as NativeSionForConditionalGeneration,
@@ -48,6 +49,20 @@ TRANSLATION_PIPELINE_IDENTITY = {
     "schema": "sion-translation-pipeline-v2",
     "branch": "translation-only",
 }
+
+
+def save_transformers_checkpoint(*args: Any, **kwargs: Any) -> Path:
+    """Give unrelated checkpoint tests an explicit current translation graph."""
+
+    release_version = kwargs.get("release_version", "1.5")
+    translation_capable = bool(kwargs.get("translation_capable", True))
+    if translation_capable and release_version == "1.5" and "language_pairs" not in kwargs:
+        kwargs.setdefault("languages", ["ko", "ja"])
+        kwargs["language_pairs"] = [["ko", "ja"]]
+        kwargs["translation_directions"] = [["ko", "ja"], ["ja", "ko"]]
+    if translation_capable and release_version == "1.5" and "pipeline_identity" not in kwargs:
+        kwargs["pipeline_identity"] = TRANSLATION_PIPELINE_IDENTITY
+    return _save_transformers_checkpoint(*args, **kwargs)
 
 
 def tiny_model_config(vocab_size: int = 128) -> ModelConfig:
@@ -70,6 +85,8 @@ def train_tiny_tokenizer(
     language_pairs: list[tuple[str, str]] | None = None,
     foundation_languages: tuple[str, ...] = (),
 ) -> Path:
+    if language_pairs is None:
+        language_pairs = [("ko", "ja")]
     source = tmp_path / "parallel.jsonl"
     rows = [
         {
@@ -197,18 +214,22 @@ def test_hf_multilingual_tokenizer_requires_an_explicit_pair_graph(
             release_version="1.5",
         )
 
+    with pytest.raises(ValueError, match="legacy directionality is unknown"):
+        HFSionTokenizer(
+            str(tokenizer_path),
+            language_pairs=[["de", "fr"], ["sw", "ar"]],
+            release_name="sion_translate",
+            release_version="1.4",
+        )
+
     legacy = HFSionTokenizer(
         str(tokenizer_path),
         language_pairs=[["de", "fr"], ["sw", "ar"]],
+        translation_directions=[["de", "fr"], ["sw", "ar"]],
         release_name="sion_translate",
         release_version="1.4",
     )
-    assert legacy.translation_directions == [
-        ["de", "fr"],
-        ["fr", "de"],
-        ["sw", "ar"],
-        ["ar", "sw"],
-    ]
+    assert legacy.translation_directions == [["de", "fr"], ["sw", "ar"]]
 
 
 def test_current_two_language_hf_tokenizer_cannot_erase_its_direction_graph(
@@ -313,6 +334,7 @@ def test_transformers_wrapper_matches_native_forward_and_config() -> None:
         native_config,
         languages=["ko", "ja"],
         language_pairs=[["ko", "ja"]],
+        translation_directions=[["ko", "ja"], ["ja", "ko"]],
         project_revision="fixture",
     )
     restored_config = SionConfig.from_dict(config.to_dict())
@@ -412,6 +434,7 @@ def test_hf_multi_return_beam_keeps_positive_penalty_future_winner_alive() -> No
         native_config,
         languages=["ko", "ja"],
         language_pairs=[["ko", "ja"]],
+        translation_directions=[["ko", "ja"], ["ja", "ko"]],
     )
     model = SionForConditionalGeneration(config).eval()
     vocab = native_config.vocab_size
@@ -472,7 +495,7 @@ def test_transformers_checkpoint_auto_classes_and_safe_weights(
         tokenizer_path=tokenizer_path,
         languages=["ko", "ja"],
         language_pairs=[["ko", "ja"]],
-        revision_trained=True,
+        revision_directions=[["ko", "ja"]],
         max_shard_size="1MB",
     )
 
@@ -512,6 +535,7 @@ def test_transformers_checkpoint_auto_classes_and_safe_weights(
     assert remote_tokenizer.__class__.__module__.startswith("transformers_modules.")
     assert remote_model.model.__class__.__module__.startswith("transformers_modules.")
     assert remote_model.config.revision_trained is True
+    assert remote_model.config.revision_directions == [["ko", "ja"]]
     assert remote_model.config.release_name == "sion_translate"
     assert remote_model.config.release_version == "1.5"
     assert remote_model.config.slot_token_ids == tokenizer.slot_ids
@@ -539,8 +563,10 @@ def test_transformers_checkpoint_auto_classes_and_safe_weights(
     assert isinstance(local_config, SionConfig)
     assert isinstance(local_model, SionForConditionalGeneration)
     assert local_config.revision_trained is True
+    assert local_config.revision_directions == [["ko", "ja"]]
     export_metadata = json.loads((output_dir / "sion_export.json").read_text(encoding="utf-8"))
     assert export_metadata["capabilities"]["revision_trained"] is True
+    assert export_metadata["capabilities"]["revision_directions"] == [["ko", "ja"]]
     assert export_metadata["release_name"] == "sion_translate"
     assert export_metadata["release_version"] == "1.5"
 
@@ -959,6 +985,225 @@ def test_transformers_config_rejects_non_boolean_revision_capability() -> None:
         SionConfig(revision_trained="true")
 
 
+def test_transformers_config_round_trips_canonical_revision_subgraph(
+    tmp_path: Path,
+) -> None:
+    config = SionConfig(
+        languages=["pt-br", "zh-hant"],
+        language_pairs=[["PT-br", "ZH-hant"]],
+        translation_directions=[["pt-BR", "zh-Hant"], ["zh-hant", "PT-br"]],
+        revision_directions=[["PT-BR", "zh-hant"]],
+    )
+    config.save_pretrained(tmp_path)
+
+    restored = SionConfig.from_pretrained(tmp_path)
+
+    assert restored.translation_directions == [
+        ["pt-BR", "zh-Hant"],
+        ["zh-Hant", "pt-BR"],
+    ]
+    assert restored.revision_directions == [["pt-BR", "zh-Hant"]]
+    assert restored.revision_trained is True
+
+
+def test_transformers_config_rejects_revision_relabeling_and_alias_duplicates() -> None:
+    common = {
+        "languages": ["pt-BR", "zh-Hant"],
+        "language_pairs": [["pt-BR", "zh-Hant"]],
+        "translation_directions": [["pt-BR", "zh-Hant"]],
+    }
+    with pytest.raises(ValueError, match="subset of translation_directions"):
+        SionConfig(
+            **common,
+            revision_directions=[["zh-Hant", "pt-BR"]],
+        )
+    with pytest.raises(ValueError, match="duplicate revision direction"):
+        SionConfig(
+            **common,
+            revision_directions=[
+                ["pt-br", "ZH-hant"],
+                ["PT-BR", "zh-Hant"],
+            ],
+        )
+    with pytest.raises(ValueError, match="disagrees with revision_directions"):
+        SionConfig(
+            **common,
+            revision_directions=[["pt-BR", "zh-Hant"]],
+            revision_trained=False,
+        )
+
+
+def test_current_transformers_config_requires_an_exact_revision_graph() -> None:
+    common = {
+        "languages": ["pt-BR", "zh-Hant"],
+        "language_pairs": [["pt-BR", "zh-Hant"]],
+        "translation_directions": [["pt-BR", "zh-Hant"], ["zh-Hant", "pt-BR"]],
+        "release_name": "sion_translate",
+        "release_version": "1.5",
+        "pipeline": TRANSLATION_PIPELINE_IDENTITY,
+    }
+
+    with pytest.raises(ValueError, match="require explicit revision_directions"):
+        SionConfig(**common, revision_trained=True)
+    with pytest.raises(ValueError, match="require explicit revision_directions"):
+        SionConfig(**common, revision_trained=False)
+
+
+def test_legacy_transformers_config_does_not_invent_reverse_directions() -> None:
+    common = {
+        "languages": ["de", "fr"],
+        "language_pairs": [["de", "fr"]],
+        "release_name": "sion_translate",
+        "release_version": "1.4",
+    }
+    with pytest.raises(ValueError, match="legacy directionality is unknown"):
+        SionConfig(**common)
+
+    config = SionConfig(**common, translation_directions=[["de", "fr"]])
+    assert config.translation_directions == [["de", "fr"]]
+
+
+def test_current_transformers_config_rejects_an_empty_translation_graph() -> None:
+    with pytest.raises(ValueError, match="non-empty language-pair graph"):
+        SionConfig(
+            release_name="sion_translate",
+            release_version="1.5",
+            translation_capable=True,
+            revision_directions=[],
+            pipeline=TRANSLATION_PIPELINE_IDENTITY,
+        )
+
+
+def test_transformers_pipeline_requires_release_identity_and_exact_schema() -> None:
+    graph = {
+        "languages": ["pt-BR", "zh-Hant"],
+        "language_pairs": [["pt-BR", "zh-Hant"]],
+        "translation_directions": [["pt-BR", "zh-Hant"]],
+        "revision_directions": [],
+    }
+    with pytest.raises(ValueError, match="requires an explicit release identity"):
+        SionConfig(**graph, pipeline=TRANSLATION_PIPELINE_IDENTITY)
+    with pytest.raises(ValueError, match="pipeline.schema"):
+        SionConfig(
+            **graph,
+            release_name="sion_translate",
+            release_version="1.5",
+            pipeline={"schema": "wrong", "branch": "translation-only"},
+        )
+
+    with pytest.raises(ValueError, match="requires pipeline identity"):
+        SionConfig(
+            **graph,
+            release_name="sion_translate",
+            release_version="1.5",
+        )
+    with pytest.raises(ValueError, match="contain exactly schema and branch"):
+        SionConfig(
+            **graph,
+            release_name="sion_translate",
+            release_version="1.5",
+            pipeline={**TRANSLATION_PIPELINE_IDENTITY, "unbound": True},
+        )
+
+
+def test_transformers_pipeline_validates_content_addressed_foundation_lineage() -> None:
+    lineage = {
+        "schema": "sion-foundation-lineage-v1",
+        "release_name": "sion",
+        "release_version": "1.5",
+        "languages": ["pt-BR", "zh-Hant"],
+        "selected_step": 7,
+        "foundation_manifest_sha256": "a" * 64,
+        "tokenizer_sha256": "b" * 64,
+        "checkpoint_identity_sha256": "c" * 64,
+        "checkpoint_artifact_sha256": "d" * 64,
+    }
+    common = {
+        "languages": ["pt-BR", "zh-Hant"],
+        "language_pairs": [["pt-BR", "zh-Hant"]],
+        "translation_directions": [["pt-BR", "zh-Hant"]],
+        "revision_directions": [],
+        "release_name": "sion_translate",
+        "release_version": "1.5",
+        "tokenizer_sha256": "b" * 64,
+    }
+    pipeline = {
+        "schema": "sion-translation-pipeline-v2",
+        "branch": "foundation-then-translation",
+        "foundation": lineage,
+    }
+
+    assert SionConfig(**common, pipeline=pipeline).pipeline == pipeline
+
+    alias_lineage = copy.deepcopy(lineage)
+    alias_lineage["languages"] = ["pt-br", "zh-Hant"]
+    with pytest.raises(ValueError, match="normalized BCP 47"):
+        SionConfig(
+            **common,
+            pipeline={**pipeline, "foundation": alias_lineage},
+        )
+
+    mismatched_tokenizer = copy.deepcopy(lineage)
+    mismatched_tokenizer["tokenizer_sha256"] = "e" * 64
+    with pytest.raises(ValueError, match="exactly match tokenizer_sha256"):
+        SionConfig(
+            **common,
+            pipeline={**pipeline, "foundation": mismatched_tokenizer},
+        )
+
+
+def test_direct_current_transformers_writer_requires_pipeline_identity(tmp_path: Path) -> None:
+    config = tiny_model_config()
+    native = NativeSionForConditionalGeneration(config, pad_id=0)
+
+    with pytest.raises(ValueError, match="requires pipeline identity"):
+        _save_transformers_checkpoint(
+            tmp_path / "missing-pipeline",
+            native.state_dict(),
+            config,
+            languages=["de", "fr"],
+            language_pairs=[["de", "fr"]],
+            translation_directions=[["de", "fr"]],
+            revision_directions=[],
+        )
+
+    assert not (tmp_path / "missing-pipeline").exists()
+
+
+def test_foundation_transformers_config_rejects_any_revision_claim() -> None:
+    with pytest.raises(ValueError, match="cannot advertise revision capability"):
+        SionConfig(
+            release_name="sion",
+            release_version="1.4",
+            translation_capable=False,
+            revision_trained=True,
+        )
+
+
+def test_current_foundation_transformers_config_requires_trained_languages() -> None:
+    with pytest.raises(ValueError, match="non-empty trained language list"):
+        SionConfig(
+            release_name="sion",
+            release_version="1.5",
+            translation_capable=False,
+            revision_directions=[],
+        )
+
+
+def test_current_translation_config_rejects_languages_outside_the_pair_graph() -> None:
+    with pytest.raises(ValueError, match="languages must exactly match"):
+        SionConfig(
+            languages=["ko", "ja", "en"],
+            language_pairs=[["ko", "ja"]],
+            translation_directions=[["ko", "ja"]],
+            revision_directions=[],
+            release_name="sion_translate",
+            release_version="1.5",
+            translation_capable=True,
+            pipeline=TRANSLATION_PIPELINE_IDENTITY,
+        )
+
+
 @pytest.mark.parametrize(
     ("release_name", "release_version"),
     [(123, "1.5"), ("sion", 1.5), ("", "1.5"), ("sion", "")],
@@ -1003,6 +1248,8 @@ def test_export_validation_enforces_expected_repository_role(tmp_path: Path) -> 
     native = NativeSionForConditionalGeneration(config, pad_id=0)
     metadata = build_export_metadata(
         config,
+        language_pair=("ko", "ja"),
+        bidirectional=True,
         pipeline_identity=TRANSLATION_PIPELINE_IDENTITY,
     )
     manifest = export_state_dict_formats(
@@ -1509,6 +1756,7 @@ def test_export_pipeline_writes_and_validates_hf_tokenizer(tmp_path: Path) -> No
         config,
         tokenizer_path=tokenizer_path,
         language_pairs=(("ko", "ja"),),
+        bidirectional=True,
         pipeline_identity=TRANSLATION_PIPELINE_IDENTITY,
     )
     manifest = export_state_dict_formats(
@@ -1522,7 +1770,7 @@ def test_export_pipeline_writes_and_validates_hf_tokenizer(tmp_path: Path) -> No
         language_pairs=(("ko", "ja"),),
     )
     entry = manifest["formats"]["transformers"]
-    assert entry["status"] == "ok"
+    assert entry["status"] == "ok", entry
     checkpoint = output_dir / entry["file"]
     assert (checkpoint / "tokenizer.model").is_file()
     assert validate_export_directory(output_dir)["valid"]
@@ -1541,6 +1789,8 @@ def test_transformers_export_promotes_tokenizer_language_discovery_to_manifest(
     metadata = build_export_metadata(
         config,
         tokenizer_path=tokenizer_path,
+        language_pairs=(("ko", "ja"),),
+        bidirectional=True,
         pipeline_identity=TRANSLATION_PIPELINE_IDENTITY,
     )
 
@@ -1577,7 +1827,10 @@ def test_foundation_conversion_preserves_release_and_rejects_translation(
     metadata = build_export_metadata(
         config,
         tokenizer_path=tokenizer_path,
-        languages=["ko", "ja", "en"],
+        # The tokenizer may reserve additional denoising languages for later
+        # stages. A foundation export advertises only the languages these
+        # weights actually trained on.
+        languages=["ko", "ja"],
         release_name="sion",
         translation_capable=False,
     )
@@ -1600,8 +1853,14 @@ def test_foundation_conversion_preserves_release_and_rejects_translation(
     assert converted["metadata"]["release_name"] == "sion"
     assert converted["metadata"]["translation_capable"] is False
     assert converted["metadata"]["release_version"] == "1.5"
-    assert converted["metadata"]["languages"] == ["ko", "ja", "en"]
+    assert converted["metadata"]["languages"] == ["ko", "ja"]
+    assert "language_pairs" not in converted["metadata"]
+    assert "translation_directions" not in converted["metadata"]
     checkpoint = tmp_path / "foundation-transformers" / converted["formats"]["transformers"]["file"]
+    exported_config = json.loads((checkpoint / "config.json").read_text(encoding="utf-8"))
+    assert exported_config["languages"] == ["ko", "ja"]
+    assert exported_config["language_pairs"] == []
+    assert exported_config["translation_directions"] == []
     restored = AutoTokenizer.from_pretrained(checkpoint, trust_remote_code=True)
     assert restored.translation_capable is False
     with pytest.raises(ValueError, match="foundation model.*not translation-capable"):

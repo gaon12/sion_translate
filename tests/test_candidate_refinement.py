@@ -347,6 +347,8 @@ def test_native_export_strictly_round_trips_trained_refinement(tmp_path) -> None
     model = SionForConditionalGeneration(_config()).eval()
     metadata = build_export_metadata(
         model.config,
+        language_pair=("en", "de"),
+        translation_directions=(("en", "de"),),
         pipeline_identity={
             "schema": "sion-translation-pipeline-v2",
             "branch": "translation-only",

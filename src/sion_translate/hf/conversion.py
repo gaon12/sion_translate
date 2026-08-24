@@ -5,12 +5,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 import hashlib
 import json
 from pathlib import Path
 import shutil
 import tempfile
-from typing import Sequence
+from typing import Any
 
 import numpy as np
 import torch
@@ -277,6 +278,60 @@ def _translation_directions(
     return directions
 
 
+def _revision_directions(
+    translation_directions: Sequence[Sequence[str]],
+    configured: Sequence[Sequence[str]] | None,
+    revision_trained: bool | None,
+) -> list[list[str]] | None:
+    allowed = {tuple(direction) for direction in translation_directions}
+    if configured is None:
+        if revision_trained is True:
+            if len(allowed) != 1:
+                raise ValueError(
+                    "revision_trained=true is ambiguous unless exactly one authenticated "
+                    "translation direction exists; pass revision_directions"
+                )
+            return [list(next(iter(allowed)))]
+        if revision_trained is False:
+            return []
+        return None
+    directions: list[list[str]] = []
+    seen: set[tuple[str, str]] = set()
+    for raw_direction in configured:
+        if isinstance(raw_direction, (str, bytes)) or not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
+            raw_direction, Sequence
+        ):
+            raise ValueError("each revision direction must be a two-item language sequence")
+        direction = canonicalize_language_pair(
+            raw_direction,
+            field="export revision direction",
+        )
+        if direction in seen:
+            raise ValueError(
+                "duplicate export revision direction after BCP 47 canonicalization: "
+                f"{raw_direction!r}"
+            )
+        if direction not in allowed:
+            raise ValueError(
+                "revision_directions must be a subset of authenticated "
+                f"translation_directions; got {direction!r}"
+            )
+        seen.add(direction)
+        directions.append(list(direction))
+    if revision_trained is not None and revision_trained is not bool(directions):
+        raise ValueError("revision_trained disagrees with revision_directions")
+    return directions
+
+
+def _uses_current_capability_contract(release_version: str) -> bool:
+    parts = release_version.strip().split(".")
+    return (
+        len(parts) in {2, 3}
+        and all(part.isdigit() for part in parts)
+        and tuple(int(part) for part in parts[:2]) >= (1, 5)
+    )
+
+
 def _metadata_language_graph(
     metadata: dict[str, object],
     *,
@@ -480,7 +535,9 @@ def _save_transformers_checkpoint_unpublished(
     release_name: str = TRANSLATION_RELEASE_NAME,
     release_version: str = MODEL_RELEASE_VERSION,
     translation_capable: bool = True,
+    revision_directions: Sequence[Sequence[str]] | None = None,
     revision_trained: bool | None = None,
+    pipeline_identity: Mapping[str, Any] | None = None,
     allow_language_subset: bool = False,
     max_shard_size: str = "5GB",
 ) -> Path:
@@ -561,6 +618,16 @@ def _save_transformers_checkpoint_unpublished(
                 f"metadata: {unauthenticated!r}"
             )
 
+    resolved_revision_directions = _revision_directions(
+        directions,
+        revision_directions,
+        revision_trained,
+    )
+    if resolved_revision_directions is None and _uses_current_capability_contract(release_version):
+        # A new current-generation checkpoint may safely underclaim revision
+        # support, but it must serialize that decision as an exact empty graph.
+        resolved_revision_directions = []
+
     if token_features_path is None and tokenizer_path is not None:
         sibling_features = tokenizer_path.parent / "token_features.npz"
         if sibling_features.is_file():
@@ -599,15 +666,21 @@ def _save_transformers_checkpoint_unpublished(
         languages=list(languages or []),
         language_pairs=pairs,
         translation_directions=directions,
+        revision_directions=resolved_revision_directions,
         release_name=release_name,
         release_version=release_version,
         translation_capable=translation_capable,
-        revision_trained=revision_trained,
+        revision_trained=(
+            bool(resolved_revision_directions)
+            if resolved_revision_directions is not None
+            else revision_trained
+        ),
         default_reasoning_level=default_reasoning_level,
         slot_token_ids=slot_token_ids,
         tokenizer_sha256=tokenizer_sha256,
         token_features_sha256=token_features_sha256,
         token_features_shapes=token_features_shapes,
+        pipeline=(dict(pipeline_identity) if pipeline_identity is not None else None),
     )
     # Build only metadata tensors, then bind the caller's stable CPU snapshot
     # directly. A normal 32B wrapper would allocate another ~128 GiB of FP32
@@ -806,7 +879,12 @@ def _save_transformers_checkpoint_unpublished(
             "reasoning_level": default_reasoning_level,
         },
         "capabilities": (
-            {"revision_trained": revision_trained} if revision_trained is not None else {}
+            {
+                "revision_directions": resolved_revision_directions,
+                "revision_trained": bool(resolved_revision_directions),
+            }
+            if resolved_revision_directions is not None
+            else {}
         ),
         "native_state_dict_prefix": "model.",
         "self_contained_remote_code": True,
@@ -835,6 +913,8 @@ def _save_transformers_checkpoint_unpublished(
             "transformers>=5,<6",
         ],
     }
+    if pipeline_identity is not None:
+        metadata["pipeline"] = dict(pipeline_identity)
     (output_dir / "sion_export.json").write_text(
         json.dumps(metadata, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -856,7 +936,9 @@ def save_transformers_checkpoint(
     release_name: str = TRANSLATION_RELEASE_NAME,
     release_version: str = MODEL_RELEASE_VERSION,
     translation_capable: bool = True,
+    revision_directions: Sequence[Sequence[str]] | None = None,
     revision_trained: bool | None = None,
+    pipeline_identity: Mapping[str, Any] | None = None,
     allow_language_subset: bool = False,
     max_shard_size: str = "5GB",
     _atomic_publish: bool = True,
@@ -878,7 +960,9 @@ def save_transformers_checkpoint(
             release_name=release_name,
             release_version=release_version,
             translation_capable=translation_capable,
+            revision_directions=revision_directions,
             revision_trained=revision_trained,
+            pipeline_identity=pipeline_identity,
             allow_language_subset=allow_language_subset,
             max_shard_size=max_shard_size,
         )
@@ -903,7 +987,9 @@ def save_transformers_checkpoint(
             release_name=release_name,
             release_version=release_version,
             translation_capable=translation_capable,
+            revision_directions=revision_directions,
             revision_trained=revision_trained,
+            pipeline_identity=pipeline_identity,
             allow_language_subset=allow_language_subset,
             max_shard_size=max_shard_size,
         )

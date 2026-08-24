@@ -16,21 +16,23 @@ from sion_translate.training.export import (
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Convert a Sion FP32/EMA state-dict export")
-    parser.add_argument("source", help="model.pt 또는 model_ema.pt")
+    parser.add_argument("source", help="model.pt or model_ema.pt")
     parser.add_argument(
         "--output",
         required=True,
-        help="변환 파일과 export_manifest.json을 저장할 폴더",
+        help="directory that will receive converted files and export_manifest.json",
     )
     parser.add_argument(
         "--formats",
         default=",".join(DEFAULT_CONVERSION_FORMATS),
-        help=("쉼표로 구분한 형식 (기본: " + ",".join(DEFAULT_CONVERSION_FORMATS) + ")"),
+        help=(
+            "comma-separated output formats (default: " + ",".join(DEFAULT_CONVERSION_FORMATS) + ")"
+        ),
     )
-    parser.add_argument("--tokenizer", help="호환성 SHA256을 기록할 tokenizer model")
+    parser.add_argument("--tokenizer", help="tokenizer model whose SHA-256 will be recorded")
     parser.add_argument(
         "--token-features",
-        help="MorphoScript token_features.npz (HF checkpoint에도 복사·검증)",
+        help="MorphoScript token_features.npz, copied into and verified with HF checkpoints",
     )
     parser.add_argument(
         "--language-pair",
@@ -38,7 +40,10 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         dest="language_pairs",
         metavar=("SOURCE", "TARGET"),
-        help=("내보낼 언어 방향. 여러 번 지정 가능: --language-pair ko ja --language-pair en ru"),
+        help=(
+            "language pair to export; repeat for additional pairs, for example "
+            "--language-pair ko ja --language-pair en ru"
+        ),
     )
     direction_policy = parser.add_mutually_exclusive_group()
     direction_policy.add_argument(
@@ -46,60 +51,79 @@ def build_parser() -> argparse.ArgumentParser:
         nargs=2,
         action="append",
         metavar=("SOURCE", "TARGET"),
-        help="실제로 학습된 방향을 반복 지정; 기존 metadata와 정확히 일치해야 함",
+        help=(
+            "exact direction seen during training; repeat for additional directions and "
+            "match existing metadata exactly"
+        ),
     )
     direction_policy.add_argument(
         "--bidirectional",
         action="store_true",
-        help="각 --language-pair의 양방향이 모두 학습됐음을 명시적으로 인증",
+        help="explicitly attest that both directions of every language pair were trained",
     )
     direction_policy.add_argument(
         "--unidirectional",
         action="store_true",
-        help="각 --language-pair의 SOURCE→TARGET 방향만 학습된 것으로 기록",
+        help="record only the SOURCE-to-TARGET direction of each language pair as trained",
     )
     parser.add_argument(
         "--release-name",
-        help="metadata가 없는 구형 export의 배포 이름(예: sion 또는 sion_translate)",
+        help="release name for a legacy export without metadata, such as sion or sion_translate",
     )
     parser.add_argument(
         "--release-version",
-        help="metadata가 없는 구형 export의 모델 세대(예: 1.0); 추측하지 않음",
+        help="model generation for a legacy export without metadata, such as 1.0",
     )
     release_capability = parser.add_mutually_exclusive_group()
     release_capability.add_argument(
         "--translation-capable",
         dest="translation_capable",
         action="store_true",
-        help="metadata가 없는 구형 export가 번역 학습을 마쳤음을 명시",
+        help="attest that a legacy export without metadata completed translation training",
     )
     release_capability.add_argument(
         "--foundation-only",
         dest="translation_capable",
         action="store_false",
-        help="metadata가 없는 구형 export가 번역 불가 foundation 가중치임을 명시",
+        help="attest that a legacy export contains foundation-only, non-translation weights",
     )
     parser.set_defaults(translation_capable=None)
     capability = parser.add_mutually_exclusive_group()
     capability.add_argument(
+        "--revision-direction",
+        nargs=2,
+        action="append",
+        metavar=("SOURCE", "TARGET"),
+        help=(
+            "exact direction trained with revision examples; repeat as needed and use only "
+            "authenticated translation directions"
+        ),
+    )
+    capability.add_argument(
         "--revision-trained",
         action="store_true",
-        help="revision 학습 예제가 포함됐음을 metadata에 기록",
+        help=(
+            "compatibility flag for a legacy model with exactly one direction; use "
+            "--revision-direction when more than one direction exists"
+        ),
     )
     capability.add_argument(
         "--no-revision-trained",
         action="store_true",
-        help="revision 학습 예제가 없음을 metadata에 기록",
+        help="record that no revision-training examples were used",
     )
     parser.add_argument(
         "--int4-backend",
         choices=("auto", "torchao", "packed"),
         default="auto",
-        help="auto는 TorchAO 실패 시 portable packed INT4로 전환",
+        help="auto falls back to portable packed INT4 when TorchAO is unavailable",
     )
     parser.add_argument(
         "--llama-quantize",
-        help=("하위 호환 인자(현재 무시됨). GGUF는 내장 deterministic K-quant로 생성"),
+        help=(
+            "deprecated compatibility argument (currently ignored); GGUF uses the built-in "
+            "deterministic K-quant implementation"
+        ),
     )
     return parser
 
@@ -110,7 +134,9 @@ def main() -> None:
     formats = tuple(value.strip().lower() for value in args.formats.split(",") if value.strip())
     unknown = sorted(set(formats) - set(SUPPORTED_FORMATS))
     if unknown:
-        raise SystemExit(f"지원하지 않는 형식: {unknown} (지원: {', '.join(SUPPORTED_FORMATS)})")
+        raise SystemExit(
+            f"unsupported formats: {unknown} (supported: {', '.join(SUPPORTED_FORMATS)})"
+        )
     revision_trained = (
         True if args.revision_trained else False if args.no_revision_trained else None
     )
@@ -123,6 +149,7 @@ def main() -> None:
         language_pairs=args.language_pairs,
         translation_directions=args.translation_direction,
         bidirectional=(True if args.bidirectional else False if args.unidirectional else None),
+        revision_directions=args.revision_direction,
         revision_trained=revision_trained,
         release_name=args.release_name,
         release_version=args.release_version,
@@ -136,7 +163,7 @@ def main() -> None:
     ]
     print(f"[sion] manifest: {Path(args.output) / 'export_manifest.json'}")
     if failures:
-        raise SystemExit(f"내보내기 실패 형식: {', '.join(failures)}")
+        raise SystemExit(f"export failed for formats: {', '.join(failures)}")
 
 
 if __name__ == "__main__":

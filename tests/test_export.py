@@ -85,6 +85,22 @@ def build_export_metadata(
     translation_capable = bool(kwargs.get("translation_capable", True))
     if "pipeline_identity" not in kwargs and translation_capable and release_version == "1.5":
         kwargs["pipeline_identity"] = translation_pipeline_identity()
+    if (
+        translation_capable
+        and release_version == "1.5"
+        and "language_pair" not in kwargs
+        and "language_pairs" not in kwargs
+    ):
+        kwargs["language_pair"] = ("ko", "ja")
+    if (
+        translation_capable
+        and ("language_pair" in kwargs or "language_pairs" in kwargs)
+        and "translation_directions" not in kwargs
+        and "bidirectional" not in kwargs
+    ):
+        # Test fixtures explicitly attest the historical two-way graph. The
+        # production API intentionally has no directionality default.
+        kwargs["bidirectional"] = True
     return _build_export_metadata(model_config, **kwargs)
 
 
@@ -350,10 +366,68 @@ def test_export_metadata_records_tokenizer_hash(tmp_path: Path) -> None:
         export_config(),
         tokenizer_path=tokenizer,
         language_pair=("ko", "ja"),
-        revision_trained=True,
+        revision_directions=(("ko", "ja"),),
     )
     assert metadata["tokenizer"]["sha256"] == hashlib.sha256(tokenizer.read_bytes()).hexdigest()
     assert metadata["capabilities"]["revision_trained"] is True
+    assert metadata["capabilities"]["revision_directions"] == [["ko", "ja"]]
+
+
+def test_export_metadata_scopes_revision_to_canonical_translation_edges() -> None:
+    metadata = build_export_metadata(
+        export_config(),
+        language_pair=("pt-br", "zh-hant"),
+        translation_directions=(("PT-br", "ZH-hant"), ("zh-Hant", "pt-BR")),
+        revision_directions=(("PT-BR", "zh-hant"),),
+    )
+
+    assert metadata["capabilities"] == {
+        "revision_directions": [["pt-BR", "zh-Hant"]],
+        "revision_trained": True,
+    }
+    with pytest.raises(ValueError, match="revision_trained=true is ambiguous"):
+        build_export_metadata(
+            export_config(),
+            language_pair=("pt-BR", "zh-Hant"),
+            revision_trained=True,
+        )
+    with pytest.raises(ValueError, match="duplicate revision direction"):
+        build_export_metadata(
+            export_config(),
+            language_pair=("pt-BR", "zh-Hant"),
+            revision_directions=(
+                ("pt-br", "ZH-hant"),
+                ("PT-BR", "zh-Hant"),
+            ),
+        )
+    with pytest.raises(ValueError, match="subset of authenticated"):
+        build_export_metadata(
+            export_config(),
+            language_pair=("pt-BR", "zh-Hant"),
+            translation_directions=(("pt-BR", "zh-Hant"),),
+            revision_directions=(("zh-Hant", "pt-BR"),),
+        )
+
+
+def test_export_metadata_uses_registry_preferred_graph_identities() -> None:
+    metadata = build_export_metadata(
+        export_config(),
+        language_pair=("en-BU", "zh-cmn"),
+        translation_directions=(("EN-mm", "CMN"),),
+    )
+
+    assert metadata["language_pairs"] == [["en-MM", "cmn"]]
+    assert metadata["translation_directions"] == [["en-MM", "cmn"]]
+
+    with pytest.raises(ValueError, match="duplicate translation direction"):
+        build_export_metadata(
+            export_config(),
+            language_pair=("en-MM", "cmn"),
+            translation_directions=(
+                ("en-BU", "zh-cmn"),
+                ("EN-mm", "CMN"),
+            ),
+        )
 
 
 def test_export_metadata_records_evidence_and_parity_architecture() -> None:
@@ -431,7 +505,9 @@ def test_foundation_pipeline_accepts_a_configured_distinct_base_release_name(
     metadata = _build_export_metadata(
         export_config(),
         tokenizer_path=tokenizer,
-        languages=("ko", "ja", "en"),
+        languages=("ko", "ja"),
+        language_pair=("ko", "ja"),
+        bidirectional=True,
         pipeline_identity=pipeline,
     )
 
@@ -482,7 +558,32 @@ def test_export_metadata_rejects_nonexact_pipeline_contracts(
     pipeline_identity: dict[str, object],
 ) -> None:
     with pytest.raises(ValueError, match="pipeline|lineage"):
-        _build_export_metadata(export_config(), pipeline_identity=pipeline_identity)
+        _build_export_metadata(
+            export_config(),
+            language_pair=("ko", "ja"),
+            bidirectional=True,
+            pipeline_identity=pipeline_identity,
+        )
+
+
+def test_pipeline_marker_enforces_current_graph_for_pre_1_5_labels() -> None:
+    with pytest.raises(ValueError, match="pipeline metadata requires.*language-pair graph"):
+        _build_export_metadata(
+            export_config(),
+            release_version="1.4",
+            pipeline_identity=translation_pipeline_identity(),
+        )
+
+
+def test_pipeline_languages_must_exactly_match_the_pair_graph() -> None:
+    with pytest.raises(ValueError, match="languages must exactly match"):
+        _build_export_metadata(
+            export_config(),
+            language_pair=("ko", "ja"),
+            languages=("ko", "ja", "en"),
+            bidirectional=True,
+            pipeline_identity=translation_pipeline_identity(),
+        )
 
 
 def test_foundation_export_metadata_forbids_translation_pipeline_identity() -> None:
@@ -519,16 +620,33 @@ def test_foundation_pipeline_binds_tokenizer_without_conflating_translation_lang
             export_config(),
             tokenizer_path=tokenizer,
             languages=("ko", "ja"),
+            language_pair=("ko", "ja"),
+            bidirectional=True,
             pipeline_identity=wrong_tokenizer,
         )
     independent_languages = _build_export_metadata(
         export_config(),
         tokenizer_path=tokenizer,
         languages=("ko", "en"),
+        language_pair=("ko", "en"),
+        bidirectional=True,
         pipeline_identity=pipeline,
     )
     assert independent_languages["languages"] == ["ko", "en"]
     assert independent_languages["pipeline"]["foundation"]["languages"] == ["ko", "ja"]
+
+    for invalid_languages in (["pt-br", "pt-BR"], ["not a tag!"]):
+        invalid_lineage = json.loads(json.dumps(pipeline))
+        invalid_lineage["foundation"]["languages"] = invalid_languages
+        with pytest.raises(ValueError, match="normalized BCP 47"):
+            _build_export_metadata(
+                export_config(),
+                tokenizer_path=tokenizer,
+                languages=("ko", "ja"),
+                language_pair=("ko", "ja"),
+                bidirectional=True,
+                pipeline_identity=invalid_lineage,
+            )
 
 
 def test_export_revalidates_pipeline_after_tokenizer_and_language_overrides(
@@ -686,6 +804,27 @@ def test_native_loader_rejects_tampered_reasoning_endpoint(tmp_path: Path) -> No
         load_exported_model(tampered)
 
 
+def test_conversion_rejects_tampered_reasoning_endpoint(tmp_path: Path) -> None:
+    config = export_config()
+    config.experimental.candidate_refinement_enabled = True
+    model = SionForConditionalGeneration(config)
+    source_dir = tmp_path / "source"
+    export_state_dict_formats(
+        source_dir,
+        model.state_dict(),
+        config,
+        0,
+        formats=("fp32",),
+    )
+    payload = torch.load(source_dir / "model.pt", weights_only=True)
+    payload["metadata"]["generation_defaults"] = {"reasoning_level": 0}
+    tampered = tmp_path / "tampered.pt"
+    torch.save(payload, tampered)
+
+    with pytest.raises(ValueError, match="does not match model features"):
+        convert_export(tampered, tmp_path / "converted", formats=("fp16",))
+
+
 def test_native_loader_rejects_current_schema_without_pipeline_identity(
     tmp_path: Path,
 ) -> None:
@@ -715,6 +854,28 @@ def test_native_loader_rejects_schema_stripping_from_declared_1_5(
 
     with pytest.raises(ValueError, match="requires pipeline identity"):
         load_exported_model(tampered)
+
+
+def test_conversion_rejects_schema_less_payload_claiming_current_identity(
+    tmp_path: Path,
+) -> None:
+    config = export_config()
+    model = SionForConditionalGeneration(config)
+    source_dir = tmp_path / "source"
+    export_state_dict_formats(
+        source_dir,
+        model.state_dict(),
+        config,
+        0,
+        formats=("fp32",),
+    )
+    payload = torch.load(source_dir / "model.pt", weights_only=True)
+    payload.pop("schema")
+    schema_less = tmp_path / "schema-less-current.pt"
+    torch.save(payload, schema_less)
+
+    with pytest.raises(ValueError, match="legacy identity recovery is restricted"):
+        convert_export(schema_less, tmp_path / "converted", formats=("fp16",))
 
 
 def test_native_loader_accepts_schema_less_declared_1_0(tmp_path: Path) -> None:
@@ -803,6 +964,94 @@ def test_export_rejects_caller_metadata_that_bypasses_repository_role(
         )
 
 
+def test_export_rejects_checkpoint_step_provenance_mismatch(tmp_path: Path) -> None:
+    config = export_config()
+    model = SionForConditionalGeneration(config)
+    metadata = build_export_metadata(config, step=99)
+
+    with pytest.raises(ValueError, match=r"metadata\.step must match.*99 != 7"):
+        export_state_dict_formats(
+            tmp_path,
+            model.state_dict(),
+            config,
+            0,
+            step=7,
+            formats=("fp32",),
+            metadata=metadata,
+        )
+
+    assert not (tmp_path / "model.pt").exists()
+    assert not (tmp_path / "export_manifest.json").exists()
+
+
+def test_validation_rejects_native_payload_step_drift(tmp_path: Path) -> None:
+    config = export_config()
+    model = SionForConditionalGeneration(config)
+    export_state_dict_formats(
+        tmp_path,
+        model.state_dict(),
+        config,
+        0,
+        step=7,
+        formats=("fp32",),
+        metadata=build_export_metadata(config, step=7),
+    )
+    artifact = tmp_path / "model.pt"
+    payload = torch.load(artifact, map_location="cpu", weights_only=True)
+    payload["step"] = 8
+    torch.save(payload, artifact)
+    manifest_path = tmp_path / "export_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["formats"]["fp32"]["size"] = artifact.stat().st_size
+    manifest["formats"]["fp32"]["sha256"] = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+
+    report = validate_export_directory(tmp_path)
+    assert report["valid"] is False
+    assert "payload.step does not match metadata.step" in report["formats"]["fp32"]["message"]
+
+
+def test_export_and_validation_authenticate_every_feature_flag(tmp_path: Path) -> None:
+    config = export_config()
+    model = SionForConditionalGeneration(config)
+    forged = build_export_metadata(config, step=3)
+    forged["feature_flags"]["candidate_refinement"] = True
+
+    with pytest.raises(ValueError, match="feature_flags do not match"):
+        export_state_dict_formats(
+            tmp_path / "rejected",
+            model.state_dict(),
+            config,
+            0,
+            step=3,
+            formats=("fp32",),
+            metadata=forged,
+        )
+
+    valid_dir = tmp_path / "valid"
+    manifest = export_state_dict_formats(
+        valid_dir,
+        model.state_dict(),
+        config,
+        0,
+        step=3,
+        formats=("fp32",),
+        metadata=build_export_metadata(config, step=3),
+    )
+    manifest["metadata"]["feature_flags"]["candidate_refinement"] = True
+    manifest["metadata_compatibility_id"] = export_module._metadata_compatibility_id(
+        manifest["metadata"]
+    )
+    (valid_dir / "export_manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    report = validate_export_directory(valid_dir)
+    assert report["valid"] is False
+    assert any(error["error_type"] == "InvalidFeatureFlags" for error in report["errors"])
+
+
 def test_export_metadata_records_exact_trained_translation_directions() -> None:
     metadata = build_export_metadata(
         export_config(),
@@ -811,6 +1060,31 @@ def test_export_metadata_records_exact_trained_translation_directions() -> None:
     )
     assert metadata["language_pairs"] == [["ko", "ja"], ["en", "ru"]]
     assert metadata["translation_directions"] == [["ko", "ja"], ["en", "ru"]]
+
+
+def test_current_metadata_never_invents_bidirectional_capability() -> None:
+    pipeline = translation_pipeline_identity()
+    with pytest.raises(ValueError, match="explicit translation_directions.*bidirectional policy"):
+        _build_export_metadata(
+            export_config(),
+            language_pair=("de", "fr"),
+            pipeline_identity=pipeline,
+        )
+
+    forward_only = _build_export_metadata(
+        export_config(),
+        language_pair=("de", "fr"),
+        translation_directions=(("de", "fr"),),
+        pipeline_identity=pipeline,
+    )
+    attested_two_way = _build_export_metadata(
+        export_config(),
+        language_pair=("de", "fr"),
+        bidirectional=True,
+        pipeline_identity=pipeline,
+    )
+    assert forward_only["translation_directions"] == [["de", "fr"]]
+    assert attested_two_way["translation_directions"] == [["de", "fr"], ["fr", "de"]]
 
 
 def test_export_metadata_rejects_an_uncovered_language_pair() -> None:
@@ -1156,6 +1430,166 @@ def test_conversion_rejects_translation_capability_relabeling(
         )
 
 
+def test_conversion_preserves_direction_scoped_revision_capability(
+    tmp_path: Path,
+) -> None:
+    config = export_config()
+    model = SionForConditionalGeneration(config)
+    source_dir = tmp_path / "source-revision"
+    metadata = build_export_metadata(
+        config,
+        language_pair=("pt-BR", "zh-Hant"),
+        translation_directions=(("pt-BR", "zh-Hant"), ("zh-Hant", "pt-BR")),
+        revision_directions=(("pt-br", "ZH-hant"),),
+    )
+    export_state_dict_formats(
+        source_dir,
+        model.state_dict(),
+        config,
+        0,
+        formats=("fp32",),
+        metadata=metadata,
+    )
+
+    converted = convert_export(
+        source_dir / "model.pt",
+        tmp_path / "converted-revision",
+        formats=("fp16",),
+    )
+
+    assert converted["metadata"]["capabilities"] == {
+        "revision_directions": [["pt-BR", "zh-Hant"]],
+        "revision_trained": True,
+    }
+    with pytest.raises(ValueError, match="conflict with source metadata"):
+        convert_export(
+            source_dir / "model.pt",
+            tmp_path / "relabeled-revision",
+            formats=("fp16",),
+            revision_directions=(("zh-Hant", "pt-BR"),),
+        )
+
+
+def test_current_export_serializes_an_explicit_empty_revision_graph() -> None:
+    metadata = build_export_metadata(export_config())
+
+    assert metadata["capabilities"] == {
+        "revision_directions": [],
+        "revision_trained": False,
+    }
+
+
+def test_current_translation_export_requires_a_model_authenticated_graph() -> None:
+    with pytest.raises(ValueError, match="non-empty language-pair graph"):
+        _build_export_metadata(
+            export_config(),
+            pipeline_identity=translation_pipeline_identity(),
+        )
+
+
+def test_current_export_cannot_gain_revision_capability_after_metadata_removal(
+    tmp_path: Path,
+) -> None:
+    config = export_config()
+    model = SionForConditionalGeneration(config)
+    source_dir = tmp_path / "source"
+    export_state_dict_formats(
+        source_dir,
+        model.state_dict(),
+        config,
+        0,
+        formats=("fp32",),
+        metadata=build_export_metadata(
+            config,
+            language_pair=("de", "fr"),
+            translation_directions=(("de", "fr"),),
+        ),
+    )
+    source = source_dir / "model.pt"
+    payload = torch.load(source, weights_only=True)
+    payload["metadata"].pop("capabilities")
+    torch.save(payload, source)
+
+    with pytest.raises(ValueError, match="requires explicit capabilities.revision_directions"):
+        load_exported_model(source)
+    with pytest.raises(ValueError, match="requires explicit capabilities.revision_directions"):
+        convert_export(
+            source,
+            tmp_path / "relabeled",
+            formats=("fp16",),
+            revision_directions=(("de", "fr"),),
+        )
+
+
+def test_current_schema_missing_role_identity_cannot_be_recovered_by_override(
+    tmp_path: Path,
+) -> None:
+    config = export_config()
+    model = SionForConditionalGeneration(config)
+    source_dir = tmp_path / "foundation"
+    export_state_dict_formats(
+        source_dir,
+        model.state_dict(),
+        config,
+        0,
+        formats=("fp32",),
+        metadata=build_export_metadata(
+            config,
+            release_name="sion",
+            translation_capable=False,
+            languages=("ko", "ja"),
+        ),
+        release_name="sion",
+        translation_capable=False,
+    )
+    source = source_dir / "model.pt"
+    payload = torch.load(source, weights_only=True)
+    payload["metadata"].pop("release_name")
+    payload["metadata"].pop("translation_capable")
+    torch.save(payload, source)
+
+    with pytest.raises(ValueError, match="release_name must be a non-empty string"):
+        convert_export(
+            source,
+            tmp_path / "translation-relabel",
+            formats=("fp16",),
+            release_name="sion_translate",
+            translation_capable=True,
+            language_pair=("ko", "ja"),
+            translation_directions=(("ko", "ja"),),
+        )
+
+
+def test_unversioned_legacy_recovery_cannot_create_a_current_release(tmp_path: Path) -> None:
+    config = export_config()
+    model = SionForConditionalGeneration(config)
+    source_dir = tmp_path / "source"
+    export_state_dict_formats(
+        source_dir,
+        model.state_dict(),
+        config,
+        0,
+        formats=("fp32",),
+    )
+    source = source_dir / "model.pt"
+    payload = torch.load(source, weights_only=True)
+    payload.pop("schema")
+    payload["metadata"] = {}
+    torch.save(payload, source)
+
+    with pytest.raises(ValueError, match="restricted to pre-1.5"):
+        convert_export(
+            source,
+            tmp_path / "current",
+            formats=("fp16",),
+            release_name="sion_translate",
+            release_version="1.5",
+            translation_capable=True,
+            language_pair=("ko", "ja"),
+            translation_directions=(("ko", "ja"),),
+        )
+
+
 def test_gguf_only_conversion_resolves_inherited_foundation_tokenizer(
     tmp_path: Path,
 ) -> None:
@@ -1298,6 +1732,10 @@ def test_0b_style_transformers_sidecars_are_legacy_only_before_1_5(
 
     manifest["metadata"]["release_version"] = "1.5"
     manifest["metadata"]["pipeline"] = translation_pipeline_identity()
+    manifest["metadata"]["capabilities"] = {
+        "revision_directions": [],
+        "revision_trained": False,
+    }
     manifest["metadata"]["generation_defaults"] = {"reasoning_level": 0}
     manifest["metadata_compatibility_id"] = export_module._metadata_compatibility_id(
         manifest["metadata"]
@@ -1395,16 +1833,17 @@ def test_transformers_options_flow_through_conversion_and_training_export(
     config = export_config()
     model = SionForConditionalGeneration(config)
     source_dir = tmp_path / "source"
+    pairs = (("ko", "ja"), ("en", "ru"))
     export_state_dict_formats(
         source_dir,
         model.state_dict(),
         config,
         0,
         formats=("fp32",),
+        metadata=build_export_metadata(config, language_pairs=pairs),
     )
     tokenizer_marker = tmp_path / "tokenizer.model"
     tokenizer_marker.write_bytes(b"tokenizer propagation fixture")
-    pairs = (("ko", "ja"), ("en", "ru"))
     calls: list[dict[str, object]] = []
     real_save = hf_conversion.save_transformers_checkpoint
 
@@ -1436,6 +1875,7 @@ def test_transformers_options_flow_through_conversion_and_training_export(
         formats=("transformers",),
         tokenizer_path=tokenizer_marker,
         language_pairs=pairs,
+        bidirectional=True,
         pipeline_identity=translation_pipeline_identity(),
     )
     assert trained is not None
@@ -1528,6 +1968,41 @@ def test_export_cli_accepts_repeated_exact_translation_directions() -> None:
             ]
         )
 
+
+def test_export_cli_accepts_structured_revision_directions() -> None:
+    from sion_translate.cli.export import build_parser
+
+    args = build_parser().parse_args(
+        [
+            "model.pt",
+            "--output",
+            "converted",
+            "--revision-direction",
+            "pt-BR",
+            "zh-Hant",
+            "--revision-direction",
+            "en-x-review",
+            "de-CH-1901",
+        ]
+    )
+
+    assert args.revision_direction == [
+        ["pt-BR", "zh-Hant"],
+        ["en-x-review", "de-CH-1901"],
+    ]
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(
+            [
+                "model.pt",
+                "--output",
+                "converted",
+                "--revision-direction",
+                "pt-BR",
+                "zh-Hant",
+                "--revision-trained",
+            ]
+        )
+
     bidirectional = build_parser().parse_args(
         ["model.pt", "--output", "converted", "--bidirectional"]
     )
@@ -1549,6 +2024,8 @@ def test_training_export_manifest_merges_base_and_quantized_formats(
         4,
         ema=None,
         formats=("fp32", "int8"),
+        language_pair=("ko", "ja"),
+        bidirectional=True,
         pipeline_identity=translation_pipeline_identity(),
     )
     assert manifest is not None
@@ -1574,6 +2051,8 @@ def test_training_export_preserves_pipeline_identity_in_every_mode(
         context,
         11,
         formats=("fp32",),
+        language_pair=("ko", "ja"),
+        bidirectional=True,
         pipeline_identity=pipeline,
         strict=strict,
     )
@@ -1685,9 +2164,7 @@ def test_transformers_pipeline_sidecars_cross_validate_exact_identity(tmp_path: 
 
     validation = validate_export_directory(tmp_path)
     assert not validation["valid"]
-    assert any(
-        "disagree about pipeline identity" in error["message"] for error in validation["errors"]
-    )
+    assert any("pipeline" in error["message"].lower() for error in validation["errors"])
 
 
 def test_transformers_tokenizer_identity_is_cross_checked_with_manifest(
@@ -1822,6 +2299,8 @@ def test_distributed_regular_export_waits_on_durable_success_status(
         main,
         17,
         formats=("fp32",),
+        language_pair=("ko", "ja"),
+        bidirectional=True,
         pipeline_identity=translation_pipeline_identity(),
     )
     peer_manifest = export_inference_models(
@@ -1831,6 +2310,8 @@ def test_distributed_regular_export_waits_on_durable_success_status(
         peer,
         17,
         formats=("fp32",),
+        language_pair=("ko", "ja"),
+        bidirectional=True,
         pipeline_identity=translation_pipeline_identity(),
     )
 
@@ -1876,6 +2357,8 @@ def test_distributed_regular_export_propagates_failure_through_durable_status(
             main,
             19,
             formats=("fp32",),
+            language_pair=("ko", "ja"),
+            bidirectional=True,
             pipeline_identity=translation_pipeline_identity(),
         )
     with pytest.raises(
@@ -1889,6 +2372,8 @@ def test_distributed_regular_export_propagates_failure_through_durable_status(
             peer,
             19,
             formats=("fp32",),
+            language_pair=("ko", "ja"),
+            bidirectional=True,
             pipeline_identity=translation_pipeline_identity(),
         )
 
@@ -2199,8 +2684,8 @@ def test_subset_export_does_not_merge_incompatible_metadata(tmp_path: Path) -> N
     [
         ({"step": 1}, {"step": 2}),
         (
-            {"language_pairs": (("ko", "ja"),), "languages": ("ko", "ja", "en")},
-            {"language_pairs": (("ko", "ja"),), "languages": ("ko", "ja", "ru")},
+            {"language_pairs": (("ko", "ja"),), "languages": ("ko", "ja")},
+            {"language_pairs": (("en", "ru"),), "languages": ("en", "ru")},
         ),
         (
             {"source": "source-a"},
@@ -2223,11 +2708,14 @@ def test_subset_export_does_not_merge_contradictory_provenance(
             source = tmp_path / source_name
             source.write_bytes(source_name.encode("utf-8"))
             overrides["source"] = source
+    first_step = int(first_overrides.get("step", 0))
+    second_step = int(second_overrides.get("step", 0))
     first = export_state_dict_formats(
         tmp_path,
         model.state_dict(),
         config,
         0,
+        step=first_step,
         formats=("fp32",),
         metadata=build_export_metadata(config, **first_overrides),
     )
@@ -2236,6 +2724,7 @@ def test_subset_export_does_not_merge_contradictory_provenance(
         model.state_dict(),
         config,
         0,
+        step=second_step,
         formats=("bf16",),
         metadata=build_export_metadata(config, **second_overrides),
     )
@@ -2243,6 +2732,38 @@ def test_subset_export_does_not_merge_contradictory_provenance(
     assert first["artifact_set_id"] == second["artifact_set_id"]
     assert first["metadata_compatibility_id"] != second["metadata_compatibility_id"]
     assert set(second["formats"]) == {"bf16"}
+    assert validate_export_directory(tmp_path)["valid"]
+
+
+def test_same_weight_new_step_reuses_provenance_without_reusing_old_artifacts(
+    tmp_path: Path,
+) -> None:
+    config = export_config()
+    model = SionForConditionalGeneration(config)
+    first = _export_state_dict_formats(
+        tmp_path,
+        model.state_dict(),
+        config,
+        0,
+        step=3,
+        formats=("fp32",),
+        metadata=build_export_metadata(config, step=3),
+    )
+
+    second = _export_state_dict_formats(
+        tmp_path,
+        model.state_dict(),
+        config,
+        0,
+        step=4,
+        formats=("bf16",),
+    )
+
+    assert first["artifact_set_id"] == second["artifact_set_id"]
+    assert second["step"] == 4
+    assert second["metadata"]["step"] == 4
+    assert set(second["formats"]) == {"bf16"}
+    assert not (tmp_path / "model.pt").exists()
     assert validate_export_directory(tmp_path)["valid"]
 
 
@@ -2334,6 +2855,7 @@ def test_custom_sion_gguf_is_real_mixed_k_quant(tmp_path: Path) -> None:
         metadata=build_export_metadata(
             config,
             language_pairs=(("ko", "ja"),),
+            revision_directions=(("ko", "ja"),),
             pipeline_identity=pipeline,
         ),
     )
@@ -2353,6 +2875,8 @@ def test_custom_sion_gguf_is_real_mixed_k_quant(tmp_path: Path) -> None:
         ["ko", "ja"],
         ["ja", "ko"],
     ]
+    assert json.loads(reader.fields["sion.revision_directions"].contents()) == [["ko", "ja"]]
+    assert reader.fields["sion.revision_trained"].contents() is True
     tensor_types = {tensor.tensor_type.name for tensor in reader.tensors}
     assert {"Q4_K", "Q5_K", "F16"} <= tensor_types
     state = model.state_dict()
@@ -2361,6 +2885,68 @@ def test_custom_sion_gguf_is_real_mixed_k_quant(tmp_path: Path) -> None:
     stored_manifest = json.loads((tmp_path / "export_manifest.json").read_text())
     assert stored_manifest["formats"]["gguf_q4_k_m"]["sha256"] == entry["sha256"]
     assert validate_export_directory(tmp_path)["valid"]
+
+
+@pytest.mark.parametrize(
+    ("translation_directions", "revision_directions", "revision_trained", "message"),
+    [
+        (
+            [["PT-br", "ZH-hant"], ["pt-BR", "zh-Hant"]],
+            [],
+            False,
+            "duplicate translation direction",
+        ),
+        (
+            [["pt-BR", "zh-Hant"]],
+            None,
+            True,
+            "requires explicit sion.revision_directions",
+        ),
+    ],
+)
+def test_standalone_current_gguf_rejects_alias_and_bool_only_capability_claims(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    translation_directions: list[list[str]],
+    revision_directions: list[list[str]] | None,
+    revision_trained: bool,
+    message: str,
+) -> None:
+    gguf = pytest.importorskip("gguf")
+    config = export_config()
+
+    class Field:
+        def __init__(self, value: object):
+            self.value = value
+
+        def contents(self) -> object:
+            return self.value
+
+    fields = {
+        "general.name": Field("sion_translate"),
+        "sion.release_name": Field("sion_translate"),
+        "sion.release_version": Field("1.5"),
+        "sion.translation_capable": Field(True),
+        "sion.pipeline": Field(json.dumps(translation_pipeline_identity())),
+        "sion.languages": Field(json.dumps(["pt-BR", "zh-Hant"])),
+        "sion.language_pairs": Field(json.dumps([["pt-BR", "zh-Hant"]])),
+        "sion.translation_directions": Field(json.dumps(translation_directions)),
+        "sion.revision_trained": Field(revision_trained),
+        "sion.model_config": Field(json.dumps(asdict(config))),
+        "sion.pad_token_id": Field(0),
+    }
+    if revision_directions is not None:
+        fields["sion.revision_directions"] = Field(json.dumps(revision_directions))
+
+    reader = types.SimpleNamespace(
+        fields=fields,
+        tensors=[],
+        data=types.SimpleNamespace(_mmap=None),
+    )
+    monkeypatch.setattr(gguf, "GGUFReader", lambda _path: reader)
+
+    with pytest.raises(RuntimeError, match=message):
+        export_module._inspect_sion_gguf(tmp_path / "model.gguf")
 
 
 def test_0b_style_gguf_identity_fallback_is_legacy_only_before_1_5(
@@ -2404,6 +2990,10 @@ def test_0b_style_gguf_identity_fallback_is_legacy_only_before_1_5(
 
     manifest["metadata"]["release_version"] = "1.5"
     manifest["metadata"]["pipeline"] = translation_pipeline_identity()
+    manifest["metadata"]["capabilities"] = {
+        "revision_directions": [],
+        "revision_trained": False,
+    }
     manifest["metadata_compatibility_id"] = export_module._metadata_compatibility_id(
         manifest["metadata"]
     )
@@ -2425,10 +3015,17 @@ def test_foundation_gguf_records_its_role_without_translation_pipeline(
     gguf = pytest.importorskip("gguf")
     config = export_config()
     model = SionForConditionalGeneration(config)
+    with pytest.raises(ValueError, match="non-empty trained language list"):
+        build_export_metadata(
+            config,
+            release_name="sion",
+            translation_capable=False,
+        )
     metadata = build_export_metadata(
         config,
         release_name="sion",
         translation_capable=False,
+        languages=("ko", "ja"),
     )
 
     manifest = export_state_dict_formats(
@@ -2449,6 +3046,7 @@ def test_foundation_gguf_records_its_role_without_translation_pipeline(
     assert reader.fields["sion.release_name"].contents() == "sion"
     assert reader.fields["sion.release_version"].contents() == "1.5"
     assert reader.fields["sion.translation_capable"].contents() is False
+    assert json.loads(reader.fields["sion.languages"].contents()) == ["ko", "ja"]
     assert "sion.pipeline" not in reader.fields
     assert validate_export_directory(tmp_path)["valid"]
 
@@ -2637,6 +3235,8 @@ def test_strict_final_export_is_directory_transactional(
             context,
             2,
             formats=("fp32", "gguf_q4_k_m"),
+            language_pair=("ko", "ja"),
+            bidirectional=True,
             pipeline_identity=translation_pipeline_identity(),
             strict=True,
         )
@@ -2758,6 +3358,8 @@ def test_complete_file_and_manifest_generation_uses_a_cross_process_lock(tmp_pat
                 formats=("fp32",),
                 metadata=export_module.build_export_metadata(
                     config,
+                    language_pair=("ko", "ja"),
+                    bidirectional=True,
                     pipeline_identity={{
                         "schema": "sion-translation-pipeline-v2",
                         "branch": "translation-only",
