@@ -8,7 +8,7 @@ from sion_translate.console import configure_stdio
 
 
 class FakeStream:
-    """reconfigure() 호출을 기록하는 텍스트 스트림 대역."""
+    """A text-stream stand-in that records calls to ``reconfigure()``."""
 
     def __init__(self, encoding: str, *, fails: bool = False):
         self.encoding = encoding
@@ -23,7 +23,7 @@ class FakeStream:
 
 
 class BareStream:
-    """reconfigure() 가 없는 스트림 (일부 임베딩 환경 / 테스트 러너)."""
+    """A stream without ``reconfigure()``, as seen in some hosts and test runners."""
 
     encoding = "cp949"
 
@@ -44,7 +44,7 @@ def test_reopens_non_utf8_streams_as_utf8(monkeypatch: pytest.MonkeyPatch) -> No
 
     configure_stdio()
 
-    # 입력은 손실을 눈에 보이게, 출력은 원문 복원이 가능하게 처리한다.
+    # Make input loss visible while keeping output reversible to the original text.
     assert stdin.calls == [{"encoding": "utf-8", "errors": "replace"}]
     for stream in (stdout, stderr):
         assert stream.calls == [{"encoding": "utf-8", "errors": "backslashreplace"}]
@@ -73,7 +73,7 @@ def test_honours_explicit_pythonioencoding(monkeypatch: pytest.MonkeyPatch) -> N
 def test_tolerates_streams_that_cannot_be_reconfigured(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # 인코딩 편의 기능이 CLI 를 막아서는 안 되므로 조용히 넘어가야 한다.
+    # An encoding convenience must not block the CLI, so failure is tolerated.
     _install(monkeypatch, BareStream(), FakeStream("cp949", fails=True), None)
 
     configure_stdio()
