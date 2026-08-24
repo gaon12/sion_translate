@@ -1,7 +1,8 @@
-"""challenge 문장의 학습 코퍼스 누출 감사.
+"""Audit challenge-sentence leakage into the training corpus.
 
-기존 누출 방지는 seed 30쌍 **내부**에서만 동작합니다. 그 12개 challenge
-문장이 897만 행짜리 원천 코퍼스에 이미 있는지는 아무도 확인하지 않았습니다.
+The original leakage guard worked only **within** the 30 seed pairs. It did not
+check whether the 12 challenge sentences already occurred in the source corpus
+of roughly 8.97 million rows.
 """
 
 from __future__ import annotations
@@ -50,7 +51,7 @@ def _challenge(path, cases):
 
 
 def test_both_sides_of_a_challenge_case_are_audited(tmp_path) -> None:
-    """정답 쪽이 코퍼스에 있어도 누출이다 — 모델이 그 문장을 생성해 본 것이다."""
+    """A reference-side match is also a leak because the model has generated it."""
     path = _challenge(
         tmp_path / "cases.jsonl",
         [
@@ -155,17 +156,18 @@ def test_an_exact_duplicate_in_the_corpus_is_found(tmp_path) -> None:
     findings = audit_holdout_leakage(load_holdout_items([challenge]), [corpus])
     leaked = [finding for finding in findings if finding.leaked]
 
-    assert len(leaked) == 2  # 원문과 정답 양쪽
+    assert len(leaked) == 2  # Both the source and reference are audited.
     assert all(finding.worst.exact for finding in leaked)
     assert all(finding.worst.line == 2 for finding in leaked)
 
 
 def test_trailing_punctuation_does_not_hide_a_verbatim_leak(tmp_path) -> None:
-    """실측 사례. 마침표 하나가 완전일치 집계를 0 으로 만들고 있었다.
+    """A punctuation-only difference must not hide a measured verbatim leak.
 
-    `김칫국부터 마시지 마.` 는 `data29.jsonl:185527` 에 `김칫국부터 마시지 마…`
-    로 통째로 들어 있습니다. dedup 키는 구두점을 남기므로 둘이 다른 문장으로
-    집계됐고, 관문은 "완전일치 누출 0개" 라고 보고했습니다.
+    `김칫국부터 마시지 마.` occurs in full as `김칫국부터 마시지 마…` at
+    `data29.jsonl:185527`. The deduplication key preserves punctuation, so the two
+    forms were counted as different sentences and the old gate reported zero
+    exact leaks.
     """
 
     challenge = _challenge(
@@ -187,11 +189,11 @@ def test_trailing_punctuation_does_not_hide_a_verbatim_leak(tmp_path) -> None:
     leaked = [finding for finding in findings if finding.leaked]
 
     assert len(leaked) == 1
-    assert leaked[0].worst.exact, "구두점만 다른 행은 완전일치로 잡혀야 한다"
+    assert leaked[0].worst.exact, "Punctuation-only variants must count as exact leaks"
 
 
 def test_a_near_duplicate_is_found_where_exact_matching_would_miss_it(tmp_path) -> None:
-    """조사 하나 다른 행은 완전일치로 잡히지 않는다. 그래서 MinHash 를 쓴다."""
+    """Similarity detection catches a row that differs by one Korean particle."""
     challenge = _challenge(
         tmp_path / "cases.jsonl",
         [
@@ -216,7 +218,7 @@ def test_a_near_duplicate_is_found_where_exact_matching_would_miss_it(tmp_path) 
 
 
 def test_an_unrelated_corpus_reports_no_leak(tmp_path) -> None:
-    """오탐이 많으면 이 관문은 무시당한다."""
+    """Unrelated sentences must not create false positives that erode trust."""
     challenge = _challenge(
         tmp_path / "cases.jsonl",
         [
@@ -240,7 +242,7 @@ def test_an_unrelated_corpus_reports_no_leak(tmp_path) -> None:
 
 
 def test_a_different_language_field_is_never_compared(tmp_path) -> None:
-    """한국어 challenge 를 일본어 행과 비교하면 안 된다."""
+    """A Korean challenge item must never be compared with a Japanese field."""
     challenge = _challenge(
         tmp_path / "cases.jsonl",
         [
@@ -305,20 +307,21 @@ def test_the_summary_reports_the_leak_rate_and_a_warning(tmp_path) -> None:
     assert summary["leaked_items"] == 1
     assert summary["exact_leaked_items"] == 1
     assert summary["by_category"] == {"idiom_culture": 1}
-    # 누출된 집합을 품질 benchmark 로 쓰면 안 된다는 사실이 보고서에 남아야 한다.
+    # The report must state that a leaked set cannot be used as a quality benchmark.
     assert "benchmark" in summary["note"]
 
 
 def test_containment_answers_is_the_holdout_inside_the_corpus_line() -> None:
-    """Jaccard 가 아닌 이유: 누출의 전형은 긴 문장 안에 관용구가 들어 있는 것.
+    """Containment answers whether the holdout appears inside a corpus line.
 
-    상대 문장이 길다는 이유로 점수가 떨어지면 그 누출을 놓칩니다.
+    A typical leak embeds an idiom in a longer sentence. Its score must not fall
+    merely because the corpus sentence contains additional text.
     """
     idiom = "김칫국부터 마시지 마"
     assert containment(idiom, idiom) == 1.0
     assert containment(idiom, "야 그러니까 김칫국부터 마시지 마 진짜") > 0.8
     assert containment(idiom, "오늘 날씨가 정말 좋습니다") == 0.0
-    # 비대칭이어야 한다 — 짧은 쪽이 긴 쪽에 들어 있는지를 묻는 것이다.
+    # The score is asymmetric because it asks whether the short side is in the long side.
     assert containment("야 그러니까 김칫국부터 마시지 마 진짜", idiom) < 0.8
 
 
@@ -344,20 +347,20 @@ def test_a_threshold_outside_the_unit_interval_is_refused(threshold) -> None:
 
 
 def test_the_match_cap_keeps_the_worst_leaks_not_the_first_ones(tmp_path) -> None:
-    """스캔 순서대로 앞의 N 개를 남기면 더 심한 누출을 버린다.
+    """The match cap keeps the most severe leaks instead of the first matches.
 
-    실제로 `호랑이도 제 말 하면 온다더니.` 는 data12 에서 0.91, data9 에서
-    1.00 인데 문자열 정렬상 data12 가 먼저라 1.00 이 상한에 걸려 사라졌습니다.
-    안전 관문이 누출을 과소보고하는 방향이라 허용할 수 없습니다.
+    A measured case for `호랑이도 제 말 하면 온다더니.` scored 0.91 in data12
+    and 1.00 in data9. Lexical file ordering visited data12 first, so a first-N
+    cap discarded the exact match. A safety gate must not under-report leakage.
     """
     idiom = "호랑이도 제 말 하면 온다더니"
     challenge = _challenge(
         tmp_path / "cases.jsonl",
         [{"id": "c1", "source": idiom, "source_language": "ko", "target_language": "ja"}],
     )
-    # 먼저 스캔되는 파일에는 **부분** 일치만 둡니다. 관용구를 통째로 담으면
-    # 문장이 아무리 길어도 containment 는 1.0 입니다 — 비대칭이 설계 의도라
-    # 그것으로는 "앞의 N 개"와 "가장 나쁜 N 개"를 구분할 수 없습니다.
+    # The first file contains only **partial** matches. A line containing the
+    # complete idiom has containment 1.0 regardless of its length; that intended
+    # asymmetry cannot distinguish "first N" from "worst N" in this regression.
     weak = _shard(
         tmp_path / "data" / "a_first.jsonl",
         [{"ko": f"호랑이도 제 말 하면 좋겠다는 생각 {index}", "ja": "x"} for index in range(6)],
@@ -372,5 +375,5 @@ def test_the_match_cap_keeps_the_worst_leaks_not_the_first_ones(tmp_path) -> Non
     assert len(leaked.matches) == 3
     assert leaked.worst.similarity == 1.0
     assert "z_last" in leaked.worst.file
-    # 보고서가 심한 순으로 정렬되어 있어야 검수가 위에서부터 유효하다.
+    # Severity ordering lets a reviewer process the most important rows first.
     assert leaked.matches == sorted(leaked.matches, key=lambda m: -m.similarity)

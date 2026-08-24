@@ -1,12 +1,12 @@
-"""expressive challenge 문장이 학습 코퍼스에 이미 있는지 감사한다.
+"""Audit whether expressive challenge sentences already occur in the training corpus.
 
     python scripts/data/audit_holdout_leakage.py \
         --holdout examples/expressive_cultural_cases.jsonl \
         --corpus "data/*.jsonl" --language-pair ko ja \
         --output reports/holdout_leakage.json
 
-누출된 항목이 있으면 종료 코드가 0이 아닙니다. 독립 holdout 이 아닌 것을
-품질 benchmark 로 인용하는 일을 막기 위한 관문입니다.
+The command exits with a nonzero status when it finds a leak. This safety gate
+prevents a non-independent holdout from being cited as a quality benchmark.
 """
 
 from __future__ import annotations
@@ -26,9 +26,11 @@ from sion_translate.tokenizer import expand_inputs
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="challenge 문장의 학습 코퍼스 누출 감사")
-    parser.add_argument("--holdout", nargs="+", required=True, help="challenge JSONL")
-    parser.add_argument("--corpus", nargs="+", required=True, help="학습 JSONL 또는 glob")
+    parser = argparse.ArgumentParser(
+        description="Audit challenge-sentence leakage into a training corpus"
+    )
+    parser.add_argument("--holdout", nargs="+", required=True, help="challenge JSONL files")
+    parser.add_argument("--corpus", nargs="+", required=True, help="training JSONL files or globs")
     parser.add_argument(
         "--language-pair",
         nargs=2,
@@ -38,11 +40,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--similarity", type=float, default=DEFAULT_SIMILARITY_THRESHOLD)
     parser.add_argument("--max-matches", type=int, default=5)
-    parser.add_argument("--output", help="JSON 보고서 경로")
+    parser.add_argument("--output", help="path for the JSON report")
     parser.add_argument(
         "--allow-leaks",
         action="store_true",
-        help="누출이 있어도 0 으로 종료 (조사용)",
+        help="exit successfully even when leaks are found (investigation only)",
     )
     return parser
 
@@ -52,12 +54,15 @@ def main() -> None:
     args = build_parser().parse_args()
     items = load_holdout_items(args.holdout, language_pairs=args.language_pair)
     if not items:
-        raise SystemExit(f"challenge 문장을 읽지 못했습니다: {args.holdout}")
+        raise SystemExit(f"No challenge sentences could be read from: {args.holdout}")
     corpus = expand_inputs(args.corpus)
     if not corpus:
-        raise SystemExit(f"학습 코퍼스와 일치하는 JSONL 이 없습니다: {args.corpus}")
+        raise SystemExit(f"No training JSONL files matched: {args.corpus}")
 
-    print(f"challenge {len(items)}개를 코퍼스 {len(corpus)}개 파일과 대조합니다.", flush=True)
+    print(
+        f"Comparing {len(items)} challenge item(s) against {len(corpus)} corpus file(s).",
+        flush=True,
+    )
     findings = audit_holdout_leakage(
         items,
         corpus,
@@ -97,23 +102,24 @@ def main() -> None:
         path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     print(
-        f"감사 {summary['audited_items']}개 / 누출 {summary['leaked_items']}개 "
-        f"({summary['leak_rate']:.1%}), 그중 완전일치 {summary['exact_leaked_items']}개"
+        f"Audited items: {summary['audited_items']} / leaked items: "
+        f"{summary['leaked_items']} ({summary['leak_rate']:.1%}) / exact leaks: "
+        f"{summary['exact_leaked_items']}"
     )
     for finding in findings:
         worst = finding.worst
         if worst is None:
             continue
         print(
-            f"  [{worst.similarity:.2f}{' 완전일치' if worst.exact else ''}] {finding.item.identifier}"
+            f"  [{worst.similarity:.2f}{' exact' if worst.exact else ''}] {finding.item.identifier}"
         )
         print(f"    holdout: {finding.item.text[:60]}")
         print(f"    corpus : {Path(worst.file).name}:{worst.line}  {worst.text[:60]}")
     if summary["leaked_items"] and not args.allow_leaks:
         raise SystemExit(
-            "누출된 challenge 문장이 있습니다. 이 집합은 독립 holdout 이 아니므로 "
-            "품질 benchmark 로 인용하지 마십시오 — 회귀 smoke set 으로만 쓰거나, "
-            "누출된 항목을 교체하십시오."
+            "Leaked challenge sentences were found. This set is not an independent "
+            "holdout and must not be cited as a quality benchmark. Use it only as a "
+            "regression smoke set, or replace the leaked items."
         )
 
 
