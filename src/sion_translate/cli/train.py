@@ -1,20 +1,21 @@
-"""sion_translate 학습 실행 진입점(CLI) — 인자 없이 실행하는 완전 자동 파이프라인.
+"""Fully automated sion_translate training entry point.
 
-    sion-train            ← 이것만 실행하면 됩니다.
+    sion-train            # This is the only command required.
 
-동작 순서:
-    ① 실행 환경(GPU 수·VRAM·bf16·CPU) 자동 인식
-    ② 설정 로드 — 프로젝트 루트의 ``sion_translate.yaml`` 이 있으면 그 값을 우선 적용
-       (없거나 비워 두면 전부 자동). ``--config`` 로 다른 파일도 지정 가능.
-    ③ ``data/*.jsonl`` 자동 인식 — 토크나이저가 없으면 학습하고,
-       파일이 추가/변경되었으면 데이터셋을 자동으로 다시 준비
-    ④ 데이터 규모에 맞춰 모델 크기·step 수·배치 등 수치 자동 결정
-    ⑤ 이전 학습이 있으면 단계별 checkpoints/latest 에서 자동 재개
-    ⑥ SFT 사전학습 후 pretrain/에 저장
-    ⑦ 복합 보상 MRT + 다중 후보 선호학습 후 posttrain/에 별도 저장
+Workflow:
+    1. Detect the execution environment, including GPU count, VRAM, bf16, and CPU.
+    2. Load sion_translate.yaml from the project root when present. Missing values
+       remain automatic; --config can select another file.
+    3. Discover data/*.jsonl, train a tokenizer when needed, and rebuild prepared
+       data when source files change.
+    4. Select model size, step count, batch size, and related values from the data
+       scale and available hardware.
+    5. Resume each stage automatically from checkpoints/latest when possible.
+    6. Run SFT pretraining and store its artifacts under pretrain/.
+    7. Run composite-reward MRT and multi-candidate preference training, storing
+       those artifacts separately under posttrain/.
 
-각 단계가 시작될 때마다 "[sion] …" 텍스트가 출력되므로 현재 어디까지
-진행됐는지 터미널에서 바로 확인할 수 있습니다.
+Every stage prints a "[sion] ..." message so progress is visible in the terminal.
 """
 
 # CLI configuration, CUDA properties, DataLoader internals, and torch.compile
@@ -166,8 +167,8 @@ def coordinated_training_run_lock(
             if acquisition_error is not None:
                 raise acquisition_error
             raise RuntimeError(
-                "rank 0이 training.output_dir run lock을 획득하지 못했습니다. "
-                "rank 0의 오류에서 현재 보유자와 output_dir를 확인하십시오."
+                "Rank 0 could not acquire the training.output_dir run lock. "
+                "Inspect rank 0's error for the current owner and output_dir."
             )
         yield lock_path
     finally:
@@ -200,10 +201,10 @@ def preflight_final_export_dependencies(formats: list[str] | tuple[str, ...]) ->
         return
     details = ", ".join(f"{format_name} → {package}" for format_name, package in missing.items())
     raise RuntimeError(
-        "요청한 최종 export 포맷의 의존성이 없습니다: "
-        f"{details}. 장기 학습을 시작하기 전에 "
-        'python -m pip install -e ".[export]" 로 설치하거나 '
-        "training.final_export_formats에서 해당 포맷을 제거하세요."
+        "Dependencies for the requested final export formats are missing: "
+        f"{details}. Before starting a long training run, install them with "
+        'python -m pip install -e ".[export]" or remove the affected formats '
+        "from training.final_export_formats."
     )
 
 
@@ -1024,21 +1025,24 @@ def tokenizer_policy_problem(
         metadata = load_tokenizer_metadata(tokenizer_path)
         recorded_policy = tokenizer_split_digits_policy(tokenizer_path)
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
-        return f"토크나이저 정책/메타데이터를 읽을 수 없습니다: {exc}"
+        return f"Could not read tokenizer policy/metadata: {exc}"
 
     if not tokenizer.splits_digits:
-        return "토크나이저가 여러 자리 숫자를 한 자리씩 분리하지 않습니다 (split_digits=False 동작)"
+        return (
+            "The tokenizer does not split multi-digit numbers into individual "
+            "digits (split_digits=False behavior)"
+        )
     if recorded_policy is False:
-        return "tokenizer_metadata.json에 split_digits=false가 기록되어 있습니다"
+        return "tokenizer_metadata.json records split_digits=false"
     if recorded_policy is None or metadata is None:
-        return "버전 2 이상의 tokenizer_metadata.json이 없습니다"
+        return "tokenizer_metadata.json version 2 or newer is missing"
 
     recorded_hash = metadata.get("model_sha256")
     if recorded_hash != file_sha256(tokenizer_path):
-        return "tokenizer_metadata.json의 model_sha256이 실제 모델과 다릅니다"
+        return "tokenizer_metadata.json model_sha256 does not match the model file"
     vocab_path = tokenizer_path.with_suffix(".vocab")
     if not vocab_path.is_file() or metadata.get("vocab_sha256") != file_sha256(vocab_path):
-        return "tokenizer_metadata.json의 vocab_sha256이 실제 vocabulary와 다릅니다"
+        return "tokenizer_metadata.json vocab_sha256 does not match the vocabulary file"
     raw_pairs = metadata.get("language_pairs")
     recorded_pairs = (
         tuple((str(pair[0]), str(pair[1])) for pair in raw_pairs)
@@ -1048,7 +1052,7 @@ def tokenizer_policy_problem(
     )
     if recorded_pairs != language_pairs:
         return (
-            "tokenizer_metadata.json의 language_pairs가 현재 설정과 다릅니다 "
+            "tokenizer_metadata.json language_pairs differs from the current configuration "
             f"(metadata={recorded_pairs}, config={language_pairs})"
         )
     raw_directions = metadata.get("translation_directions")
@@ -1059,7 +1063,7 @@ def tokenizer_policy_problem(
             isinstance(direction, list) and len(direction) == 2 for direction in raw_directions
         )
     ):
-        return "tokenizer_metadata.json의 translation_directions 형식이 잘못되었습니다"
+        return "tokenizer_metadata.json translation_directions has an invalid format"
     recorded_directions = (
         tuple((str(direction[0]), str(direction[1])) for direction in raw_directions)
         if isinstance(raw_directions, list)
@@ -1069,31 +1073,33 @@ def tokenizer_policy_problem(
     expected_directions = translation_directions or ()
     if require_recorded_directions and not recorded_directions:
         return (
-            "명시적 translation_directions를 인증할 tokenizer metadata가 없습니다; "
-            "기존 tokenizer에 사후 표기하지 말고 같은 방향 정책으로 다시 학습해야 합니다"
+            "Tokenizer metadata cannot authenticate the explicit "
+            "translation_directions. Retrain with the same direction policy "
+            "instead of adding provenance to an existing tokenizer afterward."
         )
     if recorded_directions and expected_directions and recorded_directions != expected_directions:
         return (
-            "tokenizer_metadata.json의 translation_directions가 현재 설정과 다릅니다 "
+            "tokenizer_metadata.json translation_directions differs from the "
+            "current configuration "
             f"(metadata={recorded_directions}, config={expected_directions})"
         )
     expected_languages = {language for pair in language_pairs for language in pair}
     if set(tokenizer.languages) != expected_languages:
         return (
-            "토크나이저 제어 토큰의 언어 집합이 현재 설정과 다릅니다 "
+            "The tokenizer control-token language set differs from the current configuration "
             f"(tokenizer={sorted(tokenizer.languages)}, config={sorted(expected_languages)})"
         )
     expected_denoise_languages = set(foundation_languages or expected_languages)
     if set(tokenizer.denoise_tags) != expected_denoise_languages:
         return (
-            "토크나이저 복원 태그의 언어 집합이 foundation 설정과 다릅니다 "
+            "The tokenizer denoising-tag language set differs from the foundation configuration "
             f"(tokenizer={sorted(tokenizer.denoise_tags)}, "
             f"config={sorted(expected_denoise_languages)})"
         )
     tokenizer_reasoning_languages = set(getattr(tokenizer, "reasoning_tags", {}))
     if tokenizer_reasoning_languages != set(reasoning_languages):
         return (
-            "토크나이저 reasoning 태그의 언어 집합이 구조화 코퍼스와 다릅니다 "
+            "The tokenizer reasoning-tag language set differs from the structured corpus "
             f"(tokenizer={sorted(tokenizer_reasoning_languages)}, "
             f"corpus={sorted(reasoning_languages)})"
         )
@@ -1102,34 +1108,52 @@ def tokenizer_policy_problem(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Train sion_translate. 인자 없이 실행하면 환경/데이터를 자동 인식합니다."
+        description=(
+            "Train sion_translate. With no arguments, detect the environment and "
+            "data automatically."
+        )
     )
     parser.add_argument(
-        "--config", help=f"설정 파일 (기본: 루트의 {DEFAULT_CONFIG_FILE}, 없으면 전부 자동)"
+        "--config",
+        help=(
+            f"Configuration file (default: {DEFAULT_CONFIG_FILE} in the project "
+            "root; fully automatic when absent)"
+        ),
     )
-    parser.add_argument("--epochs", type=int, help="SFT가 전체 학습 dataset을 완주할 횟수")
-    parser.add_argument("--max-steps", type=int, help="최대 step 수동 지정 (자동값 무시)")
     parser.add_argument(
-        "--posttrain-epochs", type=int, help="MRT가 전체 학습 dataset을 완주할 횟수"
+        "--epochs", type=int, help="Number of complete SFT passes over the training dataset"
     )
-    parser.add_argument("--posttrain-steps", type=int, help="MRT 사후학습 step 수동 지정")
-    parser.add_argument("--skip-posttraining", action="store_true", help="SFT 사전학습까지만 실행")
     parser.add_argument(
-        "--resume-from", help="재개할 체크포인트 수동 지정 (기본: latest 자동 감지)"
+        "--max-steps", type=int, help="Manual maximum step count; overrides automation"
+    )
+    parser.add_argument(
+        "--posttrain-epochs",
+        type=int,
+        help="Number of complete MRT passes over the training dataset",
+    )
+    parser.add_argument("--posttrain-steps", type=int, help="Manual MRT posttraining step count")
+    parser.add_argument(
+        "--skip-posttraining",
+        action="store_true",
+        help="Stop after SFT pretraining",
+    )
+    parser.add_argument(
+        "--resume-from",
+        help="Checkpoint to resume manually (default: discover latest automatically)",
     )
     parser.add_argument(
         "--prepare-only",
         action="store_true",
-        help="토크나이저와 dataset shard만 준비하고 학습 전에 종료",
+        help="Prepare only the tokenizer and dataset shards, then exit before training",
     )
     return parser
 
 
 def seed_everything(seed: int, rank: int) -> None:
-    """재현 가능한 학습을 위해 모든 난수 생성기에 시드를 고정합니다.
+    """Seed every random-number generator for reproducible training.
 
-    rank 를 더해 주는 이유: 분산 학습에서 rank 마다 dropout 등
-    실행 시점 난수가 서로 달라야 하기 때문입니다.
+    The rank is added because runtime randomness such as dropout must differ
+    between ranks during distributed training.
     """
     random.seed(seed + rank)
     np.random.seed((seed + rank) % (2**32))
@@ -1139,10 +1163,10 @@ def seed_everything(seed: int, rank: int) -> None:
 
 
 def resolve_config(args: argparse.Namespace) -> tuple[AppConfig, dict[str, Any], str]:
-    """설정 파일을 찾아 (config, raw dict, 출처 설명) 을 돌려줍니다.
+    """Resolve and return the configuration, raw dictionary, and source label.
 
-    raw dict 는 '사용자가 어떤 키를 직접 적었는지'를 기억하는 용도입니다.
-    자동 설정은 사용자가 적지 않은 키만 채웁니다.
+    The raw dictionary records which keys the user supplied explicitly.
+    Automatic settings fill only keys that the user did not provide.
     """
     if args.config:
         raw = load_raw_config(args.config)
@@ -1152,9 +1176,9 @@ def resolve_config(args: argparse.Namespace) -> tuple[AppConfig, dict[str, Any],
         source = DEFAULT_CONFIG_FILE
     else:
         raw = {}
-        source = "내장 기본값 (전부 자동)"
+        source = "built-in defaults (fully automatic)"
 
-    # 커맨드라인 인자는 파일보다 우선하며, '사용자 지정'으로 취급합니다.
+    # Command-line arguments override the file and count as explicit user settings.
     if args.epochs is not None:
         raw.setdefault("training", {})["num_train_epochs"] = args.epochs
     if args.max_steps is not None:
@@ -1328,16 +1352,19 @@ def _ensure_artifacts_on_main(
     prepare_foundation: bool = True,
     locks_held: bool = False,
 ) -> None:
-    """토크나이저와 준비된 데이터셋이 없거나 낡았으면 자동으로 만듭니다.
+    """Create the tokenizer and prepared datasets when absent or stale.
 
-    - 토크나이저: 없을 때만 학습합니다. 기존 vocabulary를 사용하는 다른 run을
-      깨뜨릴 수 있으므로 내용 계약에 맞지 않는 산출물은 자동 이동하거나 덮어쓰지
-      않고, 운영자가 관련 checkpoint를 확인할 수 있도록 구체적인 오류를 냅니다.
-    - 데이터셋: ``data/`` 의 파일 이름+크기 지문을 기록해 두고, 지문이
-      달라지면(파일 추가/변경) 기존 데이터셋을 옆으로 보관한 뒤 다시 만듭니다.
+    - Tokenizer: train only when it is missing. An incompatible artifact is
+      neither moved nor overwritten automatically because another run may depend
+      on its vocabulary. Instead, report a concrete error so the operator can
+      inspect related checkpoints.
+    - Dataset: record a filename-and-size fingerprint for data/. When files are
+      added or changed, preserve the old dataset beside the active path and
+      prepare a new one.
 
-    이 내부 구현은 rank 0에서만 호출됩니다. 분산 peer 대기는 process-group
-    collective가 아니라 ``ensure_artifacts``의 durable status channel이 맡습니다.
+    This internal implementation runs only on rank 0. Distributed peers wait
+    through ensure_artifacts' durable status channel rather than a process-group
+    collective.
     """
 
     if foundation_plan is None:
@@ -1353,9 +1380,9 @@ def _ensure_artifacts_on_main(
         if foundation_plan.enabled
         else ()
     )
-    # 같은 artifacts/ 를 쓰는 작업 두 개가 동시에 "없으니 만들자"고 판단하면
-    # 서로 다른 세대의 토크나이저와 데이터셋이 같은 경로에 섞입니다. 실패가
-    # 아니라 **섞인 상태**라 지문 검사는 그 조합을 처음 보는 것으로만 인식합니다.
+    # If two jobs sharing artifacts/ both decide that outputs are absent, tokenizer
+    # and dataset generations can be mixed under one path. This is not an obvious
+    # failure: fingerprinting would merely see the mixed combination as new.
     with ExitStack() as artifact_scope:
         if context.is_main and not locks_held:
             # Every run acquires the same target-root locks in the same order.
@@ -1377,51 +1404,56 @@ def _ensure_artifacts_on_main(
 
             if not files and not dataset_ready:
                 raise FileNotFoundError(
-                    f"원천 데이터({data_dir}/*.jsonl)도 준비된 데이터셋({dataset_dir})도 없습니다."
+                    f"Neither source data ({data_dir}/*.jsonl) nor a prepared "
+                    f"dataset ({dataset_dir}) exists."
                 )
             if not tokenizer_path.is_file() and dataset_ready and not files:
                 raise FileNotFoundError(
-                    f"준비된 데이터셋은 있지만 대응하는 토크나이저가 없습니다: {tokenizer_path}. "
-                    "원천 데이터와 새 출력 경로를 지정해 새 run을 시작하세요."
+                    "A prepared dataset exists, but its tokenizer is missing: "
+                    f"{tokenizer_path}. Start a new run with source data and new "
+                    "output paths."
                 )
             if not files and dataset_ready:
                 integrity_problem = dataset_artifact_problem(dataset_dir)
                 if integrity_problem is not None:
                     raise RuntimeError(
-                        "준비된 번역 데이터셋 payload가 손상됐지만 다시 만들 원천 "
-                        f"데이터가 없습니다: {integrity_problem}"
+                        "The prepared translation dataset payload is corrupt, and "
+                        "no source data is available to rebuild it: "
+                        f"{integrity_problem}"
                     )
 
             if files:
                 cpu_plan = build_cpu_plan(input_files=len(files))
                 announce(
-                    f"원천 데이터 인식: {len(files)}개 파일, "
-                    f"총 {sum(files.values()) / 2**30:.2f} GiB ({data_dir}/)",
+                    f"Source data discovered: {len(files)} files, "
+                    f"{sum(files.values()) / 2**30:.2f} GiB total ({data_dir}/)",
                     context,
                 )
                 announce(
-                    f"CPU 자동 배분: 할당 {cpu_plan.available}개 → "
-                    f"입력 정제 {cpu_plan.preprocess_workers}개 + "
-                    f"SentencePiece {cpu_plan.sentencepiece_threads}개; "
-                    f"dataset 준비 {cpu_plan.dataset_workers}개",
+                    f"Automatic CPU allocation: {cpu_plan.available} available → "
+                    f"{cpu_plan.preprocess_workers} input-cleaning workers + "
+                    f"{cpu_plan.sentencepiece_threads} SentencePiece threads; "
+                    f"{cpu_plan.dataset_workers} dataset-preparation workers",
                     context,
                 )
-                # ── 토크나이저 ────────────────────────────────────────────
+                # ── Tokenizer ─────────────────────────────────────────────
                 if not tokenizer_path.exists():
                     if existing_checkpoint is not None:
                         raise RuntimeError(
-                            "기존 체크포인트가 있지만 대응하는 토크나이저가 없습니다. "
-                            f"checkpoint={existing_checkpoint}. 기존 vocabulary를 추측해 "
-                            "새 토크나이저로 덮어쓸 수 없습니다. tokenizer_model, dataset_dir, "
-                            "training.output_dir을 새 경로로 지정해 새 run을 시작하세요."
+                            "An existing checkpoint has no corresponding tokenizer: "
+                            f"checkpoint={existing_checkpoint}. The previous vocabulary "
+                            "cannot be guessed and overwritten with a new tokenizer. "
+                            "Start a new run with new tokenizer_model, dataset_dir, "
+                            "and training.output_dir paths."
                         )
                     from sion_translate.tokenizer import train_tokenizer
 
                     pair_estimate = estimate_pair_count(files, data_dir)
                     vocab_size = pick_vocab_size(pair_estimate)
                     announce(
-                        f"토크나이저가 없어 새로 학습합니다 "
-                        f"(약 {pair_estimate:,}행 → vocab {vocab_size:,}) — 시간이 걸립니다.",
+                        "The tokenizer is missing, so a new one will be trained "
+                        f"(approximately {pair_estimate:,} rows → vocab "
+                        f"{vocab_size:,}). This may take time.",
                         context,
                     )
                     train_tokenizer(
@@ -1430,9 +1462,9 @@ def _ensure_artifacts_on_main(
                         vocab_size=vocab_size,
                         language_pairs=config.data.configured_language_pairs(),
                         translation_directions=config.data.configured_translation_directions(),
-                        # foundation 단계가 자기 코퍼스에 없는 어휘로 학습하지 않도록
-                        # 단일어 코퍼스도 넣습니다. 언어별 상한이 없으면 분량이 큰
-                        # 언어가 vocab 을 독식합니다.
+                        # Include monolingual corpora so foundation training does not
+                        # encounter only out-of-vocabulary terms. Per-language caps
+                        # prevent the largest corpus from dominating the vocabulary.
                         monolingual=foundation_plan.discovery,
                         monolingual_sample_ratio=config.foundation.tokenizer_sample_ratio,
                         foundation_languages=foundation_plan.languages,
@@ -1443,11 +1475,11 @@ def _ensure_artifacts_on_main(
                         num_workers=cpu_plan.preprocess_workers,
                         num_threads=cpu_plan.sentencepiece_threads,
                     )
-                    announce("토크나이저 학습 완료.", context)
-                    # 토크나이저 파일의 SHA-256도 데이터셋 지문에 포함됩니다.
+                    announce("Tokenizer training complete.", context)
+                    # The tokenizer file's SHA-256 is part of the dataset fingerprint.
                     files = scan_configured_raw_data(config, data_dir, tokenizer_path)
 
-                # ── 데이터셋 (지문 기반 변경 감지) ─────────────────────────
+                # ── Dataset with fingerprint-based change detection ───────
                 policy_problem = tokenizer_policy_problem(
                     tokenizer_path,
                     config.data.configured_language_pairs(),
@@ -1481,16 +1513,17 @@ def _ensure_artifacts_on_main(
                         )
                     if policy_problem is not None:
                         checkpoint_detail = (
-                            f" 기존 checkpoint={existing_checkpoint}와 vocabulary 호환성을 "
-                            "깨뜨리는 자동 재학습은 수행하지 않습니다."
+                            f" Automatic retraining will not break vocabulary "
+                            f"compatibility with checkpoint={existing_checkpoint}."
                             if existing_checkpoint is not None
                             else ""
                         )
                         raise RuntimeError(
                             f"{policy_problem}.{checkpoint_detail} tokenizer_model, dataset_dir, "
-                            "training.output_dir을 함께 검토하세요. 새 학습이라면 관련 run이 "
-                            "이 vocabulary를 쓰지 않는지 확인한 뒤 기존 tokenizer/dataset을 "
-                            "별도 백업으로 옮기고 split_digits=True로 다시 준비하십시오."
+                            "Review training.output_dir as well. For a new training "
+                            "run, first confirm that no related run uses this vocabulary. "
+                            "Then move the existing tokenizer/dataset to a separate "
+                            "backup and prepare them again with split_digits=True."
                         )
                 stored = stored_fingerprint(dataset_dir) if dataset_ready else None
                 integrity_problem = (
@@ -1504,20 +1537,22 @@ def _ensure_artifacts_on_main(
                     if dataset_ready:
                         backup = backup_stale_dataset(dataset_dir)
                         reason = (
-                            f"indexed payload 무결성 실패 ({integrity_problem})"
+                            f"indexed payload integrity failure ({integrity_problem})"
                             if integrity_problem is not None
                             else (
-                                "호환 가능한 지문 없음"
+                                "no compatible fingerprint"
                                 if stored is None
-                                else "원천/토크나이저/전처리 변경"
+                                else "source/tokenizer/preprocessing changed"
                             )
                         )
                         announce(
-                            f"{reason} 감지 → 기존 데이터셋을 {backup.name}/ 으로 보관합니다.",
+                            f"Detected {reason}; preserving the existing dataset "
+                            f"under {backup.name}/.",
                             context,
                         )
                     announce(
-                        "데이터셋 준비 시작 (품질 필터 + 중복 제거 + 토큰화) — 시간이 걸립니다.",
+                        "Preparing the dataset (quality filtering, deduplication, "
+                        "and tokenization). This may take time.",
                         context,
                     )
                     prepare_dataset(
@@ -1534,23 +1569,24 @@ def _ensure_artifacts_on_main(
                         num_workers=cpu_plan.dataset_workers,
                         expected_fingerprint=files,
                     )
-                    announce("데이터셋 준비 완료.", context)
+                    announce("Dataset preparation complete.", context)
                 else:
-                    announce("데이터셋 최신 상태 확인 (원천 데이터 변경 없음).", context)
+                    announce("Dataset is current; source data has not changed.", context)
 
-                # ── foundation(단일어) 데이터셋 ──────────────────────────
+                # ── Foundation monolingual dataset ────────────────────────
                 for line in foundation_plan.report:
                     announce(f"  {line}", context)
                 if not foundation_plan.enabled:
-                    announce(f"foundation 단계: {foundation_plan.reason}", context)
+                    announce(f"Foundation stage: {foundation_plan.reason}", context)
                 elif not prepare_foundation:
                     announce(
-                        "SFT resume 후보를 먼저 검증하므로 foundation 데이터셋 준비를 보류합니다.",
+                        "Deferring foundation dataset preparation while SFT resume "
+                        "candidates are validated first.",
                         context,
                     )
                 else:
                     for warning in foundation_plan.warnings:
-                        announce(f"[경고] foundation: {warning}", context)
+                        announce(f"[warning] foundation: {warning}", context)
                     foundation_dataset = Path(config.foundation.dataset_dir)
                     from sion_translate.data.prepare_foundation import (
                         foundation_dataset_problem,
@@ -1575,19 +1611,19 @@ def _ensure_artifacts_on_main(
                         release_name=config.foundation.release_name,
                     )
                     if foundation_problem is None:
-                        announce("foundation 데이터셋 최신 상태 확인.", context)
+                        announce("Foundation dataset is current.", context)
                     else:
                         if foundation_dataset.exists() or foundation_dataset.is_symlink():
                             backup = backup_stale_dataset(foundation_dataset)
                             announce(
-                                f"{foundation_problem} → 기존 foundation 데이터셋을 "
-                                f"{backup.name}/ 으로 보관합니다.",
+                                f"{foundation_problem}; preserving the existing "
+                                f"foundation dataset under {backup.name}/.",
                                 context,
                             )
 
                         announce(
-                            "foundation 데이터셋 준비 시작 (복원 + reasoning 토큰화) — "
-                            "시간이 걸립니다.",
+                            "Preparing the foundation dataset (denoising and "
+                            "reasoning tokenization). This may take time.",
                             context,
                         )
                         foundation_stats = prepare_foundation_dataset(
@@ -2719,12 +2755,11 @@ def run_foundation_stage(
     artifacts_verified: bool = False,
     _resume_lease_scope: ExitStack | None = None,
 ) -> FoundationOutcome:
-    """번역 학습 전에 복원과 선택적 reasoning으로 encoder-decoder를 만든다.
+    """Build the encoder-decoder through denoising and optional reasoning.
 
-    끝난 단계를 다시 돌리지 않는 것이 중요합니다. 이 단계는 파이프라인에서
-    가장 오래 걸리는 구간이라, 번역 학습이 실패해 다시 실행할 때마다 며칠짜리
-    사전학습을 반복하면 안 됩니다. 완료 표시가 있으면 학습을 건너뛰고 best
-    가중치만 물려받습니다.
+    Completed work must not run again. This is the longest pipeline stage and can
+    take days, so a later translation-training failure must not repeat it. When a
+    valid completion marker exists, skip training and inherit only the best weights.
     """
 
     if not foundation_plan.enabled:
@@ -2792,7 +2827,7 @@ def run_foundation_stage(
         )
         if context.is_main:
             assert isinstance(backup, Path)
-            announce(f"{reason} → 이전 실행을 {backup.name}/ 으로 보관합니다.", context)
+            announce(f"{reason}; preserving the previous run under {backup.name}/.", context)
         archive_visibility_scope = distributed_failure_scope(run_root.exists(), context)
         if archive_visibility_scope != "none":
             raise RuntimeError(
@@ -2801,7 +2836,8 @@ def run_foundation_stage(
 
     if stale_completed_run:
         archive_completed_run(
-            "foundation 완료 세대의 입력·설정·checkpoint 구성이 현재 실행과 다릅니다"
+            "The completed foundation generation's input, configuration, or "
+            "checkpoint layout differs from the current run"
         )
         marker = None
         marker_is_current_here = False
@@ -2856,14 +2892,15 @@ def run_foundation_stage(
         except Exception as error:
             if context.distributed and _has_unverifiable_legacy_dcp_generation(best_checkpoint):
                 raise RuntimeError(
-                    "foundation 완료 checkpoint가 historical shard digest 없는 legacy "
-                    "DCP입니다. 자동 archive/retrain 또는 현재 bytes의 자동 승격을 "
-                    "거부합니다. 원본 백업을 확인한 뒤 명시적 offline recovery를 "
-                    f"수행하세요: {error}"
+                    "The completed foundation checkpoint is a legacy DCP without "
+                    "historical shard digests. Automatic archive/retraining and "
+                    "promotion of the current bytes are refused. Inspect the original "
+                    f"backup and perform explicit offline recovery: {error}"
                 ) from error
             archive_completed_run(
-                "foundation 완료 marker와 일치하는 exact checkpoint 세대를 모든 "
-                f"rank에서 인증하지 못해 새로 학습합니다: {error}"
+                "Could not authenticate an exact checkpoint generation matching "
+                "the foundation completion marker on every rank; training a new "
+                f"generation: {error}"
             )
             reusable_completion = False
 
@@ -2917,8 +2954,9 @@ def run_foundation_stage(
         if not export_binding_matches:
             preflight_final_export_dependencies(config.foundation.final_export_formats)
             announce(
-                "foundation 완료 checkpoint는 유효하지만 최종 base export가 없거나 "
-                "손상됐거나 같은 가중치 세대로 증명되지 않아 재학습 없이 다시 내보냅니다.",
+                "The completed foundation checkpoint is valid, but the final base "
+                "export is missing, corrupt, or not proven to use the same weight "
+                "generation. Re-exporting without retraining.",
                 context,
             )
             final_export_dir = export_final_model(
@@ -2950,13 +2988,13 @@ def run_foundation_stage(
                 description="publishing the repaired foundation export binding",
             )
         announce(
-            f"foundation 단계는 이미 완료됐습니다 → {checkpoint_source} 의 가중치를 "
-            f"물려받습니다 (step {provenance['step']:,}).",
+            "The foundation stage is already complete; inheriting weights from "
+            f"{checkpoint_source} (step {provenance['step']:,}).",
             context,
         )
         return FoundationOutcome(
             ran=False,
-            reason="이미 완료된 foundation 단계의 가중치를 재사용했습니다.",
+            reason="Reused weights from the completed foundation stage.",
             best_checkpoint=str(checkpoint_source),
             selected_step=provenance["step"],
             languages=foundation_languages,
@@ -2974,15 +3012,17 @@ def run_foundation_stage(
         raise RuntimeError(f"foundation resume resolution returned invalid state: {resume_state!r}")
     if resume_state == "untrusted_legacy":
         raise RuntimeError(
-            "foundation resume checkpoint는 historical shard digest가 없는 legacy DCP라 "
-            "자동 archive/retrain 또는 현재 bytes의 자동 승격을 거부합니다. 원본 "
-            "백업을 확인하고 명시적 offline recovery를 수행하세요: "
+            "The foundation resume checkpoint is a legacy DCP without historical "
+            "shard digests, so automatic archive/retraining and promotion of the "
+            "current bytes are refused. Inspect the original backup and perform "
+            "explicit offline recovery: "
             f"{resume_plan.get('reason', 'unverifiable legacy generation')}"
         )
     has_resume = resume_state == "available"
     if resume_state == "invalid":
         archive_completed_run(
-            "foundation 재개 checkpoint를 인증하지 못해 새로 학습합니다: "
+            "Could not authenticate the foundation resume checkpoint; training "
+            "a new generation: "
             f"{resume_plan.get('reason', 'unknown resolution failure')}"
         )
 
@@ -3052,8 +3092,8 @@ def run_foundation_stage(
             trusted_best_artifact_sha256 = consensus_best_digest or None
         except Exception as error:
             archive_completed_run(
-                "foundation 재개 checkpoint의 세대·v2 inventory·identity를 인증하지 "
-                f"못해 새로 학습합니다: {error}"
+                "Could not authenticate the generation, v2 inventory, and identity "
+                f"of the foundation resume checkpoint; training a new generation: {error}"
             )
             has_resume = False
             resume_source = None
@@ -3070,9 +3110,9 @@ def run_foundation_stage(
         )
         if context.is_main and quarantine is not None:
             announce(
-                "foundation latest가 content-bind하지 않은 completion/best/export를 "
-                "재개 checkpoint와 분리해 "
-                f"{quarantine.name}/ 에 보관합니다.",
+                "Foundation latest does not content-bind its completion/best/export. "
+                "Separating those artifacts from the resume checkpoint and "
+                f"preserving them under {quarantine.name}/.",
                 context,
             )
         derivative_visibility_scope = distributed_failure_scope(
@@ -3091,7 +3131,7 @@ def run_foundation_stage(
                 "distributed rank"
             )
         foundation_config.training.resume_from = str(resume_source)
-        announce(f"foundation: 이전 실행 발견 → {resume_source} 에서 재개합니다.", context)
+        announce(f"Foundation: previous run found; resuming from {resume_source}.", context)
     else:
         untrusted_partial_run_here = bool(
             context.is_main
@@ -3108,8 +3148,8 @@ def run_foundation_stage(
         untrusted_partial_run = broadcast_bool(untrusted_partial_run_here, context)
         if untrusted_partial_run:
             archive_completed_run(
-                "인증할 완료 marker나 재개 checkpoint가 없는 foundation 부분 실행을 "
-                "새 학습과 분리합니다"
+                "Separating a partial foundation run with no authenticatable "
+                "completion marker or resume checkpoint from new training"
             )
 
     preflight_final_export_dependencies(config.foundation.final_export_formats)
@@ -3121,8 +3161,9 @@ def run_foundation_stage(
         verify_integrity=not artifacts_verified,
     )
     announce(
-        f"foundation 데이터 규모: 학습 {len(train_dataset):,}개 / "
-        f"검증 {len(validation_dataset):,}개 (언어: {', '.join(foundation_languages)})",
+        f"Foundation data: {len(train_dataset):,} training examples / "
+        f"{len(validation_dataset):,} validation examples "
+        f"(languages: {', '.join(foundation_languages)})",
         context,
     )
 
@@ -3168,7 +3209,10 @@ def run_foundation_stage(
         ),
     )
 
-    announce("0단계 foundation 사전학습(복원 + 선택적 reasoning)을 시작합니다.", context)
+    announce(
+        "Starting stage 0 foundation pretraining (denoising and optional reasoning).",
+        context,
+    )
     result = train(
         model,
         train_loader,
@@ -3217,9 +3261,9 @@ def run_foundation_stage(
         stage=FOUNDATION_STAGE_DIRECTORY,
         step=int(result["selected_step"]),
         formats=config.foundation.final_export_formats,
-        # 번역 모델이 아니라 그 파운데이션입니다. 이름을 나누는 것만으로는
-        # 부족합니다 — 구조가 번역 모델과 같아서 그대로 실으면 방향 태그를
-        # 받아들이고 그럴듯한 쓰레기를 냅니다.
+        # This is the foundation, not the translation model. A distinct name alone
+        # is insufficient: the architectures match, so publishing it without this
+        # capability boundary would accept direction tags and emit plausible junk.
         release_name=config.foundation.release_name,
         translation_capable=False,
         languages=foundation_languages,
@@ -3253,7 +3297,7 @@ def run_foundation_stage(
 
 
 def find_auto_resume(config: AppConfig) -> str | None:
-    """이전 학습의 latest 체크포인트가 있으면 그 경로를 돌려줍니다."""
+    """Return the latest checkpoint path from a previous run when one exists."""
     latest = Path(config.training.output_dir) / "checkpoints" / "latest"
     if checkpoint_path_exists(latest):
         return str(latest)
@@ -3308,8 +3352,9 @@ def _archive_invalid_automatic_resume(
     if context.is_main:
         assert isinstance(backup, Path)
         announce(
-            f"{stage} 자동 재개 후보를 인증하지 못해 {backup.name}/ 으로 보관하고 "
-            f"fresh 경로로 돌아갑니다: {_bounded_status_text(error)}",
+            f"Could not authenticate the automatic {stage} resume candidate. "
+            f"Preserving it under {backup.name}/ and returning to a fresh path: "
+            f"{_bounded_status_text(error)}",
             context,
         )
     visibility_scope = distributed_failure_scope(
@@ -3488,8 +3533,9 @@ def _configured_foundation_branch_plan(
     return FoundationPlan(
         enabled=True,
         reason=(
-            "foundation은 설정상 활성화되어 있으나 원천 코퍼스가 현재 보이지 않습니다. "
-            "인증된 downstream checkpoint 또는 준비된 base 세대만 재사용합니다."
+            "Foundation is enabled in the configuration, but its source corpus "
+            "is currently unavailable. Reuse only an authenticated downstream "
+            "checkpoint or prepared base generation."
         ),
         discovery=discovered_plan.discovery,
         languages=discovered_plan.languages,
@@ -3647,7 +3693,7 @@ def run_foundation_before_translation(
     if validated_pretrain_resume:
         return FoundationOutcome(
             ran=False,
-            reason="검증된 SFT resume가 foundation 실행/로드보다 우선합니다.",
+            reason="A validated SFT resume takes precedence over foundation execution/loading.",
         )
     return run_foundation_stage(
         config,
@@ -3669,19 +3715,21 @@ def translation_initialization_message(
     """Describe the ancestry that the translation stages will actually use."""
 
     if resume_from:
-        branch = pipeline_branch or "검증된"
+        branch = pipeline_branch or "validated"
         return (
-            f"{branch} SFT 체크포인트 {resume_from} 를 우선 재개합니다. foundation 단계는 "
-            "이번 실행에서 학습하거나 로드하지 않으며 최종 release는 sion_translate입니다."
+            f"Resuming the {branch} SFT checkpoint {resume_from} first. The "
+            "foundation stage will not be trained or loaded in this run, and the "
+            "final release is sion_translate."
         )
     if foundation_outcome.best_checkpoint:
         return (
-            "번역 학습을 foundation 가중치에서 시작합니다 "
+            "Starting translation training from foundation weights "
             f"({foundation_release_name} step {foundation_outcome.selected_step:,})."
         )
     return (
-        "foundation 모델(sion)은 학습·내보내지 않습니다. fresh initialization에서 "
-        "번역 SFT/MRT로 바로 진행해 sion_translate만 만듭니다."
+        "The foundation model (sion) will not be trained or exported. Starting "
+        "from fresh initialization and proceeding directly through translation "
+        "SFT/MRT to produce only sion_translate."
     )
 
 
@@ -3691,25 +3739,25 @@ def main() -> None:
     context = initialize_distributed()
     run_scope = ExitStack()
     try:
-        # ── 단계 ①: 환경 자동 인식 ──────────────────────────────────────
+        # ── Stage 1: detect the execution environment ────────────────────
         env = probe_environment()
         env = synchronize_environment(env, context)
-        announce(f"준비 ①: 실행 환경 — {describe_environment(env)}", context)
+        announce(f"Preparation 1: execution environment — {describe_environment(env)}", context)
 
-        # ── 단계 ②: 설정 로드 ───────────────────────────────────────────
+        # ── Stage 2: load configuration ──────────────────────────────────
         config, raw, source = resolve_config(args)
         run_scope.enter_context(coordinated_training_run_lock(config.training.output_dir, context))
         checkpoint_lease_scope = ExitStack()
         run_scope.enter_context(checkpoint_lease_scope)
-        announce(f"준비 ②: 설정 로드 — {source}", context)
+        announce(f"Preparation 2: configuration loaded — {source}", context)
         if not args.prepare_only:
             # The built-in collator has no dense alignment-label provider.
             # Reject a permanently-zero BATS alignment objective before doing
             # artifact preparation or allocating model parameters.
             config.validate_training_supervision(alignment_targets_available=False)
 
-        # ── 단계 ③: 원천 데이터 인식 + 토크나이저/데이터셋 자동 준비 ──
-        announce("준비 ③: 원천 데이터를 확인합니다.", context)
+        # ── Stage 3: discover source data and prepare artifacts ──────────
+        announce("Preparation 3: checking source data.", context)
         discovered_foundation_plan = plan_foundation_stage(config)
         foundation_plan = _configured_foundation_branch_plan(
             config,
@@ -3759,11 +3807,11 @@ def main() -> None:
         config.model.vocab_size = len(tokenizer)
         preflight_morphoscript_token_features(config, tokenizer)
         if args.prepare_only:
-            announce("전처리 전용 실행 완료.", context)
+            announce("Preparation-only run complete.", context)
             return
 
-        # 모델 파라미터 초기화는 world size 와 무관하게 같은 시드(rank 0 기준)로
-        # 수행합니다. 실행 시점 난수는 모델 생성 후에 rank 별로 다시 시드합니다.
+        # Initialize model parameters with the same rank-0 seed regardless of
+        # world size. Reseed runtime randomness per rank after model construction.
         seed_everything(config.training.seed, 0)
 
         train_dataset = IndexedParallelDataset(
@@ -3785,12 +3833,13 @@ def main() -> None:
         preflight_dataset_direction_contract(config, train_dataset, require_all_pairs=True)
         preflight_dataset_direction_contract(config, validation_dataset)
         announce(
-            f"데이터 규모: 학습 {len(train_dataset):,}개 / 검증 {len(validation_dataset):,}개 "
-            f"(설정된 번역 방향 포함)",
+            f"Data size: {len(train_dataset):,} training examples / "
+            f"{len(validation_dataset):,} validation examples "
+            "(including configured translation directions)",
             context,
         )
 
-        # ── 단계 ④: 데이터 규모·환경 기반 자동 수치 결정 ────────────────
+        # ── Stage 4: derive settings from data and hardware ──────────────
         decisions = apply_auto_settings(
             config,
             raw,
@@ -3801,7 +3850,7 @@ def main() -> None:
             source_names=train_dataset.source_names,
         )
         if decisions:
-            announce("준비 ④: 자동 결정된 설정 —", context)
+            announce("Preparation 4: automatically selected settings —", context)
             for line in decisions:
                 announce(f"  · {line}", context)
         config.validate()
@@ -3834,7 +3883,8 @@ def main() -> None:
         )
         if revision_directions:
             announce(
-                "양의 샘플링 확률로 인증된 revision 학습 방향: "
+                "Revision training directions authenticated with positive "
+                "sampling probability: "
                 + ", ".join(f"{source}→{target}" for source, target in revision_directions),
                 context,
             )
@@ -3842,7 +3892,7 @@ def main() -> None:
         if not foundation_plan.enabled:
             pipeline_identity = build_translation_pipeline_identity(foundation_plan)
 
-        # 실행 루트 아래에 사전학습/사후학습 산출물을 서로 분리합니다.
+        # Keep pretraining and posttraining artifacts separate under the run root.
         run_root = Path(config.training.output_dir)
         pretrain_config = copy.deepcopy(config)
         pretrain_config.training.output_dir = str(run_root / "pretrain")
@@ -3850,38 +3900,40 @@ def main() -> None:
             _build_posttraining_config(config, run_root) if config.posttraining.enabled else None
         )
 
-        # ── 단계 ⑤: 이전 사전학습 자동 재개 ────────────────────────────
+        # ── Stage 5: discover previous stage checkpoints ─────────────────
         if not pretrain_config.training.resume_from and pretrain_resume_candidate:
             pretrain_config.training.resume_from = pretrain_resume_candidate
         if pretrain_config.training.resume_from:
             announce(
-                f"준비 ⑤: 이전 SFT 체크포인트 후보 발견 → {pretrain_config.training.resume_from}",
+                "Preparation 5: previous SFT checkpoint candidate found → "
+                f"{pretrain_config.training.resume_from}",
                 context,
             )
         if posttrain_resume_candidate:
             announce(
-                f"준비 ⑤: 이전 MRT 체크포인트 후보 발견 → {posttrain_resume_candidate}",
+                "Preparation 5: previous MRT checkpoint candidate found → "
+                f"{posttrain_resume_candidate}",
                 context,
             )
 
-        # ── DataLoader 구성 ──────────────────────────────────────────────
-        # collator: 원문/번역문을 토큰화하고 패딩해 텐서 배치로 만듭니다.
+        # ── Build DataLoaders ─────────────────────────────────────────────
+        # The collator tokenizes and pads sources/translations into tensor batches.
         collator_args = build_collator_args(config, tokenizer)
         train_collator = SionBatchCollator(
             **collator_args,
             denoise_probability=config.data.denoise_probability,
-            # 온라인 증강(원문 토큰 dropout)은 학습에만 적용합니다.
+            # Apply online source-token dropout only during training.
             source_token_dropout=config.data.source_token_dropout,
             decoder_input_noise=config.data.decoder_input_noise,
         )
         validation_collator = SionBatchCollator(
             **collator_args,
             denoise_probability=config.data.validation_denoise_probability,
-            source_token_dropout=0.0,  # 검증은 항상 깨끗한 입력으로
+            source_token_dropout=0.0,  # Validation always uses clean input.
             decoder_input_noise=0.0,
         )
-        # sampler: 비슷한 길이끼리 묶어(bucket) 패딩 낭비를 줄이고,
-        # 분산 학습에서 rank 별로 겹치지 않게 배치를 나눕니다.
+        # The sampler buckets similar lengths to reduce padding and partitions
+        # batches across ranks without overlap during distributed training.
         post_sampler: DistributedBucketBatchSampler | None = None
         post_validation_sampler: DistributedBucketBatchSampler | None = None
         if post_config is not None:
@@ -3926,11 +3978,12 @@ def main() -> None:
             context.device,
             training=False,
         )
-        # ── 모델 생성과 분산 배치 ────────────────────────────────────────
-        announce("모델을 생성하고 장치에 배치합니다.", context)
-        # 모든 CUDA 전략은 meta device에서 파라미터 수와 영구 상태 용량을 먼저
-        # 검사합니다. 통과한 뒤에만 single/DDP는 전체 모델을, FSDP2는 shard를
-        # 실제 GPU에 할당하므로 과대 구성도 constructor OOM보다 명확히 실패합니다.
+        # ── Construct and distribute the model ───────────────────────────
+        announce("Constructing the model and placing it on devices.", context)
+        # Every CUDA strategy checks parameter count and persistent-state capacity
+        # on the meta device first. Only after this passes do single/DDP allocate
+        # the full model and FSDP2 allocate shards on actual GPUs. Oversized
+        # configurations therefore fail clearly before a constructor OOM.
         parallel_strategy = resolve_parallel_strategy(
             config.training.parallel_strategy,
             context,
@@ -3942,8 +3995,8 @@ def main() -> None:
             pad_id=tokenizer.pad_id,
             parallel_strategy=parallel_strategy,
         )
-        # SFT와 MRT가 같은 DDP wrapper를 공유하므로 단계 전환 뒤의 파라미터
-        # 사용 집합까지 고려해 unused-parameter 탐지 여부를 정합니다.
+        # SFT and MRT share one DDP wrapper, so unused-parameter detection accounts
+        # for the parameter-use set after the stage transition as well.
         detect_unused_parameters = requires_ddp_unused_parameter_detection(config)
         model = parallelize_model(
             model,
@@ -3958,24 +4011,25 @@ def main() -> None:
         )
         if config.training.compile:
             model = cast(torch.nn.Module, torch.compile(model))
-        # 여기서부터의 난수(dropout, denoising 등)는 rank 별로 달라야 합니다.
+        # Runtime randomness such as dropout and denoising must differ by rank.
         seed_everything(config.training.seed, context.rank)
         announce(
-            f"모델 파라미터 수: {parameter_count:,}; 병렬 전략: {parallel_strategy}",
+            f"Model parameters: {parameter_count:,}; parallel strategy: {parallel_strategy}",
             context,
         )
         if capacity is not None:
             announce(
-                "영구 학습 상태 추정: "
-                f"rank당 {capacity['per_rank_state_gib']:.1f} GiB / "
-                f"안전 예산 {capacity['state_budget_gib']:.1f} GiB",
+                "Estimated persistent training state: "
+                f"{capacity['per_rank_state_gib']:.1f} GiB per rank / "
+                f"{capacity['state_budget_gib']:.1f} GiB safety budget",
                 context,
             )
 
-        # ── 단계 ⑤: downstream-first 체크포인트 선택 ──────────────────
-        # 가장 진행된 단계를 먼저 복구해야 이미 끝난 foundation/SFT를 다시
-        # 실행하지 않습니다. 각 논리 체크포인트의 current와 previous는 서로
-        # 독립된 lease에서 검증하고, 완전히 검증된 하나만 실제 load까지 유지합니다.
+        # ── Stage 5: select checkpoints downstream-first ─────────────────
+        # Recover the most advanced stage first so completed foundation/SFT work
+        # does not run again. Validate each logical checkpoint's current and
+        # previous generations through independent leases, retaining only one
+        # fully validated lease through the actual load.
         validated_posttrain_resume = False
         if posttrain_resume_candidate:
             assert post_config is not None
@@ -4006,7 +4060,8 @@ def main() -> None:
                 pipeline_identity = selected_pipeline
                 validated_posttrain_resume = True
                 announce(
-                    "준비 ⑤: MRT resume 전체 검증 완료 — foundation과 SFT 실행/로드를 건너뜁니다.",
+                    "Preparation 5: MRT resume fully validated; skipping "
+                    "foundation and SFT execution/loading.",
                     context,
                 )
 
@@ -4041,17 +4096,22 @@ def main() -> None:
                 pipeline_identity = selected_pipeline
                 validated_pretrain_resume = True
                 announce(
-                    "준비 ⑤: SFT resume 전체 검증 완료 — foundation 실행/로드를 건너뜁니다.",
+                    "Preparation 5: SFT resume fully validated; skipping "
+                    "foundation execution/loading.",
                     context,
                 )
 
-        # ── 단계 ⑤-b: foundation 사전학습 (복원 + reasoning) ───────────
-        # 번역쌍을 보기 전에 encoder-decoder 를 먼저 만듭니다. 이 단계의
-        # 산출물은 번역 모델이 아니라 그 파운데이션이라 별도 이름으로 나갑니다.
+        # ── Stage 5b: foundation pretraining (denoising + reasoning) ─────
+        # Build the encoder-decoder before exposing it to translation pairs.
+        # This stage produces a foundation rather than a translation model, so it
+        # is released under a separate name.
         if validated_posttrain_resume or validated_pretrain_resume:
             foundation_outcome = FoundationOutcome(
                 ran=False,
-                reason="검증된 downstream resume가 foundation 실행/로드보다 우선합니다.",
+                reason=(
+                    "A validated downstream resume takes precedence over foundation "
+                    "execution/loading."
+                ),
             )
         else:
             if discovered_foundation_plan.enabled:
@@ -4070,8 +4130,8 @@ def main() -> None:
                     prepare_foundation=True,
                 )
                 announce(
-                    "foundation 원천 코퍼스가 오프라인이므로 인증된 준비 데이터와 "
-                    "checkpoint만 사용합니다.",
+                    "The foundation source corpus is offline, so only authenticated "
+                    "prepared data and checkpoints will be used.",
                     context,
                 )
             foundation_outcome = run_foundation_before_translation(
@@ -4102,8 +4162,8 @@ def main() -> None:
         if validated_posttrain_resume:
             assert post_config is not None
             announce(
-                f"검증된 MRT 체크포인트 {post_config.training.resume_from} 를 직접 재개합니다. "
-                "foundation과 SFT는 이번 실행에서 학습하거나 로드하지 않습니다.",
+                f"Resuming validated MRT checkpoint {post_config.training.resume_from} "
+                "directly. Foundation and SFT will not be trained or loaded in this run.",
                 context,
             )
         else:
@@ -4117,11 +4177,11 @@ def main() -> None:
                 context,
             )
 
-        # ── 단계 ⑥: SFT 사전학습 ───────────────────────────────────────
+        # ── Stage 6: SFT pretraining ─────────────────────────────────────
         pretrain_result: dict[str, float | int | bool | str] | None = None
         if validated_posttrain_resume:
             announce(
-                "검증된 MRT resume가 있으므로 SFT DataLoader 생성과 학습을 건너뜁니다.",
+                "A validated MRT resume exists; skipping SFT DataLoader creation and training.",
                 context,
             )
         else:
@@ -4137,7 +4197,7 @@ def main() -> None:
                 collate_fn=validation_collator,
                 **validation_loader_args,
             )
-            announce("1단계 SFT 사전학습을 시작합니다.", context)
+            announce("Starting stage 1 SFT pretraining.", context)
             pretrain_result = train(
                 model,
                 train_loader,
@@ -4154,7 +4214,7 @@ def main() -> None:
             del train_loader, validation_loader
             if memory:
                 announce(
-                    "사전학습 메모리 정리: "
+                    "Pretraining memory cleanup: "
                     f"allocated {memory['before_allocated_gib']:.2f}→"
                     f"{memory['after_allocated_gib']:.2f} GiB, "
                     f"reserved {memory['before_reserved_gib']:.2f}→"
@@ -4164,13 +4224,13 @@ def main() -> None:
         del train_sampler, validation_sampler
         del train_collator, validation_collator
 
-        # ── 단계 ⑦: MRT 사후학습 ───────────────────────────────────────
+        # ── Stage 7: MRT posttraining ────────────────────────────────────
         if post_config is not None:
             post = config.posttraining
             assert post_sampler is not None
             assert post_validation_sampler is not None
 
-            # 보상 계산은 깨끗한 원문/정답을 기준으로 해야 하므로 증강을 끕니다.
+            # Disable augmentation because rewards require clean sources/references.
             post_collator = SionBatchCollator(
                 **collator_args,
                 denoise_probability=0.0,
@@ -4191,10 +4251,10 @@ def main() -> None:
             )
             objective = MinimumRiskObjective(tokenizer, post)
             announce(
-                f"2단계 복합 MRT/선호 사후학습을 시작합니다: "
-                f"후보 {post.samples_per_source}개, risk {post.risk_weight:.2f}, "
+                "Starting stage 2 composite MRT/preference posttraining: "
+                f"{post.samples_per_source} candidates, risk {post.risk_weight:.2f}, "
                 f"preference {post.preference_weight:.2f}, "
-                f"검증 beam {post.validation_num_beams}",
+                f"validation beam {post.validation_num_beams}",
                 context,
             )
             posttrain_result = train(
@@ -4217,7 +4277,7 @@ def main() -> None:
             )
             if memory:
                 announce(
-                    "사후학습 메모리 정리: "
+                    "Posttraining memory cleanup: "
                     f"allocated {memory['before_allocated_gib']:.2f}→"
                     f"{memory['after_allocated_gib']:.2f} GiB, "
                     f"reserved {memory['before_reserved_gib']:.2f}→"
@@ -4226,16 +4286,18 @@ def main() -> None:
                 )
             final_step = int(posttrain_result["selected_step"])
         else:
-            announce("posttraining.enabled=false — 사후학습을 건너뜁니다.", context)
+            announce("posttraining.enabled=false; skipping posttraining.", context)
             assert pretrain_result is not None
             final_step = int(pretrain_result["selected_step"])
 
-        # 중간 best/latest에서는 학습 재개와 빠른 확인에 필요한 경량 포맷만
-        # 저장합니다. 모든 학습 단계가 끝난 지금 선택된 best 가중치에서 7종을
-        # 한 번만 생성해, 매 평가 때 대형 CPU 양자화/I/O로 H100을 세우지 않습니다.
+        # Intermediate best/latest checkpoints store only lightweight formats
+        # needed for resume and quick validation. After every training stage, emit
+        # all requested formats once from the selected best weights so expensive
+        # CPU quantization and I/O do not leave an H100 idle at every evaluation.
         final_stage = "posttrain" if config.posttraining.enabled else "pretrain"
         announce(
-            "선택된 best 가중치 최종 내보내기: " + ", ".join(config.training.final_export_formats),
+            "Final export from selected best weights: "
+            + ", ".join(config.training.final_export_formats),
             context,
         )
         final_export_dir = export_final_model(
@@ -4248,7 +4310,7 @@ def main() -> None:
             authenticated_revision_directions=revision_directions,
             pipeline_identity=pipeline_identity,
         )
-        announce(f"최종 모델 내보내기 검증 완료: {final_export_dir}", context)
+        announce(f"Final model export validation complete: {final_export_dir}", context)
     finally:
         try:
             cleanup_distributed(context)

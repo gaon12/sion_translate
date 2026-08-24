@@ -2033,9 +2033,9 @@ def test_translation_initialization_log_states_the_no_corpus_release_contract() 
     )
 
     assert "fresh initialization" in message
-    assert "sion)은 학습·내보내지 않습니다" in message
+    assert "foundation model (sion) will not be trained or exported" in message
     assert "SFT/MRT" in message
-    assert "sion_translate만" in message
+    assert "only sion_translate" in message
 
 
 def test_validated_sft_resume_takes_priority_without_touching_foundation(monkeypatch) -> None:
@@ -2058,8 +2058,8 @@ def test_validated_sft_resume_takes_priority_without_touching_foundation(monkeyp
     )
 
     assert not outcome.ran
-    assert "우선 재개" in message
-    assert "foundation 단계" in message and "로드하지 않으며" in message
+    assert "Resuming" in message and "first" in message
+    assert "foundation stage" in message and "not be trained or loaded" in message
 
 
 def test_tokenizer_policy_requires_digit_splitting_and_matching_identity(
@@ -2094,7 +2094,7 @@ def test_tokenizer_policy_requires_digit_splitting_and_matching_identity(
         lambda _: True,
     )
     assert tokenizer_policy_problem(model_path, pairs) is None
-    assert "명시적 translation_directions" in str(
+    assert "explicit translation_directions" in str(
         tokenizer_policy_problem(
             model_path,
             pairs,
@@ -2103,7 +2103,7 @@ def test_tokenizer_policy_requires_digit_splitting_and_matching_identity(
         )
     )
     metadata["translation_directions"] = "ko-ja"
-    assert "형식이 잘못" in str(tokenizer_policy_problem(model_path, pairs))
+    assert "invalid format" in str(tokenizer_policy_problem(model_path, pairs))
     metadata["translation_directions"] = [["ko", "ja"]]
     assert (
         tokenizer_policy_problem(
@@ -2114,8 +2114,10 @@ def test_tokenizer_policy_requires_digit_splitting_and_matching_identity(
         )
         is None
     )
-    assert "복원 태그" in str(tokenizer_policy_problem(model_path, pairs, ("ko", "ja", "en")))
-    assert "reasoning 태그" in str(
+    assert "denoising-tag language set" in str(
+        tokenizer_policy_problem(model_path, pairs, ("ko", "ja", "en"))
+    )
+    assert "reasoning-tag language set" in str(
         tokenizer_policy_problem(model_path, pairs, ("ko", "ja"), ("ja",))
     )
 
@@ -2136,7 +2138,7 @@ def test_tokenizer_policy_requires_digit_splitting_and_matching_identity(
         "sion_translate.cli.train.SionTokenizer",
         lambda _: WrongLanguageTokenizer(),
     )
-    assert "언어 집합" in str(tokenizer_policy_problem(model_path, pairs))
+    assert "language set" in str(tokenizer_policy_problem(model_path, pairs))
 
 
 def test_explicit_direction_graph_cannot_be_backfilled_onto_a_legacy_tokenizer(

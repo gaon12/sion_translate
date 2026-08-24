@@ -153,7 +153,7 @@ def test_coordinated_peer_follows_rank_zero_lock_failure(tmp_path, monkeypatch) 
     context = DistributedContext(1, 1, 2, torch.device("cpu"), True, "gloo")
     monkeypatch.setattr(train_module, "broadcast_bool", lambda _value, _context: True)
 
-    with pytest.raises(RuntimeError, match="rank 0.*run lock"):
+    with pytest.raises(RuntimeError, match="Rank 0.*run lock"):
         with train_module.coordinated_training_run_lock(tmp_path, context):
             raise AssertionError("a peer must not enter after rank 0 failed")
 

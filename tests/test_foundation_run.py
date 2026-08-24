@@ -420,7 +420,7 @@ def test_a_second_run_reuses_the_weights_instead_of_retraining(
     outcome = run_foundation_stage(config, plan, fresh, tokenizer, context)
 
     assert not outcome.ran
-    assert "재사용" in outcome.reason
+    assert "Reused" in outcome.reason
     assert outcome.best_checkpoint is not None
     assert torch.allclose(fresh.token_embedding.weight, trained)
     assert completion.read_bytes() == original_marker
