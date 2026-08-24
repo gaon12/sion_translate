@@ -17,6 +17,14 @@ from typing import Any, Sequence, cast
 import numpy as np
 import torch
 
+from sion_translate.generation import (
+    DEFAULT_LENGTH_PENALTY,
+    DEFAULT_MAX_OUTPUT_LENGTH_MARGIN,
+    DEFAULT_MAX_OUTPUT_LENGTH_RATIO,
+    DEFAULT_MIN_NEW_TOKENS,
+    DEFAULT_NO_REPEAT_NGRAM_SIZE,
+    DEFAULT_NUM_BEAMS,
+)
 from sion_translate.glossary import Glossary, apply_source_placeholders, restore_targets
 from sion_translate.language_tags import canonicalize_language_pair, canonicalize_language_tag
 from sion_translate.model import SionForConditionalGeneration
@@ -798,8 +806,8 @@ class Translator:
         *,
         source_language: str | None = None,
         target_language: str,
-        num_beams: int = 4,
-        length_penalty: float = 1.0,
+        num_beams: int = DEFAULT_NUM_BEAMS,
+        length_penalty: float = DEFAULT_LENGTH_PENALTY,
         max_new_tokens: int = 256,
         batch_size: int = 16,
         glossary: Glossary | None = None,
@@ -813,10 +821,10 @@ class Translator:
         sampling_seed: int | None = None,
         generator: torch.Generator | None = None,
         return_rerank_details: bool = False,
-        min_new_tokens: int = 1,
-        no_repeat_ngram_size: int = 4,
-        max_output_length_ratio: float | None = 3.0,
-        max_output_length_margin: int = 16,
+        min_new_tokens: int = DEFAULT_MIN_NEW_TOKENS,
+        no_repeat_ngram_size: int = DEFAULT_NO_REPEAT_NGRAM_SIZE,
+        max_output_length_ratio: float | None = DEFAULT_MAX_OUTPUT_LENGTH_RATIO,
+        max_output_length_margin: int = DEFAULT_MAX_OUTPUT_LENGTH_MARGIN,
         reasoning_level: int | None = None,
     ) -> list[str]:
         """Translate a sequence of sentences into ``target_language``.
@@ -1109,8 +1117,8 @@ class Translator:
         *,
         source_language: str | None = None,
         target_language: str,
-        num_beams: int = 4,
-        length_penalty: float = 1.0,
+        num_beams: int = DEFAULT_NUM_BEAMS,
+        length_penalty: float = DEFAULT_LENGTH_PENALTY,
         max_new_tokens: int = 256,
         batch_size: int = 16,
         glossary: Glossary | None = None,
@@ -1124,10 +1132,10 @@ class Translator:
         sampling_seed: int | None = None,
         generator: torch.Generator | None = None,
         return_rerank_details: bool = False,
-        min_new_tokens: int = 1,
-        no_repeat_ngram_size: int = 4,
-        max_output_length_ratio: float | None = 3.0,
-        max_output_length_margin: int = 16,
+        min_new_tokens: int = DEFAULT_MIN_NEW_TOKENS,
+        no_repeat_ngram_size: int = DEFAULT_NO_REPEAT_NGRAM_SIZE,
+        max_output_length_ratio: float | None = DEFAULT_MAX_OUTPUT_LENGTH_RATIO,
+        max_output_length_margin: int = DEFAULT_MAX_OUTPUT_LENGTH_MARGIN,
         reasoning_level: int | None = None,
     ) -> list[str]:
         """Translate raw sources, excluding the revision-only control separator."""
@@ -1177,8 +1185,8 @@ class Translator:
         *,
         source_language: str | None = None,
         target_language: str,
-        num_beams: int = 4,
-        length_penalty: float = 1.0,
+        num_beams: int = DEFAULT_NUM_BEAMS,
+        length_penalty: float = DEFAULT_LENGTH_PENALTY,
         max_new_tokens: int = 256,
         batch_size: int = 16,
         reasoning_level: int | None = None,

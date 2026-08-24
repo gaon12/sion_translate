@@ -365,14 +365,44 @@ class MinimumRiskObjective:
         labels.masked_fill_(labels.eq(eos_id).cumsum(dim=-1) > 1, -100)
         return labels
 
-    def _max_new_tokens(
-        self, base: SionForConditionalGeneration, reference_labels: torch.Tensor
-    ) -> int:
-        return min(
-            self.config.max_new_tokens,
-            base.config.max_seq_len - 1,
-            reference_labels.shape[1] + 32,
+    def _forbidden_token_ids(self, base: SionForConditionalGeneration) -> tuple[int, ...]:
+        """Return the same training-only token exclusion used by deployment."""
+
+        special_ids = set(self.special_ids)
+        draft_id = getattr(self.tokenizer, "draft_id", None)
+        if draft_id is not None:
+            special_ids.add(int(draft_id))
+        return tuple(
+            sorted(
+                token_id
+                for token_id in special_ids - {self.tokenizer.eos_id}
+                if 0 <= token_id < base.config.vocab_size
+            )
         )
+
+    def _deployment_generation_limits(
+        self,
+        base: SionForConditionalGeneration,
+        attention_mask: torch.Tensor,
+    ) -> tuple[int, torch.Tensor]:
+        """Derive output limits from source lengths without consulting references."""
+
+        hard_limit = min(self.config.max_new_tokens, base.config.max_seq_len - 1)
+        minimum = self.config.decode_min_new_tokens
+        if hard_limit <= minimum:
+            raise ValueError(
+                "posttraining generation requires model/config max_new_tokens to exceed "
+                "decode_min_new_tokens"
+            )
+        # Inputs contain one target-language control token and one EOS token.
+        # This matches Translator.translate_batch's source-relative policy.
+        source_content_lengths = attention_mask.sum(dim=-1).sub(2).clamp_min(0)
+        row_limits = torch.ceil(
+            source_content_lengths.to(torch.float64) * self.config.decode_max_output_length_ratio
+        ).to(torch.long)
+        row_limits.add_(self.config.decode_max_output_length_margin)
+        row_limits.clamp_(min=minimum + 1, max=hard_limit)
+        return int(row_limits.max().item()), row_limits
 
     @staticmethod
     def _generation_features(batch: dict[str, torch.Tensor]) -> dict[str, Any]:
@@ -488,6 +518,10 @@ class MinimumRiskObjective:
             base.config.max_seq_len - 1,
             int(source_lengths.max().item()) + 32,
         )
+        roundtrip_min_new_tokens = min(
+            self.config.decode_min_new_tokens,
+            max(0, max_new_tokens - 1),
+        )
         generated = base.generate(
             reverse_inputs,
             reverse_mask,
@@ -495,6 +529,9 @@ class MinimumRiskObjective:
             eos_id=self.tokenizer.eos_id,
             max_new_tokens=max_new_tokens,
             num_beams=self.config.roundtrip_num_beams,
+            forbidden_token_ids=self._forbidden_token_ids(base),
+            min_new_tokens=roundtrip_min_new_tokens,
+            no_repeat_ngram_size=self.config.decode_no_repeat_ngram_size,
         )
         roundtrips = torch.full(
             (batch_size * samples, generated.shape[-1]),
@@ -747,15 +784,24 @@ class MinimumRiskObjective:
     def validation_metrics(
         self, model: nn.Module, batch: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        """실제 추론과 가까운 beam 출력으로 사후학습 품질을 검증합니다."""
+        """Validate with the same reference-free constraints used by deployment."""
         base = cast(SionForConditionalGeneration, unwrap_model(model))
+        max_new_tokens, row_limits = self._deployment_generation_limits(
+            base,
+            batch["attention_mask"],
+        )
         generated = base.generate(
             batch["input_ids"],
             batch["attention_mask"],
             bos_id=self.tokenizer.bos_id,
             eos_id=self.tokenizer.eos_id,
-            max_new_tokens=self._max_new_tokens(base, batch["labels"]),
+            max_new_tokens=max_new_tokens,
             num_beams=self.config.validation_num_beams,
+            length_penalty=self.config.validation_length_penalty,
+            forbidden_token_ids=self._forbidden_token_ids(base),
+            min_new_tokens=self.config.decode_min_new_tokens,
+            no_repeat_ngram_size=self.config.decode_no_repeat_ngram_size,
+            max_new_tokens_per_row=row_limits,
             **self._generation_features(batch),
         )
         roundtrip_candidates, roundtrip_mask = self._backtranslate_candidates(
@@ -819,12 +865,10 @@ class MinimumRiskObjective:
         reference_labels = batch["labels"]
         batch_size = reference_labels.shape[0]
         generation_features = self._generation_features(batch)
-        forbidden = tuple(
-            sorted(
-                token_id
-                for token_id in self.special_ids - {self.tokenizer.eos_id}
-                if 0 <= token_id < base.config.vocab_size
-            )
+        forbidden = self._forbidden_token_ids(base)
+        max_new_tokens, row_limits = self._deployment_generation_limits(
+            base,
+            batch["attention_mask"],
         )
         # Sampling and round-trip generation are no-grad operations inside the
         # trainer's autocast scope.  Prevent their detached parameter casts from
@@ -836,10 +880,13 @@ class MinimumRiskObjective:
                 bos_id=self.tokenizer.bos_id,
                 eos_id=self.tokenizer.eos_id,
                 num_samples=self.config.samples_per_source,
-                max_new_tokens=self._max_new_tokens(base, reference_labels),
+                max_new_tokens=max_new_tokens,
                 temperature=self.config.sampling_temperature,
                 top_k=self.config.top_k,
                 forbidden_token_ids=forbidden,
+                min_new_tokens=self.config.decode_min_new_tokens,
+                no_repeat_ngram_size=self.config.decode_no_repeat_ngram_size,
+                max_new_tokens_per_row=row_limits,
                 **generation_features,
             )
             roundtrip_started = time.perf_counter()

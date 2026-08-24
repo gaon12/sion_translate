@@ -19,6 +19,12 @@ from pathlib import Path
 
 from sion_translate.config import config_from_raw, load_raw_config
 from sion_translate.console import configure_stdio
+from sion_translate.generation import (
+    DEFAULT_LENGTH_PENALTY,
+    DEFAULT_MAX_OUTPUT_LENGTH_RATIO,
+    DEFAULT_NO_REPEAT_NGRAM_SIZE,
+    DEFAULT_NUM_BEAMS,
+)
 from sion_translate.glossary import load_glossary
 from sion_translate.inference import Translator, find_exported_model
 from sion_translate.iterative import refine_batch, summarize
@@ -83,7 +89,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="INT8 양자화 모델 사용 (CPU 전용, 용량·메모리 절감. 속도는 빨라지지 않음)",
     )
-    parser.add_argument("--num-beams", type=int, default=4, help="beam 수 (1=greedy, 기본 4)")
+    parser.add_argument(
+        "--num-beams",
+        type=int,
+        default=DEFAULT_NUM_BEAMS,
+        help="number of beams; use 1 for greedy decoding (default: 4)",
+    )
     parser.add_argument(
         "--candidates",
         type=int,
@@ -128,7 +139,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.01,
         help="한 라운드의 QE 개선이 이 값 미만이면 중단 (기본 0.01)",
     )
-    parser.add_argument("--length-penalty", type=float, default=1.0)
+    parser.add_argument("--length-penalty", type=float, default=DEFAULT_LENGTH_PENALTY)
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument(
         "--reasoning-level",
@@ -145,14 +156,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-repeat-ngram-size",
         type=int,
-        default=4,
-        help="이 크기의 n-gram 재생성을 금지 (0=끔, 기본 4)",
+        default=DEFAULT_NO_REPEAT_NGRAM_SIZE,
+        help="forbid repeated n-grams of this size; use 0 to disable (default: 4)",
     )
     parser.add_argument(
         "--max-output-length-ratio",
         type=float,
-        default=3.0,
-        help="원문 토큰 수 대비 출력 상한 비율 (여유 토큰 16개 별도 추가)",
+        default=DEFAULT_MAX_OUTPUT_LENGTH_RATIO,
+        help="maximum output/source token ratio, plus a separate 16-token margin",
     )
     parser.add_argument(
         "--glossary",

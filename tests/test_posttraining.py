@@ -20,6 +20,7 @@ class TextTokenizer:
     mask_id = 6
     language_tags = {"ja": 4, "ko": 5}
     denoise_tags = {"ja": 7, "ko": 8}
+    draft_id = 9
     slot_ids = [30]
     pieces = {
         10: "가격 ",
@@ -178,7 +179,7 @@ def test_roundtrip_reward_requires_recovering_the_source() -> None:
 
 def test_backtranslation_skips_rows_without_a_trained_reverse_edge() -> None:
     class RecordingGenerator:
-        config = SimpleNamespace(max_seq_len=16)
+        config = SimpleNamespace(max_seq_len=16, vocab_size=64)
 
         def __init__(self) -> None:
             self.inputs: torch.Tensor | None = None
@@ -255,7 +256,7 @@ def test_backtranslation_is_conservative_without_reverse_graph_metadata() -> Non
 
 def test_backtranslation_keeps_fsdp_rank_in_collectives_without_local_reverse_rows() -> None:
     class RecordingGenerator:
-        config = SimpleNamespace(max_seq_len=16)
+        config = SimpleNamespace(max_seq_len=16, vocab_size=64)
         _synchronize_generation_across_ranks = True
 
         def __init__(self) -> None:
@@ -555,6 +556,8 @@ class MemoryAwareCandidateScorer(TinyCandidateScorer):
         self.config = SimpleNamespace(label_smoothing=0.1, max_seq_len=16, vocab_size=64)
         self.sample_memory: dict[str, torch.Tensor] = {}
         self.generate_memory: dict[str, torch.Tensor] = {}
+        self.sample_options: dict[str, object] = {}
+        self.generate_options: dict[str, object] = {}
         self.scoring_memory: list[torch.Tensor] = []
 
     @staticmethod
@@ -577,6 +580,7 @@ class MemoryAwareCandidateScorer(TinyCandidateScorer):
     ) -> torch.Tensor:
         del attention_mask
         self.sample_memory = self._memory_from(kwargs)
+        self.sample_options = dict(kwargs)
         candidates = torch.tensor(
             [[2, 20, 21, 3], [2, 20, 22, 3]],
             device=input_ids.device,
@@ -591,6 +595,7 @@ class MemoryAwareCandidateScorer(TinyCandidateScorer):
     ) -> torch.Tensor:
         del attention_mask
         self.generate_memory = self._memory_from(kwargs)
+        self.generate_options = dict(kwargs)
         return torch.tensor(
             [[2, 20, 21, 3]],
             device=input_ids.device,
@@ -649,11 +654,52 @@ def test_tetm_memory_is_shared_by_sampling_scoring_and_validation_generation() -
         torch.testing.assert_close(model.sample_memory[name], batch[name])
     assert model.scoring_memory
     assert all(memory.shape[-2:] == (1, 1) for memory in model.scoring_memory)
+    assert model.sample_options["min_new_tokens"] == 1
+    assert model.sample_options["no_repeat_ngram_size"] == 4
+    assert model.sample_options["forbidden_token_ids"] == (0, 2, 4, 5, 6, 7, 8, 9)
+    torch.testing.assert_close(
+        model.sample_options["max_new_tokens_per_row"],  # type: ignore[arg-type]
+        torch.tensor([4]),
+    )
 
     objective.validation_metrics(model, batch)
     assert set(model.generate_memory) == expected_names
     for name in expected_names:
         torch.testing.assert_close(model.generate_memory[name], batch[name])
+    assert model.generate_options["length_penalty"] == 1.0
+    assert model.generate_options["min_new_tokens"] == 1
+    assert model.generate_options["no_repeat_ngram_size"] == 4
+    assert model.generate_options["forbidden_token_ids"] == (0, 2, 4, 5, 6, 7, 8, 9)
+    torch.testing.assert_close(
+        model.generate_options["max_new_tokens_per_row"],  # type: ignore[arg-type]
+        torch.tensor([4]),
+    )
+
+
+def test_posttraining_generation_limits_ignore_reference_length() -> None:
+    config = PostTrainingConfig(
+        max_new_tokens=20,
+        decode_max_output_length_ratio=2.0,
+        decode_max_output_length_margin=3,
+    )
+    objective = MinimumRiskObjective(TextTokenizer(), config)
+    model = MemoryAwareCandidateScorer()
+    attention_mask = torch.tensor(
+        [
+            [True, True, True, True, False, False],
+            [True, True, True, True, True, True],
+        ]
+    )
+
+    max_new_tokens, row_limits = objective._deployment_generation_limits(
+        model,  # type: ignore[arg-type]
+        attention_mask,
+    )
+
+    # Remove the language tag and source EOS before applying the ratio:
+    # (4 - 2) * 2 + 3 = 7 and (6 - 2) * 2 + 3 = 11.
+    assert max_new_tokens == 11
+    torch.testing.assert_close(row_limits, torch.tensor([7, 11]))
 
 
 def test_reward_cpu_work_overlaps_candidate_scoring_and_reports_wait_telemetry() -> None:

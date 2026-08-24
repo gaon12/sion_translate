@@ -434,6 +434,11 @@ _POSTTRAINING_OBJECTIVE_FIELDS = (
     "roundtrip_num_beams",
     "roundtrip_max_new_tokens",
     "validation_num_beams",
+    "validation_length_penalty",
+    "decode_min_new_tokens",
+    "decode_no_repeat_ngram_size",
+    "decode_max_output_length_ratio",
+    "decode_max_output_length_margin",
     "selection_metric",
 )
 

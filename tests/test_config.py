@@ -538,6 +538,38 @@ def test_posttraining_memory_batch_sizes_must_be_positive(field: str) -> None:
 @pytest.mark.parametrize(
     ("field", "value"),
     [
+        ("decode_min_new_tokens", -1),
+        ("decode_min_new_tokens", True),
+        ("decode_no_repeat_ngram_size", -1),
+        ("decode_no_repeat_ngram_size", 2.5),
+        ("decode_max_output_length_margin", -1),
+        ("decode_max_output_length_ratio", 0.0),
+        ("decode_max_output_length_ratio", float("nan")),
+        ("validation_length_penalty", 0.0),
+        ("validation_length_penalty", float("inf")),
+    ],
+)
+def test_posttraining_deployment_decoding_policy_is_validated(
+    field: str,
+    value: object,
+) -> None:
+    config = AppConfig()
+    setattr(config.posttraining, field, value)
+    with pytest.raises(ValueError, match=field):
+        config.validate()
+
+
+def test_posttraining_minimum_generation_length_must_fit_the_hard_limit() -> None:
+    config = AppConfig()
+    config.posttraining.max_new_tokens = 4
+    config.posttraining.decode_min_new_tokens = 4
+    with pytest.raises(ValueError, match="smaller than max_new_tokens"):
+        config.validate()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
         ("roundtrip_reward_weight", -0.1),
         ("roundtrip_failure_penalty", 1.1),
         ("roundtrip_min_score", -0.1),

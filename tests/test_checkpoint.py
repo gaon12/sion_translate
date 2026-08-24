@@ -2783,6 +2783,11 @@ def test_reward_weights_are_part_of_the_posttraining_identity() -> None:
         ("samples_per_source", 8),
         ("selection_metric", "macro_direction_reward"),
         ("validation_num_beams", 1),
+        ("validation_length_penalty", 0.8),
+        ("decode_min_new_tokens", 2),
+        ("decode_no_repeat_ngram_size", 3),
+        ("decode_max_output_length_ratio", 2.5),
+        ("decode_max_output_length_margin", 8),
     ):
         changed = _objective_config()
         setattr(changed.posttraining, field, value)

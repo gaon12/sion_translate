@@ -31,6 +31,14 @@ from sion_translate.data.records import (
     normalize_language_pairs,
     normalize_translation_directions,
 )
+from sion_translate.generation import (
+    DEFAULT_LENGTH_PENALTY,
+    DEFAULT_MAX_OUTPUT_LENGTH_MARGIN,
+    DEFAULT_MAX_OUTPUT_LENGTH_RATIO,
+    DEFAULT_MIN_NEW_TOKENS,
+    DEFAULT_NO_REPEAT_NGRAM_SIZE,
+    DEFAULT_NUM_BEAMS,
+)
 from sion_translate.language_tags import canonicalize_language_pair, canonicalize_language_tags
 from sion_translate.synthetic import (
     DEFAULT_SYNTHETIC_PREFIXES,
@@ -704,8 +712,16 @@ class PostTrainingConfig:
     roundtrip_min_score: float = 0.55
     roundtrip_num_beams: int = 1
     roundtrip_max_new_tokens: int = 256
-    # best/early stopping은 이 beam 수로 생성한 번역의 복합 보상을 사용합니다.
-    validation_num_beams: int = 4
+    # Candidate sampling and best-model validation use the same constraints as
+    # deployment. These fields are part of checkpoint identity because changing
+    # them changes both the optimized candidate distribution and the metric used
+    # for early stopping.
+    validation_num_beams: int = DEFAULT_NUM_BEAMS
+    validation_length_penalty: float = DEFAULT_LENGTH_PENALTY
+    decode_min_new_tokens: int = DEFAULT_MIN_NEW_TOKENS
+    decode_no_repeat_ngram_size: int = DEFAULT_NO_REPEAT_NGRAM_SIZE
+    decode_max_output_length_ratio: float = DEFAULT_MAX_OUTPUT_LENGTH_RATIO
+    decode_max_output_length_margin: int = DEFAULT_MAX_OUTPUT_LENGTH_MARGIN
     # MRT best 선택 지표. 평균 reward 하나로 고르면 한 방향이 후퇴해도 다른
     # 방향이 더 오르면 그 체크포인트가 best 가 됩니다. 이 저장소는 이미
     # ko→ja 59.81 대 ja→ko 49.87 로 방향 격차가 있어서, 평균만 보면 격차가
@@ -866,6 +882,35 @@ class AppConfig:
         ):
             if value <= 0:
                 raise ValueError(f"posttraining.{name} must be positive")
+        for name, value in (
+            ("decode_min_new_tokens", post.decode_min_new_tokens),
+            ("decode_no_repeat_ngram_size", post.decode_no_repeat_ngram_size),
+            ("decode_max_output_length_margin", post.decode_max_output_length_margin),
+        ):
+            if type(value) is not int:
+                raise ValueError(f"posttraining.{name} must be an integer")
+            if value < 0:
+                raise ValueError(f"posttraining.{name} must be non-negative")
+        if post.decode_min_new_tokens >= post.max_new_tokens:
+            raise ValueError(
+                "posttraining.decode_min_new_tokens must be smaller than max_new_tokens"
+            )
+        if (
+            type(post.validation_length_penalty) not in (int, float)
+            or not math.isfinite(post.validation_length_penalty)
+            or post.validation_length_penalty <= 0
+        ):
+            raise ValueError(
+                "posttraining.validation_length_penalty must be a positive finite number"
+            )
+        if (
+            type(post.decode_max_output_length_ratio) not in (int, float)
+            or not math.isfinite(post.decode_max_output_length_ratio)
+            or post.decode_max_output_length_ratio <= 0
+        ):
+            raise ValueError(
+                "posttraining.decode_max_output_length_ratio must be a positive finite number"
+            )
         if post.max_steps is not None and post.max_steps <= 0:
             raise ValueError("posttraining.max_steps must be positive when specified")
         if post.samples_per_source < 2:
