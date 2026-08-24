@@ -68,7 +68,7 @@ def test_a_folder_that_is_not_a_configured_language_is_reported_not_read(tmp_pat
     assert "korean_tech_corpus_130m" not in discovery.languages
     assert discovery.unconfigured_languages == ()
     reasons = {entry.path.name: entry.reason for entry in discovery.skipped}
-    assert "언어 코드 형식이 아닌" in reasons["korean_tech_corpus_130m"]
+    assert "not a valid language tag" in reasons["korean_tech_corpus_130m"]
 
 
 def test_a_valid_language_code_that_is_not_configured_is_named(tmp_path) -> None:
@@ -137,8 +137,8 @@ def test_stray_top_level_files_are_reported(tmp_path) -> None:
     discovery = discover_monolingual_sources(root, ["ko", "ja"])
 
     reasons = {entry.path.name: entry.reason for entry in discovery.skipped}
-    assert "언어 폴더가 아닌" in reasons["a.py"]
-    assert "언어 폴더가 아닌" in reasons["data.txt"]
+    assert "not a language directory" in reasons["a.py"]
+    assert "not a language directory" in reasons["data.txt"]
 
 
 def test_empty_files_are_reported_not_silently_dropped(tmp_path) -> None:
@@ -148,7 +148,7 @@ def test_empty_files_are_reported_not_silently_dropped(tmp_path) -> None:
     discovery = discover_monolingual_sources(root, ["ko", "ja"])
 
     reasons = {entry.path.name: entry.reason for entry in discovery.skipped}
-    assert reasons["empty.txt"] == "빈 파일"
+    assert reasons["empty.txt"] == "empty file"
 
 
 def test_a_missing_root_reports_every_language_as_empty(tmp_path) -> None:
@@ -272,7 +272,7 @@ def test_a_language_with_no_data_produces_a_warning() -> None:
 def test_a_thin_language_produces_a_warning() -> None:
     report = assess_language_balance({"ko": 10_000_000, "ja": 100}, alpha=1.0)
     assert not report.is_balanced()
-    assert any("비중" in warning for warning in report.warnings)
+    assert any("batch share" in warning for warning in report.warnings)
 
 
 def test_a_balanced_corpus_produces_no_warning() -> None:

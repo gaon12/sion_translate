@@ -278,7 +278,7 @@ def test_same_size_source_mutation_invalidates_the_prepared_dataset(
 
     problem = _dataset_problem(tmp_path, discovery, tokenizer_model)
     assert problem is not None
-    assert "내용" in problem
+    assert "content changed" in problem
 
 
 def test_corrupt_source_id_invalidates_manifest_before_dataset_loading(
@@ -365,7 +365,7 @@ def test_unreadable_source_reports_the_failing_path(tmp_path, tokenizer_model) -
 
     problem = _dataset_problem(tmp_path, discovery, tokenizer_model)
     assert problem is not None
-    assert "hash를 읽을 수 없습니다" in problem
+    assert "Cannot read the foundation source hash" in problem
     assert str(source_path) in problem
 
 
@@ -483,7 +483,7 @@ def test_source_mutation_aborts_publication_and_removes_staging(
         record_inventory_call,
     )
 
-    with pytest.raises(RuntimeError, match="준비 중 변경"):
+    with pytest.raises(RuntimeError, match="changed during preparation"):
         prepare_foundation_dataset(discovery, tokenizer_model, tmp_path / "dataset")
 
     assert not inventory_called
@@ -518,7 +518,7 @@ def test_tokenizer_mutation_aborts_publication_and_removes_staging(
         iter_then_mutate_tokenizer,
     )
 
-    with pytest.raises(RuntimeError, match="tokenizer가 준비 중 변경"):
+    with pytest.raises(RuntimeError, match="Foundation tokenizer changed during preparation"):
         prepare_foundation_dataset(discovery, local_tokenizer, tmp_path / "dataset")
 
     assert mutated
@@ -551,7 +551,7 @@ def test_new_source_added_during_build_aborts_publication(
         iter_then_add_source,
     )
 
-    with pytest.raises(RuntimeError, match="원천 파일 목록이 준비 중 변경"):
+    with pytest.raises(RuntimeError, match="Foundation source list changed during preparation"):
         prepare_foundation_dataset(discovery, tokenizer_model, tmp_path / "dataset")
 
     assert added_source.is_file()
@@ -591,7 +591,7 @@ def test_source_mutation_during_inventory_is_caught_even_with_restored_metadata(
         inventory_then_mutate,
     )
 
-    with pytest.raises(RuntimeError, match="준비 중 변경"):
+    with pytest.raises(RuntimeError, match="changed during preparation"):
         prepare_foundation_dataset(discovery, tokenizer_model, tmp_path / "dataset")
 
     assert not (tmp_path / "dataset").exists()
@@ -866,7 +866,7 @@ def test_a_tokenizer_without_the_language_tags_is_refused(tmp_path, tokenizer_mo
 
 def test_an_empty_discovery_is_refused(tmp_path, tokenizer_model) -> None:
     discovery = discover_monolingual_sources(tmp_path / "absent", ["ko"])
-    with pytest.raises(ValueError, match="학습 가능한 파일이 없습니다"):
+    with pytest.raises(ValueError, match="no usable training files"):
         prepare_foundation_dataset(discovery, tokenizer_model, tmp_path / "dataset")
 
 
