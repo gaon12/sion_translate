@@ -176,7 +176,7 @@ def test_cli_direction_resolution_supports_structured_bcp47_pairs() -> None:
 def test_cli_direction_resolution_rejects_canonical_model_duplicates() -> None:
     directions = (("zh-hant", "X-ACME"), ("zh-Hant", "x-acme"))
 
-    with pytest.raises(SystemExit, match="중복"):
+    with pytest.raises(SystemExit, match="duplicate"):
         resolve_evaluation_directions(None, directions)
 
 
@@ -184,7 +184,7 @@ def test_comparison_output_requires_an_exact_line_count(tmp_path: Path) -> None:
     comparison = tmp_path / "comparison.txt"
     comparison.write_text("first\nsecond\nthird\n", encoding="utf-8")
 
-    with pytest.raises(SystemExit, match=r"3줄 != 평가쌍 2개"):
+    with pytest.raises(SystemExit, match=r"3 translation lines != 2 evaluation pairs"):
         evaluate_cli._read_comparison_lines(comparison, expected_count=2)
 
     comparison.write_text("first\nsecond\n", encoding="utf-8")
@@ -198,11 +198,11 @@ def test_comparison_specs_require_distinct_trimmed_names_and_paths() -> None:
     assert evaluate_cli._parse_comparison_specs([" Service = output.txt "]) == [
         ("Service", "output.txt")
     ]
-    with pytest.raises(SystemExit, match="형식"):
+    with pytest.raises(SystemExit, match="NAME=FILE format"):
         evaluate_cli._parse_comparison_specs([" =output.txt"])
-    with pytest.raises(SystemExit, match="중복"):
+    with pytest.raises(SystemExit, match="Duplicate"):
         evaluate_cli._parse_comparison_specs(["Service=a.txt", " service =b.txt"])
-    with pytest.raises(SystemExit, match="예약"):
+    with pytest.raises(SystemExit, match="reserved"):
         evaluate_cli._parse_comparison_specs(["SION=external.txt"])
 
 
@@ -230,14 +230,14 @@ def test_result_markdown_escapes_untrusted_labels() -> None:
 def test_translate_target_resolution_uses_reachable_model_edges() -> None:
     directions = (("de", "fr"), ("fr", "de"), ("sw", "ar"))
 
-    with pytest.raises(SystemExit, match="--from LANG 또는 --to LANG"):
+    with pytest.raises(SystemExit, match="--from LANG or --to LANG"):
         resolve_translation_target(None, None, directions)
     assert resolve_translation_target(None, None, (("de", "fr"),)) == "fr"
     assert resolve_translation_target(None, "sw", directions) == "ar"
     assert resolve_translation_target("de", "fr", directions) == "de"
-    with pytest.raises(SystemExit, match="출발하는 학습 방향"):
+    with pytest.raises(SystemExit, match="No trained direction starts"):
         resolve_translation_target(None, "ar", directions)
-    with pytest.raises(SystemExit, match="학습된 target"):
+    with pytest.raises(SystemExit, match="not a trained target"):
         resolve_translation_target("sw", None, directions)
 
 
@@ -252,7 +252,7 @@ def test_translate_target_resolution_requires_target_for_branching_source() -> N
 def test_translate_direction_resolution_fills_only_unambiguous_endpoints() -> None:
     directions = (("ko", "ja"), ("en", "de"), ("fr", "de"))
 
-    with pytest.raises(SystemExit, match="--from LANG 또는 --to LANG"):
+    with pytest.raises(SystemExit, match="--from LANG or --to LANG"):
         resolve_translation_direction(None, None, directions)
     assert resolve_translation_direction(None, None, (("ko", "ja"),)) == ("ko", "ja")
     assert resolve_translation_direction("ja", None, directions) == ("ko", "ja")
@@ -267,14 +267,14 @@ def test_translate_target_resolution_canonicalizes_bcp47_cli_identities() -> Non
     assert resolve_translation_target(None, "ZH-hant", directions) == "x-acme"
     assert resolve_translation_target("X-ACME", "zh-Hant", directions) == "x-acme"
 
-    with pytest.raises(SystemExit, match="학습되지 않은 방향"):
+    with pytest.raises(SystemExit, match="not a trained direction"):
         resolve_translation_target("zh-Hant", "x-acme", directions)
 
 
 def test_translate_target_resolution_rejects_canonical_model_duplicates() -> None:
     directions = (("zh-hant", "X-ACME"), ("zh-Hant", "x-acme"))
 
-    with pytest.raises(SystemExit, match="중복"):
+    with pytest.raises(SystemExit, match="duplicate"):
         resolve_translation_target(None, None, directions)
 
 

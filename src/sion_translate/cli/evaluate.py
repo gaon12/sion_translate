@@ -1,20 +1,21 @@
-"""번역 품질 평가 CLI — 고정 평가셋에서 chrF/BLEU 를 측정합니다.
+"""Measure chrF/BLEU on a fixed translation evaluation set.
 
-    sion-evaluate                          # 자체 test split 양방향 평가
-    sion-evaluate --benchmark flores.jsonl # 외부 벤치마크(JSONL) 평가
+    sion-evaluate                          # Evaluate every direction on the test split
+    sion-evaluate --benchmark flores.jsonl # Evaluate an external JSONL benchmark
     sion-evaluate --direction ko ja \
       --compare deepl=deepl_out.txt \
-      --compare google=google_out.txt     # 외부 서비스 출력과 비교
+      --compare google=google_out.txt     # Compare external-service output
 
-외부 서비스 비교 방법:
-    1. sion-evaluate --direction ko ja --export-sources src.txt 로
-       평가셋 원문을 파일로 뽑습니다.
-    2. 그 원문을 DeepL/Google/Papago 등에 넣어 번역 결과를
-       한 줄에 한 문장씩 파일로 저장합니다.
-    3. --compare 서비스이름=결과파일 로 넘기면 같은 정답에 대해
-       같은 지표로 나란히 채점됩니다.
+To compare an external service:
+    1. Export evaluation sources with
+       sion-evaluate --direction ko ja --export-sources src.txt.
+    2. Translate those sources with DeepL, Google, Papago, or another service,
+       then save one translation per line.
+    3. Pass --compare SERVICE=OUTPUT_FILE to score it against the same references
+       with the same metrics.
 
-결과는 터미널 표 + reports/evaluation-*.json/.md 로 저장됩니다.
+Results are printed as a terminal table and saved under
+reports/evaluation-*.json/.md.
 """
 
 # CLI registry callables are discovered dynamically.
@@ -47,50 +48,62 @@ DEFAULT_CONFIG_FILE = "sion_translate.yaml"
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Evaluate translation quality (chrF/BLEU)")
-    parser.add_argument("--split", default="test", help="평가할 데이터셋 split (기본: test)")
+    parser.add_argument("--split", default="test", help="Dataset split to evaluate (default: test)")
     parser.add_argument(
         "--benchmark",
         action="append",
         default=[],
-        help="외부 벤치마크 JSONL 경로 (지정하면 split 대신 사용; 여러 번 지정 가능)",
+        help=(
+            "External benchmark JSONL path. When provided, it replaces --split; "
+            "may be specified repeatedly."
+        ),
     )
     parser.add_argument(
         "--direction",
         nargs="+",
         metavar="LANG",
         help=(
-            "평가 방향: --direction SOURCE TARGET (기본: 모든 학습 방향). "
-            "하이픈이 없는 단순 태그는 기존 ko-ja 형식도 지원"
+            "Evaluation direction: --direction SOURCE TARGET (default: every "
+            "trained direction). Simple tags without hyphens also accept the "
+            "legacy ko-ja form."
         ),
     )
-    parser.add_argument("--max-samples", type=int, default=500, help="방향당 최대 평가 문장 수")
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=500,
+        help="Maximum evaluation sentences per direction",
+    )
     parser.add_argument("--num-beams", type=int, default=4)
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--model", help="내보낸 모델 경로 (기본: exports 자동 탐색)")
-    parser.add_argument("--int8", action="store_true", help="INT8 양자화 모델 평가")
+    parser.add_argument("--model", help="Exported model path (default: discover from exports)")
+    parser.add_argument("--int8", action="store_true", help="Evaluate the INT8 quantized model")
     parser.add_argument(
         "--compare",
         action="append",
         default=[],
         metavar="NAME=FILE",
-        help="외부 시스템 출력 파일(한 줄=한 번역). --direction 지정 필요",
+        help="External-system output file, one translation per line; requires --direction",
     )
     parser.add_argument(
         "--export-sources",
-        help="평가셋 원문을 이 파일로 저장 (외부 서비스에 넣을 입력 추출용). --direction 지정 필요",
+        help=("Save evaluation sources to this file for an external service; requires --direction"),
     )
-    parser.add_argument("--output", help="결과 저장 경로 (기본: reports/evaluation-<시각>)")
+    parser.add_argument("--output", help="Result path (default: reports/evaluation-<timestamp>)")
     parser.add_argument(
         "--glossary",
-        help="용어집 JSON 경로 (지정 시 sion_translate 번역에 용어 강제 적용; 기본: 설정의 data.glossary)",
+        help=(
+            "Glossary JSON path used to force terms in sion_translate output "
+            "(default: configuration data.glossary)"
+        ),
     )
     parser.add_argument(
         "--no-glossary",
         action="store_true",
-        help="설정에 글로서리가 있어도 평가에서는 사용하지 않음",
+        help="Disable the glossary for evaluation even when one is configured",
     )
-    parser.add_argument("--config", help=f"설정 파일 (기본: {DEFAULT_CONFIG_FILE})")
+    parser.add_argument("--config", help=f"Configuration file (default: {DEFAULT_CONFIG_FILE})")
     return parser
 
 
@@ -116,14 +129,14 @@ def resolve_evaluation_directions(
             raise SystemExit(str(error)) from error
         if direction in seen:
             raise SystemExit(
-                "모델 translation_directions에 BCP 47 정규화 후 중복인 방향이 "
-                f"있습니다: {_direction_label(*direction)}"
+                "Model translation_directions contains a duplicate after BCP 47 "
+                f"normalization: {_direction_label(*direction)}"
             )
         seen.add(direction)
         directions.append(direction)
 
     if not directions:
-        raise SystemExit("모델에 인증된 translation_directions가 없습니다")
+        raise SystemExit("The model has no authenticated translation_directions.")
 
     tokens = (requested,) if isinstance(requested, str) else tuple(requested or ())
     if not tokens or tokens == ("both",):
@@ -152,7 +165,7 @@ def resolve_evaluation_directions(
             return matches
 
     valid = ", ".join(f"--direction {source} {target}" for source, target in directions)
-    raise SystemExit(f"--direction은 SOURCE TARGET 두 개의 언어 태그로 지정하세요 (지원: {valid})")
+    raise SystemExit(f"--direction requires two language tags: SOURCE TARGET (supported: {valid})")
 
 
 def _direction_label(source_language: str, target_language: str) -> str:
@@ -167,8 +180,8 @@ def _read_comparison_lines(file_path: str | Path, *, expected_count: int) -> lis
     lines = Path(file_path).read_text(encoding="utf-8").splitlines()
     if len(lines) != expected_count:
         raise SystemExit(
-            f"{file_path}: 번역 {len(lines)}줄 != 평가쌍 {expected_count}개 — "
-            "줄 수가 평가셋과 정확히 일치해야 합니다"
+            f"{file_path}: {len(lines)} translation lines != {expected_count} "
+            "evaluation pairs; the line count must match the evaluation set exactly"
         )
     return lines
 
@@ -181,12 +194,14 @@ def _parse_comparison_specs(specs: Sequence[str]) -> list[tuple[str, str]]:
         name = raw_name.strip()
         file_path = raw_path.strip()
         if not separator or not name or not file_path:
-            raise SystemExit(f"--compare 형식은 이름=파일 입니다: {spec}")
+            raise SystemExit(f"--compare must use NAME=FILE format: {spec}")
         identity = name.casefold()
         if identity == "sion":
-            raise SystemExit("--compare 시스템 이름 'sion'은 내장 모델 레이블로 예약되어 있습니다")
+            raise SystemExit(
+                "The --compare system name 'sion' is reserved for the built-in model label"
+            )
         if identity in seen_names:
-            raise SystemExit(f"--compare 시스템 이름이 중복됩니다: {name}")
+            raise SystemExit(f"Duplicate --compare system name: {name}")
         seen_names.add(identity)
         parsed.append((name, file_path))
     return parsed
@@ -203,24 +218,24 @@ def main() -> None:
     model_path = args.model or find_exported_model(config.training.output_dir, int8=args.int8)
     translator = Translator(model_path, config.data.tokenizer_model)
 
-    # ── 평가 방향 결정 ──────────────────────────────────────────────────
+    # ── Resolve evaluation directions ────────────────────────────────────
     directions = resolve_evaluation_directions(args.direction, translator.translation_directions)
     if (args.compare or args.export_sources) and len(directions) != 1:
         raise SystemExit(
-            "--compare / --export-sources 는 --direction 을 한 방향으로 지정해야 합니다"
+            "--compare / --export-sources require --direction to select exactly one direction"
         )
     comparison_specs = _parse_comparison_specs(args.compare)
 
-    # ── 글로서리 (선택) ─────────────────────────────────────────────────
+    # ── Optional glossary ────────────────────────────────────────────────
     glossary = None
     glossary_path = None if args.no_glossary else (args.glossary or config.data.glossary)
     if glossary_path:
         glossary = load_glossary(glossary_path)
-        log(f"글로서리 적용: {glossary_path} ({len(glossary)}개 용어)")
+        log(f"Applying glossary: {glossary_path} ({len(glossary)} terms)")
 
-    # ── 평가쌍 로드 ─────────────────────────────────────────────────────
+    # ── Load evaluation pairs ────────────────────────────────────────────
     if args.benchmark:
-        log(f"벤치마크 로드: {', '.join(args.benchmark)}")
+        log(f"Loading benchmark: {', '.join(args.benchmark)}")
         pairs = load_benchmark_pairs(
             args.benchmark,
             translator.language_pairs,
@@ -229,7 +244,7 @@ def main() -> None:
         )
         eval_set_name = ";".join(args.benchmark)
     else:
-        log(f"자체 {args.split} split 로드 (학습에 전혀 노출되지 않은 holdout)")
+        log(f"Loading internal {args.split} split (a holdout never exposed to training)")
         pairs = load_split_pairs(
             config.data.dataset_dir,
             args.split,
@@ -239,28 +254,31 @@ def main() -> None:
         )
         eval_set_name = f"dataset:{args.split}"
 
-    # ── (선택) 외부 서비스용 원문 추출 ──────────────────────────────────
+    # ── Optionally export sources for an external service ────────────────
     if args.export_sources:
         direction = directions[0]
         sources = [source for source, _ in pairs.get(direction, [])]
         Path(args.export_sources).write_text("\n".join(sources) + "\n", encoding="utf-8")
         log(
-            f"원문 {len(sources)}문장 저장: {args.export_sources} "
-            f"(외부 서비스 번역 후 --compare 로 넘기세요)"
+            f"Saved {len(sources)} source sentences to {args.export_sources}. "
+            "Translate them with the external service, then pass its output via --compare."
         )
 
-    # ── 평가 실행 ───────────────────────────────────────────────────────
+    # ── Run evaluation ───────────────────────────────────────────────────
     results: list[DirectionResult] = []
     for source_language, target_language in directions:
         samples = pairs.get((source_language, target_language), [])
         if not samples:
-            log(f"{_direction_label(source_language, target_language)}: 평가쌍이 없어 건너뜁니다")
+            log(
+                f"{_direction_label(source_language, target_language)}: "
+                "no evaluation pairs; skipping"
+            )
             continue
         sources = [source for source, _ in samples]
         references = [reference for _, reference in samples]
         direction_name = _direction_label(source_language, target_language)
 
-        log(f"{direction_name}: {len(samples)}문장 번역 중 (beam {args.num_beams})...")
+        log(f"{direction_name}: translating {len(samples)} sentences (beam {args.num_beams})...")
         started = time.perf_counter()
         hypotheses = translator.translate(
             sources,
@@ -291,18 +309,18 @@ def main() -> None:
             )
         )
         number_summary = (
-            f"숫자 F1 {number_result.f1:.2f} "
-            f"(일치 {number_result.exact}/{number_result.samples}, "
-            f"환각 {number_result.inventions})"
+            f"number F1 {number_result.f1:.2f} "
+            f"(exact {number_result.exact}/{number_result.samples}, "
+            f"inventions {number_result.inventions})"
             if number_result.samples
-            else "숫자 문장 없음"
+            else "no sentences with numbers"
         )
         log(
             f"{direction_name}: chrF {chrf:.2f} / BLEU {bleu:.2f} / "
-            f"{number_summary} ({elapsed:.0f}초)"
+            f"{number_summary} ({elapsed:.0f}s)"
         )
 
-        # 외부 시스템 출력 채점 (같은 정답, 같은 지표)
+        # Score external output against the same references and metrics.
         for name, file_path in comparison_specs:
             hypotheses = _read_comparison_lines(
                 file_path,
@@ -328,9 +346,9 @@ def main() -> None:
             )
 
     if not results:
-        raise SystemExit("평가할 데이터가 없습니다.")
+        raise SystemExit("No data is available for evaluation.")
 
-    # ── 결과 출력·저장 ──────────────────────────────────────────────────
+    # ── Print and save results ───────────────────────────────────────────
     print()
     print(results_as_markdown(results))
     output = args.output or f"reports/evaluation-{time.strftime('%Y%m%d-%H%M%S')}"
@@ -349,7 +367,7 @@ def main() -> None:
             "evaluated_directions": [list(direction) for direction in directions],
         },
     )
-    log(f"저장: {output}.json / {output}.md")
+    log(f"Saved: {output}.json / {output}.md")
 
 
 if __name__ == "__main__":

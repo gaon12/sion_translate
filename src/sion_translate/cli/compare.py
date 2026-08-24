@@ -1,4 +1,4 @@
-"""여러 번역 시스템의 JSONL 출력을 동일 조건으로 비교한다."""
+"""Compare JSONL outputs from multiple translation systems consistently."""
 
 from __future__ import annotations
 
@@ -20,15 +20,18 @@ from sion_translate.evaluation import results_as_markdown
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Compare translation output JSONL files")
-    parser.add_argument("--cases", required=True, help="비교 문장 JSONL")
+    parser.add_argument("--cases", required=True, help="Comparison cases in JSONL format")
     parser.add_argument(
         "--system",
         action="append",
         required=True,
         metavar="NAME=FILE",
-        help="시스템 이름과 번역 출력 JSONL (여러 번 지정)",
+        help="System name and translation-output JSONL; may be specified repeatedly",
     )
-    parser.add_argument("--output", help="결과 경로 확장자 제외 (기본: reports/comparison-시각)")
+    parser.add_argument(
+        "--output",
+        help="Result path without an extension (default: reports/comparison-<timestamp>)",
+    )
     return parser
 
 
@@ -42,10 +45,10 @@ def parse_system_specs(specs: Sequence[str]) -> list[tuple[str, str]]:
         name = raw_name.strip()
         path = raw_path.strip()
         if not separator or not name or not path:
-            raise ValueError(f"--system 형식은 NAME=FILE 입니다: {spec}")
+            raise ValueError(f"--system must use NAME=FILE format: {spec}")
         identity = name.casefold()
         if identity in seen_identities:
-            raise ValueError(f"중복 시스템 이름: {name}")
+            raise ValueError(f"Duplicate system name: {name}")
         seen_identities.add(identity)
         parsed.append((name, path))
     return parsed
@@ -76,7 +79,7 @@ def main() -> None:
     print(results_as_markdown(results))
     print()
     print(category_results_as_markdown(category_results))
-    print(f"저장: {output}.json / {output}.md")
+    print(f"Saved: {output}.json / {output}.md")
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""비교 문장 JSONL을 sion_translate 또는 공개 baseline으로 번역한다."""
+"""Translate comparison-case JSONL with sion_translate or a public baseline."""
 
 from __future__ import annotations
 
@@ -16,14 +16,17 @@ from sion_translate.console import configure_stdio
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Translate comparison cases to output JSONL")
-    parser.add_argument("--cases", required=True, help="비교 문장 JSONL")
-    parser.add_argument("--output", required=True, help="번역 출력 JSONL")
+    parser.add_argument("--cases", required=True, help="Comparison cases in JSONL format")
+    parser.add_argument("--output", required=True, help="Translation output in JSONL format")
     parser.add_argument("--backend", required=True, choices=("sion", *HF_BASELINES))
-    parser.add_argument("--model", help="sion_translate export(.pt); backend=sion에서 필수")
+    parser.add_argument("--model", help="sion_translate export (.pt); required for backend=sion")
     parser.add_argument(
-        "--tokenizer", help="sion_translate SentencePiece(.model); backend=sion에서 필수"
+        "--tokenizer",
+        help="sion_translate SentencePiece model (.model); required for backend=sion",
     )
-    parser.add_argument("--device", default="auto", help="auto, cpu, cuda, cuda:0 등")
+    parser.add_argument(
+        "--device", default="auto", help="Device such as auto, cpu, cuda, or cuda:0"
+    )
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-beams", type=int, default=4)
     parser.add_argument("--max-new-tokens", type=int, default=256)
@@ -71,7 +74,7 @@ def main() -> None:
         cases = load_comparison_cases(args.cases)
         if args.backend == "sion":
             if not args.model or not args.tokenizer:
-                raise ValueError("backend=sion에는 --model과 --tokenizer가 필요합니다")
+                raise ValueError("backend=sion requires --model and --tokenizer")
             translations = _translate_with_sion(
                 cases,
                 model_path=args.model,
@@ -93,7 +96,7 @@ def main() -> None:
         write_system_translations(args.output, cases, translations)
     except (OSError, UnicodeError, RuntimeError, ValueError) as error:
         raise SystemExit(str(error)) from error
-    print(f"저장: {args.output} ({len(cases)}문장)")
+    print(f"Saved: {args.output} ({len(cases)} sentences)")
 
 
 if __name__ == "__main__":

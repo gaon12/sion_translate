@@ -48,20 +48,28 @@ _SHA256_LENGTH = 64
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Backtranslation data augmentation")
     parser.add_argument(
-        "--mono-dir", default="data_mono", help="단일어 텍스트 폴더 (기본: data_mono)"
+        "--mono-dir",
+        default="data_mono",
+        help="Directory containing monolingual text (default: data_mono)",
     )
     parser.add_argument(
         "--max-ratio",
         type=float,
         default=1.0,
-        help="방향별 합성 train 행 상한 = 같은 방향 real train 행 × 이 값",
+        help=(
+            "Maximum synthetic training rows per direction: real training rows "
+            "in that direction multiplied by this value"
+        ),
     )
-    parser.add_argument("--model", help="내보낸 생성 모델 경로 (기본: exports 자동 탐색)")
+    parser.add_argument(
+        "--model", help="Exported generator model path (default: discover from exports)"
+    )
     parser.add_argument(
         "--tokenizer",
         help=(
-            "생성 모델의 토크나이저 경로. 생략하면 목적 학습 설정의 토크나이저를 "
-            "사용하며, 별도 reverse-generator artifact에는 이 옵션을 지정해야 합니다"
+            "Tokenizer path for the generator model. When omitted, use the "
+            "destination training configuration's tokenizer. Specify this option "
+            "for a separate reverse-generator artifact."
         ),
     )
     parser.add_argument("--num-beams", type=int, default=4)
@@ -71,9 +79,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--language-pair",
         nargs=2,
         metavar=("LANG_A", "LANG_B"),
-        help="다중 언어쌍 모델에서 증강할 물리 언어쌍",
+        help="Physical language pair to augment in a multi-pair model",
     )
-    parser.add_argument("--config", help=f"목적 학습 설정 파일 (기본: {DEFAULT_CONFIG_FILE})")
+    parser.add_argument(
+        "--config",
+        help=f"Destination training configuration (default: {DEFAULT_CONFIG_FILE})",
+    )
     return parser
 
 
@@ -100,13 +111,14 @@ def resolve_augmentation_pair(
         matches = [pair for pair in pairs if frozenset(pair) == edge]
         if len(matches) != 1:
             raise SystemExit(
-                f"모델에 없는 --language-pair 입니다: {tuple(requested)} (지원: {pairs})"
+                f"--language-pair is not present in the model: {tuple(requested)} "
+                f"(supported: {pairs})"
             )
         return matches[0]
     if len(pairs) == 1:
         return pairs[0]
     raise SystemExit(
-        f"다중 언어쌍 모델에서는 --language-pair LANG_A LANG_B를 지정하세요 (지원: {pairs})"
+        f"--language-pair LANG_A LANG_B is required for a multi-pair model (supported: {pairs})"
     )
 
 
@@ -129,7 +141,8 @@ def resolve_augmentation_destination(
     if len(matches) != 1:
         configured = list(normalized_destinations)
         raise SystemExit(
-            "증강 모델의 언어쌍이 현재 학습 설정에 정확히 한 번 존재해야 합니다: "
+            "The augmentation model's language pair must appear exactly once in "
+            "the current training configuration: "
             f"model={normalized_model_pair}, config={configured}"
         )
     return matches[0]
@@ -167,7 +180,8 @@ def preflight_backtranslation_directions(
     )
     if unknown_job_languages:
         raise SystemExit(
-            f"단일어 입력 언어가 증강 언어쌍 밖에 있습니다: {unknown_job_languages} not in {pair}"
+            "Monolingual input languages fall outside the augmentation pair: "
+            f"{unknown_job_languages} not in {pair}"
         )
     required_generation = {
         (mono_language, pair[0] if mono_language == pair[1] else pair[1])
@@ -183,12 +197,19 @@ def preflight_backtranslation_directions(
     if missing_generation:
         needed = ", ".join(f"{source}→{target}" for source, target in missing_generation)
         supported = ", ".join(f"{source}→{target}" for source, target in sorted(generated))
-        failures.append(f"모델 생성 방향 누락: {needed} (모델 지원: {supported or '없음'})")
+        failures.append(
+            f"missing model generation directions: {needed} (model supports: {supported or 'none'})"
+        )
     if missing_training:
         needed = ", ".join(f"{source}→{target}" for source, target in missing_training)
         supported = ", ".join(f"{source}→{target}" for source, target in sorted(trained))
-        failures.append(f"목적 학습 방향 누락: {needed} (설정 지원: {supported or '없음'})")
-    raise SystemExit("진짜 역번역 방향 계약을 만족하지 않습니다: " + "; ".join(failures))
+        failures.append(
+            f"missing destination training directions: {needed} "
+            f"(configuration supports: {supported or 'none'})"
+        )
+    raise SystemExit(
+        "The true backtranslation direction contract is not satisfied: " + "; ".join(failures)
+    )
 
 
 def _valid_sha256(value: object) -> str | None:
@@ -226,8 +247,8 @@ def generator_identity(
         tokenizer_sha = _valid_sha256(translator.tokenizer_metadata.get("model_sha256"))
     if source_sha is None or tokenizer_sha is None:
         raise ValueError(
-            "증강 생성 모델 export에 source/tokenizer SHA-256 신원이 없습니다. "
-            "현재 1.5 export를 사용하세요."
+            "The augmentation generator export has no source/tokenizer SHA-256 "
+            "identity. Use a current 1.5 export."
         )
     identity_payload = {
         "loaded_artifact": {
@@ -281,8 +302,9 @@ def _discover_mono_files(mono_dir: Path, pair: tuple[str, str]) -> list[tuple[Pa
             jobs.append((path, language))
     if not jobs:
         raise SystemExit(
-            f"{mono_dir}/ 에 단일어 파일이 없습니다. '이름.<언어>.txt' 형식으로 "
-            f"넣어 주세요 (언어: {'/'.join(pair)}). 예: news.{pair[1]}.txt"
+            f"No monolingual files were found in {mono_dir}/. Add files named "
+            f"'name.<language>.txt' for {'/'.join(pair)}; for example, "
+            f"news.{pair[1]}.txt."
         )
     return jobs
 
@@ -306,12 +328,13 @@ def _source_has_remaining_text(
                 has_text = True
     if progress.cursor_line > total_lines:
         raise ValueError(
-            "augmentation ledger cursor가 단일어 입력 행 수보다 큽니다: "
+            "The augmentation ledger cursor exceeds the monolingual input line count: "
             f"{progress.cursor_line} > {total_lines}"
         )
     if progress.eof and progress.cursor_line != total_lines:
         raise ValueError(
-            "augmentation ledger eof 상태와 단일어 입력 행 수가 다릅니다: "
+            "The augmentation ledger EOF state disagrees with the monolingual "
+            "input line count: "
             f"cursor={progress.cursor_line}, lines={total_lines}"
         )
     return has_text
@@ -356,7 +379,7 @@ def _run_locked(args: argparse.Namespace, config: AppConfig) -> None:
 
     model_path = Path(args.model or find_exported_model(config.training.output_dir)).resolve()
     generator_tokenizer = args.tokenizer or config.data.tokenizer_model
-    log(f"생성 모델 로드: {model_path}")
+    log(f"Loading generator model: {model_path}")
     model_stat_before = model_path.stat()
     translator = Translator(model_path, generator_tokenizer)
     model_snapshot = snapshot_file(model_path)
@@ -376,7 +399,7 @@ def _run_locked(args: argparse.Namespace, config: AppConfig) -> None:
         model_stat_after.st_ino,
     )
     if model_file_identity_before != model_file_identity_after:
-        raise RuntimeError("생성 모델 파일이 로드·해시 계산 중 변경되었습니다")
+        raise RuntimeError("The generator model file changed while it was loaded and hashed")
     model_pair = resolve_augmentation_pair(args.language_pair, translator.language_pairs)
     pair = resolve_augmentation_destination(
         model_pair,
@@ -385,8 +408,8 @@ def _run_locked(args: argparse.Namespace, config: AppConfig) -> None:
     model_max_seq_len = int(translator.model_config.max_seq_len)
     if args.max_new_tokens > model_max_seq_len:
         raise SystemExit(
-            f"--max-new-tokens {args.max_new_tokens}이 모델 최대 길이 "
-            f"{model_max_seq_len}보다 큽니다. ledger를 만들기 전에 중단합니다."
+            f"--max-new-tokens {args.max_new_tokens} exceeds the model maximum "
+            f"length {model_max_seq_len}. Stopping before the ledger is created."
         )
     model_identity, tokenizer_identity = generator_identity(translator, model_snapshot)
 
@@ -427,9 +450,12 @@ def _run_locked(args: argparse.Namespace, config: AppConfig) -> None:
         finalized_empty += 1
     if not actionable:
         if finalized_empty:
-            log(f"빈 입력 또는 기게시 문장 {finalized_empty:,}개 job을 EOF로 확정했습니다.")
+            log(
+                f"Finalized {finalized_empty:,} jobs containing empty or already "
+                "published input at EOF."
+            )
         else:
-            log("처리할 새 단일어 문장이 없습니다.")
+            log("No new monolingual sentences require processing.")
         return
 
     preflight_backtranslation_directions(
@@ -455,8 +481,8 @@ def _run_locked(args: argparse.Namespace, config: AppConfig) -> None:
         budget = synthetic_budget(counts.real, existing_synthetic, args.max_ratio)
         log(
             f"{direction[0]}→{direction[1]}: real train {counts.real:,} / "
-            f"기존·미준비 synthetic {existing_synthetic:,} / 비율 {args.max_ratio:g} "
-            f"→ 최대 {budget:,}행"
+            f"existing or pending synthetic {existing_synthetic:,} / ratio "
+            f"{args.max_ratio:g} → maximum {budget:,} rows"
         )
         if budget <= 0:
             continue
@@ -474,17 +500,18 @@ def _run_locked(args: argparse.Namespace, config: AppConfig) -> None:
         pending[direction] = pending.get(direction, 0) + result.written
         total_written += result.written
         log(
-            f"{path.name}: {result.written:,}행 게시 / 품질 탈락 "
-            f"{result.quality_filtered:,} / 중복 {result.duplicates:,} / 길이 초과 "
+            f"{path.name}: published {result.written:,} rows / quality-filtered "
+            f"{result.quality_filtered:,} / duplicates {result.duplicates:,} / too long "
             f"{result.too_long:,}"
         )
 
     if total_written == 0:
-        log("방향별 합성 상한 또는 입력 종료로 새로 게시된 행이 없습니다.")
+        log("No rows were published because direction limits were reached or input ended.")
         return
     log(
-        f"완료: 총 {total_written:,}행. 다음 sion-train에서 train 전용, "
-        f"합성 sampling weight {config.data.synthetic_sampling_weight:g}로 반영됩니다."
+        f"Complete: {total_written:,} total rows. The next sion-train run will "
+        "use them only for training with synthetic sampling weight "
+        f"{config.data.synthetic_sampling_weight:g}."
     )
 
 
@@ -504,8 +531,8 @@ def main() -> None:
     config.validate()
     if config.data.synthetic_sampling_weight == 0:
         raise SystemExit(
-            "data.synthetic_sampling_weight가 0이라 생성해도 학습되지 않습니다. "
-            "증강을 실행하지 않습니다."
+            "data.synthetic_sampling_weight is 0, so generated rows would not be "
+            "trained. Augmentation will not run."
         )
 
     # Training/prepare holds the same dataset-parent lease. Acquire it before

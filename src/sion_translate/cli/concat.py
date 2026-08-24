@@ -1,10 +1,10 @@
-"""무관한 번역쌍을 이어붙여 다문장 학습 예제를 만드는 CLI.
+"""Build multi-sentence training examples by joining unrelated translation pairs.
 
     sion-concat --input "data/*.jsonl" --output data/concat_multi.jsonl --count 200000
 
-산출 파일 이름이 ``concat_`` 으로 시작하면 ``sion-prepare-data`` 의
-``--train-only-prefix`` 기본값에 걸려 train split 에만 들어갑니다. 합성 예제로
-holdout 점수를 올리는 일을 막기 위한 것입니다.
+When the output filename starts with ``concat_``, the default
+``sion-prepare-data --train-only-prefix`` policy restricts it to the training
+split. This prevents synthetic examples from inflating holdout scores.
 """
 
 # CLI registries and argparse namespaces expose dynamic callables.
@@ -46,39 +46,53 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Concatenate unrelated pairs into multi-sentence training examples"
     )
-    parser.add_argument("--input", nargs="+", required=True, help="JSONL 파일 또는 glob 패턴")
-    parser.add_argument("--output", required=True, help="산출 JSONL 경로")
-    parser.add_argument("--count", type=_nonnegative_int, required=True, help="만들 예제 수")
+    parser.add_argument("--input", nargs="+", required=True, help="JSONL files or glob patterns")
+    parser.add_argument("--output", required=True, help="Output JSONL path")
+    parser.add_argument(
+        "--count", type=_nonnegative_int, required=True, help="Number of examples to build"
+    )
     parser.add_argument("--min-sentences", type=_positive_int, default=2)
     parser.add_argument("--max-sentences", type=_positive_int, default=4)
     parser.add_argument(
         "--separator",
         default="space",
         choices=sorted(SEPARATORS),
-        help="space=공백으로 이어붙임(실사용 입력에 가까움), seg=<seg> 제어 토큰으로 경계 명시",
+        help=(
+            "space joins text with spaces to resemble normal input; seg marks "
+            "boundaries explicitly with the <seg> control token"
+        ),
     )
     parser.add_argument(
         "--max-chars",
         type=_positive_int,
         default=480,
-        help="한쪽 최대 글자 수 (기본 480). 학습 shard 가 잘라낼 예제를 미리 버립니다",
+        help=(
+            "Maximum characters per side (default: 480). Discard examples that "
+            "a training shard would truncate."
+        ),
     )
     parser.add_argument(
         "--tokenizer",
-        help="SentencePiece 모델 경로. 주면 --max-tokens 를 토큰 수로 정확히 셉니다",
+        help=(
+            "SentencePiece model path. When provided, --max-tokens is measured "
+            "using exact token counts."
+        ),
     )
     parser.add_argument(
         "--max-tokens",
         type=_positive_int,
         default=None,
-        help="한쪽 최대 토큰 수 (--tokenizer 와 함께 사용; 보통 학습의 max_tokens_per_side)",
+        help=(
+            "Maximum tokens per side; requires --tokenizer and normally matches "
+            "training max_tokens_per_side."
+        ),
     )
     parser.add_argument(
         "--language-pair",
         nargs=2,
         required=True,
         metavar=("LANG_A", "LANG_B"),
-        help="JSONL 언어 키 (LANG_A LANG_B)",
+        help="JSONL language keys (LANG_A LANG_B)",
     )
     parser.add_argument("--seed", type=int, default=20260726)
     return parser
@@ -89,7 +103,7 @@ def main() -> None:
     args = build_parser().parse_args()
 
     if args.max_tokens is not None and not args.tokenizer:
-        raise SystemExit("--max-tokens 를 쓰려면 --tokenizer 도 지정해야 합니다")
+        raise SystemExit("--max-tokens requires --tokenizer.")
 
     count_tokens: Callable[[str], int] | None = None
     if args.tokenizer:
@@ -104,11 +118,11 @@ def main() -> None:
 
     paths = expand_inputs(args.input)
     if not paths:
-        raise SystemExit(f"입력 JSONL 을 찾지 못했습니다: {args.input}")
+        raise SystemExit(f"Could not find any input JSONL files: {args.input}")
 
     pairs = list(read_records(paths, args.language_pair))
     if not pairs:
-        raise SystemExit("읽을 수 있는 번역쌍이 없습니다")
+        raise SystemExit("No readable translation pairs were found.")
 
     examples, stats = build_concatenations(
         pairs,
@@ -126,12 +140,12 @@ def main() -> None:
     output = Path(args.output)
     if not output.name.startswith(DEFAULT_TRAIN_ONLY_PREFIXES):
         print(
-            f"[sion] 주의: {output.name} 은 "
-            f"{' / '.join(DEFAULT_TRAIN_ONLY_PREFIXES)} 로 시작하지 않습니다. "
-            "이대로면 합성 예제가 validation/test 로 들어가 holdout 점수를 부풀립니다. "
-            "파일 이름을 바꾸거나 sion-prepare-data 의 --train-only-prefix 를 맞추십시오."
+            f"[sion] Warning: {output.name} does not start with "
+            f"{' / '.join(DEFAULT_TRAIN_ONLY_PREFIXES)}. Synthetic examples may "
+            "therefore enter validation/test and inflate holdout scores. Rename "
+            "the file or update sion-prepare-data --train-only-prefix."
         )
-    print(f"[sion] {written}개 예제를 {output} 에 썼습니다")
+    print(f"[sion] Wrote {written} examples to {output}")
     print(json.dumps(stats.as_dict(), ensure_ascii=False, indent=2))
 
 

@@ -214,7 +214,7 @@ def test_augmentation_pair_is_resolved_from_the_model_artifact() -> None:
     trained_pairs = (("de", "fr"), ("sw", "ar"))
 
     assert resolve_augmentation_pair(("ar", "sw"), trained_pairs) == ("sw", "ar")
-    with pytest.raises(SystemExit, match="모델에 없는"):
+    with pytest.raises(SystemExit, match="not present in the model"):
         resolve_augmentation_pair(("ko", "ja"), trained_pairs)
     with pytest.raises(SystemExit, match="--language-pair"):
         resolve_augmentation_pair(None, trained_pairs)
@@ -230,7 +230,7 @@ def test_augmentation_destination_requires_the_same_physical_pair() -> None:
         "sw",
         "ar",
     )
-    with pytest.raises(SystemExit, match="현재 학습 설정"):
+    with pytest.raises(SystemExit, match="current training configuration"):
         resolve_augmentation_destination(("ar", "sw"), (("de", "fr"),))
 
     assert resolve_augmentation_destination(
@@ -261,14 +261,14 @@ def test_augment_preflight_checks_generation_and_destination_edges(
 ) -> None:
     mono_files = [(tmp_path / "news.ar.txt", "ar")]
 
-    with pytest.raises(SystemExit, match="모델 생성 방향 누락: ar→sw"):
+    with pytest.raises(SystemExit, match="missing model generation directions: ar→sw"):
         preflight_backtranslation_directions(
             ("sw", "ar"),
             mono_files,
             (("sw", "ar"),),
             (("sw", "ar"),),
         )
-    with pytest.raises(SystemExit, match="목적 학습 방향 누락: sw→ar"):
+    with pytest.raises(SystemExit, match="missing destination training directions: sw→ar"):
         preflight_backtranslation_directions(
             ("sw", "ar"),
             mono_files,
@@ -344,7 +344,7 @@ def test_augment_locks_before_loading_the_model_and_pair_mismatch_is_nonmutating
     monkeypatch.setattr(augment_cli, "Translator", PairMismatchTranslator)
     monkeypatch.setattr(sys, "argv", ["sion-augment", "--model", "model.pt"])
 
-    with pytest.raises(SystemExit, match="현재 학습 설정"):
+    with pytest.raises(SystemExit, match="current training configuration"):
         augment_cli.main()
 
     assert events == ["lock-enter", "model-load", "lock-exit"]
@@ -401,7 +401,7 @@ def test_augment_rejects_excess_generation_length_before_creating_a_ledger(
         ["sion-augment", "--model", "model.pt", "--max-new-tokens", "65"],
     )
 
-    with pytest.raises(SystemExit, match="모델 최대 길이"):
+    with pytest.raises(SystemExit, match="model maximum length"):
         augment_cli.main()
 
     assert not raw_dir.exists()
@@ -460,7 +460,7 @@ def test_source_progress_rejects_impossible_cursor_and_eof_state(tmp_path: Path)
             mono_path,
             JobProgress(identity, cursor_line=100),
         )
-    with pytest.raises(ValueError, match="eof"):
+    with pytest.raises(ValueError, match="EOF"):
         augment_cli._source_has_remaining_text(  # noqa: SLF001 - CLI regression contract
             mono_path,
             JobProgress(identity, cursor_line=0, eof=True),

@@ -99,15 +99,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--monolingual-corpus",
         help=(
-            "foundation 단일어 코퍼스 루트 (예: data/corpus). 지정하면 그 단계가 "
-            "주는 디코더 타깃 노출을 함께 세고 두 단계를 합친 판정을 냅니다"
+            "Root of the foundation monolingual corpus (for example, "
+            "data/corpus). When provided, include its decoder-target exposure "
+            "and report a combined decision across both stages."
         ),
     )
     parser.add_argument(
         "--monolingual-max-lines",
         type=int,
         default=0,
-        help="0 이면 전량 스캔, 양수는 언어별 prefix 표본 (빠른 preflight 용)",
+        help=(
+            "Scan everything when set to 0; a positive value samples that many "
+            "prefix rows per language for a faster preflight."
+        ),
     )
     parser.add_argument("--output", help="JSON report path (default: stdout)")
     parser.add_argument(
@@ -170,8 +174,8 @@ def main() -> None:
             raise SystemExit("--filter-quality applies only to raw --input scans")
         if args.monolingual_corpus:
             raise SystemExit(
-                "--monolingual-corpus 는 --input 스캔과 함께 씁니다 "
-                "(--dataset 은 이미 색인된 번역 데이터셋입니다)"
+                "--monolingual-corpus must be used with an --input scan; "
+                "--dataset already refers to an indexed translation dataset."
             )
         if (
             args.language_pairs
@@ -229,7 +233,7 @@ def main() -> None:
             rare_threshold=args.rare_threshold,
             max_piece_examples=args.max_piece_examples,
         )
-        # 원시 count 벡터는 어휘 크기의 정수 배열이라 보고서에 싣지 않습니다.
+        # Omit the raw count vector because it is a vocabulary-sized integer array.
         monolingual.pop("counts", None)
         report["monolingual"] = monolingual
     report.pop("global_target_counts", None)
