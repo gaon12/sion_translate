@@ -17,14 +17,14 @@ Run from a clean repository checkout::
 
 from __future__ import annotations
 
-from collections.abc import Generator, Iterator, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 import hashlib
 import importlib
 import json
+import math
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -49,13 +49,9 @@ REMOTE_SCRIPT_PATH = f"{REMOTE_REPOSITORY_ROOT}/scripts/modal_train_tokenizer.py
 CHILD_MODE_FLAG = "--modal-tokenizer-child"
 CHILD_HEARTBEAT_SECONDS = 45.0
 
-SOURCE_MANIFEST_VERSION = 1
-TRAINING_MANIFEST_VERSION = 1
+SOURCE_MANIFEST_VERSION = 2
+TRAINING_MANIFEST_VERSION = 2
 EXPECTED_SENTENCEPIECE_VERSION = "0.2.1"
-EXPECTED_TOKENIZER_SAMPLE_RATIO = 0.40
-EXPECTED_PARALLEL_SENTENCES = 18_177_344
-EXPECTED_MONOLINGUAL_SENTENCES = {"ja": 3_445_471, "ko": 3_308_940}
-EXPECTED_TOTAL_SENTENCES = 24_931_755
 EXPECTED_VOCAB_SIZE = 48_000
 REQUIRED_ARTIFACTS = frozenset(
     {"sion.model", "sion.vocab", "token_features.npz", "tokenizer_metadata.json"}
@@ -195,11 +191,8 @@ def build_source_manifest(
         records = list(executor.map(hash_source, paths))
     records.sort(key=lambda record: record.path)
     ratio = float(config.foundation.tokenizer_sample_ratio)
-    if ratio != EXPECTED_TOKENIZER_SAMPLE_RATIO:
-        raise RuntimeError(
-            "refusing to train a non-production tokenizer ratio: "
-            f"expected {EXPECTED_TOKENIZER_SAMPLE_RATIO}, got {ratio}"
-        )
+    if not math.isfinite(ratio) or ratio < 0:
+        raise RuntimeError("configured tokenizer sample ratio must be finite and non-negative")
     return {
         "version": SOURCE_MANIFEST_VERSION,
         "git_commit": git_commit,
@@ -219,8 +212,14 @@ def _parse_source_manifest(manifest: Mapping[str, object]) -> list[SourceRecord]
     commit = manifest.get("git_commit")
     if not isinstance(commit, str) or COMMIT_PATTERN.fullmatch(commit) is None:
         raise ValueError("source manifest has an invalid Git commit")
-    if manifest.get("tokenizer_sample_ratio") != EXPECTED_TOKENIZER_SAMPLE_RATIO:
-        raise ValueError("source manifest does not describe the production tokenizer ratio")
+    ratio = manifest.get("tokenizer_sample_ratio")
+    if (
+        isinstance(ratio, bool)
+        or not isinstance(ratio, (int, float))
+        or not math.isfinite(float(ratio))
+        or ratio < 0
+    ):
+        raise ValueError("source manifest tokenizer sample ratio is invalid")
     raw_files = manifest.get("files")
     if not isinstance(raw_files, list):
         raise ValueError("source manifest files must be a list")
@@ -292,32 +291,6 @@ def verify_source_manifest(
     return paths, config
 
 
-@contextmanager
-def _observe_tokenizer_sentence_counts(tokenizer_module: Any) -> Generator[list[int]]:
-    """Count both exhaustive production iterator passes without changing content."""
-
-    production_iterator = tokenizer_module.iter_tokenizer_sentences
-    observed: list[int] = []
-
-    def counted_iterator(*args: Any, **kwargs: Any) -> Iterator[str]:
-        count = 0
-        for sentence in production_iterator(*args, **kwargs):
-            count += 1
-            yield sentence
-        if count != EXPECTED_TOTAL_SENTENCES:
-            raise RuntimeError(
-                "production tokenizer iterator count differs from the measured input: "
-                f"expected {EXPECTED_TOTAL_SENTENCES}, got {count}"
-            )
-        observed.append(count)
-
-    tokenizer_module.iter_tokenizer_sentences = counted_iterator
-    try:
-        yield observed
-    finally:
-        tokenizer_module.iter_tokenizer_sentences = production_iterator
-
-
 def _artifact_records(directory: Path) -> dict[str, dict[str, object]]:
     actual = {path.name for path in directory.iterdir() if path.is_file()}
     if actual != set(REQUIRED_ARTIFACTS):
@@ -336,7 +309,7 @@ def _artifact_records(directory: Path) -> dict[str, dict[str, object]]:
 
 def _validate_training_metadata(
     directory: Path,
-    observed_sentence_counts: Sequence[int],
+    expected_sample_ratio: float,
     artifacts: Mapping[str, Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
     metadata_path = directory / "tokenizer_metadata.json"
@@ -346,21 +319,60 @@ def _validate_training_metadata(
     metadata = cast(dict[str, object], metadata_value)
     if metadata.get("sentencepiece_version") != EXPECTED_SENTENCEPIECE_VERSION:
         raise RuntimeError("tokenizer metadata records the wrong SentencePiece version")
-    if metadata.get("monolingual_sample_ratio") != EXPECTED_TOKENIZER_SAMPLE_RATIO:
+    if metadata.get("monolingual_sample_ratio") != expected_sample_ratio:
         raise RuntimeError("tokenizer metadata records the wrong monolingual ratio")
-    if metadata.get("monolingual_sentences") != EXPECTED_MONOLINGUAL_SENTENCES:
-        raise RuntimeError(
-            "actual monolingual sample counts differ from the measured production counts: "
-            f"{metadata.get('monolingual_sentences')}"
-        )
-    if list(observed_sentence_counts) != [EXPECTED_TOTAL_SENTENCES, EXPECTED_TOTAL_SENTENCES]:
-        raise RuntimeError(
-            "production tokenizer iterator counts differ between its two exhaustive passes: "
-            f"{list(observed_sentence_counts)}"
-        )
-    actual_total = EXPECTED_PARALLEL_SENTENCES + sum(EXPECTED_MONOLINGUAL_SENTENCES.values())
-    if actual_total != EXPECTED_TOTAL_SENTENCES:
-        raise RuntimeError("configured production sentence-count assertions are inconsistent")
+    corpus_sentences = metadata.get("corpus_sentences")
+    sampled_sentences = metadata.get("sampled_sentences")
+    if (
+        not isinstance(corpus_sentences, int)
+        or isinstance(corpus_sentences, bool)
+        or corpus_sentences < 1
+    ):
+        raise RuntimeError("tokenizer metadata has an invalid corpus sentence count")
+    if (
+        not isinstance(sampled_sentences, int)
+        or isinstance(sampled_sentences, bool)
+        or not 1 <= sampled_sentences <= corpus_sentences
+    ):
+        raise RuntimeError("tokenizer metadata has an invalid sampled sentence count")
+
+    def sentence_counts(field: str, expected_total: int | None = None) -> dict[str, int]:
+        raw_counts = metadata.get(field)
+        if not isinstance(raw_counts, Mapping):
+            raise RuntimeError(f"tokenizer metadata {field} must be an object")
+        normalized: dict[str, int] = {}
+        for raw_language, raw_count in raw_counts.items():
+            if not isinstance(raw_language, str) or not raw_language:
+                raise RuntimeError(f"tokenizer metadata {field} has an invalid language")
+            if not isinstance(raw_count, int) or isinstance(raw_count, bool) or raw_count < 0:
+                raise RuntimeError(f"tokenizer metadata {field} has an invalid count")
+            normalized[raw_language] = raw_count
+        if expected_total is not None and sum(normalized.values()) != expected_total:
+            raise RuntimeError(f"tokenizer metadata {field} does not sum to its total")
+        return normalized
+
+    corpus_by_language = sentence_counts(
+        "corpus_sentences_per_language",
+        corpus_sentences,
+    )
+    sampled_by_language = sentence_counts(
+        "sampled_sentences_per_language",
+        sampled_sentences,
+    )
+    if set(corpus_by_language) != set(sampled_by_language):
+        raise RuntimeError("sampled tokenizer languages differ from the full corpus")
+    if any(sampled_by_language[language] > count for language, count in corpus_by_language.items()):
+        raise RuntimeError("sampled tokenizer language count exceeds its corpus count")
+    monolingual = sentence_counts("monolingual_sentences")
+    if not set(monolingual).issubset(sampled_by_language):
+        raise RuntimeError("monolingual tokenizer counts contain an unknown language")
+    if any(monolingual[language] > sampled_by_language[language] for language in monolingual):
+        raise RuntimeError("monolingual tokenizer count exceeds its sampled language count")
+    contract = metadata.get("training_contract")
+    if not isinstance(contract, Mapping):
+        raise RuntimeError("tokenizer metadata has no authenticated training contract")
+    if metadata.get("training_contract_sha256") != _manifest_digest(contract):
+        raise RuntimeError("tokenizer metadata training contract digest is invalid")
     if artifacts is not None:
         recorded_identities = {
             "sion.model": metadata.get("model_sha256"),
@@ -418,7 +430,7 @@ def _new_run_id(commit: str, source_manifest: Mapping[str, object]) -> str:
     # would waste the whole run before publication.
     timestamp = datetime.now(UTC).strftime("%Y%m%dt%H%M%Sz")
     return (
-        f"ratio-040-{commit[:12]}-{_manifest_digest(source_manifest)[:12]}-"
+        f"tokenizer-{commit[:12]}-{_manifest_digest(source_manifest)[:12]}-"
         f"{timestamp}-{secrets.token_hex(3)}"
     )
 
@@ -471,8 +483,8 @@ def _train_child(build_directory: Path, result_path: Path) -> None:
         source_root=remote_repository_root,
     )
     ratio = float(config.foundation.tokenizer_sample_ratio)
-    if ratio != EXPECTED_TOKENIZER_SAMPLE_RATIO:
-        raise RuntimeError(f"child tokenizer ratio differs from production: {ratio}")
+    if not math.isfinite(ratio) or ratio < 0:
+        raise RuntimeError("child tokenizer ratio must be finite and non-negative")
     pairs = config.data.configured_language_pairs()
     foundation_languages = config.foundation_languages()
     discovery = monolingual_module.discover_monolingual_sources(
@@ -494,31 +506,35 @@ def _train_child(build_directory: Path, result_path: Path) -> None:
     cpu_plan = tokenizer_module.build_cpu_plan(input_files=len(paths))
     cpu_plan_payload = _cpu_plan_payload(cpu_plan)
 
-    with _observe_tokenizer_sentence_counts(tokenizer_module) as observed_counts:
-        tokenizer_module.train_tokenizer(
-            [str(input_mount / config.data.raw_dir / "*.jsonl")],
-            build_directory,
-            vocab_size=EXPECTED_VOCAB_SIZE,
-            language_pairs=pairs,
-            monolingual=discovery,
-            monolingual_sample_ratio=ratio,
-            foundation_languages=foundation_languages,
-            reasoning_languages=reasoning_languages,
-            approximate_split=config.data.approximate_split,
-            source_only_languages=config.data.configured_source_only_languages(),
-            train_only_prefixes=config.data.configured_synthetic_prefixes(),
-            num_workers=cpu_plan.preprocess_workers,
-            num_threads=cpu_plan.sentencepiece_threads,
-        )
+    tokenizer_module.train_tokenizer(
+        [str(input_mount / config.data.raw_dir / "*.jsonl")],
+        build_directory,
+        vocab_size=EXPECTED_VOCAB_SIZE,
+        language_pairs=pairs,
+        translation_directions=config.data.configured_translation_directions(),
+        monolingual=discovery,
+        monolingual_sample_ratio=ratio,
+        foundation_languages=foundation_languages,
+        reasoning_languages=reasoning_languages,
+        approximate_split=config.data.approximate_split,
+        source_only_languages=config.data.configured_source_only_languages(),
+        train_only_prefixes=config.data.configured_synthetic_prefixes(),
+        num_workers=cpu_plan.preprocess_workers,
+        num_threads=cpu_plan.sentencepiece_threads,
+    )
     artifacts = _artifact_records(build_directory)
-    metadata = _validate_training_metadata(build_directory, observed_counts, artifacts)
+    metadata = _validate_training_metadata(build_directory, ratio, artifacts)
     _write_json_atomic(
         result_path,
         {
             "sentencepiece_version": sentencepiece_version,
             "tokenizer_sample_ratio": ratio,
-            "observed_sentence_counts": list(observed_counts),
+            "corpus_sentences": metadata.get("corpus_sentences"),
+            "corpus_sentences_per_language": metadata.get("corpus_sentences_per_language"),
+            "sampled_sentences": metadata.get("sampled_sentences"),
+            "sampled_sentences_per_language": metadata.get("sampled_sentences_per_language"),
             "monolingual_sentences": metadata.get("monolingual_sentences"),
+            "training_contract_sha256": metadata.get("training_contract_sha256"),
             "cpu_plan": cpu_plan_payload,
         },
     )
@@ -586,7 +602,7 @@ def _run_training_subprocess(
     )
 
 
-def _load_child_result(path: Path) -> dict[str, object]:
+def _load_child_result(path: Path, *, expected_sample_ratio: float) -> dict[str, object]:
     if not path.is_file():
         raise RuntimeError(f"tokenizer child succeeded without a result JSON: {path}")
     value = json.loads(path.read_text(encoding="utf-8"))
@@ -595,21 +611,32 @@ def _load_child_result(path: Path) -> dict[str, object]:
     result = cast(dict[str, object], value)
     if result.get("sentencepiece_version") != EXPECTED_SENTENCEPIECE_VERSION:
         raise RuntimeError("tokenizer child reported the wrong SentencePiece version")
-    if result.get("tokenizer_sample_ratio") != EXPECTED_TOKENIZER_SAMPLE_RATIO:
+    if result.get("tokenizer_sample_ratio") != expected_sample_ratio:
         raise RuntimeError("tokenizer child reported the wrong sample ratio")
-    if result.get("observed_sentence_counts") != [
-        EXPECTED_TOTAL_SENTENCES,
-        EXPECTED_TOTAL_SENTENCES,
-    ]:
-        raise RuntimeError(
-            "tokenizer child reported unexpected iterator counts: "
-            f"{result.get('observed_sentence_counts')}"
-        )
-    if result.get("monolingual_sentences") != EXPECTED_MONOLINGUAL_SENTENCES:
-        raise RuntimeError(
-            "tokenizer child reported unexpected monolingual counts: "
-            f"{result.get('monolingual_sentences')}"
-        )
+    corpus_sentences = result.get("corpus_sentences")
+    sampled_sentences = result.get("sampled_sentences")
+    if (
+        not isinstance(corpus_sentences, int)
+        or isinstance(corpus_sentences, bool)
+        or corpus_sentences < 1
+    ):
+        raise RuntimeError("tokenizer child reported an invalid corpus sentence count")
+    if (
+        not isinstance(sampled_sentences, int)
+        or isinstance(sampled_sentences, bool)
+        or not 1 <= sampled_sentences <= corpus_sentences
+    ):
+        raise RuntimeError("tokenizer child reported an invalid sampled sentence count")
+    for field in (
+        "corpus_sentences_per_language",
+        "sampled_sentences_per_language",
+        "monolingual_sentences",
+    ):
+        if not isinstance(result.get(field), dict):
+            raise RuntimeError(f"tokenizer child result has no {field}")
+    contract_digest = result.get("training_contract_sha256")
+    if not isinstance(contract_digest, str) or SHA256_PATTERN.fullmatch(contract_digest) is None:
+        raise RuntimeError("tokenizer child result has no valid training contract digest")
     cpu_plan = result.get("cpu_plan")
     if not isinstance(cpu_plan, dict):
         raise RuntimeError("tokenizer child result has no CPU plan")
@@ -638,8 +665,8 @@ def _train_remote(source_manifest: Mapping[str, object], run_id: str) -> dict[st
         workers=16,
     )
     ratio = float(config.foundation.tokenizer_sample_ratio)
-    if ratio != EXPECTED_TOKENIZER_SAMPLE_RATIO:
-        raise RuntimeError(f"remote tokenizer ratio changed after verification: {ratio}")
+    if ratio != source_manifest.get("tokenizer_sample_ratio"):
+        raise RuntimeError("remote tokenizer ratio changed after source verification")
     parent_cpu_plan = _cpu_plan_payload(tokenizer_module.build_cpu_plan(input_files=len(paths)))
 
     with tempfile.TemporaryDirectory(prefix="sion-tokenizer-") as workspace:
@@ -656,15 +683,17 @@ def _train_remote(source_manifest: Mapping[str, object], run_id: str) -> dict[st
             str(child_result_path),
         ]
         _run_training_subprocess(command)
-        child_result = _load_child_result(child_result_path)
+        child_result = _load_child_result(
+            child_result_path,
+            expected_sample_ratio=ratio,
+        )
         if child_result["cpu_plan"] != parent_cpu_plan:
             raise RuntimeError(
                 "tokenizer child CPU plan differs from its verified parent: "
                 f"parent={parent_cpu_plan}, child={child_result['cpu_plan']}"
             )
-        observed_counts = cast(list[int], child_result["observed_sentence_counts"])
         artifacts = _artifact_records(build_directory)
-        metadata = _validate_training_metadata(build_directory, observed_counts, artifacts)
+        metadata = _validate_training_metadata(build_directory, ratio, artifacts)
         training_manifest: dict[str, object] = {
             "version": TRAINING_MANIFEST_VERSION,
             "run_id": run_id,
@@ -678,12 +707,14 @@ def _train_remote(source_manifest: Mapping[str, object], run_id: str) -> dict[st
             "tokenizer_sample_ratio": ratio,
             "vocab_size": EXPECTED_VOCAB_SIZE,
             "sentence_counts": {
-                "parallel": EXPECTED_PARALLEL_SENTENCES,
-                "monolingual": EXPECTED_MONOLINGUAL_SENTENCES,
-                "total": EXPECTED_TOTAL_SENTENCES,
-                "observed_passes": observed_counts,
+                "corpus": metadata.get("corpus_sentences"),
+                "corpus_per_language": metadata.get("corpus_sentences_per_language"),
+                "sampled": metadata.get("sampled_sentences"),
+                "sampled_per_language": metadata.get("sampled_sentences_per_language"),
+                "monolingual_sampled": metadata.get("monolingual_sentences"),
             },
             "cpu_plan": parent_cpu_plan,
+            "training_contract_sha256": metadata.get("training_contract_sha256"),
             "required_character_count": metadata.get("required_character_count"),
             "required_characters_sha256": metadata.get("required_characters_sha256"),
             "artifacts": artifacts,

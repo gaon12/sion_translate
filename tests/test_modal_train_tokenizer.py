@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Iterator
 from pathlib import Path
 import subprocess
 import sys
@@ -15,11 +14,9 @@ import scripts.modal_train_tokenizer as modal_tokenizer_script
 
 from scripts.modal_train_tokenizer import (
     CHILD_MODE_FLAG,
-    EXPECTED_MONOLINGUAL_SENTENCES,
     EXPECTED_SENTENCEPIECE_VERSION,
-    EXPECTED_TOKENIZER_SAMPLE_RATIO,
-    EXPECTED_TOTAL_SENTENCES,
     REQUIRED_ARTIFACTS,
+    SOURCE_MANIFEST_VERSION,
     SourceRecord,
     _artifact_records,
     _child_failure_message,
@@ -27,7 +24,6 @@ from scripts.modal_train_tokenizer import (
     _load_child_result,
     _manifest_digest,
     _new_run_id,
-    _observe_tokenizer_sentence_counts,
     _parse_source_manifest,
     _publish_candidate,
     _records_digest,
@@ -35,14 +31,16 @@ from scripts.modal_train_tokenizer import (
     _validate_training_metadata,
 )
 
+SAMPLE_RATIO = 0.37
+
 
 def source_manifest(records: list[SourceRecord]) -> dict[str, object]:
     return {
-        "version": 1,
+        "version": SOURCE_MANIFEST_VERSION,
         "git_commit": "a" * 40,
         "config_path": "sion_translate.yaml",
         "config_sha256": "b" * 64,
-        "tokenizer_sample_ratio": EXPECTED_TOKENIZER_SAMPLE_RATIO,
+        "tokenizer_sample_ratio": SAMPLE_RATIO,
         "file_count": len(records),
         "total_bytes": sum(record.size for record in records),
         "files_sha256": _records_digest(records),
@@ -81,19 +79,6 @@ def test_generated_run_id_is_publishable(tmp_path: Path) -> None:
     assert published.name == run_id
 
 
-def test_iterator_count_mismatch_fails_before_training_continues() -> None:
-    class TokenizerModule:
-        @staticmethod
-        def iter_tokenizer_sentences() -> Iterator[str]:
-            yield "one sentence"
-
-    with _observe_tokenizer_sentence_counts(TokenizerModule) as observed:
-        with pytest.raises(RuntimeError, match="iterator count differs"):
-            list(TokenizerModule.iter_tokenizer_sentences())
-
-    assert observed == []
-
-
 def test_candidate_publish_is_complete_atomic_and_never_overwrites(tmp_path: Path) -> None:
     build = tmp_path / "build"
     build.mkdir()
@@ -110,22 +95,26 @@ def test_candidate_publish_is_complete_atomic_and_never_overwrites(tmp_path: Pat
         _publish_candidate(build, output, "ratio-040-test")
 
 
-def test_training_metadata_requires_measured_production_counts(tmp_path: Path) -> None:
+def test_training_metadata_accepts_arbitrary_language_counts(tmp_path: Path) -> None:
+    contract = {"schema": "sion-tokenizer-training-v3", "languages": ["de", "fr"]}
     metadata = {
         "sentencepiece_version": EXPECTED_SENTENCEPIECE_VERSION,
-        "monolingual_sample_ratio": EXPECTED_TOKENIZER_SAMPLE_RATIO,
-        "monolingual_sentences": EXPECTED_MONOLINGUAL_SENTENCES,
+        "monolingual_sample_ratio": SAMPLE_RATIO,
+        "monolingual_sentences": {"fr": 5},
+        "corpus_sentences": 100,
+        "corpus_sentences_per_language": {"de": 60, "fr": 40},
+        "sampled_sentences": 50,
+        "sampled_sentences_per_language": {"de": 28, "fr": 22},
+        "training_contract": contract,
+        "training_contract_sha256": _manifest_digest(contract),
     }
     (tmp_path / "tokenizer_metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
-    assert (
-        _validate_training_metadata(tmp_path, [EXPECTED_TOTAL_SENTENCES, EXPECTED_TOTAL_SENTENCES])
-        == metadata
-    )
+    assert _validate_training_metadata(tmp_path, SAMPLE_RATIO) == metadata
 
-    metadata["monolingual_sentences"] = {"ja": 1, "ko": 2}
+    metadata["sampled_sentences_per_language"] = {"de": 28, "fr": 21}
     (tmp_path / "tokenizer_metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
-    with pytest.raises(RuntimeError, match="monolingual sample counts"):
-        _validate_training_metadata(tmp_path, [EXPECTED_TOTAL_SENTENCES, EXPECTED_TOTAL_SENTENCES])
+    with pytest.raises(RuntimeError, match="does not sum"):
+        _validate_training_metadata(tmp_path, SAMPLE_RATIO)
 
 
 def test_file_hash_uses_file_bytes(tmp_path: Path) -> None:
@@ -220,9 +209,13 @@ def test_parent_validates_child_result_json(tmp_path: Path) -> None:
     result_path = tmp_path / "child-result.json"
     result = {
         "sentencepiece_version": EXPECTED_SENTENCEPIECE_VERSION,
-        "tokenizer_sample_ratio": EXPECTED_TOKENIZER_SAMPLE_RATIO,
-        "observed_sentence_counts": [EXPECTED_TOTAL_SENTENCES, EXPECTED_TOTAL_SENTENCES],
-        "monolingual_sentences": EXPECTED_MONOLINGUAL_SENTENCES,
+        "tokenizer_sample_ratio": SAMPLE_RATIO,
+        "corpus_sentences": 100,
+        "corpus_sentences_per_language": {"de": 60, "fr": 40},
+        "sampled_sentences": 50,
+        "sampled_sentences_per_language": {"de": 28, "fr": 22},
+        "monolingual_sentences": {"fr": 5},
+        "training_contract_sha256": "c" * 64,
         "cpu_plan": {
             "available": 16,
             "preprocess_workers": 8,
@@ -230,12 +223,12 @@ def test_parent_validates_child_result_json(tmp_path: Path) -> None:
         },
     }
     result_path.write_text(json.dumps(result), encoding="utf-8")
-    assert _load_child_result(result_path) == result
+    assert _load_child_result(result_path, expected_sample_ratio=SAMPLE_RATIO) == result
 
-    result["observed_sentence_counts"] = [EXPECTED_TOTAL_SENTENCES]
+    result["sampled_sentences"] = 101
     result_path.write_text(json.dumps(result), encoding="utf-8")
-    with pytest.raises(RuntimeError, match="iterator counts"):
-        _load_child_result(result_path)
+    with pytest.raises(RuntimeError, match="sampled sentence count"):
+        _load_child_result(result_path, expected_sample_ratio=SAMPLE_RATIO)
 
 
 def test_child_mode_help_does_not_construct_modal_app() -> None:
