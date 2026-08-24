@@ -136,16 +136,18 @@ def _candidate_refinement_steps(reasoning_level: int | None, configured_steps: i
 
 @dataclass
 class SionOutput:
-    """forward 결과 묶음.
+    """Collect model outputs and token-exact loss accounting.
 
-    - logits: 각 위치의 다음 토큰 예측 점수 (batch, seq, vocab)
-    - loss: 토큰당 평균 LM loss + 보조 loss (backward 용 요약값)
-    - lm_loss_sum / token_count: loss 의 분자/분모.
-      trainer 가 gradient accumulation 시 '토큰 수 기준'으로 정확히
-      정규화할 수 있도록 합계 형태로 따로 내보냅니다.
-    - auxiliary_loss: z-loss + 실험 기능(register/alignment/evidence/parity) 보조 loss 합
-    - evidence_*: 불확실성 오차 위치와 원문 재참조 budget 진단
-    - semantic_parity_*: 원문/정답 표현의 의미 checksum 보조 목적과 cosine 점수
+    - ``logits`` contains next-token scores with shape ``(batch, seq, vocab)``.
+    - ``loss`` is mean language-model loss per token plus auxiliary losses.
+    - ``lm_loss_sum`` and ``token_count`` expose the numerator and denominator
+      separately so the trainer can normalize gradient accumulation by the
+      exact number of target tokens.
+    - ``auxiliary_loss`` combines z-loss and enabled register, alignment,
+      evidence, and semantic-parity objectives.
+    - ``evidence_*`` reports uncertain error positions and source reread budget.
+    - ``semantic_parity_*`` reports the source/target representation checksum
+      objective and cosine score.
     """
 
     logits: torch.Tensor
@@ -154,8 +156,8 @@ class SionOutput:
     token_count: torch.Tensor | None = None
     auxiliary_loss: torch.Tensor | None = None
     register_loss: torch.Tensor | None = None
-    # register 규칙에 걸리지 않아 감독을 못 받은 행의 비율. 이 값이 크면
-    # CoRe 의 보조 loss 가 배치의 일부만 보고 있다는 뜻입니다.
+    # Fraction of rows not supervised because no register rule matched. A high
+    # value means the CoRe auxiliary objective sees only part of the batch.
     register_unsupervised_rate: torch.Tensor | None = None
     alignment_loss: torch.Tensor | None = None
     coverage_loss: torch.Tensor | None = None
@@ -193,16 +195,20 @@ class GenerationContext:
 
 
 class SionForConditionalGeneration(nn.Module):
-    """sion_translate 번역 모델 본체 (encoder-decoder Transformer).
+    """Implement the Sion encoder-decoder translation model.
 
-    구성 요약:
-    - 임베딩: 한/일 공용(joint) vocab 하나를 encoder·decoder·출력층이
-      모두 공유(tie)해 파라미터를 절약합니다.
-    - encoder: ``encoder_layers`` 층 (깊은 encoder / 얕은 decoder 구성 —
-      번역 품질은 encoder 깊이의 영향이 크고, decoder 가 얕으면 추론이 빠릅니다)
-    - decoder: causal self-attention + cross-attention
-    - 위치 정보: RoPE (encoder/decoder self-attention 에만 적용)
-    - 실험 기능(BATS/CoRe/TETM/MorphoScript)은 설정으로 켤 때만 생성됩니다.
+    Architecture summary:
+
+    - One joint vocabulary can be tied across encoder input, decoder input, and
+      output projection to reduce parameters and improve sharing across the
+      configured language graph.
+    - The encoder uses ``encoder_layers`` layers. A deeper encoder with a
+      shallower decoder can improve source understanding while keeping
+      autoregressive inference faster.
+    - The decoder combines causal self-attention with source cross-attention.
+    - RoPE is applied to encoder and decoder self-attention only.
+    - Experimental BATS, CoRe, TETM, MorphoScript, evidence, and refinement
+      modules are constructed only when their configuration enables them.
     """
 
     def __init__(self, config: ModelConfig, *, pad_id: int = 0):
@@ -260,8 +266,8 @@ class SionForConditionalGeneration(nn.Module):
                 for _ in range(config.decoder_layers)
             ]
         )
-        # 공유 블록 반복 설정. 가중치를 새로 만들지 않으므로 state_dict 가 바뀌지
-        # 않습니다 — 기존 체크포인트를 그대로 불러올 수 있습니다.
+        # Recurrent blocks reuse existing weights and therefore do not add new
+        # state-dict keys, preserving checkpoint shape compatibility.
         self.recurrent_block_layers = min(
             config.experimental.recurrent_block_layers, config.encoder_layers
         )
@@ -289,9 +295,9 @@ class SionForConditionalGeneration(nn.Module):
             if exp.morphoscript_enabled
             else None
         )
-        # MorphoScript 를 켰을 때만 게이트 파라미터를 만듭니다. 꺼져 있는데
-        # 파라미터로 등록해 두면 DDP 가 find_unused_parameters=True 를
-        # 요구하게 되어 매 step 불필요한 통신 비용이 생깁니다.
+        # Create MorphoScript gate parameters only when enabled. Registering
+        # unused parameters would force DDP to search for unused values and add
+        # unnecessary communication to every step.
         self.morph_gates: nn.Parameter | None = (
             nn.Parameter(torch.zeros(config.encoder_layers)) if exp.morphoscript_enabled else None
         )
@@ -357,16 +363,15 @@ class SionForConditionalGeneration(nn.Module):
         self.init_weights()
 
     def residual_write_count(self) -> int:
-        """잔차 스트림에 한 번의 forward 동안 값이 더해지는 총 횟수.
+        """Count additions to the residual stream during one forward pass.
 
-        초기화 스케일의 분모입니다. 층 수가 아니라 **쓰기 횟수**가 기준인
-        이유는, 잔차 스트림의 분산이 그 스트림에 더해지는 항의 개수만큼
-        누적되기 때문입니다.
+        Weight initialization scales by residual writes rather than layer count
+        because residual-stream variance accumulates with every added branch.
 
-        - encoder layer 는 2번 씁니다 (self-attention, FFN).
-        - decoder layer 는 3번 씁니다 (self-attention, cross-attention, FFN).
-          층 수만 세면 decoder 쪽을 1.5배 과소평가합니다.
-        - 공유 블록을 반복하면 그 블록의 층이 추가로 반복 횟수만큼 더 씁니다.
+        - Each encoder layer writes twice: self-attention and FFN.
+        - Each decoder layer writes three times: self-attention, cross-attention,
+          and FFN. Counting layers alone underestimates decoder writes by 1.5x.
+        - Reusing a recurrent block adds the writes from every repeated layer.
         """
 
         encoder_writes = 2 * self.config.encoder_layers
@@ -376,10 +381,12 @@ class SionForConditionalGeneration(nn.Module):
         return max(encoder_writes, decoder_writes)
 
     def init_weights(self) -> None:
-        """가중치 초기화. 기본은 N(0, init_std²) 정규분포이고,
-        잔차 경로로 합쳐지는 출력 projection(out_proj/down_proj)은
-        잔차 쓰기 횟수에 비례해 더 작게 초기화해 깊은 모델의 초기 발산을
-        막습니다 (``residual_write_count`` 참고)."""
+        """Initialize weights while scaling residual output projections.
+
+        Most weights use ``N(0, init_std**2)``. Output and down projections that
+        write into the residual stream use a smaller scale based on
+        ``residual_write_count`` to prevent early divergence in deep models.
+        """
         std = self.config.init_std
         residual_std = std / self.residual_write_count() ** 0.5
 
@@ -464,12 +471,11 @@ class SionForConditionalGeneration(nn.Module):
                 hidden = hidden + torch.tanh(self.morph_gates[index]) * side_states
             return hidden
 
-        # 공유 블록 반복: 마지막 recurrent_block_layers 개 층을 **하나의 블록으로
-        # 묶어** recurrent_steps 번 통과시킵니다. 층마다 따로 반복하는 것과는 다른
-        # 계산입니다 — (L2, L3) 를 3번 도는 것과 L2 를 3번 돈 뒤 L3 를 3번 도는 것은
-        # 서로 다른 함수이고, 여기서 의도한 것은 전자(블록 단위 재귀)입니다.
-        # 같은 가중치를 재사용하므로 파라미터는 늘지 않고 유효 깊이만 늘어납니다.
-        # 0 이면 블록이 비어 아래 루프가 원래대로 각 층을 한 번씩만 돕니다.
+        # Treat the final ``recurrent_block_layers`` as one block and run that
+        # whole block ``recurrent_steps`` times. Repeating (L2, L3) together is
+        # not equivalent to running L2 repeatedly and then L3 repeatedly. The
+        # shared weights increase effective depth without increasing parameter
+        # count. A block size of zero leaves the ordinary one-pass layer loop.
         block_size = min(self.recurrent_block_layers, len(self.encoder_layers))
         boundary = len(self.encoder_layers) - block_size
         for index in range(boundary):
@@ -495,8 +501,8 @@ class SionForConditionalGeneration(nn.Module):
         return self.decoder_norm(hidden)
 
     def _logits(self, hidden: torch.Tensor) -> torch.Tensor:
-        # tie_embeddings=True 면 별도 출력층 없이 입력 임베딩 행렬을
-        # 그대로 출력 projection 으로 재사용합니다 (파라미터 절약 + 일반화 도움).
+        # Tied embeddings reuse the input embedding matrix as the output
+        # projection, reducing parameters and encouraging shared structure.
         if self.lm_head is not None:
             return self.lm_head(hidden)
         return F.linear(hidden, self.token_embedding.weight)
@@ -722,8 +728,9 @@ class SionForConditionalGeneration(nn.Module):
         reverse_direction_trained: torch.Tensor | None = None,
         reasoning_level: int | None = None,
     ) -> SionOutput:
-        # Collator가 제공하는 사후학습용 방향 메타데이터입니다. 일반 SFT
-        # forward에서는 의미가 없지만 batch를 그대로 전달할 수 있게 받습니다.
+        # The collator supplies these direction fields for posttraining. Plain
+        # SFT does not consume them, but accepting them keeps batch forwarding
+        # uniform across objectives.
         del source_language_tag_ids, reverse_direction_trained
         reasoning_level = _validate_reasoning_level(reasoning_level)
         evidence_reasoning_is_active = self.evidence_repair is not None and reasoning_level != 0
@@ -779,8 +786,8 @@ class SionForConditionalGeneration(nn.Module):
                     ignore_index=-100,
                     reduction="none",
                 )
-                # (batch, seq, vocab) 하나를 잡아 두는 것은 큰 vocab 에서 GB 단위
-                # 입니다. 두 요약값만 남기고 즉시 놓아 줍니다.
+                # Holding one ``(batch, seq, vocab)`` tensor can cost gigabytes
+                # for a large vocabulary. Retain only the two summaries.
                 del pre_repair_logits
         decoder_states, uncertainty_logits, evidence_requests = self._apply_evidence_repair(
             decoder_states,
@@ -821,13 +828,12 @@ class SionForConditionalGeneration(nn.Module):
                 reasoning_active=reasoning_active,
                 candidate_refinement_steps=candidate_steps_tensor,
             )
-        # label 이 -100 인 위치(패딩)는 loss 계산에서 제외합니다.
+        # Labels equal to -100 mark padding and do not contribute to loss.
         token_count = labels.ne(-100).sum()
-        # BF16 autocast 아래에서 loss 는 FP32 로 계산해야 하는데, `logits.float()`
-        # 를 호출하는 곳마다 (batch, seq, vocab) 사본이 새로 생기고 그 사본은 전부
-        # backward 까지 살아 있습니다. batch 32 · seq 512 · vocab 48,000 이면 사본
-        # 하나가 3.1 GB 라, 예전처럼 cross-entropy 와 z-loss 가 따로 부르면 6.3 GB
-        # 가 상주했습니다. 한 번만 만들어 모든 FP32 소비자가 공유합니다.
+        # Loss must use FP32 under BF16 autocast. Each separate ``logits.float()``
+        # call creates a ``(batch, seq, vocab)`` copy that survives until
+        # backward. At batch 32, sequence 512, and vocabulary 48,000, one copy
+        # is about 3.1 GB. Share one conversion across every FP32 consumer.
         float_logits = logits.float()
         lm_loss_sum = F.cross_entropy(
             float_logits.reshape(-1, float_logits.shape[-1]),
@@ -837,8 +843,8 @@ class SionForConditionalGeneration(nn.Module):
             label_smoothing=self.config.label_smoothing,
         )
         auxiliary_loss = logits.new_zeros(())
-        # z-loss: logsumexp(logits)² 에 작은 벌점을 줘 logit 크기가
-        # 무한정 커지는 것을 막습니다 (혼합 정밀도 학습 안정화).
+        # Z-loss lightly penalizes squared logsumexp so logits cannot grow
+        # without bound, improving mixed-precision training stability.
         if self.config.z_loss_weight > 0:
             log_normalizer = float_logits.logsumexp(-1)
             valid_targets = labels.ne(-100).to(dtype=log_normalizer.dtype)
@@ -861,9 +867,9 @@ class SionForConditionalGeneration(nn.Module):
             auxiliary_loss = auxiliary_loss + (
                 self.config.experimental.register_loss_weight * register_loss
             )
-            # 감독을 못 받은 비율을 드러냅니다. 규칙에 안 걸린 문장(단편·감탄사·
-            # 욕설)은 loss 에서 빠지는데, 그 비율이 로그에 없으면 CoRe 가 배치의
-            # 절반만 보고 있어도 알 수 없습니다.
+            # Surface the unsupervised fraction. Fragments, interjections, and
+            # other unmatched rows do not enter this loss; without the metric,
+            # CoRe could see only half a batch without making that gap visible.
             register_unsupervised_rate = 1.0 - (known_weights.sum() / known_weights.numel())
 
         alignment_loss = logits.new_zeros(())
@@ -1015,10 +1021,10 @@ class SionForConditionalGeneration(nn.Module):
         memory_mode_ids: torch.Tensor | None = None,
         reasoning_level: int | None = None,
     ) -> torch.Tensor:
-        """KV cache 를 사용해 새 토큰 1개를 디코딩합니다 (추론 전용).
+        """Decode one new token with inference KV caches.
 
-        ``caches`` 는 layer 별 {"self": (k, v), "cross": (k, v)} 목록이며
-        이 함수가 제자리에서(in-place) 갱신합니다.
+        ``caches`` contains one ``{"self": (k, v), "cross": (k, v)}`` mapping
+        per decoder layer. This method updates those mappings in place.
         """
         hidden = self._embed(tokens)
         if register_context is not None:
@@ -1183,8 +1189,8 @@ class SionForConditionalGeneration(nn.Module):
             rows, columns = matches.nonzero(as_tuple=True)
             logits[rows, previous_next_tokens[rows, columns]] = float("-inf")
 
-        # 극단적으로 작은 vocab이나 과도한 사용자 제약에서도 multinomial/
-        # argmax가 NaN으로 무너지지 않게 EOS를 최후의 탈출구로 둡니다.
+        # Keep EOS as a last-resort escape when a tiny vocabulary or excessive
+        # constraints remove every other token, preventing NaN sampling.
         no_valid_token = ~torch.isfinite(logits).any(dim=-1)
         logits[no_valid_token, eos_id] = 0.0
         return logits
@@ -1212,14 +1218,14 @@ class SionForConditionalGeneration(nn.Module):
         reasoning_level: int | None = None,
         **encoder_features: torch.Tensor,
     ) -> torch.Tensor:
-        """번역문 생성.
+        """Generate translations with cached greedy or beam decoding.
 
-        - ``num_beams=1``: greedy 디코딩 (가장 빠름)
-        - ``num_beams>=2``: beam search + GNMT length penalty.
-          번역 품질 평가나 실사용에는 beam 4 + length_penalty 1.0 을 권장합니다.
+        - ``num_beams=1`` uses the fastest greedy path.
+        - ``num_beams>=2`` uses beam search with the GNMT length penalty.
 
-        두 경로 모두 KV cache 를 사용해 토큰당 비용이 문장 길이에 선형입니다
-        (이전 구현은 매 토큰마다 prefix 전체를 다시 계산했습니다).
+        Both paths use KV caches, making each new token linear in current
+        sequence length instead of recomputing the full prefix. Select beam and
+        length-penalty values from evaluation of the actual release checkpoint.
         """
         reasoning_level = _validate_reasoning_level(reasoning_level)
         if isinstance(max_new_tokens, bool):
@@ -1336,7 +1342,7 @@ class SionForConditionalGeneration(nn.Module):
         reasoning_level: int | None = None,
         **encoder_features: torch.Tensor,
     ) -> torch.Tensor:
-        """MRT용 확률적 후보를 ``(batch, samples, length)``로 생성합니다."""
+        """Generate stochastic MRT candidates as ``(batch, samples, length)``."""
         reasoning_level = _validate_reasoning_level(reasoning_level)
         if isinstance(max_new_tokens, bool):
             raise TypeError("max_new_tokens must be an integer")
@@ -1541,7 +1547,7 @@ class SionForConditionalGeneration(nn.Module):
                 eos_id=eos_id,
             )
             next_token = logits.argmax(-1, keepdim=True)
-            # 이미 끝난 문장은 EOS 를 반복해 길이만 맞춥니다.
+            # Repeat EOS for completed rows only to keep tensor lengths aligned.
             next_token = torch.where(finished[:, None], eos_id, next_token)
             sequences = torch.cat((sequences, next_token), dim=1)
             finished |= next_token.squeeze(1).eq(eos_id)
@@ -1578,18 +1584,18 @@ class SionForConditionalGeneration(nn.Module):
         memory_mode_ids: torch.Tensor | None = None,
         reasoning_level: int | None = None,
     ) -> torch.Tensor:
-        """배치 beam search.
+        """Run batched beam search.
 
-        각 문장을 ``num_beams`` 개로 복제해 (batch × beams) 를 하나의 큰
-        배치처럼 디코딩하고, 매 스텝 상위 2×beams 후보 중에서
-        - EOS 로 끝난 후보는 완성 가설로 저장하고 (GNMT length penalty 적용)
-        - 나머지 중 상위 beams 개를 살아있는 beam 으로 유지합니다.
+        Each source is replicated ``num_beams`` times and decoded as one
+        ``batch * beams`` tensor. At every step, the top ``2 * beams`` options
+        are split into completed EOS hypotheses, scored with the GNMT length
+        penalty, and the best remaining live beams.
         """
         batch = encoder_states.shape[0]
         device = encoder_states.device
         total = batch * num_beams
 
-        # 문장마다 beam 수만큼 encoder 출력을 복제합니다.
+        # Replicate encoder output once for every beam of each source row.
         encoder_states = encoder_states.repeat_interleave(num_beams, dim=0)
         source_mask = source_mask.repeat_interleave(num_beams, dim=0)
         if register_context is not None:
@@ -1619,11 +1625,11 @@ class SionForConditionalGeneration(nn.Module):
             repeats=num_beams,
         )
         sequences = torch.full((total, 1), bos_id, dtype=torch.long, device=device)
-        # 첫 스텝에서 모든 beam 이 같은 BOS 에서 출발하므로, beam 0 만 점수 0 으로
-        # 두고 나머지는 -inf 로 시작해 중복 후보를 걸러냅니다.
+        # Every beam begins at the same BOS. Give only beam zero a finite score
+        # so the first step does not create duplicate hypotheses.
         beam_scores = torch.full((batch, num_beams), float("-inf"), device=device)
         beam_scores[:, 0] = 0.0
-        # 완성된 가설: batch 별 (length-penalty 적용 점수, 토큰 텐서) 목록
+        # Completed hypotheses per row: (length-penalized score, token tensor).
         done: list[list[tuple[float, torch.Tensor]]] = [[] for _ in range(batch)]
         maximum_completion_lengths: list[int] = (
             cast(
@@ -1635,7 +1641,7 @@ class SionForConditionalGeneration(nn.Module):
         )
 
         def penalized(raw_score: float, length: int) -> float:
-            # GNMT length penalty: 길이가 짧은 번역이 유리해지는 것을 보정합니다.
+            # GNMT length penalty offsets the raw-score preference for short text.
             return raw_score / (((5.0 + length) / 6.0) ** length_penalty)
 
         for position in range(max_new_tokens):
@@ -1670,20 +1676,20 @@ class SionForConditionalGeneration(nn.Module):
             )
             log_probs = F.log_softmax(logits, dim=-1)
             vocab = log_probs.shape[-1]
-            # 누적 점수 = 지금까지의 beam 점수 + 새 토큰 log 확률
+            # Accumulate the existing beam score and the new token log probability.
             candidate_scores = (beam_scores.view(-1, 1) + log_probs).view(batch, num_beams * vocab)
-            # EOS 로 빠지는 후보가 있어도 살아있는 beam 을 채울 수 있도록 2배수 선택
+            # Select twice as many options so EOS completions do not empty live beams.
             top_scores, top_indices = candidate_scores.topk(2 * num_beams, dim=-1)
-            source_beams = top_indices // vocab  # 어느 beam 에서 나온 후보인지
+            source_beams = top_indices // vocab  # Beam that produced each candidate.
             new_tokens = top_indices % vocab
 
-            # 후보 선별을 텐서 연산으로 처리합니다. 이전 구현은 step 마다
-            # batch × 2·beams × 3 번 스칼라를 host 로 읽어 왔고, GPU 에서는
-            # 그 하나하나가 device 동기화입니다.
+            # Select candidates with tensor operations. The previous loop read
+            # ``batch * 2 * beams * 3`` scalars on the host per step, and every
+            # GPU scalar read forced device synchronization.
             #
-            # topk 결과는 점수 내림차순이므로 "살아있는 후보 중 앞쪽 num_beams
-            # 개"가 곧 "점수가 가장 높은 num_beams 개"입니다. cumsum 으로 각
-            # 후보의 생존 순위를 구해 그 순위를 목적지 슬롯으로 씁니다.
+            # ``topk`` is already score-descending, so the first ``num_beams``
+            # live candidates are the best live candidates. A cumulative sum
+            # gives each survivor a unique destination slot.
             finite = top_scores.ne(float("-inf"))
             ends_here = new_tokens.eq(eos_id)
             alive = finite & ~ends_here
@@ -1692,9 +1698,9 @@ class SionForConditionalGeneration(nn.Module):
             flat_sources = (
                 torch.arange(batch, device=device).unsqueeze(1) * num_beams + source_beams
             )
-            # 채택되지 않은 후보는 여분의 마지막 열로 흘려보내고 잘라 버립니다.
-            # scatter 의 목적지가 겹치지 않아야 하는데, 채택된 후보의 순위는
-            # 서로 다르므로 충돌이 없습니다.
+            # Scatter rejected options into one disposable final column. Every
+            # accepted survivor has a distinct rank, so accepted writes cannot
+            # collide.
             spill = torch.where(keep, alive_rank, torch.full_like(alive_rank, num_beams))
             width = num_beams + 1
             score_buffer = torch.full((batch, width), float("-inf"), device=device)
@@ -1710,9 +1716,9 @@ class SionForConditionalGeneration(nn.Module):
             gather_flat = source_buffer[:, :num_beams].contiguous()
             step_tokens = token_buffer[:, :num_beams].contiguous()
 
-            # 완성 가설만 host 로 내립니다. 보통 step 당 0~2개이므로 한 번의
-            # 동기화로 끝나고, nonzero 는 row-major 라 (batch, 후보) 순서가
-            # 기존 이중 루프와 같습니다 — max() 의 동점 처리 순서가 유지됩니다.
+            # Transfer only completed hypotheses to the host. There are usually
+            # zero to two per step, and row-major ``nonzero`` preserves the old
+            # ``(batch, candidate)`` tie-breaking order in a single sync.
             finished = (finite & ends_here).nonzero(as_tuple=False)
             if finished.numel():
                 finished_rows = finished[:, 0]
@@ -1735,7 +1741,7 @@ class SionForConditionalGeneration(nn.Module):
                     finished_sources,
                     strict=True,
                 ):
-                    # 완성 가설 (BOS 제외한 생성 길이 = position+1)
+                    # Completed hypothesis; generated length excludes BOS.
                     done[row].append(
                         (
                             penalized(score, position + 1),
@@ -1744,10 +1750,10 @@ class SionForConditionalGeneration(nn.Module):
                     )
 
             flat_index = gather_flat.reshape(-1)
-            # 살아남은 beam 의 순서에 맞게 문장 기록과 self KV cache 를 재배열합니다.
-            # cross KV 는 encoder 출력에서 나온 것이라 같은 문장의 beam 끼리
-            # 내용이 완전히 같습니다. beam 순서가 바뀌어도 값이 그대로이므로
-            # 재배열하지 않습니다 (step 마다 수 MiB 를 복사하던 낭비였습니다).
+            # Reorder sequences and self-attention caches to match surviving
+            # beams. Cross-attention caches come from encoder output and are
+            # identical across beams for one source, so reordering them would
+            # only copy several unnecessary MiB per step.
             sequences = torch.cat(
                 (sequences.index_select(0, flat_index), step_tokens.reshape(-1, 1)), dim=1
             )
@@ -1761,8 +1767,8 @@ class SionForConditionalGeneration(nn.Module):
                 )
             beam_scores = next_scores
 
-            # 모든 문장이 '완성 가설이 충분하고, 살아있는 beam 이 더 나은 점수를
-            # 낼 가능성이 없는' 상태면 일찍 종료합니다.
+            # Stop once every row has enough completions and no live beam can
+            # improve its retained score.
             all_done = all(len(hypotheses) >= num_beams for hypotheses in done)
             if all_done:
                 # One reduction and one host transfer instead of one per row.
@@ -1790,9 +1796,9 @@ class SionForConditionalGeneration(nn.Module):
             ):
                 break
 
-        # 길이 제한에 걸린 live beam도 이미 끝난 가설과 함께 비교합니다.
-        # 낮은 확률의 EOS가 일찍 한 번 나왔다는 이유만으로 더 높은 점수의
-        # 진행 중 번역을 버리면 max_new_tokens 경계에서 품질이 역전됩니다.
+        # Compare live beams that reached the length limit with completed
+        # hypotheses. Otherwise one early low-probability EOS could discard a
+        # better unfinished translation exactly at ``max_new_tokens``.
         outputs: list[torch.Tensor] = []
         generated_length = max(1, sequences.shape[1] - 1)
         for b in range(batch):

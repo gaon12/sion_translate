@@ -260,21 +260,21 @@ class ContentRegisterState(nn.Module):
         pooled = (encoder_states * weights).sum(1) / weights.sum(1).clamp_min(1.0)
         pooled = self.norm(pooled)
         logits = self.classifier(pooled)
-        # class 0 은 "규칙에 걸리지 않음" 이지 학습 가능한 범주가 아닙니다.
-        # register loss 는 labels > 0 만 학습하므로 class 0 은 **한 번도 정답이
-        # 되지 않고** 모든 예제에서 오답으로만 등장합니다. 그런데도 softmax 에
-        # 남겨 두면 두 가지가 생깁니다.
+        # Class 0 means "no heuristic matched," not a supervised category.
+        # Register loss trains only labels greater than zero, so class 0 is
+        # never correct and appears only as a negative. Keeping it in this
+        # softmax would cause two problems:
         #
-        #   1. class 0 의 logit 이 계속 눌리기만 해 확률이 0 으로 수렴합니다.
-        #      즉 실질적으로 3-way 인데 4-way 인 척하는 상태입니다.
-        #   2. 그 사이 class 0 의 embedding 행은 context 혼합에 계속 섞이면서
-        #      register loss 로부터는 아무 신호도 받지 못합니다.
+        #   1. Its logit would be pushed down forever, making a nominally
+        #      four-way classifier behave like an implicit three-way one.
+        #   2. Its embedding row would still enter the context mixture while
+        #      receiving no positive signal from register loss.
         #
-        # 여기서 아예 빼면 분류기의 출력 공간과 실제 감독 대상이 같아집니다.
-        # class 0 을 "중립" 이라는 진짜 범주로 학습시키지 않는 이유는, 그 안에
-        # 정말 경어 표지가 없는 문장과 정규식이 놓친 문장이 섞여 있어서
-        # 구분할 수 없기 때문입니다 — 그것을 정답으로 주면 휴리스틱의 사각지대를
-        # 모델에 가르치게 됩니다.
+        # Removing it makes the classifier output space match the supervised
+        # labels. We cannot reinterpret class 0 as a true "neutral" category:
+        # it mixes genuinely unmarked text with examples missed by the regex.
+        # Supervising that mixture would teach the model the heuristic's blind
+        # spots as ground truth.
         supervised = logits.masked_fill(
             torch.zeros_like(logits, dtype=torch.bool).index_fill_(
                 -1, torch.zeros(1, dtype=torch.long, device=logits.device), True

@@ -10,11 +10,11 @@ from torch import nn
 
 
 class RMSNorm(nn.Module):
-    """RMS 정규화. LayerNorm 에서 평균 빼기를 생략한 가벼운 버전입니다.
+    """Apply RMS normalization without LayerNorm's mean subtraction.
 
-    각 위치의 hidden vector 를 자기 크기(RMS)로 나눠 스케일을 일정하게
-    맞춘 뒤, 학습 가능한 가중치를 곱합니다. 수치 안정성을 위해 계산은
-    항상 float32 로 수행합니다.
+    Each hidden vector is divided by its root-mean-square magnitude before a
+    learned scale is applied. The normalization is always computed in float32
+    for numerical stability.
     """
 
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -36,11 +36,12 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 class RotaryEmbedding(nn.Module):
-    """RoPE(회전 위치 인코딩). 위치 정보를 별도 임베딩으로 더하는 대신,
-    query/key 벡터를 위치에 비례한 각도로 '회전'시켜 상대 위치를 표현합니다.
+    """Represent relative positions with rotary positional embeddings (RoPE).
 
-    cos/sin 표는 미리 계산해 버퍼로 보관합니다 (persistent=False 이므로
-    체크포인트에는 저장되지 않고 매번 다시 계산됩니다).
+    RoPE rotates query and key vectors by a position-dependent angle instead of
+    adding a separate position embedding. Precomputed cosine and sine tables are
+    non-persistent buffers, so checkpoints do not store them and each process
+    rebuilds them.
     """
 
     def __init__(self, head_dim: int, max_seq_len: int, base: float = 10000.0):
@@ -118,14 +119,15 @@ def _head_rms_norm(x: torch.Tensor, eps: float) -> torch.Tensor:
 class GQAAttention(nn.Module):
     """Grouped-Query Attention.
 
-    query 는 ``num_heads`` 개를 쓰지만 key/value 는 더 적은 ``num_kv_heads``
-    개만 만들어 여러 query head 가 공유합니다. 품질은 거의 유지하면서
-    KV 메모리와 연산을 줄이는 기법입니다.
+    Queries use ``num_heads`` heads, while keys and values use the smaller
+    ``num_kv_heads`` count and are shared across query groups. This reduces KV
+    memory and computation while retaining most of the quality of full
+    multi-head attention.
 
-    - ``qk_norm=True`` 면 query/key 를 head 단위로 RMS 정규화해
-      attention 점수 폭주를 막습니다 (학습 안정성 향상).
-    - self-attention 일 때만 RoPE 를 적용하고, cross-attention
-      (decoder→encoder)에는 위치 회전을 적용하지 않습니다.
+    - ``qk_norm=True`` applies RMS normalization per query/key head to keep
+      attention scores bounded and improve training stability.
+    - RoPE is used only for self-attention. Decoder-to-encoder cross-attention
+      does not rotate positions.
     """
 
     rope: RotaryEmbedding | None
@@ -184,14 +186,15 @@ class GQAAttention(nn.Module):
         position_offset: int = 0,
         use_cache: bool = False,
     ):
-        """attention 계산. ``use_cache=True`` 면 (출력, (k, v)) 튜플을 반환합니다.
+        """Compute attention and optionally return ``(output, (key, value))``.
 
-        KV cache (추론 가속용):
-        - self-attention: 새 토큰의 k/v 만 계산해 ``past_key_value`` 뒤에
-          이어 붙입니다. ``position_offset`` 은 지금까지 생성된 토큰 수로,
-          RoPE 회전 각도를 올바른 위치에 맞추는 데 씁니다.
-        - cross-attention: encoder 출력은 생성 내내 변하지 않으므로
-          첫 스텝에 계산한 k/v 를 ``past_key_value`` 로 그대로 재사용합니다.
+        The inference KV cache follows two policies:
+
+        - Self-attention computes only the new token's key/value tensors and
+          appends them to ``past_key_value``. ``position_offset`` supplies the
+          number of tokens already generated so RoPE uses the correct position.
+        - Cross-attention reuses the encoder key/value tensors computed at the
+          first step because encoder output does not change during generation.
         """
         is_cross_attention = key_value_states is not None
         q = self._shape(self.q_proj(hidden_states), self.num_heads)
@@ -199,7 +202,7 @@ class GQAAttention(nn.Module):
             q = _head_rms_norm(q, self.norm_eps)
 
         if is_cross_attention and past_key_value is not None:
-            # cross-attention 캐시 적중: encoder 쪽 k/v 재계산 생략
+            # A cross-attention cache hit avoids recomputing encoder keys and values.
             k, v = past_key_value
         else:
             source = key_value_states if key_value_states is not None else hidden_states
@@ -207,7 +210,7 @@ class GQAAttention(nn.Module):
             if self.rope is not None and not is_cross_attention:
                 q, k = self.rope(q, k, offset=position_offset)
             if not is_cross_attention and past_key_value is not None:
-                # self-attention 캐시: 과거 토큰의 k/v 뒤에 새 토큰을 이어 붙임
+                # Append the new token after cached self-attention keys and values.
                 k = torch.cat((past_key_value[0], k), dim=-2)
                 v = torch.cat((past_key_value[1], v), dim=-2)
         present_key_value = (k, v) if use_cache else None
@@ -215,9 +218,9 @@ class GQAAttention(nn.Module):
         attention_mask = None
         if key_padding_mask is not None:
             attention_mask = key_padding_mask[:, None, None, :].to(torch.bool)
-        # 토큰을 1개씩 생성하는 캐시 디코딩에서는 query 가 항상 마지막 위치이므로
-        # causal mask 가 필요 없습니다 (SDPA 의 is_causal 은 query/key 길이가
-        # 다르면 마스크를 잘못 정렬하므로 여기서 반드시 꺼야 합니다).
+        # Cached single-token decoding always queries the final position, so it
+        # needs no causal mask. SDPA misaligns ``is_causal`` when query and key
+        # lengths differ, so this case must disable it explicitly.
         if is_causal and q.shape[-2] == 1:
             is_causal = False
         enable_gqa = self.num_heads != self.num_kv_heads
@@ -247,8 +250,11 @@ class GQAAttention(nn.Module):
 
 
 class SwiGLU(nn.Module):
-    """SwiGLU feed-forward. 일반 FFN(ReLU) 대신 gate × up 곱 구조를 써서
-    같은 파라미터 수로 더 좋은 성능을 내는 현대 표준 구성입니다."""
+    """Use a gated ``gate * up`` SwiGLU feed-forward transformation.
+
+    This modern replacement for a plain ReLU FFN generally provides better
+    quality at a comparable parameter count.
+    """
 
     def __init__(
         self,
@@ -288,11 +294,11 @@ class SwiGLU(nn.Module):
 
 
 class EncoderLayer(nn.Module):
-    """인코더 한 층: pre-RMSNorm → self-attention → pre-RMSNorm → SwiGLU.
+    """Run pre-RMSNorm self-attention followed by pre-RMSNorm SwiGLU.
 
-    잔차 연결(residual) 앞에 norm 을 두는 pre-norm 구조라 깊게 쌓아도
-    학습이 안정적입니다. 마지막에 attention_mask 를 곱해 패딩 위치의
-    hidden 을 0 으로 유지합니다.
+    Placing normalization before each residual branch keeps deep stacks stable.
+    The final attention-mask multiplication keeps hidden states at padding
+    positions equal to zero.
     """
 
     def __init__(
@@ -337,11 +343,11 @@ class EncoderLayer(nn.Module):
 
 
 class DecoderLayer(nn.Module):
-    """디코더 한 층: causal self-attention → cross-attention(원문 참조) → SwiGLU.
+    """Run causal self-attention, source cross-attention, and SwiGLU.
 
-    - self-attention 은 미래 토큰을 보지 못하도록 causal mask 를 사용합니다.
-    - cross-attention 은 인코더 출력(원문)을 key/value 로 사용하며,
-      원문 패딩 위치는 ``source_mask`` 로 가립니다.
+    - Self-attention uses a causal mask so a token cannot see future targets.
+    - Cross-attention uses encoder output as keys and values, while
+      ``source_mask`` hides padded source positions.
     """
 
     def __init__(
@@ -434,11 +440,12 @@ class DecoderLayer(nn.Module):
         tuple[torch.Tensor, torch.Tensor],
         tuple[torch.Tensor, torch.Tensor],
     ]:
-        """KV cache 를 사용한 '새 토큰 1개' 디코딩 스텝 (추론 전용).
+        """Decode one new token with the inference-only KV cache.
 
-        forward 와 계산 결과는 같지만, 이미 처리한 토큰의 attention 을
-        다시 계산하지 않아 토큰당 비용이 O(전체 길이²) → O(전체 길이)로
-        줄어듭니다. 반환값: (출력, 갱신된 self k/v, cross k/v)
+        The result matches ``forward``, but previously processed attention is
+        not recomputed. This reduces per-token work from quadratic to linear in
+        the current sequence length. The return value contains the output,
+        updated self-attention keys/values, and cross-attention keys/values.
         """
         attn_out, self_kv = self.self_attn(
             self.self_norm(x),
