@@ -1,9 +1,10 @@
-"""foundation 코퍼스의 디코더 타깃 노출 감사.
+"""Audit decoder-target exposure in the foundation corpus.
 
-복원 과제의 정답은 원문 전체이므로 단일어 코퍼스의 **모든 토큰이 디코더
-타깃**입니다. 병렬 감사만 보고 어휘를 판단하면 두 방향으로 틀립니다 —
-foundation 이 충분히 노출시키는 조각을 위험하다고 하거나, 단일어가 어휘에
-밀어 넣은 조각이 번역 학습에서 안 나오는 것을 놓칩니다.
+The complete original sentence is the reconstruction target, so **every token**
+in a monolingual corpus is exposed as a decoder target. Judging vocabulary from
+the parallel audit alone fails in two directions: it can flag pieces that
+foundation training exposes sufficiently, and it can miss pieces introduced by
+monolingual data but absent from translation targets.
 """
 
 from __future__ import annotations
@@ -86,7 +87,7 @@ def test_short_and_long_lines_are_dropped_by_reason(tmp_path, tokenizer_model) -
 
 
 def test_a_prefix_sample_is_labelled_as_incomplete(tmp_path, tokenizer_model) -> None:
-    """표본은 빠른 preflight 용이지 어휘가 안전하다는 선언이 아니다."""
+    """A sample supports fast preflight checks but cannot certify vocabulary safety."""
     report = audit_monolingual_token_exposure(
         _corpus(tmp_path),
         tokenizer_model,
@@ -103,29 +104,30 @@ def test_special_pieces_are_excluded_from_the_verdict(tmp_path, tokenizer_model)
 
 
 def test_an_empty_corpus_is_refused(tmp_path, tokenizer_model) -> None:
-    with pytest.raises(ValueError, match="읽을 수 있는 파일이 없습니다"):
+    with pytest.raises(ValueError, match="no readable files"):
         audit_monolingual_token_exposure(
             discover_monolingual_sources(tmp_path / "absent", ["ko"]),
             tokenizer_model,
         )
 
 
-# ── 두 단계를 합쳐야 답이 나온다 ────────────────────────────────────────
+# ── The answer requires evidence from both stages ───────────────────────
 
 
 def test_foundation_rescues_pieces_the_parallel_corpus_barely_targets(
     tmp_path,
     tokenizer_model,
 ) -> None:
-    """이 함수가 존재하는 이유.
+    """Show why the combined exposure calculation is necessary.
 
-    foundation 이 먼저 돌면 출력 임베딩은 두 단계 모두에서 신호를 받습니다.
-    병렬 감사만 보고 판정하면 조각을 잘못 죽입니다.
+    When foundation training runs first, output embeddings receive signals from
+    both stages. A decision based only on the parallel audit would incorrectly
+    remove pieces.
     """
     monolingual = audit_monolingual_token_exposure(_corpus(tmp_path), tokenizer_model)
     vocab_size = monolingual["vocab_size"]
 
-    # 병렬 코퍼스가 거의 만들지 않는 조각을 흉내 낸다.
+    # Model a piece that the parallel corpus almost never produces.
     parallel = np.zeros(vocab_size, dtype=np.uint64)
     parallel[:] = 1
 

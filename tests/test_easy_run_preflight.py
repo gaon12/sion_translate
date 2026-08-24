@@ -172,7 +172,7 @@ def test_a_missing_checker_does_not_block_the_run(monkeypatch, tmp_path: Path) -
 
 
 def test_the_foundation_corpus_is_reported_before_training(tmp_path, capsys) -> None:
-    """건너뛰는 것이 정상 경로이므로, 조용히 건너뛰면 안 된다."""
+    """Skipping is a normal path, but the preflight must report it."""
     import easy_run
 
     config = tmp_path / "config.yaml"
@@ -186,7 +186,7 @@ def test_the_foundation_corpus_is_reported_before_training(tmp_path, capsys) -> 
 
     output = capsys.readouterr().out
     assert "Skipping the foundation stage" in output
-    # 무엇을 어디에 두면 되는지가 출력에 있어야 한다.
+    # The output must explain what files to add and where to put them.
     assert ".txt" in output and ".jsonl" in output
 
 
@@ -211,12 +211,12 @@ def test_a_usable_corpus_is_announced_with_its_languages(tmp_path, capsys) -> No
     output = capsys.readouterr().out
     assert "Running the foundation stage" in output
     assert "ko" in output and "ja" in output
-    # 산출물이 번역 모델과 분리된다는 사실을 미리 알린다.
+    # Explain in advance that the artifact is separate from the translation model.
     assert "runs/*/foundation/" in output
 
 
 def test_a_skipped_directory_is_named_in_the_preflight(tmp_path, capsys) -> None:
-    """`data/corpus/korean_tech_corpus_130m/` 같은 실제 사례."""
+    """Cover a real layout such as ``data/corpus/korean_tech_corpus_130m/``."""
     import easy_run
 
     corpus = tmp_path / "corpus"

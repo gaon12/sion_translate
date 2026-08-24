@@ -1,9 +1,9 @@
-"""단일어 코퍼스 탐색·읽기 규격.
+"""Discovery and reading contracts for monolingual corpora.
 
-이 단계는 GPU 시간을 가장 많이 쓰는데 입력 오류는 조용합니다. 키 이름 하나가
-틀리면 그 파일만 0문장이 되고, 그 사실은 학습이 끝난 뒤에야 드러납니다.
-그래서 여기 테스트는 "잘 읽는다" 보다 "건너뛴 것을 이유와 함께 돌려준다" 에
-무게를 둡니다.
+This stage consumes the most GPU time, while input mistakes fail silently. One
+wrong key can reduce a single file to zero sentences and remain hidden until
+training ends. These tests therefore emphasize reporting skipped input with a
+reason, not just reading valid input successfully.
 """
 
 from __future__ import annotations
@@ -56,9 +56,10 @@ def test_nested_folders_inside_a_language_are_scanned(tmp_path) -> None:
 
 
 def test_a_folder_that_is_not_a_configured_language_is_reported_not_read(tmp_path) -> None:
-    """`data/corpus/korean_tech_corpus_130m/` 같은 실제 사례.
+    """Cover a real layout such as ``data/corpus/korean_tech_corpus_130m/``.
 
-    조용히 무시하면 사용자는 그 5.3 GB 가 학습에 들어갔다고 믿습니다.
+    If it is silently ignored, an operator can believe that its 5.3 GB entered
+    training.
     """
     root = _corpus(tmp_path)
     _write(root / "korean_tech_corpus_130m" / "ui.txt", ["기술 문장"])
@@ -129,7 +130,7 @@ def test_unsupported_extensions_are_reported(tmp_path) -> None:
 
 
 def test_stray_top_level_files_are_reported(tmp_path) -> None:
-    """`data/corpus/a.py` 와 `data/corpus/data.txt` 같은 실제 사례."""
+    """Cover real stray files such as ``data/corpus/a.py`` and ``data.txt``."""
     root = _corpus(tmp_path)
     (root / "a.py").write_text("print()\n", encoding="utf-8")
     (root / "data.txt").write_text("떠 있는 파일\n", encoding="utf-8")
@@ -186,7 +187,7 @@ def test_jsonl_files_read_the_text_key(tmp_path) -> None:
 
 
 def test_jsonl_rejections_are_counted_by_reason(tmp_path) -> None:
-    """무엇이 몇 줄 빠졌는지 셀 수 없으면 조용한 손실이 된다."""
+    """Count every rejection reason so missing rows cannot remain silent."""
     path = _write(
         tmp_path / "a.jsonl",
         [
@@ -206,7 +207,7 @@ def test_jsonl_rejections_are_counted_by_reason(tmp_path) -> None:
     assert stats.malformed_json == 1
     assert stats.non_string_text == 1
     assert stats.blank == 1
-    # 키 없음 + 객체 아님
+    # One missing key plus one non-object record.
     assert stats.missing_text_key == 2
     assert stats.rejected == 5
     assert set(stats.reasons()) == {
@@ -224,10 +225,10 @@ def test_reading_an_unsupported_extension_is_an_error(tmp_path) -> None:
 
 
 def test_source_only_languages_are_excluded_from_foundation() -> None:
-    """단일어 복원은 그 언어를 디코더 출력으로 만드는 학습이다.
+    """Monolingual reconstruction teaches the decoder to emit that language.
 
-    source-only 는 '번역 결과로 나오면 안 되는 언어' 라는 뜻이므로, foundation
-    이 먼저 그 반대를 가르치면 안 됩니다.
+    Source-only means that a language must never appear as a translation result,
+    so foundation training must not teach the opposite behavior first.
     """
     assert foundation_languages(
         ["kj", "kd", "jd", "ko", "ja"],
@@ -263,7 +264,7 @@ def test_alpha_outside_the_unit_interval_is_rejected(alpha) -> None:
 
 
 def test_a_language_with_no_data_produces_a_warning() -> None:
-    """현재 저장소의 실제 상태: ko 5.3 GB, ja 0."""
+    """Model a corpus where one configured language has no data."""
     report = assess_language_balance({"ko": 18_000_000, "ja": 0})
     assert not report.is_balanced()
     assert any("ja" in warning for warning in report.warnings)
@@ -298,11 +299,11 @@ def test_an_empty_discovery_is_falsy() -> None:
     assert not MonolingualDiscovery(root=__import__("pathlib").Path("x"))
 
 
-# ── 토크나이저 표본 상한 ────────────────────────────────────────────────
+# ── Tokenizer sample caps ───────────────────────────────────────────────
 
 
 def test_budget_follows_the_parallel_corpus_proportions() -> None:
-    """상한은 '그 언어의 병렬 문장 수 x ratio'."""
+    """Cap each language at its parallel sentence count times the ratio."""
     from sion_translate.data.monolingual import monolingual_budgets
 
     budgets = monolingual_budgets({"ko": 1000, "ja": 1000}, ["ko", "ja"], ratio=1.0)
@@ -313,15 +314,15 @@ def test_budget_follows_the_parallel_corpus_proportions() -> None:
 
 
 def test_a_language_without_parallel_data_still_gets_a_budget() -> None:
-    """번역쌍은 아직 없지만 단일어는 확보한 언어는 정상적인 중간 상태다.
+    """Monolingual data without a translation pair is a valid intermediate state.
 
-    0 으로 두면 그 언어가 토크나이저에서 통째로 빠지고, 나중에 번역쌍을
-    추가할 때 토크나이저를 다시 학습해야 합니다.
+    A zero budget would exclude the language from the tokenizer completely and
+    force tokenizer retraining when a translation pair is added later.
     """
     from sion_translate.data.monolingual import monolingual_budgets
 
     budgets = monolingual_budgets({"ko": 1000, "ja": 500}, ["ko", "ja", "en"], ratio=1.0)
-    assert budgets["en"] == 750  # ko/ja 평균
+    assert budgets["en"] == 750  # Mean of the ko and ja budgets.
     assert budgets["ko"] == 1000
 
 
@@ -341,7 +342,7 @@ def test_sampling_respects_the_budget(tmp_path) -> None:
 
 
 def test_sampling_spreads_across_the_file_instead_of_truncating(tmp_path) -> None:
-    """앞에서 자르면 한 출처만 뽑히고 그 편향이 어휘에 박힌다."""
+    """Prefix truncation can imprint one source's bias into the vocabulary."""
     path = _write(tmp_path / "a.txt", [f"문장 {index:05d} 번입니다" for index in range(2000)])
     from sion_translate.data.monolingual import sample_monolingual_sentences
 
@@ -349,7 +350,7 @@ def test_sampling_spreads_across_the_file_instead_of_truncating(tmp_path) -> Non
     indices = [int(text.split()[1]) for text in sampled]
 
     assert len(sampled) > 50
-    # 앞에서 자른 표본이라면 최댓값이 표본 크기 근처에 머문다.
+    # A prefix sample would have a maximum index near the sample size.
     assert max(indices) > 1500
     assert min(indices) < 500
 
@@ -370,7 +371,7 @@ def test_a_zero_budget_yields_nothing(tmp_path) -> None:
     assert list(sample_monolingual_sentences([path], 0)) == []
 
 
-# ── 긴 문서 분할: 버리지도 자르지도 않는다 ──────────────────────────────
+# ── Long-document segmentation without dropping or truncating text ─────
 
 
 def test_a_short_text_is_returned_unchanged() -> None:
@@ -380,7 +381,7 @@ def test_a_short_text_is_returned_unchanged() -> None:
 
 
 def test_a_long_document_is_split_at_sentence_boundaries() -> None:
-    """문장 중간에서 끊으면 미완성 문장을 완성된 정답으로 가르치게 된다."""
+    """Splitting mid-sentence would teach an incomplete sentence as a full target."""
     from sion_translate.data.monolingual import segment_text
 
     document = " ".join(f"이것은 {index}번째 문장입니다." for index in range(20))
@@ -388,9 +389,9 @@ def test_a_long_document_is_split_at_sentence_boundaries() -> None:
 
     assert len(segments) > 1
     assert all(len(segment) <= 60 for segment in segments)
-    # 문장 경계에서 나뉘었으므로 각 조각이 문장부호로 끝난다.
+    # Sentence-boundary segmentation leaves each piece ending in punctuation.
     assert all(segment.endswith(".") for segment in segments)
-    # 내용이 사라지지 않는다.
+    # No content is lost.
     assert "".join(segments).replace(" ", "") == document.replace(" ", "")
 
 
@@ -424,7 +425,7 @@ def test_a_non_positive_cap_is_rejected() -> None:
 
 
 def test_japanese_sentence_enders_are_boundaries() -> None:
-    """일본어 코퍼스가 가장 크게 손해 보던 쪽이다 (e_gov 97.3% 폐기)."""
+    """Japanese data suffered most from the old behavior: e_gov lost 97.3%."""
     from sion_translate.data.monolingual import segment_text
 
     document = "".join(f"これは{index}番目の文です。" for index in range(20))

@@ -1,9 +1,9 @@
-"""단일어 shard 준비와, 그것이 실제 학습 경로를 통과하는지.
+"""Prepare monolingual shards and exercise them through the real training path.
 
-이 파일의 핵심은 마지막 두 테스트입니다. shard 를 쓰는 것만으로는 아무것도
-보장되지 않습니다 — 같은 shard 가 ``IndexedParallelDataset`` 을 거쳐
-collator 까지 갔을 때 ``<denoise_xx>`` 배치가 나오고, 문장이 두 번 학습되지
-않아야 이 단계가 의도대로 도는 것입니다.
+The final tests are the critical checks. Writing a shard alone guarantees
+nothing. After the same shard passes through ``IndexedParallelDataset`` and the
+collator, it must produce a ``<denoise_xx>`` batch without training every
+sentence twice.
 """
 
 from __future__ import annotations
@@ -132,7 +132,7 @@ def test_the_manifest_records_the_stage_identity(tmp_path, tokenizer_model) -> N
     assert manifest["objective"] == "span-corruption-denoising"
     assert manifest["format"] == "sion-foundation-indexed-v3"
     assert manifest["target_storage"] == "row-shared-source-v1"
-    # 순서는 폴더 정렬 순서를 따른다. 각 언어가 자기 자신과 짝지어지는 것이 요점.
+    # Directory sorting sets the order; the important property is self-pairing.
     assert sorted(manifest["language_pairs"]) == [["ja", "ja"], ["ko", "ko"]]
     assert all(pair[0] == pair[1] for pair in manifest["language_pairs"])
     assert manifest["source_only_languages"] == []
@@ -370,7 +370,7 @@ def test_unreadable_source_reports_the_failing_path(tmp_path, tokenizer_model) -
 
 
 def test_the_manifest_carries_the_skipped_paths_forward(tmp_path, tokenizer_model) -> None:
-    """왜 어떤 파일이 안 들어갔는지는 산출물에 남아야 한다."""
+    """The artifact must retain the reason each skipped file was excluded."""
     root = _corpus(tmp_path / "corpus")
     (root / "ko" / "notes.md").write_text("마크다운\n", encoding="utf-8")
     discovery = discover_monolingual_sources(root, ["ko", "ja"])
@@ -396,8 +396,8 @@ def test_short_and_long_lines_are_dropped_by_reason(tmp_path, tokenizer_model) -
         minimum_characters=8,
         maximum_characters=4000,
     )
-    # 짧은 줄만 버립니다. 긴 문서는 버리지 않고 나눕니다 — e_gov 는 문자의
-    # 97.3%, aozora 는 92.8% 가 "상한 초과" 한 줄이라 통째로 폐기됐었습니다.
+    # Drop only short lines and segment long documents. Earlier handling discarded
+    # 97.3% of e_gov and 92.8% of aozora characters as single over-limit lines.
     assert stats.languages["ko"].too_short == 1
     assert stats.languages["ko"].too_long == 0
     assert stats.languages["ko"].segmented_documents == 1
@@ -877,15 +877,15 @@ def test_the_report_names_the_drop_reasons(tmp_path, tokenizer_model) -> None:
     assert "train" in rendered
 
 
-# ── 여기부터가 핵심: 실제 학습 경로를 통과하는가 ────────────────────────
+# ── Critical checks through the real training path ─────────────────────
 
 
 def test_each_sentence_is_trained_once_not_twice(tmp_path, tokenizer_model) -> None:
-    """복원 과제는 두 방향이 같은 예제다.
+    """Both directions of a reconstruction example are identical.
 
-    ``forward_only`` 를 쓰지 않으면 양방향 확장이 모든 문장을 정확히 두 번
-    학습시킵니다 — 조용히 epoch 이 두 배가 되고, 손실 곡선만 보면 알 수
-    없습니다.
+    Without ``forward_only``, bidirectional expansion trains every sentence
+    exactly twice. This silently doubles the epoch and is invisible in the loss
+    curve alone.
     """
     _, stats = _prepare(tmp_path, tokenizer_model)
     dataset = IndexedParallelDataset(tmp_path / "dataset", split="train", bidirectional=True)
@@ -895,7 +895,7 @@ def test_each_sentence_is_trained_once_not_twice(tmp_path, tokenizer_model) -> N
 
 
 def test_the_collator_produces_denoising_batches(tmp_path, tokenizer_model) -> None:
-    """입력은 ``<denoise_xx>`` 로 시작하고, 정답은 손상되지 않은 원문이어야 한다."""
+    """Input starts with ``<denoise_xx>`` and the target is the intact original."""
     _prepare(tmp_path, tokenizer_model)
     tokenizer = SionTokenizer(tokenizer_model)
     dataset = IndexedParallelDataset(tmp_path / "dataset", split="train", bidirectional=True)
@@ -913,9 +913,9 @@ def test_the_collator_produces_denoising_batches(tmp_path, tokenizer_model) -> N
     denoise_ids = set(tokenizer.denoise_tags.values())
     first_tokens = batch["input_ids"][:, 0].tolist()
     assert all(token in denoise_ids for token in first_tokens), first_tokens
-    # 손상은 입력에만 일어난다: 정답에는 <mask> 가 없어야 한다.
+    # Corruption affects only input; the target must contain no <mask> token.
     assert not (batch["labels"] == tokenizer.mask_id).any()
-    # 실제로 무언가 가려졌는지 확인한다. 그렇지 않으면 복원할 것이 없다.
+    # Confirm that something was masked; otherwise there is nothing to reconstruct.
     assert (batch["input_ids"] == tokenizer.mask_id).any()
 
 
@@ -923,7 +923,7 @@ def test_no_translation_direction_tag_appears_in_a_foundation_batch(
     tmp_path,
     tokenizer_model,
 ) -> None:
-    """foundation 배치에 ``<2xx>`` 가 섞이면 번역을 미리 배우는 셈이 된다."""
+    """A ``<2xx>`` tag in a foundation batch would teach translation prematurely."""
     _prepare(tmp_path, tokenizer_model)
     tokenizer = SionTokenizer(tokenizer_model)
     dataset = IndexedParallelDataset(tmp_path / "dataset", split="train", bidirectional=True)

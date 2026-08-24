@@ -1,9 +1,9 @@
-"""foundation 단계의 실행 여부 판단과 설정 유도.
+"""Test foundation-stage planning and derived configuration.
 
-"폴더가 있으면 자동 실행" 이므로 건너뛰는 것이 정상 경로입니다. 그래서 여기
-테스트의 절반은 **왜 건너뛰었는지가 문장으로 남는가** 를 봅니다 — 조용히
-건너뛰면 사용자는 5 GB 코퍼스가 학습에 들어갔다고 믿은 채로 번역 학습을
-끝냅니다.
+The stage runs automatically when its corpus directory exists, so skipping is a
+normal path. Many tests therefore verify that the reason for skipping is
+reported clearly. If the pipeline skips silently, an operator can finish
+translation training while believing that a 5 GB corpus was used.
 """
 
 from __future__ import annotations
@@ -97,7 +97,7 @@ def test_pipeline_identity_tracks_model_ancestry_not_the_skip_reason(tmp_path) -
 
 
 def test_source_only_languages_never_reach_the_plan(tmp_path) -> None:
-    """혼용문 kj 로 복원 학습을 하면 디코더가 kj 를 생성하도록 배운다."""
+    """Reconstructing source-only ``kj`` would teach the decoder to emit it."""
     _corpus(tmp_path, languages=("ko", "ja", "kj"))
     plan = plan_foundation_stage(_config(tmp_path))
     assert "kj" not in plan.languages
@@ -105,7 +105,7 @@ def test_source_only_languages_never_reach_the_plan(tmp_path) -> None:
 
 
 def test_a_language_without_data_warns_but_still_runs(tmp_path) -> None:
-    """현재 저장소의 실제 상태: ko 만 있고 ja 는 없다."""
+    """Cover a corpus where one configured language has no data."""
     _corpus(tmp_path, languages=("ko",))
     plan = plan_foundation_stage(_config(tmp_path))
     assert plan.enabled
@@ -125,14 +125,14 @@ def test_the_plan_carries_the_discovery_report(tmp_path) -> None:
     assert any("stray.py" in line for line in plan.report)
 
 
-# ── 설정 유도 ───────────────────────────────────────────────────────────
+# ── Derived configuration ───────────────────────────────────────────────
 
 
 def test_the_derived_config_is_a_pure_denoising_run(tmp_path) -> None:
-    """src == tgt 인 shard 에서 복원을 걸지 않으면 '입력을 베껴라' 가 된다."""
+    """Without denoising, a ``src == tgt`` shard only teaches input copying."""
     derived = build_foundation_config(_config(tmp_path))
     assert derived.data.denoise_probability == 1.0
-    # 검증만 0 이면 검증 손실이 복사 과제의 손실이 되어 best 선택이 무의미해진다.
+    # Without validation noise, copy loss makes best-checkpoint selection meaningless.
     assert derived.data.validation_denoise_probability == 1.0
     assert derived.data.source_token_dropout == 0.0
     assert derived.data.decoder_input_noise == 0.0
@@ -181,7 +181,7 @@ def test_the_derived_config_takes_its_schedule_from_the_foundation_section(tmp_p
 
 
 def test_the_derived_config_has_no_posttraining_and_no_recursion(tmp_path) -> None:
-    """복원 단계는 번역을 하지 않으므로 MRT 도, 또 다른 foundation 도 없다."""
+    """A reconstruction stage performs neither MRT nor nested foundation training."""
     derived = build_foundation_config(_config(tmp_path))
     assert derived.posttraining.enabled is False
     assert derived.foundation.enabled is False
@@ -193,7 +193,7 @@ def test_the_derived_config_drops_source_only_languages(tmp_path) -> None:
 
 
 def test_the_derived_config_uses_a_direction_free_selection_metric(tmp_path) -> None:
-    """복원 과제에는 번역 방향이 없다."""
+    """A reconstruction task has no translation direction."""
     derived = build_foundation_config(_config(tmp_path))
     assert derived.training.sft_selection_metric == "global_nll"
 

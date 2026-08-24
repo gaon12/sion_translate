@@ -1,9 +1,10 @@
-"""foundation 단계를 실제로 한 번 돌려 본다.
+"""Exercise one complete foundation-training stage.
 
-계획·설정 유도는 `test_foundation_stage.py` 가 봅니다. 여기서는 그 설정으로
-정말 학습이 돌고, **두 번째 실행이 다시 학습하지 않는지** 를 봅니다. 이
-단계는 파이프라인에서 가장 오래 걸리는 구간이라, 번역 학습이 실패해 다시
-실행할 때마다 며칠짜리 사전학습을 반복하면 안 됩니다.
+``test_foundation_stage.py`` covers planning and derived configuration. This
+module verifies that the resulting configuration really trains and, critically,
+that a second invocation does not train again. This is the longest pipeline
+stage, so retrying failed translation training must not repeat days of
+pretraining.
 """
 
 from __future__ import annotations
@@ -74,7 +75,7 @@ def tokenizer_model(tmp_path_factory):
 
 
 def _prepared(tmp_path, tokenizer_model, *, empty_language: str | None = None):
-    """토크나이저·코퍼스·데이터셋이 준비된 설정과 모델을 만든다."""
+    """Build a configuration and model with prepared tokenizer, corpus, and data."""
 
     corpus = tmp_path / "corpus"
     for language, template in (
@@ -201,7 +202,7 @@ def test_the_stage_trains_and_marks_itself_complete(
     run_root = foundation_run_directory(config)
     assert (run_root / FOUNDATION_COMPLETION_FILENAME).is_file()
     assert (run_root / "checkpoints" / "best").exists()
-    # 실제로 학습이 일어났다면 가중치가 움직여야 한다.
+    # A real training run must move the weights.
     assert not torch.allclose(model.token_embedding.weight, before)
 
     marker = json.loads((run_root / FOUNDATION_COMPLETION_FILENAME).read_text(encoding="utf-8"))
@@ -401,7 +402,7 @@ def test_a_second_run_reuses_the_weights_instead_of_retraining(
     tokenizer_model,
     monkeypatch,
 ) -> None:
-    """가장 비싼 단계를 반복하지 않는 것이 이 표시의 존재 이유다."""
+    """The completion marker exists to prevent repeating the most expensive stage."""
     config, plan, model, tokenizer, context = _prepared(tmp_path, tokenizer_model)
     run_foundation_stage(config, plan, model, tokenizer, context)
     trained = model.token_embedding.weight.detach().clone()
@@ -1100,7 +1101,7 @@ def test_a_missing_corpus_never_trains_or_exports_a_foundation_model(
 
 
 def test_the_stage_publishes_under_the_foundation_release_name(tmp_path, tokenizer_model) -> None:
-    """foundation 산출물은 번역 모델이 아니라 그 파운데이션이다."""
+    """Publish the base under its foundation name, not the translation name."""
     config, plan, model, tokenizer, context = _prepared(tmp_path, tokenizer_model)
     # The translation graph also contains a source-only variety, but the
     # foundation plan deliberately targets only ko/ja.
@@ -1129,7 +1130,7 @@ def test_the_stage_publishes_under_the_foundation_release_name(tmp_path, tokeniz
     assert metadata["release_name"] == "sion"
     assert metadata["translation_capable"] is False
     assert metadata["languages"] == ["ko", "ja"]
-    # 번역 방향을 적지 않는다. 번역할 수 없는 가중치이기 때문이다.
+    # Do not advertise directions because these weights cannot translate.
     assert "translation_directions" not in metadata
     assert "language_pair" not in metadata
     assert "language_pairs" not in metadata
