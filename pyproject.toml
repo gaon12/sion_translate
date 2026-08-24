@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "sion-translate"
 dynamic = ["version"]
-description = "From-scratch Korean-Japanese experimental machine translation training stack"
+description = "From-scratch multilingual foundation and machine translation training stack"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
