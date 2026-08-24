@@ -22,6 +22,8 @@ Stage ``prepare`` does every deterministic repair and drop, and writes rows that
 are ready to be scored::
 
     python scripts/data/recover_shard.py prepare \
+        --source-key ko --target-key ja \
+        --source-language ko --target-language ja \
         --source-scripts ko --target-scripts ja \
         --output data/staging/data50.prepared.jsonl \
         --report reports/recover-data50-prepare.json \
@@ -38,6 +40,7 @@ Then score them with the pinned embedding model, which attaches
 Stage ``select`` then resolves the fan-out and cuts the low-similarity tail::
 
     python scripts/data/recover_shard.py select \
+        --source-key ko --target-key ja \
         --min-similarity 0.80 --unique-source \
         --output data/data54.jsonl \
         --report reports/recover-data50-select.json \
@@ -60,18 +63,65 @@ import json
 from pathlib import Path
 import sys
 from typing import Any, Iterable, Sequence
+import uuid
 
 from sion_translate.data.quality import QualityPolicy, assess_pair, canonical_text
 from sion_translate.function_morphemes import (
     placeholder_hole_markers,
     rejoin_orphan_particles,
 )
+from sion_translate.language_tags import canonicalize_language_tag
 from sion_translate.scripts_registry import (
     collapse_spurious_spaces,
     has_foreign_script,
     resolve_scripts,
     spurious_space_count,
 )
+
+
+def _validate_parallel_keys(source_key: str, target_key: str) -> None:
+    if (
+        not source_key.strip()
+        or not target_key.strip()
+        or source_key != source_key.strip()
+        or target_key != target_key.strip()
+    ):
+        raise ValueError(
+            "source_key and target_key must be non-empty and have no surrounding whitespace"
+        )
+    if source_key == target_key:
+        raise ValueError("source_key and target_key must be distinct")
+
+
+def _canonical_language_direction(
+    source_language: str,
+    target_language: str,
+) -> tuple[str, str]:
+    source = canonicalize_language_tag(source_language, field="source_language")
+    target = canonicalize_language_tag(target_language, field="target_language")
+    if source == target:
+        raise ValueError(
+            "source_language and target_language must identify distinct BCP 47 languages"
+        )
+    return source, target
+
+
+def _path_identity(path: Path) -> str:
+    resolved = str(path.resolve(strict=False))
+    return resolved.casefold() if sys.platform == "win32" else resolved
+
+
+def _validate_output_path(path: Path) -> None:
+    if path.exists() and not path.is_file():
+        raise ValueError(f"output path is not a regular file: {path}")
+    if path.parent.exists() and not path.parent.is_dir():
+        raise ValueError(f"output parent is not a directory: {path.parent}")
+
+
+def _validate_distinct_io(path: Path, output: Path) -> None:
+    _validate_output_path(output)
+    if _path_identity(path) == _path_identity(output):
+        raise ValueError("input and output paths must be distinct")
 
 
 @dataclass
@@ -93,11 +143,11 @@ class PrepareResult:
     particles_rejoined: int = 0
     particles_joined: int = 0
     min_space_density: float = 0.0
-    quality_reasons: dict[str, int] = field(default_factory=dict)
-    foreign_script_examples: list[dict[str, str]] = field(default_factory=list)
-    spacing_examples: list[dict[str, str]] = field(default_factory=list)
-    placeholder_hole_examples: list[dict[str, str]] = field(default_factory=list)
-    isolated_spacing_examples: list[dict[str, Any]] = field(default_factory=list)
+    quality_reasons: dict[str, int] = field(default_factory=dict[str, int])
+    foreign_script_examples: list[dict[str, str]] = field(default_factory=list[dict[str, str]])
+    spacing_examples: list[dict[str, str]] = field(default_factory=list[dict[str, str]])
+    placeholder_hole_examples: list[dict[str, str]] = field(default_factory=list[dict[str, str]])
+    isolated_spacing_examples: list[dict[str, Any]] = field(default_factory=list[dict[str, Any]])
     distinct_sources: int = 0
     max_targets_per_source: int = 0
 
@@ -116,10 +166,10 @@ class SelectResult:
     dropped_over_fanout: int = 0
     sources_over_fanout: int = 0
     max_targets_per_source: int | None = None
-    similarity_percentiles: dict[str, float] = field(default_factory=dict)
-    dropped_examples: list[dict[str, Any]] = field(default_factory=list)
-    resolved_fanout_examples: list[dict[str, Any]] = field(default_factory=list)
-    over_fanout_examples: list[dict[str, Any]] = field(default_factory=list)
+    similarity_percentiles: dict[str, float] = field(default_factory=dict[str, float])
+    dropped_examples: list[dict[str, Any]] = field(default_factory=list[dict[str, Any]])
+    resolved_fanout_examples: list[dict[str, Any]] = field(default_factory=list[dict[str, Any]])
+    over_fanout_examples: list[dict[str, Any]] = field(default_factory=list[dict[str, Any]])
 
 
 def read_rows(path: Path) -> Iterable[tuple[int, dict[str, Any] | None]]:
@@ -137,12 +187,31 @@ def read_rows(path: Path) -> Iterable[tuple[int, dict[str, Any] | None]]:
 
 
 def write_rows(path: Path, rows: Sequence[dict[str, Any]]) -> None:
+    _validate_output_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".part")
-    with temporary.open("w", encoding="utf-8", newline="\n") as handle:
-        for row in rows:
-            handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
-    temporary.replace(path)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+            for row in rows:
+                handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def write_report(path: Path, result: PrepareResult | SelectResult) -> None:
+    _validate_output_path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(asdict(result), ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def rank_key(source: str, target: str, seed: str) -> str:
@@ -190,10 +259,20 @@ def prepare_shard(
     min_space_density: float,
     rejoin_particles: bool,
 ) -> PrepareResult:
+    _validate_parallel_keys(source_key, target_key)
+    _validate_distinct_io(path, output)
+    source_language, target_language = _canonical_language_direction(
+        source_language,
+        target_language,
+    )
     result = PrepareResult(path=str(path), output=str(output))
     result.min_space_density = min_space_density
-    permitted_source = resolve_scripts(source_scripts) if source_scripts else frozenset()
-    permitted_target = resolve_scripts(target_scripts) if target_scripts else frozenset()
+    permitted_source: frozenset[str] = (
+        resolve_scripts(source_scripts) if source_scripts else frozenset()
+    )
+    permitted_target: frozenset[str] = (
+        resolve_scripts(target_scripts) if target_scripts else frozenset()
+    )
 
     kept: list[dict[str, Any]] = []
     seen_pairs: set[tuple[str, str]] = set()
@@ -292,7 +371,12 @@ def prepare_shard(
             continue
 
         if apply_quality:
-            assessment = assess_pair(source, target, policy=policy)
+            assessment = assess_pair(
+                source,
+                target,
+                policy=policy,
+                languages=(source_language, target_language),
+            )
             if not assessment.accepted:
                 result.dropped_quality += 1
                 for reason in assessment.rejection_reasons:
@@ -332,6 +416,8 @@ def select_alignments(
     max_targets_per_source: int | None,
     seed: str,
 ) -> SelectResult:
+    _validate_parallel_keys(source_key, target_key)
+    _validate_distinct_io(path, output)
     result = SelectResult(path=str(path), output=str(output), min_similarity=min_similarity)
     result.max_targets_per_source = max_targets_per_source
 
@@ -455,18 +541,18 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("input", type=Path)
     common.add_argument("--output", type=Path, required=True)
     common.add_argument("--report", type=Path)
-    common.add_argument("--source-key", default="ko")
-    common.add_argument("--target-key", default="ja")
+    common.add_argument("--source-key", required=True)
+    common.add_argument("--target-key", required=True)
 
     prepare = subparsers.add_parser("prepare", parents=[common], help="deterministic repairs")
     prepare.add_argument("--source-scripts", type=script_list, default=[])
     prepare.add_argument("--target-scripts", type=script_list, default=[])
     prepare.add_argument(
         "--source-language",
-        default="ko",
+        required=True,
         help="language tag used for stranded-particle detection; unknown tags are not checked",
     )
-    prepare.add_argument("--target-language", default="ja")
+    prepare.add_argument("--target-language", required=True)
     prepare.add_argument(
         "--min-space-density",
         type=float,
@@ -503,9 +589,26 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    try:
+        _validate_parallel_keys(args.source_key, args.target_key)
+        if args.stage == "prepare":
+            _canonical_language_direction(args.source_language, args.target_language)
+    except ValueError as error:
+        print(f"invalid parallel identity: {error}", file=sys.stderr)
+        return 2
     path = args.input
     if not path.is_file():
         print(f"{path}: not a file", file=sys.stderr)
+        return 2
+    try:
+        _validate_distinct_io(path, args.output)
+        if args.report:
+            _validate_output_path(args.report)
+            report_identity = _path_identity(args.report)
+            if report_identity in {_path_identity(path), _path_identity(args.output)}:
+                raise ValueError("report path must be distinct from input and output paths")
+    except (OSError, ValueError) as error:
+        print(f"invalid output identity: {error}", file=sys.stderr)
         return 2
 
     try:
@@ -564,11 +667,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     if args.report:
-        args.report.parent.mkdir(parents=True, exist_ok=True)
-        args.report.write_text(
-            json.dumps(asdict(result), ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        try:
+            write_report(args.report, result)
+        except OSError as error:
+            print(f"cannot write report ({error})", file=sys.stderr)
+            return 2
     return 0
 
 

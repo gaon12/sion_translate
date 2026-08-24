@@ -13,6 +13,8 @@ import json
 from pathlib import Path
 import sys
 
+import pytest
+
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "data" / "recover_shard.py"
 SPEC = importlib.util.spec_from_file_location("recover_shard_test", SCRIPT_PATH)
@@ -360,6 +362,14 @@ def test_cli_runs_both_stages(tmp_path: Path) -> None:
                 str(raw),
                 "--output",
                 str(prepared),
+                "--source-key",
+                "ko",
+                "--target-key",
+                "ja",
+                "--source-language",
+                "ko",
+                "--target-language",
+                "ja",
                 "--source-scripts",
                 "ko",
                 "--target-scripts",
@@ -385,6 +395,10 @@ def test_cli_runs_both_stages(tmp_path: Path) -> None:
                 str(scored),
                 "--output",
                 str(final),
+                "--source-key",
+                "ko",
+                "--target-key",
+                "ja",
                 "--min-similarity",
                 "0.8",
                 "--unique-source",
@@ -407,6 +421,14 @@ def test_cli_rejects_a_missing_input(tmp_path: Path) -> None:
                 str(tmp_path / "nope.jsonl"),
                 "--output",
                 str(tmp_path / "out.jsonl"),
+                "--source-key",
+                "ko",
+                "--target-key",
+                "ja",
+                "--source-language",
+                "ko",
+                "--target-language",
+                "ja",
             ]
         )
         == 2
@@ -539,3 +561,127 @@ def test_rejoining_can_be_turned_off(tmp_path: Path) -> None:
     result = prepare(source, output, rejoin_particles=False)
     assert result.particles_rejoined == 0
     assert read_shard(output)[0]["ko"] == "금요일 오전 아홉 시 에 깨워줘"
+
+
+@pytest.mark.parametrize(
+    ("source_key", "target_key", "message"),
+    [
+        ("", "ja", "must be non-empty"),
+        (" ko", "ja", "surrounding whitespace"),
+        ("text", "text", "must be distinct"),
+    ],
+)
+def test_prepare_rejects_invalid_parallel_keys_before_writing(
+    tmp_path: Path,
+    source_key: str,
+    target_key: str,
+    message: str,
+) -> None:
+    source = write_shard(tmp_path / "in.jsonl", [{"text": "same", "ja": "異なる"}])
+    output = tmp_path / "out.jsonl"
+
+    with pytest.raises(ValueError, match=message):
+        prepare(
+            source,
+            output,
+            source_key=source_key,
+            target_key=target_key,
+        )
+
+    assert not output.exists()
+
+
+def test_select_rejects_self_pair_keys_before_reading_or_writing(tmp_path: Path) -> None:
+    missing_input = tmp_path / "missing.jsonl"
+    output = tmp_path / "out.jsonl"
+
+    with pytest.raises(ValueError, match="must be distinct"):
+        RECOVER.select_alignments(
+            missing_input,
+            output,
+            source_key="text",
+            target_key="text",
+            score_key="semantic_similarity",
+            min_similarity=0.0,
+            unique_source=False,
+            unique_target=False,
+            max_targets_per_source=None,
+            seed="test",
+        )
+
+    assert not output.exists()
+
+
+def test_prepare_rejects_canonical_bcp47_self_pair_before_writing(tmp_path: Path) -> None:
+    source = write_shard(tmp_path / "in.jsonl", [{"src": "a", "tgt": "b"}])
+    output = tmp_path / "out.jsonl"
+
+    with pytest.raises(ValueError, match="distinct BCP 47 languages"):
+        prepare(
+            source,
+            output,
+            source_key="src",
+            target_key="tgt",
+            source_language="PT-br",
+            target_language="pt-BR",
+        )
+
+    assert not output.exists()
+
+
+def test_direct_apis_reject_input_output_alias_before_mutation(tmp_path: Path) -> None:
+    source = write_shard(
+        tmp_path / "in.jsonl",
+        [{"ko": "원문입니다.", "ja": "原文です。", "semantic_similarity": 1.0}],
+    )
+    original = source.read_bytes()
+
+    with pytest.raises(ValueError, match="input and output paths must be distinct"):
+        prepare(source, source)
+    with pytest.raises(ValueError, match="input and output paths must be distinct"):
+        RECOVER.select_alignments(
+            source,
+            source,
+            source_key="ko",
+            target_key="ja",
+            score_key="semantic_similarity",
+            min_similarity=0.0,
+            unique_source=False,
+            unique_target=False,
+            max_targets_per_source=None,
+            seed="test",
+        )
+
+    assert source.read_bytes() == original
+
+
+def test_cli_rejects_report_collisions_before_writing(tmp_path: Path) -> None:
+    source = write_shard(
+        tmp_path / "in.jsonl",
+        [{"ko": "원문입니다.", "ja": "原文です。", "semantic_similarity": 1.0}],
+    )
+    output = tmp_path / "out.jsonl"
+    original = source.read_bytes()
+
+    assert (
+        RECOVER.main(
+            [
+                "select",
+                str(source),
+                "--output",
+                str(output),
+                "--report",
+                str(source),
+                "--source-key",
+                "ko",
+                "--target-key",
+                "ja",
+                "--min-similarity",
+                "0.0",
+            ]
+        )
+        == 2
+    )
+
+    assert source.read_bytes() == original
+    assert not output.exists()
