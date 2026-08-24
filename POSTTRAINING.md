@@ -1,102 +1,146 @@
-# sion_translate 사후학습 설계와 실험 가이드
+# Posttraining design and experiment guide
 
-## 현재 구현
+## Implemented objective
 
-사후학습의 전체 loss는 다음과 같습니다.
+The posttraining loss combines reference supervision, expected sequence risk, and
+candidate preferences:
 
 ```text
-L = L_reference_CE + risk_weight * L_composite_MRT
-                   + preference_weight * L_multi_pair
+L = L_reference_CE
+  + L_reference_auxiliary
+  + risk_weight * L_composite_MRT
+  + preference_weight * (L_candidate_pairs + L_reference_anchor)
 ```
 
-- `L_reference_CE`: 정답 번역 likelihood를 유지해 보상 최적화 중 문장 품질이
-  무너지는 것을 막는 anchor입니다.
-- `L_composite_MRT`: 확률적으로 생성한 후보들의 기대 위험을 최소화합니다.
-- `L_multi_pair`: reward 차이가 `preference_min_gap` 이상인 모든 후보쌍에 대해
-  더 좋은 후보의 평균 log-probability가 더 높아지도록 학습합니다.
-- 후보 reward는 `chrF + token F1 + 숫자 + 구조 문자열 + glossary slot + 목표
-  언어 문자 + 길이`의 가중 평균이며, 과도한 반복과 원문 복사를 감점합니다.
-- 사후학습의 `best`와 early stopping은 CE가 아니라 validation 문장의 beam
-  번역에 계산한 복합 reward를 사용합니다. CE도 모델 drift 진단용으로 계속
-  기록합니다.
-- 선택 지표는 `posttraining.selection_metric` 이며 기본값은
-  **`worst_direction_reward`**(가장 낮은 방향)입니다. 평균 reward 하나로 고르면
-  한 방향이 후퇴해도 다른 방향이 더 오르면 그 체크포인트가 best 가 됩니다 —
-  이 저장소는 이미 ko→ja 59.81 대 ja→ko 49.87 로 방향 격차가 있어서, 평균만
-  보면 격차가 벌어지는 것을 놓칩니다. `macro_direction_reward`(방향 균형)와
-  `reward`(예전 동작)도 고를 수 있습니다. 방향 메타데이터가 없는 custom caller
-  에서는 평균 reward 로 되돌아가며 그 사실을 한 번 출력합니다.
-- 방향별 reward 는 `validation_direction_<src>_to_<tgt>_reward` 로 로그에
-  남습니다.
-- 선택 지표는 `posttraining.selection_metric`이며 기본값은
-  **`worst_direction_reward`**(가장 낮은 방향)입니다. 평균 reward 하나로 고르면
-  한 방향이 후퇴해도 다른 방향이 더 오르면 그 체크포인트가 best 가 됩니다 —
-  이 저장소는 이미 ko→ja 59.81 대 ja→ko 49.87 로 방향 격차가 있어서, 평균만
-  보면 격차가 벌어지는 것을 놓칩니다. `macro_direction_reward`(방향 균형)와
-  `reward`(예전 동작)도 고를 수 있습니다. 방향 메타데이터가 없는 custom caller
-  에서는 평균 reward로 되돌아가며 그 사실을 한 번 출력합니다.
-- 방향별 reward는 `validation_direction_<src>_to_<tgt>_reward` 로 로그에
-  남습니다.
+- `L_reference_CE` preserves the likelihood of the gold translation while sequence-level
+  rewards change the candidate distribution.
+- `L_reference_auxiliary` keeps enabled supervised heads, such as semantic alignment and
+  evidence budgeting, active during MRT.
+- `L_composite_MRT` minimizes expected risk over candidates sampled from the current
+  model.
+- `L_candidate_pairs` trains every candidate pair whose reward gap exceeds
+  `preference_min_gap`.
+- `L_reference_anchor` compares sampled candidates with the gold sequence. A rewarded
+  sample cannot become preferred merely by outranking other weak samples; its score must
+  remain anchored to the reference.
 
-기본 보상 가중치는 일반 문장 품질을 위한 시작점입니다. 숫자/코드가 중요한
-업무 데이터라면 `reward_number_weight`, `reward_structured_weight`,
-`reward_slot_weight`를 올리고 반드시 별도 holdout으로 확인해야 합니다.
+All candidate and reference scores use mean token log-probability, which avoids a
+systematic preference for short sequences. Non-finite rewards or sequence scores stop the
+step instead of silently contaminating optimizer state.
 
-## 설계 근거
+## Composite reward
 
-- [Minimum Risk Training for Neural Machine Translation (ACL 2016)](https://aclanthology.org/P16-1159/):
-  문장 단위 평가 척도의 기대 위험을 직접 최적화하는 기본 구조입니다.
-- [M2PO: Multi-Perspective Multi-Pair Preference Optimization (ACL 2026)](https://aclanthology.org/2026.acl-long.469/):
-  단일 관점의 품질 추정이 부분 환각/누락을 놓칠 수 있으며, 후보 하나만 고르는
-  대신 여러 관점과 모든 후보쌍을 쓰는 방법을 제안합니다. 현재의 복합 reward와
-  all-pair preference loss에 반영했습니다.
-- [Direct Quality Optimization for Neural Machine Translation (WMT 2025)](https://aclanthology.org/2025.wmt-1.2/):
-  encoder-decoder NMT에서도 직접 선호 최적화가 품질을 높일 수 있음을 보입니다.
-- [Word Alignment as Preference for Machine Translation (EMNLP 2024)](https://aclanthology.org/2024.emnlp-main.188/):
-  정렬 기반 선호가 환각과 누락을 줄일 수 있다는 결과를 숫자·구조 문자열·slot
-  보존 보상에 반영했습니다.
-- [xCOMET: Transparent Machine Translation Evaluation through Fine-grained Error Detection (TACL 2024)](https://aclanthology.org/2024.tacl-1.54/),
-  [Fine-Grained Reward Optimization for Machine Translation using Error Severity (TACL 2026)](https://aclanthology.org/2026.tacl-1.33/):
-  문장 점수뿐 아니라 오류 위치/심각도를 이용하는 fine-grained reward가 학습을
-  안정화할 수 있습니다. xCOMET는 별도 대형 모델과 VRAM이 필요하므로 기본 실행의
-  필수 의존성으로 넣지 않았고, 아래 2차 실험으로 분리합니다.
-- [Metric Bias in Minimum Bayes Risk Decoding (WMT 2024)](https://aclanthology.org/2024.wmt-1.109/):
-  최적화에 사용한 metric 하나만으로 결과를 평가하면 reward hacking을 놓칠 수
-  있음을 보여 줍니다. 그래서 chrF 단독 reward를 피하고 최종 평가는 별도 지표로
-  수행합니다.
-- [Unlikelihood Training for Neural Machine Translation (COLING 2020)](https://aclanthology.org/2020.coling-main.462/):
-  반복 생성 억제의 근거입니다. 현재는 반복을 직접 음의 보상으로 적용합니다.
+The local reward combines:
 
-## 권장 실험 순서
+- chrF reference similarity;
+- token multiset F1;
+- number preservation;
+- structured token and placeholder preservation;
+- protected glossary-slot preservation;
+- target-language character evidence when a profile is available;
+- output/reference length agreement;
+- optional round-trip reconstruction.
 
-동일한 사전학습 checkpoint, validation/test split, 생성 설정으로 아래를 비교합니다.
+It separately penalizes excessive repetition, inappropriate source copying, invented or
+dropped numeric values, and low round-trip quality. Numeric corruption is a fixed penalty
+in addition to the weighted number component because a small ratio loss can otherwise be
+overcome by a modest chrF gain.
 
-| 실험 | 설정 | 확인할 효과 |
+Tune number, structured, and slot weights for domains where exact values, code, or
+localization placeholders are critical. Every change requires an independent holdout;
+the training reward is not sufficient evidence of improvement.
+
+## Deployment-aligned generation
+
+Candidate sampling and posttraining validation use the same reference-free constraints as
+native deployment:
+
+- training-only control tokens are forbidden;
+- a minimum output length is enforced;
+- repeated n-grams are blocked;
+- per-row output limits are derived from source length plus a bounded margin;
+- validation uses the deployment beam count and length penalty;
+- candidate-refinement reasoning uses the checkpoint's configured endpoint.
+
+Reference target length is never used to choose a validation or candidate generation
+limit. These decoding controls are part of checkpoint objective identity, so changing one
+cannot silently resume against an incomparable historical best metric.
+
+## Best-checkpoint selection
+
+Posttraining selects and early-stops on generated translation reward, not teacher-forced
+cross-entropy. CE remains in telemetry as a drift diagnostic.
+
+`posttraining.selection_metric` supports:
+
+- `worst_direction_reward` (default): optimize the weakest authenticated direction;
+- `macro_direction_reward`: average every observed direction equally;
+- `reward`: global row-weighted mean, retained for compatibility.
+
+Per-direction metrics use the form
+`validation_direction_<source>_to_<target>_reward`. If a custom caller does not provide
+direction metadata, the trainer falls back to global reward and reports the fallback.
+
+This logic operates on arbitrary BCP 47 direction graphs. It does not assume a particular
+pair or a bidirectional topology.
+
+## Why these components exist
+
+- [Minimum Risk Training for Neural Machine Translation (ACL 2016)](https://aclanthology.org/P16-1159/)
+  provides the expected sequence-risk foundation.
+- [M2PO: Multi-Perspective Multi-Pair Preference Optimization (ACL 2026)](https://aclanthology.org/2026.acl-long.469/)
+  motivates multi-perspective rewards and more than one preference pair.
+- [Direct Quality Optimization for Neural Machine Translation (WMT 2025)](https://aclanthology.org/2025.wmt-1.2/)
+  demonstrates direct preference optimization for encoder-decoder NMT.
+- [Word Alignment as Preference for Machine Translation (EMNLP 2024)](https://aclanthology.org/2024.emnlp-main.188/)
+  motivates explicit omission and hallucination signals.
+- [xCOMET (TACL 2024)](https://aclanthology.org/2024.tacl-1.54/) and
+  [Fine-Grained Reward Optimization (TACL 2026)](https://aclanthology.org/2026.tacl-1.33/)
+  motivate error-location and severity rewards. They require a separate large model and
+  are not mandatory runtime dependencies here.
+- [Metric Bias in Minimum Bayes Risk Decoding (WMT 2024)](https://aclanthology.org/2024.wmt-1.109/)
+  explains why evaluation with only the optimized metric can hide reward hacking.
+- [Unlikelihood Training for Neural Machine Translation (COLING 2020)](https://aclanthology.org/2020.coling-main.462/)
+  motivates explicit repetition suppression.
+
+## Recommended ablation order
+
+Use the same SFT checkpoint, tokenizer, data fingerprint, validation/test splits,
+direction graph, and decoding policy for every comparison.
+
+| Experiment | Settings | Question |
 |---|---|---|
-| A | `risk_weight=0`, `preference_weight=0` | CE anchor 기준선 |
-| B | chrF MRT만 사용 | 기존 사후학습 기준선 |
-| C | 기본 복합 MRT | 숫자/slot 누락, 반복, 원문 복사 개선 |
-| D | 복합 MRT + multi-pair | 후보 순위와 전체 번역 품질 개선 |
-| E | D + xCOMET 오류 심각도 reward | 더 미세한 환각/누락 개선 가능성 |
+| A | `risk_weight=0`, `preference_weight=0` | What does reference CE alone preserve? |
+| B | chrF-only MRT | What does the historical sequence-risk baseline change? |
+| C | Composite MRT | Do preservation, repetition, and copy failures improve? |
+| D | Composite MRT plus all candidate pairs | Does candidate ordering improve beyond expected risk? |
+| E | D plus gold/reference preference anchoring | Do rewarded samples remain faithful to the reference? |
+| F | E plus offline external severity rewards | Do independent fine-grained errors improve enough to justify the cost? |
 
-최종 비교에는 학습 reward만 쓰지 말고 다음을 함께 기록합니다.
+Record at least:
 
-- test split의 chrF/BLEU와 방향별 점수(ko→ja, ja→ko)
-- 숫자, URL/이메일/코드, glossary slot의 exact preservation rate
-- 반복 출력률, 빈 출력률, 원문 복사율, 길이 비율 분포
-- 일반/전문/대화 도메인별 점수와 최소 200문장 blind 사람 평가
+- chrF and BLEU globally and for every authenticated direction;
+- worst-direction and macro-direction values;
+- exact number, URL, email, code, placeholder, and glossary-slot preservation;
+- repetition, empty-output, source-copy, and output/source length distributions;
+- results by general, technical, conversational, and other relevant domains;
+- a blind human evaluation large enough to support the claimed conclusion.
 
-E는 실험 옵션입니다. xCOMET 같은 외부 reward 모델을 online으로 함께 돌리면 GPU
-메모리와 학습 시간이 크게 증가하므로, 먼저 후보를 offline으로 scoring해 preference
-pair를 저장한 뒤 학습하는 방식을 권장합니다. 같은 xCOMET 점수만으로 E를 선택하지
-말고 C/D와 독립 metric 및 사람 평가로 비교해야 합니다.
+Do not select experiment F with the same external metric used to create its preferences.
+Score candidates offline when possible, store exact model and dataset provenance, and
+compare with independent metrics and human review.
 
-## 조정 기준
+## Tuning rules
 
-- 후보 reward가 거의 같아 pair가 적으면 `samples_per_source`를 4~8로 늘리거나
-  `preference_min_gap`을 0.02까지 낮춥니다.
-- 문장이 불안정해지면 `preference_weight`를 먼저 0.05로, 그다음
-  `risk_weight`를 0.10으로 낮춥니다. CE anchor는 끄지 않는 편이 안전합니다.
-- 반복/복사율은 낮지만 chrF가 떨어지면 해당 penalty를 절반으로 낮춥니다.
-- validation reward는 오르는데 외부 test 지표가 떨어지면 reward hacking으로 보고
-  가중치를 재조정하거나 독립 reward를 추가합니다.
+- If candidate rewards are nearly tied, increase `samples_per_source` gradually or lower
+  `preference_min_gap` toward 0.02.
+- If language quality becomes unstable, reduce `preference_weight` first, then
+  `risk_weight`. Keep the reference CE and gold preference anchors enabled.
+- If repetition and copying improve but chrF falls, halve the relevant penalty and repeat
+  the complete evaluation.
+- If validation reward rises while independent test metrics fall, treat it as reward
+  hacking. Rebalance components or add an independent signal.
+- If one direction regresses while the global mean rises, retain
+  `worst_direction_reward` or use a documented macro-direction policy.
+- If MRT runs out of memory, lower batch size and candidate micro-batch before reducing
+  the number of distinct candidates.
