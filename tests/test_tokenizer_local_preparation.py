@@ -11,6 +11,7 @@ import sion_translate.tokenizer as tokenizer_module
 from sion_translate.fingerprint import file_sha256
 from sion_translate.tokenizer import (
     TOKENIZER_ARTIFACT_FILENAMES,
+    TOKENIZER_PUBLISH_PREFIX,
     TOKENIZER_STAGING_PREFIX,
     TokenizerSentence,
     iter_stratified_tokenizer_sentences,
@@ -156,6 +157,88 @@ def test_completed_private_staging_is_recovered_before_retraining(
 
     assert file_sha256(recovered) == expected_digest
     assert not staging.exists()
+
+
+def test_publication_failure_preserves_a_complete_resumable_staging_build(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    corpus = _parallel_corpus(tmp_path / "parallel.jsonl")
+    output = tmp_path / "tokenizer"
+    actual_replace = tokenizer_module.os.replace
+
+    def fail_during_sidecar_publication(source: Path, destination: Path) -> None:
+        if Path(destination).name == "token_features.npz":
+            raise OSError("simulated disk exhaustion during publication")
+        actual_replace(source, destination)
+
+    monkeypatch.setattr(tokenizer_module.os, "replace", fail_during_sidecar_publication)
+    with pytest.raises(OSError, match="simulated disk exhaustion"):
+        _train_small(corpus, output)
+
+    assert not (output / "sion.model").exists()
+    staging_directories = list(output.glob(f"{TOKENIZER_STAGING_PREFIX}*"))
+    assert len(staging_directories) == 1
+    staging = staging_directories[0]
+    assert all((staging / name).is_file() for name in TOKENIZER_ARTIFACT_FILENAMES)
+    assert not list(staging.glob(f"{TOKENIZER_PUBLISH_PREFIX}*"))
+
+    monkeypatch.setattr(tokenizer_module.os, "replace", actual_replace)
+
+    def unexpected_training(**kwargs: object) -> None:
+        del kwargs
+        raise AssertionError("the completed staging build must resume without retraining")
+
+    monkeypatch.setattr(tokenizer_module.spm.SentencePieceTrainer, "train", unexpected_training)
+    recovered = _train_small(corpus, output)
+
+    assert recovered.is_file()
+    assert not staging.exists()
+
+
+def test_unreadable_orphan_metadata_is_discarded_before_retraining(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    corpus = _parallel_corpus(tmp_path / "parallel.jsonl")
+    output = tmp_path / "tokenizer"
+    _train_small(corpus, output)
+    staging = output / f"{TOKENIZER_STAGING_PREFIX}corrupt"
+    staging.mkdir()
+    for name in TOKENIZER_ARTIFACT_FILENAMES:
+        (output / name).replace(staging / name)
+    (staging / "tokenizer_metadata.json").write_bytes(b"\xff\xfe\x00")
+
+    def expected_retraining(**kwargs: object) -> None:
+        del kwargs
+        raise RuntimeError("retraining reached after corrupt orphan cleanup")
+
+    monkeypatch.setattr(tokenizer_module.spm.SentencePieceTrainer, "train", expected_retraining)
+    with pytest.raises(RuntimeError, match="retraining reached"):
+        _train_small(corpus, output)
+
+    assert not staging.exists()
+    assert not list(output.glob(f"{TOKENIZER_STAGING_PREFIX}*"))
+
+
+def test_junction_like_staging_entry_blocks_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    corpus = _parallel_corpus(tmp_path / "parallel.jsonl")
+    output = tmp_path / "tokenizer"
+    candidate = output / f"{TOKENIZER_STAGING_PREFIX}junction"
+    candidate.mkdir(parents=True)
+    original_is_junction = getattr(Path, "is_junction", None)
+
+    def fake_is_junction(path: Path) -> bool:
+        if path == candidate:
+            return True
+        return bool(original_is_junction and original_is_junction(path))
+
+    monkeypatch.setattr(Path, "is_junction", fake_is_junction, raising=False)
+    with pytest.raises(RuntimeError, match="unsafe tokenizer staging entry"):
+        _train_small(corpus, output)
 
 
 def test_existing_generation_rejects_changed_source_content(tmp_path: Path) -> None:

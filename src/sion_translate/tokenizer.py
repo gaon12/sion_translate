@@ -71,6 +71,7 @@ TOKENIZER_ARTIFACT_FILENAMES = (
     "sion.model",
 )
 TOKENIZER_STAGING_PREFIX = ".sion-tokenizer-staging-"
+TOKENIZER_PUBLISH_PREFIX = ".sion-tokenizer-publish-"
 
 # Language-dependent control tokens: <2xx> requests translation into xx, and
 # <denoise_xx> requests reconstruction of text in xx.
@@ -1362,7 +1363,7 @@ def _validate_tokenizer_generation(
         _assert_plain_tokenizer_file(path, role=f"tokenizer artifact {name}")
     try:
         raw_metadata = json.loads(paths[TOKENIZER_METADATA_FILENAME].read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise RuntimeError("tokenizer metadata is unreadable") from error
     if not isinstance(raw_metadata, dict):
         raise RuntimeError("tokenizer metadata must be a JSON object")
@@ -1413,7 +1414,12 @@ def _remove_tokenizer_staging(path: Path, output_dir: Path) -> None:
 
 
 def _publish_tokenizer_generation(staging: Path, output_dir: Path) -> Path:
-    """Publish sidecars first and the model commit marker last."""
+    """Publish copies of sidecars first and link the model commit marker last.
+
+    Keeping the authenticated originals in ``staging`` makes an ordinary I/O
+    failure resumable. A later run can validate and publish the same completed
+    build instead of repeating SentencePiece training after disk space is freed.
+    """
 
     model_path = output_dir / "sion.model"
     if model_path.exists() or model_path.is_symlink():
@@ -1429,9 +1435,32 @@ def _publish_tokenizer_generation(staging: Path, output_dir: Path) -> Path:
     for name in TOKENIZER_ARTIFACT_FILENAMES:
         source = staging / name
         destination = output_dir / name
-        if name == "sion.model" and (destination.exists() or destination.is_symlink()):
-            raise FileExistsError(f"refusing to replace an existing tokenizer model: {destination}")
-        os.replace(source, destination)
+        if name == "sion.model":
+            # A hard link is an atomic no-replace operation on the same volume.
+            # The staging directory is below output_dir, so this also keeps the
+            # completed source available if another process wins the race.
+            try:
+                os.link(source, destination, follow_symlinks=False)
+            except FileExistsError as error:
+                raise FileExistsError(
+                    f"refusing to replace an existing tokenizer model: {destination}"
+                ) from error
+            continue
+
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=TOKENIZER_PUBLISH_PREFIX,
+            dir=staging,
+        )
+        os.close(descriptor)
+        temporary = Path(temporary_name)
+        try:
+            shutil.copyfile(source, temporary)
+            with temporary.open("r+b") as handle:
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
     return model_path
 
 
@@ -1443,7 +1472,8 @@ def _recover_tokenizer_staging(
 
     recovered: Path | None = None
     for candidate in sorted(output_dir.glob(f"{TOKENIZER_STAGING_PREFIX}*")):
-        if candidate.is_symlink() or not candidate.is_dir():
+        candidate_is_junction = getattr(candidate, "is_junction", lambda: False)
+        if candidate.is_symlink() or candidate_is_junction() or not candidate.is_dir():
             raise RuntimeError(f"unsafe tokenizer staging entry blocks recovery: {candidate}")
         try:
             _validate_tokenizer_generation(candidate, expected_contract)
@@ -1710,6 +1740,7 @@ def train_tokenizer(
 
     staging = Path(tempfile.mkdtemp(prefix=TOKENIZER_STAGING_PREFIX, dir=output_dir))
     published = False
+    recoverable = False
     try:
         model_prefix = staging / "sion"
         sampled_counts: Counter[str] = Counter()
@@ -1781,11 +1812,12 @@ def train_tokenizer(
             raise RuntimeError(
                 "tokenizer sources changed during training; refusing to publish mixed inputs"
             )
+        recoverable = True
         _publish_tokenizer_generation(staging, output_dir)
         published = True
         return _validate_tokenizer_generation(output_dir, training_contract)
     finally:
-        if staging.exists():
+        if staging.exists() and (published or not recoverable):
             _remove_tokenizer_staging(staging, output_dir)
         if not published and canonical_model.exists():
             # The model is the commit marker. If publication reached it, the
