@@ -32,6 +32,29 @@ def test_foundation_only_language_reserves_only_a_denoise_tag() -> None:
     assert "<2en>" not in symbols
 
 
+def test_deprecated_aliases_cannot_create_duplicate_language_controls() -> None:
+    symbols = control_symbols(
+        ["iw", "HE", "i-klingon", "tlh", "en-BU", "en-MM", "zh-cmn", "cmn"],
+        denoise_languages=["in", "id"],
+        reasoning_languages=["ji", "yi"],
+    )
+
+    assert symbols.count("<2he>") == 1
+    assert symbols.count("<2tlh>") == 1
+    assert symbols.count("<2en-MM>") == 1
+    assert symbols.count("<2cmn>") == 1
+    assert symbols.count("<denoise_id>") == 1
+    assert symbols.count("<reason_yi>") == 1
+    assert not {
+        "<2iw>",
+        "<2i-klingon>",
+        "<2en-BU>",
+        "<2zh-cmn>",
+        "<denoise_in>",
+        "<reason_ji>",
+    } & set(symbols)
+
+
 def test_reasoning_controls_are_reserved_only_for_structured_corpus_languages() -> None:
     without_reasoning = control_symbols(["ko", "ja"], denoise_languages=["ko", "ja", "en"])
     with_reasoning = control_symbols(

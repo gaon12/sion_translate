@@ -138,6 +138,22 @@ def test_language_pair_normalization_canonicalizes_script_and_region_tags() -> N
     ) == (("pt-BR", "zh-Hant"), ("sr-Latn-RS", "de"))
 
 
+def test_language_pair_normalization_collapses_deprecated_identity_aliases() -> None:
+    assert normalize_language_pairs(
+        language_pairs=(
+            ("IW", "in"),
+            ("id", "he"),
+            ("i-klingon", "en"),
+            ("en-BU", "zh-cmn"),
+        )
+    ) == (("he", "id"), ("tlh", "en"), ("en-MM", "cmn"))
+
+    with pytest.raises(ValueError, match="pair members must be distinct"):
+        normalize_language_pairs(language_pair=("iw", "HE"))
+    with pytest.raises(ValueError, match="pair members must be distinct"):
+        normalize_language_pairs(language_pair=("zh-cmn", "cmn"))
+
+
 def test_record_expansion_resolves_canonical_alias_keys() -> None:
     expansion = expand_parallel_record(
         {"PT-br": "Olá.", "zh-hant": "您好。"},
@@ -158,6 +174,24 @@ def test_record_expansion_rejects_duplicate_canonical_language_keys() -> None:
 
     assert expansion.pairs == ()
     assert "duplicate_language_key" in expansion.issues
+
+
+def test_record_expansion_resolves_and_deduplicates_deprecated_alias_keys() -> None:
+    resolved = expand_parallel_record(
+        {"IW": "שלום", "in": "Halo"},
+        (("he", "id"),),
+    )
+    assert resolved.issues == ()
+    assert [
+        (pair.language_a, pair.text_a, pair.language_b, pair.text_b) for pair in resolved.pairs
+    ] == [("he", "שלום", "id", "Halo")]
+
+    ambiguous = expand_parallel_record(
+        {"iw": "ראשון", "HE": "שני", "id": "Bahasa Indonesia"},
+        (("he", "id"),),
+    )
+    assert ambiguous.pairs == ()
+    assert "duplicate_language_key" in ambiguous.issues
 
 
 def test_hyphenated_language_pair_containers_use_unambiguous_separators() -> None:
@@ -184,6 +218,16 @@ def test_pair_container_labels_resolve_canonical_language_aliases() -> None:
 
     assert expansion.issues == ()
     assert [(pair.language_a, pair.language_b) for pair in expansion.pairs] == [("pt-BR", "en")]
+
+
+def test_pair_container_labels_resolve_grandfathered_preferred_values() -> None:
+    expansion = expand_parallel_record(
+        {"i-klingon/en": {"source": "Qapla'", "target": "Success!"}},
+        (("tlh", "en"),),
+    )
+
+    assert expansion.issues == ()
+    assert [(pair.language_a, pair.language_b) for pair in expansion.pairs] == [("tlh", "en")]
 
 
 @pytest.mark.parametrize(
