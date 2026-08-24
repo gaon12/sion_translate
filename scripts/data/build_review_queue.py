@@ -1,16 +1,18 @@
-"""오염 의심 정답쌍을 사람 검수 queue 로 뽑는다.
+"""Build a human review queue of translation pairs that may be contaminated.
 
-**아무것도 지우지 않습니다.** 원천별로 묶고 확신도 순으로 정렬한 JSONL 을
-낼 뿐입니다. 자동 삭제가 틀린 이유는 로스트에 적힌 그대로입니다 — 규칙이
-휴리스틱이라 정상 번역도 걸리고(`개` 가 실제 동물인 문장), 오염된 행의 가치는
-삭제가 아니라 재번역에 있습니다.
+**This command never deletes corpus rows.** It emits review records in stable
+input order and reports counts grouped by source and rule. Each row places its
+highest-confidence finding first. Automatic deletion is unsafe because the
+heuristics also catch valid translations, such as sentences where `개` really
+means an animal. A contaminated row is also usually worth retranslating rather
+than discarding.
 
     python scripts/data/build_review_queue.py \
         --input "data/*.jsonl" --output reports/review_queue.jsonl \
         --language-pair ko ja
 
-출력 한 줄이 검수 대상 하나이고, 원본 파일과 행 번호를 그대로 들고 있어
-고친 뒤 되돌려 넣을 수 있습니다.
+Each output line is one review item. It retains the original file and line
+number so a reviewer can repair the pair and place it back in the corpus.
 """
 
 from __future__ import annotations
@@ -33,10 +35,13 @@ from sion_translate.tokenizer import expand_inputs
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="오염 의심 정답쌍을 사람 검수 queue 로 뽑습니다 (삭제하지 않음)"
+        description=(
+            "Build a human review queue of potentially contaminated translation "
+            "pairs without deleting corpus rows"
+        )
     )
-    parser.add_argument("--input", nargs="+", required=True, help="JSONL 파일 또는 glob")
-    parser.add_argument("--output", required=True, help="검수 queue JSONL 경로")
+    parser.add_argument("--input", nargs="+", required=True, help="JSONL files or globs")
+    parser.add_argument("--output", required=True, help="path for the review queue JSONL")
     language_group = parser.add_mutually_exclusive_group(required=True)
     language_group.add_argument("--language-pair", nargs=2)
     language_group.add_argument("--language-pairs", nargs=2, action="append")
@@ -44,11 +49,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--minimum-confidence",
         type=float,
         default=0.0,
-        help="이 확신도 미만은 queue 에서 제외 (기본 0: 전부 포함)",
+        help="exclude findings below this confidence (default: 0, include all)",
     )
     parser.add_argument(
         "--summary",
-        help="원천별·규칙별 집계 JSON 경로 (기본: stdout 요약만)",
+        help="path for counts by source and rule (default: print a summary only)",
     )
     return parser
 
@@ -61,13 +66,13 @@ def main() -> None:
     if unsupported:
         rendered = ", ".join(f"{source}→{target}" for source, target in unsupported)
         raise SystemExit(
-            "이 도구는 ko→ja 규칙만 가지고 있습니다. 규칙 없는 방향을 조용히 "
-            f"제외하지 않기 위해 여기서 중단합니다: {rendered}"
+            "This tool has rules only for ko->ja. It is stopping instead of silently "
+            f"excluding unsupported directions: {rendered}"
         )
 
     paths = expand_inputs(args.input)
     if not paths:
-        raise SystemExit(f"입력과 일치하는 JSONL 이 없습니다: {args.input}")
+        raise SystemExit(f"No JSONL files matched the requested inputs: {args.input}")
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -133,7 +138,10 @@ def main() -> None:
         "queued_rate": (queued / scanned) if scanned else 0.0,
         "by_rule": dict(by_rule.most_common()),
         "by_source": dict(by_source.most_common()),
-        "note": "이 목록은 자동 삭제 기준이 아니라 사람 검수·재번역 대상입니다.",
+        "note": (
+            "This list is a queue for human review and retranslation, not a rule "
+            "for automatic deletion."
+        ),
     }
     if args.summary:
         summary_path = Path(args.summary)
@@ -141,10 +149,12 @@ def main() -> None:
         summary_path.write_text(
             json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )
-    print(f"검사한 쌍 {scanned:,} / 검수 대상 {queued:,} ({summary['queued_rate']:.3%})")
+    print(
+        f"Scanned pairs: {scanned:,} / queued for review: {queued:,} ({summary['queued_rate']:.3%})"
+    )
     for rule, count in by_rule.most_common():
         print(f"  {rule}: {count:,}")
-    print(f"queue: {output}")
+    print(f"Review queue: {output}")
 
 
 if __name__ == "__main__":
