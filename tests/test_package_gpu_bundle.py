@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
+import os
 from pathlib import Path
+import stat
 import subprocess
+from types import SimpleNamespace
 import zipfile
 
+import numpy as np
 import pytest
 
 from scripts import package_gpu_bundle
@@ -281,22 +286,115 @@ def _with_foundation_dataset(
     root: Path,
     *,
     tokenizer_sha256: str | None = None,
+    manifest_updates: dict[str, object] | None = None,
 ) -> None:
     dataset = root / "artifacts" / "foundation_dataset"
     (dataset / "train").mkdir(parents=True)
     (dataset / "validation").mkdir()
-    (dataset / "train" / "train.00000.idx.npy").write_bytes(b"foundation ids")
-    digest = tokenizer_sha256 or _file_sha256(root / "artifacts" / "tokenizer" / "sion.model")
-    (dataset / "manifest.json").write_text(
-        json.dumps(
-            {
-                "format": "sion-foundation-indexed-v2",
-                "stage": "foundation",
-                "tokenizer_sha256": digest,
-                "artifact_inventory": _artifact_inventory(dataset),
-            }
+    index = np.asarray(
+        [
+            (0, 3, 0, 3, 0, 0, 0, 0, 0, 100, 0, 1, 1),
+            (3, 2, 0, 4, 0, 0, 0, 0, 1, 100, 0, 1, 0),
+        ],
+        dtype=package_gpu_bundle.FOUNDATION_INDEX_DTYPE,
+    )
+    for split in ("train", "validation"):
+        np.save(dataset / split / "00000.idx.npy", index, allow_pickle=False)
+        (dataset / split / "00000.src.bin").write_bytes(
+            np.asarray([1, 2, 3, 4, 5], dtype=np.uint32).tobytes()
         )
-        + "\n",
+        (dataset / split / "00000.tgt.bin").write_bytes(
+            np.asarray([6, 7, 8, 9], dtype=np.uint32).tobytes()
+        )
+    digest = tokenizer_sha256 or _file_sha256(root / "artifacts" / "tokenizer" / "sion.model")
+    sources = [
+        {
+            "id": 0,
+            "language": "ko",
+            "logical_path": "ko/corpus.txt",
+            "name": "corpus.txt",
+            "records": 2,
+            "sha256": hashlib.sha256(b"source corpus").hexdigest(),
+            "size_bytes": len(b"source corpus"),
+            "task": "denoising",
+        },
+        {
+            "id": 1,
+            "language": "ko",
+            "logical_path": "ko/reasoning.jsonl",
+            "name": "reasoning.jsonl",
+            "records": 2,
+            "sha256": hashlib.sha256(b"reasoning corpus").hexdigest(),
+            "size_bytes": len(b"reasoning corpus"),
+            "task": "reasoning",
+        },
+    ]
+    source_identities = [
+        {
+            "language": source["language"],
+            "logical_path": source["logical_path"],
+            "sha256": source["sha256"],
+            "size_bytes": source["size_bytes"],
+            "task": source["task"],
+        }
+        for source in sources
+    ]
+    manifest: dict[str, object] = {
+        "format": "sion-foundation-indexed-v3",
+        "stage": "foundation",
+        "release_name": "sion",
+        "objective": "span-corruption-denoising+structured-reasoning",
+        "languages": ["ko"],
+        "language_to_id": {"ko": 0},
+        "language_pairs": [["ko", "ko"]],
+        "source_only_languages": [],
+        "storage_sides": ["src", "tgt"],
+        "target_storage": "row-shared-source-v1",
+        "index_dtype": json.loads(json.dumps(package_gpu_bundle.FOUNDATION_INDEX_DTYPE.descr)),
+        "tokenizer_model": "sion.model",
+        "tokenizer_sha256": digest,
+        "fingerprint": {"tokenizer_sha256": digest},
+        "tokenizer_identity": {
+            "schema": "content-sha256-v1",
+            "size_bytes": (root / "artifacts" / "tokenizer" / "sion.model").stat().st_size,
+            "sha256": digest,
+        },
+        "preprocessing_schema": "foundation-mixed-objectives-v6",
+        "preprocessing_options": {
+            "deduplicate": True,
+            "deduplication_backend": "sqlite-blake2b-128-v1",
+            "maximum_characters": 4000,
+            "max_tokens": 510,
+            "max_target_tokens": 510,
+            "minimum_characters": 8,
+            "reasoning_sample_share": 0.05,
+            "shard_size": 200_000,
+            "validation_fraction": 0.002,
+        },
+        "source_identity_schema": "corpus-relative-posix-sha256-v1",
+        "sources_sha256": _canonical_json_sha256(source_identities),
+        "sources": sources,
+        "language_sampling": {
+            "alpha": 0.3,
+            "minimum_share": 0.05,
+            "weights": {"ko": 1.0},
+            "counts": {"ko": 4},
+            "warnings": [],
+        },
+        "reasoning": {
+            "contract": "prompt-to-delimited-trace-v1",
+            "languages": ["ko"],
+            "records": 2,
+            "sample_share": 0.05,
+            "trace_symbols": ["<think>", "</think>", "<answer>", "</answer>"],
+        },
+        "stats": {"train_records": 2, "validation_records": 2},
+        "artifact_inventory": _artifact_inventory(dataset),
+    }
+    if manifest_updates:
+        manifest.update(manifest_updates)
+    (dataset / "manifest.json").write_text(
+        json.dumps(manifest) + "\n",
         encoding="utf-8",
     )
 
@@ -496,10 +594,31 @@ def test_foundation_dataset_has_an_explicit_authenticated_opt_in(tmp_path: Path)
     )
     with zipfile.ZipFile(archive_path) as archive:
         names = set(archive.namelist())
-    assert "sion_translate/artifacts/foundation_dataset/train/train.00000.idx.npy" in names
+    assert "sion_translate/artifacts/foundation_dataset/train/00000.idx.npy" in names
     origins = {entry["path"]: entry["origin"] for entry in _manifest(archive_path)["files"]}
-    assert origins["artifacts/foundation_dataset/train/train.00000.idx.npy"] == "foundation-dataset"
+    assert origins["artifacts/foundation_dataset/train/00000.idx.npy"] == "foundation-dataset"
     package_gpu_bundle.verify_archive(archive_path)
+
+
+def test_bundle_foundation_markers_match_the_current_preparer_contract() -> None:
+    from sion_translate.artifacts import FOUNDATION_RELEASE_NAME
+    from sion_translate.data.prepare import SHARED_TARGET_INDEX_DTYPE
+    from sion_translate.data.prepare_foundation import (
+        FOUNDATION_INDEX_FORMAT,
+        FOUNDATION_PREPROCESSING_SCHEMA,
+        FOUNDATION_SOURCE_IDENTITY_SCHEMA,
+        FOUNDATION_TOKENIZER_IDENTITY_SCHEMA,
+    )
+
+    assert package_gpu_bundle.FOUNDATION_DATASET_FORMAT == FOUNDATION_INDEX_FORMAT
+    assert package_gpu_bundle.FOUNDATION_RELEASE_NAME == FOUNDATION_RELEASE_NAME
+    assert package_gpu_bundle.FOUNDATION_PREPROCESSING_SCHEMA == FOUNDATION_PREPROCESSING_SCHEMA
+    assert package_gpu_bundle.FOUNDATION_SOURCE_IDENTITY_SCHEMA == FOUNDATION_SOURCE_IDENTITY_SCHEMA
+    assert (
+        package_gpu_bundle.FOUNDATION_TOKENIZER_IDENTITY_SCHEMA
+        == FOUNDATION_TOKENIZER_IDENTITY_SCHEMA
+    )
+    assert package_gpu_bundle.FOUNDATION_INDEX_DTYPE == SHARED_TARGET_INDEX_DTYPE
 
 
 def test_foundation_dataset_rejects_a_stale_tokenizer_identity(tmp_path: Path) -> None:
@@ -511,6 +630,109 @@ def test_foundation_dataset_rejects_a_stale_tokenizer_identity(tmp_path: Path) -
         package_gpu_bundle.build_bundle(
             root,
             tmp_path / "stale-foundation.zip",
+            include_tokenizer=True,
+            include_foundation_dataset=True,
+        )
+
+
+def test_foundation_dataset_rejects_the_legacy_v2_generation(tmp_path: Path) -> None:
+    root = _repository(tmp_path)
+    _with_tokenizer(root)
+    _with_foundation_dataset(
+        root,
+        manifest_updates={"format": "sion-foundation-indexed-v2"},
+    )
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="sion-foundation-indexed-v3"):
+        package_gpu_bundle.build_bundle(
+            root,
+            tmp_path / "legacy-foundation.zip",
+            include_tokenizer=True,
+            include_foundation_dataset=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("manifest_updates", "message"),
+    [
+        ({"stage": "translation"}, "stage marker"),
+        ({"release_name": "translation"}, "release_name must be"),
+        ({"preprocessing_schema": "foundation-mixed-objectives-v5"}, "mixed-objectives-v6"),
+        ({"target_storage": "duplicated-target-v1"}, "target_storage marker"),
+        ({"storage_sides": ["source", "target"]}, "storage_sides marker"),
+        ({"index_dtype": [["src_offset", "<u8"]]}, "index_dtype marker"),
+    ],
+)
+def test_foundation_dataset_requires_every_v3_contract_marker(
+    tmp_path: Path,
+    manifest_updates: dict[str, object],
+    message: str,
+) -> None:
+    root = _repository(tmp_path)
+    _with_tokenizer(root)
+    _with_foundation_dataset(root, manifest_updates=manifest_updates)
+
+    with pytest.raises(package_gpu_bundle.BundleError, match=message):
+        package_gpu_bundle.build_bundle(
+            root,
+            tmp_path / "invalid-foundation-marker.zip",
+            include_tokenizer=True,
+            include_foundation_dataset=True,
+        )
+
+
+def test_foundation_dataset_rejects_self_consistent_invalid_target_aliases(
+    tmp_path: Path,
+) -> None:
+    root = _repository(tmp_path)
+    _with_tokenizer(root)
+    _with_foundation_dataset(root)
+    dataset = root / "artifacts" / "foundation_dataset"
+    index_path = dataset / "train" / "00000.idx.npy"
+    index = np.load(index_path, allow_pickle=False)
+    index["target_shared"][0] = 0
+    np.save(index_path, index, allow_pickle=False)
+    manifest_path = dataset / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["artifact_inventory"] = _artifact_inventory(dataset)
+    manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="aliases disagree"):
+        package_gpu_bundle.build_bundle(
+            root,
+            tmp_path / "invalid-foundation-alias.zip",
+            include_tokenizer=True,
+            include_foundation_dataset=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "replacement", "message"),
+    [
+        ("language_sampling", "weights", {"ko": 0.5}, "weight is invalid"),
+        ("language_sampling", "counts", {"ko": 3}, "counts disagree"),
+        ("reasoning", "sample_share", 0.10, "reasoning policy contradicts"),
+    ],
+)
+def test_foundation_dataset_rejects_malformed_gpu_sampling_policy(
+    tmp_path: Path,
+    section: str,
+    field: str,
+    replacement: object,
+    message: str,
+) -> None:
+    root = _repository(tmp_path)
+    _with_tokenizer(root)
+    _with_foundation_dataset(root)
+    manifest_path = root / "artifacts" / "foundation_dataset" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest[section][field] = replacement
+    manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+
+    with pytest.raises(package_gpu_bundle.BundleError, match=message):
+        package_gpu_bundle.build_bundle(
+            root,
+            tmp_path / "invalid-foundation-sampling.zip",
             include_tokenizer=True,
             include_foundation_dataset=True,
         )
@@ -725,3 +947,114 @@ def test_failed_verification_preserves_existing_output(
 
     assert output.read_bytes() == b"previous bundle"
     assert not list(tmp_path.glob(".bundle.zip.*.tmp"))
+
+
+def test_build_refuses_insufficient_staging_space_before_creating_a_zip(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _repository(tmp_path)
+    monkeypatch.setattr(
+        package_gpu_bundle.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(free=0),
+    )
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="insufficient free disk space"):
+        package_gpu_bundle.build_bundle(root, tmp_path / "no-space.zip")
+
+    assert not list(tmp_path.glob(".no-space.zip.*.tmp"))
+
+
+def test_build_detects_a_changed_archive_during_atomic_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _repository(tmp_path)
+    output = tmp_path / "bundle.zip"
+    original_publish = package_gpu_bundle._publish_archive
+
+    def publish_then_corrupt(temporary_path: Path, destination: Path, *, overwrite: bool) -> None:
+        original_publish(temporary_path, destination, overwrite=overwrite)
+        destination.write_bytes(b"corrupted after publication")
+
+    monkeypatch.setattr(package_gpu_bundle, "_publish_archive", publish_then_corrupt)
+    with pytest.raises(package_gpu_bundle.BundleError, match="differ from the verified"):
+        package_gpu_bundle.build_bundle(root, output)
+
+
+def test_source_metadata_drift_is_detected_while_a_member_is_written(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    source_path = root / "payload.bin"
+    source_path.write_bytes(b"stable payload")
+    entry = package_gpu_bundle.SourceEntry(
+        relative_path=package_gpu_bundle.PurePosixPath("payload.bin"),
+        source_path=source_path,
+        origin="git-index",
+        mode="100644",
+    )
+    original_copy = package_gpu_bundle._copy_and_hash
+
+    def copy_then_touch(source, destination):
+        result = original_copy(source, destination)
+        metadata = source_path.stat()
+        os.utime(
+            source_path,
+            ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 1_000_000_000),
+        )
+        return result
+
+    monkeypatch.setattr(package_gpu_bundle, "_copy_and_hash", copy_then_touch)
+    with (
+        zipfile.ZipFile(tmp_path / "drift.zip", mode="w") as archive,
+        pytest.raises(package_gpu_bundle.BundleError, match="changed while"),
+    ):
+        package_gpu_bundle._write_source(archive, entry)
+
+
+def test_windows_reparse_attributes_are_treated_as_links() -> None:
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    metadata = SimpleNamespace(st_mode=stat.S_IFDIR, st_file_attributes=reparse_flag)
+
+    assert package_gpu_bundle._metadata_is_link_like(metadata)
+
+
+def test_archive_verification_rejects_nondeterministic_member_order(tmp_path: Path) -> None:
+    root = _repository(tmp_path)
+    archive_path = tmp_path / "bundle.zip"
+    reordered_path = tmp_path / "reordered.zip"
+    package_gpu_bundle.build_bundle(root, archive_path)
+
+    with (
+        zipfile.ZipFile(archive_path) as source,
+        zipfile.ZipFile(reordered_path, mode="w") as destination,
+    ):
+        for info in reversed(source.infolist()):
+            destination.writestr(info, source.read(info))
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="deterministic manifest order"):
+        package_gpu_bundle.verify_archive(reordered_path)
+
+
+def test_archive_verification_rejects_non_zip64_member_headers(tmp_path: Path) -> None:
+    root = _repository(tmp_path)
+    archive_path = tmp_path / "bundle.zip"
+    rewritten_path = tmp_path / "rewritten.zip"
+    package_gpu_bundle.build_bundle(root, archive_path)
+
+    with (
+        zipfile.ZipFile(archive_path) as source,
+        zipfile.ZipFile(rewritten_path, mode="w") as destination,
+    ):
+        for source_info in source.infolist():
+            rewritten_info = copy.copy(source_info)
+            rewritten_info.create_version = 20
+            rewritten_info.extract_version = 20
+            destination.writestr(rewritten_info, source.read(source_info))
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="deterministic ZIP64 headers"):
+        package_gpu_bundle.verify_archive(rewritten_path)

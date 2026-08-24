@@ -50,10 +50,13 @@ import argparse
 from collections.abc import Mapping
 from dataclasses import dataclass
 import hashlib
+import io
 import json
+import math
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -62,6 +65,8 @@ from typing import Callable, IO, Iterable, cast
 import unicodedata
 import zipfile
 
+import numpy as np
+from numpy.typing import NDArray
 import yaml
 
 
@@ -73,7 +78,30 @@ FORMAT_VERSION = 1
 DATASET_FINGERPRINT_SCHEMA = "sion-dataset-fingerprint-v2"
 DATASET_ARTIFACT_INVENTORY_SCHEMA = "sion-indexed-artifact-inventory-v1"
 TRANSLATION_DATASET_FORMAT = "sion-indexed-parallel-v6"
-FOUNDATION_DATASET_FORMAT = "sion-foundation-indexed-v2"
+FOUNDATION_DATASET_FORMAT = "sion-foundation-indexed-v3"
+FOUNDATION_RELEASE_NAME = "sion"
+FOUNDATION_PREPROCESSING_SCHEMA = "foundation-mixed-objectives-v6"
+FOUNDATION_SOURCE_IDENTITY_SCHEMA = "corpus-relative-posix-sha256-v1"
+FOUNDATION_TOKENIZER_IDENTITY_SCHEMA = "content-sha256-v1"
+FOUNDATION_TARGET_STORAGE = "row-shared-source-v1"
+FOUNDATION_STORAGE_SIDES = ["src", "tgt"]
+FOUNDATION_INDEX_DTYPE = np.dtype(
+    [
+        ("src_offset", "<u8"),
+        ("src_length", "<u4"),
+        ("tgt_offset", "<u8"),
+        ("tgt_length", "<u4"),
+        ("src_register", "u1"),
+        ("tgt_register", "u1"),
+        ("src_language_id", "<u2"),
+        ("tgt_language_id", "<u2"),
+        ("source_id", "<u2"),
+        ("quality_score", "u1"),
+        ("synthetic", "u1"),
+        ("forward_only", "u1"),
+        ("target_shared", "u1"),
+    ]
+)
 PREPARE_COMPLETION_SCHEMA = "sion-prepare-completion-v1"
 TOKENIZER_ROOT_PATH = "artifacts/tokenizer"
 TOKENIZER_MODEL_PATH = "artifacts/tokenizer/sion.model"
@@ -89,6 +117,8 @@ FOUNDATION_DATASET_MANIFEST_PATH = "artifacts/foundation_dataset/manifest.json"
 COPY_BUFFER_SIZE = 8 * 1024 * 1024
 ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 MAX_METADATA_SIZE = 64 * 1024 * 1024
+MIN_FREE_DISK_RESERVE = 512 * 1024 * 1024
+FREE_DISK_RESERVE_DIVISOR = 50
 
 EXCLUDED_TOP_LEVEL = {
     ".git",
@@ -371,7 +401,7 @@ def _load_monolingual_selection(
     else:
         config_relative = _repository_relative_path(root, str(raw_config_path), field="config path")
     resolved_config = root.joinpath(*config_relative.parts)
-    _assert_regular_source(resolved_config, config_relative)
+    _assert_regular_source(root, resolved_config, config_relative)
     config_object = _load_validated_project_config(resolved_config)
     from sion_translate.config import AppConfig
 
@@ -434,13 +464,103 @@ def _tracked_stage_zero_entries(root: Path) -> list[SourceEntry]:
     return entries
 
 
-def _assert_regular_source(path: Path, relative_path: PurePosixPath) -> None:
+def _metadata_is_link_like(metadata: os.stat_result) -> bool:
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    file_attributes = int(getattr(metadata, "st_file_attributes", 0))
+    return stat.S_ISLNK(metadata.st_mode) or bool(reparse_flag and file_attributes & reparse_flag)
+
+
+def _assert_regular_source(
+    root: Path,
+    path: Path,
+    relative_path: PurePosixPath,
+) -> os.stat_result:
+    """Reject link-like ancestors and return a stable leaf metadata snapshot."""
+
+    current = root
+    for index, part in enumerate(relative_path.parts):
+        current = current / part
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError as error:
+            raise BundleError(f"selected source file is missing: {relative_path}") from error
+        if _metadata_is_link_like(metadata):
+            raise BundleError(
+                "selected source path may not contain a symlink, junction, or reparse point: "
+                f"{relative_path}"
+            )
+        leaf = index == len(relative_path.parts) - 1
+        if not leaf and not stat.S_ISDIR(metadata.st_mode):
+            raise BundleError(f"selected source parent is not a directory: {relative_path}")
+        if leaf:
+            if not stat.S_ISREG(metadata.st_mode):
+                raise BundleError(f"selected source is not a regular file: {relative_path}")
+            if current != path:
+                raise BundleError(f"selected source path is not canonical: {relative_path}")
+            return metadata
+    raise BundleError(f"selected source path is empty: {relative_path}")
+
+
+def _tree_root_is_directory(
+    root: Path,
+    tree_root: Path,
+    origin: str,
+) -> bool:
     try:
-        metadata = path.lstat()
-    except FileNotFoundError as error:
-        raise BundleError(f"selected source file is missing: {relative_path}") from error
-    if not stat.S_ISREG(metadata.st_mode):
-        raise BundleError(f"selected source is not a regular file: {relative_path}")
+        relative = PurePosixPath(tree_root.relative_to(root).as_posix())
+    except ValueError as error:
+        raise BundleError(f"{origin} root escapes the repository: {tree_root}") from error
+    current = root
+    for part in relative.parts:
+        current = current / part
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            return False
+        if _metadata_is_link_like(metadata):
+            raise BundleError(
+                f"{origin} root may not contain a symlink, junction, or reparse point: {relative}"
+            )
+        if not stat.S_ISDIR(metadata.st_mode):
+            return False
+    return True
+
+
+def _walk_regular_tree(tree_root: Path, origin: str) -> list[Path]:
+    """Walk without following link-like directories on any supported platform."""
+
+    files: list[Path] = []
+    pending = [tree_root]
+    while pending:
+        directory = pending.pop()
+        try:
+            with os.scandir(directory) as iterator:
+                children = sorted(iterator, key=lambda entry: entry.name)
+        except OSError as error:
+            raise BundleError(
+                f"could not inspect {origin} directory {directory}: {error}"
+            ) from error
+        child_directories: list[Path] = []
+        for child in children:
+            child_path = Path(child.path)
+            try:
+                metadata = child.stat(follow_symlinks=False)
+            except OSError as error:
+                raise BundleError(
+                    f"could not inspect {origin} source {child_path}: {error}"
+                ) from error
+            if _metadata_is_link_like(metadata):
+                raise BundleError(
+                    f"{origin} may not contain a symlink, junction, or reparse point: {child_path}"
+                )
+            if stat.S_ISDIR(metadata.st_mode):
+                child_directories.append(child_path)
+            elif stat.S_ISREG(metadata.st_mode):
+                files.append(child_path)
+            else:
+                raise BundleError(f"{origin} contains a non-regular path: {child_path}")
+        pending.extend(reversed(child_directories))
+    return sorted(files, key=lambda path: path.as_posix())
 
 
 def _collect_tree(
@@ -459,17 +579,9 @@ def _collect_tree(
     """
 
     entries: list[SourceEntry] = []
-    if tree_root.is_symlink():
-        relative = tree_root.relative_to(root).as_posix()
-        raise BundleError(f"{origin} root may not be a symlink: {relative}")
-    if not tree_root.is_dir():
+    if not _tree_root_is_directory(root, tree_root, origin):
         return entries
-    for source_path in sorted(tree_root.rglob("*"), key=lambda path: path.as_posix()):
-        if source_path.is_symlink():
-            relative = source_path.relative_to(root).as_posix()
-            raise BundleError(f"{origin} source may not be a symlink: {relative}")
-        if source_path.is_dir():
-            continue
+    for source_path in _walk_regular_tree(tree_root, origin):
         if suffixes is not None and source_path.suffix.lower() not in suffixes:
             continue
         relative_path = _validated_relative_path(source_path.relative_to(root).as_posix())
@@ -489,9 +601,7 @@ def _collect_configured_monolingual_sources(
     selection: MonolingualSelection,
 ) -> list[SourceEntry]:
     corpus_root = root.joinpath(*selection.corpus_root.parts)
-    if corpus_root.is_symlink():
-        raise BundleError(f"monolingual-corpus root may not be a symlink: {selection.corpus_root}")
-    if not corpus_root.is_dir():
+    if not _tree_root_is_directory(root, corpus_root, "monolingual-corpus"):
         raise BundleError(
             "--with-monolingual-corpus was requested but the configured corpus directory "
             f"does not exist: {selection.corpus_root}"
@@ -500,13 +610,19 @@ def _collect_configured_monolingual_sources(
     configured = {language: language for language in selection.languages}
     matching_directories: dict[str, Path] = {}
     for candidate in sorted(corpus_root.iterdir(), key=lambda path: path.name.casefold()):
-        if not candidate.is_dir():
-            continue
         try:
             key = _canonical_language(candidate.name, field="monolingual corpus directory")
         except BundleError:
             continue
         if key not in configured:
+            continue
+        metadata = candidate.lstat()
+        if _metadata_is_link_like(metadata):
+            raise BundleError(
+                "configured monolingual language directory may not be a symlink, junction, "
+                f"or reparse point: {candidate.relative_to(root)}"
+            )
+        if not stat.S_ISDIR(metadata.st_mode):
             continue
         previous = matching_directories.get(key)
         if previous is not None:
@@ -691,6 +807,468 @@ def _validated_artifact_inventory(
     return files
 
 
+def _foundation_preprocessing_options(manifest: Mapping[str, object]) -> dict[str, object]:
+    raw_options = manifest.get("preprocessing_options")
+    if not isinstance(raw_options, Mapping):
+        raise BundleError("foundation manifest has no valid preprocessing_options object")
+    option_values = cast(Mapping[object, object], raw_options)
+    if any(not isinstance(key, str) for key in option_values):
+        raise BundleError("foundation preprocessing_options keys must be strings")
+    options = {cast(str, key): value for key, value in option_values.items()}
+    expected_fields = {
+        "deduplicate",
+        "deduplication_backend",
+        "maximum_characters",
+        "max_tokens",
+        "max_target_tokens",
+        "minimum_characters",
+        "reasoning_sample_share",
+        "shard_size",
+        "validation_fraction",
+    }
+    if set(options) != expected_fields:
+        raise BundleError("foundation preprocessing_options fields do not match v6")
+
+    deduplicate = options["deduplicate"]
+    backend = options["deduplication_backend"]
+    if not isinstance(deduplicate, bool):
+        raise BundleError("foundation deduplicate option must be a boolean")
+    expected_backend = "sqlite-blake2b-128-v1" if deduplicate else "disabled"
+    if backend != expected_backend:
+        raise BundleError("foundation deduplication backend contradicts its enabled flag")
+
+    integer_fields = (
+        "minimum_characters",
+        "maximum_characters",
+        "max_tokens",
+        "max_target_tokens",
+        "shard_size",
+    )
+    integers: dict[str, int] = {}
+    for field in integer_fields:
+        value = options[field]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise BundleError(f"foundation preprocessing option {field} must be positive")
+        integers[field] = value
+    if integers["maximum_characters"] <= integers["minimum_characters"]:
+        raise BundleError("foundation maximum_characters must exceed minimum_characters")
+    if integers["max_target_tokens"] < 6:
+        raise BundleError("foundation max_target_tokens is too small for trace markers")
+
+    reasoning_share = options["reasoning_sample_share"]
+    if (
+        isinstance(reasoning_share, bool)
+        or not isinstance(reasoning_share, (int, float))
+        or not math.isfinite(float(reasoning_share))
+        or not 0.0 <= float(reasoning_share) <= 0.10
+    ):
+        raise BundleError("foundation preprocessing option reasoning_sample_share is invalid")
+    validation_fraction = options["validation_fraction"]
+    if (
+        isinstance(validation_fraction, bool)
+        or not isinstance(validation_fraction, (int, float))
+        or not math.isfinite(float(validation_fraction))
+        or not 0.0 < float(validation_fraction) < 0.5
+    ):
+        raise BundleError("foundation preprocessing option validation_fraction is invalid")
+    return options
+
+
+def _foundation_source_contract(
+    manifest: Mapping[str, object],
+) -> tuple[tuple[str, ...], tuple[int, ...], tuple[int, ...]]:
+    raw_languages = manifest.get("languages")
+    language_values = cast(list[object], raw_languages) if isinstance(raw_languages, list) else []
+    if (
+        not isinstance(raw_languages, list)
+        or not raw_languages
+        or any(not isinstance(language, str) or not language for language in language_values)
+    ):
+        raise BundleError("foundation manifest languages must be a non-empty string list")
+    languages = cast(list[str], language_values)
+    if len(languages) != len(set(languages)):
+        raise BundleError("foundation manifest languages must be unique")
+    expected_language_to_id = {language: index for index, language in enumerate(languages)}
+    if manifest.get("language_to_id") != expected_language_to_id:
+        raise BundleError("foundation manifest language_to_id is not contiguous")
+    if manifest.get("language_pairs") != [[language, language] for language in languages]:
+        raise BundleError("foundation language pairs must be self-denoising pairs")
+    if manifest.get("source_only_languages") != []:
+        raise BundleError("foundation manifest may not declare source-only languages")
+
+    raw_sources = manifest.get("sources")
+    if not isinstance(raw_sources, list) or not raw_sources:
+        raise BundleError("foundation manifest has no source tasks")
+    tasks: list[str] = []
+    records: list[int] = []
+    language_ids: list[int] = []
+    source_identities: list[dict[str, object]] = []
+    expected_source_fields = {
+        "id",
+        "language",
+        "logical_path",
+        "name",
+        "records",
+        "sha256",
+        "size_bytes",
+        "task",
+    }
+    for source_id, raw_source in enumerate(cast(list[object], raw_sources)):
+        if not isinstance(raw_source, Mapping):
+            raise BundleError("foundation source metadata must contain objects")
+        source_values = cast(Mapping[object, object], raw_source)
+        if any(not isinstance(key, str) for key in source_values):
+            raise BundleError("foundation source metadata keys must be strings")
+        source = {cast(str, key): value for key, value in source_values.items()}
+        if set(source) != expected_source_fields or source.get("id") != source_id:
+            raise BundleError("foundation source ids and fields do not match v3")
+        language = source.get("language")
+        if not isinstance(language, str) or language not in expected_language_to_id:
+            raise BundleError(f"foundation source {source_id} has an invalid language")
+        task = source.get("task")
+        if task not in {"denoising", "reasoning"}:
+            raise BundleError(f"foundation source {source_id} has an invalid task")
+        record_count = source.get("records")
+        size_bytes = source.get("size_bytes")
+        digest = source.get("sha256")
+        logical_path = source.get("logical_path")
+        name = source.get("name")
+        if isinstance(record_count, bool) or not isinstance(record_count, int) or record_count < 0:
+            raise BundleError(f"foundation source {source_id} has an invalid record count")
+        if isinstance(size_bytes, bool) or not isinstance(size_bytes, int) or size_bytes < 0:
+            raise BundleError(f"foundation source {source_id} has an invalid byte size")
+        if not isinstance(digest, str) or not SHA256_PATTERN.fullmatch(digest):
+            raise BundleError(f"foundation source {source_id} has an invalid SHA-256")
+        if not isinstance(logical_path, str):
+            raise BundleError(f"foundation source {source_id} has an invalid logical path")
+        validated_logical_path = _validated_relative_path(logical_path)
+        if not isinstance(name, str) or name != validated_logical_path.name:
+            raise BundleError(f"foundation source {source_id} name disagrees with its path")
+        tasks.append(cast(str, task))
+        records.append(record_count)
+        language_ids.append(expected_language_to_id[language])
+        source_identities.append(
+            {
+                "language": language,
+                "logical_path": logical_path,
+                "sha256": digest,
+                "size_bytes": size_bytes,
+                "task": task,
+            }
+        )
+
+    sources_digest = hashlib.sha256(_canonical_json_bytes(source_identities)).hexdigest()
+    if manifest.get("sources_sha256") != sources_digest:
+        raise BundleError("foundation aggregate source identity is invalid")
+    return tuple(tasks), tuple(records), tuple(language_ids)
+
+
+def _foundation_shard_groups(
+    inventory: Mapping[str, tuple[int, str]],
+) -> dict[tuple[str, str], dict[str, str]]:
+    groups: dict[tuple[str, str], dict[str, str]] = {}
+    pattern = re.compile(r"(?P<prefix>[0-9]{5,})\.(?P<kind>idx\.npy|src\.bin|tgt\.bin)")
+    for raw_path in inventory:
+        relative = PurePosixPath(raw_path)
+        if len(relative.parts) != 2 or relative.parts[0] not in {"train", "validation"}:
+            raise BundleError(f"foundation inventory contains a non-shard path: {raw_path}")
+        match = pattern.fullmatch(relative.name)
+        if match is None:
+            raise BundleError(f"foundation inventory has an invalid shard name: {raw_path}")
+        key = (relative.parts[0], match.group("prefix"))
+        groups.setdefault(key, {})[match.group("kind")] = raw_path
+
+    expected_kinds = {"idx.npy", "src.bin", "tgt.bin"}
+    for (split, prefix), members in groups.items():
+        if set(members) != expected_kinds:
+            raise BundleError(
+                f"foundation shard {split}/{prefix} is incomplete: "
+                f"missing={sorted(expected_kinds - set(members))}"
+            )
+    if not any(split == "train" for split, _prefix in groups):
+        raise BundleError("foundation inventory has no training shards")
+    for split in ("train", "validation"):
+        prefixes = sorted(prefix for candidate, prefix in groups if candidate == split)
+        expected = [f"{index:05d}" for index in range(len(prefixes))]
+        if prefixes != expected:
+            raise BundleError(f"foundation {split} shard sequence is not contiguous")
+    return groups
+
+
+def _validate_foundation_sampling_contract(
+    manifest: Mapping[str, object],
+    source_tasks: tuple[str, ...],
+    source_records: tuple[int, ...],
+    source_language_ids: tuple[int, ...],
+    preprocessing_options: Mapping[str, object],
+) -> None:
+    languages = cast(list[str], manifest["languages"])
+    expected_counts = {language: 0 for language in languages}
+    for record_count, language_id in zip(source_records, source_language_ids, strict=True):
+        expected_counts[languages[language_id]] += record_count
+
+    raw_sampling = manifest.get("language_sampling")
+    if not isinstance(raw_sampling, Mapping):
+        raise BundleError("foundation manifest has no usable language_sampling policy")
+    sampling_values = cast(Mapping[str, object], raw_sampling)
+    if set(sampling_values) != {"alpha", "minimum_share", "weights", "counts", "warnings"}:
+        raise BundleError("foundation language_sampling fields are invalid")
+    alpha = sampling_values.get("alpha")
+    minimum_share = sampling_values.get("minimum_share")
+    if (
+        isinstance(alpha, bool)
+        or not isinstance(alpha, (int, float))
+        or not math.isfinite(float(alpha))
+        or not 0.0 < float(alpha) <= 1.0
+    ):
+        raise BundleError("foundation language_sampling alpha is invalid")
+    if (
+        isinstance(minimum_share, bool)
+        or not isinstance(minimum_share, (int, float))
+        or not math.isfinite(float(minimum_share))
+        or not 0.0 <= float(minimum_share) < 1.0
+    ):
+        raise BundleError("foundation language_sampling minimum_share is invalid")
+    if sampling_values.get("counts") != expected_counts:
+        raise BundleError("foundation language_sampling counts disagree with source records")
+
+    raw_weights = sampling_values.get("weights")
+    if not isinstance(raw_weights, Mapping):
+        raise BundleError("foundation language_sampling weights must be an object")
+    weight_values = cast(Mapping[str, object], raw_weights)
+    if set(weight_values) != set(languages):
+        raise BundleError("foundation language_sampling weight languages are invalid")
+    scaled = {
+        language: math.pow(float(count), float(alpha))
+        for language, count in expected_counts.items()
+        if count > 0
+    }
+    scaled_total = sum(scaled.values())
+    for language in languages:
+        raw_weight = weight_values.get(language)
+        expected_weight = scaled.get(language, 0.0) / scaled_total if scaled_total > 0.0 else 0.0
+        if (
+            isinstance(raw_weight, bool)
+            or not isinstance(raw_weight, (int, float))
+            or not math.isfinite(float(raw_weight))
+            or not math.isclose(
+                float(raw_weight),
+                expected_weight,
+                rel_tol=1e-12,
+                abs_tol=1e-15,
+            )
+        ):
+            raise BundleError(f"foundation language_sampling weight is invalid for {language}")
+    raw_warnings = sampling_values.get("warnings")
+    if not isinstance(raw_warnings, list) or any(
+        not isinstance(warning, str) for warning in cast(list[object], raw_warnings)
+    ):
+        raise BundleError("foundation language_sampling warnings must be strings")
+
+    raw_reasoning = manifest.get("reasoning")
+    if not isinstance(raw_reasoning, Mapping):
+        raise BundleError("foundation manifest has no usable reasoning policy")
+    reasoning_values = cast(Mapping[str, object], raw_reasoning)
+    if set(reasoning_values) != {
+        "contract",
+        "languages",
+        "records",
+        "sample_share",
+        "trace_symbols",
+    }:
+        raise BundleError("foundation reasoning policy fields are invalid")
+    reasoning_languages = list(
+        dict.fromkeys(
+            languages[language_id]
+            for task, language_id in zip(source_tasks, source_language_ids, strict=True)
+            if task == "reasoning"
+        )
+    )
+    reasoning_records = sum(
+        record_count
+        for task, record_count in zip(source_tasks, source_records, strict=True)
+        if task == "reasoning"
+    )
+    if (
+        reasoning_values.get("contract") != "prompt-to-delimited-trace-v1"
+        or reasoning_values.get("languages") != reasoning_languages
+        or reasoning_values.get("records") != reasoning_records
+        or reasoning_values.get("sample_share") != preprocessing_options["reasoning_sample_share"]
+        or reasoning_values.get("trace_symbols") != ["<think>", "</think>", "<answer>", "</answer>"]
+    ):
+        raise BundleError("foundation reasoning policy contradicts its source tasks")
+    expected_objective = (
+        "span-corruption-denoising+structured-reasoning"
+        if reasoning_records > 0
+        else "span-corruption-denoising"
+    )
+    if manifest.get("objective") != expected_objective:
+        raise BundleError("foundation objective contradicts its indexed reasoning rows")
+
+
+def _load_foundation_index(content: bytes, path: str) -> NDArray[np.void]:
+    try:
+        raw_loaded: object = np.load(io.BytesIO(content), allow_pickle=False)
+    except (OSError, ValueError) as error:
+        raise BundleError(f"foundation index cannot be read: {path}") from error
+    if not isinstance(raw_loaded, np.ndarray):
+        raise BundleError(f"foundation index is not an array: {path}")
+    loaded = cast(NDArray[np.void], raw_loaded)
+    if loaded.ndim != 1 or loaded.dtype != FOUNDATION_INDEX_DTYPE:
+        raise BundleError(f"foundation index dtype or shape is invalid: {path}")
+    if len(loaded) == 0:
+        raise BundleError(f"foundation index shard is empty: {path}")
+    return loaded
+
+
+def _validate_foundation_dataset_contract(
+    *,
+    manifest: Mapping[str, object],
+    inventory: Mapping[str, tuple[int, str]],
+    identities: Mapping[str, tuple[int, str]],
+    read_payload: Callable[[str], bytes],
+    tokenizer_sha256: str,
+) -> None:
+    if manifest.get("stage") != "foundation":
+        raise BundleError("foundation manifest has an invalid stage marker")
+    if manifest.get("release_name") != FOUNDATION_RELEASE_NAME:
+        raise BundleError(f"foundation manifest release_name must be {FOUNDATION_RELEASE_NAME!r}")
+    if manifest.get("preprocessing_schema") != FOUNDATION_PREPROCESSING_SCHEMA:
+        raise BundleError(f"foundation manifest does not use {FOUNDATION_PREPROCESSING_SCHEMA}")
+    preprocessing_options = _foundation_preprocessing_options(manifest)
+    if manifest.get("storage_sides") != FOUNDATION_STORAGE_SIDES:
+        raise BundleError("foundation storage_sides marker is invalid")
+    if manifest.get("target_storage") != FOUNDATION_TARGET_STORAGE:
+        raise BundleError("foundation target_storage marker is invalid")
+    expected_dtype = json.loads(json.dumps(FOUNDATION_INDEX_DTYPE.descr))
+    if manifest.get("index_dtype") != expected_dtype:
+        raise BundleError("foundation index_dtype marker does not match shared-target v3")
+    if manifest.get("source_identity_schema") != FOUNDATION_SOURCE_IDENTITY_SCHEMA:
+        raise BundleError("foundation source identity schema is obsolete")
+
+    tokenizer_identity = manifest.get("tokenizer_identity")
+    model_size, _model_digest = identities[TOKENIZER_MODEL_PATH]
+    expected_tokenizer_identity = {
+        "schema": FOUNDATION_TOKENIZER_IDENTITY_SCHEMA,
+        "size_bytes": model_size,
+        "sha256": tokenizer_sha256,
+    }
+    if tokenizer_identity != expected_tokenizer_identity:
+        raise BundleError("foundation tokenizer_identity does not authenticate sion.model")
+    if manifest.get("tokenizer_model") != "sion.model":
+        raise BundleError("foundation tokenizer_model must be the portable sion.model name")
+    if manifest.get("fingerprint") != {"tokenizer_sha256": tokenizer_sha256}:
+        raise BundleError("foundation fingerprint disagrees with its tokenizer identity")
+
+    source_tasks, expected_source_records, source_language_ids = _foundation_source_contract(
+        manifest
+    )
+    _validate_foundation_sampling_contract(
+        manifest,
+        source_tasks,
+        expected_source_records,
+        source_language_ids,
+        preprocessing_options,
+    )
+    shard_groups = _foundation_shard_groups(inventory)
+    observed_source_records = np.zeros(len(source_tasks), dtype=np.uint64)
+    observed_split_records = {"train": 0, "validation": 0}
+    dataset_prefix = f"{FOUNDATION_DATASET_ROOT_PATH}/"
+    shard_size = cast(int, preprocessing_options["shard_size"])
+
+    for (split, _prefix), members in sorted(shard_groups.items()):
+        index_relative = members["idx.npy"]
+        index_path = f"{dataset_prefix}{index_relative}"
+        index = _load_foundation_index(read_payload(index_path), index_path)
+        if len(index) > shard_size:
+            raise BundleError(f"foundation shard exceeds configured shard_size: {index_path}")
+
+        source_ids = np.asarray(index["source_id"], dtype=np.int64)
+        if int(source_ids.min()) < 0 or int(source_ids.max()) >= len(source_tasks):
+            raise BundleError(f"foundation source_id is out of range: {index_path}")
+        observed_source_records += np.bincount(
+            source_ids,
+            minlength=len(source_tasks),
+        )[: len(source_tasks)].astype(np.uint64)
+        observed_split_records[split] += len(index)
+
+        source_languages = np.asarray(index["src_language_id"], dtype=np.int64)
+        target_languages = np.asarray(index["tgt_language_id"], dtype=np.int64)
+        expected_languages = np.asarray(source_language_ids, dtype=np.int64)[source_ids]
+        if not np.array_equal(source_languages, expected_languages) or not np.array_equal(
+            target_languages,
+            expected_languages,
+        ):
+            raise BundleError(f"foundation index language ids disagree with sources: {index_path}")
+        if not bool((np.asarray(index["forward_only"], dtype=np.uint8) == 1).all()):
+            raise BundleError(f"foundation index contains a reverse-enabled row: {index_path}")
+
+        target_shared = np.asarray(index["target_shared"], dtype=np.uint8)
+        if not bool(np.isin(target_shared, (0, 1)).all()):
+            raise BundleError(f"foundation target_shared flag is invalid: {index_path}")
+        shared_mask = target_shared.astype(np.bool_)
+        expected_shared = np.fromiter(
+            (source_tasks[int(source_id)] == "denoising" for source_id in source_ids.tolist()),
+            dtype=np.bool_,
+            count=len(source_ids),
+        )
+        if not np.array_equal(shared_mask, expected_shared):
+            raise BundleError(f"foundation target aliases disagree with source tasks: {index_path}")
+
+        source_offsets = np.asarray(index["src_offset"], dtype=np.uint64)
+        source_lengths = np.asarray(index["src_length"], dtype=np.uint64)
+        target_offsets = np.asarray(index["tgt_offset"], dtype=np.uint64)
+        target_lengths = np.asarray(index["tgt_length"], dtype=np.uint64)
+        expected_source_offsets = np.concatenate(
+            (np.zeros(1, dtype=np.uint64), np.cumsum(source_lengths[:-1], dtype=np.uint64))
+        )
+        stored_target_lengths = np.where(shared_mask, 0, target_lengths)
+        expected_target_offsets = np.concatenate(
+            (
+                np.zeros(1, dtype=np.uint64),
+                np.cumsum(stored_target_lengths[:-1], dtype=np.uint64),
+            )
+        )
+        if not np.array_equal(source_offsets, expected_source_offsets) or not np.array_equal(
+            target_offsets,
+            expected_target_offsets,
+        ):
+            raise BundleError(f"foundation token offsets are not contiguous: {index_path}")
+        if bool(shared_mask.any()) and (
+            not np.array_equal(source_lengths[shared_mask], target_lengths[shared_mask])
+            or not np.array_equal(
+                np.asarray(index["src_register"])[shared_mask],
+                np.asarray(index["tgt_register"])[shared_mask],
+            )
+            or not bool((np.asarray(index["synthetic"], dtype=np.uint8)[shared_mask] == 0).all())
+        ):
+            raise BundleError(f"foundation shared targets contradict source rows: {index_path}")
+
+        source_relative = members["src.bin"]
+        target_relative = members["tgt.bin"]
+        expected_source_size = int(source_lengths.sum(dtype=np.uint64)) * 4
+        expected_target_size = int(stored_target_lengths.sum(dtype=np.uint64)) * 4
+        if inventory[source_relative][0] != expected_source_size:
+            raise BundleError(f"foundation source payload size is invalid: {source_relative}")
+        if inventory[target_relative][0] != expected_target_size:
+            raise BundleError(f"foundation target payload size is invalid: {target_relative}")
+
+    if observed_source_records.tolist() != list(expected_source_records):
+        raise BundleError("foundation source record counts disagree with indexed rows")
+    stats = manifest.get("stats")
+    if not isinstance(stats, Mapping):
+        raise BundleError("foundation manifest has no valid stats object")
+    stat_values = cast(Mapping[str, object], stats)
+    for split, field in (("train", "train_records"), ("validation", "validation_records")):
+        value = stat_values.get(field)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value != observed_split_records[split]
+        ):
+            raise BundleError(f"foundation {field} disagrees with indexed rows")
+
+
 def _validate_dataset_contract(
     *,
     payload_paths: set[str],
@@ -768,6 +1346,18 @@ def _validate_dataset_contract(
         recorded_hash = manifest.get("tokenizer_sha256")
         if not isinstance(recorded_hash, str) or not SHA256_PATTERN.fullmatch(recorded_hash):
             raise BundleError(f"{manifest_path} has no valid tokenizer_sha256")
+        if recorded_hash != tokenizer_sha256:
+            raise BundleError(
+                f"{dataset_root} tokenizer mismatch: manifest records {recorded_hash}, "
+                f"but {TOKENIZER_MODEL_PATH} is {tokenizer_sha256}"
+            )
+        _validate_foundation_dataset_contract(
+            manifest=manifest,
+            inventory=inventory,
+            identities=identities,
+            read_payload=read_payload,
+            tokenizer_sha256=tokenizer_sha256,
+        )
 
     if recorded_hash != tokenizer_sha256:
         raise BundleError(
@@ -820,7 +1410,7 @@ def _collect_sources(
     }
 
     def add(entry: SourceEntry) -> None:
-        _assert_regular_source(entry.source_path, entry.relative_path)
+        _assert_regular_source(root, entry.source_path, entry.relative_path)
         previous = selected.get(entry.relative_path)
         if previous is not None:
             if previous.source_path.resolve() != entry.source_path.resolve():
@@ -840,7 +1430,7 @@ def _collect_sources(
         add(entry)
 
     data_root = root / "data"
-    if data_root.is_dir():
+    if _tree_root_is_directory(root, data_root, "data corpus"):
         for source_path in sorted(data_root.glob("*.jsonl"), key=lambda path: path.name):
             if not source_path.name.endswith(".jsonl"):
                 continue
@@ -855,26 +1445,8 @@ def _collect_sources(
             )
 
     evaluation_root = data_root / "evaluation_only"
-    if evaluation_root.is_dir():
-        evaluation_paths = sorted(
-            evaluation_root.rglob("*"),
-            key=lambda path: path.relative_to(root).as_posix(),
-        )
-        for source_path in evaluation_paths:
-            if source_path.is_symlink():
-                relative = source_path.relative_to(root).as_posix()
-                raise BundleError(f"evaluation-only source may not be a symlink: {relative}")
-            if source_path.is_dir():
-                continue
-            relative_path = _validated_relative_path(source_path.relative_to(root).as_posix())
-            add(
-                SourceEntry(
-                    relative_path=relative_path,
-                    source_path=source_path,
-                    origin="evaluation-only",
-                    mode="100644",
-                )
-            )
+    for entry in _collect_tree(root, evaluation_root, "evaluation-only"):
+        add(entry)
 
     if include_monolingual_corpus:
         selection = _load_monolingual_selection(root, config_path)
@@ -1003,33 +1575,58 @@ def _copy_and_hash(source: IO[bytes], destination: IO[bytes]) -> tuple[int, str]
     return total, digest.hexdigest()
 
 
+def _source_root(entry: SourceEntry) -> Path:
+    root = entry.source_path
+    for _part in entry.relative_path.parts:
+        root = root.parent
+    return root
+
+
+def _source_metadata_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        int(metadata.st_mode),
+        int(metadata.st_size),
+        int(metadata.st_mtime_ns),
+        int(metadata.st_ctime_ns),
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        int(getattr(metadata, "st_file_attributes", 0)),
+    )
+
+
 def _write_source(
     archive: zipfile.ZipFile,
     entry: SourceEntry,
+    *,
+    expected_identity: tuple[int, ...] | None = None,
 ) -> FileRecord:
-    before = entry.source_path.stat()
-    if not stat.S_ISREG(before.st_mode):
-        raise BundleError(f"selected source is no longer a regular file: {entry.relative_path}")
+    root = _source_root(entry)
+    before = _assert_regular_source(root, entry.source_path, entry.relative_path)
+    if expected_identity is not None and _source_metadata_identity(before) != expected_identity:
+        raise BundleError(f"source changed after bundle preflight: {entry.relative_path}")
 
     info = _zip_info(entry.relative_path.as_posix(), entry.mode)
-    with (
-        entry.source_path.open("rb") as source,
-        archive.open(
+    with entry.source_path.open("rb") as source:
+        opened = os.fstat(source.fileno())
+        if _metadata_is_link_like(opened) or not stat.S_ISREG(opened.st_mode):
+            raise BundleError(
+                f"selected source became link-like while it was opened: {entry.relative_path}"
+            )
+        if _source_metadata_identity(opened) != _source_metadata_identity(before):
+            raise BundleError(f"source changed before it was packaged: {entry.relative_path}")
+        with archive.open(
             info,
             mode="w",
             force_zip64=True,
-        ) as destination,
-    ):
-        size, digest = _copy_and_hash(source, destination)
+        ) as destination:
+            size, digest = _copy_and_hash(source, destination)
+        after_handle = os.fstat(source.fileno())
 
-    after = entry.source_path.stat()
+    after = _assert_regular_source(root, entry.source_path, entry.relative_path)
     if (
         size != before.st_size
-        or after.st_size != before.st_size
-        or after.st_mtime_ns != before.st_mtime_ns
-        or after.st_ctime_ns != before.st_ctime_ns
-        or after.st_ino != before.st_ino
-        or after.st_dev != before.st_dev
+        or _source_metadata_identity(after_handle) != _source_metadata_identity(before)
+        or _source_metadata_identity(after) != _source_metadata_identity(before)
     ):
         raise BundleError(f"source changed while it was packaged: {entry.relative_path}")
     return FileRecord(
@@ -1101,6 +1698,8 @@ def _write_archive(
     sources: list[SourceEntry],
     commit: str,
     tree: str,
+    *,
+    expected_source_identities: Mapping[str, tuple[int, ...]] | None = None,
 ) -> None:
     with zipfile.ZipFile(
         destination,
@@ -1110,7 +1709,18 @@ def _write_archive(
         allowZip64=True,
         strict_timestamps=True,
     ) as archive:
-        records = [_write_source(archive, entry) for entry in sources]
+        records = [
+            _write_source(
+                archive,
+                entry,
+                expected_identity=(
+                    expected_source_identities.get(entry.relative_path.as_posix())
+                    if expected_source_identities is not None
+                    else None
+                ),
+            )
+            for entry in sources
+        ]
         manifest = _manifest_bytes(commit, tree, records)
         manifest_sha256 = _write_bytes(archive, MANIFEST_NAME, manifest)
         _write_bytes(
@@ -1118,6 +1728,84 @@ def _write_archive(
             CHECKSUMS_NAME,
             _checksums_bytes(records, manifest_sha256),
         )
+
+
+def _deflate_size_bound(size: int) -> int:
+    """Return zlib's conservative upper bound for one deflated payload."""
+
+    return size + (size >> 12) + (size >> 14) + (size >> 25) + 13
+
+
+def _zip_member_size_bound(relative_path: str, size: int) -> int:
+    encoded_name_size = len(f"{ARCHIVE_ROOT}/{relative_path}".encode("utf-8"))
+    # Account for local and central headers, ZIP64 fields, and a possible data
+    # descriptor. Seekable output usually needs less, but the preflight must
+    # remain safe if zipfile changes that implementation detail.
+    metadata_bound = 30 + 20 + encoded_name_size + 24 + 46 + 28 + encoded_name_size
+    return _deflate_size_bound(size) + metadata_bound
+
+
+def _estimated_archive_size_bound(
+    sources: list[SourceEntry],
+    commit: str,
+    tree: str,
+) -> tuple[int, dict[str, tuple[int, ...]]]:
+    records: list[FileRecord] = []
+    source_identities: dict[str, tuple[int, ...]] = {}
+    total = 0
+    for entry in sources:
+        metadata = _assert_regular_source(
+            _source_root(entry),
+            entry.source_path,
+            entry.relative_path,
+        )
+        source_identities[entry.relative_path.as_posix()] = _source_metadata_identity(metadata)
+        record = FileRecord(
+            path=entry.relative_path.as_posix(),
+            size=metadata.st_size,
+            sha256="0" * 64,
+            origin=entry.origin,
+            mode=entry.mode,
+        )
+        records.append(record)
+        total += _zip_member_size_bound(record.path, record.size)
+
+    manifest = _manifest_bytes(commit, tree, records)
+    checksums = _checksums_bytes(records, "0" * 64)
+    total += _zip_member_size_bound(MANIFEST_NAME, len(manifest))
+    total += _zip_member_size_bound(CHECKSUMS_NAME, len(checksums))
+    # End-of-central-directory, ZIP64 locator, and a small implementation
+    # cushion. The per-member bounds above dominate this fixed allowance.
+    return total + 4096, source_identities
+
+
+def _format_byte_count(value: int) -> str:
+    gibibytes = value / (1024**3)
+    return f"{gibibytes:.2f} GiB ({value:,} bytes)"
+
+
+def _ensure_free_disk_for_archive(
+    output_parent: Path,
+    sources: list[SourceEntry],
+    commit: str,
+    tree: str,
+) -> tuple[int, dict[str, tuple[int, ...]]]:
+    archive_bound, source_identities = _estimated_archive_size_bound(sources, commit, tree)
+    reserve = max(MIN_FREE_DISK_RESERVE, archive_bound // FREE_DISK_RESERVE_DIVISOR)
+    required = archive_bound + reserve
+    try:
+        free = shutil.disk_usage(output_parent).free
+    except OSError as error:
+        raise BundleError(
+            f"could not inspect free disk space at {output_parent}: {error}"
+        ) from error
+    if free < required:
+        raise BundleError(
+            "insufficient free disk space for a safely staged GPU bundle: "
+            f"need at least {_format_byte_count(required)}, "
+            f"but only {_format_byte_count(free)} is free"
+        )
+    return archive_bound, source_identities
 
 
 def _fsync_file(path: Path) -> None:
@@ -1192,7 +1880,18 @@ def _parse_manifest(content: bytes) -> tuple[dict[str, object], list[FileRecord]
     if not isinstance(decoded, dict):
         raise BundleError(f"{MANIFEST_NAME} must contain a JSON object")
     raw = cast(dict[str, object], decoded)
-    if raw.get("format_version") != FORMAT_VERSION:
+    expected_top_level = {
+        "archive_root",
+        "files",
+        "format_version",
+        "git",
+        "payload",
+        "zip_metadata",
+    }
+    if set(raw) != expected_top_level:
+        raise BundleError("package manifest fields do not match format version 1")
+    format_version = raw.get("format_version")
+    if isinstance(format_version, bool) or format_version != FORMAT_VERSION:
         raise BundleError("unsupported package manifest format version")
     if raw.get("archive_root") != ARCHIVE_ROOT:
         raise BundleError(f"manifest archive_root must be {ARCHIVE_ROOT!r}")
@@ -1201,6 +1900,8 @@ def _parse_manifest(content: bytes) -> tuple[dict[str, object], list[FileRecord]
     if not isinstance(git_identity, dict):
         raise BundleError("manifest git identity is missing")
     git_values = cast(dict[object, object], git_identity)
+    if set(git_values) != {"commit", "tree"}:
+        raise BundleError("manifest Git identity fields are invalid")
     commit = git_values.get("commit")
     tree = git_values.get("tree")
     if not isinstance(commit, str) or not GIT_OBJECT_PATTERN.fullmatch(commit):
@@ -1216,6 +1917,8 @@ def _parse_manifest(content: bytes) -> tuple[dict[str, object], list[FileRecord]
         if not isinstance(raw_record, dict):
             raise BundleError("manifest contains a non-object file record")
         record_values = cast(dict[object, object], raw_record)
+        if set(record_values) != {"mode", "origin", "path", "sha256", "size"}:
+            raise BundleError("manifest file record fields are invalid")
         path = record_values.get("path")
         size = record_values.get("size")
         digest = record_values.get("sha256")
@@ -1268,10 +1971,18 @@ def _parse_manifest(content: bytes) -> tuple[dict[str, object], list[FileRecord]
     if not isinstance(payload, dict):
         raise BundleError("manifest payload summary is missing")
     payload_values = cast(dict[object, object], payload)
+    if set(payload_values) != {"file_count", "total_bytes"}:
+        raise BundleError("manifest payload summary fields are invalid")
     if payload_values.get("file_count") != len(records):
         raise BundleError("manifest payload file_count does not match its files")
     if payload_values.get("total_bytes") != sum(record.size for record in records):
         raise BundleError("manifest payload total_bytes does not match its files")
+    if raw.get("zip_metadata") != {
+        "compression": "deflate",
+        "timestamp": "1980-01-01T00:00:00Z",
+        "zip64": True,
+    }:
+        raise BundleError("manifest ZIP metadata does not match the deterministic contract")
     return raw, records
 
 
@@ -1310,11 +2021,14 @@ def _validate_checksums(
     checksums: dict[str, str],
     manifest_sha256: str,
 ) -> None:
-    expected_paths = {record.path for record in records} | {MANIFEST_NAME}
+    expected_order = [record.path for record in records] + [MANIFEST_NAME]
+    expected_paths = set(expected_order)
     if set(checksums) != expected_paths:
         missing = sorted(expected_paths - set(checksums))
         extra = sorted(set(checksums) - expected_paths)
         raise BundleError(f"{CHECKSUMS_NAME} path set mismatch; missing={missing}, extra={extra}")
+    if list(checksums) != expected_order:
+        raise BundleError(f"{CHECKSUMS_NAME} paths are not in deterministic manifest order")
     for record in records:
         if checksums[record.path] != record.sha256:
             raise BundleError(f"{CHECKSUMS_NAME} disagrees with manifest for {record.path}")
@@ -1348,6 +2062,8 @@ def verify_archive(archive_path: Path | str) -> VerificationResult:
 
     try:
         with zipfile.ZipFile(path, mode="r", allowZip64=True) as archive:
+            if archive.comment:
+                raise BundleError("ZIP archive comments are not part of the deterministic contract")
             infos = archive.infolist()
             names = [info.filename for info in infos]
             if len(names) != len(set(names)):
@@ -1361,6 +2077,8 @@ def verify_archive(archive_path: Path | str) -> VerificationResult:
                     )
                 if info.flag_bits & 0x1:
                     raise BundleError(f"encrypted ZIP members are not supported: {info.filename}")
+                if info.comment:
+                    raise BundleError(f"ZIP member comments are not supported: {info.filename}")
                 if info.compress_type != zipfile.ZIP_DEFLATED:
                     raise BundleError(
                         f"ZIP member uses an unsupported compression method: {info.filename}"
@@ -1372,6 +2090,10 @@ def verify_archive(archive_path: Path | str) -> VerificationResult:
                 if info.create_system != 3:
                     raise BundleError(
                         f"ZIP member has an unsupported creator system: {info.filename}"
+                    )
+                if info.create_version != 45 or info.extract_version != 45:
+                    raise BundleError(
+                        f"ZIP member does not use deterministic ZIP64 headers: {info.filename}"
                     )
                 _root, relative = _validate_zip_member_name(info.filename)
                 portable_key = _portable_path_key(relative)
@@ -1395,6 +2117,13 @@ def verify_archive(archive_path: Path | str) -> VerificationResult:
                     MANIFEST_NAME,
                 )
             raw_manifest, records = _parse_manifest(manifest_content)
+            expected_member_order = [
+                *(f"{ARCHIVE_ROOT}/{record.path}" for record in records),
+                f"{ARCHIVE_ROOT}/{MANIFEST_NAME}",
+                f"{ARCHIVE_ROOT}/{CHECKSUMS_NAME}",
+            ]
+            if names != expected_member_order:
+                raise BundleError("ZIP members are not in deterministic manifest order")
             with archive.open(checksums_info, mode="r") as source:
                 checksums_content = _read_limited(
                     source,
@@ -1464,19 +2193,31 @@ def verify_archive(archive_path: Path | str) -> VerificationResult:
 
 def _read_tree_metadata(path: Path, name: str) -> bytes:
     metadata = path.lstat()
-    if not stat.S_ISREG(metadata.st_mode):
+    if _metadata_is_link_like(metadata) or not stat.S_ISREG(metadata.st_mode):
         raise BundleError(f"{name} is not a regular file")
     with path.open("rb") as source:
         return _read_limited(source, metadata.st_size, name)
 
 
 def _resolve_tree_root(path: Path) -> Path:
-    if path.is_symlink():
-        raise BundleError("package tree root may not be a symlink")
+    try:
+        root_metadata = path.lstat()
+    except FileNotFoundError as error:
+        raise BundleError(f"package tree root does not exist: {path}") from error
+    if _metadata_is_link_like(root_metadata):
+        raise BundleError("package tree root may not be a symlink, junction, or reparse point")
+    if not stat.S_ISDIR(root_metadata.st_mode):
+        raise BundleError(f"package tree root is not a directory: {path}")
     candidate = path.resolve()
     if (candidate / MANIFEST_NAME).is_file():
         return candidate
     nested = candidate / ARCHIVE_ROOT
+    try:
+        nested_metadata = nested.lstat()
+    except FileNotFoundError:
+        nested_metadata = None
+    if nested_metadata is not None and _metadata_is_link_like(nested_metadata):
+        raise BundleError("nested package tree root may not be link-like")
     if (nested / MANIFEST_NAME).is_file():
         return nested
     raise BundleError(f"could not find {MANIFEST_NAME} in {candidate} or its {ARCHIVE_ROOT} child")
@@ -1502,13 +2243,8 @@ def verify_tree(tree_path: Path | str) -> VerificationResult:
     )
 
     actual_files: set[str] = set()
-    for candidate in root.rglob("*"):
+    for candidate in _walk_regular_tree(root, "package tree"):
         relative = candidate.relative_to(root).as_posix()
-        metadata = candidate.lstat()
-        if stat.S_ISDIR(metadata.st_mode):
-            continue
-        if not stat.S_ISREG(metadata.st_mode):
-            raise BundleError(f"package tree contains a non-regular path: {relative}")
         actual_files.add(_validated_relative_path(relative).as_posix())
 
     expected_files = {record.path for record in records} | {MANIFEST_NAME, CHECKSUMS_NAME}
@@ -1546,6 +2282,24 @@ def verify_tree(tree_path: Path | str) -> VerificationResult:
     )
 
 
+def _resolved_output_path(raw_path: Path) -> Path:
+    """Resolve the parent while refusing an existing link-like output leaf."""
+
+    absolute = Path(os.path.abspath(raw_path))
+    try:
+        metadata = absolute.lstat()
+    except FileNotFoundError:
+        metadata = None
+    if metadata is not None:
+        if _metadata_is_link_like(metadata):
+            raise BundleError(
+                f"bundle output may not be a symlink, junction, or reparse point: {absolute}"
+            )
+        if not stat.S_ISREG(metadata.st_mode):
+            raise BundleError(f"bundle output exists but is not a regular file: {absolute}")
+    return absolute.parent.resolve(strict=False) / absolute.name
+
+
 def build_bundle(
     repository_root: Path | str = REPOSITORY_ROOT,
     output_path: Path | str | None = None,
@@ -1562,10 +2316,8 @@ def build_bundle(
     root = Path(repository_root).resolve()
     if not root.is_dir():
         raise BundleError(f"repository root does not exist: {root}")
-    output = (
-        Path(output_path).resolve()
-        if output_path is not None
-        else (root / f"{ARCHIVE_ROOT}.zip").resolve()
+    output = _resolved_output_path(
+        Path(output_path) if output_path is not None else root / f"{ARCHIVE_ROOT}.zip"
     )
     if output.suffix.lower() != ".zip":
         raise BundleError("bundle output must use the .zip extension")
@@ -1587,6 +2339,12 @@ def build_bundle(
         raise BundleError("the bundle source allowlist selected no files")
     if any(source.source_path.resolve() == output for source in sources):
         raise BundleError("bundle output may not overwrite a selected source file")
+    archive_size_bound, source_identities = _ensure_free_disk_for_archive(
+        output.parent,
+        sources,
+        commit,
+        tree,
+    )
 
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{output.name}.",
@@ -1596,19 +2354,33 @@ def build_bundle(
     os.close(descriptor)
     temporary_path = Path(temporary_name)
     try:
-        _write_archive(temporary_path, sources, commit, tree)
+        _write_archive(
+            temporary_path,
+            sources,
+            commit,
+            tree,
+            expected_source_identities=source_identities,
+        )
         _fsync_file(temporary_path)
         verification = verify_archive(temporary_path)
+        temporary_size, temporary_sha256 = _hash_file(temporary_path)
+        if temporary_size > archive_size_bound:
+            raise BundleError(
+                "temporary ZIP exceeded the conservative disk-space estimate; "
+                "refusing to publish it"
+            )
         _ensure_clean_tracked_tree(root)
         if _git_identity(root) != (commit, tree):
             raise BundleError("Git HEAD changed while the bundle was being built")
         _publish_archive(temporary_path, output, overwrite=overwrite)
         _fsync_directory(output.parent)
+        archive_size, archive_sha256 = _hash_file(output)
+        if (archive_size, archive_sha256) != (temporary_size, temporary_sha256):
+            raise BundleError("published bundle bytes differ from the verified temporary ZIP")
     except BaseException:
         temporary_path.unlink(missing_ok=True)
         raise
 
-    _archive_size, archive_sha256 = _hash_file(output)
     return BuildResult(
         output_path=output,
         archive_sha256=archive_sha256,
