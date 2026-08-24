@@ -1,366 +1,404 @@
-# 처음부터 재학습 실행 안내
+# Retraining from a clean start
 
-GPU 서버에서 토크나이저부터 사후학습까지 순서대로 돌리는 절차입니다.
-2026-08-08 기준이며, 이 문서의 수치는 전부 실측입니다.
+This runbook covers the complete `sion_translate` 1.5 workflow: local tokenizer and
+dataset preparation, verified transfer to a GPU server, foundation pretraining,
+translation SFT, gold-anchored MRT posttraining, evaluation, export, and recovery.
 
-## 0. 전제
+The language graph comes from the configuration. Nothing in this procedure assumes
+Korean, English, Japanese, a fixed number of languages, or symmetric translation
+directions.
 
-기존 체크포인트와의 호환은 고려하지 않습니다. 배포된 체크포인트는
-`split_digits=False` 토크나이저로 학습돼 `sion-train`이 거부하므로, 어차피
-토크나이저부터 새로 만들어야 합니다.
+## 1. Understand the two model roles
 
-`data/`는 Git 저장소에 포함되지 않습니다(`.gitignore`). 일반 clone에서는
-권한을 확인한 코퍼스를 별도로 준비해야 합니다. 유지관리자가 만든
-`sion_translate.zip`에는 manifest에 기록된 학습 snapshot과
-`data/evaluation_only/`가 이미 포함됩니다.
+One training run can produce two distinct models:
 
-## 1. 가장 짧은 경로
+- The **foundation model** learns from configured monolingual corpora. It is a base model
+  and is deliberately marked `translation_capable: false`.
+- The **translation model** starts from the selected foundation weights, learns the exact
+  configured directed translation graph, and can then run MRT posttraining.
 
-GPU ZIP을 서버에 올린 경우 먼저 압축과 내부 checksum을 검증합니다.
+After real training and evaluation finish, publish the foundation model in a new Hugging
+Face repository and publish the translation model in `gaon12/sion_translate`. Do not
+create or update model cards before measured artifacts exist.
 
-```bash
-TRAINING_ZIP="sion-training-input-COMMIT-082695f2.zip"
-sha256sum "$TRAINING_ZIP"  # 배포자가 전달한 값과 비교
-python -m zipfile -t "$TRAINING_ZIP"
-unzip "$TRAINING_ZIP"
-cd sion_translate
-python scripts/package_gpu_bundle.py verify-tree .
+When MRT is enabled, deploy the best posttraining export. The SFT export remains useful
+as a comparison point, but it is not the final T2/M2 result.
 
-pip install -e ".[dev,export,hangul]"
-python easy_run.py
-```
+## 2. Start from an authenticated source tree
 
-설치 뒤 학습 명령은 `easy_run.py` 하나입니다.
-
-1. CUDA와 다중 GPU NCCL 사전검사
-2. **shard 구조 검사** — 설정된 언어쌍 레코드가 표본에 없으면 즉시 중단
-3. `/dev/shm` 여유가 있으면 코퍼스를 RAM 디스크로 복사
-4. 토크나이저 학습 (없을 때) + 데이터셋 준비
-5. **byte fallback/MorphoScript 검사** — 잘못된 sidecar나 표현력 부족이면 중단
-6. 모든 rank의 최소 VRAM/BF16 능력으로 공통 설정 후 분산 SFT
-7. best SFT 모델에서 MRT 사후학습 (`posttraining.enabled` 기본 true)
-
-대화형 셸에 `tmux`가 이미 있으면 체크아웃별 세션을 사용합니다. 비대화형
-Slurm/nohup/container 또는 tmux가 없는 서버에서는 설치를 강제하지 않고 현재
-프로세스에서 계속합니다.
-
-아래 2절부터는 수동으로 단계를 나눠 돌리거나 중간 산출물을 확인할 때
-읽으십시오.
-
-## 2. 환경
+Use Python 3.11 or 3.12. Install the project and run the local quality gates before
+preparing large artifacts:
 
 ```bash
 python -m pip install --upgrade pip
-python -m pip install -e ".[dev,export]"
-# 한국어 조사 처리에 쓰는 선택 의존성 (없으면 내장 fallback 사용)
-python -m pip install -e ".[hangul]"
-```
-
-CI가 Python 3.11과 3.12에서 돕니다. 그 외 버전은 검증되지 않았습니다.
-
-설치 확인:
-
-```bash
+python -m pip install -e ".[dev,export,hangul]"
+ruff format --check .
+ruff check .
+pyright
 python -m pytest -p no:cacheprovider
-ruff format --check . && ruff check .
 ```
 
-## 3. 코퍼스 확인
+The `hangul` extra is optional for languages that do not need its morphology helper. The
+core pipeline has a built-in fallback, but every production run should record the exact
+installed extras and dependency versions.
 
-학습 전에 실제로 무엇이 들어가는지 세십시오.
+Raw corpora under `data/` are not ordinary Git payloads. A fresh clone therefore needs
+the separately authorized training snapshot. Never substitute evaluation-only data or
+an unreviewed local file merely to satisfy a missing path.
 
-```bash
-python - <<'PY'
-import glob, io
-total = 0
-for path in sorted(glob.glob("data/*.jsonl")):
-    rows = sum(1 for line in io.open(path, "rb") if line.strip())
-    total += rows
-    print(f"{path:44} {rows:>10,}")
-print(f"{'TOTAL':44} {total:>10,}")
-PY
-```
+## 3. Define a language graph, not a language list
 
-2026-08-08 기준 **9,042,554개 물리 행 / 54 files**입니다. 숫자가 크게 다르면 코퍼스
-업로드가 덜 끝난 것입니다.
+The configuration distinguishes three concepts:
 
-### 키 이름 확인 — 반드시 하십시오
+1. **Physical language pairs** describe fields that coexist in a source record.
+2. **Translation directions** describe edges the model is allowed to learn and serve.
+3. **Source-only languages** may appear as inputs but must not be requested as targets.
 
-행 수가 맞아도 학습에 안 들어갈 수 있습니다. JSONL의 키 이름이 설정된 언어와
-다르면 그 파일은 **0문장**을 내놓고 로그에 아무 말도 남지 않습니다.
+A physical pair does not imply both directions. For example, a record with `de` and `fr`
+can train only `de -> fr` when that is the configured edge. The tokenizer, indexed
+dataset, checkpoints, exports, and inference runtime all authenticate the same exact
+graph.
+
+Use short ASCII language identifiers accepted by the schema. The identifiers are data,
+not special cases in Python code. Adding a language or changing an edge invalidates
+artifacts whose authenticated graph no longer matches.
+
+## 4. Inspect input shards before expensive work
+
+Run the structural preflight:
 
 ```bash
 python scripts/data/check_shard_keys.py
 ```
 
-종료코드가 0이 아니면 그 파일은 학습에서 빠질 가능성이 있습니다. 검사는 각
-shard에서 최대 2,000개 물리 행만 구조적으로 확인하고, 정상 파일은 첫 유효
-레코드에서 멈춥니다. 품질 필터와 split을 다시 실행하지 않으므로 대용량 코퍼스를
-두 번 전처리하거나 저품질 문장을 키 오류로 오진하지 않습니다. 실제로
-`data40.jsonl`이 키를 `한국어`/`일본어`로 써서 빠지던 문제를 이 검사로 찾았습니다.
+The check samples each shard without repeating the full quality and split pipeline. A
+nonzero exit code means that at least one configured pair may produce no usable record.
+Fix the source JSONL transactionally, run the check again, and keep only one copy in the
+training discovery path. Leaving both the original and repaired file can train duplicate
+content.
 
-`easy_run.py`가 이 검사를 학습 전에 자동으로 돌리므로, 수동 실행은 미리
-확인하고 싶을 때만 하면 됩니다.
+Also inspect the effective corpus report produced by the preparation command. File counts
+alone are not sufficient: filtering, deduplication, direction policy, source-only rules,
+and sampling weights determine the effective training mass.
 
-고치는 방법은 **JSONL의 키를 바꾸는 것 하나뿐**입니다. 언어쌍에 추가하는 것은
-불가능합니다 — 언어 키는 1~16자 ASCII 영숫자여야 하므로 `한국어`는 언어 키가
-될 수 없습니다.
+Do not use a historical row count as an integrity check. The authenticated inventory and
+source fingerprints are authoritative for the current snapshot.
 
-```bash
-python - <<'PY'
-import io, json
-src, dst = "data/data40.jsonl", "data/data40.fixed.jsonl"
-with io.open(src, encoding="utf-8-sig") as fin, io.open(dst, "w", encoding="utf-8", newline="\n") as fout:
-    for line in fin:
-        line = line.strip()
-        if not line:
-            continue
-        row = json.loads(line)
-        fout.write(json.dumps({"ko": row["한국어"], "ja": row["일본어"]}, ensure_ascii=False) + "\n")
-print("wrote", dst)
-PY
-```
+## 5. Prepare tokenizer and datasets locally
 
-바꾼 뒤 `check_shard_keys.py`를 다시 돌려 0이 나오는지 보고, 원본은 지우거나
-`data/` 밖으로 옮기십시오. 둘 다 남으면 같은 내용이 중복 학습됩니다.
-
-## 4. 토크나이저
-
-이 runbook이 대상으로 삼는 완전한 GPU 학습 ZIP은
-`--with-tokenizer --with-dataset --with-monolingual-corpus`로 만든 variant입니다.
-여기에는 검증된 `artifacts/tokenizer/`와 그 tokenizer로 만든
-`artifacts/dataset/`이 함께 들어 있습니다. 서버에서 둘 중 하나만 다시 만들지
-마십시오. tokenizer가 바뀌면 모든 token ID의 의미가 바뀌므로 dataset도 함께
-재생성해야 합니다. package CLI의 기본 ZIP은 이 opt-in artifact들을 포함하지
-않습니다.
-
-production tokenizer 자체를 다시 학습할 때는 병렬 JSONL과 `data/corpus/{ja,ko}`를
-모두 올린 `sion-dataset` Modal volume에서 다음 명령을 실행합니다.
+Tokenizer training and indexing are CPU, RAM, and storage work. Run them on the local
+machine before renting the GPU server:
 
 ```bash
-python -m modal run scripts/modal_train_tokenizer.py
+sion-train --config sion_translate.yaml --prepare-only
 ```
 
-이 경로는 `foundation.tokenizer_sample_ratio: 0.40`, SentencePiece 0.2.1, 원문
-90파일의 size/SHA, 두 번의 전체 iterator pass를 검증하고 기존 candidate를
-덮어쓰지 않습니다. 성공 candidate의 model/vocab/features/metadata/training manifest
-5파일을 함께 설치한 뒤 번역 dataset과 GPU ZIP을 다시 만드십시오. SIGSEGV 원인과
-버전 정책은 [`sentencepiece-sigsegv.md`](sentencepiece-sigsegv.md)에 있습니다.
+This command stops before allocating a model. It prepares and authenticates:
 
-아래 명령은 **병렬 JSONL만 보는 진단용**입니다. 단일어 corpus와 production 0.40
-표본을 쓰지 않으므로 release tokenizer를 만드는 명령으로 사용하면 안 됩니다.
+```text
+artifacts/
+|-- tokenizer/
+|-- dataset/
+`-- foundation_dataset/   # only when eligible monolingual input exists
+```
+
+Preparation uses the language graph and corpus inventory from the configuration. The
+tokenizer sampler is deterministic, bounded, and language-aware, so a large corpus cannot
+silently crowd every smaller configured language out of the sample.
+
+Run the same command a second time:
+
+```bash
+sion-train --config sion_translate.yaml --prepare-only
+```
+
+The second run must authenticate and reuse the complete artifacts. It must not silently
+retrain a tokenizer, partially append a dataset, or accept an incompatible directory.
+Treat a graph, tokenizer, token-feature, source-fingerprint, or inventory mismatch as a
+hard failure. Investigate it instead of deleting metadata and forcing reuse.
+
+### Manual diagnostic commands
+
+The unified preparation entry point is preferred. For a small manual diagnostic, pass
+the same graph to both commands:
 
 ```bash
 sion-train-tokenizer \
   --input "data/*.jsonl" \
   --output-dir artifacts/tokenizer \
-  --vocab-size 48000 \
-  --input-sentence-size 0 \
-  --required-character-min-occurrences 25 \
-  --language-pairs kj ko --language-pairs kj ja \
-  --language-pairs kd ko --language-pairs kd ja \
-  --language-pairs jd ko --language-pairs jd ja \
-  --language-pairs ko ja \
-  --approximate-split \
-  --source-only-language kj kd jd \
-  --train-only-prefix bt_ concat_ revise_ synthetic_
-```
+  --language-pair de fr \
+  --translation-direction de fr
 
-`--input-sentence-size 0`은 제공된 iterator stream 전체를 쓰고 SentencePiece가
-다시 내부 표본을 뽑지 않게 합니다. production Modal 경로에서는 애플리케이션이
-먼저 0.40 정책으로 단일어를 고른 뒤 이 옵션을 적용합니다. 위 parallel-only 진단
-명령에는 0.40 단일어 표본이 없습니다. 내부 상한을 두면 작은 shard가 비중만큼만
-보이므로, 한본어(`kj`)처럼 작지만 고유 문자가 있는 shard는 그 문자가 사라질 수
-있습니다.
-
-`--required-character-min-occurrences 25`는 표본에서 25회 이상 나오는 문자를
-어휘에 못 박습니다. 2026-08-08 production 0.40 실행에서는 9,751개가 남았고,
-그 집합의 SHA-256까지 `training_manifest.json`에 기록했습니다. 표본 밖 또는 더
-희귀한 문자는 byte fallback 대상입니다.
-
-### 끝나면 반드시 확인할 것
-
-`easy_run.py`가 자동으로 검사하므로 보통은 따로 할 일이 없습니다. 수동으로
-확인하려면:
-
-```bash
-python - <<'PY'
-import sys
-sys.path.insert(0, ".")
-from pathlib import Path
-import easy_run
-easy_run._verify_tokenizer(Path("artifacts/tokenizer/sion.model"), Path("data"))
-PY
-```
-
-코퍼스에서 표본을 뽑아 byte fallback 비율을 재고, 원인 문자를 코드포인트와
-함께 출력합니다. 고정된 프로브 문자열을 쓰지 않으므로 다른 언어쌍에서도
-그대로 동작합니다.
-
-판정은 0이 아니라 **비율**입니다. 임계값 25 미만 문자는 의도적으로 byte
-fallback 대상이고, 그것이 byte fallback의 용도입니다. 기본 상한은 0.2%입니다.
-
-비율이 높으면 `--required-character-min-occurrences`를 낮추거나 vocab을
-키우십시오. 다만 required 문자 수 + 제어 심볼 + byte fallback 256이 vocab을
-넘으면 학습이 시작 전에 거부됩니다.
-
-## 5. 데이터셋 준비
-
-```bash
 sion-prepare-data \
   --input "data/*.jsonl" \
   --tokenizer artifacts/tokenizer/sion.model \
   --output-dir artifacts/dataset \
-  --language-pairs kj ko --language-pairs kj ja \
-  --language-pairs kd ko --language-pairs kd ja \
-  --language-pairs jd ko --language-pairs jd ja \
-  --language-pairs ko ja \
-  --approximate-split \
-  --source-only-language kj kd jd \
-  --train-only-prefix bt_ concat_ revise_ synthetic_
+  --language-pair de fr \
+  --translation-direction de fr
 ```
 
-`sion-train`을 인자 없이 돌리면 이 단계가 자동으로 실행되므로 건너뛰어도
-됩니다. 수동으로 돌리면 중간 산출물을 확인할 수 있습니다.
+Repeat the graph options for every physical pair and every directed edge. Do not infer a
+reverse direction. A parallel-only diagnostic does not replace the production tokenizer
+sample when the configured foundation corpora are also part of tokenizer training.
 
-## 5-b. foundation 사전학습 (선택, 자동)
+### Tokenizer compatibility
 
-`data/corpus/<언어코드>/` 에 단일어 텍스트(`.txt` 한 줄에 하나, 또는 `text` 키의
-`.jsonl`)가 있으면 번역 학습 **전에** 단일어 복원 사전학습이 자동으로 먼저
-돕니다. 없으면 이유를 출력하고 건너뜁니다. `easy_run.py` 가 시작 전에 언어별
-분량·건너뛴 파일·언어 불균형 경고를 출력하므로 그것부터 확인하십시오.
+Changing any of these inputs requires a new tokenizer and newly indexed datasets:
 
-끝나면 `runs/auto/foundation/stage_complete.json` 이 남고, 이후 실행은 학습을
-건너뛰고 그 가중치만 물려받습니다. **중단된** 실행은 표시가 없으므로 정상적으로
-재개됩니다.
+- vocabulary or normalization policy;
+- digit splitting or byte fallback policy;
+- required characters;
+- language control symbols or graph identity;
+- effective tokenizer sample inventory.
 
-가중치 인계는 재개가 아닙니다 — optimizer moment·scheduler·step 을 물려받지
-않고, 대신 토크나이저와 model config 가 같은지 검증합니다. 토크나이저가 다르면
-텐서 모양은 맞아서 로드는 성공하고 모든 임베딩 행이 조용히 다른 것을 가리키기
-때문입니다.
+Never pair old indexed token IDs with a new tokenizer merely because the vocabulary size
+is equal. The shapes can match while every embedding row means something different.
 
-자세한 내용: `docs/foundation-pretraining.md`
+The verifier measures byte-fallback use on corpus-derived probes. Rare characters may
+legitimately use byte fallback; the ratio and configured limit determine acceptance.
+See [`sentencepiece-sigsegv.md`](sentencepiece-sigsegv.md) for the crash investigation
+and tokenizer version policy.
 
-## 6. 학습
+## 6. Review automatic model sizing
+
+Automatic sizing uses effective training data, not a hard-coded language combination.
+Release 1.5 adds a five-percent promotion buffer at each preset boundary. The current
+promotion points are:
+
+| Larger preset | Raw boundary | Promotion point |
+|---|---:|---:|
+| 200M class | 200,000 | 210,000 |
+| 450M class | 3,000,000 | 3,150,000 |
+| 1.3B class | 30,000,000 | 31,500,000 |
+| 3B class | 100,000,000 | 105,000,000 |
+
+The buffer prevents a modest addition near a boundary from abruptly selecting a much
+larger model. It is a stability policy, not a claim that one preset is universally best.
+Record the selected preset, effective example count, graph, token budget, and validation
+curves for each run.
+
+Do not override the capacity preflight simply to start training. The runner estimates
+parameters, gradients, optimizer state, optional EMA, activations, communication buffers,
+and runtime headroom before CUDA allocation.
+
+## 7. Build and verify the GPU upload bundle
+
+After both local preparation runs succeed, build a bundle containing the prepared
+artifacts:
 
 ```bash
-# 단일 GPU
-sion-train
+python scripts/package_gpu_bundle.py build \
+  --output sion_translate.zip \
+  --with-tokenizer \
+  --with-dataset \
+  --with-foundation-dataset
 
-# 다중 GPU
-torchrun --standalone --nproc-per-node=8 -m sion_translate.cli.train
+python scripts/package_gpu_bundle.py verify-archive sion_translate.zip
 ```
 
-`sion_translate.yaml`을 자동으로 읽습니다. 적지 않은 항목(모델 크기, 배치,
-step 예산, 정밀도)은 GPU와 데이터 규모를 보고 자동 결정됩니다.
+Use `--with-monolingual-corpus` only when the GPU server must rebuild the foundation
+dataset. If `artifacts/foundation_dataset/` is already complete and authenticated,
+omitting raw monolingual corpora makes the upload smaller and prevents accidental
+server-side re-preparation.
 
-### 이 run에서 켠 것
+Record the archive path, byte size, SHA-256, source commit, Git tree, configuration
+fingerprint, and artifact inventory. Do not upload an archive that fails verification.
 
-| 모듈 | 상태 | 이유 |
-|---|---|---|
-| SiTU-GLU | off | shape가 같아도 activation을 바꾸므로 CoRe와 별도 검증 |
-| BATS | off | 내장 collator에 정렬 label이 없고 coverage-only 목적은 uniform 해가 존재 |
-| CoRe (register) | **on — 검증 대상** | 반말이 존댓말의 2.1배라 register 혼입이 실측된 실패 |
-| TETM | off | 한 번에 하나씩 원칙 |
-| MorphoScript | off | script 위반이 현재 0%. 실패하지 않는 문제 |
+## 8. Verify the bundle on the GPU server
 
-CoRe의 `inject_gate`는 0에서 시작하고 `tanh(gate)`로 곱해집니다. 즉 step 0에서
-forward 기여가 정확히 0이고 보조 loss만 흐릅니다. 모델이 이 신호를 쓸지를
-학습으로 정하므로 켜는 위험이 낮습니다.
+Compare the archive digest with the value recorded locally, test the ZIP container, and
+verify the extracted tree:
 
-### 학습 중 볼 것
-
-- **train/val loss 곡선.** train이 계속 떨어지는데 val이 따라오면 underfit이라
-  모델을 키울 근거가 됩니다. val이 벌어지면 반대입니다. 현재 형상(200M)은
-  양방향 target 토큰 357,344,643/epoch에 대해 잘 맞는 크기입니다.
-- **register loss.** 떨어지지 않으면 CoRe가 신호를 못 찾는 것이므로 끄십시오.
-
-## 7. 사후학습 (MRT)
-
-`posttraining.enabled`가 기본 true라 학습 뒤 자동으로 이어집니다.
-복합 보상 7종(chrF / token_f1 / number / structured / slot / language / length)에
-반복 페널티와 복사 페널티가 붙습니다.
-
-`roundtrip_enabled`는 `sion_translate.yaml`에서 **true**입니다(가중치 0.20).
-후보를 원문 언어로 되번역해 원문이 복원되는지 보는 성분입니다.
-
-여기에 대해 이전에 "끄십시오"라고 안내한 적이 있는데, 그건 **다른 맥락의
-측정을 옮긴 것이라 부정확했습니다.** 그 측정은 번역 대기열에서 왕복 점수를
-**하드 필터**로 썼을 때 32행 파일럿에서 적합성과 역상관이더라는 것이었습니다.
-여기서는 8개 성분 복합 보상의 0.20 가중치라 성격이 다릅니다.
-
-지금 판단할 근거가 없으므로 켠 채로 둡니다. 다만 비용은 알고 계십시오:
-후보마다 역방향 디코드가 한 번 더 돕니다(`roundtrip_num_beams: 1`이라
-greedy). MRT 생성 시간이 늘어납니다.
-
-끄고 싶다면 `roundtrip_enabled: false`로 바꾸고, 남은 7개 성분의 가중치 합이
-달라진다는 점만 유의하십시오(정규화되므로 비율은 유지됩니다).
-
-## 8. 산출물 위치
-
+```bash
+sha256sum sion_translate.zip
+python3 -m zipfile -t sion_translate.zip
+unzip sion_translate.zip
+cd sion_translate
+python3 scripts/package_gpu_bundle.py verify-tree .
 ```
+
+Stop on any mismatch. Re-upload the verified archive instead of manually repairing a
+failed extraction.
+
+Install the GPU environment and confirm CUDA:
+
+```bash
+python3 -m pip install --upgrade pip
+python3 -m pip install -e ".[dev,export,hangul]"
+python3 - <<'PY'
+import torch
+
+assert torch.cuda.is_available(), "PyTorch cannot access CUDA"
+print("PyTorch:", torch.__version__)
+print("CUDA runtime:", torch.version.cuda)
+print("GPUs:", [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())])
+print("BF16:", torch.cuda.is_bf16_supported())
+print("NCCL:", torch.distributed.is_nccl_available())
+PY
+```
+
+Authenticate the prepared inputs once more without starting model training:
+
+```bash
+sion-train --config sion_translate.yaml --prepare-only
+```
+
+A complete bundle should reuse every included artifact.
+
+## 9. Start or resume training
+
+The recommended entry point is:
+
+```bash
+python3 easy_run.py
+```
+
+It validates CUDA and NCCL, authenticates inputs, applies the buffered sizing policy,
+selects a distributed strategy from the smallest visible GPU, and resumes the furthest
+complete compatible stage.
+
+For an explicit multi-GPU launch:
+
+```bash
+torchrun --standalone --nproc-per-node=8 \
+  -m sion_translate.cli.train \
+  --config sion_translate.yaml
+```
+
+Use the actual visible GPU count. One GPU uses the single-device path. Multiple GPUs use
+DDP when complete persistent state fits per rank and FSDP2 when sharding is required.
+Automatic BF16 is enabled only when every rank supports it.
+
+If a process stops, run the same command again. Checkpoint generations are published
+transactionally, authenticated, and separated into `current` and `previous` recovery
+states. The loader resumes only a complete compatible generation.
+
+## 10. Training stages and accuracy controls
+
+### Foundation stage
+
+When eligible monolingual data has positive sampling mass, the foundation stage learns a
+denoising/reconstruction objective first. The effective language list is derived from
+the prepared data, not merely from names present in the configuration.
+
+Weight handoff to translation SFT is not an optimizer resume. The runner verifies the
+tokenizer and model configuration, then transfers model weights without inheriting the
+foundation optimizer moments, scheduler, or step counter.
+
+### Translation SFT
+
+SFT learns only the authenticated directed edges. Critical corruption in numbers,
+placeholders, markup, URLs, code-like spans, and other structured content is rejected
+during preparation instead of being treated as ordinary translation noise.
+
+Monitor training and validation loss per direction. A falling training loss with a
+matching validation improvement can support a larger-capacity experiment. A widening
+gap indicates overfitting, leakage, or a distribution problem rather than an automatic
+reason to increase parameters.
+
+### Gold-anchored MRT and preference posttraining
+
+Posttraining generates multiple first-pass candidates, scores the full candidate
+distribution, and trains a second-stage refinement path anchored to the gold target.
+Candidate generation uses the same safety policy as deployment:
+
+- training-only controls are forbidden;
+- minimum output length and repeated n-gram limits are enforced;
+- row-specific output limits are derived from the source, not the reference target;
+- validation uses the same deployment-aligned defaults;
+- round-trip reward is available only when the required authenticated reverse edge
+  exists.
+
+This is not only candidate reranking. At inference time, the deployed T2/M2 path feeds
+the first prediction back through the learned revision edge and returns the refined
+second prediction. Export metadata binds both translation and revision direction graphs,
+so inference fails closed when a requested refinement edge was not trained.
+
+MRT can use more memory than teacher-forced SFT. If it runs out of memory, reduce
+`posttraining.batch_size_per_gpu`, then candidate micro-batch size, candidates per source,
+and generation limits in that order. Keep at least two candidates per source.
+
+## 11. Output locations
+
+```text
 runs/auto/
-├── foundation/           단일어 복원 (data/corpus/ 가 있을 때만)
-│   ├── checkpoints/
-│   ├── exports/best/     파운데이션 모델 `sion` — 번역 불가
-│   └── stage_complete.json
-├── pretrain/             번역 SFT (foundation 가중치에서 시작)
-│   ├── checkpoints/      best / latest / final
-│   └── exports/best/     fp32 fp16 bf16 int8 int4 fp8 gguf_q4_k_m transformers
-└── posttrain/            MRT 사후학습
-    ├── checkpoints/
-    └── exports/best/
-artifacts/
-├── tokenizer/            sion.model, token_features.npz
-├── dataset/              전처리된 번역 indexed 데이터
-└── foundation_dataset/   단일어 복원 shard (data/corpus/ 가 있을 때만)
+|-- foundation/
+|   |-- checkpoints/
+|   |-- exports/best/       # base model; translation is refused
+|   `-- stage_complete.json
+|-- pretrain/
+|   |-- checkpoints/
+|   `-- exports/best/       # translation SFT comparison artifact
+`-- posttrain/
+    |-- checkpoints/
+    `-- exports/best/       # final translation artifact when MRT is enabled
 ```
 
-`runs/auto/foundation/exports/best/` 는 **번역 모델이 아닙니다.** 번역쌍을 한 번도
-보지 않았지만 구조가 같아서, 막지 않으면 방향 태그를 받고 그럴듯한 헛소리를
-냅니다. metadata 의 `translation_capable: false` 를 보고 `Translator` 가
-거부합니다.
+Checkpoint aliases have distinct purposes:
 
-`posttraining.enabled`가 true이므로 **최종 산출물은
-`runs/auto/posttrain/exports/best/`** 입니다. `pretrain/` 쪽은 MRT 이전
-단계이고 비교할 때만 씁니다.
+- `best` is selected by authenticated validation metrics;
+- `latest` is the normal restart point;
+- `final` records the last completed step.
 
-체크포인트는 `best`(validation 기준), `latest`(재시작용), `final`(마지막 step)
-입니다. 쓸 것은 `best`입니다.
+Use `best` for release evaluation. Always move the matching tokenizer and token-feature
+sidecar with model weights.
 
-가중치를 가져갈 때는 **토크나이저를 반드시 함께** 가져가십시오. vocab이
-맞지 않으면 가중치만으로는 아무것도 못 합니다.
-
-## 9. 평가
+## 12. Evaluate before publishing
 
 ```bash
 sion-evaluate --help
 sion-translate --help
 ```
 
-**평가 시 주의.** 저장소 자체 test split 점수는 근사 중복 유출로 부풀려져
-있었습니다(test split chrF 77.50 대 실제 진단 61.79). `approximate_split: true`가
-켜져 있으면 이번에는 완화되지만, 진짜 기준선은 외부 평가셋입니다.
+Report results separately for every trained direction and for both first-pass and refined
+outputs. Include quality, structured-content preservation, language correctness,
+repetition, latency, and memory. Use an external evaluation set that is isolated from all
+training discovery paths; an internal approximate split alone is not a release claim.
 
-`data/evaluation_only/data22.jsonl`(FLORES-200)은 학습에서 격리돼 있습니다.
-배포판은 이것을 학습에 섞어서 홀드아웃 점수가 부풀었습니다.
+Do not assume that a beam setting measured on an older checkpoint remains optimal. Sweep
+the supported decoding policy on the new best checkpoint and record the complete command,
+seed, graph, dataset digest, and metrics.
 
-beam은 4를 쓰십시오. 실측에서 1→2→4가 chrF 77.28→77.36→77.50이고 16에서
-심한 반복 붕괴가 일어났습니다.
+## 13. Verify and publish exports
 
-## 10. 되돌아볼 만한 실패 지점
+The final export manifest authenticates the weight identity, checkpoint step, release
+role, pipeline lineage, exact translation and revision edges, feature flags, tokenizer,
+token features, and every output digest.
 
-- 토크나이저를 다시 만들면 `artifacts/dataset`과 체크포인트를 재사용할 수
-  없습니다. 3~5단계를 순서대로 다시 돌려야 합니다.
-- `source_only_languages`를 빠뜨리면 표준 한국어를 요청해도 혼용문·사투리가
-  나옵니다. yaml 주석 처리된 예시를 실제로 풀어야 합니다.
-- `approximate_split`을 끄면 홀드아웃 점수가 번역 품질을 재지 않습니다.
+```bash
+python - <<'PY'
+import json
+from sion_translate.training.export import validate_export_directory
 
-## 11. 선택 사항 — exposure bias
+path = "runs/auto/posttrain/exports/best"
+result = validate_export_directory(path)
+print(json.dumps(result, indent=2))
+raise SystemExit(0 if result["valid"] else 1)
+PY
+```
 
-`data.decoder_input_noise`가 0(꺼짐)입니다. teacher forcing이 정답 접두사만
-보여 주는 문제의 본학습 단계 대책인데, 디코더 조건부를 바꾸는 개입이라
-측정 없이 켜지 않았습니다.
+Do not upload an invalid directory. Confirm that native, Transformers, and GGUF metadata
+describe the same weight set, graph, role, tokenizer, pipeline, and feature flags.
 
-시도한다면 0.1부터 보고 검증 loss로 A/B하십시오. labels는 건드리지 않으므로
-목적함수는 그대로입니다.
+Only after evaluation and export verification should maintainers create the new
+foundation-model repository, update `gaon12/sion_translate`, and write evidence-based
+model cards.
+
+## 14. Failure report checklist
+
+Keep enough evidence to reproduce a failure:
+
+- complete traceback, not only the final line;
+- source commit and Git tree;
+- bundle path, size, and SHA-256;
+- configuration and authenticated data fingerprints;
+- tokenizer and dataset manifest digests;
+- Python, PyTorch, CUDA runtime, driver, and dependency versions;
+- GPU model, count, node/rank topology, and NCCL status;
+- last telemetry records and available disk, RAM, and VRAM;
+- checkpoint generation selected for resume.
+
+Do not delete a failed artifact or checkpoint until its manifest and consumers have been
+identified. Preserve it under a separate recovery path, fix the cause in code or data,
+rerun formatting and linting, rerun tests, and then restart the affected preparation or
+training stage.
