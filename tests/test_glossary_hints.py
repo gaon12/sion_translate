@@ -90,6 +90,27 @@ def test_malformed_hint_entry_is_reported() -> None:
         parse_hinted_source(f"{GLOSSARY_TOKEN} 사과 {SEGMENT_TOKEN} 원문")
 
 
+@pytest.mark.parametrize(
+    "entry",
+    [
+        f"{GLOSSARY_TOKEN} {PROTECT_TOKEN} Apple {SEGMENT_TOKEN} source",
+        f"{GLOSSARY_TOKEN} apple {PROTECT_TOKEN} {SEGMENT_TOKEN} source",
+    ],
+)
+def test_parser_rejects_empty_hint_terms(entry: str) -> None:
+    with pytest.raises(ValueError, match="non-empty"):
+        parse_hinted_source(entry)
+
+
+def test_parser_rejects_multiple_protect_markers_in_one_entry() -> None:
+    malformed = (
+        f"{GLOSSARY_TOKEN} apple {PROTECT_TOKEN} Apple {PROTECT_TOKEN} extra {SEGMENT_TOKEN} source"
+    )
+
+    with pytest.raises(ValueError, match="more than one"):
+        parse_hinted_source(malformed)
+
+
 # ---------------------------------------------------------------------------
 # Adherence
 # ---------------------------------------------------------------------------
@@ -155,7 +176,7 @@ def test_trie_finds_every_term() -> None:
 
 
 def test_undelimited_matches_are_rejected() -> None:
-    """미나 inside 루미나 would hint the model to translate a fragment."""
+    """A shorter CJK term inside a longer word must not hint a fragment."""
 
     assert BUILDER.is_delimited("루미나 광장에서", "루미나") is True
     assert BUILDER.is_delimited("루미나 광장에서", "미나") is False
