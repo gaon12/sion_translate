@@ -1,14 +1,13 @@
-"""artifact 루트에 대한 프로세스 간 배타 락.
+"""Provide inter-process exclusive locks for artifacts and training runs.
 
-토크나이저와 데이터셋 생성은 "없으면 만든다" 규칙으로 돕니다. 두 작업이
-동시에 시작하면 둘 다 "없다"고 판단하고 둘 다 만들기 시작하며, 각자 다른
-세대의 산출물을 같은 경로에 씁니다. 결과는 실패가 아니라 **섞인 상태**입니다 —
-한 세대의 토크나이저와 다른 세대의 데이터셋이 남고, 지문 검사는 그 조합을
-처음 보는 것으로만 인식합니다.
+Tokenizer and dataset creation follow a create-if-missing policy. Without one
+lock around the complete operation, two processes can both observe a missing
+artifact and publish different generations into the same path. That may leave a
+mixed tokenizer/dataset state rather than an obvious failed process.
 
-락은 열린 파일 디스크립터에 겁니다. 파일의 **존재**로 잠그지 않는 이유는
-그러면 크래시한 작업이 영영 풀리지 않는 락을 남기기 때문입니다. OS 수준
-락은 프로세스가 어떻게 끝나든 커널이 놓아 줍니다.
+Locks are attached to open file descriptors instead of file existence. A stale
+file from a crashed process would otherwise block work forever, while the kernel
+always releases an operating-system lock when its process exits.
 """
 
 from __future__ import annotations
@@ -25,14 +24,14 @@ from typing import IO, Callable, Iterator
 LOCK_FILENAME = ".sion_artifacts.lock"
 TRAINING_RUN_LOCK_FILENAME = ".sion_training_run.lock"
 
-# 보유자 정보를 적는 영역과 겹치지 않도록, 락은 파일 내용 **바깥**의 고정
-# 바이트에 겁니다. Windows 의 byte-range 락은 잠긴 구간에 대한 쓰기를 막기
-# 때문에, 같은 바이트를 잠그고 거기에 쓰면 자기 자신이 막힙니다.
+# Lock a fixed byte beyond the holder-information region. Windows byte-range
+# locks prevent writes to the locked range, so locking and writing the same byte
+# would make the process block itself.
 _LOCK_OFFSET = 1 << 30
-# 보유자 한 줄을 고정 길이로 채워 truncate 없이 덮어씁니다.
+# Pad the holder record to a fixed width so updates never require truncation.
 _HOLDER_WIDTH = 128
 
-if sys.platform == "win32":  # pragma: no cover - 플랫폼별 분기
+if sys.platform == "win32":  # pragma: no cover - platform-specific branch
     import msvcrt
 
     def _try_acquire(handle: IO[str]) -> bool:
@@ -49,7 +48,7 @@ if sys.platform == "win32":  # pragma: no cover - 플랫폼별 분기
             msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
         except OSError:
             pass
-else:  # pragma: no cover - 플랫폼별 분기
+else:  # pragma: no cover - platform-specific branch
     import fcntl
 
     def _try_acquire(handle: IO[str]) -> bool:
@@ -71,7 +70,7 @@ def _describe_holder(path: Path) -> str:
         recorded = path.read_text(encoding="utf-8")[:_HOLDER_WIDTH].strip()
     except OSError:
         recorded = ""
-    return recorded or "알 수 없는 프로세스"
+    return recorded or "unknown process"
 
 
 @contextmanager  # pyright: ignore[reportDeprecated]
@@ -83,14 +82,12 @@ def _exclusive_lock(
     timeout: float = 0.0,
     poll_interval: float = 1.0,
 ) -> Iterator[Path]:
-    """``root`` 를 만들거나 바꾸는 동안 배타적으로 잠근다.
+    """Lock ``root`` exclusively while a caller creates or changes it.
 
-    ``timeout=0`` 이면 즉시 실패합니다. 기다리는 것이 기본이 아닌 이유는,
-    다른 작업이 토크나이저를 만드는 중이라면 몇 시간이 걸릴 수 있고 그동안
-    말없이 멈춰 있는 것보다 "누가 쥐고 있다"고 말하는 편이 낫기 때문입니다.
-
-    락을 쥔 쪽의 host/pid 를 파일에 적어 두므로, 실패 메시지가 어느 프로세스를
-    봐야 하는지 알려 줍니다.
+    ``timeout=0`` fails immediately. Waiting is not the default because another
+    tokenizer build may take hours; reporting its owner is safer than appearing
+    to hang silently. The lock file records the owner's host and process ID so a
+    conflict message identifies the process to inspect.
     """
 
     root = Path(root)
@@ -100,7 +97,7 @@ def _exclusive_lock(
     handle = open(lock_path, "r+", encoding="utf-8") if lock_path.exists() else None
     if handle is None:
         lock_path.touch()
-        handle = open(lock_path, "r+", encoding="utf-8")  # noqa: SIM115 - 컨텍스트가 소유
+        handle = open(lock_path, "r+", encoding="utf-8")  # noqa: SIM115 - context owns it
     try:
         while True:
             if _try_acquire(handle):
@@ -120,21 +117,21 @@ def _exclusive_lock(
 
 def _artifact_conflict_message(root: Path, holder: str) -> str:
     return (
-        f"artifact 루트가 다른 프로세스에 잠겨 있습니다: {root}\n"
-        f"  현재 보유자: {holder}\n"
-        "  같은 artifacts/ 를 쓰는 작업을 동시에 두 개 실행하면 서로 다른 "
-        "세대의 토크나이저와 데이터셋이 섞입니다. 앞선 작업이 끝나기를 "
-        "기다리거나, 이 작업에 별도의 artifact 경로를 주십시오."
+        f"artifact root is locked by another process: {root}\n"
+        f"  current holder: {holder}\n"
+        "  Running two jobs against the same artifacts directory can mix "
+        "different tokenizer and dataset generations. Wait for the current "
+        "job to finish or give this job a separate artifact path."
     )
 
 
 def _training_run_conflict_message(root: Path, holder: str) -> str:
     return (
-        f"학습 output_dir가 다른 프로세스에 잠겨 있습니다: {root}\n"
-        f"  현재 보유자: {holder}\n"
-        "  같은 training.output_dir에서 동시에 두 run을 실행하면 체크포인트·"
-        "로그·내보내기 산출물이 섞입니다. 앞선 run이 끝나기를 기다리거나 "
-        "이 run에 별도의 training.output_dir를 주십시오."
+        f"training output directory is locked by another process: {root}\n"
+        f"  current holder: {holder}\n"
+        "  Running two jobs in the same training.output_dir can mix checkpoints, "
+        "logs, and exports. Wait for the current job to finish or give this run "
+        "a separate training.output_dir."
     )
 
 
@@ -145,7 +142,7 @@ def artifact_lock(
     timeout: float = 0.0,
     poll_interval: float = 1.0,
 ) -> Iterator[Path]:
-    """Artifact 생성 전체가 ``root`` 를 독점하도록 잠그다."""
+    """Reserve ``root`` exclusively for the complete artifact build."""
 
     with _exclusive_lock(
         root,
@@ -190,7 +187,7 @@ def training_run_lock(
     timeout: float = 0.0,
     poll_interval: float = 1.0,
 ) -> Iterator[Path]:
-    """학습 run 전체가 ``training.output_dir`` 를 독점하도록 잠그다."""
+    """Reserve ``training.output_dir`` for the complete training run."""
 
     with _exclusive_lock(
         root,

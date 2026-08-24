@@ -1,14 +1,15 @@
-"""CLI 표준 입출력을 UTF-8 로 고정한다.
+"""Make command-line standard streams reliably support multilingual UTF-8.
 
-Windows 콘솔의 기본 인코딩은 로케일에 따라 cp949/cp932 이므로, 한국어·일본어를
-그대로 출력하면 파이프나 리다이렉션 없이도 다음처럼 죽습니다.
+The default Windows console encoding can be a locale-specific code page such as
+cp949 or cp932. Printing text outside that code page can fail even without a pipe
+or redirection:
 
     UnicodeEncodeError: 'cp949' codec can't encode character '\\u4f1a'
 
-번역 결과가 한자·가나를 포함하는 것이 정상인 프로젝트에서는 이 실패가 기본
-경로에 놓여 있으므로, CLI 진입점에서 스트림을 UTF-8 로 다시 엽니다. 표준 입력도
-같이 처리합니다 — ``cat input.txt | sion-translate`` 로 일본어를 읽을 때 같은
-이유로 UnicodeDecodeError 가 납니다.
+Translation output may legitimately contain any Unicode script, so CLI entry
+points reconfigure all standard streams as UTF-8. Standard input needs the same
+protection when a pipeline such as ``cat input.txt | sion-translate`` supplies
+text that the active Windows code page cannot decode.
 """
 
 from __future__ import annotations
@@ -26,12 +27,11 @@ def _is_utf8(stream: IO[Any]) -> bool:
 
 
 def configure_stdio() -> None:
-    """표준 입출력이 UTF-8 이 아니면 UTF-8 로 다시 엽니다.
+    """Reconfigure standard streams as UTF-8 when the caller did not choose one.
 
-    호출자가 ``PYTHONIOENCODING`` 을 지정했으면 그 의도를 존중해 아무것도 하지
-    않습니다. 스트림이 ``reconfigure`` 를 지원하지 않는 경우(테스트 더블, 일부
-    임베딩 환경)에도 조용히 넘어갑니다 — 인코딩 편의 기능이 CLI 를 막아서는
-    안 되기 때문입니다.
+    An explicit ``PYTHONIOENCODING`` takes precedence. Streams without a
+    ``reconfigure`` method, including test doubles and some embedded runtimes,
+    are left unchanged because an encoding convenience must not block the CLI.
     """
     if os.environ.get("PYTHONIOENCODING"):
         return
@@ -43,9 +43,9 @@ def configure_stdio() -> None:
         if reconfigure is None:
             continue
         try:
-            # 잘못된 바이트 하나 때문에 번역 작업 전체가 죽지 않도록 대체 문자를
-            # 씁니다. 입력은 손실을 눈에 보이게(replace), 출력은 원문 복원이
-            # 가능하게(backslashreplace) 처리합니다.
+            # One invalid byte must not terminate a whole translation job.
+            # Input makes damage visible with replacement characters; output
+            # uses backslash escapes so the original scalar remains recoverable.
             if stream is sys.stdin:
                 reconfigure(encoding="utf-8", errors="replace")
             else:
