@@ -93,6 +93,7 @@ def make_translator(
     revision_trained: bool | None = False,
     language_pairs: tuple[tuple[str, str], ...] = (("ko", "ja"),),
     translation_directions: tuple[tuple[str, str], ...] | None = None,
+    revision_directions: tuple[tuple[str, str], ...] | object = _UNSET,
     tokenizer_class: type[FakeTokenizer] = FakeTokenizer,
     quantization: dict[str, object] | None = None,
     feature_sha256: str | None = None,
@@ -102,6 +103,9 @@ def make_translator(
     raw_revision_capability: object = _UNSET,
     feature_arrays: dict[str, np.ndarray] | None = None,
     loaded_model: SionForConditionalGeneration | None = None,
+    release_version: str | None = "1.5",
+    translation_capable: object = True,
+    return_export_metadata: bool = True,
 ) -> inference.Translator:
     tokenizer_path = tmp_path / "tokenizer.model"
     tokenizer_path.write_bytes(b"fake tokenizer")
@@ -143,24 +147,50 @@ def make_translator(
         "legacy": False,
         "format": "fp32",
     }
+    if release_version is not None:
+        metadata.update(
+            {
+                "release_name": "sion_translate",
+                "release_version": release_version,
+            }
+        )
+        release_numbers = tuple(int(part) for part in release_version.split("."))
+        if release_numbers[:2] >= (1, 5):
+            metadata["pipeline"] = {
+                "schema": "sion-translation-pipeline-v2",
+                "branch": "translation-only",
+            }
+    if translation_capable is not _UNSET:
+        metadata["translation_capable"] = translation_capable
     if raw_revision_capability is not _UNSET:
         metadata["capabilities"] = {"revision_trained": raw_revision_capability}
+    elif revision_directions is not _UNSET:
+        assert isinstance(revision_directions, tuple)
+        configured_revision_directions = revision_directions
+        metadata["capabilities"] = {
+            "revision_directions": [
+                list(direction) for direction in configured_revision_directions
+            ],
+            "revision_trained": bool(configured_revision_directions),
+        }
     elif revision_trained is not None:
         metadata["capabilities"] = {"revision_trained": revision_trained}
     if quantization is not None:
         metadata["quantization"] = quantization
-    authenticated_directions = translation_directions or tuple(
-        direction for pair in language_pairs for direction in (pair, (pair[1], pair[0]))
+    recorded_directions = (
+        tuple(direction for pair in language_pairs for direction in (pair, (pair[1], pair[0])))
+        if translation_directions is None
+        else translation_directions
     )
-    if authenticated_directions:
-        metadata["translation_directions"] = [
-            list(direction) for direction in authenticated_directions
-        ]
+    if recorded_directions:
+        metadata["translation_directions"] = [list(direction) for direction in recorded_directions]
     monkeypatch.setattr(inference, "SionTokenizer", tokenizer_class)
     monkeypatch.setattr(
         inference,
         "load_exported_model",
-        lambda *_args, **_kwargs: (model, config, 0, metadata),
+        lambda *_args, **_kwargs: (
+            (model, config, 0, metadata) if return_export_metadata else (model, config, 0)
+        ),
     )
     return inference.Translator(
         tmp_path / "model.pt",
@@ -456,7 +486,7 @@ def test_translator_applies_safe_decode_limits_and_control_token_mask(
         reasoning_level=0,
     )
 
-    # FakeTokenizer.encode()는 본문 토큰 2개를 내므로 2*2 + margin 1입니다.
+    # FakeTokenizer.encode() emits two content tokens, so the cap is 2*2 plus margin 1.
     assert captured["max_new_tokens"] == 5
     torch.testing.assert_close(
         captured["max_new_tokens_per_row"],
@@ -527,7 +557,7 @@ def test_disconnected_multilingual_graph_rejects_untrained_direction(
         tokenizer_class=ArbitraryGraphFakeTokenizer,
     )
     assert translator._resolve_source_language("de", "fr") == "de"
-    with pytest.raises(ValueError, match="학습되지 않은 번역 방향"):
+    with pytest.raises(ValueError, match="Untrained translation direction"):
         translator.translate(
             ["ein Satz"],
             source_language="de",
@@ -561,7 +591,7 @@ def test_unidirectional_export_rejects_untrained_reverse_direction(
         translation_directions=(("ko", "ja"),),
     )
     assert translator._resolve_source_language("ko", "ja") == "ko"
-    with pytest.raises(ValueError, match="학습되지 않은 번역 방향"):
+    with pytest.raises(ValueError, match="Untrained translation direction"):
         translator._resolve_source_language("ja", "ko")
 
 
@@ -660,11 +690,106 @@ def test_legacy_missing_direction_graph_remains_unknown() -> None:
     assert inference._translation_directions_from_metadata(metadata) == ()
 
 
+def test_legacy_non_ko_ja_export_cannot_invent_directions_from_tokenizer_sidecar(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        inference,
+        "load_tokenizer_metadata",
+        lambda _path: {
+            "language_pairs": [["pt-BR", "zh-Hant"]],
+            "translation_directions": [["pt-BR", "zh-Hant"], ["zh-Hant", "pt-BR"]],
+        },
+    )
+
+    with pytest.raises(ValueError, match="exact translation_directions"):
+        make_translator(
+            monkeypatch,
+            tmp_path,
+            runtime_config(),
+            language_pairs=(("pt-BR", "zh-Hant"),),
+            translation_directions=(),
+            tokenizer_class=BCP47GraphFakeTokenizer,
+            release_version="1.4",
+        )
+
+
+@pytest.mark.parametrize("translation_capable", [_UNSET, "true"])
+def test_schema_less_non_ko_ja_native_export_requires_boolean_translation_capability(
+    monkeypatch,
+    tmp_path: Path,
+    translation_capable: object,
+) -> None:
+    monkeypatch.setattr(
+        inference,
+        "load_tokenizer_metadata",
+        lambda _path: {
+            "language_pairs": [["pt-BR", "zh-Hant"]],
+            "translation_directions": [["pt-BR", "zh-Hant"]],
+        },
+    )
+
+    with pytest.raises(ValueError, match="translation_capable must be an explicit boolean"):
+        make_translator(
+            monkeypatch,
+            tmp_path,
+            runtime_config(),
+            language_pairs=(("pt-BR", "zh-Hant"),),
+            translation_directions=(),
+            tokenizer_class=BCP47GraphFakeTokenizer,
+            release_version=None,
+            translation_capable=translation_capable,
+        )
+
+
+def test_metadata_less_non_ko_ja_native_export_cannot_use_tokenizer_sidecar_graph(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        inference,
+        "load_tokenizer_metadata",
+        lambda _path: {
+            "language_pairs": [["pt-BR", "zh-Hant"]],
+            "translation_directions": [["pt-BR", "zh-Hant"]],
+        },
+    )
+
+    with pytest.raises(ValueError, match="translation_capable must be an explicit boolean"):
+        make_translator(
+            monkeypatch,
+            tmp_path,
+            runtime_config(),
+            language_pairs=(("pt-BR", "zh-Hant"),),
+            translation_directions=(),
+            tokenizer_class=BCP47GraphFakeTokenizer,
+            return_export_metadata=False,
+        )
+
+
+def test_legacy_non_ko_ja_export_keeps_its_exact_embedded_direction_graph(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    translator = make_translator(
+        monkeypatch,
+        tmp_path,
+        runtime_config(),
+        language_pairs=(("pt-BR", "zh-Hant"),),
+        translation_directions=(("pt-BR", "zh-Hant"),),
+        tokenizer_class=BCP47GraphFakeTokenizer,
+        release_version="1.4",
+    )
+
+    assert translator.translation_directions == (("pt-BR", "zh-Hant"),)
+
+
 def test_cpu_only_quantization_metadata_overrides_requested_cuda(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    with pytest.warns(RuntimeWarning, match="CPU 전용"):
+    with pytest.warns(RuntimeWarning, match="CPU-only"):
         translator = make_translator(
             monkeypatch,
             tmp_path,
@@ -796,7 +921,7 @@ def test_token_features_follow_export_metadata_filename(monkeypatch, tmp_path: P
     assert set(translator.token_features) == {"script", "onset", "vowel", "coda"}
 
 
-def test_unknown_legacy_revision_capability_warns_but_remains_usable(
+def test_unknown_legacy_revision_capability_fails_closed_even_for_one_direction(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -805,17 +930,190 @@ def test_unknown_legacy_revision_capability_warns_but_remains_usable(
         tmp_path,
         runtime_config(),
         revision_trained=None,
+        translation_directions=(("ko", "ja"),),
     )
-    monkeypatch.setattr(
-        translator,
-        "translate",
-        lambda texts, **_kwargs: list(texts),
-    )
-    with pytest.warns(RuntimeWarning, match="기록되어 있지 않습니다"):
-        revised = translator.revise(
+    with pytest.raises(ValueError, match="does not record revision_directions or revision_trained"):
+        translator.revise(
             ["원문"],
             ["초안"],
             target_language="ja",
             max_new_tokens=2,
         )
-    assert revised == ["원문 <draft> 초안"]
+
+
+def test_legacy_exact_true_revision_flag_keeps_single_direction_compatibility(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    translator = make_translator(
+        monkeypatch,
+        tmp_path,
+        runtime_config(),
+        revision_trained=True,
+        translation_directions=(("ko", "ja"),),
+    )
+    monkeypatch.setattr(
+        translator,
+        "_translate_internal",
+        lambda texts, **_kwargs: list(texts),
+    )
+
+    assert translator.revise(
+        ["원문"],
+        ["초안"],
+        target_language="ja",
+        max_new_tokens=2,
+    ) == ["원문 <draft> 초안"]
+
+
+def test_revision_capability_is_scoped_to_exact_canonical_bcp47_edge(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    translator = make_translator(
+        monkeypatch,
+        tmp_path,
+        runtime_config(),
+        language_pairs=(("pt-BR", "zh-Hant"),),
+        translation_directions=(("pt-BR", "zh-Hant"), ("zh-Hant", "pt-BR")),
+        revision_directions=(("PT-br", "zh-hant"),),
+        tokenizer_class=BCP47GraphFakeTokenizer,
+    )
+    monkeypatch.setattr(translator, "_translate_internal", lambda texts, **_kwargs: list(texts))
+
+    assert translator.revision_directions == (("pt-BR", "zh-Hant"),)
+    assert translator.revise(
+        ["fonte"],
+        ["草稿"],
+        source_language="PT-br",
+        target_language="zh-hant",
+    ) == ["fonte <draft> 草稿"]
+    with pytest.raises(ValueError, match="revision capability.*zh-Hant→pt-BR"):
+        translator.revise(
+            ["來源"],
+            ["rascunho"],
+            source_language="zh-hant",
+            target_language="PT-br",
+        )
+
+
+def test_public_translate_cannot_bypass_empty_revision_edges_with_reserved_separator(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    translator = make_translator(
+        monkeypatch,
+        tmp_path,
+        runtime_config(),
+        language_pairs=(("pt-BR", "zh-Hant"),),
+        translation_directions=(("pt-BR", "zh-Hant"),),
+        revision_directions=(),
+        tokenizer_class=BCP47GraphFakeTokenizer,
+    )
+
+    with pytest.raises(ValueError, match=r"reserved <draft>.*use revise\(\)"):
+        translator.translate(
+            ["fonte <draft> 草稿"],
+            source_language="pt-BR",
+            target_language="zh-Hant",
+        )
+    with pytest.raises(TypeError, match="sequence of strings"):
+        translator.translate(  # type: ignore[arg-type]
+            "fonte <draft> 草稿",
+            source_language="pt-BR",
+            target_language="zh-Hant",
+        )
+    with pytest.raises(ValueError, match="revision capability"):
+        translator.revise(
+            ["fonte"],
+            ["草稿"],
+            source_language="pt-BR",
+            target_language="zh-Hant",
+        )
+
+
+@pytest.mark.parametrize(
+    ("source", "draft", "message"),
+    [
+        ("   ", "草稿", "non-blank"),
+        ("fonte", "   ", "non-blank"),
+        ("fonte <draft> injetado", "草稿", "must not contain reserved"),
+        ("fonte", "草稿 <draft> injetado", "must not contain reserved"),
+    ],
+)
+def test_revise_validates_blank_and_multiple_separator_inputs_before_internal_translation(
+    monkeypatch,
+    tmp_path: Path,
+    source: str,
+    draft: str,
+    message: str,
+) -> None:
+    translator = make_translator(
+        monkeypatch,
+        tmp_path,
+        runtime_config(),
+        language_pairs=(("pt-BR", "zh-Hant"),),
+        translation_directions=(("pt-BR", "zh-Hant"),),
+        revision_directions=(("pt-BR", "zh-Hant"),),
+        tokenizer_class=BCP47GraphFakeTokenizer,
+    )
+    internal_calls: list[list[str]] = []
+    monkeypatch.setattr(
+        translator,
+        "_translate_internal",
+        lambda texts, **_kwargs: internal_calls.append(list(texts)) or list(texts),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        translator.revise(
+            [source],
+            [draft],
+            source_language="pt-BR",
+            target_language="zh-Hant",
+        )
+
+    assert internal_calls == []
+
+
+@pytest.mark.parametrize("legacy_value", [True])
+def test_legacy_revision_capability_rejects_ambiguous_multidirection_graph(
+    monkeypatch,
+    tmp_path: Path,
+    legacy_value: bool | None,
+) -> None:
+    translator = make_translator(
+        monkeypatch,
+        tmp_path,
+        runtime_config(),
+        revision_trained=legacy_value,
+    )
+
+    with pytest.raises(ValueError, match="ambiguous.*re-export with revision_directions"):
+        translator.revise(["원문"], ["초안"], target_language="ja")
+
+
+def test_revision_direction_metadata_rejects_alias_duplicates_and_graph_widening(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="duplicate revision direction"):
+        make_translator(
+            monkeypatch,
+            tmp_path,
+            runtime_config(),
+            language_pairs=(("pt-BR", "zh-Hant"),),
+            translation_directions=(("pt-BR", "zh-Hant"),),
+            revision_directions=(("pt-br", "ZH-hant"), ("PT-BR", "zh-Hant")),
+            tokenizer_class=BCP47GraphFakeTokenizer,
+        )
+
+    with pytest.raises(ValueError, match="subset of authenticated translation"):
+        make_translator(
+            monkeypatch,
+            tmp_path,
+            runtime_config(),
+            language_pairs=(("pt-BR", "zh-Hant"),),
+            translation_directions=(("pt-BR", "zh-Hant"),),
+            revision_directions=(("zh-Hant", "pt-BR"),),
+            tokenizer_class=BCP47GraphFakeTokenizer,
+        )

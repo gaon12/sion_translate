@@ -1,7 +1,8 @@
-"""추론 공용 도우미.
+"""Shared inference helpers.
 
-학습이 끝난 모델(exports/)을 찾아 불러오고, 문장 목록을 배치로 번역합니다.
-`sion-translate`(대화형 번역)와 `sion-augment`(역번역 데이터 증강)가 공유합니다.
+Locate and load trained exports, then translate sequences of sentences in
+batches. The interactive translator and backtranslation augmenter share this
+runtime.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from sion_translate.tokenizer import (
     SLOT_SYMBOLS,
     SionTokenizer,
     load_tokenizer_metadata,
+    tokenizer_metadata_path,
     tokenizer_split_digits_policy,
 )
 from sion_translate.fp8_runtime import describe_runtime, prepare_fp8_model_for_device
@@ -34,6 +36,52 @@ from sion_translate.training.export import (
     metadata_requires_explicit_direction_graph,
     resolve_manifest_artifact,
 )
+
+
+def _runtime_file_identity(path: Path, *, label: str) -> dict[str, object]:
+    """Hash one runtime artifact while detecting replacement during the read."""
+
+    try:
+        resolved = path.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"{label} does not exist: {path}") from exc
+    if not resolved.is_file():
+        raise ValueError(f"{label} is not a file: {resolved}")
+    before = resolved.stat()
+    digest = hashlib.sha256()
+    with resolved.open("rb") as handle:
+        while block := handle.read(8 * 1024 * 1024):
+            digest.update(block)
+    after = resolved.stat()
+    before_stat = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+    after_stat = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+    if before_stat != after_stat:
+        raise ValueError(f"{label} changed while its load identity was being captured: {resolved}")
+    return {
+        "path": str(resolved),
+        "size": after.st_size,
+        "sha256": digest.hexdigest(),
+        "device": after.st_dev,
+        "inode": after.st_ino,
+        "mtime_ns": after.st_mtime_ns,
+    }
+
+
+def _optional_runtime_file_identity(path: Path, *, label: str) -> dict[str, object] | None:
+    return _runtime_file_identity(path, label=label) if path.is_file() else None
+
+
+def _verified_load_identity(
+    before: Mapping[str, object] | None,
+    after: Mapping[str, object] | None,
+    *,
+    label: str,
+) -> dict[str, object] | None:
+    """Require identical bytes and stat identity before and after an artifact load."""
+
+    if before != after:
+        raise ValueError(f"{label} changed while Translator was loading it")
+    return dict(before) if before is not None else None
 
 
 def _language_pairs_from_metadata(
@@ -119,6 +167,57 @@ def _translation_directions_from_metadata(
     return tuple(directions)
 
 
+def _revision_directions_from_metadata(
+    metadata: Mapping[str, Any] | None,
+    translation_directions: Sequence[tuple[str, str]],
+) -> tuple[tuple[str, str], ...] | None:
+    """Return authoritative revision edges, preserving legacy uncertainty."""
+
+    if metadata is None:
+        return None
+    capabilities = metadata.get("capabilities")
+    if capabilities is None:
+        return None
+    if not isinstance(capabilities, Mapping):
+        raise ValueError("model capabilities metadata must be an object")
+    typed_capabilities = cast(Mapping[object, object], capabilities)
+    has_summary = "revision_trained" in typed_capabilities
+    summary: object = typed_capabilities.get("revision_trained")
+    if has_summary and not isinstance(summary, bool):
+        raise ValueError("model capabilities.revision_trained must be a boolean when present")
+    raw_directions: object = typed_capabilities.get("revision_directions")
+    if "revision_directions" not in typed_capabilities:
+        if summary is False:
+            return ()
+        if summary is True and len(translation_directions) == 1:
+            return (translation_directions[0],)
+        return None
+    if not isinstance(raw_directions, Sequence) or isinstance(raw_directions, (str, bytes)):
+        raise ValueError("model capabilities.revision_directions must be a sequence")
+    allowed = set(translation_directions)
+    directions: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for raw_direction in cast(Sequence[object], raw_directions):
+        if not isinstance(raw_direction, Sequence) or isinstance(raw_direction, (str, bytes)):
+            raise ValueError(f"invalid revision direction metadata: {raw_direction!r}")
+        direction = canonicalize_language_pair(
+            cast(Sequence[object], raw_direction),
+            field="revision direction metadata",
+        )
+        if direction in seen:
+            raise ValueError(f"duplicate revision direction metadata: {raw_direction!r}")
+        if direction not in allowed:
+            raise ValueError(
+                "revision direction metadata must be a subset of authenticated translation "
+                f"directions: {direction!r}"
+            )
+        seen.add(direction)
+        directions.append(direction)
+    if has_summary and summary is not bool(directions):
+        raise ValueError("model capabilities.revision_trained disagrees with revision_directions")
+    return tuple(directions)
+
+
 def _manifest_artifact(directory: Path, *, int8: bool) -> Path | None:
     format_names = ("int8",) if int8 else ("fp32", "bf16", "fp16")
     return resolve_manifest_artifact(directory, format_names)
@@ -129,17 +228,18 @@ def find_exported_model(
     *,
     int8: bool = False,
 ) -> Path:
-    """가장 좋은 내보내기 모델을 찾습니다.
+    """Find the best available exported model.
 
-    우선순위: 사후학습 best/latest → 사전학습 best/latest → 기존 단일-stage 경로.
-    (EMA 가중치가 보통 번역 품질이 더 좋습니다. --int8 이면 양자화본을 찾습니다.)
+    Search post-training before pre-training, best before latest, and then the
+    legacy single-stage directory. EMA weights take priority because they
+    usually translate better. ``int8=True`` selects a quantized artifact.
     """
     output_dir = Path(output_dir)
     filenames = ["model_int8.pt"] if int8 else ["model_ema.pt", "model.pt"]
     export_roots = [
         output_dir / "posttrain" / "exports",
         output_dir / "pretrain" / "exports",
-        output_dir / "exports",  # 이전 버전 산출물과의 호환
+        output_dir / "exports",  # Compatibility with legacy single-stage exports.
     ]
     for exports in export_roots:
         for stage in ("best", "latest"):
@@ -156,12 +256,12 @@ def find_exported_model(
                 if candidate.exists():
                     return candidate
     raise FileNotFoundError(
-        f"{output_dir} 아래에 내보낸 모델이 없습니다. 먼저 sion-train 으로 학습하세요."
+        f"No exported model exists below {output_dir}. Train with sion-train first."
     )
 
 
 class Translator:
-    """내보낸 모델 + 토크나이저로 문장을 번역하는 얇은 래퍼."""
+    """Translate text with one exported model and its tokenizer."""
 
     def __init__(
         self,
@@ -173,18 +273,36 @@ class Translator:
     ):
         model_path = Path(model_path)
         tokenizer_path = Path(tokenizer_path)
+        tokenizer_sidecar_path = tokenizer_metadata_path(tokenizer_path)
+        model_identity_before = _optional_runtime_file_identity(
+            model_path,
+            label="translation model",
+        )
+        tokenizer_identity_before = _runtime_file_identity(
+            tokenizer_path,
+            label="tokenizer model",
+        )
+        tokenizer_metadata_identity_before = _optional_runtime_file_identity(
+            tokenizer_sidecar_path,
+            label="tokenizer metadata",
+        )
+        # Queue translation verifies these load-time identities again at its
+        # public library boundary. Preserve the exact paths used here instead
+        # of trusting caller-supplied provenance paths.
+        self.translation_model_path = str(model_path.resolve())
+        self.tokenizer_model_path = str(tokenizer_path.resolve())
         self.tokenizer = SionTokenizer(tokenizer_path)
         declared_split_digits = tokenizer_split_digits_policy(tokenizer_path)
         if declared_split_digits is False or (
             declared_split_digits is None and not self.tokenizer.splits_digits
         ):
-            # split_digits 없이 학습된 토크나이저는 숫자를 덩어리로 암기하므로
-            # 금액·용량·날짜가 조용히 다른 값으로 바뀔 수 있습니다. 출력만 보고는
-            # 알아채기 어려우므로 로드 시점에 한 번 알립니다.
+            # A tokenizer trained without split_digits can memorize numbers as
+            # opaque pieces and silently change amounts, doses, or dates. Warn at
+            # load time because this corruption is hard to notice in fluent text.
             warnings.warn(
-                f"{tokenizer_path} 는 숫자를 자릿수로 분리하지 않습니다. "
-                "금액·용량·날짜가 다른 값으로 바뀔 수 있으니 숫자가 중요한 문장은 "
-                "사람이 검토하세요. 재학습 시에는 split_digits 를 켜십시오.",
+                f"{tokenizer_path} does not split numbers into digits. Amounts, doses, and "
+                "dates can change silently, so review number-sensitive output. Enable "
+                "split_digits when retraining the tokenizer.",
                 RuntimeWarning,
                 stacklevel=2,
             )
@@ -203,15 +321,23 @@ class Translator:
             self.export_metadata = cast(
                 dict[str, Any], dict(cast(Mapping[object, object], raw_metadata))
             )
-        # 번역할 수 없는 산출물을 번역기로 싣지 않습니다. foundation 모델은
-        # 번역쌍을 한 번도 보지 않았지만 구조가 같아서, 막지 않으면 방향
-        # 태그를 받아들이고 그럴듯한 쓰레기를 냅니다.
-        if self.export_metadata.get("translation_capable") is False:
+        # A foundation model shares the architecture and accepts direction tags
+        # despite never seeing parallel supervision. Require an authenticated
+        # translation capability instead of producing plausible-looking noise.
+        translation_capable = self.export_metadata.get("translation_capable")
+        if not isinstance(translation_capable, bool):
+            raise ValueError(
+                "model export metadata.translation_capable must be an explicit boolean; "
+                "tokenizer metadata cannot establish that native weights were trained "
+                "for translation"
+            )
+        if not translation_capable:
             release = self.export_metadata.get("release_name", "unknown")
             raise ValueError(
-                f"이 export 는 번역 모델이 아닙니다 (release_name={release!r}). "
-                "단일어 복원만 학습한 foundation 산출물이므로 번역에 쓸 수 없습니다. "
-                "번역 단계(runs/*/pretrain 또는 posttrain)의 export 를 지정하세요."
+                f"This export is not a translation model (release_name={release!r}). "
+                "A foundation artifact trained only on monolingual reconstruction cannot "
+                "translate. Select an export from the translation stage under "
+                "runs/*/pretrain or runs/*/posttrain."
             )
         self.tokenizer_metadata = cast(
             dict[str, Any] | None, load_tokenizer_metadata(tokenizer_path)
@@ -223,28 +349,31 @@ class Translator:
             self.language_pairs = ((self.tokenizer.languages[0], self.tokenizer.languages[1]),)
         if not self.language_pairs and len(self.tokenizer.languages) > 2:
             raise ValueError(
-                "다국어 번역 모델에는 language_pairs metadata가 필요합니다. "
-                "학습된 방향 그래프를 알 수 없는 상태에서 모든 언어 조합을 "
-                "지원한다고 추측할 수 없습니다."
+                "A multilingual translation model requires language_pairs metadata. "
+                "The runtime cannot infer that every language combination was trained "
+                "when the exact direction graph is unknown."
             )
         self.translation_directions = _translation_directions_from_metadata(self.export_metadata)
         if not self.translation_directions:
-            self.translation_directions = _translation_directions_from_metadata(
-                self.tokenizer_metadata
-            )
-        if not self.translation_directions:
             raise ValueError(
-                "번역 방향 metadata가 없습니다. 구형 export의 language_pairs만으로는 "
-                "단방향/양방향 학습 여부를 인증할 수 없습니다. sion-export에서 "
-                "--bidirectional, --unidirectional 또는 --translation-direction을 "
-                "명시해 다시 변환하세요."
+                "Model export metadata does not contain exact translation_directions. "
+                "Tokenizer-side language_pairs or translation_directions cannot establish "
+                "which directions the native weights learned. Re-export with explicit "
+                "--bidirectional, --unidirectional, or --translation-direction options."
             )
         self._translation_direction_edges: set[tuple[str, str]] = set(self.translation_directions)
+        self.revision_directions = _revision_directions_from_metadata(
+            self.export_metadata,
+            self.translation_directions,
+        )
+        self._revision_direction_edges = (
+            set(self.revision_directions) if self.revision_directions is not None else None
+        )
         self._validate_compatibility(tokenizer_path)
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
-        # 양자화 모델은 CPU 전용 커널을 쓰므로 CPU 에 남깁니다.
+        # CPU-kernel quantized models must remain on the CPU.
         quantization = self.export_metadata.get("quantization")
         quantization_mapping = (
             cast(Mapping[object, object], quantization)
@@ -257,9 +386,9 @@ class Translator:
         self.quantized = runtime_device == "cpu" or any(
             "quantized" in type(module).__module__ for module in self.model.modules()
         )
-        # FP8 export 는 CPU 전용이 아닙니다. 현재는 가중치를 BF16(미지원 CUDA는
-        # FP16)으로 즉시 역양자화한 뒤 dense GEMM 을 하므로 실제 선택을 로그에
-        # 남깁니다. 상주 FP8 형식과 계산 dtype은 서로 독립입니다.
+        # FP8 exports are not CPU-only. The current runtime immediately
+        # dequantizes weights to BF16, or FP16 on unsupported CUDA devices, and
+        # uses dense GEMM. Record that runtime choice separately from storage.
         fp8_export = (
             quantization_mapping is not None and quantization_mapping.get("format") == "fp8"
         )
@@ -272,7 +401,8 @@ class Translator:
         else:
             if self.device.type != "cpu":
                 warnings.warn(
-                    "이 양자화 export는 CPU 전용이므로 요청한 CUDA 장치 대신 CPU에서 실행합니다.",
+                    "This quantized export is CPU-only; using CPU instead of the requested "
+                    "CUDA device.",
                     RuntimeWarning,
                     stacklevel=2,
                 )
@@ -284,11 +414,46 @@ class Translator:
             tokenizer_path=tokenizer_path,
             explicit_path=token_features_path,
         )
+        token_features_identity_before = _optional_runtime_file_identity(
+            feature_path,
+            label="token features",
+        )
+        self.token_features_path = (
+            str(feature_path.resolve(strict=True)) if feature_path.is_file() else None
+        )
+        self.tokenizer_metadata_path = (
+            str(tokenizer_sidecar_path.resolve(strict=True))
+            if tokenizer_sidecar_path.is_file()
+            else None
+        )
         self.token_features = self._load_token_features(
             feature_path,
             required=self.model_config.experimental.morphoscript_enabled,
             explicit=token_features_path is not None,
             expected_identity=self.export_metadata.get("token_features"),
+        )
+        self.translation_model_identity = _verified_load_identity(
+            model_identity_before,
+            _optional_runtime_file_identity(model_path, label="translation model"),
+            label="translation model",
+        )
+        self.tokenizer_model_identity = _verified_load_identity(
+            tokenizer_identity_before,
+            _runtime_file_identity(tokenizer_path, label="tokenizer model"),
+            label="tokenizer model",
+        )
+        self.tokenizer_metadata_identity = _verified_load_identity(
+            tokenizer_metadata_identity_before,
+            _optional_runtime_file_identity(
+                tokenizer_sidecar_path,
+                label="tokenizer metadata",
+            ),
+            label="tokenizer metadata",
+        )
+        self.token_features_identity = _verified_load_identity(
+            token_features_identity_before,
+            _optional_runtime_file_identity(feature_path, label="token features"),
+            label="token features",
         )
 
     def _resolve_token_features_path(
@@ -395,6 +560,10 @@ class Translator:
                 raise ValueError(
                     "model capabilities.revision_trained must be a boolean when present"
                 )
+            _revision_directions_from_metadata(
+                self.export_metadata,
+                self.translation_directions,
+            )
 
         tokenizer_metadata = self.tokenizer_metadata
         if tokenizer_metadata is None:
@@ -575,11 +744,11 @@ class Translator:
 
     @property
     def languages(self) -> tuple[str, ...]:
-        """이 모델이 지원하는 언어 (토크나이저의 <2xx> 태그에서 자동 인식)."""
+        """Return languages advertised by the tokenizer's target tags."""
         return self.tokenizer.languages
 
     def _other_language(self, target_language: str) -> str:
-        """언어가 정확히 둘일 때 목표가 아닌 언어를 원문으로 추론합니다."""
+        """Infer the non-target source only when exactly two languages exist."""
         others = [lang for lang in self.languages if lang != target_language]
         return others[0] if len(others) == 1 else ""
 
@@ -598,15 +767,16 @@ class Translator:
             source_language = self._other_language(target_language)
             if not source_language:
                 raise ValueError(
-                    "다국어 모델은 source_language를 명시해야 합니다 "
-                    f"(지원: {sorted(self.languages)})"
+                    "Multilingual models require an explicit source_language "
+                    f"(supported: {sorted(self.languages)})"
                 )
         if source_language not in self.languages:
             raise ValueError(
-                f"지원하지 않는 원문 언어: {source_language} (지원: {sorted(self.languages)})"
+                f"Unsupported source language: {source_language} "
+                f"(supported: {sorted(self.languages)})"
             )
         if source_language == target_language:
-            raise ValueError("source_language와 target_language는 달라야 합니다")
+            raise ValueError("source_language and target_language must be different")
         empty_directions: set[tuple[str, str]] = set()
         direction_edges = cast(
             set[tuple[str, str]],
@@ -616,13 +786,13 @@ class Translator:
             translation_directions = getattr(self, "translation_directions", ())
             supported = ", ".join(f"{source}→{target}" for source, target in translation_directions)
             raise ValueError(
-                f"학습되지 않은 번역 방향: {source_language}→{target_language} "
-                f"(지원 방향: {supported})"
+                f"Untrained translation direction: {source_language}→{target_language} "
+                f"(supported directions: {supported})"
             )
         return source_language
 
     @torch.no_grad()
-    def translate(
+    def _translate_internal(
         self,
         texts: Sequence[str],
         *,
@@ -649,37 +819,35 @@ class Translator:
         max_output_length_margin: int = 16,
         reasoning_level: int | None = None,
     ) -> list[str]:
-        """문장 목록을 ``target_language`` 로 번역합니다.
+        """Translate a sequence of sentences into ``target_language``.
 
-        입력 언어는 지정할 필요가 없습니다 — 모델 입력의 <2xx> 태그가
-        '어느 언어로 번역할지'만 지시하며 (학습 때와 같은 방식),
-        나머지 한쪽 언어가 입력이라고 가정합니다.
+        ``source_language`` may be omitted only when exactly one non-target
+        language is possible. The target control tag follows the same contract
+        used during training.
 
-        ``glossary`` 를 주면 지정한 용어를 정해진 대응어로 강제합니다.
-        (원문에서 slot 토큰으로 치환 → 번역 → 대응어로 복원.)
-        모델이 slot 을 보존하지 못해 누락된 용어는 ``append_missing_glossary``
-        가 참이면 문장 끝에 괄호로 덧붙여 최소한의 강제를 보장합니다.
+        A ``glossary`` replaces source terms with protected slots and restores
+        their required target forms after generation. If the model drops a
+        glossary slot, ``append_missing_glossary`` appends the missing term.
 
-        숫자·단위·URL·현지화 플레이스홀더도 같은 slot 경로로 자동 보호하고
-        원문의 정확한 표면형으로 복원합니다. 모델이 slot 을 누락했을 때에도
-        ``append_missing_structured`` 가 참이면 값 자체가 사라지지 않게 덧붙입니다.
+        Numbers, units, URLs, and localization placeholders use the same slot
+        protection path and retain their exact source surface forms.
+        ``append_missing_structured`` preserves a value even when generation
+        drops its slot.
 
-        ``num_candidates`` 를 1 이상으로 두면 beam 결과에 더해 그 수만큼 확률적
-        후보를 뽑고 ``rerank`` 방식으로 하나를 고릅니다 (``sion_translate.rerank``
-        참고). 재학습 없이 추론 계산량만 늘리는 경로이며, 후보 목록의 첫 번째는
-        항상 beam 결과이므로 동점이면 기존 동작이 유지됩니다.
+        A positive ``num_candidates`` adds stochastic candidates to the beam
+        result and selects one with ``rerank``. The beam result remains first,
+        so stable tie-breaking preserves the original behavior.
 
-        ``return_rerank_details`` 가 참이면 문자열 대신 ``RerankResult`` 목록을
-        돌려줍니다 — 어느 후보가 왜 뽑혔는지 확인할 때 씁니다.
+        ``return_rerank_details`` returns ``RerankResult`` objects instead of
+        plain strings for selection diagnostics.
 
-        ``reasoning_level`` 은 선택적 evidence repair와 후보분포 정제 계산량입니다.
-        0은 두 경로를 완전히 우회하고, 1-9는 설정된 반복 endpoint를 단조롭게
-        선택합니다(반복이 하나면 1-9가 같습니다). ``None``은 학습·검증에서
-        사용한 checkpoint 기본값을 적용합니다.
+        ``reasoning_level`` controls optional evidence repair and distribution
+        refinement. Zero bypasses both paths, 1-9 selects configured refinement
+        endpoints monotonically, and ``None`` uses the checkpoint default.
 
-        생성 중에는 학습 제어 토큰을 금지하고 ``no_repeat_ngram_size`` 크기의
-        반복을 차단합니다. ``max_output_length_ratio``는 원문 토큰 수에 비해
-        비정상적으로 긴 디코딩만 일찍 잘라 정상적인 EOS 종료에는 관여하지 않습니다.
+        Generation forbids training-only control tokens and blocks repeated
+        n-grams of ``no_repeat_ngram_size``. ``max_output_length_ratio`` stops
+        only outputs that are implausibly long relative to their sources.
         """
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
@@ -693,9 +861,9 @@ class Translator:
         if length_penalty <= 0:
             raise ValueError("length_penalty must be positive")
         if num_candidates < 0:
-            raise ValueError("num_candidates 는 0 이상이어야 합니다")
+            raise ValueError("num_candidates must be non-negative")
         if return_rerank_details and num_candidates < 1:
-            raise ValueError("return_rerank_details 는 num_candidates 가 1 이상일 때만 씁니다")
+            raise ValueError("return_rerank_details requires num_candidates to be positive")
         if num_candidates and temperature <= 0:
             raise ValueError("temperature must be positive")
         if top_k < 0:
@@ -744,7 +912,8 @@ class Translator:
         tag_id = self.tokenizer.language_tags.get(target_language)
         if tag_id is None:
             raise ValueError(
-                f"지원하지 않는 언어: {target_language} (지원: {sorted(self.languages)})"
+                f"Unsupported target language: {target_language} "
+                f"(supported: {sorted(self.languages)})"
             )
         source_language = self._resolve_source_language(
             source_language,
@@ -771,7 +940,7 @@ class Translator:
             structured_map: dict[str, str] | None,
             glossary_map: dict[str, str] | None,
         ) -> str:
-            """생성 토큰을 문자열로 되돌리고 보호 slot 을 복원합니다."""
+            """Decode generated tokens and restore protected slots."""
             tokens = [token for token in row if token not in special_ids]
             text = self.tokenizer.decode(tokens)
             if structured_map:
@@ -781,16 +950,15 @@ class Translator:
             if glossary_map:
                 text, missing = restore_targets(text, glossary_map)
                 if missing and append_missing_glossary:
-                    # 모델이 slot 을 흘린 경우: 최소한의 용어 보존을 위해
-                    # 강제 용어를 괄호로 덧붙입니다.
+                    # Append required terms when generation drops their slots.
                     text = f"{text} ({', '.join(missing)})"
             return text
 
         for start in range(0, len(texts), batch_size):
             chunk = list(texts[start : start + batch_size])
-            # QE 는 원문과 대조하므로 slot 치환 전의 문장을 따로 보관합니다.
+            # Quality estimation compares against the unmasked source.
             sources = list(chunk)
-            # 글로서리 적용: 원문의 용어를 slot 으로 치환하고 문장별 매핑을 보관.
+            # Protect glossary terms and retain one restoration map per row.
             structured_maps: list[dict[str, str]] = []
             glossary_maps: list[dict[str, str]] = []
             prepared: list[str] = []
@@ -892,8 +1060,8 @@ class Translator:
                 results.extend(beam_texts)
                 continue
 
-            # beam 결과를 첫 후보로 두고 확률적 후보를 덧붙입니다. 동점이면
-            # 첫 후보가 유지되므로 재순위가 기존 동작보다 나빠질 일이 없습니다.
+            # Keep the beam result first, then add stochastic candidates. Stable
+            # tie-breaking therefore preserves the baseline beam result.
             sampled = self.model.sample(
                 device_inputs,
                 device_mask,
@@ -923,7 +1091,7 @@ class Translator:
                         structured_maps[row_index],
                         glossary_maps[row_index],
                     )
-                    # 같은 문장을 여러 번 채점할 이유가 없습니다.
+                    # Avoid scoring duplicate candidate text.
                     if candidate not in candidates:
                         candidates.append(candidate)
                 outcome = rerank_select(
@@ -934,6 +1102,72 @@ class Translator:
                 )
                 results.append(outcome if return_rerank_details else outcome.text)
         return results
+
+    def translate(
+        self,
+        texts: Sequence[str],
+        *,
+        source_language: str | None = None,
+        target_language: str,
+        num_beams: int = 4,
+        length_penalty: float = 1.0,
+        max_new_tokens: int = 256,
+        batch_size: int = 16,
+        glossary: Glossary | None = None,
+        append_missing_glossary: bool = True,
+        append_missing_structured: bool = True,
+        num_candidates: int = 0,
+        rerank: str = "mbr+qe",
+        temperature: float = 0.3,
+        top_k: int = 0,
+        seed: int | None = None,
+        sampling_seed: int | None = None,
+        generator: torch.Generator | None = None,
+        return_rerank_details: bool = False,
+        min_new_tokens: int = 1,
+        no_repeat_ngram_size: int = 4,
+        max_output_length_ratio: float | None = 3.0,
+        max_output_length_margin: int = 16,
+        reasoning_level: int | None = None,
+    ) -> list[str]:
+        """Translate raw sources, excluding the revision-only control separator."""
+
+        if isinstance(texts, (str, bytes)):
+            raise TypeError("texts must be a sequence of strings, not one string")
+        raw_texts = tuple(cast(Sequence[object], texts))
+        if any(not isinstance(text, str) for text in raw_texts):
+            raise TypeError("texts must contain only strings")
+        validated_texts = cast(tuple[str, ...], raw_texts)
+        if any(DRAFT_SEPARATOR in text for text in validated_texts):
+            raise ValueError(
+                f"raw translation source must not contain reserved {DRAFT_SEPARATOR}; "
+                "use revise() with separate source and draft values"
+            )
+        return self._translate_internal(
+            validated_texts,
+            source_language=source_language,
+            target_language=target_language,
+            num_beams=num_beams,
+            length_penalty=length_penalty,
+            max_new_tokens=max_new_tokens,
+            batch_size=batch_size,
+            glossary=glossary,
+            append_missing_glossary=append_missing_glossary,
+            append_missing_structured=append_missing_structured,
+            num_candidates=num_candidates,
+            rerank=rerank,
+            temperature=temperature,
+            top_k=top_k,
+            seed=seed,
+            sampling_seed=sampling_seed,
+            generator=generator,
+            return_rerank_details=return_rerank_details,
+            min_new_tokens=min_new_tokens,
+            no_repeat_ngram_size=no_repeat_ngram_size,
+            max_output_length_ratio=max_output_length_ratio,
+            max_output_length_margin=max_output_length_margin,
+            reasoning_level=reasoning_level,
+        )
 
     @torch.no_grad()
     def revise(
@@ -949,15 +1183,18 @@ class Translator:
         batch_size: int = 16,
         reasoning_level: int | None = None,
     ) -> list[str]:
-        """``원문 + 초안`` 을 받아 고친 번역을 돌려줍니다.
+        """Revise drafts using separate source and draft sequences.
 
-        ``sion-revise-data`` 로 만든 ``원문 <draft> 초안 → 번역`` 예제로 학습한
-        모델에서만 의미가 있습니다. 그렇게 학습하지 않은 모델에 쓰면 ``<draft>``
-        뒤를 그냥 원문의 일부로 읽으므로 결과가 나빠집니다.
+        This operation is valid only for exact directions trained on examples
+        shaped as ``source <draft> draft -> target``. An untrained model treats
+        the draft as ordinary source text and cannot provide reliable revision.
 
-        토크나이저에 ``<draft>`` 가 없으면 (2026-07 이전 토크나이저) 오류를 냅니다 —
-        구분자가 여러 토큰으로 쪼개져 학습 때와 다른 입력이 되기 때문입니다.
+        The tokenizer must contain the atomic ``<draft>`` control token. Older
+        tokenizers that split it into pieces do not reproduce the training input.
         """
+        target_language = canonicalize_language_tag(target_language, field="target_language")
+        source_language = self._resolve_source_language(source_language, target_language)
+        requested_direction = (source_language, target_language)
         capabilities = self.export_metadata.get("capabilities")
         capabilities_mapping = (
             cast(Mapping[object, object], capabilities)
@@ -969,31 +1206,70 @@ class Translator:
             if capabilities_mapping is not None
             else None
         )
-        if revision_trained is False:
+        revision_direction_edges = getattr(self, "_revision_direction_edges", None)
+        if (
+            revision_direction_edges is not None
+            and requested_direction not in revision_direction_edges
+        ):
             raise ValueError(
-                "The exported model does not declare the revision capability; "
-                "export a checkpoint trained on revision examples."
+                "The exported model does not declare the revision capability for "
+                f"{source_language}→{target_language}; re-export with the exact "
+                "revision_directions."
             )
-        if revision_trained is None:
-            warnings.warn(
-                "이전 export에는 revision 학습 여부가 기록되어 있지 않습니다. "
-                "호환성을 위해 실행하지만, revision 예제로 학습하지 않은 모델이면 "
-                "결과 품질을 보장할 수 없습니다.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+        if revision_direction_edges is None:
+            if revision_trained is None:
+                raise ValueError(
+                    "Legacy export metadata does not record revision_directions or "
+                    "revision_trained; revision inference is disabled until the model "
+                    "is re-exported with an explicit revision capability."
+                )
+            if len(self.translation_directions) != 1:
+                raise ValueError(
+                    "Legacy revision capability metadata is ambiguous for a model with multiple "
+                    "translation directions; re-export with revision_directions."
+                )
+            if revision_trained is False:
+                raise ValueError(
+                    "The exported model does not declare the revision capability; "
+                    "export a checkpoint trained on revision examples."
+                )
         if self.tokenizer.draft_id is None:
             raise ValueError(
-                f"이 토크나이저에는 {DRAFT_SEPARATOR} 제어 토큰이 없어 초안 수정을 "
-                "쓸 수 없습니다. sion-train-tokenizer 로 다시 학습하십시오."
+                f"This tokenizer does not contain the {DRAFT_SEPARATOR} control token. "
+                "Retrain it with sion-train-tokenizer before using revision."
             )
-        if len(texts) != len(drafts):
-            raise ValueError(f"원문 {len(texts)}개와 초안 {len(drafts)}개의 수가 다릅니다")
-        return self.translate(
-            [
-                serialize_revision_input(source, draft)
-                for source, draft in zip(texts, drafts, strict=True)
-            ],
+        if isinstance(texts, (str, bytes)) or isinstance(drafts, (str, bytes)):
+            raise TypeError("revision texts and drafts must each be a sequence of strings")
+        raw_texts = tuple(cast(Sequence[object], texts))
+        raw_drafts = tuple(cast(Sequence[object], drafts))
+        if any(not isinstance(text, str) for text in (*raw_texts, *raw_drafts)):
+            raise TypeError("revision texts and drafts must contain only strings")
+        validated_texts = cast(tuple[str, ...], raw_texts)
+        validated_drafts = cast(tuple[str, ...], raw_drafts)
+        if len(validated_texts) != len(validated_drafts):
+            raise ValueError(
+                f"Revision source count {len(validated_texts)} does not match draft count "
+                f"{len(validated_drafts)}"
+            )
+        serialized_inputs: list[str] = []
+        for index, (source, draft) in enumerate(
+            zip(validated_texts, validated_drafts, strict=True)
+        ):
+            if not source.strip() or not draft.strip():
+                raise ValueError(f"revision source and draft must be non-blank at row {index}")
+            if DRAFT_SEPARATOR in source or DRAFT_SEPARATOR in draft:
+                raise ValueError(
+                    f"revision source and draft must not contain reserved {DRAFT_SEPARATOR} "
+                    f"at row {index}"
+                )
+            serialized = serialize_revision_input(source, draft)
+            if serialized.count(DRAFT_SEPARATOR) != 1:
+                raise ValueError(
+                    f"revision input must contain exactly one separator at row {index}"
+                )
+            serialized_inputs.append(serialized)
+        return self._translate_internal(
+            serialized_inputs,
             source_language=source_language,
             target_language=target_language,
             num_beams=num_beams,
