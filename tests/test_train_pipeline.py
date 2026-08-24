@@ -356,7 +356,7 @@ def test_prepared_artifact_identity_binds_control_file_contents(tmp_path: Path) 
 
     for root, format_name in (
         (dataset, "sion-indexed-parallel-v6"),
-        (foundation_dataset, "sion-foundation-indexed-v2"),
+        (foundation_dataset, "sion-foundation-indexed-v3"),
     ):
         payload = root / "train" / "00000.bin"
         payload.parent.mkdir(parents=True)
