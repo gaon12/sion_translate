@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
 
 import pytest
 
+import sion_translate.cli.compare as compare_cli
+from sion_translate.cli.compare import parse_system_specs
 from sion_translate.comparison import (
     category_results_as_markdown,
     comparison_as_markdown,
@@ -227,3 +230,108 @@ def test_invalid_comparison_intensity_is_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="intensity"):
         load_comparison_cases(path)
+
+
+def test_comparison_languages_are_canonicalized_and_alias_self_pairs_rejected(
+    tmp_path: Path,
+) -> None:
+    canonical_path = tmp_path / "canonical.jsonl"
+    _write_jsonl(
+        canonical_path,
+        [
+            {
+                "id": "extended",
+                "source_language": "ZH-hant",
+                "target_language": "X-ACME",
+                "source": "你好",
+                "reference": "hello",
+            }
+        ],
+    )
+
+    case = load_comparison_cases(canonical_path)[0]
+    assert (case.source_language, case.target_language) == ("zh-Hant", "x-acme")
+
+    self_pair_path = tmp_path / "self-pair.jsonl"
+    _write_jsonl(
+        self_pair_path,
+        [
+            {
+                "id": "alias-self-pair",
+                "source_language": "zh-hant",
+                "target_language": "zh-Hant",
+                "source": "你好",
+                "reference": "你好",
+            }
+        ],
+    )
+    with pytest.raises(ValueError, match="언어가 같습니다"):
+        load_comparison_cases(self_pair_path)
+
+
+def test_comparison_direction_labels_do_not_collide_for_private_use_tags(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "private-use.jsonl"
+    _write_jsonl(
+        path,
+        [
+            {
+                "id": "first",
+                "source_language": "x-a",
+                "target_language": "x-b-x-c",
+                "source": "alpha",
+                "reference": "beta",
+            },
+            {
+                "id": "second",
+                "source_language": "x-a-x-b",
+                "target_language": "x-c",
+                "source": "gamma",
+                "reference": "delta",
+            },
+        ],
+    )
+    cases = load_comparison_cases(path)
+    results = score_systems(
+        cases,
+        {"perfect": {case.id: case.reference for case in cases}},
+    )
+
+    assert {result.direction for result in results} == {
+        "x-a→x-b-x-c",
+        "x-a-x-b→x-c",
+    }
+
+
+def test_compare_cli_system_specs_strip_labels_and_casefold_identity() -> None:
+    assert parse_system_specs([" Model One = first.jsonl "]) == [("Model One", "first.jsonl")]
+    with pytest.raises(ValueError, match="중복 시스템 이름"):
+        parse_system_specs(
+            ["Straße=first.jsonl", " STRASSE =second.jsonl"],
+        )
+
+
+def test_compare_cli_rejects_duplicate_label_before_opening_system_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cases_path = tmp_path / "cases.jsonl"
+    _cases(cases_path)
+    monkeypatch.setattr(compare_cli, "configure_stdio", lambda: None)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "sion-compare",
+            "--cases",
+            str(cases_path),
+            "--system",
+            " Model =missing-first.jsonl",
+            "--system",
+            "model=missing-second.jsonl",
+        ],
+    )
+
+    with pytest.raises(SystemExit, match="중복 시스템 이름"):
+        compare_cli.main()

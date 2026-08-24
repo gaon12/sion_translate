@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Sequence
 import time
 
 from sion_translate.comparison import (
@@ -31,20 +32,34 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def parse_system_specs(specs: Sequence[str]) -> list[tuple[str, str]]:
+    """Parse display labels while rejecting case-insensitive identity collisions."""
+
+    parsed: list[tuple[str, str]] = []
+    seen_identities: set[str] = set()
+    for spec in specs:
+        raw_name, separator, raw_path = spec.partition("=")
+        name = raw_name.strip()
+        path = raw_path.strip()
+        if not separator or not name or not path:
+            raise ValueError(f"--system 형식은 NAME=FILE 입니다: {spec}")
+        identity = name.casefold()
+        if identity in seen_identities:
+            raise ValueError(f"중복 시스템 이름: {name}")
+        seen_identities.add(identity)
+        parsed.append((name, path))
+    return parsed
+
+
 def main() -> None:
     configure_stdio()
     args = build_parser().parse_args()
     try:
+        system_specs = parse_system_specs(args.system)
         cases = load_comparison_cases(args.cases)
         systems: dict[str, dict[str, str]] = {}
-        for spec in args.system:
-            name, separator, path = spec.partition("=")
-            if not separator or not name.strip() or not path.strip():
-                raise ValueError(f"--system 형식은 NAME=FILE 입니다: {spec}")
-            name = name.strip()
-            if name in systems:
-                raise ValueError(f"중복 시스템 이름: {name}")
-            systems[name] = load_system_translations(path.strip(), cases)
+        for name, path in system_specs:
+            systems[name] = load_system_translations(path, cases)
         results = score_systems(cases, systems)
         category_results = score_system_categories(cases, systems)
         output = args.output or f"reports/comparison-{time.strftime('%Y%m%d-%H%M%S')}"

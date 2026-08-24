@@ -20,6 +20,7 @@ from sion_translate.evaluation import (
     results_as_markdown,
     score_translations,
 )
+from sion_translate.language_tags import LanguageTagError, canonicalize_language_tag
 
 
 @dataclass(frozen=True)
@@ -82,6 +83,21 @@ def _optional_intensity(row: dict[str, object], *, location: str) -> int | None:
     return value
 
 
+def _canonical_case_language(value: str, *, field: str, location: str) -> str:
+    try:
+        return canonicalize_language_tag(value, field=f"{location}: '{field}'")
+    except LanguageTagError as error:
+        raise ValueError(str(error)) from error
+
+
+def _direction_label(source_language: str, target_language: str) -> str:
+    """Return a collision-free label while preserving legacy simple labels."""
+
+    if "-" not in source_language and "-" not in target_language:
+        return f"{source_language}-{target_language}"
+    return f"{source_language}→{target_language}"
+
+
 def _jsonl_rows(path: str | Path) -> list[tuple[int, object]]:
     path = Path(path)
     rows: list[tuple[int, object]] = []
@@ -107,8 +123,16 @@ def load_comparison_cases(path: str | Path) -> list[ComparisonCase]:
         if case_id in seen:
             raise ValueError(f"{location}: 중복 id: {case_id}")
         seen.add(case_id)
-        source_language = _required_text(row, "source_language", location=location)
-        target_language = _required_text(row, "target_language", location=location)
+        source_language = _canonical_case_language(
+            _required_text(row, "source_language", location=location),
+            field="source_language",
+            location=location,
+        )
+        target_language = _canonical_case_language(
+            _required_text(row, "target_language", location=location),
+            field="target_language",
+            location=location,
+        )
         if source_language == target_language:
             raise ValueError(f"{location}: 원문 언어와 목표 언어가 같습니다")
         assert isinstance(row, dict)
@@ -204,7 +228,7 @@ def score_systems(
             results.append(
                 DirectionResult(
                     system=system_name,
-                    direction=f"{source_language}-{target_language}",
+                    direction=_direction_label(source_language, target_language),
                     samples=len(direction_cases),
                     chrf=chrf,
                     bleu=bleu,
@@ -244,7 +268,7 @@ def score_system_categories(
             results.append(
                 CategoryResult(
                     system=system_name,
-                    direction=f"{source_language}-{target_language}",
+                    direction=_direction_label(source_language, target_language),
                     category=category,
                     samples=len(group_cases),
                     chrf=chrf,
@@ -318,7 +342,7 @@ def comparison_as_markdown(
                     for value in (
                         case.id,
                         case.category,
-                        f"{case.source_language}-{case.target_language}",
+                        _direction_label(case.source_language, case.target_language),
                         system_name,
                         case.source,
                         case.reference,
