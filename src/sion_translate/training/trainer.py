@@ -1,18 +1,21 @@
-"""sion_translate 학습 루프.
+"""Training loop for sion_translate.
 
-이 파일의 큰 흐름은 다음과 같습니다.
+The main sequence is:
 
-1. optimizer(AdamW) / scheduler(warmup + cosine) / AMP scaler 준비
-2. (요청 시) 체크포인트에서 학습 상태 복원
-3. 학습 루프: micro-batch → gradient accumulation → optimizer step
-   - 매 step 마다 tqdm progress bar 에 loss, LR, grad_norm 등을 표시
-   - ``log_every`` step 마다 JSON 한 줄 로그 + TensorBoard 기록
-4. ``eval_every`` step 마다 검증 → best 갱신 판단 + early stopping
-5. 저장 정책 (각 시점마다 두 종류를 남깁니다)
+1. Prepare AdamW, the warmup-plus-cosine scheduler, and the AMP scaler.
+2. Restore training state from a checkpoint when requested.
+3. Run micro-batches, gradient accumulation, and optimizer updates.
+   - Show loss, learning rate, and gradient norm in a tqdm progress bar.
+   - Write one JSON record and TensorBoard values every ``log_every`` steps.
+4. Validate every ``eval_every`` steps, update the best checkpoint, and apply
+   early stopping.
+5. Save two artifact classes at each relevant point:
+
    - checkpoints/best, checkpoints/latest, checkpoints/final
-     : 학습 재개용 (optimizer 상태 포함, 용량 큼)
+     for resume, including the large optimizer state.
    - exports/best, exports/latest
-     : 추론용. 일반(FP32) ``model.pt`` 와 INT8 양자화 ``model_int8.pt`` 둘 다 저장
+     for inference, including regular FP32 ``model.pt`` and quantized INT8
+     ``model_int8.pt`` artifacts.
 """
 
 # DataLoader samplers, AMP scalers, tqdm, and SummaryWriter expose dynamic hooks.
@@ -172,17 +175,17 @@ def resolve_training_budget(
 
 
 def announce(message: str, context: DistributedContext) -> None:
-    """현재 진행 단계를 사람이 읽기 좋은 텍스트로 출력합니다.
+    """Print a human-readable progress message from rank 0.
 
-    ``tqdm.write`` 를 쓰면 progress bar 를 깨뜨리지 않고 그 위에
-    한 줄을 출력할 수 있습니다. rank 0(main)에서만 출력합니다.
+    ``tqdm.write`` places the message above the progress bar without corrupting
+    its display.
     """
     if context.is_main:
         tqdm.write(f"[sion] {message}")
 
 
 def move_to_device(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
-    """collator 가 만든 batch(텐서 dict)를 학습 장치(GPU/CPU)로 옮깁니다."""
+    """Move a collated tensor batch to its CPU or GPU training device."""
     return {key: value.to(device, non_blocking=True) for key, value in batch.items()}
 
 
@@ -193,8 +196,12 @@ def cosine_scheduler(
     max_steps: int,
     min_ratio: float,
 ) -> torch.optim.lr_scheduler.LambdaLR:
-    """학습률 스케줄: 처음 ``warmup_steps`` 동안 0→최대로 선형 증가(warmup),
-    그 뒤에는 cosine 곡선을 따라 최대치의 ``min_ratio`` 배까지 서서히 감소합니다."""
+    """Build a linear-warmup and cosine-decay learning-rate schedule.
+
+    The multiplier rises linearly from zero to its maximum over
+    ``warmup_steps``, then follows a cosine curve down to ``min_ratio`` of that
+    maximum.
+    """
 
     def schedule(step: int) -> float:
         if step < warmup_steps:
@@ -207,10 +214,10 @@ def cosine_scheduler(
 
 
 def build_optimizer_param_groups(model: nn.Module, weight_decay: float) -> list[dict[str, Any]]:
-    """AdamW weight decay 를 '행렬 형태의 가중치'에만 적용하도록 파라미터를 두 그룹으로 나눕니다.
+    """Split parameters so AdamW decay applies only to matrix-like weights.
 
-    norm 가중치, bias, 1차원 게이트 같은 파라미터에 decay 를 걸면
-    학습이 불안정해질 수 있어 관례적으로 제외합니다.
+    Norm weights, biases, and one-dimensional gates are conventionally excluded
+    because decaying them can destabilize training.
     """
     decay: list[nn.Parameter] = []
     no_decay: list[nn.Parameter] = []
@@ -233,7 +240,7 @@ def build_optimizer_param_groups(model: nn.Module, weight_decay: float) -> list[
 
 
 def _autocast_context(precision: str, device: torch.device):
-    """AMP(자동 혼합 정밀도) 컨텍스트. CUDA + bf16/fp16 일 때만 활성화됩니다."""
+    """Return an AMP context enabled only for CUDA bf16 or fp16 compute."""
     if device.type != "cuda" or precision.lower() == "fp32":
         return nullcontext()
     dtype = torch.bfloat16 if precision.lower() == "bf16" else torch.float16
@@ -241,9 +248,9 @@ def _autocast_context(precision: str, device: torch.device):
 
 
 def _make_grad_scaler(training: TrainingConfig, context: DistributedContext):
-    """fp16 학습에서 gradient underflow 를 막아 주는 GradScaler 를 만듭니다.
+    """Create the GradScaler that prevents gradient underflow in fp16 training.
 
-    bf16/fp32 에서는 비활성 상태의 scaler 가 반환되어 아무 일도 하지 않습니다.
+    bf16 and fp32 receive a disabled scaler that behaves as a no-op.
     """
     enabled = context.device.type == "cuda" and training.precision.lower() == "fp16"
     fsdp_enabled = training.parallel_strategy.lower() == "fsdp2" or (
@@ -262,7 +269,7 @@ def _make_summary_writer(
     context: DistributedContext,
     start_step: int,
 ):
-    """TensorBoard 기록기. rank 0 에서만 만들고, 재개 시 이후 step 기록을 정리(purge)합니다."""
+    """Create a rank-0 TensorBoard writer and purge superseded resumed steps."""
     if not training.tensorboard:
         return None
     try:
@@ -284,7 +291,7 @@ def _make_summary_writer(
 
 
 def _fail_if_known_empty(loader: Iterable[dict[str, torch.Tensor]], name: str) -> None:
-    """길이를 알 수 있는 loader 가 비어 있으면 학습 시작 전에 바로 실패시킵니다."""
+    """Reject an empty sized loader before training starts."""
     try:
         length = len(loader)  # type: ignore[arg-type]
     except (TypeError, AttributeError):
@@ -423,13 +430,13 @@ def _select_posttraining_validation_metric(
 def _selection_metric_label(key: str) -> str:
     ema = key.startswith("validation_ema_")
     labels = {
-        "macro_direction_nll": "방향 균형 macro NLL",
-        "worst_direction_nll": "최저 성능 방향 NLL",
-        "reward": "생성 복합 reward",
-        "macro_direction_reward": "방향 균형 macro reward",
-        "worst_direction_reward": "최저 성능 방향 reward",
-        "nll": "전체 token NLL",
-        "loss": "검증 loss",
+        "macro_direction_nll": "direction-balanced macro NLL",
+        "worst_direction_nll": "worst-direction NLL",
+        "reward": "composite generation reward",
+        "macro_direction_reward": "direction-balanced macro reward",
+        "worst_direction_reward": "worst-direction reward",
+        "nll": "overall token NLL",
+        "loss": "validation loss",
     }
     label = labels.get(_validation_metric_suffix(key), key)
     return f"EMA {label}" if ema else label
@@ -447,13 +454,13 @@ def evaluate(
     objective: Callable[[nn.Module, dict[str, torch.Tensor]], ObjectiveOutput] | None = None,
     language_tags: Mapping[str, int] | None = None,
 ) -> dict[str, float]:
-    """검증 데이터로 CE/NLL과 선택적 생성 품질 보상을 계산합니다 (gradient 없음).
+    """Calculate CE/NLL and optional generation-quality rewards without gradients.
 
-    - ``validation_loss`` 는 학습과 같은 label-smoothed CE를 유지합니다.
-    - perplexity와 언어/방향 지표는 smoothing 없는 실제 token NLL입니다.
-    - 방향 통계는 모든 rank가 같은 고정 layout tensor를 reduce하므로, 특정
-      rank에 한 방향의 표본이 하나도 없어도 collective 순서가 어긋나지 않습니다.
-    - 분산 학습에서는 모든 rank 의 합계를 all-reduce 로 모아 전체 평균을 냅니다.
+    - ``validation_loss`` retains the same label-smoothed CE used for training.
+    - Perplexity and language/direction metrics use true unsmoothed token NLL.
+    - Every rank reduces the same fixed-layout direction tensor, so collective
+      order remains stable even when one rank has no rows for a direction.
+    - Distributed totals are all-reduced before global means are calculated.
     """
     was_training = model.training
     model.eval()
@@ -475,14 +482,16 @@ def evaluate(
     )
     batches = 0
 
-    # 검증에도 작은 progress bar 를 표시합니다 (rank 0 전용, 끝나면 지워짐).
+    # Show a short rank-0 validation progress bar and remove it when complete.
     progress = None
     if show_progress and context.is_main:
         try:
             total = min(len(loader), max_batches)  # type: ignore[arg-type]
         except (TypeError, AttributeError):
             total = max_batches
-        progress = tqdm(total=total, desc="검증", unit="batch", leave=False, dynamic_ncols=True)
+        progress = tqdm(
+            total=total, desc="validation", unit="batch", leave=False, dynamic_ncols=True
+        )
 
     try:
         for batch in loader:
@@ -620,10 +629,9 @@ def evaluate(
         )
     if objective_sums:
         denominator = objective_count.clamp_min(1)
-        # 방향별 reward: 합계와 행 수가 같은 가중을 받았으므로 나누면 상쇄됩니다.
-        # 방향 하나가 후퇴해도 평균 reward 가 오르면 그 체크포인트가 best 가 되는
-        # 것을 막기 위한 값입니다 — 이 저장소는 이미 ko→ja 59.81 대 ja→ko 49.87
-        # 로 방향 격차가 있어서 평균만 보면 격차가 벌어지는 것을 놓칩니다.
+        # Sums and row counts receive the same aggregation weight, which cancels
+        # when divided. Worst-direction and macro rewards prevent a higher global
+        # mean from hiding a regression in one translation direction.
         direction_rewards: dict[str, float] = {}
         for name in list(objective_sums):
             if not name.endswith("_reward_sum"):
@@ -674,8 +682,9 @@ def build_training_checkpoint_identity(
             config.training.seed,
         ),
         stage_name=stage_name,
-        # 목적함수/최적화 설정도 identity 입니다. MRT stage 일 때만 reward
-        # 정의까지 포함해 SFT resume가 MRT 설정 변경에 좌우되지 않게 합니다.
+        # Objective and optimization settings are part of checkpoint identity.
+        # Include the reward definition only for MRT so unrelated MRT changes do
+        # not invalidate an SFT resume.
         objective_identity=build_objective_identity(
             config.training,
             config.posttraining,
@@ -713,7 +722,7 @@ def train(
     authenticated_revision_directions: Sequence[Sequence[str]] | None = None,
     pipeline_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, float | int | bool | str]:
-    """sion_translate 학습의 본체. 반환값은 진행 상태와 best 선택 지표 요약입니다."""
+    """Train sion_translate and return progress plus best-selection metadata."""
     config.validate()
     configured_revision_directions = config.data.configured_revision_directions()
     if not export_translation_capable:
@@ -823,14 +832,14 @@ def train(
                 raise failure from preflight_error
             raise failure
 
-    # ── 단계 1/4: optimizer · scheduler · AMP scaler 준비 ─────────────────
-    announce("단계 1/4: optimizer(AdamW)와 학습률 스케줄러를 준비합니다.", context)
+    # Stage 1/4: prepare the optimizer, scheduler, and AMP scaler.
+    announce("Stage 1/4: preparing AdamW and the learning-rate scheduler.", context)
     optimizer = torch.optim.AdamW(
         build_optimizer_param_groups(model, training.weight_decay),
         lr=training.learning_rate,
         betas=(training.adam_beta1, training.adam_beta2),
         eps=training.adam_eps,
-        weight_decay=0.0,  # decay 는 param group 별로 이미 지정했으므로 여기서는 0
+        weight_decay=0.0,  # Each parameter group already specifies its decay.
         fused=context.device.type == "cuda",
     )
     scheduler = cosine_scheduler(
@@ -840,11 +849,11 @@ def train(
         min_ratio=training.min_learning_rate_ratio,
     )
     scaler = _make_grad_scaler(training, context)
-    # EMA(가중치 지수이동평균): 매 step 뒤 shadow 가중치를 갱신해 두었다가
-    # 평가·내보내기에 사용합니다. 번역 품질을 안정적으로 올려 주는 기법입니다.
+    # Update EMA shadows after each optimizer step and use them for evaluation
+    # and export to stabilize translation quality.
     ema = EMAWeights(model, training.ema_decay) if training.ema_decay > 0 else None
     if ema is not None:
-        announce(f"EMA 가중치 평균 활성화 (decay={training.ema_decay})", context)
+        announce(f"EMA weight averaging enabled (decay={training.ema_decay}).", context)
     configured_selection_metric = (
         "validation_reward" if objective is not None else training.sft_selection_metric.lower()
     )
@@ -856,9 +865,9 @@ def train(
         "batch_in_epoch": 0,
     }
 
-    # ── 단계 2/4: (선택) 체크포인트에서 재개 ──────────────────────────────
+    # Stage 2/4: optionally resume from a checkpoint.
     if training.resume_from:
-        announce(f"단계 2/4: 체크포인트에서 학습을 재개합니다 → {training.resume_from}", context)
+        announce(f"Stage 2/4: resuming from checkpoint {training.resume_from}.", context)
         start_step = load_checkpoint(
             training.resume_from,
             model,
@@ -870,7 +879,7 @@ def train(
             ema=ema,
             expected_identity=checkpoint_identity,
         )
-        announce(f"재개 완료: step {start_step} 부터 다시 시작합니다.", context)
+        announce(f"Resume complete; continuing from step {start_step}.", context)
         loaded_metric = training_state.get("configured_selection_metric")
         loaded_best_metric = training_state.get("best_selection_metric")
         loaded_best_step = int(training_state.get("best_step", -1))
@@ -882,8 +891,8 @@ def train(
         if not selection_metadata_matches:
             previous = loaded_metric if loaded_metric is not None else "legacy/unknown"
             announce(
-                "체크포인트의 best 선택 지표가 현재 설정과 호환되지 않아 "
-                f"best/early-stopping 기록을 초기화합니다 ({previous!r} → "
+                "The checkpoint's best-selection metric is incompatible with the "
+                f"current configuration. Resetting best and early-stopping history ({previous!r} -> "
                 f"{configured_selection_metric!r}).",
                 context,
             )
@@ -920,8 +929,9 @@ def train(
                 recorded_best_invalid = True
         if recorded_best_invalid:
             announce(
-                "재개 checkpoint의 best 선택 기록에 대응하는 exact best artifact를 "
-                "모든 rank에서 인증할 수 없어 다음 검증에서 안전하게 다시 선택합니다.",
+                "The exact best artifact referenced by the resumed checkpoint could "
+                "not be authenticated on every rank. The next validation will safely "
+                "select a new best checkpoint.",
                 context,
             )
             training_state.update(
@@ -934,7 +944,7 @@ def train(
                 }
             )
     else:
-        announce("단계 2/4: 재개할 체크포인트가 없어 처음부터 학습합니다.", context)
+        announce("Stage 2/4: no resume checkpoint; starting a new run.", context)
     # A retry becomes this run generation only after its checkpoint has loaded
     # successfully. Until then, retain the previous resolved configuration.
     _publish_resolved_config(config, output_dir, context)
@@ -962,15 +972,15 @@ def train(
         loaded_best_selection_metric if isinstance(loaded_best_selection_metric, str) else None
     )
     stopped_early = False
-    # 리스트로 두는 이유: 아래 중첩 함수에서 값을 바꾸는데 대입을 쓰면
-    # 그 이름이 지역 변수가 됩니다.
+    # A list permits the nested validation function to record this condition
+    # without rebinding a local boolean.
     reward_fallback_reported: list[bool] = []
     last_eval_step = -1
     last_train_loss: float | None = None
     micro_step = 0
-    # SFT는 token 수, MRT는 source 문장 수를 gradient 정규화 분모로 씁니다.
+    # SFT normalizes gradients by token count; MRT uses source-sentence count.
     accumulated_local_normalizer = torch.zeros((), device=context.device, dtype=torch.float64)
-    # [loss 합, 정규화 분모, 보조 loss 합, 보조 분모, 실제 처리 token 수]
+    # [loss sum, normalizer, auxiliary-loss sum, auxiliary normalizer, processed tokens]
     window = torch.zeros(5, device=context.device, dtype=torch.float64)
     objective_window: dict[str, torch.Tensor] = {}
     log_start = time.perf_counter()
@@ -992,7 +1002,7 @@ def train(
         }
 
     def save(path: Path) -> None:
-        """학습 재개용 체크포인트(모델 + optimizer + scheduler + 진행 상태)를 저장합니다."""
+        """Save model, optimizer, scheduler, and progress state for resume."""
         save_checkpoint(
             path,
             model,
@@ -1007,12 +1017,13 @@ def train(
         )
 
     def export_models(name: str) -> None:
-        """추론용 모델을 exports/<name>/ 에 저장합니다.
+        """Save an inference model under ``exports/<name>/``.
 
-        학습 중에는 EMA가 켜졌으면 선택용 model_ema.pt 하나만, 아니면
-        model.pt 하나만 저장합니다. raw 학습 가중치는 재개 체크포인트에 이미
-        있으므로 중복 full-state export를 만들지 않습니다. 느린 양자화·HF 변환은
-        전체 학습 종료 뒤 선택된 best에서 한 번 수행합니다.
+        During training, save only ``model_ema.pt`` when EMA is enabled, or
+        ``model.pt`` otherwise. Resume checkpoints already contain raw weights,
+        so another full-state export would be redundant. Slow quantization and
+        Hugging Face conversion run once from the selected best checkpoint after
+        all training stages finish.
         """
         token_features_path = (
             config.data.tokenizer_features
@@ -1057,23 +1068,24 @@ def train(
                 if entry.get("status") != "ok"
             ]
             announce(
-                f"추론용 모델 저장 완료: exports/{name} [{', '.join(successful)}]",
+                f"Inference export complete: exports/{name} [{', '.join(successful)}]",
                 context,
             )
             if failed:
                 announce(
-                    "일부 중간 포맷 저장 실패(체크포인트 학습은 계속됨): " + ", ".join(failed),
+                    "Some intermediate formats failed to export; checkpointed training "
+                    "continues: " + ", ".join(failed),
                     context,
                 )
 
     def validate_and_update_early_stopping() -> bool:
-        """검증을 수행하고 best 갱신 여부와 early stopping 여부를 결정합니다.
+        """Validate, update the best checkpoint, and decide whether to stop early.
 
-        반환값이 True 면 '더 이상 개선이 없어 학습을 멈춰야 한다'는 뜻입니다.
+        ``True`` means training should stop because improvement has stalled.
         """
         nonlocal best_validation_loss, best_step, bad_evals, last_eval_step
         nonlocal best_checkpoint_artifact_sha256, best_selection_metric
-        announce(f"검증 시작 (step {step})", context)
+        announce(f"Validation starting at step {step}.", context)
         metrics = evaluate(
             model,
             validation_loader,
@@ -1085,8 +1097,8 @@ def train(
             language_tags=language_tags,
         )
         if ema is not None:
-            # EMA 가중치로도 한 번 더 검증합니다. best 선택과 early stopping 은
-            # EMA 손실을 기준으로 합니다 (보통 원본보다 낮고 안정적입니다).
+            # Validate EMA weights separately. Best selection and early stopping
+            # use their usually lower and more stable metric.
             with ema.swap(model):
                 ema_metrics = evaluate(
                     model,
@@ -1102,21 +1114,21 @@ def train(
                 if name.startswith("validation_"):
                     metrics[f"validation_ema_{name.removeprefix('validation_')}"] = value
         if last_train_loss is not None and objective is None:
-            # 검증 loss - 학습 loss. 값이 커질수록 과적합 신호입니다.
+            # Validation loss minus training loss; larger values indicate overfitting.
             metrics["generalization_gap"] = float(metrics["validation_loss"]) - last_train_loss
         last_eval_step = step
         if context.is_main:
-            summary = "검증 결과: loss={:.4f}, NLL={:.4f}, perplexity={:.2f}".format(
+            summary = "Validation: loss={:.4f}, NLL={:.4f}, perplexity={:.2f}".format(
                 metrics["validation_loss"],
                 metrics.get("validation_nll", metrics["validation_loss"]),
                 metrics["validation_perplexity"],
             )
             if "validation_macro_direction_nll" in metrics:
-                summary += ", 방향 macro NLL={:.4f}".format(
+                summary += ", direction macro NLL={:.4f}".format(
                     metrics["validation_macro_direction_nll"]
                 )
             if "validation_worst_direction_nll" in metrics:
-                summary += ", 최저 방향 NLL={:.4f}".format(
+                summary += ", worst-direction NLL={:.4f}".format(
                     metrics["validation_worst_direction_nll"]
                 )
             if "validation_ema_loss" in metrics:
@@ -1131,10 +1143,10 @@ def train(
                 for name, value in metrics.items():
                     writer.add_scalar(f"validation/{name.removeprefix('validation_')}", value, step)
 
-        # best 갱신 판단은 rank 0 에서만 하고, 그 결과를 모든 rank 에 방송해
-        # 전 rank 가 같은 시점에 저장/종료하도록 맞춥니다.
-        # 사후학습은 실제 생성 reward를 최대화하고, SFT는 설정된 NLL 지표를 최소화합니다.
-        # 기존 체크포인트 상태와 호환하기 위해 최대화 지표는 음수로 저장합니다.
+        # Rank 0 decides whether the metric improved, then broadcasts the result
+        # so every rank saves and stops together. Post-training maximizes actual
+        # generation reward, while SFT minimizes the configured NLL metric. Store
+        # maximization metrics negated for compatibility with existing state.
         if objective is not None and "validation_reward" in metrics:
             configured = config.posttraining.selection_metric
             selection_value, selection_key, used_fallback = _select_posttraining_validation_metric(
@@ -1144,8 +1156,8 @@ def train(
             )
             if used_fallback and configured != "reward" and not reward_fallback_reported:
                 announce(
-                    f"posttraining.selection_metric={configured} 를 계산할 방향 "
-                    "메타데이터가 없어 평균 reward 로 선택합니다.",
+                    f"Direction metadata required for posttraining.selection_metric={configured} "
+                    "is unavailable. Falling back to mean reward.",
                     context,
                 )
                 reward_fallback_reported.append(True)
@@ -1161,13 +1173,14 @@ def train(
             selection_name = _selection_metric_label(selection_key)
             if used_fallback:
                 announce(
-                    f"SFT 선택 지표 {training.sft_selection_metric!r}를 계산할 수 없어 "
-                    f"{selection_name}(으)로 대체합니다.",
+                    f"SFT selection metric {training.sft_selection_metric!r} is unavailable; "
+                    f"falling back to {selection_name}.",
                     context,
                 )
         if best_selection_metric is not None and selection_key != best_selection_metric:
             announce(
-                "검증 선택 지표가 이전 best 기록과 달라져 비교 기준을 초기화합니다 "
+                "The validation selection metric differs from the previous best record. "
+                "Resetting the comparison baseline "
                 f"({best_selection_metric!r} → {selection_key!r}).",
                 context,
             )
@@ -1184,7 +1197,7 @@ def train(
             bad_evals = 0
             best_selection_metric = selection_key
             announce(
-                f"{selection_name} 최고 기록 갱신 ({selection_value:.4f}) → best 저장",
+                f"New best {selection_name} ({selection_value:.4f}); saving best checkpoint.",
                 context,
             )
             best_checkpoint = output_dir / "checkpoints" / "best"
@@ -1209,7 +1222,8 @@ def train(
         else:
             bad_evals += 1
             announce(
-                f"개선 없음 (연속 {bad_evals}회 / 허용 {training.early_stopping_patience}회)",
+                f"No improvement ({bad_evals} consecutive evaluations; "
+                f"patience {training.early_stopping_patience}).",
                 context,
             )
         should_stop_here = (
@@ -1225,31 +1239,31 @@ def train(
             writer.flush()
         return should_stop
 
-    # ── 단계 3/4: 학습 루프 ───────────────────────────────────────────────
+    # Stage 3/4: training loop.
     target_description = (
-        f"전체 dataset {budget.target_epochs} epoch 완주"
+        f"complete {budget.target_epochs} full dataset epochs"
         if budget.target_epochs is not None
-        else f"최대 {budget.max_optimizer_steps} step override"
+        else f"explicit limit of {budget.max_optimizer_steps} optimizer steps"
     )
     announce(
-        f"단계 3/4: {stage_name} 학습 시작 (목표 {target_description}, "
-        f"현재 step {start_step}, 완료 epoch {epoch})",
+        f"Stage 3/4: starting {stage_name} training (target: {target_description}; "
+        f"current step: {start_step}; completed epochs: {epoch}).",
         context,
     )
     model.train()
     optimizer.zero_grad(set_to_none=True)
-    # 전체 학습 진행률 bar. optimizer step 단위로 1씩 증가합니다.
+    # The main progress bar advances once per optimizer update.
     progress = tqdm(
         total=budget.max_optimizer_steps,
         initial=start_step,
-        desc="학습",
+        desc="training",
         unit="step",
         dynamic_ncols=True,
         disable=not context.is_main,
     )
     try:
         while budget.should_continue(step=step, epoch=epoch) and not stopped_early:
-            # epoch 마다 sampler 의 셔플 순서를 바꿔 같은 배치 순서가 반복되지 않게 합니다.
+            # Give the sampler a new deterministic shuffle order for every epoch.
             if hasattr(train_loader, "batch_sampler") and hasattr(
                 train_loader.batch_sampler, "set_epoch"
             ):
@@ -1292,8 +1306,8 @@ def train(
                 batches_this_epoch += 1
                 batch_in_epoch += 1
                 batch = move_to_device(batch, context.device)
-                # epoch의 마지막 불완전 accumulation 창도 반드시 반영합니다.
-                # 그렇지 않으면 dataset을 읽고도 마지막 배치들의 gradient가 버려집니다.
+                # Apply the final incomplete accumulation window in each epoch;
+                # otherwise the last batches are read but their gradients are lost.
                 is_epoch_last_batch = (
                     budget.batches_per_epoch is not None
                     and batches_this_epoch >= budget.batches_per_epoch
@@ -1365,12 +1379,12 @@ def train(
                     objective_window[name][1] += normalizer.double()
                 if not is_last_micro:
                     data_wait_started = time.perf_counter()
-                    continue  # accumulation 창이 아직 안 찼으면 다음 micro-batch 로
+                    continue  # Continue until the accumulation window is full.
 
-                # ── optimizer step: gradient 정규화 → clip → 파라미터 갱신 ──
+                # Optimizer step: normalize gradients, clip, and update parameters.
                 if scaler.is_enabled():
                     scaler.unscale_(optimizer)
-                # 창 전체(모든 rank)의 정규화 분모를 여기서 한 번만 모읍니다.
+                # Aggregate the normalizer for the complete window across all ranks once.
                 global_normalizer = accumulated_local_normalizer.clone()
                 reduce_sum(global_normalizer, context)
                 gradient_denominator = global_normalizer.clamp_min(1.0)
@@ -1380,7 +1394,7 @@ def train(
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), training.grad_clip)
                 optimizer_updated = True
                 if scaler.is_enabled():
-                    # fp16 overflow 가 발생하면 scaler 가 이 step 을 건너뜁니다.
+                    # The scaler skips this update when fp16 overflow occurs.
                     old_scale = scaler.get_scale()
                     scaler.step(optimizer)
                     scaler.update()
@@ -1392,22 +1406,22 @@ def train(
                 micro_step = 0
                 if not optimizer_updated:
                     data_wait_started = time.perf_counter()
-                    continue  # overflow 로 건너뛴 step 은 세지 않습니다
+                    continue  # Do not count an update skipped due to overflow.
 
                 if ema is not None:
-                    # 성공한 optimizer step 뒤에만 EMA shadow 를 갱신합니다.
+                    # Update EMA shadows only after a successful optimizer step.
                     ema.update(model)
                 scheduler.step()
                 step += 1
                 steps_since_log += 1
 
-                # 진행률 자체는 동기화 없이 매 step 갱신합니다. loss/grad_norm을
-                # 매번 Python scalar로 바꾸면 CUDA가 강제 동기화되므로, postfix는
-                # 아래 log_every 구간에서만 갱신합니다.
+                # Advance progress without synchronization. Converting loss and
+                # gradient norm to Python scalars would force a CUDA sync, so the
+                # postfix is refreshed only in the log_every block below.
                 if context.is_main:
                     progress.update(1)
 
-                # log_every step 마다: 전 rank 합산 통계를 JSON + TensorBoard 로 기록
+                # Aggregate all ranks and write JSON plus TensorBoard every log_every steps.
                 if step % training.log_every == 0:
                     elapsed = max(time.perf_counter() - log_start, 1e-6)
                     reduced_window = window.clone()
@@ -1482,22 +1496,25 @@ def train(
                     if context.device.type == "cuda":
                         torch.cuda.reset_peak_memory_stats(context.device)
 
-                # step override는 eval_every, 공식 epoch 학습은 완주 경계에서만
-                # 검증합니다. 중간 평가가 epoch 종료 평가보다 먼저 best 기준을
-                # 바꾸면 patience가 같은 epoch 안에서 잘못 소모될 수 있습니다.
+                # Explicit step-limited runs validate every eval_every steps. Formal
+                # epoch-based runs validate only at completed-epoch boundaries so an
+                # intermediate evaluation cannot consume patience within the same epoch.
                 if not budget.epoch_limited and step % training.eval_every == 0:
                     stopped_early = validate_and_update_early_stopping()
                     if stopped_early:
                         announce(
-                            f"Early stopping: {bad_evals}회 연속 개선이 없어 학습을 종료합니다.",
+                            f"Early stopping after {bad_evals} consecutive evaluations "
+                            "without improvement.",
                             context,
                         )
                         epoch_completed = False
                         break
 
-                # save_every step 마다: 최신(latest) 체크포인트 + 추론용 모델 저장
+                # Save the latest resume checkpoint and inference export periodically.
                 if step % training.save_every == 0:
-                    announce(f"최신 체크포인트 저장: checkpoints/latest (step {step})", context)
+                    announce(
+                        f"Saving latest checkpoint at step {step}: checkpoints/latest.", context
+                    )
                     save(output_dir / "checkpoints" / "latest")
                     export_models("latest")
                 if not budget.epoch_limited and step >= budget.max_optimizer_steps:
@@ -1519,13 +1536,13 @@ def train(
                     )
                     if stopped_early:
                         announce(
-                            f"Early stopping: {epoch}개 epoch를 완주한 뒤 "
-                            f"{bad_evals}회 연속 개선이 없어 종료합니다.",
+                            f"Early stopping after {epoch} completed epochs and "
+                            f"{bad_evals} consecutive evaluations without improvement.",
                             context,
                         )
 
-        # ── 단계 4/4: 마무리 저장 ─────────────────────────────────────────
-        # 마지막 step 에서 검증을 아직 안 했다면 한 번 더 수행합니다.
+        # Stage 4/4: final validation and persistence.
+        # Validate once more if the final step has not yet been evaluated.
         if last_eval_step != step:
             should_stop = validate_and_update_early_stopping()
             stopped_early = stopped_early or (
@@ -1537,7 +1554,7 @@ def train(
                 )
             )
         announce(
-            "단계 4/4: 종료 시점 모델을 저장합니다 "
+            "Stage 4/4: saving final model state "
             "(checkpoints/final + checkpoints/latest + exports/latest)",
             context,
         )
@@ -1582,19 +1599,19 @@ def train(
         if ema is not None:
             ema.copy_to(model)
         announce(
-            f"다음 단계용으로 best checkpoint(step {best_step}, "
-            f"{selected_weights} weights)를 복원했습니다.",
+            f"Restored best checkpoint for the next stage (step {best_step}, "
+            f"{selected_weights} weights).",
             context,
         )
         if objective is not None:
-            final_selection_name = "생성 복합 reward"
+            final_selection_name = "composite generation reward"
             final_selection_value = -best_validation_loss
         else:
             final_metric_key = best_selection_metric or f"validation_{configured_selection_metric}"
             final_selection_name = _selection_metric_label(final_metric_key)
             final_selection_value = best_validation_loss
         announce(
-            f"학습 종료: step {step}, best {final_selection_name} "
+            f"Training complete at step {step}; best {final_selection_name}: "
             f"{final_selection_value:.4f}" + (" (early stopping)" if stopped_early else ""),
             context,
         )
