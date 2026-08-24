@@ -6,15 +6,18 @@ from __future__ import annotations
 import glob
 import hashlib
 import json
+import math
 import multiprocessing
+import os
 import re
+import shutil
 import tempfile
 import unicodedata
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Iterator, Sequence
+from typing import Any, Iterable, Iterator, Mapping, Sequence, cast
 
 import numpy as np
 import sentencepiece as spm
@@ -56,10 +59,21 @@ from sion_translate.synthetic import (
 LEGACY_LANGUAGE_PAIR = ("ko", "ja")
 TOKENIZER_METADATA_FILENAME = "tokenizer_metadata.json"
 TOKENIZER_METADATA_VERSION = 2
+TOKENIZER_TRAINING_SCHEMA = "sion-tokenizer-training-v3"
 SENTENCEPIECE_MULTITHREADED_TRAINING_REGRESSION = "0.2.2"
+DEFAULT_TOKENIZER_INPUT_SENTENCE_SIZE = 1_000_000
+DEFAULT_TOKENIZER_SAMPLING_ALPHA = 0.7
+TOKENIZER_ARTIFACT_FILENAMES = (
+    "sion.vocab",
+    "token_features.npz",
+    TOKENIZER_METADATA_FILENAME,
+    # The model is published last and acts as the generation commit marker.
+    "sion.model",
+)
+TOKENIZER_STAGING_PREFIX = ".sion-tokenizer-staging-"
 
-# 언어쌍에 따라 달라지는 제어 토큰: <2xx> = "xx 언어로 번역하라",
-# <denoise_xx> = "xx 언어 원문을 복원하라(denoising)".
+# Language-dependent control tokens: <2xx> requests translation into xx, and
+# <denoise_xx> requests reconstruction of text in xx.
 SHARED_CONTROL_SYMBOLS = [
     "<doc>",
     "<seg>",
@@ -72,11 +86,11 @@ SHARED_CONTROL_SYMBOLS = [
 ]
 SLOT_SYMBOLS = [f"<slot_{index}>" for index in range(64)]
 
-# 나중에 추가된 제어 토큰. 새로 학습하는 토크나이저에는 예약하지만, 이 토큰이 없는
-# 기존 토크나이저도 계속 불러올 수 있어야 하므로 **필수 목록에 넣지 않습니다**.
-# 없으면 관련 기능(초안 수정)만 사용할 수 없고 번역은 그대로 동작합니다.
+# These controls were introduced after the first tokenizer release. New
+# tokenizers reserve them, but they intentionally stay outside the required
+# compatibility list so older tokenizers can still translate.
 #
-# <draft> = "이 뒤는 같은 문장의 초벌 번역이다. 원문과 대조해 고쳐라."
+# <draft> marks a first-pass translation that must be revised against source.
 OPTIONAL_CONTROL_SYMBOLS = [
     "<draft>",
 ]
@@ -94,7 +108,7 @@ def control_symbols(
     denoise_languages: Sequence[str] | None = None,
     reasoning_languages: Sequence[str] = (),
 ) -> list[str]:
-    """언어 목록에 맞는 전체 제어 토큰 목록 (토크나이저 학습 시 예약)."""
+    """Return every control symbol that must be reserved for the language graph."""
 
     unique_languages = canonicalize_language_tags(
         list(languages),
@@ -121,7 +135,7 @@ def control_symbols(
     )
 
 
-# 하위 호환용 별칭 (기존 ko-ja 토크나이저 검증 경로에서 사용)
+# Compatibility alias used only when validating the historical two-language model.
 BASE_CONTROL_SYMBOLS = control_symbols(LEGACY_LANGUAGE_PAIR)
 
 SCRIPT_SPECIAL = 0
@@ -181,6 +195,16 @@ def tokenizer_split_digits_policy(model_or_directory: str | Path) -> bool | None
     return split_digits
 
 
+def _canonical_json_sha256(value: Mapping[str, Any]) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def write_tokenizer_metadata(
     model_path: str | Path,
     *,
@@ -192,6 +216,11 @@ def write_tokenizer_metadata(
     monolingual_sentences: dict[str, int] | None = None,
     monolingual_sample_ratio: float = 0.0,
     required_characters: Sequence[str] = (),
+    corpus_sentences: int | None = None,
+    corpus_sentences_per_language: Mapping[str, int] | None = None,
+    sampled_sentences: int | None = None,
+    sampled_sentences_per_language: Mapping[str, int] | None = None,
+    training_contract: Mapping[str, Any] | None = None,
 ) -> Path:
     """Write the reproducibility and identity contract for a trained tokenizer."""
 
@@ -232,8 +261,8 @@ def write_tokenizer_metadata(
         "model_sha256": file_sha256(model_path),
         "vocab_file": vocab_path.name,
         "vocab_sha256": file_sha256(vocab_path),
-        # foundation 단계가 이 토크나이저와 같은 어휘를 보는지 확인할 수 있게
-        # 단일어 표본 규모를 남깁니다. 0 이면 병렬 코퍼스만으로 학습한 것입니다.
+        # Record the actual monolingual contribution so foundation training can
+        # prove that its vocabulary saw those language domains.
         "monolingual_sample_ratio": float(monolingual_sample_ratio),
         "monolingual_sentences": dict(monolingual_sentences or {}),
         # The model format does not identify the trainer build. Keep it in the
@@ -246,6 +275,16 @@ def write_tokenizer_metadata(
         metadata["required_characters_sha256"] = hashlib.sha256(
             rendered_required.encode("utf-8")
         ).hexdigest()
+    if corpus_sentences is not None:
+        metadata["corpus_sentences"] = corpus_sentences
+        metadata["corpus_sentences_per_language"] = dict(corpus_sentences_per_language or {})
+    if sampled_sentences is not None:
+        metadata["sampled_sentences"] = sampled_sentences
+        metadata["sampled_sentences_per_language"] = dict(sampled_sentences_per_language or {})
+    if training_contract is not None:
+        contract = dict(training_contract)
+        metadata["training_contract"] = contract
+        metadata["training_contract_sha256"] = _canonical_json_sha256(contract)
     if features_path.is_file():
         metadata["token_features_file"] = features_path.name
         metadata["token_features_size"] = features_path.stat().st_size
@@ -261,7 +300,7 @@ def write_tokenizer_metadata(
 
 
 def _to_python_string(value: object, *, value_name: str) -> str:
-    """문자열 계열 값을 SentencePiece용 기본 Python ``str``로 변환한다."""
+    """Convert string-like scalars to the built-in ``str`` SentencePiece expects."""
     if isinstance(value, str):
         return str(value)
 
@@ -269,9 +308,9 @@ def _to_python_string(value: object, *, value_name: str) -> str:
         try:
             return value.decode("utf-8")
         except UnicodeDecodeError as error:
-            raise TypeError(f"{value_name}이 UTF-8로 해석할 수 없는 bytes입니다.") from error
+            raise TypeError(f"{value_name} contains bytes that are not valid UTF-8") from error
 
-    # numpy.str_, pandas 문자열 스칼라 등은 item()으로 기본 스칼라를 얻는다.
+    # numpy.str_ and similar scalar wrappers expose their built-in value via item().
     item_method = getattr(value, "item", None)
     if callable(item_method):
         try:
@@ -287,12 +326,10 @@ def _to_python_string(value: object, *, value_name: str) -> str:
                 return scalar_value.decode("utf-8")
             except UnicodeDecodeError as error:
                 raise TypeError(
-                    f"{value_name}의 스칼라 값이 UTF-8로 해석할 수 없는 bytes입니다."
+                    f"{value_name} contains scalar bytes that are not valid UTF-8"
                 ) from error
 
-    raise TypeError(
-        f"{value_name}은 문자열이어야 합니다. 현재 타입={type(value).__name__}, 값={value!r}"
-    )
+    raise TypeError(f"{value_name} must be text; got type={type(value).__name__}, value={value!r}")
 
 
 def expand_inputs(patterns: Sequence[str]) -> list[Path]:
@@ -448,10 +485,10 @@ def iter_parallel_text_with_languages(
     train_only_prefixes: Sequence[str] = DEFAULT_SYNTHETIC_PREFIXES,
     num_workers: int | None = None,
 ) -> Iterator[tuple[str, str]]:
-    """``(language, text)`` 쌍을 낸다.
+    """Yield ``(language, text)`` pairs from the accepted training partition.
 
-    언어별 상한을 걸려면 어느 문장이 어느 언어인지 알아야 합니다. 라벨 없는
-    ``iter_parallel_text`` 는 이 함수를 감싼 것이라 두 경로가 갈라지지 않습니다.
+    Language labels make later stratified limits possible. ``iter_parallel_text``
+    wraps this function so labeled and unlabeled paths cannot drift apart.
     """
 
     policy = QualityPolicy()
@@ -544,23 +581,21 @@ class SionTokenizer:
         if missing_ids:
             raise ValueError(f"Tokenizer is missing required IDs: {missing_ids}")
 
-        # 언어쌍 자동 감지: vocab 에 예약된 <2xx> 토큰을 찾아 어떤 언어쌍으로
-        # 학습된 토크나이저인지 알아냅니다. 덕분에 설정을 따로 전달하지 않아도
-        # ko-ja 든 en-de 든 같은 코드로 동작합니다.
-        self.language_tags: dict[str, int] = {}  # {"ja": <2ja> 토큰 id, ...}
-        self.denoise_tags: dict[str, int] = {}  # {"ko": <denoise_ko> 토큰 id, ...}
-        self.reasoning_tags: dict[str, int] = {}  # {"en": <reason_en> 토큰 id, ...}
+        # Discover the language graph from reserved <2xx> pieces. The same code
+        # therefore works for any configured pair without a separate language map.
+        self.language_tags: dict[str, int] = {}  # {"ja": <2ja> token ID, ...}
+        self.denoise_tags: dict[str, int] = {}  # {"ko": <denoise_ko> token ID, ...}
+        self.reasoning_tags: dict[str, int] = {}  # {"en": <reason_en> token ID, ...}
         lang_pattern = re.compile(r"^<2([^<>\s]+)>$")
         denoise_pattern = re.compile(r"^<denoise_([^<>\s]+)>$")
         reasoning_pattern = re.compile(r"^<reason_([^<>\s]+)>$")
         byte_pattern = re.compile(r"^<0x[0-9A-Fa-f]{2}>$")
-        # 예약 구간의 끝은 첫 byte fallback 조각입니다. SentencePiece 는
-        # pad/unk/bos/eos → user_defined_symbols → byte 조각 → 학습된 조각
-        # 순으로 배치하므로, 여기서 멈추면 제어 토큰은 전부 보면서 학습된
-        # 조각을 <2xx> 로 오인할 일도 없습니다.
+        # The reserved region ends at the first byte-fallback piece. SentencePiece
+        # orders meta pieces, user symbols, byte pieces, then learned pieces, so
+        # stopping there sees every control without misclassifying learned text.
         #
-        # 고정 상한(예전 256)을 쓰면 언어 수가 늘 때 스캔이 예약 구간 중간에서
-        # 끊기고, 증상이 예외가 아니라 "일부 언어만 감지됨" 이라 조용합니다.
+        # A fixed scan limit would silently lose later languages as this reserved
+        # region grows; scanning to the byte boundary avoids that failure mode.
         for token_id in range(self.processor.vocab_size()):
             piece = self.processor.id_to_piece(token_id)
             if byte_pattern.match(piece):
@@ -630,7 +665,7 @@ class SionTokenizer:
         self.mask_id = symbol_ids["<mask>"]
         self.slot_ids = [symbol_ids[symbol] for symbol in SLOT_SYMBOLS]
 
-        # 선택적 제어 토큰: 없으면 None. 기존 토크나이저를 거부하지 않습니다.
+        # Optional controls remain absent on legacy tokenizers without rejecting them.
         self.optional_ids: dict[str, int] = {}
         for symbol in OPTIONAL_CONTROL_SYMBOLS:
             token_id = int(self.processor.piece_to_id(symbol))
@@ -647,7 +682,7 @@ class SionTokenizer:
             raise ValueError(
                 f"Tokenizer reasoning task tags require every trace marker; missing {missing}"
             )
-        # 하위 호환 별칭 (ko-ja 토크나이저일 때만 존재)
+        # Compatibility aliases exist only for the historical two-language tokenizer.
         if {"ko", "ja"} == set(self.language_tags):
             self.ko_to_ja_id = self.language_tags["ja"]
             self.ja_to_ko_id = self.language_tags["ko"]
@@ -659,12 +694,11 @@ class SionTokenizer:
 
     @property
     def splits_digits(self) -> bool:
-        """숫자가 한 자리씩 분리되는 토크나이저인지 확인한다.
+        """Return whether the tokenizer keeps every digit as one piece.
 
-        SentencePiece 모델 파일에는 학습 플래그가 그대로 남지 않으므로,
-        여러 자리 숫자를 실제로 인코딩해 조각을 확인합니다. 거짓이면 금액·
-        용량 같은 값이 그럴듯한 다른 값으로 바뀌는 오역 위험이 있습니다
-        (자세한 배경은 ``train_tokenizer`` 의 ``split_digits`` 설명 참고).
+        SentencePiece does not preserve this trainer flag in an accessible model
+        field, so the check encodes a multi-digit probe. Merged number pieces make
+        value substitutions in amounts and measurements more likely.
         """
         pieces = self.processor.encode("38720", out_type=str)
         return all(len(piece.replace("▁", "")) <= 1 for piece in pieces)
@@ -673,16 +707,16 @@ class SionTokenizer:
         return int(self.processor.piece_to_id(piece))
 
     def encode(self, text: str) -> list[int]:
-        """문장을 정규화한 뒤 SentencePiece 토큰 ID 목록으로 변환한다."""
+        """Normalize text and convert it to SentencePiece token IDs."""
         source_text = _to_python_string(
             text,
-            value_name="tokenizer.encode() 입력",
+            value_name="tokenizer.encode() input",
         )
 
         normalized_text = normalize_text(source_text)
         normalized_text = _to_python_string(
             normalized_text,
-            value_name="normalize_text() 반환값",
+            value_name="normalize_text() return value",
         )
 
         return list(
@@ -694,6 +728,76 @@ class SionTokenizer:
 
     def decode(self, ids: Iterable[int]) -> str:
         return self.processor.decode([int(token_id) for token_id in ids])
+
+
+@dataclass(frozen=True)
+class TokenizerSentence:
+    """One normalized tokenizer sentence and its sampling stratum."""
+
+    language: str
+    text: str
+    monolingual: bool = False
+
+
+def iter_tokenizer_records(
+    paths: Sequence[Path],
+    *,
+    monolingual: MonolingualDiscovery | None = None,
+    monolingual_sample_ratio: float = 0.0,
+    language_pairs: Sequence[Sequence[str]],
+    translation_directions: Sequence[Sequence[str]] | None = None,
+    validation_fraction: float = 0.005,
+    test_fraction: float = 0.005,
+    approximate_split: bool = False,
+    source_only_languages: Sequence[str] = (),
+    train_only_prefixes: Sequence[str] = DEFAULT_SYNTHETIC_PREFIXES,
+    num_workers: int | None = None,
+    monolingual_counts: dict[str, int] | None = None,
+) -> Iterator[TokenizerSentence]:
+    """Yield parallel data followed by bounded monolingual vocabulary data.
+
+    Monolingual examples expose vocabulary needed by the foundation stage. Their
+    per-language budgets are derived from parallel counts, preventing a large
+    monolingual source from taking over the joint vocabulary. Parallel examples
+    must therefore be consumed first.
+    """
+
+    parallel_counts: Counter[str] = Counter()
+    for language, text in iter_parallel_text_with_languages(
+        paths,
+        validation_fraction=validation_fraction,
+        test_fraction=test_fraction,
+        language_pairs=language_pairs,
+        translation_directions=translation_directions,
+        approximate_split=approximate_split,
+        source_only_languages=source_only_languages,
+        train_only_prefixes=train_only_prefixes,
+        num_workers=num_workers,
+    ):
+        parallel_counts[language] += 1
+        yield TokenizerSentence(language=language, text=text)
+
+    if monolingual is None or not monolingual.sources or monolingual_sample_ratio <= 0:
+        return
+    budgets = monolingual_budgets(
+        dict(parallel_counts),
+        monolingual.languages,
+        ratio=monolingual_sample_ratio,
+    )
+    for language in monolingual.languages:
+        emitted = 0
+        for text in sample_monolingual_sentences(
+            monolingual.paths_for(language),
+            budgets.get(language, 0),
+        ):
+            emitted += 1
+            yield TokenizerSentence(
+                language=language,
+                text=canonical_text(text),
+                monolingual=True,
+            )
+        if monolingual_counts is not None:
+            monolingual_counts[language] = emitted
 
 
 def iter_tokenizer_sentences(
@@ -711,100 +815,213 @@ def iter_tokenizer_sentences(
     num_workers: int | None = None,
     monolingual_counts: dict[str, int] | None = None,
 ) -> Iterator[str]:
-    """토크나이저가 볼 문장 전부: 병렬 코퍼스 + 상한을 건 단일어 표본.
+    """Yield all tokenizer sentences while keeping record metadata internal."""
 
-    단일어를 넣는 이유는 foundation 단계가 자기 코퍼스에 없는 어휘로 학습하는
-    것을 막기 위해서이고, 상한을 거는 이유는 분량이 큰 언어가 vocab 을
-    독식하는 것을 막기 위해서입니다. 상한은 병렬 코퍼스를 흘려보내며 언어별로
-    센 문장 수에서 나오므로, 추가 pass 없이 결정됩니다 — 병렬을 먼저 전부
-    내보낸 뒤에 단일어를 내보내는 순서가 그래서 중요합니다.
-
-    ``monolingual_counts`` 를 주면 언어별로 실제 내보낸 단일어 문장 수가
-    기록됩니다(호출자 보고용).
-    """
-
-    parallel_counts: Counter[str] = Counter()
-    for language, text in iter_parallel_text_with_languages(
+    for record in iter_tokenizer_records(
         paths,
-        validation_fraction=validation_fraction,
-        test_fraction=test_fraction,
+        monolingual=monolingual,
+        monolingual_sample_ratio=monolingual_sample_ratio,
         language_pairs=language_pairs,
         translation_directions=translation_directions,
+        validation_fraction=validation_fraction,
+        test_fraction=test_fraction,
         approximate_split=approximate_split,
         source_only_languages=source_only_languages,
         train_only_prefixes=train_only_prefixes,
         num_workers=num_workers,
+        monolingual_counts=monolingual_counts,
     ):
-        parallel_counts[language] += 1
-        yield text
-
-    if monolingual is None or not monolingual.sources or monolingual_sample_ratio <= 0:
-        return
-    budgets = monolingual_budgets(
-        dict(parallel_counts),
-        monolingual.languages,
-        ratio=monolingual_sample_ratio,
-    )
-    for language in monolingual.languages:
-        emitted = 0
-        for text in sample_monolingual_sentences(
-            monolingual.paths_for(language),
-            budgets.get(language, 0),
-        ):
-            emitted += 1
-            yield canonical_text(text)
-        if monolingual_counts is not None:
-            monolingual_counts[language] = emitted
+        yield record.text
 
 
 @dataclass(frozen=True)
 class CorpusCounts:
-    """한 번의 스캔에서 나오는 값들.
+    """Character and language counts produced by one exhaustive corpus pass.
 
-    문자 빈도는 ``required_chars`` 를 뽑는 데 쓰고, 가장 긴 낱말은
-    SentencePiece 의 16비트 낱말 한계를 넘는지 보는 데 씁니다. 같은 pass 에서
-    나와야 서로 어긋나지 않습니다.
+    Character frequencies drive ``required_chars`` while language counts drive
+    deterministic sampling. Computing both together prevents pass-to-pass drift.
     """
 
     characters: Counter[str]
     sentences: int
+    sentences_per_language: Counter[str] = field(default_factory=Counter)
+    monolingual_sentences_per_language: Counter[str] = field(default_factory=Counter)
 
     @property
     def character_total(self) -> int:
         return sum(self.characters.values())
 
 
+def stratified_sentence_quotas(
+    counts: Mapping[str, int],
+    sentence_limit: int,
+    *,
+    alpha: float = DEFAULT_TOKENIZER_SAMPLING_ALPHA,
+) -> dict[str, int]:
+    """Allocate an exact bounded sample across arbitrary language strata.
+
+    ``alpha=1`` follows corpus size. Lower values reserve relatively more space
+    for low-resource languages. Every non-empty language receives one sentence
+    before the remaining capacity is distributed with deterministic largest
+    remainders. No language names or scripts are embedded in this policy.
+    """
+
+    if type(sentence_limit) is not int:
+        raise TypeError("sentence_limit must be an integer")
+    if sentence_limit < 0:
+        raise ValueError("sentence_limit must be non-negative")
+    if not math.isfinite(alpha) or not 0.0 < alpha <= 1.0:
+        raise ValueError("sampling alpha must be finite and in (0, 1]")
+    normalized: dict[str, int] = {}
+    for language, raw_count in counts.items():
+        if type(raw_count) is not int:
+            raise TypeError(f"sentence count for {language!r} must be an integer")
+        if raw_count < 0:
+            raise ValueError(f"sentence count for {language!r} must be non-negative")
+        if raw_count:
+            normalized[str(language)] = raw_count
+    total = sum(normalized.values())
+    if sentence_limit == 0 or sentence_limit >= total:
+        return dict(sorted(normalized.items()))
+    if sentence_limit < len(normalized):
+        raise ValueError(
+            "input_sentence_size must be at least the number of non-empty languages "
+            f"({len(normalized)}) so no language disappears from tokenizer training"
+        )
+
+    quotas = {language: 1 for language in normalized}
+    capacities = {language: normalized[language] - 1 for language in normalized}
+    remaining = sentence_limit - len(quotas)
+    while remaining:
+        active = [language for language in sorted(normalized) if capacities[language] > 0]
+        if not active:
+            break
+        weights = {language: math.pow(float(normalized[language]), alpha) for language in active}
+        weight_total = sum(weights.values())
+        ideal = {language: remaining * weights[language] / weight_total for language in active}
+        assigned = 0
+        for language in active:
+            addition = min(capacities[language], math.floor(ideal[language]))
+            quotas[language] += addition
+            capacities[language] -= addition
+            assigned += addition
+        remaining -= assigned
+        if not remaining:
+            break
+        by_remainder = sorted(
+            (language for language in active if capacities[language] > 0),
+            key=lambda language: (-(ideal[language] - math.floor(ideal[language])), language),
+        )
+        if not by_remainder:
+            continue
+        for language in by_remainder[:remaining]:
+            quotas[language] += 1
+            capacities[language] -= 1
+            remaining -= 1
+            if not remaining:
+                break
+    if sum(quotas.values()) != sentence_limit:
+        raise RuntimeError("stratified tokenizer quota allocation did not reach its exact limit")
+    return dict(sorted(quotas.items()))
+
+
+def iter_stratified_tokenizer_sentences(
+    records: Iterable[TokenizerSentence],
+    counts: Mapping[str, int],
+    quotas: Mapping[str, int],
+    *,
+    seed: int = 0,
+    sampled_counts: Counter[str] | None = None,
+    sampled_monolingual_counts: Counter[str] | None = None,
+) -> Iterator[str]:
+    """Select exact systematic samples in one pass and constant memory.
+
+    A language-specific hash rotates evenly spaced selection positions. The
+    result is reproducible for a seed, covers the full ordered corpus rather than
+    its prefix, and never stores sentence text in a Python reservoir.
+    """
+
+    positions: Counter[str] = Counter()
+    offsets = {
+        language: int.from_bytes(
+            hashlib.blake2b(f"{seed}\0{language}".encode("utf-8"), digest_size=8).digest(),
+            "big",
+        )
+        % count
+        for language, count in counts.items()
+        if count > 0
+    }
+    emitted: Counter[str] = Counter()
+    emitted_monolingual: Counter[str] = Counter()
+    for record in records:
+        language = record.language
+        if language not in counts:
+            raise RuntimeError(
+                f"tokenizer corpus produced a language absent from its counting pass: {language}"
+            )
+        count = counts.get(language, 0)
+        quota = quotas.get(language, 0)
+        positions[language] += 1
+        if count <= 0 or quota <= 0:
+            continue
+        position = positions[language] - 1
+        rotated = (position + offsets[language]) % count
+        selected = ((rotated + 1) * quota) // count > (rotated * quota) // count
+        if not selected:
+            continue
+        emitted[language] += 1
+        if record.monolingual:
+            emitted_monolingual[language] += 1
+        yield record.text
+    expected = {language: quota for language, quota in quotas.items() if quota > 0}
+    observed_counts = {language: positions[language] for language in counts}
+    if observed_counts != dict(counts):
+        raise RuntimeError(
+            "tokenizer corpus changed between counting and sampling: "
+            f"expected language counts={dict(counts)}, observed={observed_counts}"
+        )
+    actual = {language: emitted[language] for language in expected}
+    if actual != expected:
+        raise RuntimeError(
+            "tokenizer corpus changed between counting and sampling: "
+            f"expected={expected}, emitted={actual}"
+        )
+    if sampled_counts is not None:
+        sampled_counts.update(emitted)
+    if sampled_monolingual_counts is not None:
+        sampled_monolingual_counts.update(emitted_monolingual)
+
+
 # ─────────────────────────────────────────────────────────────────────────
-# SentencePiece 0.2.2 는 큰 코퍼스의 다중 스레드 정규화에서 SIGSEGV 로 죽습니다.
-# 크기 상한을 두지 않는 이유는 크기가 원인이 아니기 때문입니다.
+# SentencePiece 0.2.2 can segfault during multithreaded normalization of a
+# large corpus. Corpus size is not a reliable predictor of the failure.
 #
-# 2026-08-07 실측. 원소 = 문자 + 문장 (`MakeSeedSentencePieces` 가 문장마다
-# 경계 문자를 하나 넣고 이어 붙입니다):
+# Measurements from 2026-08-07. Elements equal characters plus one boundary
+# element per sentence in ``MakeSeedSentencePieces``:
 #
-#     문장        문자     원소    최장낱말   결과
-#     20,459,141  0.93 G  0.95 G   16,886   통과
-#     20,923,746  1.95 G  1.97 G        ?   통과
+#     sentences   chars   elements  longest word  result
+#     20,459,141  0.93 G  0.95 G          16,886  pass
+#     20,923,746  1.95 G  1.97 G               ?  pass
 #     20,355,467  1.06 G  1.08 G    1,401   SIGSEGV
 #     24,954,792  1.95 G  1.98 G        ?   SIGSEGV
 #     41,438,233  3.93 G  3.97 G        ?   SIGSEGV
 #
-# 세 번째 줄이 핵심입니다. 첫 줄보다 **모든 축에서 작은데** 죽습니다.
-# 배제된 가설: 메모리(통과 실행 peak 40~50 GiB, 실패는 256 GiB 를 주고도
-# 죽음), 문자 수, 문장 수, 원소 수, 스레드 경합(4·16 둘 다 죽음), 4 KiB 초과
-# 긴 줄(미리 걸러도 죽음), google/sentencepiece#954 의 32,768 자 낱말 한계
-# (최장 1,401 자 코퍼스가 죽으므로 해당 없음), required_chars 의 블록 문자.
+# The third corpus is smaller on every measured axis than the first, yet it
+# fails. Ruled-out causes include memory (40-50 GiB passing peak versus 256 GiB
+# provisioned for a failure), sentence/character/element counts, 4 versus 16
+# threads, lines over 4 KiB, the 32,768-character word limit, and block elements.
 #
-# v0.2.2 소스 빌드의 native stack 은 ``PrefixMatcher::GlobalReplace`` 안의
-# ``std::string::_M_append``/glibc malloc 을 가리켰습니다. Python iterator 를
-# 거치지 않는 C++ CLI 에서도 같습니다. 정확 A/B 결과:
+# A source build points to ``PrefixMatcher::GlobalReplace`` through
+# ``std::string::_M_append``/glibc malloc. The C++ CLI reproduces it without a
+# Python iterator. Exact A/B results:
 #
-# * 0.2.2, 4 threads: SIGSEGV; 1 thread: 통과
-# * 0.2.1, 4 threads: 통과
-# * 0.2.2 에서 새 thread pool 만 우회: SIGSEGV
-# * 0.2.2 에서 ``de32a1e`` 가 없앤 normalization offset 만 복원: 통과
+# * 0.2.2, 4 threads: SIGSEGV; 1 thread: pass
+# * 0.2.1, 4 threads: pass
+# * 0.2.2 with only the new thread pool bypassed: SIGSEGV
+# * 0.2.2 with the normalization offset removed by ``de32a1e`` restored: pass
 #
-# 따라서 0.2.2 의 offset 생략 회귀가 원인입니다. 실패는 모든 문장을 읽은 뒤에
-# 오므로 아래 runtime 검사는 문자 스캔보다 먼저 실행해야 합니다.
+# The omitted normalization offset in 0.2.2 is therefore the measured cause.
+# Reject that runtime before scanning because the crash arrives after input load.
 # ─────────────────────────────────────────────────────────────────────────
 
 
@@ -814,10 +1031,10 @@ def validate_sentencepiece_training_runtime(num_threads: int) -> str:
     version = str(getattr(spm, "__version__", "unknown"))
     if version == SENTENCEPIECE_MULTITHREADED_TRAINING_REGRESSION and num_threads > 1:
         raise RuntimeError(
-            "sentencepiece 0.2.2의 다중 스레드 trainer에는 확인된 SIGSEGV 회귀가 "
-            "있습니다(normalization offset을 생략한 upstream de32a1e). 코퍼스를 "
-            "스캔하기 전에 중단합니다. 프로젝트가 고정한 sentencepiece==0.2.1을 "
-            "설치하거나, 느린 우회가 필요하면 num_threads=1을 명시하십시오."
+            "sentencepiece 0.2.2 has a confirmed SIGSEGV regression in its "
+            "multithreaded trainer (upstream de32a1e omitted normalization offsets). "
+            "Install the pinned sentencepiece==0.2.1, or explicitly use "
+            "num_threads=1 for the slower measured workaround."
         )
     return version
 
@@ -840,7 +1057,9 @@ def corpus_character_counts(
 
     counts: Counter[str] = Counter()
     sentences = 0
-    for text in iter_tokenizer_sentences(
+    sentences_per_language: Counter[str] = Counter()
+    monolingual_per_language: Counter[str] = Counter()
+    for record in iter_tokenizer_records(
         paths,
         monolingual=monolingual,
         monolingual_sample_ratio=monolingual_sample_ratio,
@@ -853,9 +1072,17 @@ def corpus_character_counts(
         train_only_prefixes=train_only_prefixes,
         num_workers=num_workers,
     ):
-        counts.update(text)
+        counts.update(record.text)
         sentences += 1
-    return CorpusCounts(characters=counts, sentences=sentences)
+        sentences_per_language[record.language] += 1
+        if record.monolingual:
+            monolingual_per_language[record.language] += 1
+    return CorpusCounts(
+        characters=counts,
+        sentences=sentences,
+        sentences_per_language=sentences_per_language,
+        monolingual_sentences_per_language=monolingual_per_language,
+    )
 
 
 # Characters SentencePiece refuses to accept as required characters. Passing one
@@ -890,10 +1117,10 @@ def required_characters_from_counts(
     """Characters frequent enough that byte fallback would be a regression.
 
     A character seen this often carries content, so splitting it into raw bytes
-    costs the model three tokens where one would do. The 한본어 corpus produces
-    fused syllables (``네`` + ``ㅋ`` -> ``넼``) that appear over a thousand times
+    costs the model three tokens where one would do. A mixed-script corpus produces
+    produce NFC-fused syllables that appear over a thousand times
     yet are absent from any tokenizer trained before that corpus existed; the
-    shipped one renders ``넼`` as three ``<0x..>`` pieces.
+    while an older shipped tokenizer renders one as three ``<0x..>`` pieces.
 
     The threshold is a floor on *content*, not a guess about any one language:
     below it a character is genuinely incidental and byte fallback is the right
@@ -946,27 +1173,20 @@ def _required_characters_rejected(characters: Sequence[str], probe_corpus: Path)
 def acceptable_required_characters(
     required: Sequence[str],
 ) -> tuple[list[str], list[str]]:
-    """``(수용된 문자, 거부된 문자)`` — SentencePiece 에게 직접 물어서 가른다.
+    """Ask SentencePiece which required characters it accepts.
 
-    ``required_chars`` 에 SentencePiece 가 받지 않는 문자가 하나라도 있으면
-    학습은 **코퍼스를 다 읽은 뒤에** assert 로 죽습니다. 3,500만 문장에서는 그
-    지점까지 가는 데만 몇 시간이 걸리고, 빌린 CPU 라면 그 시간이 곧 비용입니다.
-
-    어떤 문자가 거부되는지 규칙으로 예측하지 않습니다. U+2047 은 ``kUNKChar``
-    라 설명이 되지만 U+2585 는 되지 않습니다 — 이웃한 블록 문자는 통과하고,
-    공백 기호 U+2581 도 아닙니다. 규칙을 추측해 목록을 손으로 관리하면 다음
-    코퍼스에서 또 같은 방식으로 무너집니다. 그래서 작은 합성 코퍼스로 실제
-    학습을 시켜 보고, 실패하면 이분 탐색으로 범인을 찾아 빼기를 반복합니다.
-
-    비용은 몇 초짜리 학습 수십 번이고, 막는 것은 코퍼스 전량 스캔입니다.
+    One rejected required character makes the trainer assert only after reading
+    the full corpus. Instead of guessing undocumented rules, this function trains
+    on a small synthetic corpus and bisects any failing character set. A few
+    seconds of probes prevent wasting an hours-long production corpus scan.
     """
 
     candidate = list(required)
     rejected: list[str] = []
     with tempfile.TemporaryDirectory() as workspace:
         probe_corpus = Path(workspace) / "probe.txt"
-        # 어떤 언어에도 치우치지 않게, 그리고 required 문자를 담지 않게 씁니다.
-        # 여기서 재는 것은 코퍼스가 아니라 required 집합의 수용 여부입니다.
+        # Keep the probe language-neutral and free of required characters. It
+        # measures only whether SentencePiece accepts the required set.
         probe_corpus.write_text(
             "".join(f"probe line {index}\n" for index in range(500)),
             encoding="utf-8",
@@ -982,9 +1202,8 @@ def acceptable_required_characters(
                 elif _required_characters_rejected(right, probe_corpus):
                     low = right
                 else:
-                    # 어느 절반도 단독으로는 실패하지 않으면 조합 문제입니다.
-                    # 그런 사례는 아직 관측되지 않았고, 조용히 추측해서 지우는
-                    # 것보다 멈추고 말하는 편이 낫습니다.
+                    # If neither half fails alone, the failure depends on a
+                    # combination. Stop rather than silently dropping a guess.
                     raise RuntimeError(
                         "SentencePiece rejects this required-character set, but no "
                         f"single character explains it ({len(low)} remain). Inspect "
@@ -996,17 +1215,253 @@ def acceptable_required_characters(
     return candidate, rejected
 
 
+def _source_identity_record(
+    path: Path,
+    *,
+    role: str,
+    identity: str,
+    language: str | None = None,
+) -> dict[str, object]:
+    """Hash one regular source and reject mutation during the hash pass."""
+
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"tokenizer source must be a regular non-symlink file: {path}")
+    before = path.stat()
+    digest = file_sha256(path)
+    after = path.stat()
+    identity_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+    identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+    if identity_before != identity_after:
+        raise RuntimeError(f"tokenizer source changed while it was hashed: {path}")
+    record: dict[str, object] = {
+        "role": role,
+        "path": identity,
+        "size": after.st_size,
+        "sha256": digest,
+    }
+    if language is not None:
+        record["language"] = language
+    return record
+
+
+def _tokenizer_source_records(
+    paths: Sequence[Path],
+    monolingual: MonolingualDiscovery | None,
+) -> list[dict[str, object]]:
+    resolved_parallel = [path.resolve() for path in paths]
+    try:
+        parallel_root = Path(os.path.commonpath([str(path.parent) for path in resolved_parallel]))
+    except ValueError:
+        parallel_root = None
+
+    def parallel_identity(path: Path) -> str:
+        resolved = path.resolve()
+        if parallel_root is None:
+            return resolved.as_posix()
+        return resolved.relative_to(parallel_root).as_posix()
+
+    records = [
+        _source_identity_record(
+            path,
+            role="parallel",
+            identity=parallel_identity(path),
+        )
+        for path in sorted(paths, key=lambda item: str(item.resolve()))
+    ]
+    if monolingual is not None:
+        records.extend(
+            _source_identity_record(
+                source.path,
+                role="monolingual",
+                identity=source.path.resolve().relative_to(monolingual.root.resolve()).as_posix(),
+                language=source.language,
+            )
+            for source in sorted(
+                monolingual.sources,
+                key=lambda item: (item.language, str(item.path.resolve())),
+            )
+        )
+    return sorted(
+        records,
+        key=lambda record: (
+            str(record["role"]),
+            str(record.get("language", "")),
+            str(record["path"]),
+            str(record["sha256"]),
+            str(record["size"]),
+        ),
+    )
+
+
+def _tokenizer_training_contract(
+    *,
+    source_records: Sequence[Mapping[str, object]],
+    vocab_size: int,
+    input_sentence_size: int,
+    sampling_alpha: float,
+    sampling_seed: int,
+    seed_sentencepiece_size: int,
+    character_coverage: float,
+    required_character_min_occurrences: int,
+    validation_fraction: float,
+    test_fraction: float,
+    language_pairs: Sequence[Sequence[str]],
+    translation_directions: Sequence[Sequence[str]],
+    denoise_languages: Sequence[str],
+    reasoning_languages: Sequence[str],
+    approximate_split: bool,
+    source_only_languages: Sequence[str],
+    train_only_prefixes: Sequence[str],
+    split_digits: bool,
+    monolingual_sample_ratio: float,
+    sentencepiece_version: str,
+    num_threads: int,
+) -> dict[str, object]:
+    """Build the exact contract used to resume or reject an existing output."""
+
+    return {
+        "schema": TOKENIZER_TRAINING_SCHEMA,
+        "sources": [dict(record) for record in source_records],
+        "vocab_size": vocab_size,
+        "input_sentence_size": input_sentence_size,
+        "sampling_alpha": sampling_alpha,
+        "sampling_seed": sampling_seed,
+        "seed_sentencepiece_size": seed_sentencepiece_size,
+        "character_coverage": character_coverage,
+        "required_character_min_occurrences": required_character_min_occurrences,
+        "validation_fraction": validation_fraction,
+        "test_fraction": test_fraction,
+        "language_pairs": [list(pair) for pair in language_pairs],
+        "translation_directions": [list(direction) for direction in translation_directions],
+        "denoise_languages": list(denoise_languages),
+        "reasoning_languages": list(reasoning_languages),
+        "approximate_split": approximate_split,
+        "source_only_languages": list(source_only_languages),
+        "train_only_prefixes": list(train_only_prefixes),
+        "split_digits": split_digits,
+        "monolingual_sample_ratio": monolingual_sample_ratio,
+        "sentencepiece_version": sentencepiece_version,
+        "num_threads": num_threads,
+    }
+
+
+def _assert_plain_tokenizer_file(path: Path, *, role: str) -> None:
+    is_junction = getattr(path, "is_junction", lambda: False)
+    if path.is_symlink() or is_junction() or not path.is_file():
+        raise RuntimeError(f"{role} must be a regular non-symlink file: {path}")
+
+
+def _validate_tokenizer_generation(
+    directory: Path,
+    expected_contract: Mapping[str, object],
+) -> Path:
+    """Authenticate a complete tokenizer generation against its training contract."""
+
+    paths = {name: directory / name for name in TOKENIZER_ARTIFACT_FILENAMES}
+    for name, path in paths.items():
+        _assert_plain_tokenizer_file(path, role=f"tokenizer artifact {name}")
+    try:
+        raw_metadata = json.loads(paths[TOKENIZER_METADATA_FILENAME].read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError("tokenizer metadata is unreadable") from error
+    if not isinstance(raw_metadata, dict):
+        raise RuntimeError("tokenizer metadata must be a JSON object")
+    metadata = cast(dict[str, Any], raw_metadata)
+    contract = metadata.get("training_contract")
+    if contract != dict(expected_contract):
+        raise RuntimeError(
+            "existing tokenizer was built from a different source or training contract; "
+            "use a new output directory instead of replacing its vocabulary"
+        )
+    if metadata.get("training_contract_sha256") != _canonical_json_sha256(expected_contract):
+        raise RuntimeError("tokenizer training contract digest does not match its payload")
+    expected_digests = {
+        "sion.model": metadata.get("model_sha256"),
+        "sion.vocab": metadata.get("vocab_sha256"),
+        "token_features.npz": metadata.get("token_features_sha256"),
+    }
+    for name, expected_digest in expected_digests.items():
+        if not isinstance(expected_digest, str) or file_sha256(paths[name]) != expected_digest:
+            raise RuntimeError(f"tokenizer artifact identity differs for {name}")
+    return paths["sion.model"]
+
+
+def _remove_tokenizer_staging(path: Path, output_dir: Path) -> None:
+    """Remove only a private staging directory created below this output root."""
+
+    if path.parent != output_dir or not path.name.startswith(TOKENIZER_STAGING_PREFIX):
+        raise RuntimeError(f"refusing to remove an unexpected tokenizer staging path: {path}")
+    is_junction = getattr(path, "is_junction", lambda: False)
+    if path.is_symlink() or is_junction() or not path.is_dir():
+        raise RuntimeError(f"refusing to remove an unsafe tokenizer staging path: {path}")
+    pending = [path]
+    while pending:
+        directory = pending.pop()
+        for entry in directory.iterdir():
+            entry_is_junction = getattr(entry, "is_junction", lambda: False)
+            if entry.is_symlink() or entry_is_junction():
+                raise RuntimeError(
+                    f"refusing to remove tokenizer staging containing a reparse point: {entry}"
+                )
+            if entry.is_dir():
+                pending.append(entry)
+            elif not entry.is_file():
+                raise RuntimeError(
+                    f"refusing to remove tokenizer staging containing a special file: {entry}"
+                )
+    shutil.rmtree(path)
+
+
+def _publish_tokenizer_generation(staging: Path, output_dir: Path) -> Path:
+    """Publish sidecars first and the model commit marker last."""
+
+    model_path = output_dir / "sion.model"
+    if model_path.exists() or model_path.is_symlink():
+        raise FileExistsError(f"refusing to replace an existing tokenizer model: {model_path}")
+    for name in TOKENIZER_ARTIFACT_FILENAMES:
+        source = staging / name
+        _assert_plain_tokenizer_file(source, role=f"staged tokenizer artifact {name}")
+        destination = output_dir / name
+        if name == "sion.model" and (destination.exists() or destination.is_symlink()):
+            raise FileExistsError(f"refusing to replace an existing tokenizer model: {destination}")
+        os.replace(source, destination)
+    return model_path
+
+
+def _recover_tokenizer_staging(
+    output_dir: Path,
+    expected_contract: Mapping[str, object],
+) -> Path | None:
+    """Publish one completed interrupted build and discard incomplete private builds."""
+
+    recovered: Path | None = None
+    for candidate in sorted(output_dir.glob(f"{TOKENIZER_STAGING_PREFIX}*")):
+        if candidate.is_symlink() or not candidate.is_dir():
+            raise RuntimeError(f"unsafe tokenizer staging entry blocks recovery: {candidate}")
+        try:
+            _validate_tokenizer_generation(candidate, expected_contract)
+        except RuntimeError:
+            _remove_tokenizer_staging(candidate, output_dir)
+            continue
+        if recovered is not None:
+            _remove_tokenizer_staging(candidate, output_dir)
+            continue
+        recovered = _publish_tokenizer_generation(candidate, output_dir)
+        _remove_tokenizer_staging(candidate, output_dir)
+    return recovered
+
+
 def train_tokenizer(
     input_patterns: Sequence[str],
     output_dir: str | Path,
     *,
     vocab_size: int = 48000,
-    # 0 means "use every sentence". The corpus is now large enough that the old
-    # 4,000,000 cap covered only 22.2% of it, and uniform sampling shrinks a
-    # small shard in proportion: the 한본어 corpus is 0.11% of all sentences, so
-    # the fused syllables it exists to teach were sampled a few hundred times and
-    # could be pruned out of the vocabulary by chance.
-    input_sentence_size: int = 0,
+    # A one-million-sentence language-stratified sample remains practical on a
+    # 16 GiB workstation. Set this to 0 only when an explicitly provisioned host
+    # should expose every accepted sentence to SentencePiece.
+    input_sentence_size: int = DEFAULT_TOKENIZER_INPUT_SENTENCE_SIZE,
+    sampling_alpha: float = DEFAULT_TOKENIZER_SAMPLING_ALPHA,
+    sampling_seed: int = 0,
     seed_sentencepiece_size: int = 1_000_000,
     # Not 1.0. Full coverage puts *every* character observed in the corpus into
     # the vocabulary, which makes three separate mechanisms fight over the same
@@ -1029,31 +1484,63 @@ def train_tokenizer(
     num_workers: int | None = None,
     num_threads: int | None = None,
     split_digits: bool = True,
-    # foundation 사전학습용 단일어 코퍼스. 넣으면 그 어휘가 vocab 에 들어가고,
-    # 넣지 않으면 foundation 단계가 자기 코퍼스에 없는 어휘로 학습합니다.
-    # 언어별 상한은 `monolingual_sample_ratio` 가 정합니다.
+    # Optional monolingual data exposes vocabulary needed by foundation
+    # pretraining. monolingual_sample_ratio controls its per-language budget.
     monolingual: MonolingualDiscovery | None = None,
     monolingual_sample_ratio: float = 0.0,
     foundation_languages: Sequence[str] = (),
     reasoning_languages: Sequence[str] = (),
 ) -> Path:
-    """병렬 코퍼스로 joint SentencePiece 토크나이저를 학습한다.
+    """Train a joint SentencePiece tokenizer transactionally.
 
-    ``character_coverage`` 와 ``required_character_min_occurrences`` 는 역할이
-    다릅니다. 전자는 "빈도 꼬리를 어디서 자를지"를 정하고, 후자는 "그 아래라도
-    이건 반드시 넣어라"를 정합니다. 전자가 1.0 이면 자를 꼬리가 없어서 후자도,
-    byte fallback 도, byte fallback 비율 관문도 전부 무의미해집니다.
+    The full corpus is scanned for character coverage and per-language counts.
+    SentencePiece then receives an exact, deterministic, language-stratified
+    sample bounded by ``input_sentence_size``. This preserves low-resource
+    languages without retaining a Python reservoir of sentence strings.
 
-    ``split_digits`` 는 기본으로 켭니다. 끄면 SentencePiece 가 자주 등장하는
-    숫자열을 하나의 토큰으로 병합하므로 (예: ``62.5kg`` → ``▁6`` + ``2.5`` + ``kg``,
-    ``1,286,400`` → ``▁1,2`` + ``86`` + ``,`` + ``400``) 모델이 숫자를 자릿수로
-    다루지 못하고 통째로 암기한 덩어리로만 볼 수 있습니다. 그 결과 금액·용량·
-    날짜가 그럴듯한 다른 값으로 바뀌는 오역이 생기며, 사후학습의 숫자 보존
-    보상(``reward_number_weight``)도 최적화할 신호를 얻지 못합니다.
+    ``character_coverage`` trims the global frequency tail while
+    ``required_character_min_occurrences`` pulls meaningful characters back out
+    of that tail. ``split_digits`` keeps numeric values compositional so the
+    translation model can preserve amounts, dates, and measurements.
+
+    Artifacts are built in a private directory. Sidecars are published first and
+    ``sion.model`` last, so an interrupted run is either resumable or visibly
+    incomplete and never appears as a complete tokenizer generation.
     """
     paths = expand_inputs(input_patterns)
     if not paths:
         raise FileNotFoundError(f"No JSONL files matched: {input_patterns}")
+    if type(vocab_size) is not int or vocab_size < 1:
+        raise ValueError("vocab_size must be a positive integer")
+    if type(input_sentence_size) is not int:
+        raise TypeError("input_sentence_size must be an integer")
+    if input_sentence_size < 0:
+        raise ValueError("input_sentence_size must be non-negative")
+    if type(sampling_seed) is not int:
+        raise TypeError("sampling_seed must be an integer")
+    if isinstance(sampling_alpha, bool) or not math.isfinite(sampling_alpha):
+        raise ValueError("sampling_alpha must be finite and in (0, 1]")
+    if not 0.0 < sampling_alpha <= 1.0:
+        raise ValueError("sampling_alpha must be finite and in (0, 1]")
+    if type(seed_sentencepiece_size) is not int or seed_sentencepiece_size < 1:
+        raise ValueError("seed_sentencepiece_size must be a positive integer")
+    if (
+        type(required_character_min_occurrences) is not int
+        or required_character_min_occurrences < 0
+    ):
+        raise ValueError("required_character_min_occurrences must be a non-negative integer")
+    if isinstance(character_coverage, bool) or not math.isfinite(character_coverage):
+        raise ValueError("character_coverage must be in (0, 1]")
+    if (
+        isinstance(monolingual_sample_ratio, bool)
+        or not math.isfinite(monolingual_sample_ratio)
+        or monolingual_sample_ratio < 0
+    ):
+        raise ValueError("monolingual_sample_ratio must be finite and non-negative")
+    if num_workers is not None and (type(num_workers) is not int or num_workers < 1):
+        raise ValueError("num_workers must be a positive integer when provided")
+    if num_threads is not None and (type(num_threads) is not int or num_threads < 1):
+        raise ValueError("num_threads must be a positive integer when provided")
     if not 0.0 < character_coverage <= 1.0:
         raise ValueError("character_coverage must be in (0, 1]")
     if character_coverage >= 1.0 and required_character_min_occurrences > 0:
@@ -1088,9 +1575,6 @@ def train_tokenizer(
             f"unknown {unknown_reasoning_languages}"
         )
 
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    model_prefix = output_dir / "sion"
     symbols = (
         control_symbols(
             languages,
@@ -1103,36 +1587,92 @@ def train_tokenizer(
     plan = build_cpu_plan(input_files=len(paths))
     workers = num_workers or plan.preprocess_workers
     threads = num_threads or plan.sentencepiece_threads
-    validate_sentencepiece_training_runtime(threads)
+    sentencepiece_version = validate_sentencepiece_training_runtime(threads)
+    normalized_source_only = canonicalize_language_tags(
+        list(source_only_languages),
+        field="tokenizer source_only_languages",
+        reject_duplicates=False,
+    )
+    normalized_synthetic_prefixes = normalize_synthetic_prefixes(train_only_prefixes)
+    initial_source_records = _tokenizer_source_records(paths, monolingual)
+    sampling_description = (
+        "all accepted sentences"
+        if input_sentence_size == 0
+        else f"at most {input_sentence_size:,} stratified sentences"
+    )
+    print(
+        f"[tokenizer] authenticated {len(initial_source_records):,} source files "
+        f"({sum(cast(int, record['size']) for record in initial_source_records) / 2**30:.2f} GiB); "
+        f"SentencePiece will receive {sampling_description} "
+        f"(alpha={sampling_alpha:g}, seed={sampling_seed})",
+        flush=True,
+    )
+    training_contract = _tokenizer_training_contract(
+        source_records=initial_source_records,
+        vocab_size=vocab_size,
+        input_sentence_size=input_sentence_size,
+        sampling_alpha=sampling_alpha,
+        sampling_seed=sampling_seed,
+        seed_sentencepiece_size=seed_sentencepiece_size,
+        character_coverage=character_coverage,
+        required_character_min_occurrences=required_character_min_occurrences,
+        validation_fraction=validation_fraction,
+        test_fraction=test_fraction,
+        language_pairs=normalized_pairs,
+        translation_directions=normalized_directions,
+        denoise_languages=denoise_languages,
+        reasoning_languages=reasoning_languages,
+        approximate_split=approximate_split,
+        source_only_languages=normalized_source_only,
+        train_only_prefixes=normalized_synthetic_prefixes,
+        split_digits=split_digits,
+        monolingual_sample_ratio=monolingual_sample_ratio,
+        sentencepiece_version=sentencepiece_version,
+        num_threads=threads,
+    )
 
-    # Reserve the characters that carry content. This costs one pass over the
-    # corpus and is worth it precisely because `character_coverage` is below 1.0:
-    # coverage cuts the frequency tail globally, so a character that is rare
-    # overall but common in a shard that matters (the 한본어 fused syllables are
-    # 0.11% of all sentences) would land in the tail. This floor pulls it back.
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    canonical_model = output_dir / "sion.model"
+    if canonical_model.exists() or canonical_model.is_symlink():
+        return _validate_tokenizer_generation(output_dir, training_contract)
+    recovered = _recover_tokenizer_staging(output_dir, training_contract)
+    if recovered is not None:
+        return _validate_tokenizer_generation(output_dir, training_contract)
+
+    # One exhaustive pass provides both the character floor and exact language
+    # counts. The second pass can then sample without a text reservoir.
+    counts = corpus_character_counts(
+        paths,
+        language_pairs=normalized_pairs,
+        translation_directions=normalized_directions,
+        monolingual=monolingual,
+        monolingual_sample_ratio=monolingual_sample_ratio,
+        validation_fraction=validation_fraction,
+        test_fraction=test_fraction,
+        approximate_split=approximate_split,
+        source_only_languages=normalized_source_only,
+        train_only_prefixes=normalized_synthetic_prefixes,
+        num_workers=workers,
+    )
+    if counts.sentences == 0:
+        raise ValueError("no accepted training-partition sentences remain for tokenizer training")
+    quotas = stratified_sentence_quotas(
+        counts.sentences_per_language,
+        input_sentence_size,
+        alpha=sampling_alpha,
+    )
+    print(
+        f"[tokenizer] corpus: {counts.sentences:,} sentences, "
+        f"{counts.character_total:,} characters; selected {sum(quotas.values()):,} "
+        f"sentences across {len(quotas):,} languages",
+        flush=True,
+    )
+
+    # Reserve characters that carry content. Coverage cuts the global frequency
+    # tail; this floor restores characters that are meaningful within any shard.
     required_characters: list[str] = []
     if required_character_min_occurrences > 0:
-        counts = corpus_character_counts(
-            paths,
-            language_pairs=normalized_pairs,
-            translation_directions=normalized_directions,
-            monolingual=monolingual,
-            monolingual_sample_ratio=monolingual_sample_ratio,
-            validation_fraction=validation_fraction,
-            test_fraction=test_fraction,
-            approximate_split=approximate_split,
-            source_only_languages=source_only_languages,
-            train_only_prefixes=train_only_prefixes,
-            num_workers=workers,
-        )
-        # 이 값들은 required_chars 계획과 실행 기록을 위한 통계입니다. SIGSEGV
-        # 생존 여부를 크기로 예측하지 않습니다. 더 작은 코퍼스가 더 큰 코퍼스보다
-        # 먼저 죽은 실측이 있고, 원인은 위에서 이미 차단한 0.2.2 회귀였습니다.
-        print(
-            f"[tokenizer] 코퍼스 규모: 문장 {counts.sentences:,}, 문자 {counts.character_total:,}",
-            flush=True,
-        )
-
         required_characters = required_characters_from_counts(
             counts.characters,
             min_occurrences=required_character_min_occurrences,
@@ -1156,61 +1696,94 @@ def train_tokenizer(
         required_characters, refused = acceptable_required_characters(required_characters)
         if refused:
             print(
-                "[tokenizer] SentencePiece 가 받지 않는 문자를 required_chars 에서 "
-                f"제외했습니다: {' '.join(f'U+{ord(c):04X}' for c in refused)}",
+                "[tokenizer] excluded characters rejected by SentencePiece from "
+                f"required_chars: {' '.join(f'U+{ord(c):04X}' for c in refused)}",
                 flush=True,
             )
 
-    monolingual_counts: dict[str, int] = {}
-    spm.SentencePieceTrainer.train(
-        sentence_iterator=iter_tokenizer_sentences(
+    staging = Path(tempfile.mkdtemp(prefix=TOKENIZER_STAGING_PREFIX, dir=output_dir))
+    published = False
+    try:
+        model_prefix = staging / "sion"
+        sampled_counts: Counter[str] = Counter()
+        sampled_monolingual_counts: Counter[str] = Counter()
+        records = iter_tokenizer_records(
             paths,
             monolingual=monolingual,
             monolingual_sample_ratio=monolingual_sample_ratio,
-            monolingual_counts=monolingual_counts,
             validation_fraction=validation_fraction,
             test_fraction=test_fraction,
             language_pairs=normalized_pairs,
             translation_directions=normalized_directions,
             approximate_split=approximate_split,
-            source_only_languages=source_only_languages,
-            train_only_prefixes=train_only_prefixes,
+            source_only_languages=normalized_source_only,
+            train_only_prefixes=normalized_synthetic_prefixes,
             num_workers=workers,
-        ),
-        model_prefix=str(model_prefix),
-        vocab_size=vocab_size,
-        model_type="unigram",
-        character_coverage=character_coverage,
-        byte_fallback=True,
-        split_digits=split_digits,
-        normalization_rule_name="identity",
-        pad_id=0,
-        unk_id=1,
-        bos_id=2,
-        eos_id=3,
-        user_defined_symbols=symbols,
-        required_chars="".join(required_characters),
-        input_sentence_size=input_sentence_size,
-        seed_sentencepiece_size=seed_sentencepiece_size,
-        shuffle_input_sentence=True,
-        train_extremely_large_corpus=True,
-        hard_vocab_limit=False,
-        num_threads=threads,
-    )
-    model_path = model_prefix.with_suffix(".model")
-    write_token_features(model_path, output_dir / "token_features.npz")
-    write_tokenizer_metadata(
-        model_path,
-        split_digits=split_digits,
-        language_pairs=normalized_pairs,
-        translation_directions=normalized_directions,
-        denoise_languages=denoise_languages,
-        reasoning_languages=reasoning_languages,
-        monolingual_sentences=monolingual_counts or None,
-        monolingual_sample_ratio=monolingual_sample_ratio,
-        required_characters=required_characters,
-    )
-    return model_path
+        )
+        spm.SentencePieceTrainer.train(
+            sentence_iterator=iter_stratified_tokenizer_sentences(
+                records,
+                counts.sentences_per_language,
+                quotas,
+                seed=sampling_seed,
+                sampled_counts=sampled_counts,
+                sampled_monolingual_counts=sampled_monolingual_counts,
+            ),
+            model_prefix=str(model_prefix),
+            vocab_size=vocab_size,
+            model_type="unigram",
+            character_coverage=character_coverage,
+            byte_fallback=True,
+            split_digits=split_digits,
+            normalization_rule_name="identity",
+            pad_id=0,
+            unk_id=1,
+            bos_id=2,
+            eos_id=3,
+            user_defined_symbols=symbols,
+            required_chars="".join(required_characters),
+            # Sampling already happened in our deterministic constant-memory
+            # iterator. SentencePiece must not shuffle or sample it again.
+            input_sentence_size=0,
+            seed_sentencepiece_size=min(seed_sentencepiece_size, sum(quotas.values())),
+            shuffle_input_sentence=False,
+            train_extremely_large_corpus=True,
+            hard_vocab_limit=False,
+            num_threads=threads,
+        )
+        staged_model = model_prefix.with_suffix(".model")
+        write_token_features(staged_model, staging / "token_features.npz")
+        write_tokenizer_metadata(
+            staged_model,
+            split_digits=split_digits,
+            language_pairs=normalized_pairs,
+            translation_directions=normalized_directions,
+            denoise_languages=denoise_languages,
+            reasoning_languages=reasoning_languages,
+            monolingual_sentences=dict(sampled_monolingual_counts) or None,
+            monolingual_sample_ratio=monolingual_sample_ratio,
+            required_characters=required_characters,
+            corpus_sentences=counts.sentences,
+            corpus_sentences_per_language=counts.sentences_per_language,
+            sampled_sentences=sum(sampled_counts.values()),
+            sampled_sentences_per_language=sampled_counts,
+            training_contract=training_contract,
+        )
+        _validate_tokenizer_generation(staging, training_contract)
+        if _tokenizer_source_records(paths, monolingual) != initial_source_records:
+            raise RuntimeError(
+                "tokenizer sources changed during training; refusing to publish mixed inputs"
+            )
+        _publish_tokenizer_generation(staging, output_dir)
+        published = True
+        return _validate_tokenizer_generation(output_dir, training_contract)
+    finally:
+        if staging.exists():
+            _remove_tokenizer_staging(staging, output_dir)
+        if not published and canonical_model.exists():
+            # The model is the commit marker. If publication reached it, the
+            # generation is complete even if the caller was interrupted later.
+            _validate_tokenizer_generation(output_dir, training_contract)
 
 
 def _char_script(char: str) -> int:

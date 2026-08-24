@@ -248,22 +248,26 @@ def test_full_coverage_is_allowed_when_the_frequency_floor_is_opted_out(
     import sion_translate.tokenizer as tokenizer_module
 
     trained: list[dict] = []
+
+    def observe_training_arguments(**kwargs) -> None:
+        trained.append(kwargs)
+        raise RuntimeError("stop after observing trainer arguments")
+
     monkeypatch.setattr(
         tokenizer_module.spm.SentencePieceTrainer,
         "train",
-        lambda **kwargs: trained.append(kwargs),
+        observe_training_arguments,
     )
-    monkeypatch.setattr(tokenizer_module, "write_token_features", lambda *a, **k: None)
-    monkeypatch.setattr(tokenizer_module, "write_tokenizer_metadata", lambda *a, **k: None)
 
-    tokenizer_module.train_tokenizer(
-        [str(_tiny_shard(tmp_path))],
-        tmp_path / "out",
-        vocab_size=300,
-        character_coverage=1.0,
-        required_character_min_occurrences=0,
-        language_pair=("ko", "ja"),
-    )
+    with pytest.raises(RuntimeError, match="observing trainer arguments"):
+        tokenizer_module.train_tokenizer(
+            [str(_tiny_shard(tmp_path))],
+            tmp_path / "out",
+            vocab_size=300,
+            character_coverage=1.0,
+            required_character_min_occurrences=0,
+            language_pair=("ko", "ja"),
+        )
     assert trained and trained[0]["character_coverage"] == 1.0
     assert trained[0]["required_chars"] == ""
 
@@ -275,20 +279,24 @@ def test_the_default_coverage_leaves_a_tail_for_byte_fallback(
     import sion_translate.tokenizer as tokenizer_module
 
     trained: list[dict] = []
+
+    def observe_training_arguments(**kwargs) -> None:
+        trained.append(kwargs)
+        raise RuntimeError("stop after observing trainer arguments")
+
     monkeypatch.setattr(
         tokenizer_module.spm.SentencePieceTrainer,
         "train",
-        lambda **kwargs: trained.append(kwargs),
+        observe_training_arguments,
     )
-    monkeypatch.setattr(tokenizer_module, "write_token_features", lambda *a, **k: None)
-    monkeypatch.setattr(tokenizer_module, "write_tokenizer_metadata", lambda *a, **k: None)
 
-    tokenizer_module.train_tokenizer(
-        [str(_tiny_shard(tmp_path))],
-        tmp_path / "out",
-        vocab_size=600,
-        language_pair=("ko", "ja"),
-    )
+    with pytest.raises(RuntimeError, match="observing trainer arguments"):
+        tokenizer_module.train_tokenizer(
+            [str(_tiny_shard(tmp_path))],
+            tmp_path / "out",
+            vocab_size=600,
+            language_pair=("ko", "ja"),
+        )
     assert trained
     assert trained[0]["character_coverage"] < 1.0
     assert trained[0]["byte_fallback"] is True
