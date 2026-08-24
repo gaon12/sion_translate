@@ -1,25 +1,30 @@
-"""번역 품질 평가 공용 로직.
+"""Shared translation-quality evaluation logic.
 
-고정된 평가셋에 대해 chrF / BLEU 를 계산합니다. `sion-evaluate` CLI 가
-사용하며, 같은 평가셋에 대한 외부 서비스(DeepL/Google/Papago 등) 출력과의
-비교도 지원합니다.
+The ``sion-evaluate`` CLI uses this module to compute chrF and BLEU on a fixed
+evaluation set and to compare the model with external systems such as DeepL,
+Google, or Papago on exactly the same examples.
 
-지표 선택 이유:
-- **chrF** (문자 n-gram F-score): 토큰화가 필요 없어 한국어/일본어처럼
-  띄어쓰기 규칙이 다른 언어에서도 공정합니다. 주 지표로 사용합니다.
-- **BLEU**: 관례상 함께 보고합니다. 한/일/중은 단어 분리가 모호하므로
-  문자 단위(tokenize="char")로, 그 외 언어는 표준 13a 토큰화로 계산합니다.
-- **숫자 보존**: chrF/BLEU 는 문자 n-gram 이 대부분 겹치면 높은 점수를 주므로
-  ``250mg`` → ``1200mg`` 처럼 값 하나만 바뀐 오역을 거의 벌하지 않습니다.
-  금액·용량·날짜는 한 글자만 틀려도 문장 전체가 쓸 수 없게 되므로 따로
-  집계합니다. 재현율(누락)과 정밀도(환각)를 함께 보기 위해 F1 을 쓰고,
-  "숫자가 하나라도 틀린 문장이 몇 %인지"를 exact 비율로 함께 보고합니다.
+The metrics serve different purposes:
+
+- **chrF**, a character n-gram F-score, does not require word tokenization and
+  remains comparable across languages with different spacing conventions. It
+  is the primary metric.
+- **BLEU** is included as a conventional secondary metric. Languages registered
+  for character tokenization use ``tokenize="char"``; other languages use the
+  standard 13a tokenizer.
+- **Number preservation** catches severe value corruption that chrF and BLEU
+  barely penalize when most character n-grams still overlap, such as changing
+  ``250mg`` to ``1200mg``. A one-digit error can invalidate an amount, dose, or
+  date. F1 reports both omission and invention, while exact-match counts show
+  how many number-bearing sentences preserve every value.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
+import tempfile
 import unicodedata
 from collections import Counter
 from dataclasses import asdict, dataclass
@@ -36,27 +41,29 @@ from sion_translate.scripts_registry import uses_character_tokenization
 from sion_translate.structured import structured_signature
 from sion_translate.tokenizer import SionTokenizer
 
-# 금액/용량/날짜/버전 등 "값" 으로 취급할 숫자열. 사후학습 보상과 같은 정의를
-# 써야 학습이 최적화하는 대상과 평가가 재는 대상이 어긋나지 않습니다.
+# Numeric runs representing values such as amounts, doses, dates, and versions.
+# This definition matches post-training rewards so optimization and evaluation
+# do not measure different targets.
 #
-# 경계 조건은 ASCII 영숫자/밑줄로만 판정합니다. 파이썬 ``\w`` 는 한글과 가나까지
-# 포함하므로 ``(?![\w])`` 로 막으면 ``4월``, ``1회``, ``5개`` 처럼 조사·단위가 붙은
-# 한 자리 숫자가 전부 값에서 빠집니다 — 날짜와 복용 횟수가 바로 그 형태입니다.
-# 반대로 ``utf8``, ``config2``, ``HTTP429`` 의 숫자는 값이 아니라 식별자의 일부라서
-# 앞뒤 ASCII 문자로 걸러냅니다. ``250mg`` 은 첫 분기가 ``250`` 을 잡아냅니다.
+# Boundaries consider only ASCII letters, digits, and underscores. Python's
+# ``\w`` also includes Hangul and kana, so using ``(?![\w])`` would omit single
+# digits followed by particles or units, including ``4월``, ``1회``, and ``5개``.
+# Conversely, digits in ``utf8``, ``config2``, or ``HTTP429`` belong to an
+# identifier and are excluded by adjacent ASCII characters. The first branch
+# still captures ``250`` in ``250mg``.
 NUMBER_PATTERN = re.compile(
     r"(?<![A-Za-z0-9_])[-+]?\d[\d,.:/%+\-]*\d|(?<![A-Za-z0-9_])[-+]?\d(?![0-9])"
 )
 
 
 def normalized_matches(pattern: re.Pattern[str], text: str) -> list[str]:
-    """NFKC 정규화 후 패턴에 걸린 표면형 목록. 전각 숫자도 반각과 같게 봅니다."""
+    """Return NFKC-normalized matches, treating full-width digits as equivalent."""
     normalized = unicodedata.normalize("NFKC", text)
     return [match.group(0).casefold().rstrip(".,;:!?") for match in pattern.finditer(normalized)]
 
 
 def multiset_f1(expected: Sequence[object], actual: Sequence[object]) -> float:
-    """중복을 보존하는 F1. 둘 다 비었으면 위반이 없으므로 1입니다."""
+    """Compute duplicate-aware F1, returning 1 when both multisets are empty."""
     expected_counts = Counter(expected)
     actual_counts = Counter(actual)
     if not expected_counts and not actual_counts:
@@ -70,13 +77,13 @@ def multiset_f1(expected: Sequence[object], actual: Sequence[object]) -> float:
 
 
 def structured_tokens(text: str) -> list[str]:
-    """보존해야 할 구조 토큰 목록. 숫자는 별도 지표이므로 제외합니다."""
+    """Return structure tokens that must survive translation, excluding numbers."""
 
     return list(structured_signature(text, include_numbers=False).elements())
 
 
 def has_excessive_repetition(text: str) -> bool:
-    """한 문자나 짧은 구절이 병적으로 반복되는 생성 붕괴를 판정합니다."""
+    """Detect generation collapse dominated by one character or repeated phrase."""
     surface = [char for char in text if not char.isspace()]
     if len(surface) < 12:
         return False
@@ -86,41 +93,41 @@ def has_excessive_repetition(text: str) -> bool:
 
 
 def numeric_tokens(text: str) -> list[str]:
-    """문장에서 값으로 볼 숫자열을 뽑아냅니다. 콤마는 자리 구분자로 무시합니다.
+    """Extract numeric values, ignoring commas used as digit-group separators.
 
-    ``38,720`` 과 ``38720`` 은 같은 값이고, 한쪽 표기만 다른 것을 오역으로
-    세면 지표가 표기 관습을 벌하게 됩니다.
+    ``38,720`` and ``38720`` denote the same value. Treating formatting alone
+    as mistranslation would penalize a locale's notation convention.
     """
     return [token.replace(",", "") for token in normalized_matches(NUMBER_PATTERN, text)]
 
 
 def numeric_corruption(source: str, reference: str, hypothesis: str) -> tuple[int, int]:
-    """``(발명, 누락)`` — 어떤 근거로도 설명되지 않는 숫자 변조의 개수.
+    """Return ``(invented, dropped)`` counts for unjustified numeric changes.
 
-    ``multiset_f1`` 은 변조를 **비율**로 바꿔 놓습니다. 값 하나를 지어낸
-    후보와 숫자가 많은 문장에서 하나를 빠뜨린 후보가 비슷한 점수를 받고,
-    가중치가 0.10 이면 chrF 가 조금 높은 쪽이 이깁니다. 배포 홀드아웃에서
-    10문장 중 8문장의 값이 바뀐 것이 그 결과입니다. 그래서 비율이 아니라
-    **개수**를 세고, 호출자가 이것을 하드 페널티로 씁니다.
+    ``multiset_f1`` turns corruption into a ratio. A candidate that invents one
+    value can resemble a candidate that drops one value from a number-heavy
+    sentence, allowing a small chrF gain to dominate under a 0.10 reward weight.
+    That behavior changed values in 8 of 10 deployment-holdout sentences. This
+    function therefore returns absolute counts for use as hard penalties.
 
-    판정 기준은 원문과 정답의 **합집합**입니다.
+    The decision combines evidence from both source and reference:
 
-    * **발명**: 원문에도 정답에도 없는 값이 번역문에 있는 경우. 어느 쪽으로도
-      정당화되지 않으므로 오류입니다.
-    * **누락**: 원문과 정답에 **둘 다** 있는 값이 번역문에 없는 경우. 양쪽이
-      합의한 값이므로 빠뜨릴 이유가 없습니다.
+    * An **invention** appears in the hypothesis but in neither source nor
+      reference, so neither side justifies it.
+    * A **drop** is present in both source and reference but absent from the
+      hypothesis, so both sides agree that it is required.
 
-    원문만으로 판정하지 않는 이유는 한국어가 수를 한글로 자주 적기 때문입니다.
-    ``하루 두 번`` → ``1日2回`` 에서 ``2`` 는 원문에 숫자로 없지만 정답에는
-    있으므로 발명이 아닙니다. 정답만으로 판정하지 않는 이유는 정답 자체가
-    오염될 수 있기 때문이고, 그때 원문이 값을 뒷받침해 줍니다.
+    Source-only checks fail when a language spells out numbers. In ``하루 두 번``
+    to ``1日2回``, the digit ``2`` appears only in the valid reference and is not
+    an invention. Reference-only checks fail when the reference is corrupted;
+    source evidence can still license the original value.
     """
 
     source_values = Counter(numeric_tokens(source))
     reference_values = Counter(numeric_tokens(reference))
     hypothesis_values = Counter(numeric_tokens(hypothesis))
-    licensed = source_values | reference_values  # 합집합 (원소별 최댓값)
-    required = source_values & reference_values  # 교집합 (원소별 최솟값)
+    licensed = source_values | reference_values  # Multiset union: maximum count per value.
+    required = source_values & reference_values  # Multiset intersection: minimum count.
     invented = sum((hypothesis_values - licensed).values())
     dropped = sum((required - hypothesis_values).values())
     return invented, dropped
@@ -128,7 +135,7 @@ def numeric_corruption(source: str, reference: str, hypothesis: str) -> tuple[in
 
 @dataclass(frozen=True, slots=True)
 class NumberPreservationResult:
-    """숫자가 실제로 등장한 문장에 한정한 보존 지표."""
+    """Report preservation only across sentences that contain numeric values."""
 
     f1: float
     exact: int
@@ -140,20 +147,23 @@ def number_preservation_details(
     hypotheses: Sequence[str],
     sources: Sequence[str],
 ) -> NumberPreservationResult:
-    """원문 숫자의 보존율과 번역문이 발명한 숫자의 문장 수를 계산합니다.
+    """Measure source-number preservation and count sentences with inventions.
 
-    숫자가 없는 깨끗한 문장을 정답으로 대량 집계하면 실제 숫자 오역이
-    희석됩니다. 대신 source 또는 hypothesis 어느 한쪽에라도 숫자가 있는
-    문장만 ``samples``에 포함합니다. ``inventions``는 hypothesis의 숫자
-    multiset에 source보다 많은 값이 하나라도 있는 문장의 수입니다.
+    Counting many clean, number-free sentences as correct would hide actual
+    numeric errors. ``samples`` therefore includes only sentences where the
+    source or hypothesis contains a number. ``inventions`` counts sentences
+    whose hypothesis numeric multiset exceeds the source multiset.
 
-    Reference는 chrF/BLEU처럼 번역 품질을 채점하는 데 사용하며 이 함수의
-    보존 기준이 아닙니다. 숫자·단위처럼 원문에서 유지해야 하는 값은 source와
-    hypothesis를 직접 비교해야 reference의 표기 변환이나 오류에 좌우되지 않습니다.
+    References score translation quality through chrF and BLEU, but are not the
+    preservation baseline here. Values that must survive translation should be
+    compared directly between source and hypothesis so reference formatting or
+    reference errors cannot distort this metric.
     """
 
     if len(hypotheses) != len(sources):
-        raise ValueError(f"번역문 {len(hypotheses)}개와 원문 {len(sources)}개의 수가 다릅니다")
+        raise ValueError(
+            f"hypothesis count {len(hypotheses)} does not match source count {len(sources)}"
+        )
 
     scores: list[float] = []
     exact = 0
@@ -185,11 +195,11 @@ def number_preservation(
     hypotheses: Sequence[str],
     sources: Sequence[str],
 ) -> tuple[float, int]:
-    """하위 호환용 ``(숫자 F1, 숫자 일치 문장 수)`` 요약을 반환합니다.
+    """Return the backward-compatible ``(number F1, exact sentence count)`` pair.
 
-    Hypothesis를 source와 직접 비교하며 두 값 모두 숫자 관련 문장에 한정됩니다.
-    보고서에서 정확한 분모와 숫자 환각 횟수가 필요하면
-    :func:`number_preservation_details`를 사용하십시오.
+    Hypotheses are compared directly with sources and both values cover only
+    number-bearing sentences. Use :func:`number_preservation_details` when a
+    report also needs the exact denominator and invention count.
     """
 
     result = number_preservation_details(hypotheses, sources=sources)
@@ -198,18 +208,18 @@ def number_preservation(
 
 @dataclass
 class DirectionResult:
-    """한 방향(예: ko→ja)에 대한 한 시스템의 평가 결과."""
+    """Store one system's evaluation result for one translation direction."""
 
-    system: str  # "sion" 또는 --compare 로 넘긴 외부 시스템 이름
-    direction: str  # "ko-ja" 형식
+    system: str  # "sion" or an external system name supplied through --compare.
+    direction: str  # Canonical "source-target" form.
     samples: int
-    chrf: float  # 주 지표 (0~100, 높을수록 좋음)
+    chrf: float  # Primary metric in [0, 100]; higher is better.
     bleu: float
-    bleu_tokenize: str  # BLEU 토큰화 방식 (재현성 기록용)
-    number_f1: float = 0.0  # 숫자 보존 F1 평균 (0~100)
-    number_exact: int = 0  # 숫자가 모두 일치한 문장 수
-    number_samples: int = 0  # source/hypothesis 중 숫자가 있는 문장 수
-    number_inventions: int = 0  # source보다 많은 숫자를 생성한 문장 수
+    bleu_tokenize: str  # BLEU tokenizer recorded for reproducibility.
+    number_f1: float = 0.0  # Mean number-preservation F1 in [0, 100].
+    number_exact: int = 0  # Number-bearing sentences with every value preserved.
+    number_samples: int = 0  # Sentences with a number in source or hypothesis.
+    number_inventions: int = 0  # Sentences containing values absent from the source.
 
 
 def score_translations(
@@ -218,9 +228,11 @@ def score_translations(
     *,
     target_language: str,
 ) -> tuple[float, float, str]:
-    """(chrF, BLEU, BLEU 토큰화 방식) 을 반환합니다."""
+    """Return ``(chrF, BLEU, BLEU tokenizer)`` for one target language."""
     if len(hypotheses) != len(references):
-        raise ValueError(f"번역문 {len(hypotheses)}개와 정답 {len(references)}개의 수가 다릅니다")
+        raise ValueError(
+            f"hypothesis count {len(hypotheses)} does not match reference count {len(references)}"
+        )
     from sacrebleu.metrics.bleu import BLEU
     from sacrebleu.metrics.chrf import CHRF
 
@@ -238,10 +250,10 @@ def load_split_pairs(
     model_language_pairs: Sequence[Sequence[str]],
     max_samples_per_direction: int,
 ) -> dict[tuple[str, str], list[tuple[str, str]]]:
-    """준비된 데이터셋의 holdout split 을 (원문, 정답) 텍스트 쌍으로 되돌립니다.
+    """Decode a prepared holdout split into ``(source, reference)`` text pairs.
 
-    반환: {(원문 언어, 목표 언어): [(원문, 정답), ...]}
-    shard 에는 토큰 id 만 저장되어 있으므로 토크나이저로 디코딩합니다.
+    The result maps ``(source language, target language)`` to text pairs. Shards
+    store only token IDs, so the supplied tokenizer reconstructs their text.
     """
     dataset = IndexedParallelDataset(
         dataset_dir,
@@ -259,7 +271,7 @@ def load_split_pairs(
         direction = (item["src_language"], item["target_language"])
         bucket = pairs.setdefault(direction, [])
         if len(bucket) >= max_samples_per_direction:
-            # 두 방향 모두 상한에 도달하면 더 읽을 필요가 없습니다.
+            # Stop after every reachable direction reaches its sample cap.
             if (
                 all(len(existing) >= max_samples_per_direction for existing in pairs.values())
                 and len(pairs) == expected_directions
@@ -279,10 +291,10 @@ def load_benchmark_pairs(
     translation_directions: Sequence[Sequence[str]] | None = None,
     max_samples_per_direction: int,
 ) -> dict[tuple[str, str], list[tuple[str, str]]]:
-    """외부 벤치마크 JSONL(FLORES 변환본 등)을 평가쌍으로 읽습니다.
+    """Load external benchmark JSONL, such as converted FLORES, as text pairs.
 
-    형식은 학습 데이터와 같습니다: 한 줄에 {"ko": ..., "ja": ...}.
-    양방향 모두 평가셋으로 씁니다.
+    The format matches training data, with one language-keyed JSON object per
+    line. Every explicitly configured direction can be included.
     """
     if language_pair and isinstance(language_pair[0], str):
         language_pairs = normalize_language_pairs(language_pair)  # type: ignore[arg-type]
@@ -318,9 +330,9 @@ def load_benchmark_pairs(
 
 
 def results_as_markdown(results: Sequence[DirectionResult]) -> str:
-    """비교 표를 사람이 읽기 좋은 markdown 으로 만듭니다."""
+    """Render a human-readable Markdown comparison table."""
     lines = [
-        "| system | direction | samples | chrF | BLEU | 숫자 F1 | 숫자 일치 | 숫자 환각 |",
+        "| system | direction | samples | chrF | BLEU | number F1 | number exact | number inventions |",
         "|---|---|---:|---:|---:|---:|---:|---:|",
     ]
     for result in results:
@@ -339,20 +351,83 @@ def _markdown_cell(value: str) -> str:
     return value.replace("|", "\\|").replace("\r", " ").replace("\n", "<br>")
 
 
+def _stage_text(path: Path, text: str) -> Path:
+    """Write and synchronize a private sibling file without changing ``path``."""
+
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            newline="\n",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        return temporary_path
+    except BaseException:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+        raise
+
+
+def _fsync_parent(path: Path) -> None:
+    """Persist a published directory entry where the platform supports it."""
+
+    try:
+        descriptor = os.open(path.parent, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        # Windows and some network filesystems do not expose directory fsync.
+        pass
+    finally:
+        os.close(descriptor)
+
+
 def save_results(
     results: Sequence[DirectionResult],
     output_path: str | Path,
     *,
     metadata: dict[str, object],
 ) -> None:
-    """결과를 JSON(기계용)과 Markdown(사람용)으로 저장합니다."""
+    """Save machine-readable JSON and human-readable Markdown results."""
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     payload: dict[str, object] = {
         "metadata": metadata,
         "results": [asdict(result) for result in results],
     }
-    output_path.with_suffix(".json").write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    output_path.with_suffix(".md").write_text(results_as_markdown(results) + "\n", encoding="utf-8")
+    json_path = output_path.with_suffix(".json")
+    markdown_path = output_path.with_suffix(".md")
+    staged_json: Path | None = None
+    staged_markdown: Path | None = None
+    try:
+        # Stage and synchronize both representations before replacing either
+        # existing report. A failed render or full disk therefore preserves the
+        # complete previous pair rather than truncating one public file.
+        staged_json = _stage_text(
+            json_path,
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        )
+        staged_markdown = _stage_text(markdown_path, results_as_markdown(results) + "\n")
+        os.replace(staged_markdown, markdown_path)
+        staged_markdown = None
+        _fsync_parent(markdown_path)
+        # Publish machine-readable JSON last so it remains the authoritative
+        # completion signal for consumers that inspect both files.
+        os.replace(staged_json, json_path)
+        staged_json = None
+        _fsync_parent(json_path)
+    finally:
+        if staged_json is not None:
+            staged_json.unlink(missing_ok=True)
+        if staged_markdown is not None:
+            staged_markdown.unlink(missing_ok=True)

@@ -1,4 +1,4 @@
-"""평가(sion-evaluate) 로직 검증."""
+"""Verify the shared ``sion-evaluate`` quality-measurement logic."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import sion_translate.evaluation as evaluation_module
 import sion_translate.cli.evaluate as evaluate_cli
 import sion_translate.cli.translate as translate_cli
 from sion_translate.cli.evaluate import resolve_evaluation_directions
@@ -36,16 +37,16 @@ from tests.test_language_pair import write_en_de_jsonl
 
 
 def test_score_translations_identity_is_perfect() -> None:
-    # 정답과 완전히 같은 번역은 만점이어야 한다.
+    # A hypothesis identical to the reference must receive a perfect score.
     chrf, bleu, tokenize = score_translations(
         ["오늘 날씨가 좋다"], ["오늘 날씨가 좋다"], target_language="ja"
     )
     assert chrf == 100.0
     assert round(bleu) == 100
-    assert tokenize == "char"  # 일본어는 문자 단위 BLEU
+    assert tokenize == "char"  # Japanese uses character-level BLEU.
     _, _, tokenize_en = score_translations(["hello"], ["hello"], target_language="en")
-    assert tokenize_en == "13a"  # 라틴 문자 언어는 표준 토큰화
-    # 완전히 다른 번역은 점수가 낮아야 한다.
+    assert tokenize_en == "13a"  # Latin-script languages use standard tokenization.
+    # Unrelated text must receive a low score.
     chrf_bad, _, _ = score_translations(
         ["전혀 다른 문장"], ["오늘 날씨가 좋다"], target_language="ja"
     )
@@ -83,8 +84,8 @@ def test_load_benchmark_pairs_builds_both_directions(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     pairs = load_benchmark_pairs([benchmark], ("ko", "ja"), max_samples_per_direction=3)
-    assert len(pairs[("ko", "ja")]) == 3  # max_samples 상한 적용
-    # 역방향은 (원문, 정답)이 뒤집혀야 한다.
+    assert len(pairs[("ko", "ja")]) == 3  # Apply the configured sample cap.
+    # Reverse-direction pairs must exchange source and reference.
     assert pairs[("ja", "ko")][0] == (pairs[("ko", "ja")][0][1], pairs[("ko", "ja")][0][0])
 
 
@@ -420,7 +421,7 @@ def test_evaluate_main_records_model_owned_language_pairs(
 
 
 def test_load_split_pairs_round_trips_text(tmp_path: Path) -> None:
-    """holdout split 의 토큰 id 가 다시 읽을 수 있는 텍스트로 복원되어야 한다."""
+    """Holdout token IDs must decode back into readable text."""
     source = tmp_path / "corpus.jsonl"
     write_en_de_jsonl(source)
     model_path = train_tokenizer(
@@ -472,43 +473,43 @@ def test_load_split_pairs_round_trips_text(tmp_path: Path) -> None:
     backward = pairs[("de", "en")]
     assert len(forward) == min(stats.test, 10)
     assert len(backward) == len(forward)
-    # 복원된 텍스트에 실제 단어가 들어 있어야 한다 (디코딩 성공 확인).
+    # A real word in the reconstructed text confirms successful decoding.
     assert any("number" in source_text for source_text, _ in forward)
     assert any("Nummer" in reference for _, reference in forward)
 
 
 def test_numeric_tokens_ignores_digit_grouping_and_width() -> None:
-    # 콤마 표기와 전각/반각 차이는 값이 같으므로 오역으로 세면 안 된다.
+    # Grouping commas and full-/half-width forms do not change the numeric value.
     assert numeric_tokens("38,720원") == numeric_tokens("38720원") == ["38720"]
     assert numeric_tokens("２０２６년 ４월") == ["2026", "4"]
     assert numeric_tokens("숫자가 없는 문장") == []
 
 
 def test_numeric_tokens_sees_counters_but_not_identifiers() -> None:
-    # 조사·단위가 붙은 한 자리 숫자(날짜, 복용 횟수)도 값으로 잡아야 한다.
+    # Capture single digits followed by particles or units, including dates and doses.
     assert numeric_tokens("1회 250mg씩, 48시간 간격") == ["1", "250", "48"]
     assert numeric_tokens("접수는 4월 30일까지") == ["4", "30"]
-    # 식별자 안의 숫자는 값이 아니므로 세지 않는다.
+    # Digits embedded in identifiers are not standalone values.
     assert numeric_tokens("config.json의 retry_limit") == []
     assert numeric_tokens("utf8 인코딩") == []
 
 
 def test_numeric_corruption_counts_values_nothing_licenses() -> None:
-    # 실측 결함: 원래 값을 남긴 채 새 값을 덧붙이는 발명.
+    # Measured defect: retain the original value while inventing an additional one.
     assert numeric_corruption("1개 주세요", "1つください", "1, 999つください") == (1, 0)
-    # 값 자체가 바뀌면 발명 하나와 누락 하나다.
+    # Replacing a value creates one invention and one drop.
     assert numeric_corruption("가격 100", "価格 100円", "価格 200円") == (1, 1)
-    # 원문과 정답이 합의한 값을 빠뜨린 경우.
+    # Dropping a value agreed upon by source and reference counts as omission.
     assert numeric_corruption("250mg씩 48시간", "250mgずつ48時間", "250mgずつ") == (0, 1)
-    # 값을 지킨 번역은 변조가 없다.
+    # A hypothesis that preserves the value has no numeric corruption.
     assert numeric_corruption("가격 100", "価格 100円", "価格 100円") == (0, 0)
 
 
 def test_a_number_only_the_reference_spells_out_is_not_an_invention() -> None:
-    """한국어는 수를 한글로 자주 적는다. 원문만으로 판정하면 정상 번역이 걸린다."""
+    """Reference evidence permits digits translated from source number words."""
 
     assert numeric_corruption("하루 두 번", "1日2回", "1日2回") == (0, 0)
-    # 정답에도 원문에도 없는 값은 여전히 발명이다.
+    # A value absent from both source and reference remains an invention.
     assert numeric_corruption("하루 두 번", "1日2回", "1日5回") == (1, 0)
 
 
@@ -527,7 +528,7 @@ def test_structured_tokens_share_the_reversible_protection_parser() -> None:
 
 
 def test_number_preservation_catches_altered_values() -> None:
-    # 실제 관측된 오역: 용량과 금액이 그럴듯한 다른 값으로 바뀐다.
+    # Observed defect: doses and amounts change to plausible but incorrect values.
     sources = [
         "1회 250mg씩 복용하세요.",
         "합계 금액은 38,720엔입니다.",
@@ -548,7 +549,7 @@ def test_number_preservation_catches_altered_values() -> None:
 
 
 def test_number_preservation_scores_missing_and_invented_numbers() -> None:
-    # 누락(재현율)과 환각(정밀도)이 모두 F1 을 낮춰야 한다.
+    # Both omissions (recall) and inventions (precision) must reduce F1.
     dropped = number_preservation(["금액은 미정입니다."], sources=["금액은 38,720엔입니다."])[0]
     invented = number_preservation(
         ["금액은 38,720엔이고 수량은 50개입니다."],
@@ -601,7 +602,7 @@ def test_number_preservation_reports_additional_invention_when_source_has_number
 
 
 def test_number_preservation_rejects_length_mismatch() -> None:
-    with pytest.raises(ValueError, match="수가 다릅니다"):
+    with pytest.raises(ValueError, match="does not match source count"):
         number_preservation(["a"], sources=["a", "b"])
 
 
@@ -617,3 +618,30 @@ def test_results_saved_as_json_and_markdown(tmp_path: Path) -> None:
     assert payload["metadata"]["model"] == "test"
     assert len(payload["results"]) == 2
     assert (tmp_path / "eval.md").read_text(encoding="utf-8").startswith("| system |")
+
+
+def test_result_staging_failure_preserves_existing_reports(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    json_path = tmp_path / "eval.json"
+    markdown_path = tmp_path / "eval.md"
+    json_path.write_text('{"old": true}\n', encoding="utf-8")
+    markdown_path.write_text("old report\n", encoding="utf-8")
+    calls = 0
+
+    def fail_second_fsync(_descriptor: int) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected staging failure")
+
+    monkeypatch.setattr(evaluation_module.os, "fsync", fail_second_fsync)
+    results = [DirectionResult("sion", "sw-ar", 1, 50.0, 20.0, "13a")]
+
+    with pytest.raises(OSError, match="injected staging failure"):
+        save_results(results, tmp_path / "eval", metadata={"model": "new"})
+
+    assert json_path.read_text(encoding="utf-8") == '{"old": true}\n'
+    assert markdown_path.read_text(encoding="utf-8") == "old report\n"
+    assert list(tmp_path.glob(".eval.*.tmp")) == []

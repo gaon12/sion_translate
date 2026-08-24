@@ -326,13 +326,13 @@ def test_containment_answers_is_the_holdout_inside_the_corpus_line() -> None:
 
 
 def test_an_empty_holdout_is_refused(tmp_path) -> None:
-    with pytest.raises(ValueError, match="challenge 문장이 없습니다"):
+    with pytest.raises(ValueError, match="no challenge sentences"):
         audit_holdout_leakage([], [])
 
 
 def test_empty_corpus_and_nonpositive_match_cap_are_refused() -> None:
     item = HoldoutItem("x", "ko", "가나다")
-    with pytest.raises(ValueError, match="학습 코퍼스가 없습니다"):
+    with pytest.raises(ValueError, match="no training corpus files"):
         audit_holdout_leakage([item], [])
     with pytest.raises(ValueError, match="maximum_matches_per_item"):
         audit_holdout_leakage([item], [Path("unused.jsonl")], maximum_matches_per_item=0)
