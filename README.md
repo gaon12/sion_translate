@@ -30,8 +30,8 @@ updated before the corresponding training and evaluation runs are complete.
   preference reward without also remaining anchored to the reference sequence.
 - Conservative structured-content checks for placeholders, format specifiers, template
   syntax, numbers, and protected tokens.
-- Buffered automatic model sizing so a small corpus increase near a boundary does not
-  immediately double model capacity.
+- Smooth token-based model sizing with intermediate valid architectures, so a small
+  corpus increase cannot double model capacity at a preset boundary.
 - Bounded-memory preprocessing, exact artifact inventories, transactional exports, and a
   verifiable GPU upload bundle.
 - Native FP32, BF16, FP16, FP8, INT8, INT4, GGUF, and Transformers export paths. The exact
@@ -183,31 +183,49 @@ The foundation stage publishes only languages that have positive sampling mass i
 prepared training split. A language reserved in configuration but absent from the final
 sample cannot appear in the foundation model's capability metadata.
 
-## Buffered automatic model sizing
+## Smooth automatic model sizing
 
-Automatic sizing keeps stable preset names and applies a five-percent promotion buffer
-to each nominal corpus boundary:
+Automatic sizing reads the exact sum of `src_length + tgt_length` from the authenticated
+prepared training indexes. Each physical source/target sequence is counted once. Adding
+virtual reverse directions or training for more epochs reuses the same content and does
+not inflate model capacity. A legacy caller without prepared lengths uses an explicit
+32-tokens-per-physical-pair compatibility reference; production training does not use
+that proxy.
 
-| Current preset | Nominal boundary | Promotion starts at |
-|---|---:|---:|
-| `small` | 200,000 pairs | 210,000 pairs |
-| `medium` | 3,000,000 pairs | 3,150,000 pairs |
-| `base` | 30,000,000 pairs | 31,500,000 pairs |
-| `large` | 100,000,000 pairs | 105,000,000 pairs |
-| `xlarge` | unbounded | final tier |
+The continuous scaling curve uses these reference anchors:
 
-For example, growing a 29.75-million-pair corpus to 30.25 million pairs remains on the
-`base` preset. Explicit model settings in YAML still take precedence over automatic
-selection.
+| Unique physical tokens | Anchor architecture | Approximate parameters at 48k vocab with refinement |
+|---:|---|---:|
+| 6.4 million | `small` | 66.8M |
+| 96 million | `medium` | 124.2M |
+| 960 million | `base` | 209.7M |
+| 3.2 billion | `large` | 439.8M |
+| 9.6 billion | `xlarge` | 801.1M |
 
-With the production 48,000-piece vocabulary and candidate refinement enabled, `base`
-contains about 203.4 million parameters and `large` about 418.9 million. The current
-27,602,231-row inventory remains `base`; promotion does not occur until 31,500,000 rows.
-Parameter totals vary when the automatic vocabulary size changes.
+Targets are interpolated continuously in log token/log parameter space. The selector then
+chooses the nearest point from a deterministic 61-architecture ladder. Each intermediate
+point changes only one primary width, encoder-depth, decoder-depth, or feed-forward
+dimension; head counts are derived again when width changes. Every adjacent option
+preserves attention divisibility and differs by less than 12%, instead of jumping directly
+from about 210M to 440M.
 
-The buffer controls only promotion stability. It does not claim that a larger model is
-always better; data quality, direction balance, effective tokens, hardware capacity, and
-validation results still decide whether a preset is appropriate.
+All automatic candidates use two query heads per KV head. Their KV projection width is
+therefore exactly half of `d_model` and never falls when model width grows. Head dimensions
+remain 8-aligned and between 64 and 160. This quality-oriented policy uses more KV
+parameters, attention work, and inference cache than the older, more aggressively grouped
+presets; the trainer's preflight counts the constructed model's actual parameters before
+allocating optimizer state.
+
+The total target uses a fixed 48,000-piece tied-embedding reference. The candidate scorer
+uses the tokenizer's actual vocabulary and enabled modules, so a discrete vocabulary-size
+change consumes a different share of the same budget instead of creating another total
+parameter cliff. Explicit complete architecture settings in YAML always take precedence.
+
+The 27,602,231-row inventory has no authoritative final size until tokenizer training and
+dataset preparation expose its exact token count. Its row-only compatibility preview is
+about 203.2M parameters with the current 48k vocabulary and candidate refinement, close to
+the 200M class rather than the 440M class. The training log records the exact token count,
+continuous target, selected architecture, vocabulary size, and estimated parameter count.
 
 ## Training and restart behavior
 

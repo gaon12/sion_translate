@@ -7,7 +7,7 @@
 # needs to override.
 #
 # Automatic policy covers:
-#   - buffered small, medium, base, large, or xlarge model selection;
+#   - smooth token-scaled capacity from a dense valid architecture ladder;
 #   - BF16, FP16, or FP32 precision from the common device capability;
 #   - per-GPU batch size, activation checkpointing, and accumulation;
 #   - complete-corpus epoch budget and epoch-boundary early stopping;
@@ -76,13 +76,14 @@ model:
     # disabled until a separate ablation.
     semantic_parity_enabled: false
 
-# To pin capacity manually, uncomment a complete compatible set. The default
-# uses effective pair count and the five-percent promotion buffer.
+# To pin capacity manually, uncomment a complete compatible set. By default,
+# the authenticated prepared src+tgt token total selects a smooth capacity
+# target; virtual graph directions and repeated epochs do not inflate it.
 #   d_model: 768
 #   encoder_layers: 16
 #   decoder_layers: 8
 #   num_heads: 12
-#   num_kv_heads: 4
+#   num_kv_heads: 6
 #   d_ff: 2048
 #   dropout: 0.10
 #   label_smoothing: 0.10

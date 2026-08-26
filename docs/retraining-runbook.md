@@ -161,29 +161,49 @@ and tokenizer version policy.
 
 ## 6. Review automatic model sizing
 
-Automatic sizing uses effective training data, not a hard-coded language combination.
-Release 1.5 adds a five-percent promotion buffer at each preset boundary. The current
-promotion points are:
+Automatic sizing uses the authenticated prepared token inventory, not a hard-coded
+language combination or the number of graph edges. Sum `src_length + tgt_length` once for
+each physical training row. Do not multiply by reverse-direction expansion or planned
+epochs: those operations reuse existing content rather than adding unique observations.
 
-| Promotion | Raw boundary | Promotion point | Approximate parameters at a 48k vocabulary |
-|---|---:|---:|---:|
-| `small` -> `medium` | 200,000 | 210,000 | 64.7M -> 118.3M |
-| `medium` -> `base` | 3,000,000 | 3,150,000 | 118.3M -> 203.4M |
-| `base` -> `large` | 30,000,000 | 31,500,000 | 203.4M -> 418.9M |
-| `large` -> `xlarge` | 100,000,000 | 105,000,000 | 418.9M -> 753.9M |
+The continuous log-log scaling curve has five reference points:
 
-The parameter figures include the enabled candidate-refinement module and hold the
-vocabulary at 48,000 pieces so the architectural jump is visible. Actual totals also
-depend on the automatically selected vocabulary. The current 27,602,231-row snapshot
-therefore remains on the 203M-class `base` preset until it reaches 31,500,000 rows,
-instead of jumping to the roughly 419M `large` preset at the nominal 30M boundary.
+| Unique physical tokens | Anchor | Approximate parameters at 48k vocab with refinement |
+|---:|---|---:|
+| 6.4 million | `small` | 66.8M |
+| 96 million | `medium` | 124.2M |
+| 960 million | `base` | 209.7M |
+| 3.2 billion | `large` | 439.8M |
+| 9.6 billion | `xlarge` | 801.1M |
 
-The buffer prevents a modest addition near a boundary from abruptly selecting a much
-larger model. It is a stability policy, not a claim that one preset is universally best.
-Record the selected preset, effective example count, graph, token budget, and validation
-curves for each run.
+The runtime interpolates a continuous parameter target and selects the nearest valid point
+from a deterministic 61-architecture ladder. Ladder points change one primary dimension
+at a time; head counts are derived again when width changes. Every point preserves
+query/KV-head divisibility, and every adjacent parameter increase is below 12%; there is
+no direct 210M-to-440M promotion. A legacy API caller that has no prepared lengths uses
+the explicit 32-tokens-per-pair reference constant, but the production CLI always supplies
+the exact indexed total.
 
-Do not override the capacity preflight simply to start training. The runner estimates
+Automatic attention uses two query heads per KV head. The KV projection width is exactly
+half of `d_model`, so it is nondecreasing across the ladder; head dimensions stay
+8-aligned in the 64--160 range. This keeps representational KV capacity from collapsing
+at an intermediate width. It also costs more attention work and inference KV cache than
+the older, more aggressively grouped anchors, so do not copy old memory estimates.
+
+The continuous total budget is defined at a fixed 48,000-piece tied-embedding reference.
+Candidates are counted with the actual vocabulary, embedding-sharing choice, and enabled
+modules. This makes a larger vocabulary consume more of the same budget and prevents the
+discrete tokenizer vocabulary tiers from adding a second model-capacity cliff.
+
+Do not treat the current 27,602,231 rows as an exact capacity measurement before local
+tokenizer and dataset preparation finish. The row-only compatibility preview is about
+203.2M parameters with a 48k vocabulary and candidate refinement; the production log will
+replace that preview with the authoritative token count, smooth target, selected shape,
+and estimated parameter count. Record those values with the graph, data fingerprint,
+sampling policy, and validation curves for every run.
+
+Do not override the capacity preflight simply to start training. The runner constructs the
+final configured model on the meta device, counts its actual parameters, and then estimates
 parameters, gradients, optimizer state, optional EMA, activations, communication buffers,
 and runtime headroom before CUDA allocation.
 

@@ -88,8 +88,8 @@ The runner performs these operations:
 
 1. Validates CUDA, NCCL, the visible GPU set, and the common BF16 capability.
 2. Authenticates the raw inputs and all prepared artifact inventories.
-3. Selects a buffered data-fit model preset, batch size, precision, and distributed
-   strategy from the corpus and the smallest visible GPU.
+3. Selects a smooth token-scaled model architecture, batch size, precision, and
+   distributed strategy from the corpus and the smallest visible GPU.
 4. Resumes the furthest fully authenticated stage.
 5. Runs foundation pretraining when a prepared monolingual dataset is available.
 6. Runs directed translation SFT from the selected foundation weights.

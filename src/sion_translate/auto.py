@@ -23,12 +23,13 @@ import time
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
 import torch
 
-from sion_translate.config import AppConfig
+from sion_translate.config import AppConfig, ExperimentalConfig
 from sion_translate.fingerprint import (
     PREPROCESSING_SCHEMA,
     DatasetFingerprint,
@@ -237,11 +238,15 @@ def estimate_pair_count(files: Mapping[str, int], data_dir: str | Path) -> int:
 
 # Data- and environment-aware defaults
 
-# Nominal boundaries describe the original data-fit policy. A promotion buffer
-# keeps small corpus changes from doubling model capacity at a sharp boundary.
-# The final preset is intentionally unbounded.
-MODEL_PROMOTION_BUFFER_PERCENT = 5
-MODEL_PROMOTION_BUFFER_RATIO = MODEL_PROMOTION_BUFFER_PERCENT / 100
+# Model capacity follows the unique token mass in the authenticated prepared
+# training split. Virtual reverse directions and repeated epochs reuse those
+# tokens and therefore must not make the model appear to have more source data.
+# Thirty-two tokens per physical pair is an explicit compatibility reference
+# used only when a legacy caller cannot provide prepared token lengths. It is
+# not a measurement of the current corpus and never replaces prepared lengths
+# in the production training path.
+MODEL_REFERENCE_TOKENS_PER_PAIR = 32
+DEFAULT_MODEL_SIZING_VOCAB_SIZE = 48_000
 MODEL_SIZE_KEYS = (
     "d_model",
     "encoder_layers",
@@ -250,8 +255,8 @@ MODEL_SIZE_KEYS = (
     "num_kv_heads",
     "d_ff",
 )
-MODEL_PRESETS: tuple[tuple[int | None, str, dict[str, int]], ...] = (
-    # (nominal upper boundary, stable preset name, model settings)
+MODEL_PRESETS: tuple[tuple[int, str, dict[str, int]], ...] = (
+    # (physical-pair-equivalent anchor, stable anchor name, model settings)
     (
         200_000,
         "small",
@@ -260,7 +265,7 @@ MODEL_PRESETS: tuple[tuple[int | None, str, dict[str, int]], ...] = (
             encoder_layers=8,
             decoder_layers=4,
             num_heads=8,
-            num_kv_heads=2,
+            num_kv_heads=4,
             d_ff=1536,
         ),
     ),
@@ -272,7 +277,7 @@ MODEL_PRESETS: tuple[tuple[int | None, str, dict[str, int]], ...] = (
             encoder_layers=12,
             decoder_layers=6,
             num_heads=10,
-            num_kv_heads=2,
+            num_kv_heads=5,
             d_ff=1792,
         ),
     ),
@@ -284,7 +289,7 @@ MODEL_PRESETS: tuple[tuple[int | None, str, dict[str, int]], ...] = (
             encoder_layers=16,
             decoder_layers=8,
             num_heads=12,
-            num_kv_heads=4,
+            num_kv_heads=6,
             d_ff=2048,
         ),
     ),
@@ -296,23 +301,126 @@ MODEL_PRESETS: tuple[tuple[int | None, str, dict[str, int]], ...] = (
             encoder_layers=20,
             decoder_layers=10,
             num_heads=16,
-            num_kv_heads=4,
+            num_kv_heads=8,
             d_ff=2816,
         ),
     ),
     (
-        None,
+        300_000_000,
         "xlarge",
         dict(
             d_model=1280,
             encoder_layers=24,
             decoder_layers=12,
             num_heads=20,
-            num_kv_heads=4,
+            num_kv_heads=10,
             d_ff=3584,
         ),
     ),
 )
+
+_MODEL_LADDER_QUANTA = {
+    "d_model": 32,
+    "encoder_layers": 1,
+    "decoder_layers": 1,
+    "d_ff": 128,
+}
+
+
+@dataclass(frozen=True)
+class _ModelArchitectureCandidate:
+    """One reproducible, GPU-compatible point on the capacity ladder."""
+
+    name: str
+    settings: dict[str, int]
+
+
+def _head_layout_for_width(d_model: int) -> tuple[int, int]:
+    """Choose a tensor-friendly GQA layout without reducing KV capacity.
+
+    Automatic candidates use two query heads per KV head. This makes the total
+    KV projection width exactly half of d_model, so increasing model width can
+    never silently reduce the rank of the key/value representation. Among
+    valid layouts, prefer a head dimension near 64 while requiring an 8-wide
+    tensor-core alignment and keeping the dimension in the practical 64--160
+    range used by the ladder.
+    """
+
+    candidates: list[tuple[int, int, int]] = []
+    for num_heads in range(2, d_model + 1, 2):
+        if d_model % num_heads:
+            continue
+        head_dim = d_model // num_heads
+        if 64 <= head_dim <= 160 and head_dim % 8 == 0:
+            candidates.append((abs(head_dim - 64), -num_heads, num_heads))
+    if not candidates:
+        raise AssertionError(f"No supported automatic attention layout for width {d_model}")
+    num_heads = min(candidates)[2]
+    return num_heads, num_heads // 2
+
+
+def _interpolate_architecture_segment(
+    lower: Mapping[str, int],
+    upper: Mapping[str, int],
+) -> tuple[dict[str, int], ...]:
+    """Walk between anchors while changing one primary architecture knob per step."""
+
+    current = dict(lower)
+    architectures = [dict(current)]
+    events: list[tuple[Fraction, int, str, int]] = []
+    for order, (key, quantum) in enumerate(_MODEL_LADDER_QUANTA.items()):
+        distance = upper[key] - lower[key]
+        if distance < 0 or distance % quantum:
+            raise AssertionError(f"Invalid model anchor progression for {key}")
+        increments = [quantum] * (distance // quantum)
+        if key == "d_model":
+            # Thirty-two-wide candidates keep early-model jumps below 12%.
+            # Some widths have no group-size-two, 8-aligned head layout in the
+            # supported head-dimension range; merge those increments into the
+            # next valid width instead of emitting an inefficient shape.
+            increments = []
+            previous_width = lower[key]
+            for width in range(lower[key] + quantum, upper[key] + 1, quantum):
+                try:
+                    _head_layout_for_width(width)
+                except AssertionError:
+                    continue
+                increments.append(width - previous_width)
+                previous_width = width
+            if previous_width != upper[key]:
+                raise AssertionError(f"Upper model width {upper[key]} has no supported layout")
+        step_count = len(increments)
+        for step, increment in enumerate(increments, start=1):
+            # Midpoint event positions interleave width, depth, and FFN growth.
+            # The secondary key keeps simultaneous events reproducible while
+            # retaining the one-knob-per-candidate maximum-jump guarantee.
+            events.append((Fraction(2 * step - 1, 2 * step_count), order, key, increment))
+    for _position, _order, key, quantum in sorted(events):
+        current = dict(current)
+        current[key] += quantum
+        if key == "d_model":
+            current["num_heads"], current["num_kv_heads"] = _head_layout_for_width(current[key])
+        architectures.append(current)
+    if current != dict(upper):
+        raise AssertionError("Model architecture anchors cannot be connected by the ladder")
+    return tuple(architectures)
+
+
+def _build_model_architecture_ladder() -> tuple[_ModelArchitectureCandidate, ...]:
+    candidates: list[_ModelArchitectureCandidate] = []
+    for anchor_index in range(len(MODEL_PRESETS) - 1):
+        _lower_tokens, lower_name, lower = MODEL_PRESETS[anchor_index]
+        _upper_tokens, upper_name, upper = MODEL_PRESETS[anchor_index + 1]
+        segment = _interpolate_architecture_segment(lower, upper)
+        for step, settings in enumerate(segment[:-1]):
+            name = lower_name if step == 0 else f"{lower_name}-{upper_name}-{step:02d}"
+            candidates.append(_ModelArchitectureCandidate(name, settings))
+    _tokens, final_name, final_settings = MODEL_PRESETS[-1]
+    candidates.append(_ModelArchitectureCandidate(final_name, dict(final_settings)))
+    return tuple(candidates)
+
+
+MODEL_ARCHITECTURE_LADDER = _build_model_architecture_ladder()
 
 # Target sequences per optimizer update: batch times ranks times accumulation.
 TARGET_EFFECTIVE_BATCH = 256
@@ -348,16 +456,6 @@ def pick_vocab_size(pair_estimate: int) -> int:
     return 64_000
 
 
-def buffered_model_promotion_threshold(nominal_threshold: int) -> int:
-    """Return the first pair count that promotes beyond a nominal boundary."""
-
-    if type(nominal_threshold) is not int:
-        raise TypeError("nominal_threshold must be an integer")
-    if nominal_threshold <= 0:
-        raise ValueError("nominal_threshold must be positive")
-    return (nominal_threshold * (100 + MODEL_PROMOTION_BUFFER_PERCENT) + 99) // 100
-
-
 def _validated_pair_count(pair_count: int) -> int:
     if type(pair_count) is not int:
         raise TypeError("pair_count must be a non-negative integer")
@@ -366,21 +464,207 @@ def _validated_pair_count(pair_count: int) -> int:
     return pair_count
 
 
-def _selected_model_preset_index(pair_count: int) -> int:
+def _validated_training_token_count(training_token_count: int) -> int:
+    if type(training_token_count) is not int:
+        raise TypeError("training_token_count must be a non-negative integer")
+    if training_token_count < 0:
+        raise ValueError("training_token_count must be non-negative")
+    return training_token_count
+
+
+def _validated_architecture(architecture: Mapping[str, int]) -> dict[str, int]:
+    missing = tuple(key for key in MODEL_SIZE_KEYS if key not in architecture)
+    if missing:
+        raise ValueError(f"Model architecture is missing required keys: {missing}")
+    settings: dict[str, int] = {}
+    for key in MODEL_SIZE_KEYS:
+        value = architecture[key]
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"Model architecture {key} must be a positive integer")
+        settings[key] = value
+    if settings["d_model"] % settings["num_heads"]:
+        raise ValueError("Model architecture d_model must be divisible by num_heads")
+    if settings["num_heads"] % settings["num_kv_heads"]:
+        raise ValueError("Model architecture num_heads must be divisible by num_kv_heads")
+    return settings
+
+
+def estimate_model_parameter_count(
+    architecture: Mapping[str, int],
+    *,
+    vocab_size: int,
+    tie_embeddings: bool = True,
+    experimental: ExperimentalConfig | None = None,
+) -> int:
+    """Return the exact trainable parameter count for one supported architecture.
+
+    The calculation mirrors ``SionForConditionalGeneration`` without allocating
+    tensors. It includes the configured vocabulary, tied or untied output
+    embeddings, and every optional module that can add trainable parameters.
+    """
+
+    settings = _validated_architecture(architecture)
+    if type(vocab_size) is not int or vocab_size <= 0:
+        raise ValueError("vocab_size must be a positive integer")
+    if not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
+        tie_embeddings, bool
+    ):
+        raise TypeError("tie_embeddings must be a boolean")
+    exp = experimental if experimental is not None else ExperimentalConfig()
+
+    d_model = settings["d_model"]
+    num_heads = settings["num_heads"]
+    num_kv_heads = settings["num_kv_heads"]
+    d_ff = settings["d_ff"]
+    encoder_layers = settings["encoder_layers"]
+    decoder_layers = settings["decoder_layers"]
+    head_dim = d_model // num_heads
+
+    # One grouped-query attention block has Q and output projections of d*d,
+    # plus K and V projections of d*(kv_heads*head_dim).
+    attention = 2 * d_model * d_model + 2 * d_model * num_kv_heads * head_dim
+    feed_forward = 3 * d_model * d_ff
+    encoder_layer = attention + feed_forward + 2 * d_model
+    decoder_layer = 2 * attention + feed_forward + 3 * d_model
+    parameters = (
+        vocab_size * d_model
+        + encoder_layers * encoder_layer
+        + decoder_layers * decoder_layer
+        + 2 * d_model
+    )
+    if not tie_embeddings:
+        parameters += vocab_size * d_model
+
+    if exp.morphoscript_enabled:
+        feature_dim = max(32, d_model // 16)
+        feature_rows = exp.script_classes + 20 + 22 + 29
+        parameters += (
+            feature_rows * feature_dim
+            + 4 * feature_dim * d_model
+            + d_model * d_model
+            + encoder_layers
+        )
+    if exp.core_enabled:
+        parameters += d_model + 2 * d_model * exp.register_classes + exp.register_classes + 1
+    if exp.tetm_enabled:
+        parameters += (exp.tetm_types + exp.tetm_modes + 2) * d_model + attention + 1
+    if exp.bats_enabled:
+        parameters += 2 * d_model * exp.bats_dim + exp.bats_dim
+    if exp.evidence_repair_enabled:
+        parameters += attention + 3 * d_model * d_model + 3 * d_model + 2
+    if exp.candidate_refinement_enabled:
+        parameters += 5 * d_model * d_model + 2 * d_model + 1
+    if exp.semantic_parity_enabled:
+        parameters += 2 * d_model + 2 * d_model * exp.semantic_parity_dim
+    return parameters
+
+
+def smooth_model_parameter_target(training_token_count: int) -> int:
+    """Map unique prepared tokens to a continuous total-parameter budget.
+
+    The log-log interpolation follows the established model anchors but uses a
+    fixed 48k tied-embedding reference. Consequently, changing the tokenizer
+    vocabulary consumes a different share of one stable total budget instead
+    of adding a second capacity cliff on top of the data scaling rule.
+    """
+
+    token_count = _validated_training_token_count(training_token_count)
+    anchors = tuple(
+        (
+            pair_anchor * MODEL_REFERENCE_TOKENS_PER_PAIR,
+            estimate_model_parameter_count(
+                settings,
+                vocab_size=DEFAULT_MODEL_SIZING_VOCAB_SIZE,
+            ),
+        )
+        for pair_anchor, _name, settings in MODEL_PRESETS
+    )
+    if token_count <= anchors[0][0]:
+        return anchors[0][1]
+    if token_count >= anchors[-1][0]:
+        return anchors[-1][1]
+    for (lower_tokens, lower_parameters), (upper_tokens, upper_parameters) in zip(
+        anchors[:-1],
+        anchors[1:],
+        strict=True,
+    ):
+        if token_count <= upper_tokens:
+            fraction = math.log(token_count / lower_tokens) / math.log(upper_tokens / lower_tokens)
+            log_target = math.log(lower_parameters) + fraction * math.log(
+                upper_parameters / lower_parameters
+            )
+            return round(math.exp(log_target))
+    raise AssertionError("Model scaling anchors must cover every validated token count")
+
+
+def _select_model_architecture(
+    training_token_count: int,
+    *,
+    vocab_size: int,
+    tie_embeddings: bool,
+    experimental: ExperimentalConfig | None,
+) -> tuple[str, dict[str, int], int, int]:
+    token_count = _validated_training_token_count(training_token_count)
+    target = smooth_model_parameter_target(token_count)
+    scored = tuple(
+        (
+            estimate_model_parameter_count(
+                candidate.settings,
+                vocab_size=vocab_size,
+                tie_embeddings=tie_embeddings,
+                experimental=experimental,
+            ),
+            candidate,
+        )
+        for candidate in MODEL_ARCHITECTURE_LADDER
+    )
+    estimated_parameters, selected = min(
+        scored,
+        # Relative log distance treats equal percentage under/over-shoots
+        # symmetrically. A tie chooses the smaller model for memory safety.
+        key=lambda item: (
+            abs(math.log(item[0] / target)),
+            item[0],
+            item[1].name,
+        ),
+    )
+    return selected.name, dict(selected.settings), target, estimated_parameters
+
+
+def pick_model_architecture(
+    training_token_count: int,
+    *,
+    vocab_size: int = DEFAULT_MODEL_SIZING_VOCAB_SIZE,
+    tie_embeddings: bool = True,
+    experimental: ExperimentalConfig | None = None,
+) -> tuple[str, dict[str, int]]:
+    """Select the nearest valid architecture to a smooth token-scaled target."""
+
+    name, settings, _target, _estimated = _select_model_architecture(
+        training_token_count,
+        vocab_size=vocab_size,
+        tie_embeddings=tie_embeddings,
+        experimental=experimental,
+    )
+    return name, settings
+
+
+def pick_model_preset(
+    pair_count: int,
+    *,
+    vocab_size: int = DEFAULT_MODEL_SIZING_VOCAB_SIZE,
+    tie_embeddings: bool = True,
+    experimental: ExperimentalConfig | None = None,
+) -> tuple[str, dict[str, int]]:
+    """Compatibility wrapper using the documented tokens-per-pair reference."""
+
     count = _validated_pair_count(pair_count)
-    for index, (nominal_threshold, _name, _preset) in enumerate(MODEL_PRESETS):
-        if nominal_threshold is None:
-            return index
-        if count < buffered_model_promotion_threshold(nominal_threshold):
-            return index
-    raise AssertionError("MODEL_PRESETS must end with an unbounded preset")
-
-
-def pick_model_preset(pair_count: int) -> tuple[str, dict[str, int]]:
-    """Select a deterministic preset after applying the promotion buffer."""
-
-    _threshold, name, preset = MODEL_PRESETS[_selected_model_preset_index(pair_count)]
-    return name, dict(preset)
+    return pick_model_architecture(
+        count * MODEL_REFERENCE_TOKENS_PER_PAIR,
+        vocab_size=vocab_size,
+        tie_embeddings=tie_embeddings,
+        experimental=experimental,
+    )
 
 
 def pick_batch_size(env: EnvironmentInfo, d_model: int) -> int:
@@ -440,6 +724,7 @@ def apply_auto_settings(
     train_examples: int,
     validation_examples: int,
     physical_train_pairs: int | None = None,
+    physical_train_tokens: int | None = None,
     source_names: list[str] | None = None,
 ) -> list[str]:
     """Fill settings that the user did not specify in ``sion_translate.yaml``.
@@ -462,8 +747,19 @@ def apply_auto_settings(
         if physical_train_pairs is not None
         else train_examples // (2 if config.data.bidirectional else 1)
     )
+    if physical_train_tokens is None:
+        training_token_count = pair_count * MODEL_REFERENCE_TOKENS_PER_PAIR
+        token_basis = (
+            f"legacy {MODEL_REFERENCE_TOKENS_PER_PAIR}-tokens-per-pair reference; "
+            "prepared token lengths unavailable"
+        )
+    else:
+        training_token_count = _validated_training_token_count(physical_train_tokens)
+        token_basis = "authenticated prepared src+tgt lengths"
 
-    # Model capacity follows physical pair count, not expanded virtual directions.
+    # Model capacity follows unique physical token mass. Expanding one row into
+    # additional graph directions or repeating it for more epochs does not
+    # create new source data and therefore cannot increase this budget.
     explicit_size_keys = tuple(key for key in MODEL_SIZE_KEYS if key in raw_model)
     if explicit_size_keys and len(explicit_size_keys) != len(MODEL_SIZE_KEYS):
         missing = tuple(key for key in MODEL_SIZE_KEYS if key not in raw_model)
@@ -472,19 +768,21 @@ def apply_auto_settings(
             f"Provided: {explicit_size_keys}; missing: {missing}."
         )
     if not explicit_size_keys:
-        name, preset = pick_model_preset(pair_count)
+        sizing_vocab = config.model.vocab_size or DEFAULT_MODEL_SIZING_VOCAB_SIZE
+        name, preset, target_parameters, estimated_parameters = _select_model_architecture(
+            training_token_count,
+            vocab_size=sizing_vocab,
+            tie_embeddings=config.model.tie_embeddings,
+            experimental=config.model.experimental,
+        )
         for key, value in preset.items():
             setattr(config.model, key, value)
-        preset_index = _selected_model_preset_index(pair_count)
-        nominal_next = MODEL_PRESETS[preset_index][0]
-        next_note = (
-            f"; next promotion at {buffered_model_promotion_threshold(nominal_next):,}"
-            if nominal_next is not None
-            else "; final unbounded tier"
-        )
         decisions.append(
-            f"Model preset: {name} for {pair_count:,} physical training pairs "
-            f"({MODEL_PROMOTION_BUFFER_RATIO:.0%} promotion buffer{next_note})"
+            f"Model architecture: {name} for {training_token_count:,} unique physical "
+            f"training tokens ({token_basis}; {pair_count:,} physical pairs; virtual "
+            f"directions and epochs excluded). Estimated {estimated_parameters:,} "
+            f"parameters against a smooth {target_parameters:,}-parameter target "
+            f"with vocabulary size {sizing_vocab:,}."
         )
     if auto(raw_model, "gradient_checkpointing"):
         config.model.gradient_checkpointing = env.cuda and env.min_vram_gib < 70

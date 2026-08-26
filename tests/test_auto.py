@@ -11,21 +11,27 @@ import torch
 
 import sion_translate.auto as auto_module
 from sion_translate.auto import (
+    DEFAULT_MODEL_SIZING_VOCAB_SIZE,
     EnvironmentInfo,
+    MODEL_ARCHITECTURE_LADDER,
+    MODEL_REFERENCE_TOKENS_PER_PAIR,
     MODEL_SIZE_KEYS,
     _all_devices_support_native_bf16,
     apply_auto_settings,
     backup_stale_dataset,
-    buffered_model_promotion_threshold,
+    estimate_model_parameter_count,
+    pick_model_architecture,
     pick_model_preset,
     pick_parallel_strategy,
     pick_vocab_size,
     scan_raw_data,
+    smooth_model_parameter_target,
     stored_fingerprint,
     synchronize_environment,
     write_fingerprint,
 )
-from sion_translate.config import AppConfig
+from sion_translate.config import AppConfig, ExperimentalConfig, ModelConfig
+from sion_translate.model import SionForConditionalGeneration
 from sion_translate.training.ema import EMAWeights
 
 
@@ -111,39 +117,48 @@ def test_single_process_environment_needs_no_collective(monkeypatch) -> None:
 
 
 def test_model_preset_scales_with_data() -> None:
-    assert pick_model_preset(50_000)[1]["d_model"] == 512
-    assert pick_model_preset(1_000_000)[1]["d_model"] == 640
-    assert pick_model_preset(11_000_000)[1]["d_model"] == 768
-    assert pick_model_preset(50_000_000)[1]["d_model"] == 1024
-    assert pick_model_preset(200_000_000)[1]["d_model"] == 1280
+    architectures = [
+        pick_model_preset(pair_count)[1]
+        for pair_count in (50_000, 1_000_000, 11_000_000, 50_000_000, 200_000_000)
+    ]
+    parameter_counts = [
+        estimate_model_parameter_count(
+            architecture,
+            vocab_size=DEFAULT_MODEL_SIZING_VOCAB_SIZE,
+        )
+        for architecture in architectures
+    ]
+    assert parameter_counts == sorted(parameter_counts)
+    assert len(set(parameter_counts)) == len(parameter_counts)
+    for architecture in architectures:
+        assert architecture["d_model"] % architecture["num_heads"] == 0
+        assert architecture["num_heads"] % architecture["num_kv_heads"] == 0
     assert pick_vocab_size(50_000) == 16_000
     assert pick_vocab_size(11_000_000) == 48_000
 
 
-@pytest.mark.parametrize(
-    ("pair_count", "expected_name"),
-    [
-        (209_999, "small"),
-        (210_000, "medium"),
-        (3_149_999, "medium"),
-        (3_150_000, "base"),
-        (31_499_999, "base"),
-        (31_500_000, "large"),
-        (104_999_999, "large"),
-        (105_000_000, "xlarge"),
-    ],
-)
-def test_model_preset_promotes_only_after_the_five_percent_buffer(
-    pair_count: int,
-    expected_name: str,
-) -> None:
-    assert pick_model_preset(pair_count)[0] == expected_name
+def test_smooth_parameter_target_is_continuous_at_every_former_boundary() -> None:
+    for pair_anchor in (200_000, 3_000_000, 30_000_000, 100_000_000):
+        token_anchor = pair_anchor * MODEL_REFERENCE_TOKENS_PER_PAIR
+        below = smooth_model_parameter_target(token_anchor - 1)
+        at = smooth_model_parameter_target(token_anchor)
+        above = smooth_model_parameter_target(token_anchor + 1)
+        assert below <= at <= above
+        assert (above - below) / at < 1e-6
 
 
-def test_half_million_pair_growth_near_the_nominal_base_boundary_does_not_promote() -> None:
-    assert pick_model_preset(29_750_000)[0] == "base"
-    assert pick_model_preset(30_250_000)[0] == "base"
-    assert buffered_model_promotion_threshold(30_000_000) == 31_500_000
+def test_half_million_pair_growth_near_the_former_base_boundary_stays_gradual() -> None:
+    lower = pick_model_preset(29_750_000)[1]
+    upper = pick_model_preset(30_250_000)[1]
+    lower_parameters = estimate_model_parameter_count(
+        lower,
+        vocab_size=DEFAULT_MODEL_SIZING_VOCAB_SIZE,
+    )
+    upper_parameters = estimate_model_parameter_count(
+        upper,
+        vocab_size=DEFAULT_MODEL_SIZING_VOCAB_SIZE,
+    )
+    assert upper_parameters / lower_parameters <= 1.12
 
 
 @pytest.mark.parametrize("invalid", [-1, True, False, 1.5])
@@ -162,6 +177,232 @@ def test_model_preset_has_an_unbounded_deterministic_final_tier() -> None:
     assert second_values["d_model"] == 1280
 
 
+def test_token_sizing_is_deterministic_at_both_clamped_extremes() -> None:
+    minimum_name, minimum = pick_model_architecture(0)
+    maximum_name, maximum = pick_model_architecture(10**100)
+    minimum["d_model"] = -1
+    maximum["d_model"] = -1
+
+    assert minimum_name == pick_model_architecture(0)[0] == "small"
+    assert maximum_name == pick_model_architecture(10**100)[0] == "xlarge"
+    assert pick_model_architecture(0)[1]["d_model"] == 512
+    assert pick_model_architecture(10**100)[1]["d_model"] == 1280
+
+
+@pytest.mark.parametrize("invalid", [-1, True, False, 1.5])
+def test_model_architecture_rejects_invalid_token_counts(invalid: object) -> None:
+    expected = ValueError if invalid == -1 else TypeError
+    with pytest.raises(expected):
+        pick_model_architecture(invalid)  # type: ignore[arg-type]
+
+
+def test_architecture_ladder_is_strictly_monotone_across_gqa_layout_changes() -> None:
+    experimental = AppConfig().model.experimental
+    experimental.candidate_refinement_enabled = True
+    counts = [
+        estimate_model_parameter_count(
+            candidate.settings,
+            vocab_size=48_000,
+            experimental=experimental,
+        )
+        for candidate in MODEL_ARCHITECTURE_LADDER
+    ]
+    adjacent = tuple(zip(counts[:-1], counts[1:], strict=True))
+    assert all(lower < upper for lower, upper in adjacent)
+    assert max(upper / lower for lower, upper in adjacent) < 1.12
+
+    kv_projection_widths = []
+    for candidate in MODEL_ARCHITECTURE_LADDER:
+        architecture = candidate.settings
+        head_dim = architecture["d_model"] // architecture["num_heads"]
+        assert 64 <= head_dim <= 160
+        assert head_dim % 8 == 0
+        assert architecture["num_heads"] == 2 * architecture["num_kv_heads"]
+        kv_projection_widths.append(architecture["num_kv_heads"] * head_dim)
+    assert kv_projection_widths == sorted(kv_projection_widths)
+    assert all(
+        kv_width == candidate.settings["d_model"] // 2
+        for kv_width, candidate in zip(
+            kv_projection_widths,
+            MODEL_ARCHITECTURE_LADDER,
+            strict=True,
+        )
+    )
+
+
+@pytest.mark.parametrize("vocab_size", [8_192, 48_000, 262_144])
+def test_selected_parameter_count_is_monotone_for_arbitrary_vocabularies(
+    vocab_size: int,
+) -> None:
+    token_counts = [
+        0,
+        1_000_000,
+        6_400_000,
+        20_000_000,
+        96_000_000,
+        300_000_000,
+        960_000_000,
+        2_000_000_000,
+        3_200_000_000,
+        6_000_000_000,
+        9_600_000_000,
+        10**15,
+    ]
+    counts = []
+    for token_count in token_counts:
+        _name, architecture = pick_model_architecture(
+            token_count,
+            vocab_size=vocab_size,
+        )
+        counts.append(
+            estimate_model_parameter_count(
+                architecture,
+                vocab_size=vocab_size,
+            )
+        )
+    assert counts == sorted(counts)
+
+
+@pytest.mark.parametrize("experimental_profile", ["refinement", "all"])
+@pytest.mark.parametrize("tie_embeddings", [True, False])
+def test_parameter_estimator_matches_the_configured_production_model(
+    tie_embeddings: bool,
+    experimental_profile: str,
+) -> None:
+    config = ModelConfig(
+        vocab_size=32_771,
+        d_model=704,
+        encoder_layers=15,
+        decoder_layers=7,
+        num_heads=8,
+        num_kv_heads=4,
+        d_ff=1920,
+        tie_embeddings=tie_embeddings,
+    )
+    config.experimental.candidate_refinement_enabled = True
+    if experimental_profile == "all":
+        config.experimental.morphoscript_enabled = True
+        config.experimental.core_enabled = True
+        config.experimental.tetm_enabled = True
+        config.experimental.bats_enabled = True
+        config.experimental.bats_loss_weight = 0.01
+        config.experimental.evidence_repair_enabled = True
+        config.experimental.semantic_parity_enabled = True
+    architecture = {key: int(getattr(config, key)) for key in MODEL_SIZE_KEYS}
+
+    with torch.device("meta"):
+        model = SionForConditionalGeneration(config)
+
+    assert (
+        estimate_model_parameter_count(
+            architecture,
+            vocab_size=config.vocab_size,
+            tie_embeddings=tie_embeddings,
+            experimental=config.experimental,
+        )
+        == model.parameter_count()
+    )
+
+
+def test_vocabulary_and_embedding_sharing_have_their_exact_parameter_cost() -> None:
+    architecture = MODEL_ARCHITECTURE_LADDER[17].settings
+    lower_vocab = 31_337
+    upper_vocab = 48_000
+    vocabulary_growth = upper_vocab - lower_vocab
+    d_model = architecture["d_model"]
+
+    tied_growth = estimate_model_parameter_count(
+        architecture,
+        vocab_size=upper_vocab,
+        tie_embeddings=True,
+    ) - estimate_model_parameter_count(
+        architecture,
+        vocab_size=lower_vocab,
+        tie_embeddings=True,
+    )
+    untied_growth = estimate_model_parameter_count(
+        architecture,
+        vocab_size=upper_vocab,
+        tie_embeddings=False,
+    ) - estimate_model_parameter_count(
+        architecture,
+        vocab_size=lower_vocab,
+        tie_embeddings=False,
+    )
+
+    assert tied_growth == vocabulary_growth * d_model
+    assert untied_growth == 2 * vocabulary_growth * d_model
+
+
+@pytest.mark.parametrize("pair_boundary", [200_000, 3_000_000, 100_000_000])
+def test_discrete_vocabulary_changes_do_not_reintroduce_a_capacity_cliff(
+    pair_boundary: int,
+) -> None:
+    experimental = ExperimentalConfig(candidate_refinement_enabled=True)
+    selected_counts = []
+    for pair_count in (pair_boundary - 1, pair_boundary):
+        vocab_size = pick_vocab_size(pair_count)
+        _name, architecture = pick_model_preset(
+            pair_count,
+            vocab_size=vocab_size,
+            experimental=experimental,
+        )
+        selected_counts.append(
+            estimate_model_parameter_count(
+                architecture,
+                vocab_size=vocab_size,
+                experimental=experimental,
+            )
+        )
+    assert max(selected_counts) / min(selected_counts) < 1.10
+
+
+def test_current_inventory_compatibility_scale_stays_near_two_hundred_million() -> None:
+    experimental = AppConfig().model.experimental
+    experimental.candidate_refinement_enabled = True
+    _name, architecture = pick_model_preset(
+        27_602_231,
+        vocab_size=48_000,
+        experimental=experimental,
+    )
+    parameter_count = estimate_model_parameter_count(
+        architecture,
+        vocab_size=48_000,
+        experimental=experimental,
+    )
+    assert 180_000_000 <= parameter_count <= 220_000_000
+
+
+def test_documented_anchor_counts_and_current_preview_match_the_estimator() -> None:
+    experimental = ExperimentalConfig(candidate_refinement_enabled=True)
+    anchor_counts = tuple(
+        estimate_model_parameter_count(
+            architecture,
+            vocab_size=48_000,
+            experimental=experimental,
+        )
+        for _token_anchor, _name, architecture in auto_module.MODEL_PRESETS
+    )
+    declared_counts = tuple(f"{count / 1_000_000:.1f}M" for count in anchor_counts)
+    _name, current_architecture = pick_model_preset(
+        27_602_231,
+        vocab_size=48_000,
+        experimental=experimental,
+    )
+    current_count = estimate_model_parameter_count(
+        current_architecture,
+        vocab_size=48_000,
+        experimental=experimental,
+    )
+    declared_current = f"{current_count / 1_000_000:.1f}M"
+
+    repository_root = Path(__file__).resolve().parents[1]
+    for relative_path in ("README.md", "docs/retraining-runbook.md"):
+        document = (repository_root / relative_path).read_text(encoding="utf-8")
+        assert all(declared in document for declared in declared_counts)
+        assert declared_current in document
+
+
 def test_auto_settings_fill_unspecified_fields() -> None:
     config = AppConfig()
     config.data.language_pair = ["ko", "ja"]
@@ -173,7 +414,7 @@ def test_auto_settings_fill_unspecified_fields() -> None:
         validation_examples=110_000,
     )
     assert decisions
-    assert config.model.d_model == 768  # 11M pairs select the base preset.
+    assert config.model.d_model == 704  # Smoothly interpolated at the 11M-pair proxy.
     assert config.training.precision == "bf16"
     assert config.model.gradient_checkpointing is True
     assert config.training.batch_size_per_gpu == 8  # Selected for 24 GiB.
@@ -186,27 +427,73 @@ def test_auto_settings_fill_unspecified_fields() -> None:
     config.validate()
 
 
-def test_auto_sizing_uses_physical_pairs_for_a_mixed_direction_graph() -> None:
+def test_auto_sizing_uses_unique_tokens_for_an_arbitrary_direction_graph() -> None:
     config = AppConfig()
+    config.model.vocab_size = 64_000
+    config.data.language_pairs = [["de", "fr"], ["sw", "ar"]]
 
-    apply_auto_settings(
+    decisions = apply_auto_settings(
         config,
         raw={},
         env=cpu_environment(),
         train_examples=20_000_000,
         validation_examples=100_000,
         physical_train_pairs=2_000_000,
+        physical_train_tokens=80_000_000,
     )
 
-    # 2M physical pairs select the medium preset. Inferring pair count from the
-    # 20M virtual directions would incorrectly select the larger base preset.
-    assert config.model.d_model == 640
+    assert config.model.d_model % config.model.num_heads == 0
+    assert config.model.num_heads % config.model.num_kv_heads == 0
+    assert any("80,000,000 unique physical training tokens" in line for line in decisions)
+    assert any("virtual directions and epochs excluded" in line for line in decisions)
+
+
+def test_exact_prepared_tokens_override_the_legacy_pair_proxy() -> None:
+    exact = AppConfig()
+    exact.model.vocab_size = 48_000
+    apply_auto_settings(
+        exact,
+        raw={},
+        env=cpu_environment(),
+        train_examples=60_000_000,
+        validation_examples=100_000,
+        physical_train_pairs=30_000_000,
+        physical_train_tokens=100_000_000,
+    )
+    fallback = AppConfig()
+    fallback.model.vocab_size = 48_000
+    apply_auto_settings(
+        fallback,
+        raw={},
+        env=cpu_environment(),
+        train_examples=60_000_000,
+        validation_examples=100_000,
+        physical_train_pairs=30_000_000,
+    )
+    exact_architecture = {key: int(getattr(exact.model, key)) for key in MODEL_SIZE_KEYS}
+    fallback_architecture = {key: int(getattr(fallback.model, key)) for key in MODEL_SIZE_KEYS}
+    assert estimate_model_parameter_count(
+        exact_architecture,
+        vocab_size=48_000,
+    ) < estimate_model_parameter_count(
+        fallback_architecture,
+        vocab_size=48_000,
+    )
 
 
 def test_auto_settings_respect_user_values() -> None:
     config = AppConfig()
     config.training.max_steps = 777
-    config.model.d_model = 512
+    original_architecture = {
+        "d_model": 704,
+        "encoder_layers": 11,
+        "decoder_layers": 9,
+        "num_heads": 8,
+        "num_kv_heads": 4,
+        "d_ff": 2432,
+    }
+    for key, value in original_architecture.items():
+        setattr(config.model, key, value)
     raw = {
         "training": {"max_steps": 777},
         "model": explicit_architecture(config),
@@ -220,7 +507,7 @@ def test_auto_settings_respect_user_values() -> None:
     )
     # Automatic settings never overwrite explicit user values.
     assert config.training.max_steps == 777
-    assert config.model.d_model == 512
+    assert explicit_architecture(config) == original_architecture
 
 
 def test_auto_settings_reject_partial_manual_architecture_overrides() -> None:

@@ -68,9 +68,9 @@ mismatch.
 
 python3 easy_run.py
 
-The runner validates the hardware and data, selects a buffered data-fit preset, resumes
-the furthest authenticated stage, runs optional foundation pretraining, translation SFT,
-gold-anchored MRT/preference posttraining, and final verified export.
+The runner validates the hardware and data, selects a smooth token-scaled architecture,
+resumes the furthest authenticated stage, runs optional foundation pretraining,
+translation SFT, gold-anchored MRT/preference posttraining, and final verified export.
 
 To disable optional tmux handling:
 
