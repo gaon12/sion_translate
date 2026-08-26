@@ -158,6 +158,7 @@ def test_transformers_forward_and_generation_preserve_the_reasoning_contract(
         native_config,
         languages=["ko", "ja"],
         language_pairs=[["ko", "ja"]],
+        translation_directions=[["ko", "ja"]],
     )
     model = HFSionForConditionalGeneration(config).eval()
     assert model.model.evidence_repair is not None

@@ -827,7 +827,7 @@ def test_fp8_translator_prepares_a_bf16_model_for_fp16_fallback(
     )
 
     assert translator.fp8_runtime is not None
-    assert "FP16 즉시 역양자화" in translator.fp8_runtime
+    assert "on-demand FP16 dequantization" in translator.fp8_runtime
     assert {parameter.dtype for parameter in translator.model.parameters()} == {torch.float16}
     fp8_modules = [module for module in translator.model.modules() if isinstance(module, Fp8Linear)]
     assert fp8_modules
