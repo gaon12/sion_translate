@@ -67,6 +67,22 @@ DEFAULT_CORPUS_DIRECTORY = "data/corpus"
 DEFAULT_LANGUAGE_SAMPLING_ALPHA = 0.7
 
 
+def _portable_relative_path_key(path: Path, root: Path) -> tuple[str, str]:
+    """Return a deterministic path key independent of host path semantics.
+
+    ``WindowsPath`` comparisons ignore case while ``PosixPath`` comparisons do
+    not. Foundation source order becomes part of tokenizer sampling, source IDs,
+    and dataset fingerprints, so relying on native ``Path`` ordering would make
+    one corpus produce different artifacts on Windows and Linux. POSIX separators
+    plus an explicit case-folded key define one order on every supported host;
+    the original spelling breaks ties for case-distinct names on case-sensitive
+    filesystems.
+    """
+
+    relative = path.relative_to(root).as_posix()
+    return relative.casefold(), relative
+
+
 @dataclass(frozen=True)
 class MonolingualSource:
     """One file that will actually contribute to foundation training."""
@@ -166,7 +182,10 @@ def discover_monolingual_sources(
     skipped: list[SkippedEntry] = []
     language_directories: list[tuple[Path, str]] = []
 
-    for entry in sorted(root.iterdir()):
+    for entry in sorted(
+        root.iterdir(),
+        key=lambda path: _portable_relative_path_key(path, root),
+    ):
         if not entry.is_dir():
             skipped.append(SkippedEntry(entry, "top-level entry is not a language directory"))
             continue
@@ -208,9 +227,16 @@ def discover_monolingual_sources(
             )
             skipped.append(SkippedEntry(entry, reason))
             unconfigured.append(entry_language)
+    for language in configured:
+        directories = configured_directories.get(language, ())
+        if not directories:
             continue
+        entry = directories[0]
         found = False
-        for candidate in sorted(entry.rglob("*")):
+        for candidate in sorted(
+            entry.rglob("*"),
+            key=lambda path: _portable_relative_path_key(path, entry),
+        ):
             if not candidate.is_file():
                 continue
             if candidate.suffix.lower() not in ALLOWED_SUFFIXES:
@@ -225,7 +251,7 @@ def discover_monolingual_sources(
             if size == 0:
                 skipped.append(SkippedEntry(candidate, "empty file"))
                 continue
-            sources.append(MonolingualSource(entry_language, candidate, size))
+            sources.append(MonolingualSource(language, candidate, size))
             found = True
         if not found:
             skipped.append(SkippedEntry(entry, "no readable .txt or .jsonl files"))

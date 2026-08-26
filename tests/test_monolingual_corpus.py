@@ -87,11 +87,21 @@ def test_script_and_region_language_folders_are_canonicalized(tmp_path) -> None:
     _write(root / "pt-br" / "wiki.txt", ["uma frase em português"])
     _write(root / "ZH-hant" / "wiki.txt", ["一個繁體中文句子"])
 
-    discovery = discover_monolingual_sources(root, ["pt-BR", "zh-Hant"])
+    discovery = discover_monolingual_sources(root, ["zh-Hant", "pt-BR"])
 
-    assert discovery.languages == ("pt-BR", "zh-Hant")
+    assert discovery.languages == ("zh-Hant", "pt-BR")
     assert len(discovery.paths_for("PT-br")) == 1
     assert discovery.languages_without_data == ()
+
+
+def test_source_order_is_portable_with_mixed_case_paths(tmp_path) -> None:
+    root = tmp_path / "corpus"
+    _write(root / "pt-BR" / "Zulu.txt", ["last by the portable key"])
+    _write(root / "pt-BR" / "alpha.txt", ["first by the portable key"])
+
+    discovery = discover_monolingual_sources(root, ["pt-BR"])
+
+    assert [source.path.name for source in discovery.sources] == ["alpha.txt", "Zulu.txt"]
 
 
 def test_configured_extension_order_alias_directories_fail_before_scanning(
