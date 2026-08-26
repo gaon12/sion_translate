@@ -3320,7 +3320,7 @@ def test_atomic_replace_directory_uses_a_cross_process_publish_lock(tmp_path: Pa
         )
 
     assert result.returncode == 3, result.stderr
-    assert "다른 프로세스에 잠겨" in result.stdout
+    assert "artifact root is locked by another process" in result.stdout
     assert (destination / "generation.txt").read_text(encoding="utf-8") == "old"
     assert (temporary / "generation.txt").read_text(encoding="utf-8") == "new"
 
@@ -3382,7 +3382,7 @@ def test_complete_file_and_manifest_generation_uses_a_cross_process_lock(tmp_pat
         )
 
     assert result.returncode == 3, result.stderr
-    assert "다른 프로세스에 잠겨" in result.stdout
+    assert "artifact root is locked by another process" in result.stdout
     assert not destination.exists()
 
 
@@ -3430,7 +3430,11 @@ def test_handoff_cleanup_failure_never_exposes_a_partial_destination(
     assert not (destination / "first.txt").exists()
     handoffs = list(tmp_path.glob(".best.handoff-*"))
     assert len(handoffs) == 1
-    assert (handoffs[0] / "first.txt").is_file()
+    preserved_names = {path.name for path in handoffs[0].iterdir()}
+    remaining_names = {path.name for path in temporary.iterdir()}
+    assert len(preserved_names) == 1
+    assert preserved_names | remaining_names == {"first.txt", "second.txt"}
+    assert preserved_names.isdisjoint(remaining_names)
 
 
 def test_restore_failure_preserves_the_original_install_error_and_backup(
