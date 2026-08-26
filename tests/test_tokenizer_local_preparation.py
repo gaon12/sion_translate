@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Iterable
 from pathlib import Path
@@ -132,7 +133,36 @@ def test_completed_generation_resumes_without_retraining(
     metadata = json.loads((output / "tokenizer_metadata.json").read_text(encoding="utf-8"))
     assert metadata["sampled_sentences"] == 80
     assert set(metadata["sampled_sentences_per_language"]) == {"pt-BR", "zh-Hant"}
+    assert metadata["training_contract"]["schema"] == "sion-tokenizer-training-v4"
+    assert metadata["training_contract"]["input_traversal_policy"] == "portable-input-order-v1"
     assert metadata["training_contract"]["sampling_alpha"] == 0.7
+
+
+def test_v3_generation_is_not_reused_after_the_input_order_contract_changes(
+    tmp_path: Path,
+) -> None:
+    corpus = _parallel_corpus(tmp_path / "parallel.jsonl")
+    output = tmp_path / "tokenizer"
+    model = _train_small(corpus, output)
+    original_digest = file_sha256(model)
+    metadata_path = output / "tokenizer_metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    legacy_contract = metadata["training_contract"]
+    legacy_contract["schema"] = "sion-tokenizer-training-v3"
+    legacy_contract.pop("input_traversal_policy")
+    legacy_payload = json.dumps(
+        legacy_contract,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    metadata["training_contract_sha256"] = hashlib.sha256(legacy_payload).hexdigest()
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="different source or training contract"):
+        _train_small(corpus, output)
+
+    assert file_sha256(model) == original_digest
 
 
 def test_completed_private_staging_is_recovered_before_retraining(

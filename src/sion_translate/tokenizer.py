@@ -59,7 +59,12 @@ from sion_translate.synthetic import (
 LEGACY_LANGUAGE_PAIR = ("ko", "ja")
 TOKENIZER_METADATA_FILENAME = "tokenizer_metadata.json"
 TOKENIZER_METADATA_VERSION = 2
-TOKENIZER_TRAINING_SCHEMA = "sion-tokenizer-training-v3"
+TOKENIZER_TRAINING_SCHEMA = "sion-tokenizer-training-v4"
+# Input order affects bounded hashing samples and therefore the learned
+# SentencePiece vocabulary. Keep the policy inside the authenticated contract so
+# a future ordering change cannot silently reuse tokenizer bytes from an older
+# traversal implementation.
+TOKENIZER_INPUT_TRAVERSAL_POLICY = "portable-input-order-v1"
 SENTENCEPIECE_MULTITHREADED_TRAINING_REGRESSION = "0.2.2"
 SENTENCEPIECE_META_PIECE_COUNT = 4  # pad, unknown, beginning, and end
 DEFAULT_TOKENIZER_INPUT_SENTENCE_SIZE = 1_000_000
@@ -344,7 +349,27 @@ def expand_inputs(patterns: Sequence[str]) -> list[Path]:
             paths.update(candidate.glob("*.jsonl"))
         else:
             paths.add(candidate)
-    return sorted(path.resolve() for path in paths if path.exists())
+    resolved = {path.resolve() for path in paths if path.exists()}
+    if not resolved:
+        return []
+    try:
+        common_root: Path | None = Path(os.path.commonpath([str(path.parent) for path in resolved]))
+    except ValueError:
+        # Inputs on different Windows drives have no common root. Their absolute
+        # identities are already embedded in the contract, so using them here is
+        # deterministic and cannot make an incompatible build look reusable.
+        common_root = None
+
+    def portable_key(path: Path) -> tuple[str, str]:
+        identity = (
+            path.relative_to(common_root).as_posix() if common_root is not None else path.as_posix()
+        )
+        # Windows path comparisons ignore case while POSIX comparisons do not.
+        # An explicit folded key plus an original-spelling tie breaker defines
+        # the same order on every supported host, including case-distinct files.
+        return identity.casefold(), identity
+
+    return sorted(resolved, key=portable_key)
 
 
 def _filter_text_batch(
@@ -1262,13 +1287,16 @@ def _tokenizer_source_records(
             return resolved.as_posix()
         return resolved.relative_to(parallel_root).as_posix()
 
+    # Preserve the exact traversal order. The list is authenticated as part of
+    # the training contract, so any future stream-order change invalidates reuse
+    # even when every source file still has the same bytes.
     records = [
         _source_identity_record(
             path,
             role="parallel",
             identity=parallel_identity(path),
         )
-        for path in sorted(paths, key=lambda item: str(item.resolve()))
+        for path in paths
     ]
     if monolingual is not None:
         records.extend(
@@ -1278,21 +1306,9 @@ def _tokenizer_source_records(
                 identity=source.path.resolve().relative_to(monolingual.root.resolve()).as_posix(),
                 language=source.language,
             )
-            for source in sorted(
-                monolingual.sources,
-                key=lambda item: (item.language, str(item.path.resolve())),
-            )
+            for source in monolingual.sources
         )
-    return sorted(
-        records,
-        key=lambda record: (
-            str(record["role"]),
-            str(record.get("language", "")),
-            str(record["path"]),
-            str(record["sha256"]),
-            str(record["size"]),
-        ),
-    )
+    return records
 
 
 def _tokenizer_training_contract(
@@ -1323,6 +1339,7 @@ def _tokenizer_training_contract(
 
     return {
         "schema": TOKENIZER_TRAINING_SCHEMA,
+        "input_traversal_policy": TOKENIZER_INPUT_TRAVERSAL_POLICY,
         "sources": [dict(record) for record in source_records],
         "vocab_size": vocab_size,
         "input_sentence_size": input_sentence_size,

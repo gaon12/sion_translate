@@ -97,7 +97,11 @@ def test_candidate_publish_is_complete_atomic_and_never_overwrites(tmp_path: Pat
 
 
 def test_training_metadata_accepts_arbitrary_language_counts(tmp_path: Path) -> None:
-    contract = {"schema": "sion-tokenizer-training-v3", "languages": ["de", "fr"]}
+    contract = {
+        "schema": "sion-tokenizer-training-v4",
+        "input_traversal_policy": "portable-input-order-v1",
+        "languages": ["de", "fr"],
+    }
     metadata = {
         "sentencepiece_version": EXPECTED_SENTENCEPIECE_VERSION,
         "monolingual_sample_ratio": SAMPLE_RATIO,

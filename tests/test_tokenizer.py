@@ -15,11 +15,23 @@ from sion_translate.tokenizer import (
     CorpusCounts,
     SionTokenizer,
     control_symbols,
+    expand_inputs,
     iter_parallel_text,
     load_tokenizer_metadata,
     tokenizer_split_digits_policy,
     train_tokenizer,
 )
+
+
+def test_parallel_input_order_is_portable_with_mixed_case_paths(tmp_path: Path) -> None:
+    upper = tmp_path / "Zulu.jsonl"
+    lower = tmp_path / "alpha.jsonl"
+    upper.write_text("{}\n", encoding="utf-8")
+    lower.write_text("{}\n", encoding="utf-8")
+
+    expanded = expand_inputs([str(tmp_path)])
+
+    assert [path.name for path in expanded] == ["alpha.jsonl", "Zulu.jsonl"]
 
 
 def test_foundation_only_language_reserves_only_a_denoise_tag() -> None:
