@@ -73,6 +73,8 @@ src = ["src", "tests"]
 select = ["E4", "E7", "E9", "F", "B", "PLE"]
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+# Keep root-level launch helpers and the src-layout package importable through
+# both `pytest` and `python -m pytest` on every supported operating system.
+pythonpath = [".", "src"]
 testpaths = ["tests"]
 addopts = "-q"
