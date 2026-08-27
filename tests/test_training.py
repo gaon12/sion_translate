@@ -98,9 +98,16 @@ class FakeTokenizer:
 class FixedValidationModel(nn.Module):
     """Emit controlled token probabilities while exposing the trainer output contract."""
 
-    def __init__(self, target_probabilities: torch.Tensor, *, smoothed_loss_sum: float = 30.0):
+    def __init__(
+        self,
+        target_probabilities: torch.Tensor,
+        *,
+        smoothed_loss_sum: float = 30.0,
+        refinement_token_gain: torch.Tensor | None = None,
+    ):
         super().__init__()
         self.register_buffer("target_probabilities", target_probabilities)
+        self.register_buffer("refinement_token_gain", refinement_token_gain)
         self.smoothed_loss_sum = smoothed_loss_sum
 
     def forward(self, **batch):
@@ -115,6 +122,7 @@ class FixedValidationModel(nn.Module):
                 "lm_loss_sum": logits.new_tensor(self.smoothed_loss_sum),
                 "token_count": labels.ne(-100).sum(),
                 "auxiliary_loss": logits.new_zeros(()),
+                "candidate_refinement_token_nll_gain": self.refinement_token_gain,
             },
         )()
 
@@ -529,22 +537,84 @@ def test_validation_reports_true_nll_for_each_target_and_direction() -> None:
     assert metrics["validation_direction_count"] == 2
 
 
+def test_validation_reports_direction_balanced_candidate_refinement_gain() -> None:
+    model = FixedValidationModel(
+        torch.tensor([[0.8, 0.8], [0.25, 0.5]]),
+        refinement_token_gain=torch.tensor([[0.2, 0.4], [-0.3, 999.0]]),
+    )
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+
+    metrics = evaluate(
+        model,
+        [direction_validation_batch()],
+        context,
+        max_batches=1,
+        language_tags=FakeTokenizer.language_tags,
+    )
+
+    assert metrics["validation_candidate_refinement_nll_gain"] == pytest.approx(0.1)
+    assert metrics["validation_candidate_refinement_tokens"] == 3
+    assert metrics["validation_direction_ja_to_ko_candidate_refinement_nll_gain"] == pytest.approx(
+        0.3
+    )
+    assert metrics["validation_direction_ko_to_ja_candidate_refinement_nll_gain"] == pytest.approx(
+        -0.3
+    )
+    assert metrics["validation_macro_direction_candidate_refinement_nll_gain"] == pytest.approx(
+        0.0,
+        abs=1e-8,
+    )
+    assert metrics["validation_worst_direction_candidate_refinement_nll_gain"] == pytest.approx(
+        -0.3
+    )
+    assert metrics["validation_candidate_refinement_direction_count"] == 2
+
+
+def test_validation_restores_training_mode_after_refinement_contract_error() -> None:
+    model = FixedValidationModel(
+        torch.tensor([[0.8, 0.8], [0.25, 0.5]]),
+        refinement_token_gain=torch.tensor([[0.2]]),
+    ).train()
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+
+    with pytest.raises(ValueError, match="must match labels shape"):
+        evaluate(
+            model,
+            [direction_validation_batch()],
+            context,
+            max_batches=1,
+            language_tags=FakeTokenizer.language_tags,
+        )
+
+    assert model.training
+
+
 def test_direction_statistics_have_a_fixed_ddp_reduction_layout(monkeypatch) -> None:
-    model = FixedValidationModel(torch.tensor([[0.8, 0.8]]), smoothed_loss_sum=2.0)
+    model = FixedValidationModel(
+        torch.tensor([[0.8, 0.8]]),
+        smoothed_loss_sum=2.0,
+        refinement_token_gain=torch.tensor([[0.2, 0.4]]),
+    )
     local_batch = {name: value[:1].clone() for name, value in direction_validation_batch().items()}
     context = DistributedContext(0, 0, 2, torch.device("cpu"), True, "gloo")
     packed_reductions = 0
+    refinement_reductions = 0
     remote_nll = -math.log(0.25)
+    remote_refinement_gain = -0.5
 
     def simulate_all_reduce(tensor: torch.Tensor, _context: DistributedContext) -> torch.Tensor:
-        nonlocal packed_reductions
+        nonlocal packed_reductions, refinement_reductions
         # Sorted layout is [ja target, ko target, ja->ja, ja->ko,
         # ko->ja, ko->ko]. Rank 0 has only ja->ko; inject rank 1's
         # ko->ja row into the same preallocated tensor.
-        if tensor.shape == (6, 2):
+        if tensor.shape == (2,):
+            refinement_reductions += 1
+            tensor += tensor.new_tensor([remote_refinement_gain, 1.0])
+        if tensor.shape == (6, 4):
             packed_reductions += 1
-            tensor[0] += tensor.new_tensor([remote_nll, 1.0])
-            tensor[4] += tensor.new_tensor([remote_nll, 1.0])
+            remote = tensor.new_tensor([remote_nll, 1.0, remote_refinement_gain, 1.0])
+            tensor[0] += remote
+            tensor[4] += remote
         return tensor
 
     monkeypatch.setattr(trainer_module, "reduce_sum", simulate_all_reduce)
@@ -557,10 +627,21 @@ def test_direction_statistics_have_a_fixed_ddp_reduction_layout(monkeypatch) -> 
     )
 
     assert packed_reductions == 1
+    assert refinement_reductions == 1
     assert metrics["validation_direction_ja_to_ko_tokens"] == 2
     assert metrics["validation_direction_ko_to_ja_tokens"] == 1
     assert metrics["validation_direction_count"] == 2
     assert metrics["validation_worst_direction_nll"] == pytest.approx(remote_nll)
+    assert metrics["validation_candidate_refinement_nll_gain"] == pytest.approx(1.0 / 30.0)
+    assert metrics["validation_direction_ja_to_ko_candidate_refinement_nll_gain"] == pytest.approx(
+        0.3
+    )
+    assert metrics["validation_direction_ko_to_ja_candidate_refinement_nll_gain"] == pytest.approx(
+        remote_refinement_gain
+    )
+    assert metrics["validation_worst_direction_candidate_refinement_nll_gain"] == pytest.approx(
+        remote_refinement_gain
+    )
 
 
 def test_sparse_objective_metrics_use_one_rank_stable_ddp_layout(monkeypatch) -> None:

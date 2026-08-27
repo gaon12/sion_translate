@@ -31,8 +31,9 @@ import time
 from collections.abc import Sized
 from contextlib import nullcontext
 from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Concatenate, Iterable, Mapping, ParamSpec, Sequence, TypeVar
 
 import torch
 import torch.distributed as dist
@@ -442,6 +443,32 @@ def _selection_metric_label(key: str) -> str:
     return f"EMA {label}" if ema else label
 
 
+_ModelCallArgs = ParamSpec("_ModelCallArgs")
+_ModelCallResult = TypeVar("_ModelCallResult")
+
+
+def _restore_model_training_mode(
+    function: Callable[Concatenate[nn.Module, _ModelCallArgs], _ModelCallResult],
+) -> Callable[Concatenate[nn.Module, _ModelCallArgs], _ModelCallResult]:
+    """Restore a model's caller-owned train/eval state after success or failure."""
+
+    @wraps(function)
+    def wrapped(
+        model: nn.Module,
+        /,
+        *args: _ModelCallArgs.args,
+        **kwargs: _ModelCallArgs.kwargs,
+    ) -> _ModelCallResult:
+        was_training = model.training
+        try:
+            return function(model, *args, **kwargs)
+        finally:
+            model.train(was_training)
+
+    return wrapped
+
+
+@_restore_model_training_mode
 @torch.no_grad()
 def evaluate(
     model: nn.Module,
@@ -462,7 +489,6 @@ def evaluate(
       order remains stable even when one rank has no rows for a direction.
     - Distributed totals are all-reduced before global means are calculated.
     """
-    was_training = model.training
     model.eval()
     loss_sum = torch.zeros((), device=context.device, dtype=torch.float64)
     token_count = torch.zeros((), device=context.device, dtype=torch.float64)
@@ -474,12 +500,14 @@ def evaluate(
     language_layout = _language_metric_layout(language_tags)
     language_count = len(language_layout)
     # First N rows are target-language stats; the remaining N*N rows are
-    # source-major explicit direction stats. Each row is [NLL sum, token count].
+    # source-major explicit direction stats. Each row is
+    # [NLL sum, token count, T1-to-T2 NLL gain sum, refinement token count].
     language_stats = torch.zeros(
-        (language_count + language_count * language_count, 2),
+        (language_count + language_count * language_count, 4),
         device=context.device,
         dtype=torch.float64,
     )
+    refinement_stats = torch.zeros(2, device=context.device, dtype=torch.float64)
     batches = 0
 
     # Show a short rank-0 validation progress bar and remove it when complete.
@@ -512,6 +540,23 @@ def evaluate(
             valid_tokens = labels.ne(-100)
             row_nll = token_nll.sum(dim=1).double()
             row_token_count = valid_tokens.sum(dim=1).double()
+            raw_refinement_gain = getattr(
+                output,
+                "candidate_refinement_token_nll_gain",
+                None,
+            )
+            row_refinement_gain = None
+            row_refinement_count = None
+            if raw_refinement_gain is not None:
+                if raw_refinement_gain.shape != labels.shape:
+                    raise ValueError("candidate_refinement_token_nll_gain must match labels shape")
+                valid_refinement_gain = raw_refinement_gain.detach().double() * valid_tokens.to(
+                    dtype=torch.float64
+                )
+                row_refinement_gain = valid_refinement_gain.sum(dim=1)
+                row_refinement_count = row_token_count
+                refinement_stats[0] += row_refinement_gain.sum()
+                refinement_stats[1] += row_refinement_count.sum()
             loss_sum += output.lm_loss_sum.detach().double()
             token_count += output.token_count.detach().double()
             nll_sum += row_nll.sum()
@@ -524,6 +569,9 @@ def evaluate(
                     target_rows = target_tag_ids.eq(target_tag_id)
                     language_stats[target_index, 0] += row_nll[target_rows].sum()
                     language_stats[target_index, 1] += row_token_count[target_rows].sum()
+                    if row_refinement_gain is not None and row_refinement_count is not None:
+                        language_stats[target_index, 2] += row_refinement_gain[target_rows].sum()
+                        language_stats[target_index, 3] += row_refinement_count[target_rows].sum()
                     if source_tag_ids is None:
                         continue
                     for source_index, (_, source_tag_id) in enumerate(language_layout):
@@ -533,6 +581,13 @@ def evaluate(
                         )
                         language_stats[direction_index, 0] += row_nll[direction_rows].sum()
                         language_stats[direction_index, 1] += row_token_count[direction_rows].sum()
+                        if row_refinement_gain is not None and row_refinement_count is not None:
+                            language_stats[direction_index, 2] += row_refinement_gain[
+                                direction_rows
+                            ].sum()
+                            language_stats[direction_index, 3] += row_refinement_count[
+                                direction_rows
+                            ].sum()
             if generated_metrics is not None:
                 source_count = float(batch["input_ids"].shape[0])
                 objective_count += source_count
@@ -552,13 +607,13 @@ def evaluate(
             progress.close()
 
     if batches == 0:
-        model.train(was_training)
         raise ValueError("validation loader produced no batches")
     reduce_sum(loss_sum, context)
     reduce_sum(token_count, context)
     reduce_sum(nll_sum, context)
     reduce_sum(nll_token_count, context)
     reduce_sum(aux_sum, context)
+    reduce_sum(refinement_stats, context)
     reduce_sum(objective_count, context)
     # One fixed-size collective covers every language/direction, including rows
     # that are locally zero but observed on another DDP rank.
@@ -585,7 +640,6 @@ def evaluate(
         }
     batch_tensor = torch.tensor(float(batches), device=context.device, dtype=torch.float64)
     reduce_sum(batch_tensor, context)
-    model.train(was_training)
     mean_loss = (loss_sum / token_count.clamp_min(1)).item()
     mean_nll = (nll_sum / nll_token_count.clamp_min(1)).item()
     metrics = {
@@ -595,7 +649,13 @@ def evaluate(
         "validation_auxiliary_loss": (aux_sum / batch_tensor.clamp_min(1)).item(),
         "validation_tokens": nll_token_count.item(),
     }
+    if refinement_stats[1].item() > 0:
+        metrics["validation_candidate_refinement_nll_gain"] = (
+            refinement_stats[0] / refinement_stats[1]
+        ).item()
+        metrics["validation_candidate_refinement_tokens"] = refinement_stats[1].item()
     direction_nlls: list[float] = []
+    direction_refinement_gains: list[float] = []
     for target_index, (target_language, _) in enumerate(language_layout):
         target_tokens = language_stats[target_index, 1].item()
         if target_tokens > 0:
@@ -604,6 +664,13 @@ def evaluate(
             metrics[f"{prefix}_nll"] = target_nll
             metrics[f"{prefix}_perplexity"] = _perplexity(target_nll)
             metrics[f"{prefix}_tokens"] = target_tokens
+        target_refinement_tokens = language_stats[target_index, 3].item()
+        if target_refinement_tokens > 0:
+            prefix = f"validation_target_{target_language}"
+            metrics[f"{prefix}_candidate_refinement_nll_gain"] = (
+                language_stats[target_index, 2] / target_refinement_tokens
+            ).item()
+            metrics[f"{prefix}_candidate_refinement_tokens"] = target_refinement_tokens
         for source_index, (source_language, _) in enumerate(language_layout):
             direction_index = language_count + source_index * language_count + target_index
             direction_tokens = language_stats[direction_index, 1].item()
@@ -615,6 +682,14 @@ def evaluate(
             metrics[f"{prefix}_nll"] = direction_nll
             metrics[f"{prefix}_perplexity"] = _perplexity(direction_nll)
             metrics[f"{prefix}_tokens"] = direction_tokens
+            direction_refinement_tokens = language_stats[direction_index, 3].item()
+            if direction_refinement_tokens > 0:
+                direction_refinement_gain = (
+                    language_stats[direction_index, 2] / direction_refinement_tokens
+                ).item()
+                direction_refinement_gains.append(direction_refinement_gain)
+                metrics[f"{prefix}_candidate_refinement_nll_gain"] = direction_refinement_gain
+                metrics[f"{prefix}_candidate_refinement_tokens"] = direction_refinement_tokens
     if direction_nlls:
         macro_direction_nll = sum(direction_nlls) / len(direction_nlls)
         worst_direction_nll = max(direction_nlls)
@@ -625,6 +700,21 @@ def evaluate(
                 "validation_worst_direction_nll": worst_direction_nll,
                 "validation_worst_direction_perplexity": _perplexity(worst_direction_nll),
                 "validation_direction_count": float(len(direction_nlls)),
+            }
+        )
+    if direction_refinement_gains:
+        metrics.update(
+            {
+                "validation_macro_direction_candidate_refinement_nll_gain": sum(
+                    direction_refinement_gains
+                )
+                / len(direction_refinement_gains),
+                "validation_worst_direction_candidate_refinement_nll_gain": min(
+                    direction_refinement_gains
+                ),
+                "validation_candidate_refinement_direction_count": float(
+                    len(direction_refinement_gains)
+                ),
             }
         )
     if objective_sums:
@@ -1130,6 +1220,35 @@ def train(
             if "validation_worst_direction_nll" in metrics:
                 summary += ", worst-direction NLL={:.4f}".format(
                     metrics["validation_worst_direction_nll"]
+                )
+            refinement_gain_key = (
+                "validation_ema_candidate_refinement_nll_gain"
+                if "validation_ema_candidate_refinement_nll_gain" in metrics
+                else "validation_candidate_refinement_nll_gain"
+            )
+            if refinement_gain_key in metrics:
+                refinement_label = (
+                    "EMA provisional-to-final NLL gain"
+                    if refinement_gain_key.startswith("validation_ema_")
+                    else "provisional-to-final NLL gain"
+                )
+                summary += ", {}={:.4f}".format(
+                    refinement_label,
+                    metrics[refinement_gain_key],
+                )
+            worst_refinement_gain_key = (
+                "validation_ema_worst_direction_candidate_refinement_nll_gain"
+                if "validation_ema_worst_direction_candidate_refinement_nll_gain" in metrics
+                else "validation_worst_direction_candidate_refinement_nll_gain"
+            )
+            if worst_refinement_gain_key in metrics:
+                worst_refinement_label = (
+                    "EMA worst-direction provisional-to-final NLL gain"
+                    if worst_refinement_gain_key.startswith("validation_ema_")
+                    else "worst-direction provisional-to-final NLL gain"
+                )
+                summary += ", {}={:.4f}".format(
+                    worst_refinement_label, metrics[worst_refinement_gain_key]
                 )
             if "validation_ema_loss" in metrics:
                 summary += ", EMA loss={:.4f}".format(metrics["validation_ema_loss"])

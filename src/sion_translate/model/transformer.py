@@ -168,6 +168,11 @@ class SionOutput:
     evidence_repair_gain: torch.Tensor | None = None
     candidate_refinement_loss: torch.Tensor | None = None
     candidate_refinement_gain: torch.Tensor | None = None
+    # Detached per-token NLL(provisional)-NLL(final). With one configured step,
+    # these are the T1 and T2 distributions; with multiple steps, "final" is
+    # the last trained endpoint. Positive values mean refinement improved NLL.
+    # Validation can aggregate this diagnostic without a second decoder pass.
+    candidate_refinement_token_nll_gain: torch.Tensor | None = None
     candidate_refinement_steps: torch.Tensor | None = None
     # Explicit SSRT request diagnostics. ``reasoning_level`` remains None for
     # legacy calls that did not opt into the new input contract.
@@ -881,6 +886,7 @@ class SionForConditionalGeneration(nn.Module):
         evidence_repair_gain = logits.new_zeros(())
         candidate_refinement_loss = logits.new_zeros(())
         candidate_refinement_gain = logits.new_zeros(())
+        candidate_refinement_token_nll_gain = None
         semantic_parity_loss = logits.new_zeros(())
         semantic_parity_score = logits.new_zeros(())
         exp = self.config.experimental
@@ -963,6 +969,7 @@ class SionForConditionalGeneration(nn.Module):
             )
             valid = target_mask.to(logits.dtype)
             refinement_gain = (pre_refinement_token_nll - final_token_nll.detach()) * valid
+            candidate_refinement_token_nll_gain = refinement_gain.detach()
             candidate_refinement_gain = refinement_gain.sum() / valid.sum().clamp_min(1.0)
             auxiliary_loss = auxiliary_loss + (
                 exp.candidate_refinement_loss_weight * candidate_refinement_loss
@@ -997,6 +1004,7 @@ class SionForConditionalGeneration(nn.Module):
             evidence_repair_gain=evidence_repair_gain,
             candidate_refinement_loss=candidate_refinement_loss,
             candidate_refinement_gain=candidate_refinement_gain,
+            candidate_refinement_token_nll_gain=candidate_refinement_token_nll_gain,
             candidate_refinement_steps=candidate_steps_tensor,
             reasoning_level=requested_level,
             reasoning_budget=reasoning_budget,

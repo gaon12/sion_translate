@@ -108,6 +108,9 @@ def test_training_supervises_draft_and_refinement_without_detaching_gradients() 
     assert output.candidate_refinement_loss.item() > 0
     assert output.candidate_refinement_gain is not None
     assert torch.isfinite(output.candidate_refinement_gain)
+    assert output.candidate_refinement_token_nll_gain is not None
+    assert output.candidate_refinement_token_nll_gain.shape == _batch()["labels"].shape
+    assert torch.isfinite(output.candidate_refinement_token_nll_gain).all()
     assert output.loss is not None
     output.loss.backward()
 
@@ -116,6 +119,47 @@ def test_training_supervises_draft_and_refinement_without_detaching_gradients() 
     assert model.candidate_refinement.gate.weight.grad.abs().sum().item() > 0
     assert model.token_embedding.weight.grad is not None
     assert model.token_embedding.weight.grad.abs().sum().item() > 0
+
+
+def test_reported_gain_matches_provisional_to_final_token_nll() -> None:
+    torch.manual_seed(13)  # pyright: ignore[reportUnknownMemberType]
+    model = SionForConditionalGeneration(_config(steps=3)).eval()
+    assert model.candidate_refinement is not None
+    with torch.no_grad():
+        model.candidate_refinement.refinement_scale.fill_(0.2)
+
+    provisional_states: list[torch.Tensor] = []
+
+    def capture_provisional_states(
+        _module: torch.nn.Module,
+        args: tuple[torch.Tensor, ...],
+    ) -> None:
+        if not provisional_states:
+            provisional_states.append(args[0].detach().clone())
+
+    handle = model.candidate_refinement.register_forward_pre_hook(capture_provisional_states)
+    batch = _batch()
+    output = model(**batch)
+    handle.remove()
+
+    assert len(provisional_states) == 1
+    provisional_logits = model._logits(provisional_states[0]).float()
+    provisional_nll = F.cross_entropy(
+        provisional_logits.transpose(1, 2),
+        batch["labels"],
+        ignore_index=-100,
+        reduction="none",
+    )
+    final_nll = F.cross_entropy(
+        output.logits.float().transpose(1, 2),
+        batch["labels"],
+        ignore_index=-100,
+        reduction="none",
+    )
+    expected_gain = (provisional_nll - final_nll) * batch["labels"].ne(-100)
+
+    assert output.candidate_refinement_token_nll_gain is not None
+    torch.testing.assert_close(output.candidate_refinement_token_nll_gain, expected_gain)
 
 
 def test_zero_initialized_refiner_wakes_up_across_two_optimizer_steps() -> None:
@@ -209,6 +253,8 @@ def test_reasoning_levels_select_trained_endpoints_and_zero_is_exact_bypass() ->
     direct_output = direct(**batch)
     level_zero = refined(**batch, reasoning_level=0)
     torch.testing.assert_close(level_zero.logits, direct_output.logits)
+    assert direct_output.candidate_refinement_token_nll_gain is None
+    assert level_zero.candidate_refinement_token_nll_gain is None
     assert level_zero.candidate_refinement_steps is not None
     assert level_zero.candidate_refinement_steps.item() == 0
     assert refined(**batch, reasoning_level=1).candidate_refinement_steps.item() == 1
