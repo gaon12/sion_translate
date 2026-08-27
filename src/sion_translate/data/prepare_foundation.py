@@ -27,6 +27,7 @@ even when denoising is configured for every ordinary monolingual row.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import math
@@ -37,9 +38,11 @@ import stat
 import tempfile
 import unicodedata
 import uuid
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Any, cast
+from typing import Any, BinaryIO, Callable, cast
 
 import numpy as np
 
@@ -47,10 +50,8 @@ from sion_translate.artifacts import FOUNDATION_RELEASE_NAME
 from sion_translate.data.monolingual import (
     DEFAULT_LANGUAGE_SAMPLING_ALPHA,
     MonolingualDiscovery,
-    ReadStats,
     assess_language_balance,
     discover_monolingual_sources,
-    iter_monolingual_lines,
     segment_text,
 )
 from sion_translate.data.prepare import SHARED_TARGET_INDEX_DTYPE, ShardWriter, infer_register
@@ -59,13 +60,14 @@ from sion_translate.data.integrity import (
     dataset_artifact_problem,
 )
 from sion_translate.data.reasoning import (
-    ReasoningReadStats,
+    ReasoningDataError,
     ReasoningRecord,
     is_reasoning_jsonl,
-    iter_reasoning_records,
+    parse_reasoning_row,
     serialize_reasoning_record,
 )
 from sion_translate.fingerprint import file_sha256
+from sion_translate.locking import _exclusive_lock  # pyright: ignore[reportPrivateUsage]
 from sion_translate.splitting import choose_split_for_key
 from sion_translate.tokenizer import SionTokenizer, normalize_text
 
@@ -74,9 +76,29 @@ FOUNDATION_PREPROCESSING_SCHEMA = "foundation-mixed-objectives-v6"
 FOUNDATION_SOURCE_IDENTITY_SCHEMA = "corpus-relative-posix-sha256-v1"
 FOUNDATION_TOKENIZER_IDENTITY_SCHEMA = "content-sha256-v1"
 FOUNDATION_DEDUPLICATION_BACKEND = "sqlite-blake2b-128-v1"
-_DEDUPLICATION_DATABASE = ".foundation-dedup.sqlite3"
 _DEDUPLICATION_CACHE_KIB = 8 * 1024
-_DEDUPLICATION_COMMIT_INTERVAL = 100_000
+_FOUNDATION_RESUME_DATABASE = ".foundation-resume.sqlite3"
+_FOUNDATION_RESUME_SCHEMA = "sion-foundation-resume-v1"
+_FOUNDATION_RESUME_USER_VERSION = 1
+_FOUNDATION_OUTPUT_LOCK_SCHEMA = "sion-foundation-output-lock-v1"
+# Checkpointing is based on physical input lines, including rejected rows. The
+# interval is deliberately independent of record acceptance, segmentation, and
+# language so the same inputs always produce the same shard boundaries.
+_FOUNDATION_CHECKPOINT_INTERVAL = 100_000
+
+# Capacity planning samples physical lines at deterministic byte offsets and
+# measures their actual token/index/dedup footprint.  The margin covers source
+# regions missed by the sample, SQLite page variance, manifests, and filesystem
+# allocation.  A streaming reserve check still protects against estimator drift.
+_FOUNDATION_SAMPLE_LINES_PER_SOURCE = 64
+_FOUNDATION_SAMPLE_MAX_LINE_BYTES = 256 * 1024
+_FOUNDATION_ESTIMATE_MARGIN_NUMERATOR = 3
+_FOUNDATION_ESTIMATE_MARGIN_DENOMINATOR = 2
+_FOUNDATION_MIN_ESTIMATED_BYTES_PER_SOURCE_BYTE = 1
+_FOUNDATION_DEDUP_BYTES_PER_RECORD = 32
+_FOUNDATION_SPACE_RESERVE_BYTES = 512 * 1024 * 1024
+_FOUNDATION_SPACE_RESERVE_DIVISOR = 50
+_FOUNDATION_EMPTY_DEDUP_SHA256 = hashlib.sha256(b"").hexdigest()
 
 
 @dataclass
@@ -97,21 +119,6 @@ class LanguageStats:
     reasoning_think_truncated: int = 0
     reasoning_answer_truncated: int = 0
     read_rejects: dict[str, int] = field(default_factory=dict)
-
-    def merge_read(self, stats: ReadStats) -> None:
-        for reason, count in stats.reasons().items():
-            self.read_rejects[reason] = self.read_rejects.get(reason, 0) + count
-
-    def merge_reasoning_read(self, stats: ReasoningReadStats) -> None:
-        self.reasoning_rejected += stats.rejected
-        for reason, count in (
-            ("reasoning_blank", stats.blank),
-            ("reasoning_malformed_json", stats.malformed_json),
-            ("reasoning_non_object", stats.non_object),
-            ("reasoning_invalid_record", stats.invalid_record),
-        ):
-            if count:
-                self.read_rejects[reason] = self.read_rejects.get(reason, 0) + count
 
 
 @dataclass
@@ -142,58 +149,277 @@ class _FileSnapshot:
     file_attributes: int
 
 
-class _DiskDigestIndex:
-    """Bound deduplication memory with a disk-backed unique digest index.
+@dataclass(frozen=True)
+class _FoundationCursor:
+    """The next source position after one durably committed physical line."""
 
-    The index is scratch state inside the unpublished staging directory. SQLite
-    enforces uniqueness deterministically while its negative ``cache_size``
-    value caps the page cache in KiB. Durability is deliberately disabled: a
-    failed preparation discards the complete staging generation, so recovering
-    this private index would provide no value.
-    """
+    source_id: int
+    physical_lines: int
+    total_physical_lines: int
 
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self._connection = sqlite3.connect(path)
-        self._pending = 0
-        try:
-            self._connection.execute("PRAGMA journal_mode=OFF")
-            self._connection.execute("PRAGMA synchronous=OFF")
-            self._connection.execute("PRAGMA temp_store=FILE")
-            self._connection.execute(f"PRAGMA cache_size=-{_DEDUPLICATION_CACHE_KIB}")
-            self._connection.execute("PRAGMA locking_mode=EXCLUSIVE")
-            self._connection.execute("CREATE TABLE digests (digest BLOB PRIMARY KEY) WITHOUT ROWID")
-            self._connection.execute("BEGIN IMMEDIATE")
-        except BaseException:
-            self._connection.close()
-            raise
 
-    def add(self, digest: bytes) -> bool:
-        """Insert a digest and return ``True`` only for its first occurrence."""
+@dataclass(frozen=True)
+class _FoundationResumeState:
+    """Authenticated state committed in the same transaction as deduplication."""
 
-        cursor = self._connection.execute(
-            "INSERT OR IGNORE INTO digests (digest) VALUES (?)",
-            (sqlite3.Binary(digest),),
+    checkpoint_sequence: int
+    cursor: _FoundationCursor
+    next_shard_indices: dict[str, int]
+    stats: FoundationPrepareStats
+    source_record_counts: tuple[int, ...]
+    artifact_inventory: tuple[dict[str, object], ...]
+    dedup_digest_count: int
+    dedup_sequence_sha256: str
+
+
+@dataclass(frozen=True)
+class _PartialFoundationGeneration:
+    path: Path
+    state: _FoundationResumeState
+    journal: _FoundationResumeJournal
+
+
+@dataclass(frozen=True)
+class _StagingRecovery:
+    complete_stats: FoundationPrepareStats | None = None
+    partial: _PartialFoundationGeneration | None = None
+
+
+def _canonical_json(value: object) -> str:
+    """Serialize resume authority without platform- or locale-dependent details."""
+
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def _json_sha256(value: object) -> str:
+    return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _stats_payload(stats: FoundationPrepareStats) -> dict[str, object]:
+    return {
+        "train_records": stats.train_records,
+        "validation_records": stats.validation_records,
+        "languages": {
+            language: asdict(language_stats) for language, language_stats in stats.languages.items()
+        },
+    }
+
+
+def _resume_state_payload(
+    state: _FoundationResumeState,
+    *,
+    contract_sha256: str,
+) -> dict[str, object]:
+    return {
+        "schema": _FOUNDATION_RESUME_SCHEMA,
+        "contract_sha256": contract_sha256,
+        "checkpoint_sequence": state.checkpoint_sequence,
+        "cursor": {
+            "source_id": state.cursor.source_id,
+            "physical_lines": state.cursor.physical_lines,
+            "total_physical_lines": state.cursor.total_physical_lines,
+        },
+        "next_shard_indices": dict(state.next_shard_indices),
+        "stats": _stats_payload(state.stats),
+        "source_record_counts": list(state.source_record_counts),
+        "artifact_inventory": list(state.artifact_inventory),
+        "dedup_digest_count": state.dedup_digest_count,
+        "dedup_sequence_sha256": state.dedup_sequence_sha256,
+    }
+
+
+def _nonnegative_resume_integer(payload: Mapping[object, object], name: str) -> int:
+    value = payload.get(name)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"foundation resume {name} must be a non-negative integer")
+    return value
+
+
+def _validated_resume_inventory(raw_inventory: object) -> tuple[dict[str, object], ...]:
+    if not isinstance(raw_inventory, list):
+        raise ValueError("foundation resume artifact_inventory must be a list")
+    inventory: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for raw_entry in cast(list[object], raw_inventory):
+        if not isinstance(raw_entry, dict):
+            raise ValueError("foundation resume inventory entry must be an object")
+        entry = cast(dict[object, object], raw_entry)
+        if set(entry) != {"path", "size", "sha256"}:
+            raise ValueError("foundation resume inventory entry has unexpected fields")
+        raw_path = entry.get("path")
+        if not isinstance(raw_path, str):
+            raise ValueError("foundation resume inventory path must be a string")
+        relative = PurePosixPath(raw_path)
+        if (
+            relative.is_absolute()
+            or len(relative.parts) != 2
+            or relative.parts[0] not in {"train", "validation"}
+            or any(part in {"", ".", ".."} for part in relative.parts)
+            or relative.as_posix() != raw_path
+        ):
+            raise ValueError(f"foundation resume inventory path is unsafe: {raw_path!r}")
+        if raw_path in seen:
+            raise ValueError(f"foundation resume inventory path is duplicated: {raw_path}")
+        size = entry.get("size")
+        digest = entry.get("sha256")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise ValueError(f"foundation resume inventory size is invalid: {raw_path}")
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or digest != digest.lower()
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValueError(f"foundation resume inventory digest is invalid: {raw_path}")
+        seen.add(raw_path)
+        inventory.append({"path": raw_path, "size": size, "sha256": digest})
+    if [cast(str, entry["path"]) for entry in inventory] != sorted(seen):
+        raise ValueError("foundation resume inventory must be sorted by path")
+    return tuple(inventory)
+
+
+def _parse_resume_state(
+    raw_payload: object,
+    *,
+    contract_sha256: str,
+    languages: tuple[str, ...],
+    source_count: int,
+) -> _FoundationResumeState:
+    if not isinstance(raw_payload, dict):
+        raise ValueError("foundation resume state must be an object")
+    payload = cast(dict[object, object], raw_payload)
+    if set(payload) != {
+        "schema",
+        "contract_sha256",
+        "checkpoint_sequence",
+        "cursor",
+        "next_shard_indices",
+        "stats",
+        "source_record_counts",
+        "artifact_inventory",
+        "dedup_digest_count",
+        "dedup_sequence_sha256",
+    }:
+        raise ValueError("foundation resume state has unexpected fields")
+    if payload.get("schema") != _FOUNDATION_RESUME_SCHEMA:
+        raise ValueError("foundation resume state schema changed")
+    if payload.get("contract_sha256") != contract_sha256:
+        raise ValueError("foundation resume state belongs to a different preparation contract")
+    checkpoint_sequence = _nonnegative_resume_integer(payload, "checkpoint_sequence")
+
+    raw_cursor = payload.get("cursor")
+    if not isinstance(raw_cursor, dict):
+        raise ValueError("foundation resume cursor is invalid")
+    cursor_payload = cast(dict[object, object], raw_cursor)
+    if set(cursor_payload) != {
+        "source_id",
+        "physical_lines",
+        "total_physical_lines",
+    }:
+        raise ValueError("foundation resume cursor is invalid")
+    cursor = _FoundationCursor(
+        source_id=_nonnegative_resume_integer(cursor_payload, "source_id"),
+        physical_lines=_nonnegative_resume_integer(cursor_payload, "physical_lines"),
+        total_physical_lines=_nonnegative_resume_integer(
+            cursor_payload,
+            "total_physical_lines",
+        ),
+    )
+    if cursor.source_id > source_count or (
+        cursor.source_id == source_count and cursor.physical_lines != 0
+    ):
+        raise ValueError("foundation resume cursor is outside the ordered source list")
+    if cursor.physical_lines > cursor.total_physical_lines:
+        raise ValueError("foundation resume cursor line counts are inconsistent")
+    if cursor.source_id < source_count:
+        if checkpoint_sequence == 0:
+            if cursor != _FoundationCursor(0, 0, 0):
+                raise ValueError("foundation initial resume cursor is invalid")
+        elif (
+            cursor.physical_lines == 0
+            or cursor.total_physical_lines % _FOUNDATION_CHECKPOINT_INTERVAL != 0
+            or checkpoint_sequence != cursor.total_physical_lines // _FOUNDATION_CHECKPOINT_INTERVAL
+        ):
+            raise ValueError("foundation resume cursor is not a deterministic checkpoint")
+    elif checkpoint_sequence != (
+        cursor.total_physical_lines // _FOUNDATION_CHECKPOINT_INTERVAL + 1
+    ):
+        raise ValueError("foundation final resume checkpoint sequence is invalid")
+
+    raw_indices = payload.get("next_shard_indices")
+    if not isinstance(raw_indices, dict):
+        raise ValueError("foundation resume shard cursor is invalid")
+    indices_payload = cast(dict[object, object], raw_indices)
+    if set(indices_payload) != {"train", "validation"}:
+        raise ValueError("foundation resume shard cursor is invalid")
+    next_shard_indices = {
+        split: _nonnegative_resume_integer(indices_payload, split)
+        for split in ("train", "validation")
+    }
+
+    raw_stats = payload.get("stats")
+    stats = _stats_from_manifest(
+        {
+            "languages": list(languages),
+            "stats": raw_stats,
+        }
+    )
+    if tuple(stats.languages) != languages:
+        raise ValueError("foundation resume language order changed")
+
+    raw_source_counts = payload.get("source_record_counts")
+    if not isinstance(raw_source_counts, list):
+        raise ValueError("foundation resume source_record_counts is invalid")
+    source_count_values = cast(list[object], raw_source_counts)
+    if len(source_count_values) != source_count:
+        raise ValueError("foundation resume source_record_counts is invalid")
+    source_record_counts = tuple(
+        _nonnegative_resume_integer({"count": value}, "count") for value in source_count_values
+    )
+    if sum(source_record_counts) != stats.total_records:
+        raise ValueError("foundation resume source counts differ from its statistics")
+    artifact_inventory = _validated_resume_inventory(payload.get("artifact_inventory"))
+    dedup_digest_count = _nonnegative_resume_integer(payload, "dedup_digest_count")
+    raw_dedup_sha256 = payload.get("dedup_sequence_sha256")
+    if (
+        not isinstance(raw_dedup_sha256, str)
+        or len(raw_dedup_sha256) != 64
+        or raw_dedup_sha256 != raw_dedup_sha256.lower()
+        or any(character not in "0123456789abcdef" for character in raw_dedup_sha256)
+    ):
+        raise ValueError("foundation resume deduplication digest is invalid")
+    if dedup_digest_count == 0 and raw_dedup_sha256 != _FOUNDATION_EMPTY_DEDUP_SHA256:
+        raise ValueError("foundation empty deduplication digest is invalid")
+    if checkpoint_sequence == 0:
+        empty_stats = FoundationPrepareStats(
+            languages={language: LanguageStats() for language in languages}
         )
-        inserted = cursor.rowcount == 1
-        self._pending += 1
-        if self._pending >= _DEDUPLICATION_COMMIT_INTERVAL:
-            self._connection.commit()
-            self._connection.execute("BEGIN IMMEDIATE")
-            self._pending = 0
-        return inserted
+        if (
+            next_shard_indices != {"train": 0, "validation": 0}
+            or stats != empty_stats
+            or any(source_record_counts)
+            or artifact_inventory
+            or dedup_digest_count
+            or raw_dedup_sha256 != _FOUNDATION_EMPTY_DEDUP_SHA256
+        ):
+            raise ValueError("foundation initial resume state is not empty")
 
-    def close(self) -> None:
-        """Close and remove every private SQLite artifact before publication."""
-
-        try:
-            self._connection.commit()
-        finally:
-            self._connection.close()
-        for suffix in ("", "-journal", "-shm", "-wal"):
-            candidate = Path(f"{self.path}{suffix}")
-            if _path_exists(candidate):
-                candidate.unlink()
+    return _FoundationResumeState(
+        checkpoint_sequence=checkpoint_sequence,
+        cursor=cursor,
+        next_shard_indices=next_shard_indices,
+        stats=stats,
+        source_record_counts=source_record_counts,
+        artifact_inventory=artifact_inventory,
+        dedup_digest_count=dedup_digest_count,
+        dedup_sequence_sha256=raw_dedup_sha256,
+    )
 
 
 def _logical_relative_path(root: Path, path: Path, *, role: str) -> str:
@@ -246,6 +472,17 @@ def _text_digest(language: str, text: str) -> bytes:
 def _reasoning_digest(language: str, prompt: str, think: str, answer: str) -> bytes:
     payload = f"reasoning\0{language}\0{prompt}\0{think}\0{answer}"
     return hashlib.blake2b(payload.encode("utf-8"), digest_size=16).digest()
+
+
+def _extend_dedup_sequence_sha256(previous_sha256: str, digest: bytes) -> str:
+    """Bind one unique digest to its deterministic insertion position."""
+
+    if len(digest) != 16:
+        raise ValueError("foundation deduplication digest must contain 16 bytes")
+    value = hashlib.sha256()
+    value.update(bytes.fromhex(previous_sha256))
+    value.update(digest)
+    return value.hexdigest()
 
 
 def _is_usable(text: str) -> bool:
@@ -382,6 +619,92 @@ def _capture_source_snapshots(
             )
         snapshots.append(snapshot)
     return tuple(snapshots)
+
+
+def _build_resume_contract(
+    discovery: MonolingualDiscovery,
+    source_snapshots: tuple[_FileSnapshot, ...],
+    tokenizer_snapshot: _FileSnapshot,
+    *,
+    minimum_characters: int,
+    maximum_characters: int,
+    max_tokens: int,
+    max_target_tokens: int,
+    deduplicate: bool,
+    shard_size: int,
+    validation_fraction: float,
+    language_sampling_alpha: float,
+    minimum_language_share: float,
+    reasoning_sample_share: float,
+    release_name: str,
+) -> dict[str, object]:
+    """Bind resumable bytes to every input that can change deterministic output."""
+
+    if len(source_snapshots) != len(discovery.sources):
+        raise ValueError("foundation resume source snapshot count is invalid")
+    ordered_sources: list[dict[str, object]] = [
+        {
+            "id": source_id,
+            "language": source.language,
+            "logical_path": _source_logical_path(discovery, source.path),
+            "size_bytes": snapshot.size_bytes,
+            "sha256": snapshot.sha256,
+            "task": "reasoning" if is_reasoning_jsonl(source.path) else "denoising",
+        }
+        for source_id, (source, snapshot) in enumerate(
+            zip(discovery.sources, source_snapshots, strict=True)
+        )
+    ]
+    skipped_entries = [
+        {
+            "logical_path": _logical_relative_path(
+                discovery.root,
+                entry.path,
+                role="skipped entry",
+            ),
+            "reason": entry.reason,
+        }
+        for entry in discovery.skipped
+    ]
+    return {
+        "schema": _FOUNDATION_RESUME_SCHEMA,
+        "format": FOUNDATION_INDEX_FORMAT,
+        "preprocessing_schema": FOUNDATION_PREPROCESSING_SCHEMA,
+        "source_identity_schema": FOUNDATION_SOURCE_IDENTITY_SCHEMA,
+        "tokenizer_identity_schema": FOUNDATION_TOKENIZER_IDENTITY_SCHEMA,
+        "release_name": release_name,
+        "languages": list(discovery.languages),
+        "languages_without_data": list(discovery.languages_without_data),
+        "unconfigured_languages": list(discovery.unconfigured_languages),
+        "sources": ordered_sources,
+        "sources_sha256": _source_identity_digest(ordered_sources),
+        "skipped": skipped_entries,
+        "tokenizer_identity": {
+            "schema": FOUNDATION_TOKENIZER_IDENTITY_SCHEMA,
+            "size_bytes": tokenizer_snapshot.size_bytes,
+            "sha256": tokenizer_snapshot.sha256,
+        },
+        "storage": {
+            "index_dtype": json.loads(json.dumps(SHARED_TARGET_INDEX_DTYPE.descr)),
+            "target_storage": "row-shared-source-v1",
+        },
+        "options": {
+            "checkpoint_interval_physical_lines": _FOUNDATION_CHECKPOINT_INTERVAL,
+            "deduplicate": deduplicate,
+            "deduplication_backend": (
+                FOUNDATION_DEDUPLICATION_BACKEND if deduplicate else "disabled"
+            ),
+            "language_sampling_alpha": language_sampling_alpha,
+            "maximum_characters": maximum_characters,
+            "max_tokens": max_tokens,
+            "max_target_tokens": max_target_tokens,
+            "minimum_characters": minimum_characters,
+            "minimum_language_share": minimum_language_share,
+            "reasoning_sample_share": reasoning_sample_share,
+            "shard_size": shard_size,
+            "validation_fraction": validation_fraction,
+        },
+    }
 
 
 def _verify_source_metadata(
@@ -554,6 +877,943 @@ def _regular_staging_tree(root: Path) -> tuple[list[Path], list[Path]]:
     return directories, files
 
 
+def _foundation_staging_size(root: Path | None) -> int:
+    """Return bytes already charged to an authenticated private generation."""
+
+    if root is None:
+        return 0
+    _directories, files = _regular_staging_tree(root)
+    return sum(_regular_file_stat(path, role="staging artifact").st_size for path in files)
+
+
+def _read_bounded_sample_line(handle: BinaryIO) -> tuple[bytes, bool]:
+    """Read one physical line without allocating an unbounded document."""
+
+    first = handle.readline(_FOUNDATION_SAMPLE_MAX_LINE_BYTES + 1)
+    if not first:
+        return b"", False
+    truncated = len(first) > _FOUNDATION_SAMPLE_MAX_LINE_BYTES or not first.endswith(b"\n")
+    if len(first) > _FOUNDATION_SAMPLE_MAX_LINE_BYTES:
+        first = first[:_FOUNDATION_SAMPLE_MAX_LINE_BYTES]
+    if truncated and not first.endswith(b"\n"):
+        while True:
+            remainder = handle.readline(_FOUNDATION_SAMPLE_MAX_LINE_BYTES)
+            if not remainder or remainder.endswith(b"\n"):
+                break
+    return first, truncated
+
+
+def _sample_source_physical_lines(path: Path, size_bytes: int) -> Iterator[bytes]:
+    """Sample deterministic byte-stratified lines from one immutable source."""
+
+    sample_count = min(_FOUNDATION_SAMPLE_LINES_PER_SOURCE, max(1, size_bytes))
+    denominator = max(1, sample_count - 1)
+    offsets = tuple(
+        dict.fromkeys(
+            (max(0, size_bytes - 1) * index) // denominator for index in range(sample_count)
+        )
+    )
+    seen_starts: set[int] = set()
+    with path.open("rb") as handle:
+        for offset in offsets:
+            if offset:
+                handle.seek(offset - 1)
+                previous = handle.read(1)
+                if previous != b"\n":
+                    _discarded, truncated = _read_bounded_sample_line(handle)
+                    if truncated:
+                        # One physical line spans this and later strata. The
+                        # bounded prefix below is sufficient for density
+                        # estimation without repeatedly scanning the same tail.
+                        handle.seek(offset)
+            else:
+                handle.seek(0)
+            start = handle.tell()
+            if start in seen_starts:
+                continue
+            seen_starts.add(start)
+            raw_line, truncated = _read_bounded_sample_line(handle)
+            if not raw_line:
+                continue
+            yield raw_line
+            if truncated:
+                return
+
+
+def _sampled_foundation_storage_bytes(
+    path: Path,
+    raw_line: bytes,
+    *,
+    language: str,
+    tokenizer: SionTokenizer,
+    minimum_characters: int,
+    maximum_characters: int,
+    max_tokens: int,
+    max_target_tokens: int,
+    deduplicate: bool,
+) -> int:
+    """Measure the shard footprint represented by one sampled physical line."""
+
+    reasoning_source = is_reasoning_jsonl(path)
+    try:
+        line = raw_line.decode(
+            "utf-8-sig",
+            errors="strict" if reasoning_source else "replace",
+        )
+    except UnicodeDecodeError:
+        return 0
+    scratch = LanguageStats()
+    per_record_overhead = SHARED_TARGET_INDEX_DTYPE.itemsize + (
+        _FOUNDATION_DEDUP_BYTES_PER_RECORD if deduplicate else 0
+    )
+    if reasoning_source:
+        record = _parse_reasoning_physical_line(
+            line,
+            language=language,
+            language_stats=scratch,
+        )
+        if record is None:
+            return 0
+        encoded = serialize_reasoning_record(
+            record,
+            tokenizer,
+            max_source_tokens=max_tokens + 1,
+            max_target_tokens=max_target_tokens,
+        )
+        return 4 * (len(encoded.source_ids) + len(encoded.target_ids)) + per_record_overhead
+
+    raw_text = _parse_monolingual_physical_line(path, line, scratch)
+    if raw_text is None:
+        return 0
+    document = normalize_text(raw_text)
+    if not _is_usable(document):
+        return 0
+    segments = segment_text(
+        document,
+        maximum_characters=maximum_characters,
+        minimum_characters=minimum_characters,
+    )
+    measured = 0
+    for segment in segments:
+        token_ids = tokenizer.encode(segment)[:max_tokens]
+        # Denoising aliases the target to the source, so only one uint32 token
+        # stream is materialized. An empty tokenization still occupies dedup
+        # state but does not create an index row.
+        measured += 4 * len(token_ids)
+        if token_ids:
+            measured += SHARED_TARGET_INDEX_DTYPE.itemsize
+        if deduplicate:
+            measured += _FOUNDATION_DEDUP_BYTES_PER_RECORD
+    return measured
+
+
+def _estimate_foundation_generation_bytes(
+    discovery: MonolingualDiscovery,
+    tokenizer_model: str | Path,
+    *,
+    minimum_characters: int,
+    maximum_characters: int,
+    max_tokens: int,
+    max_target_tokens: int,
+    deduplicate: bool,
+) -> int:
+    """Estimate complete storage from deterministic, tokenizer-aware samples."""
+
+    tokenizer = SionTokenizer(tokenizer_model)
+    estimated_total = 0
+    for source in discovery.sources:
+        sampled_source_bytes = 0
+        sampled_storage_bytes = 0
+        for raw_line in _sample_source_physical_lines(source.path, source.size_bytes):
+            sampled_source_bytes += len(raw_line)
+            sampled_storage_bytes += _sampled_foundation_storage_bytes(
+                source.path,
+                raw_line,
+                language=source.language,
+                tokenizer=tokenizer,
+                minimum_characters=minimum_characters,
+                maximum_characters=maximum_characters,
+                max_tokens=max_tokens,
+                max_target_tokens=max_target_tokens,
+                deduplicate=deduplicate,
+            )
+        floor = source.size_bytes * _FOUNDATION_MIN_ESTIMATED_BYTES_PER_SOURCE_BYTE
+        if sampled_source_bytes:
+            sampled_projection = (
+                sampled_storage_bytes * source.size_bytes + sampled_source_bytes - 1
+            ) // sampled_source_bytes
+        else:
+            sampled_projection = 0
+        unbuffered = max(floor, sampled_projection)
+        estimated_total += (
+            unbuffered * _FOUNDATION_ESTIMATE_MARGIN_NUMERATOR
+            + _FOUNDATION_ESTIMATE_MARGIN_DENOMINATOR
+            - 1
+        ) // _FOUNDATION_ESTIMATE_MARGIN_DENOMINATOR
+    return estimated_total
+
+
+def _preflight_foundation_disk_space(
+    discovery: MonolingualDiscovery,
+    tokenizer_model: str | Path,
+    output_parent: Path,
+    *,
+    existing_staging: Path | None,
+    minimum_characters: int,
+    maximum_characters: int,
+    max_tokens: int,
+    max_target_tokens: int,
+    deduplicate: bool,
+) -> int:
+    """Refuse a generation that cannot retain its estimated output and reserve.
+
+    Existing resumable bytes are subtracted because ``disk_usage().free`` already
+    excludes them. The estimate is tokenizer- and source-aware, while a 50% margin
+    and an independent streaming reserve guard against distribution drift.
+    """
+
+    estimated_generation_bytes = _estimate_foundation_generation_bytes(
+        discovery,
+        tokenizer_model,
+        minimum_characters=minimum_characters,
+        maximum_characters=maximum_characters,
+        max_tokens=max_tokens,
+        max_target_tokens=max_target_tokens,
+        deduplicate=deduplicate,
+    )
+    reserve_bytes = max(
+        _FOUNDATION_SPACE_RESERVE_BYTES,
+        estimated_generation_bytes // _FOUNDATION_SPACE_RESERVE_DIVISOR,
+    )
+    existing_bytes = _foundation_staging_size(existing_staging)
+    additional_bytes = max(0, estimated_generation_bytes - existing_bytes)
+    required_free_bytes = additional_bytes + reserve_bytes
+    try:
+        free_bytes = shutil.disk_usage(output_parent).free
+    except OSError as error:
+        raise OSError(
+            error.errno,
+            f"Cannot inspect free disk space for foundation preparation: {output_parent}",
+            str(output_parent),
+        ) from error
+    if free_bytes < required_free_bytes:
+        raise OSError(
+            errno.ENOSPC,
+            "Insufficient free disk space for foundation preparation: "
+            f"need at least {required_free_bytes:,} free bytes, found {free_bytes:,}; "
+            f"estimated generation {estimated_generation_bytes:,}, "
+            f"existing resumable bytes {existing_bytes:,}, reserve {reserve_bytes:,}",
+            str(output_parent),
+        )
+    return reserve_bytes
+
+
+def _preflight_foundation_checkpoint_space(
+    output_dir: Path,
+    minimum_free_bytes: int,
+) -> None:
+    """Keep enough free space to close and roll back one in-flight checkpoint."""
+
+    if minimum_free_bytes < _FOUNDATION_SPACE_RESERVE_BYTES:
+        raise ValueError("foundation checkpoint reserve is below the absolute safety floor")
+
+    try:
+        free_bytes = shutil.disk_usage(output_dir).free
+    except OSError as error:
+        raise OSError(
+            error.errno,
+            f"Cannot inspect free disk space at a foundation checkpoint: {output_dir}",
+            str(output_dir),
+        ) from error
+    if free_bytes < minimum_free_bytes:
+        raise OSError(
+            errno.ENOSPC,
+            "Foundation preparation reached its checkpoint disk reserve: "
+            f"need {minimum_free_bytes:,} free bytes, found {free_bytes:,}",
+            str(output_dir),
+        )
+
+
+def _checkpoint_payload_files(root: Path) -> dict[str, Path]:
+    """Return regular direct-child shard files without accepting extra trees."""
+
+    files: dict[str, Path] = {}
+    for split in ("train", "validation"):
+        split_root = root / split
+        _assert_regular_directory(split_root, role=f"{split} resume payload")
+        for entry in os.scandir(split_root):
+            path = Path(entry.path)
+            value = entry.stat(follow_symlinks=False)
+            if _is_reparse_stat(value) or not stat.S_ISREG(value.st_mode):
+                raise ValueError(
+                    f"Foundation resume payload must contain only regular shard files: {path}"
+                )
+            files[f"{split}/{entry.name}"] = path
+    return files
+
+
+def _build_checkpoint_inventory(
+    root: Path,
+    previous: tuple[dict[str, object], ...],
+) -> tuple[dict[str, object], ...]:
+    """Extend an immutable shard inventory without rehashing its full prefix."""
+
+    files = _checkpoint_payload_files(root)
+    previous_by_path = {cast(str, entry["path"]): entry for entry in previous}
+    missing = set(previous_by_path) - set(files)
+    if missing:
+        raise RuntimeError(
+            f"Foundation committed shards disappeared while checkpointing: {sorted(missing)}"
+        )
+    before = {
+        relative: (
+            path.stat().st_size,
+            path.stat().st_mtime_ns,
+            getattr(path.stat(), "st_ino", 0),
+        )
+        for relative, path in files.items()
+        if relative not in previous_by_path
+    }
+    inventory: list[dict[str, object]] = []
+    for relative, path in sorted(files.items()):
+        prior = previous_by_path.get(relative)
+        if prior is not None:
+            if path.stat().st_size != prior["size"]:
+                raise RuntimeError(
+                    f"Foundation committed shard size changed while checkpointing: {relative}"
+                )
+            inventory.append(dict(prior))
+            continue
+        inventory.append(
+            {
+                "path": relative,
+                "size": path.stat().st_size,
+                "sha256": file_sha256(path),
+            }
+        )
+    after = {
+        relative: (
+            path.stat().st_size,
+            path.stat().st_mtime_ns,
+            getattr(path.stat(), "st_ino", 0),
+        )
+        for relative, path in files.items()
+        if relative not in previous_by_path
+    }
+    if after != before:
+        raise RuntimeError("Foundation shard bytes changed while checkpointing")
+    return tuple(inventory)
+
+
+def _inventory_shard_groups(
+    inventory: tuple[dict[str, object], ...],
+) -> dict[str, dict[int, set[str]]]:
+    groups: dict[str, dict[int, set[str]]] = {"train": {}, "validation": {}}
+    for entry in inventory:
+        relative = cast(str, entry["path"])
+        split, name = relative.split("/", maxsplit=1)
+        prefix, separator, suffix = name.partition(".")
+        if (
+            not separator
+            or len(prefix) != 5
+            or not prefix.isdecimal()
+            or suffix not in {"src.bin", "tgt.bin", "idx.npy"}
+        ):
+            raise ValueError(f"foundation resume shard name is invalid: {relative}")
+        groups[split].setdefault(int(prefix), set()).add(suffix)
+    return groups
+
+
+def _validate_checkpoint_payload(
+    root: Path,
+    state: _FoundationResumeState,
+    discovery: MonolingualDiscovery,
+    *,
+    deduplicate: bool,
+) -> None:
+    """Authenticate committed shard bytes and their semantic cursor boundaries."""
+
+    files = _checkpoint_payload_files(root)
+    expected = {cast(str, entry["path"]): entry for entry in state.artifact_inventory}
+    before: dict[str, tuple[int, int, int]] = {}
+    for relative, entry in expected.items():
+        path = files.get(relative)
+        if path is None:
+            raise ValueError(f"foundation resume shard is missing: {relative}")
+        value = _regular_file_stat(path, role="resume shard")
+        before[relative] = (value.st_size, value.st_mtime_ns, value.st_ino)
+        if value.st_size != entry["size"]:
+            raise ValueError(f"foundation resume shard size changed: {relative}")
+        if file_sha256(path) != entry["sha256"]:
+            raise ValueError(f"foundation resume shard digest changed: {relative}")
+
+    groups = _inventory_shard_groups(state.artifact_inventory)
+    indexed_source_counts = np.zeros(len(discovery.sources), dtype=np.int64)
+    split_totals = {"train": 0, "validation": 0}
+    language_to_id = {
+        language: language_id for language_id, language in enumerate(discovery.languages)
+    }
+    source_language_ids = np.asarray(
+        [language_to_id[source.language] for source in discovery.sources],
+        dtype=np.int64,
+    )
+    source_is_denoising = np.asarray(
+        [not is_reasoning_jsonl(source.path) for source in discovery.sources],
+        dtype=np.bool_,
+    )
+    for split in ("train", "validation"):
+        split_groups = groups[split]
+        next_index = state.next_shard_indices[split]
+        if set(split_groups) != set(range(next_index)):
+            raise ValueError(f"foundation resume {split} shard sequence is not contiguous")
+        for shard_index in range(next_index):
+            suffixes = split_groups[shard_index]
+            if suffixes != {"src.bin", "tgt.bin", "idx.npy"}:
+                raise ValueError(f"foundation resume {split} shard {shard_index:05d} is incomplete")
+            prefix = f"{shard_index:05d}"
+            index_path = root / split / f"{prefix}.idx.npy"
+            try:
+                # Load one bounded shard into memory. A NumPy memmap keeps a file
+                # handle alive through the exception traceback on Windows, which
+                # would prevent quarantining a semantically corrupt generation.
+                index = np.load(index_path, allow_pickle=False)
+            except (OSError, ValueError) as error:
+                raise ValueError(f"foundation resume index cannot be read: {index_path}") from error
+            if index.dtype != SHARED_TARGET_INDEX_DTYPE:
+                raise ValueError(f"foundation resume index dtype changed: {index_path}")
+            source_ids = np.asarray(index["source_id"], dtype=np.int64)
+            if source_ids.size and (
+                int(source_ids.min()) < 0 or int(source_ids.max()) >= len(discovery.sources)
+            ):
+                raise ValueError(f"foundation resume source id is invalid: {index_path}")
+            expected_language_ids = source_language_ids[source_ids]
+            if not np.array_equal(
+                index["src_language_id"], expected_language_ids
+            ) or not np.array_equal(index["tgt_language_id"], expected_language_ids):
+                raise ValueError(f"foundation resume language mapping changed: {index_path}")
+            if not bool((np.asarray(index["forward_only"], dtype=np.uint8) == 1).all()):
+                raise ValueError(f"foundation resume forward-only contract changed: {index_path}")
+            shared = np.asarray(index["target_shared"], dtype=np.uint8)
+            if not bool(np.isin(shared, (0, 1)).all()):
+                raise ValueError(f"foundation resume target-sharing flag changed: {index_path}")
+            if not np.array_equal(shared.astype(np.bool_), source_is_denoising[source_ids]):
+                raise ValueError(f"foundation resume target sharing changed: {index_path}")
+            src_lengths = np.asarray(index["src_length"], dtype=np.uint64)
+            tgt_lengths = np.asarray(index["tgt_length"], dtype=np.uint64)
+            if not bool((src_lengths > 0).all()) or not bool((tgt_lengths > 0).all()):
+                raise ValueError(f"foundation resume contains an empty token row: {index_path}")
+            shared_mask = shared.astype(np.bool_)
+            if bool(shared_mask.any()) and (
+                not np.array_equal(src_lengths[shared_mask], tgt_lengths[shared_mask])
+                or not np.array_equal(
+                    np.asarray(index["src_register"])[shared_mask],
+                    np.asarray(index["tgt_register"])[shared_mask],
+                )
+            ):
+                raise ValueError(
+                    f"foundation resume shared targets contradict their source rows: {index_path}"
+                )
+            if not bool((np.asarray(index["quality_score"], dtype=np.uint8) == 100).all()):
+                raise ValueError(f"foundation resume quality contract changed: {index_path}")
+            if not bool((np.asarray(index["synthetic"], dtype=np.uint8) == 0).all()):
+                raise ValueError(f"foundation resume synthetic-data contract changed: {index_path}")
+            src_offsets = np.asarray(index["src_offset"], dtype=np.uint64)
+            tgt_offsets = np.asarray(index["tgt_offset"], dtype=np.uint64)
+            expected_src_offsets = np.concatenate(
+                (np.zeros(1, dtype=np.uint64), np.cumsum(src_lengths[:-1], dtype=np.uint64))
+            )
+            stored_tgt_lengths = np.where(shared.astype(np.bool_), 0, tgt_lengths)
+            expected_tgt_offsets = np.concatenate(
+                (
+                    np.zeros(1, dtype=np.uint64),
+                    np.cumsum(stored_tgt_lengths[:-1], dtype=np.uint64),
+                )
+            )
+            if not np.array_equal(src_offsets, expected_src_offsets) or not np.array_equal(
+                tgt_offsets,
+                expected_tgt_offsets,
+            ):
+                raise ValueError(f"foundation resume token offsets changed: {index_path}")
+            if (root / split / f"{prefix}.src.bin").stat().st_size != int(
+                src_lengths.sum(dtype=np.uint64)
+            ) * 4:
+                raise ValueError(f"foundation resume source token length changed: {index_path}")
+            if (root / split / f"{prefix}.tgt.bin").stat().st_size != int(
+                stored_tgt_lengths.sum(dtype=np.uint64)
+            ) * 4:
+                raise ValueError(f"foundation resume target token length changed: {index_path}")
+            indexed_source_counts += np.bincount(
+                source_ids,
+                minlength=len(discovery.sources),
+            )[: len(discovery.sources)]
+            split_totals[split] += len(index)
+
+    if tuple(indexed_source_counts.tolist()) != state.source_record_counts:
+        raise ValueError("foundation resume source counts differ from committed shards")
+    if (
+        split_totals["train"] != state.stats.train_records
+        or split_totals["validation"] != state.stats.validation_records
+    ):
+        raise ValueError("foundation resume split counts differ from committed shards")
+    indexed_language_counts = {
+        language: int(
+            indexed_source_counts[
+                [
+                    source_id
+                    for source_id, source in enumerate(discovery.sources)
+                    if source.language == language
+                ]
+            ].sum(dtype=np.int64)
+        )
+        for language in discovery.languages
+    }
+    if indexed_language_counts != state.stats.accepted_per_language():
+        raise ValueError("foundation resume language counts differ from committed shards")
+    indexed_reasoning_counts = {
+        language: int(
+            indexed_source_counts[
+                [
+                    source_id
+                    for source_id, source in enumerate(discovery.sources)
+                    if source.language == language and is_reasoning_jsonl(source.path)
+                ]
+            ].sum(dtype=np.int64)
+        )
+        for language in discovery.languages
+    }
+    if any(
+        indexed_reasoning_counts[language] != state.stats.languages[language].reasoning_records
+        for language in discovery.languages
+    ):
+        raise ValueError("foundation resume reasoning counts differ from committed shards")
+    if deduplicate:
+        expected_digest_count = state.stats.total_records + sum(
+            language.empty_after_tokenization for language in state.stats.languages.values()
+        )
+        if state.dedup_digest_count != expected_digest_count:
+            raise ValueError("foundation resume deduplication state is incomplete")
+        if (
+            state.dedup_digest_count > 0
+            and state.dedup_sequence_sha256 == _FOUNDATION_EMPTY_DEDUP_SHA256
+        ):
+            raise ValueError("foundation resume deduplication content is incomplete")
+    elif (
+        state.dedup_digest_count != 0
+        or any(language.duplicate for language in state.stats.languages.values())
+        or state.dedup_sequence_sha256 != _FOUNDATION_EMPTY_DEDUP_SHA256
+    ):
+        raise ValueError("foundation resume has deduplication state while it is disabled")
+
+    after = {
+        relative: (
+            files[relative].stat().st_size,
+            files[relative].stat().st_mtime_ns,
+            getattr(files[relative].stat(), "st_ino", 0),
+        )
+        for relative in expected
+    }
+    if after != before:
+        raise RuntimeError("Foundation shard bytes changed during resume authentication")
+
+
+def _remove_uncommitted_foundation_tail(
+    root: Path,
+    inventory: tuple[dict[str, object], ...],
+) -> None:
+    """Remove only shard files written after the last committed authority record."""
+
+    allowed_root_names = {
+        "train",
+        "validation",
+        "manifest.json",
+        _FOUNDATION_RESUME_DATABASE,
+        f"{_FOUNDATION_RESUME_DATABASE}-journal",
+    }
+    for entry in os.scandir(root):
+        if entry.name not in allowed_root_names:
+            raise ValueError(f"foundation resume contains an unexpected artifact: {entry.path}")
+    expected = {cast(str, entry["path"]) for entry in inventory}
+    files = _checkpoint_payload_files(root)
+    removed = False
+    for relative, path in files.items():
+        if relative not in expected:
+            path.unlink()
+            removed = True
+    manifest_path = root / "manifest.json"
+    if _path_exists(manifest_path):
+        _regular_file_stat(manifest_path, role="uncommitted resume manifest")
+        manifest_path.unlink()
+        removed = True
+    if removed:
+        for split in ("train", "validation"):
+            _fsync_directory(root / split)
+        _fsync_directory(root)
+
+
+def _fsync_foundation_payload(
+    root: Path,
+    committed_inventory: tuple[dict[str, object], ...],
+) -> None:
+    """Durably close only the files added after the prior checkpoint."""
+
+    committed_paths = {cast(str, entry["path"]) for entry in committed_inventory}
+    files = _checkpoint_payload_files(root)
+    missing = committed_paths - set(files)
+    if missing:
+        raise RuntimeError(
+            f"Foundation committed shards disappeared before checkpoint sync: {sorted(missing)}"
+        )
+    for relative, path in files.items():
+        if relative not in committed_paths:
+            _fsync_file(path)
+    for split in ("train", "validation"):
+        _fsync_directory(root / split)
+    _fsync_directory(root)
+
+
+class _FoundationResumeBusy(RuntimeError):
+    """Another process still owns a private foundation generation."""
+
+
+class _FoundationResumeJournal:
+    """Durable transaction authority for cursor, shards, stats, and deduplication."""
+
+    def __init__(
+        self,
+        path: Path,
+        connection: sqlite3.Connection,
+        contract: dict[str, object],
+    ) -> None:
+        self.path = path
+        self._connection = connection
+        self.contract = contract
+        self.contract_sha256 = _json_sha256(contract)
+        self._digest_count = 0
+        self._digest_sequence_sha256 = _FOUNDATION_EMPTY_DEDUP_SHA256
+        self._closed = False
+
+    @staticmethod
+    def _connect(path: Path) -> sqlite3.Connection:
+        connection = sqlite3.connect(path, timeout=0.0, isolation_level=None)
+        try:
+            connection.execute("PRAGMA busy_timeout=0")
+            connection.execute("PRAGMA journal_mode=DELETE")
+            connection.execute("PRAGMA synchronous=FULL")
+            connection.execute("PRAGMA temp_store=FILE")
+            connection.execute(f"PRAGMA cache_size=-{_DEDUPLICATION_CACHE_KIB}")
+            connection.execute("PRAGMA locking_mode=EXCLUSIVE")
+        except BaseException:
+            connection.close()
+            raise
+        return connection
+
+    @classmethod
+    def create(
+        cls,
+        path: Path,
+        contract: dict[str, object],
+        initial_state: _FoundationResumeState,
+    ) -> _FoundationResumeJournal:
+        if _path_exists(path):
+            raise FileExistsError(f"foundation resume database already exists: {path}")
+        if initial_state.dedup_digest_count != 0:
+            raise ValueError("a new foundation resume database must start without digests")
+        if initial_state.dedup_sequence_sha256 != _FOUNDATION_EMPTY_DEDUP_SHA256:
+            raise ValueError("a new foundation resume database has an invalid digest authority")
+        connection = cls._connect(path)
+        journal = cls(path, connection, contract)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID"
+            )
+            connection.execute(
+                "CREATE TABLE state ("
+                "singleton INTEGER PRIMARY KEY CHECK (singleton = 1), "
+                "payload TEXT NOT NULL, payload_sha256 TEXT NOT NULL)"
+            )
+            connection.execute(
+                "CREATE TABLE digests ("
+                "digest BLOB PRIMARY KEY, sequence INTEGER NOT NULL UNIQUE) WITHOUT ROWID"
+            )
+            connection.execute(
+                "INSERT INTO metadata (key, value) VALUES (?, ?), (?, ?)",
+                (
+                    "contract",
+                    _canonical_json(contract),
+                    "contract_sha256",
+                    journal.contract_sha256,
+                ),
+            )
+            connection.execute(f"PRAGMA user_version={_FOUNDATION_RESUME_USER_VERSION}")
+            journal._write_state(initial_state)
+            connection.commit()
+            _fsync_file(path)
+            _fsync_directory(path.parent)
+            connection.execute("BEGIN IMMEDIATE")
+        except BaseException:
+            connection.close()
+            for suffix in ("", "-journal", "-shm", "-wal"):
+                candidate = Path(f"{path}{suffix}")
+                if _path_exists(candidate):
+                    candidate.unlink()
+            raise
+        return journal
+
+    @classmethod
+    def open(
+        cls,
+        path: Path,
+        contract: dict[str, object],
+        *,
+        languages: tuple[str, ...],
+        source_count: int,
+    ) -> tuple[_FoundationResumeJournal, _FoundationResumeState]:
+        _regular_file_stat(path, role="resume database")
+        try:
+            connection = cls._connect(path)
+            connection.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as error:
+            if "locked" in str(error).lower():
+                raise _FoundationResumeBusy(
+                    f"Foundation staging generation is still active: {path.parent}"
+                ) from error
+            raise
+        journal = cls(path, connection, contract)
+        try:
+            journal._validate_schema()
+            metadata_rows = connection.execute(
+                "SELECT key, value FROM metadata ORDER BY key"
+            ).fetchall()
+            metadata = {str(key): str(value) for key, value in metadata_rows}
+            if set(metadata) != {"contract", "contract_sha256"}:
+                raise ValueError("foundation resume metadata schema is invalid")
+            if metadata["contract_sha256"] != journal.contract_sha256:
+                raise ValueError("foundation resume contract digest changed")
+            if metadata["contract"] != _canonical_json(contract):
+                raise ValueError("foundation resume contract changed")
+            state_row = connection.execute(
+                "SELECT payload, payload_sha256 FROM state WHERE singleton = 1"
+            ).fetchone()
+            if state_row is None:
+                raise ValueError("foundation resume state is missing")
+            raw_state_text, stored_state_sha256 = state_row
+            if not isinstance(raw_state_text, str) or not isinstance(stored_state_sha256, str):
+                raise ValueError("foundation resume state encoding is invalid")
+            if hashlib.sha256(raw_state_text.encode("utf-8")).hexdigest() != stored_state_sha256:
+                raise ValueError("foundation resume state digest changed")
+            try:
+                raw_state: object = json.loads(raw_state_text)
+            except json.JSONDecodeError as error:
+                raise ValueError("foundation resume state JSON is invalid") from error
+            state = _parse_resume_state(
+                raw_state,
+                contract_sha256=journal.contract_sha256,
+                languages=languages,
+                source_count=source_count,
+            )
+            digest_count, digest_sequence_sha256 = journal._authenticate_digests()
+            if digest_count != state.dedup_digest_count:
+                raise ValueError("foundation resume deduplication count changed")
+            if digest_sequence_sha256 != state.dedup_sequence_sha256:
+                raise ValueError("foundation resume deduplication content changed")
+            journal._digest_count = digest_count
+            journal._digest_sequence_sha256 = digest_sequence_sha256
+        except BaseException:
+            connection.rollback()
+            connection.close()
+            raise
+        return journal, state
+
+    def _validate_schema(self) -> None:
+        integrity_rows = self._connection.execute("PRAGMA integrity_check").fetchall()
+        if integrity_rows != [("ok",)]:
+            raise ValueError("foundation resume database integrity check failed")
+        user_version = int(self._connection.execute("PRAGMA user_version").fetchone()[0])
+        if user_version != _FOUNDATION_RESUME_USER_VERSION:
+            raise ValueError("foundation resume database version changed")
+        tables = {
+            str(name)
+            for (name,) in self._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        if tables != {"metadata", "state", "digests"}:
+            raise ValueError("foundation resume database tables are invalid")
+        expected_sql = {
+            "metadata": (
+                "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID"
+            ),
+            "state": (
+                "CREATE TABLE state (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), "
+                "payload TEXT NOT NULL, payload_sha256 TEXT NOT NULL)"
+            ),
+            "digests": (
+                "CREATE TABLE digests (digest BLOB PRIMARY KEY, "
+                "sequence INTEGER NOT NULL UNIQUE) WITHOUT ROWID"
+            ),
+        }
+        for table, expected in expected_sql.items():
+            schema_row = self._connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table,),
+            ).fetchone()
+            if schema_row != (expected,):
+                raise ValueError(f"foundation resume database table changed: {table}")
+
+    def _authenticate_digests(self) -> tuple[int, str]:
+        """Recompute the state-bound digest chain in deterministic insertion order."""
+
+        count = 0
+        sequence_sha256 = _FOUNDATION_EMPTY_DEDUP_SHA256
+        rows = self._connection.execute("SELECT sequence, digest FROM digests ORDER BY sequence")
+        for raw_sequence, raw_digest in rows:
+            count += 1
+            if (
+                isinstance(raw_sequence, bool)
+                or not isinstance(raw_sequence, int)
+                or raw_sequence != count
+                or not isinstance(raw_digest, bytes)
+                or len(raw_digest) != 16
+            ):
+                raise ValueError("foundation resume database contains an invalid digest row")
+            sequence_sha256 = _extend_dedup_sequence_sha256(
+                sequence_sha256,
+                raw_digest,
+            )
+        return count, sequence_sha256
+
+    def _write_state(self, state: _FoundationResumeState) -> None:
+        payload_text = _canonical_json(
+            _resume_state_payload(state, contract_sha256=self.contract_sha256)
+        )
+        payload_sha256 = hashlib.sha256(payload_text.encode("utf-8")).hexdigest()
+        self._connection.execute(
+            "INSERT INTO state (singleton, payload, payload_sha256) VALUES (1, ?, ?) "
+            "ON CONFLICT(singleton) DO UPDATE SET "
+            "payload = excluded.payload, payload_sha256 = excluded.payload_sha256",
+            (payload_text, payload_sha256),
+        )
+
+    def add_digest(self, digest: bytes) -> bool:
+        cursor = self._connection.execute(
+            "INSERT OR IGNORE INTO digests (digest, sequence) VALUES (?, ?)",
+            (sqlite3.Binary(digest), self._digest_count + 1),
+        )
+        inserted = cursor.rowcount == 1
+        if inserted:
+            self._digest_count += 1
+            self._digest_sequence_sha256 = _extend_dedup_sequence_sha256(
+                self._digest_sequence_sha256,
+                digest,
+            )
+        return inserted
+
+    @property
+    def digest_sequence_sha256(self) -> str:
+        """Return the insertion-ordered digest authority for the open transaction."""
+
+        return self._digest_sequence_sha256
+
+    def commit_checkpoint(self, state: _FoundationResumeState) -> None:
+        # ``COUNT(*)`` over a tens-of-millions-row B-tree at every checkpoint
+        # makes total preparation quadratic. The connection owns an exclusive
+        # transaction, so this insertion counter is exact between the full
+        # count performed once when a journal is opened and the next commit.
+        if self._digest_count != state.dedup_digest_count:
+            raise ValueError("foundation checkpoint omitted deduplication state")
+        if self._digest_sequence_sha256 != state.dedup_sequence_sha256:
+            raise ValueError("foundation checkpoint omitted deduplication content")
+        self._write_state(state)
+        self._connection.commit()
+        _fsync_file(self.path)
+        _fsync_directory(self.path.parent)
+        self._connection.execute("BEGIN IMMEDIATE")
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        try:
+            self._connection.rollback()
+        finally:
+            self._connection.close()
+            self._closed = True
+
+    def remove(self) -> None:
+        self.close()
+        # Delete sidecars before the authoritative database. If cleanup is
+        # interrupted, the remaining main file still makes the generation
+        # recognizable as resumable instead of stranding an unexplained sidecar.
+        for suffix in ("-wal", "-shm", "-journal", ""):
+            candidate = Path(f"{self.path}{suffix}")
+            if _path_exists(candidate):
+                _regular_file_stat(candidate, role="resume database artifact")
+                candidate.unlink()
+        _fsync_directory(self.path.parent)
+
+
+class _ResumableFoundationShardWriter(ShardWriter):
+    """Start a regular writer after the last authenticated closed shard."""
+
+    def __init__(
+        self,
+        root: Path,
+        split: str,
+        shard_size: int,
+        language_to_id: dict[str, int],
+        *,
+        start_shard_index: int,
+    ) -> None:
+        self._resume_start_shard_index = start_shard_index
+        self._resume_first_open = True
+        super().__init__(
+            root,
+            split,
+            shard_size,
+            language_to_id,
+            shared_targets=True,
+        )
+
+    def _open_shard(self) -> None:
+        if self._resume_first_open:
+            self.shard_index = self._resume_start_shard_index
+            self._resume_first_open = False
+        prefix = f"{self.shard_index:05d}."
+        if any(path.name.startswith(prefix) for path in self.root.iterdir()):
+            raise FileExistsError(
+                f"foundation resume would overwrite shard {self.split}/{self.shard_index:05d}"
+            )
+        super()._open_shard()
+
+
+def _open_foundation_writers(
+    output_dir: Path,
+    shard_size: int,
+    language_to_id: dict[str, int],
+    next_shard_indices: Mapping[str, int],
+) -> dict[str, ShardWriter]:
+    writers: dict[str, ShardWriter] = {}
+    try:
+        for split in ("train", "validation"):
+            writers[split] = _ResumableFoundationShardWriter(
+                output_dir,
+                split,
+                shard_size,
+                language_to_id,
+                start_shard_index=next_shard_indices[split],
+            )
+    except BaseException:
+        _close_shard_writers(writers, suppress_errors=True)
+        raise
+    return writers
+
+
+def _next_shard_indices(writers: Mapping[str, ShardWriter]) -> dict[str, int]:
+    return {
+        split: writer.shard_index + int(bool(writer.records)) for split, writer in writers.items()
+    }
+
+
 def _close_shard_writers(
     writers: dict[str, ShardWriter],
     *,
@@ -568,6 +1828,134 @@ def _close_shard_writers(
                 first_error = error
     if first_error is not None and not suppress_errors:
         raise first_error
+
+
+def _iter_source_physical_lines(
+    path: Path,
+    *,
+    skip_lines: int,
+    strict_utf8: bool,
+) -> Iterator[tuple[int, str]]:
+    """Yield whole physical lines after a validated, content-bound cursor."""
+
+    errors = "strict" if strict_utf8 else "replace"
+    observed = 0
+    with path.open("r", encoding="utf-8-sig", errors=errors) as handle:
+        for line_number, line in enumerate(handle, start=1):
+            observed = line_number
+            if line_number <= skip_lines:
+                continue
+            yield line_number, line
+    if observed < skip_lines:
+        raise ValueError(f"foundation resume cursor exceeds physical lines in source: {path}")
+
+
+def _add_read_reject(language_stats: LanguageStats, reason: str) -> None:
+    language_stats.read_rejects[reason] = language_stats.read_rejects.get(reason, 0) + 1
+
+
+def _parse_monolingual_physical_line(
+    path: Path,
+    line: str,
+    language_stats: LanguageStats,
+) -> str | None:
+    raw = line.strip()
+    if not raw:
+        _add_read_reject(language_stats, "blank")
+        return None
+    if path.suffix.lower() == ".txt":
+        language_stats.lines_read += 1
+        return raw
+    try:
+        row: object = json.loads(raw)
+    except json.JSONDecodeError:
+        _add_read_reject(language_stats, "malformed_json")
+        return None
+    if not isinstance(row, dict) or "text" not in row:
+        _add_read_reject(language_stats, "missing_text_key")
+        return None
+    value = cast(dict[object, object], row)["text"]
+    if not isinstance(value, str):
+        _add_read_reject(language_stats, "non_string_text")
+        return None
+    text = value.strip()
+    if not text:
+        _add_read_reject(language_stats, "blank")
+        return None
+    language_stats.lines_read += 1
+    return text
+
+
+def _parse_reasoning_physical_line(
+    line: str,
+    *,
+    language: str,
+    language_stats: LanguageStats,
+) -> ReasoningRecord | None:
+    language_stats.lines_read += 1
+    raw = line.strip()
+    if not raw:
+        language_stats.reasoning_rejected += 1
+        _add_read_reject(language_stats, "reasoning_blank")
+        return None
+    try:
+        row: object = json.loads(raw)
+    except json.JSONDecodeError:
+        language_stats.reasoning_rejected += 1
+        _add_read_reject(language_stats, "reasoning_malformed_json")
+        return None
+    if not isinstance(row, dict):
+        language_stats.reasoning_rejected += 1
+        _add_read_reject(language_stats, "reasoning_non_object")
+        return None
+    try:
+        return parse_reasoning_row(
+            cast(dict[str, object], row),
+            expected_language=language,
+        )
+    except ReasoningDataError:
+        language_stats.reasoning_rejected += 1
+        _add_read_reject(language_stats, "reasoning_invalid_record")
+        return None
+
+
+def _foundation_checkpoint_committed(
+    _output_dir: Path,
+    _state: _FoundationResumeState,
+) -> None:
+    """Test seam invoked only after a checkpoint has become authoritative."""
+
+
+def _commit_foundation_checkpoint(
+    output_dir: Path,
+    writers: dict[str, ShardWriter],
+    journal: _FoundationResumeJournal,
+    previous: _FoundationResumeState,
+    *,
+    cursor: _FoundationCursor,
+    stats: FoundationPrepareStats,
+    source_record_counts: list[int],
+    dedup_digest_count: int,
+) -> _FoundationResumeState:
+    next_indices = _next_shard_indices(writers)
+    _close_shard_writers(writers, suppress_errors=False)
+    _fsync_foundation_payload(output_dir, previous.artifact_inventory)
+    state = _FoundationResumeState(
+        checkpoint_sequence=previous.checkpoint_sequence + 1,
+        cursor=cursor,
+        next_shard_indices=next_indices,
+        stats=stats,
+        source_record_counts=tuple(source_record_counts),
+        artifact_inventory=_build_checkpoint_inventory(
+            output_dir,
+            previous.artifact_inventory,
+        ),
+        dedup_digest_count=dedup_digest_count,
+        dedup_sequence_sha256=journal.digest_sequence_sha256,
+    )
+    journal.commit_checkpoint(state)
+    _foundation_checkpoint_committed(output_dir, state)
+    return state
 
 
 def _publish_staged_directory(staging_dir: Path, output_dir: Path) -> None:
@@ -626,6 +2014,49 @@ def _publication_failure_is_resumable(
     except (OSError, ValueError):
         return False
     return True
+
+
+def _partial_failure_is_resumable(
+    staging_dir: Path,
+    output_dir: Path,
+    discovery: MonolingualDiscovery,
+    tokenizer_model: str | Path,
+    *,
+    source_snapshots: tuple[_FileSnapshot, ...],
+    tokenizer_snapshot: _FileSnapshot,
+    resume_contract: dict[str, object],
+    deduplicate: bool,
+) -> bool:
+    """Keep an authenticated checkpoint after an interruption before publication."""
+
+    if not _path_exists(staging_dir) or _path_exists(output_dir):
+        return False
+    journal: _FoundationResumeJournal | None = None
+    try:
+        _verify_source_snapshots(discovery, source_snapshots)
+        _verify_tokenizer_snapshot(Path(tokenizer_model), tokenizer_snapshot)
+        journal, state = _FoundationResumeJournal.open(
+            staging_dir / _FOUNDATION_RESUME_DATABASE,
+            resume_contract,
+            languages=discovery.languages,
+            source_count=len(discovery.sources),
+        )
+        _validate_checkpoint_payload(
+            staging_dir,
+            state,
+            discovery,
+            deduplicate=deduplicate,
+        )
+        # A complete zero-row cursor represents a permanent input/configuration
+        # rejection, not useful work that should be retried forever.
+        return state.stats.total_records > 0 or state.cursor.source_id < len(discovery.sources)
+    except _FoundationResumeBusy:
+        raise
+    except (OSError, RuntimeError, ValueError, sqlite3.DatabaseError):
+        return False
+    finally:
+        if journal is not None:
+            journal.close()
 
 
 def foundation_dataset_problem(
@@ -858,6 +2289,8 @@ def _stats_from_manifest(manifest: dict[str, Any]) -> FoundationPrepareStats:
     if not isinstance(raw_stats, dict):
         raise ValueError("Foundation staging statistics are missing")
     stats_payload = cast(dict[str, Any], raw_stats)
+    if set(stats_payload) != {"train_records", "validation_records", "languages"}:
+        raise ValueError("Foundation staging statistics schema is invalid")
     raw_languages: object = stats_payload.get("languages")
     if not isinstance(raw_languages, dict):
         raise ValueError("Foundation staging language statistics are missing")
@@ -1254,6 +2687,39 @@ def _staging_candidates(output_dir: Path) -> list[Path]:
     return sorted(parent.glob(f".{output_dir.name}.staging-*"))
 
 
+def _foundation_output_lock_filename(output_dir: Path) -> str:
+    """Return a portable lock identity for one exact foundation output path."""
+
+    identity = os.path.normcase(str(_absolute_path(output_dir))).encode("utf-8")
+    digest = hashlib.sha256(identity).hexdigest()
+    return f".{_FOUNDATION_OUTPUT_LOCK_SCHEMA}-{digest}.lock"
+
+
+def _foundation_output_conflict_message(
+    output_dir: Path,
+) -> Callable[[Path, str], str]:
+    def describe(_root: Path, holder: str) -> str:
+        return (
+            f"foundation dataset output is locked by another process: {output_dir}\n"
+            f"  current holder: {holder}\n"
+            "  Wait for that preparation to finish or choose a different output directory."
+        )
+
+    return describe
+
+
+@contextmanager  # pyright: ignore[reportDeprecated]
+def _foundation_output_lock(output_dir: Path) -> Iterator[Path]:
+    """Serialize discovery recovery, generation, and publication for one output."""
+
+    with _exclusive_lock(
+        output_dir.parent,
+        filename=_foundation_output_lock_filename(output_dir),
+        conflict_message=_foundation_output_conflict_message(output_dir),
+    ) as lock_path:
+        yield lock_path
+
+
 def _clean_orphan_staging(output_dir: Path) -> None:
     for candidate in _staging_candidates(output_dir):
         _remove_staging_path(candidate)
@@ -1277,12 +2743,16 @@ def _recover_or_clean_staging(
     minimum_language_share: float,
     reasoning_sample_share: float,
     release_name: str,
-) -> FoundationPrepareStats | None:
-    valid: list[tuple[Path, FoundationPrepareStats]] = []
+    resume_contract: dict[str, object],
+) -> _StagingRecovery:
+    complete: list[tuple[Path, FoundationPrepareStats]] = []
+    partial: list[_PartialFoundationGeneration] = []
     for candidate in _staging_candidates(output_dir):
         try:
             _regular_staging_tree(candidate)
         except (OSError, RuntimeError, ValueError) as error:
+            for generation in partial:
+                generation.journal.close()
             raise RuntimeError(f"Refusing unsafe foundation staging path: {candidate}") from error
         try:
             manifest_before = _file_snapshot(
@@ -1329,35 +2799,93 @@ def _recover_or_clean_staging(
             if manifest_after != manifest_before:
                 raise ValueError("Foundation staging manifest changed during authentication")
         except (OSError, RuntimeError, ValueError, json.JSONDecodeError, TypeError):
-            _remove_staging_path(candidate)
+            journal: _FoundationResumeJournal | None = None
+            try:
+                journal, state = _FoundationResumeJournal.open(
+                    candidate / _FOUNDATION_RESUME_DATABASE,
+                    resume_contract,
+                    languages=discovery.languages,
+                    source_count=len(discovery.sources),
+                )
+                _validate_checkpoint_payload(
+                    candidate,
+                    state,
+                    discovery,
+                    deduplicate=deduplicate,
+                )
+                _remove_uncommitted_foundation_tail(candidate, state.artifact_inventory)
+                # Close the validation/cleanup race and prove that cleanup retained
+                # exactly the authenticated prefix before any writer can append.
+                _validate_checkpoint_payload(
+                    candidate,
+                    state,
+                    discovery,
+                    deduplicate=deduplicate,
+                )
+            except _FoundationResumeBusy:
+                if journal is not None:
+                    journal.close()
+                for generation in partial:
+                    generation.journal.close()
+                raise
+            except (OSError, RuntimeError, ValueError, sqlite3.DatabaseError):
+                if journal is not None:
+                    journal.close()
+                _remove_staging_path(candidate)
+                continue
+            partial.append(
+                _PartialFoundationGeneration(
+                    path=candidate,
+                    state=state,
+                    journal=journal,
+                )
+            )
             continue
-        valid.append((candidate, recovered_stats))
+        complete.append((candidate, recovered_stats))
 
-    if not valid:
-        return None
-    selected, recovered_stats = max(
-        valid,
-        key=lambda item: (item[0].stat().st_mtime_ns, item[0].name),
+    if complete:
+        for generation in partial:
+            generation.journal.close()
+            _remove_staging_path(generation.path)
+        selected, recovered_stats = max(
+            complete,
+            key=lambda item: (item[0].stat().st_mtime_ns, item[0].name),
+        )
+        # Leave only the selected complete generation before the atomic rename;
+        # a crash immediately after publication must not strand other large trees.
+        for candidate, _stats in complete:
+            if candidate != selected:
+                _remove_staging_path(candidate)
+        try:
+            _verify_source_snapshots(discovery, source_snapshots)
+            _verify_tokenizer_snapshot(Path(tokenizer_model), tokenizer_snapshot)
+            _publish_staged_directory(selected, output_dir)
+        except BaseException as error:
+            if not _publication_failure_is_resumable(
+                error,
+                selected,
+                output_dir,
+                generation_complete=True,
+            ):
+                _remove_staging_path(selected)
+            raise
+        return _StagingRecovery(complete_stats=recovered_stats)
+
+    if not partial:
+        return _StagingRecovery()
+    selected_partial = max(
+        partial,
+        key=lambda item: (
+            item.state.checkpoint_sequence,
+            item.path.stat().st_mtime_ns,
+            item.path.name,
+        ),
     )
-    # Leave only the selected recoverable generation before the atomic rename;
-    # a crash immediately after publication must not strand other large trees.
-    for candidate, _stats in valid:
-        if candidate != selected:
-            _remove_staging_path(candidate)
-    try:
-        _verify_source_snapshots(discovery, source_snapshots)
-        _verify_tokenizer_snapshot(Path(tokenizer_model), tokenizer_snapshot)
-        _publish_staged_directory(selected, output_dir)
-    except BaseException as error:
-        if not _publication_failure_is_resumable(
-            error,
-            selected,
-            output_dir,
-            generation_complete=True,
-        ):
-            _remove_staging_path(selected)
-        raise
-    return recovered_stats
+    for generation in partial:
+        if generation != selected_partial:
+            generation.journal.close()
+            _remove_staging_path(generation.path)
+    return _StagingRecovery(partial=selected_partial)
 
 
 def _prepare_foundation_dataset_in_staging(
@@ -1378,6 +2906,9 @@ def _prepare_foundation_dataset_in_staging(
     release_name: str = FOUNDATION_RELEASE_NAME,
     source_snapshots: tuple[_FileSnapshot, ...],
     tokenizer_snapshot: _FileSnapshot,
+    checkpoint_reserve_bytes: int,
+    resume_state: _FoundationResumeState | None = None,
+    resume_journal: _FoundationResumeJournal | None = None,
 ) -> FoundationPrepareStats:
     """Build a complete dataset inside a private, unpublished directory."""
 
@@ -1429,28 +2960,73 @@ def _prepare_foundation_dataset_in_staging(
             f"{missing_reasoning_tags}; retrain it after adding the reasoning files"
         )
     language_to_id = {language: index for index, language in enumerate(languages)}
-
-    deduplication_index = (
-        _DiskDigestIndex(output_dir / _DEDUPLICATION_DATABASE) if deduplicate else None
+    resume_contract = _build_resume_contract(
+        discovery,
+        source_snapshots,
+        tokenizer_snapshot,
+        minimum_characters=minimum_characters,
+        maximum_characters=maximum_characters,
+        max_tokens=max_tokens,
+        max_target_tokens=max_target_tokens,
+        deduplicate=deduplicate,
+        shard_size=shard_size,
+        validation_fraction=validation_fraction,
+        language_sampling_alpha=language_sampling_alpha,
+        minimum_language_share=minimum_language_share,
+        reasoning_sample_share=reasoning_sample_share,
+        release_name=release_name,
     )
-    writers: dict[str, ShardWriter] = {}
-    try:
+    if (resume_state is None) != (resume_journal is None):
+        raise ValueError("foundation resume state and journal must be supplied together")
+    if resume_state is None:
         for split in ("train", "validation"):
-            writers[split] = ShardWriter(
-                output_dir,
-                split,
-                shard_size,
-                language_to_id,
-                shared_targets=True,
-            )
+            (output_dir / split).mkdir(parents=True, exist_ok=False)
+        stats = FoundationPrepareStats(
+            languages={language: LanguageStats() for language in languages}
+        )
+        source_record_counts = [0 for _source in discovery.sources]
+        resume_state = _FoundationResumeState(
+            checkpoint_sequence=0,
+            cursor=_FoundationCursor(
+                source_id=0,
+                physical_lines=0,
+                total_physical_lines=0,
+            ),
+            next_shard_indices={"train": 0, "validation": 0},
+            stats=stats,
+            source_record_counts=tuple(source_record_counts),
+            artifact_inventory=(),
+            dedup_digest_count=0,
+            dedup_sequence_sha256=_FOUNDATION_EMPTY_DEDUP_SHA256,
+        )
+        resume_journal = _FoundationResumeJournal.create(
+            output_dir / _FOUNDATION_RESUME_DATABASE,
+            resume_contract,
+            resume_state,
+        )
+    else:
+        assert resume_journal is not None
+        if resume_journal.path.parent != output_dir:
+            raise ValueError("foundation resume journal belongs to a different staging directory")
+        if resume_journal.contract != resume_contract:
+            raise ValueError("foundation resume journal contract changed")
+        stats = resume_state.stats
+        source_record_counts = list(resume_state.source_record_counts)
+    assert resume_journal is not None
+    current_state = resume_state
+    cursor = current_state.cursor
+    dedup_digest_count = current_state.dedup_digest_count
+    try:
+        writers = _open_foundation_writers(
+            output_dir,
+            shard_size,
+            language_to_id,
+            current_state.next_shard_indices,
+        )
     except BaseException:
-        _close_shard_writers(writers, suppress_errors=True)
-        if deduplication_index is not None:
-            deduplication_index.close()
+        resume_journal.close()
         raise
-    stats = FoundationPrepareStats(languages={language: LanguageStats() for language in languages})
     source_ids = {source.path: index for index, source in enumerate(discovery.sources)}
-    source_record_counts = {source_id: 0 for source_id in source_ids.values()}
 
     def record_segment(
         text: str,
@@ -1461,11 +3037,13 @@ def _prepare_foundation_dataset_in_staging(
     ) -> None:
         """Write one segment, rejecting duplicates and empty token sequences here."""
 
-        if deduplication_index is not None:
+        nonlocal dedup_digest_count
+        if deduplicate:
             digest = _text_digest(language, text)
-            if not deduplication_index.add(digest):
+            if not resume_journal.add_digest(digest):
                 language_stats.duplicate += 1
                 return
+            dedup_digest_count += 1
         token_ids = tokenizer.encode(text)[:max_tokens]
         if not token_ids:
             language_stats.empty_after_tokenization += 1
@@ -1510,10 +3088,13 @@ def _prepare_foundation_dataset_in_staging(
     ) -> None:
         """Write one structured prompt-to-trace example without denoising it."""
 
+        nonlocal dedup_digest_count
         digest = _reasoning_digest(language, record.prompt, record.think, record.answer)
-        if deduplication_index is not None and not deduplication_index.add(digest):
-            language_stats.duplicate += 1
-            return
+        if deduplicate:
+            if not resume_journal.add_digest(digest):
+                language_stats.duplicate += 1
+                return
+            dedup_digest_count += 1
         encoded = serialize_reasoning_record(
             record,
             tokenizer,
@@ -1553,66 +3134,135 @@ def _prepare_foundation_dataset_in_staging(
         source_record_counts[source_id] += 1
 
     try:
-        for source in discovery.sources:
+        for source_id, source in enumerate(discovery.sources):
+            if source_id < cursor.source_id:
+                continue
             language = source.language
             language_stats = stats.languages[language]
-            if is_reasoning_jsonl(source.path):
-                reasoning_read_stats = ReasoningReadStats()
-                for record in iter_reasoning_records(
-                    source.path,
-                    expected_language=language,
-                    stats=reasoning_read_stats,
-                ):
-                    record_reasoning(
-                        record,
+            skip_lines = cursor.physical_lines if source_id == cursor.source_id else 0
+            reasoning_source = is_reasoning_jsonl(source.path)
+            for physical_line, raw_line in _iter_source_physical_lines(
+                source.path,
+                skip_lines=skip_lines,
+                strict_utf8=reasoning_source,
+            ):
+                if reasoning_source:
+                    reasoning_record = _parse_reasoning_physical_line(
+                        raw_line,
                         language=language,
                         language_stats=language_stats,
-                        source_id=source_ids[source.path],
                     )
-                language_stats.lines_read += reasoning_read_stats.physical_lines
-                language_stats.merge_reasoning_read(reasoning_read_stats)
-                continue
-            read_stats = ReadStats()
-            for raw_text in iter_monolingual_lines(source.path, stats=read_stats):
-                language_stats.lines_read += 1
-                document = normalize_text(raw_text)
-                if not _is_usable(document):
-                    language_stats.too_short += 1
-                    continue
-                # Segment long documents instead of discarding or truncating them. A
-                # historical audit found that whole-line rejection lost 97.3% of
-                # e_gov, 92.8% of aozora, and 68.0% of kowiki characters; combined with
-                # truncation, the audited pipeline lost 25.8% of all characters.
-                segments = segment_text(
-                    document,
-                    maximum_characters=maximum_characters,
-                    minimum_characters=minimum_characters,
+                    if reasoning_record is not None:
+                        record_reasoning(
+                            reasoning_record,
+                            language=language,
+                            language_stats=language_stats,
+                            source_id=source_id,
+                        )
+                else:
+                    raw_text = _parse_monolingual_physical_line(
+                        source.path,
+                        raw_line,
+                        language_stats,
+                    )
+                    if raw_text is not None:
+                        document = normalize_text(raw_text)
+                        if not _is_usable(document):
+                            language_stats.too_short += 1
+                        else:
+                            # Segment long documents instead of discarding or truncating
+                            # them. Historical audits found severe character loss when
+                            # document-sized lines were treated as sentence-sized rows.
+                            segments = segment_text(
+                                document,
+                                maximum_characters=maximum_characters,
+                                minimum_characters=minimum_characters,
+                            )
+                            if not segments:
+                                language_stats.too_short += 1
+                            else:
+                                if len(segments) > 1:
+                                    language_stats.segmented_documents += 1
+                                language_stats.segments += len(segments)
+                                for text in segments:
+                                    record_segment(
+                                        text,
+                                        language=language,
+                                        language_stats=language_stats,
+                                        source_id=source_id,
+                                    )
+                cursor = _FoundationCursor(
+                    source_id=source_id,
+                    physical_lines=physical_line,
+                    total_physical_lines=cursor.total_physical_lines + 1,
                 )
-                if not segments:
-                    language_stats.too_short += 1
-                    continue
-                if len(segments) > 1:
-                    language_stats.segmented_documents += 1
-                language_stats.segments += len(segments)
-                for text in segments:
-                    record_segment(
-                        text,
-                        language=language,
-                        language_stats=language_stats,
-                        source_id=source_ids[source.path],
+                if cursor.total_physical_lines % _FOUNDATION_CHECKPOINT_INTERVAL == 0:
+                    _preflight_foundation_checkpoint_space(
+                        output_dir,
+                        checkpoint_reserve_bytes,
                     )
-            language_stats.merge_read(read_stats)
+                    current_state = _commit_foundation_checkpoint(
+                        output_dir,
+                        writers,
+                        resume_journal,
+                        current_state,
+                        cursor=cursor,
+                        stats=stats,
+                        source_record_counts=source_record_counts,
+                        dedup_digest_count=dedup_digest_count,
+                    )
+                    writers = _open_foundation_writers(
+                        output_dir,
+                        shard_size,
+                        language_to_id,
+                        current_state.next_shard_indices,
+                    )
+            cursor = _FoundationCursor(
+                source_id=source_id + 1,
+                physical_lines=0,
+                total_physical_lines=cursor.total_physical_lines,
+            )
+
+        if current_state.cursor.source_id < len(discovery.sources):
+            _preflight_foundation_checkpoint_space(
+                output_dir,
+                checkpoint_reserve_bytes,
+            )
+            cursor = _FoundationCursor(
+                source_id=len(discovery.sources),
+                physical_lines=0,
+                total_physical_lines=cursor.total_physical_lines,
+            )
+            current_state = _commit_foundation_checkpoint(
+                output_dir,
+                writers,
+                resume_journal,
+                current_state,
+                cursor=cursor,
+                stats=stats,
+                source_record_counts=source_record_counts,
+                dedup_digest_count=dedup_digest_count,
+            )
+        else:
+            # A final authenticated cursor can be left behind by a manifest or
+            # publication failure.  Closing the empty writers is sufficient;
+            # committing another synthetic "final" checkpoint would violate
+            # the deterministic sequence contract after a second interruption.
+            _close_shard_writers(writers, suppress_errors=False)
+        # Incremental checkpoints reuse hashes for the immutable shard prefix so
+        # checkpoint cost stays linear. Authenticate the entire final prefix once
+        # before any manifest can endorse it.
+        _validate_checkpoint_payload(
+            output_dir,
+            current_state,
+            discovery,
+            deduplicate=deduplicate,
+        )
     except BaseException:
         _close_shard_writers(writers, suppress_errors=True)
-        if deduplication_index is not None:
-            deduplication_index.close()
+        resume_journal.close()
         raise
-    else:
-        try:
-            _close_shard_writers(writers, suppress_errors=False)
-        finally:
-            if deduplication_index is not None:
-                deduplication_index.close()
+    resume_journal.close()
 
     if stats.total_records == 0:
         raise ValueError(
@@ -1725,14 +3375,18 @@ def _prepare_foundation_dataset_in_staging(
         },
         "artifact_inventory": build_dataset_artifact_inventory(output_dir),
     }
-    (output_dir / "manifest.json").write_text(
+    manifest_path = output_dir / "manifest.json"
+    manifest_path.write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+    _fsync_file(manifest_path)
+    _fsync_directory(output_dir)
+    resume_journal.remove()
     return stats
 
 
-def prepare_foundation_dataset(
+def _prepare_foundation_dataset_locked(
     discovery: MonolingualDiscovery,
     tokenizer_model: str | Path,
     output_dir: str | Path,
@@ -1749,8 +3403,14 @@ def prepare_foundation_dataset(
     reasoning_sample_share: float = 0.05,
     release_name: str = FOUNDATION_RELEASE_NAME,
 ) -> FoundationPrepareStats:
-    """Transactionally prepare foundation shards and publish one complete generation."""
+    """Prepare one generation while the caller owns the exact output lease."""
 
+    if not discovery.sources:
+        raise ValueError(
+            "The monolingual corpus has no usable training files. "
+            f"root={discovery.root}. Place .txt or .jsonl files inside language-code "
+            "directories."
+        )
     final_output = Path(output_dir)
     if _path_exists(final_output):
         _clean_orphan_staging(final_output)
@@ -1764,6 +3424,22 @@ def prepare_foundation_dataset(
     # This immediate rediscovery also rejects a plan whose source list changed
     # before preparation acquired its artifact lock.
     _verify_source_metadata(discovery, source_snapshots)
+    resume_contract = _build_resume_contract(
+        discovery,
+        source_snapshots,
+        tokenizer_snapshot,
+        minimum_characters=minimum_characters,
+        maximum_characters=maximum_characters,
+        max_tokens=max_tokens,
+        max_target_tokens=max_target_tokens,
+        deduplicate=deduplicate,
+        shard_size=shard_size,
+        validation_fraction=validation_fraction,
+        language_sampling_alpha=language_sampling_alpha,
+        minimum_language_share=minimum_language_share,
+        reasoning_sample_share=reasoning_sample_share,
+        release_name=release_name,
+    )
     recovered = _recover_or_clean_staging(
         final_output,
         discovery,
@@ -1781,16 +3457,44 @@ def prepare_foundation_dataset(
         minimum_language_share=minimum_language_share,
         reasoning_sample_share=reasoning_sample_share,
         release_name=release_name,
+        resume_contract=resume_contract,
     )
-    if recovered is not None:
-        return recovered
+    if recovered.complete_stats is not None:
+        return recovered.complete_stats
     _refuse_existing_output(final_output)
-    staging_dir = Path(
-        tempfile.mkdtemp(
-            prefix=f".{final_output.name}.staging-",
-            dir=final_output.parent,
+    partial = recovered.partial
+    try:
+        checkpoint_reserve_bytes = _preflight_foundation_disk_space(
+            discovery,
+            tokenizer_model,
+            final_output.parent,
+            existing_staging=partial.path if partial is not None else None,
+            minimum_characters=minimum_characters,
+            maximum_characters=maximum_characters,
+            max_tokens=max_tokens,
+            max_target_tokens=max_target_tokens,
+            deduplicate=deduplicate,
         )
-    )
+    except BaseException:
+        # Recovery returns an exclusively locked journal.  A read-only capacity
+        # refusal must release that ownership while preserving the authenticated
+        # checkpoint for a later attempt on a roomier volume.
+        if partial is not None:
+            partial.journal.close()
+        raise
+    if partial is None:
+        staging_dir = Path(
+            tempfile.mkdtemp(
+                prefix=f".{final_output.name}.staging-",
+                dir=final_output.parent,
+            )
+        )
+        resume_state = None
+        resume_journal = None
+    else:
+        staging_dir = partial.path
+        resume_state = partial.state
+        resume_journal = partial.journal
     generation_complete = False
     try:
         stats = _prepare_foundation_dataset_in_staging(
@@ -1810,6 +3514,9 @@ def prepare_foundation_dataset(
             release_name=release_name,
             source_snapshots=source_snapshots,
             tokenizer_snapshot=tokenizer_snapshot,
+            checkpoint_reserve_bytes=checkpoint_reserve_bytes,
+            resume_state=resume_state,
+            resume_journal=resume_journal,
         )
         # Close the small post-verification window occupied by inventory and
         # manifest construction before the durable rename.
@@ -1819,14 +3526,76 @@ def prepare_foundation_dataset(
         _publish_staged_directory(staging_dir, final_output)
         return stats
     except BaseException as error:
-        if not _publication_failure_is_resumable(
+        if resume_journal is not None:
+            resume_journal.close()
+        complete_resumable = _publication_failure_is_resumable(
             error,
             staging_dir,
             final_output,
             generation_complete=generation_complete,
-        ):
+        )
+        partial_resumable = False
+        if not complete_resumable:
+            partial_resumable = _partial_failure_is_resumable(
+                staging_dir,
+                final_output,
+                discovery,
+                tokenizer_model,
+                source_snapshots=source_snapshots,
+                tokenizer_snapshot=tokenizer_snapshot,
+                resume_contract=resume_contract,
+                deduplicate=deduplicate,
+            )
+        if not complete_resumable and not partial_resumable:
             _remove_staging_path(staging_dir)
         raise
+
+
+def prepare_foundation_dataset(
+    discovery: MonolingualDiscovery,
+    tokenizer_model: str | Path,
+    output_dir: str | Path,
+    *,
+    minimum_characters: int = 8,
+    maximum_characters: int = 4000,
+    max_tokens: int = 510,
+    max_target_tokens: int | None = None,
+    deduplicate: bool = True,
+    shard_size: int = 200_000,
+    validation_fraction: float = 0.002,
+    language_sampling_alpha: float = DEFAULT_LANGUAGE_SAMPLING_ALPHA,
+    minimum_language_share: float = 0.05,
+    reasoning_sample_share: float = 0.05,
+    release_name: str = FOUNDATION_RELEASE_NAME,
+) -> FoundationPrepareStats:
+    """Transactionally prepare and atomically publish one foundation generation."""
+
+    if not discovery.sources:
+        raise ValueError(
+            "The monolingual corpus has no usable training files. "
+            f"root={discovery.root}. Place .txt or .jsonl files inside language-code "
+            "directories."
+        )
+    final_output = Path(output_dir)
+    final_output.parent.mkdir(parents=True, exist_ok=True)
+    _assert_regular_directory(final_output.parent, role="output parent")
+    with _foundation_output_lock(final_output):
+        return _prepare_foundation_dataset_locked(
+            discovery,
+            tokenizer_model,
+            final_output,
+            minimum_characters=minimum_characters,
+            maximum_characters=maximum_characters,
+            max_tokens=max_tokens,
+            max_target_tokens=max_target_tokens,
+            deduplicate=deduplicate,
+            shard_size=shard_size,
+            validation_fraction=validation_fraction,
+            language_sampling_alpha=language_sampling_alpha,
+            minimum_language_share=minimum_language_share,
+            reasoning_sample_share=reasoning_sample_share,
+            release_name=release_name,
+        )
 
 
 def render_prepare_report(stats: FoundationPrepareStats) -> list[str]:

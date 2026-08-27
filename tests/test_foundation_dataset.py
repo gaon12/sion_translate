@@ -12,8 +12,10 @@ import hashlib
 import json
 import os
 import shutil
+import sqlite3
 import stat
 from pathlib import Path, PurePosixPath
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -113,6 +115,110 @@ def _dataset_problem(
         reasoning_sample_share=0.05,
         release_name="sion",
     )
+
+
+def _tree_bytes(root: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+def _resume_corpus(root: Path) -> Path:
+    """Create mixed denoising/reasoning input with rejects and duplicates."""
+
+    language_root = root / "ja"
+    language_root.mkdir(parents=True)
+    denoising_rows = [
+        json.dumps({"text": "再開テスト用の十分に長い文 0 です。"}, ensure_ascii=False),
+        json.dumps({"text": "再開テスト用の十分に長い文 1 です。"}, ensure_ascii=False),
+        "",
+        "{malformed",
+        json.dumps({"text": "再開テスト用の十分に長い文 0 です。"}, ensure_ascii=False),
+        json.dumps({"text": "再開テスト用の十分に長い文 2 です。"}, ensure_ascii=False),
+        json.dumps({"text": "再開テスト用の十分に長い文 3 です。"}, ensure_ascii=False),
+        json.dumps({"text": "再開テスト用の十分に長い文 4 です。"}, ensure_ascii=False),
+    ]
+    (language_root / "denoising.jsonl").write_text(
+        "\n".join(denoising_rows) + "\n",
+        encoding="utf-8",
+    )
+    reasoning_rows = [
+        {
+            "prompt": "三と四を加算してください。",
+            "think": "二つの整数を確認してから合計する。",
+            "answer": "答えは七です。",
+            "language": "ja",
+        },
+        {
+            "prompt": "五と六を加算してください。",
+            "think": "二つの整数を確認してから合計する。",
+            "answer": "答えは十一です。",
+            "language": "ja",
+        },
+        {
+            "prompt": "三と四を加算してください。",
+            "think": "二つの整数を確認してから合計する。",
+            "answer": "答えは七です。",
+            "language": "ja",
+        },
+    ]
+    (language_root / "reasoning_resume.jsonl").write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in reasoning_rows) + "\n",
+        encoding="utf-8",
+    )
+    return root
+
+
+def _leave_partial_foundation_generation(
+    tmp_path: Path,
+    tokenizer_model: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    deduplicate: bool = True,
+) -> tuple[MonolingualDiscovery, Path, Path]:
+    """Crash after one checkpoint plus two uncommitted physical lines."""
+
+    discovery = discover_monolingual_sources(
+        _resume_corpus(tmp_path / "corpus"),
+        ["ja"],
+    )
+    assert discovery.sources[0].path.name == "denoising.jsonl"
+    dataset = tmp_path / "resumed"
+    original_iterator = foundation_prepare._iter_source_physical_lines
+    interruption = {"armed": True}
+
+    def interrupt_with_an_uncommitted_tail(path, *, skip_lines, strict_utf8):
+        for physical_line, line in original_iterator(
+            path,
+            skip_lines=skip_lines,
+            strict_utf8=strict_utf8,
+        ):
+            yield physical_line, line
+            if interruption["armed"] and path == discovery.sources[0].path and physical_line == 6:
+                raise RuntimeError("simulated recoverable interruption")
+
+    monkeypatch.setattr(foundation_prepare, "_FOUNDATION_CHECKPOINT_INTERVAL", 4)
+    monkeypatch.setattr(
+        foundation_prepare,
+        "_iter_source_physical_lines",
+        interrupt_with_an_uncommitted_tail,
+    )
+    with pytest.raises(RuntimeError, match="simulated recoverable interruption"):
+        prepare_foundation_dataset(
+            discovery,
+            tokenizer_model,
+            dataset,
+            deduplicate=deduplicate,
+            shard_size=3,
+            validation_fraction=0.1,
+        )
+    interruption["armed"] = False
+    staging = list(tmp_path.glob(".resumed.staging-*"))
+    assert len(staging) == 1
+    assert (staging[0] / ".foundation-resume.sqlite3").is_file()
+    return discovery, dataset, staging[0]
 
 
 def test_every_language_reaches_the_shards(tmp_path, tokenizer_model) -> None:
@@ -419,19 +525,6 @@ def test_duplicates_are_removed_within_a_language(tmp_path, tokenizer_model) -> 
     assert not list((tmp_path / "dataset").glob(".foundation-dedup.sqlite3*"))
 
 
-def test_disk_deduplication_uses_a_fixed_cache_and_removes_private_state(tmp_path) -> None:
-    database = tmp_path / "dedup.sqlite3"
-    index = foundation_prepare._DiskDigestIndex(database)
-
-    assert index._connection.execute("PRAGMA cache_size").fetchone() == (-8192,)
-    assert index.add(b"first") is True
-    assert index.add(b"first") is False
-    assert index.add(b"second") is True
-    index.close()
-
-    assert not list(tmp_path.glob("dedup.sqlite3*"))
-
-
 def test_an_existing_non_empty_output_directory_is_refused(tmp_path, tokenizer_model) -> None:
     discovery = discover_monolingual_sources(_corpus(tmp_path / "corpus"), ["ko", "ja"])
     (tmp_path / "dataset").mkdir()
@@ -452,6 +545,125 @@ def test_an_existing_empty_output_directory_is_also_refused(tmp_path, tokenizer_
     assert not any(dataset.iterdir())
 
 
+def test_disk_preflight_refuses_before_creating_staging(
+    tmp_path,
+    tokenizer_model,
+    monkeypatch,
+) -> None:
+    discovery = discover_monolingual_sources(_corpus(tmp_path / "corpus"), ["ko", "ja"])
+    monkeypatch.setattr(
+        foundation_prepare.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(free=0),
+    )
+
+    with pytest.raises(OSError, match="Insufficient free disk space"):
+        prepare_foundation_dataset(discovery, tokenizer_model, tmp_path / "dataset")
+
+    assert not (tmp_path / "dataset").exists()
+    assert not list(tmp_path.glob(".dataset.staging-*"))
+
+
+def test_disk_estimator_is_deterministic_and_uses_measured_token_layout(
+    tmp_path,
+    tokenizer_model,
+) -> None:
+    discovery = discover_monolingual_sources(_corpus(tmp_path / "corpus"), ["ko", "ja"])
+    options = {
+        "minimum_characters": 8,
+        "maximum_characters": 4000,
+        "max_tokens": 510,
+        "max_target_tokens": 510,
+        "deduplicate": True,
+    }
+
+    first = foundation_prepare._estimate_foundation_generation_bytes(
+        discovery,
+        tokenizer_model,
+        **options,
+    )
+    second = foundation_prepare._estimate_foundation_generation_bytes(
+        discovery,
+        tokenizer_model,
+        **options,
+    )
+
+    source_bytes = sum(source.size_bytes for source in discovery.sources)
+    buffered_source_floor = sum((source.size_bytes * 3 + 1) // 2 for source in discovery.sources)
+    assert first == second
+    assert first >= buffered_source_floor
+    # The estimator measures the actual shared-target token/index layout. It
+    # must not regress to the former blanket 11x source-size reservation.
+    assert first < source_bytes * 11
+
+
+@pytest.mark.parametrize(
+    ("estimated_bytes", "expected_reserve"),
+    [
+        (1 * 1024**3, 512 * 1024**2),
+        (100 * 1024**3, 2 * 1024**3),
+    ],
+)
+def test_disk_preflight_subtracts_authenticated_staging_and_preserves_the_larger_reserve(
+    tmp_path,
+    tokenizer_model,
+    monkeypatch,
+    estimated_bytes,
+    expected_reserve,
+) -> None:
+    discovery = discover_monolingual_sources(_corpus(tmp_path / "corpus"), ["ko", "ja"])
+    authenticated_staging = tmp_path / ".dataset.staging-authenticated"
+    existing_bytes = estimated_bytes // 10
+    required_free = estimated_bytes - existing_bytes + expected_reserve
+
+    monkeypatch.setattr(
+        foundation_prepare,
+        "_estimate_foundation_generation_bytes",
+        lambda *_args, **_kwargs: estimated_bytes,
+    )
+
+    def authenticated_size(path):
+        assert path == authenticated_staging
+        return existing_bytes
+
+    monkeypatch.setattr(
+        foundation_prepare,
+        "_foundation_staging_size",
+        authenticated_size,
+    )
+    free_bytes = {"value": required_free}
+    monkeypatch.setattr(
+        foundation_prepare.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(free=free_bytes["value"]),
+    )
+    options = {
+        "existing_staging": authenticated_staging,
+        "minimum_characters": 8,
+        "maximum_characters": 4000,
+        "max_tokens": 510,
+        "max_target_tokens": 510,
+        "deduplicate": True,
+    }
+
+    reserve = foundation_prepare._preflight_foundation_disk_space(
+        discovery,
+        tokenizer_model,
+        tmp_path,
+        **options,
+    )
+    assert reserve == expected_reserve
+
+    free_bytes["value"] -= 1
+    with pytest.raises(OSError, match=f"need at least {required_free:,} free bytes"):
+        foundation_prepare._preflight_foundation_disk_space(
+            discovery,
+            tokenizer_model,
+            tmp_path,
+            **options,
+        )
+
+
 def test_source_mutation_aborts_publication_and_removes_staging(
     tmp_path,
     tokenizer_model,
@@ -459,11 +671,15 @@ def test_source_mutation_aborts_publication_and_removes_staging(
 ) -> None:
     discovery = discover_monolingual_sources(_corpus(tmp_path / "corpus"), ["ko", "ja"])
     source_path = discovery.sources[0].path
-    original_iterator = foundation_prepare.iter_monolingual_lines
+    original_iterator = foundation_prepare._iter_source_physical_lines
     inventory_called = False
 
-    def iter_then_mutate(path, *, stats=None):
-        yield from original_iterator(path, stats=stats)
+    def iter_then_mutate(path, *, skip_lines, strict_utf8):
+        yield from original_iterator(
+            path,
+            skip_lines=skip_lines,
+            strict_utf8=strict_utf8,
+        )
         if path == source_path:
             original = source_path.read_bytes()
             mutated = original.replace(b"0", b"9", 1)
@@ -476,7 +692,11 @@ def test_source_mutation_aborts_publication_and_removes_staging(
         inventory_called = True
         return []
 
-    monkeypatch.setattr(foundation_prepare, "iter_monolingual_lines", iter_then_mutate)
+    monkeypatch.setattr(
+        foundation_prepare,
+        "_iter_source_physical_lines",
+        iter_then_mutate,
+    )
     monkeypatch.setattr(
         foundation_prepare,
         "build_dataset_artifact_inventory",
@@ -500,12 +720,16 @@ def test_tokenizer_mutation_aborts_publication_and_removes_staging(
     local_tokenizer = tmp_path / "tokenizer.model"
     local_tokenizer.write_bytes(tokenizer_model.read_bytes())
     source_path = discovery.sources[0].path
-    original_iterator = foundation_prepare.iter_monolingual_lines
+    original_iterator = foundation_prepare._iter_source_physical_lines
     mutated = False
 
-    def iter_then_mutate_tokenizer(path, *, stats=None):
+    def iter_then_mutate_tokenizer(path, *, skip_lines, strict_utf8):
         nonlocal mutated
-        yield from original_iterator(path, stats=stats)
+        yield from original_iterator(
+            path,
+            skip_lines=skip_lines,
+            strict_utf8=strict_utf8,
+        )
         if path == source_path and not mutated:
             encoded = bytearray(local_tokenizer.read_bytes())
             encoded[-1] ^= 1
@@ -514,7 +738,7 @@ def test_tokenizer_mutation_aborts_publication_and_removes_staging(
 
     monkeypatch.setattr(
         foundation_prepare,
-        "iter_monolingual_lines",
+        "_iter_source_physical_lines",
         iter_then_mutate_tokenizer,
     )
 
@@ -534,11 +758,15 @@ def test_new_source_added_during_build_aborts_publication(
     corpus = _corpus(tmp_path / "corpus")
     discovery = discover_monolingual_sources(corpus, ["ko", "ja"])
     source_path = discovery.sources[0].path
-    original_iterator = foundation_prepare.iter_monolingual_lines
+    original_iterator = foundation_prepare._iter_source_physical_lines
     added_source = corpus / "ko" / "added-during-build.txt"
 
-    def iter_then_add_source(path, *, stats=None):
-        yield from original_iterator(path, stats=stats)
+    def iter_then_add_source(path, *, skip_lines, strict_utf8):
+        yield from original_iterator(
+            path,
+            skip_lines=skip_lines,
+            strict_utf8=strict_utf8,
+        )
         if path == source_path:
             added_source.write_text(
                 "준비 도중 추가된 충분히 긴 한국어 문장입니다\n",
@@ -547,7 +775,7 @@ def test_new_source_added_during_build_aborts_publication(
 
     monkeypatch.setattr(
         foundation_prepare,
-        "iter_monolingual_lines",
+        "_iter_source_physical_lines",
         iter_then_add_source,
     )
 
@@ -598,12 +826,13 @@ def test_source_mutation_during_inventory_is_caught_even_with_restored_metadata(
     assert not list(tmp_path.glob(".dataset.staging-*"))
 
 
-def test_manifest_failure_aborts_publication_and_removes_staging(
+def test_manifest_failure_preserves_the_final_authenticated_checkpoint(
     tmp_path,
     tokenizer_model,
     monkeypatch,
 ) -> None:
     discovery = discover_monolingual_sources(_corpus(tmp_path / "corpus"), ["ko", "ja"])
+    original_inventory = foundation_prepare.build_dataset_artifact_inventory
 
     def fail_inventory(_output_dir):
         raise RuntimeError("inventory failed")
@@ -618,7 +847,485 @@ def test_manifest_failure_aborts_publication_and_removes_staging(
         prepare_foundation_dataset(discovery, tokenizer_model, tmp_path / "dataset")
 
     assert not (tmp_path / "dataset").exists()
+    staging = list(tmp_path.glob(".dataset.staging-*"))
+    assert len(staging) == 1
+    assert (staging[0] / ".foundation-resume.sqlite3").is_file()
+
+    def checkpoint_sequence() -> int:
+        connection = sqlite3.connect(staging[0] / ".foundation-resume.sqlite3")
+        try:
+            payload = json.loads(
+                connection.execute("SELECT payload FROM state WHERE singleton = 1").fetchone()[0]
+            )
+        finally:
+            connection.close()
+        return int(payload["checkpoint_sequence"])
+
+    final_sequence = checkpoint_sequence()
+
+    def forbid_source_replay(*_args, **_kwargs):
+        raise AssertionError("a final checkpoint must not replay input lines")
+
+    monkeypatch.setattr(
+        foundation_prepare,
+        "_iter_source_physical_lines",
+        forbid_source_replay,
+    )
+
+    # A second post-checkpoint failure must not manufacture another final
+    # checkpoint. Otherwise its sequence becomes invalid and the next recovery
+    # silently discards all completed work.
+    with pytest.raises(RuntimeError, match="inventory failed"):
+        prepare_foundation_dataset(discovery, tokenizer_model, tmp_path / "dataset")
+    assert checkpoint_sequence() == final_sequence
+
+    monkeypatch.setattr(
+        foundation_prepare,
+        "build_dataset_artifact_inventory",
+        original_inventory,
+    )
+    recovered = prepare_foundation_dataset(discovery, tokenizer_model, tmp_path / "dataset")
+
+    assert recovered.total_records == 100
+    assert (tmp_path / "dataset" / "manifest.json").is_file()
     assert not list(tmp_path.glob(".dataset.staging-*"))
+
+
+@pytest.mark.parametrize("deduplicate", [True, False])
+def test_partial_resume_is_byte_identical_for_mixed_objectives(
+    tmp_path,
+    tokenizer_model,
+    monkeypatch,
+    deduplicate,
+) -> None:
+    discovery, resumed_path, staging = _leave_partial_foundation_generation(
+        tmp_path,
+        tokenizer_model,
+        monkeypatch,
+        deduplicate=deduplicate,
+    )
+    connection = sqlite3.connect(staging / ".foundation-resume.sqlite3")
+    try:
+        contract = json.loads(
+            connection.execute("SELECT value FROM metadata WHERE key = 'contract'").fetchone()[0]
+        )
+        resume_state = json.loads(
+            connection.execute("SELECT payload FROM state WHERE singleton = 1").fetchone()[0]
+        )
+        digest_columns = [
+            row[1] for row in connection.execute("PRAGMA table_info(digests)").fetchall()
+        ]
+    finally:
+        connection.close()
+    assert contract["schema"] == "sion-foundation-resume-v1"
+    assert contract["preprocessing_schema"] == "foundation-mixed-objectives-v6"
+    assert (
+        contract["tokenizer_identity"]["sha256"]
+        == hashlib.sha256(tokenizer_model.read_bytes()).hexdigest()
+    )
+    assert contract["options"]["deduplicate"] is deduplicate
+    assert contract["options"]["checkpoint_interval_physical_lines"] == 4
+    assert digest_columns == ["digest", "sequence"]
+    assert len(resume_state["dedup_sequence_sha256"]) == 64
+    assert [source["task"] for source in contract["sources"]] == [
+        "denoising",
+        "reasoning",
+    ]
+
+    resumed_stats = prepare_foundation_dataset(
+        discovery,
+        tokenizer_model,
+        resumed_path,
+        deduplicate=deduplicate,
+        shard_size=3,
+        validation_fraction=0.1,
+    )
+    uninterrupted_stats = prepare_foundation_dataset(
+        discovery,
+        tokenizer_model,
+        tmp_path / "uninterrupted",
+        deduplicate=deduplicate,
+        shard_size=3,
+        validation_fraction=0.1,
+    )
+
+    assert resumed_stats == uninterrupted_stats
+    assert resumed_stats.languages["ja"].reasoning_records == (2 if deduplicate else 3)
+    assert resumed_stats.languages["ja"].duplicate == (2 if deduplicate else 0)
+    assert _tree_bytes(resumed_path) == _tree_bytes(tmp_path / "uninterrupted")
+    assert not list(tmp_path.glob(".resumed.staging-*"))
+    assert not list(resumed_path.glob(".foundation-resume.sqlite3*"))
+
+
+def test_disk_preflight_preserves_and_unlocks_an_authenticated_partial(
+    tmp_path,
+    tokenizer_model,
+    monkeypatch,
+) -> None:
+    discovery, resumed_path, staging = _leave_partial_foundation_generation(
+        tmp_path,
+        tokenizer_model,
+        monkeypatch,
+    )
+    actual_disk_usage = foundation_prepare.shutil.disk_usage
+    monkeypatch.setattr(
+        foundation_prepare.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(free=0),
+    )
+
+    with pytest.raises(OSError, match="Insufficient free disk space"):
+        prepare_foundation_dataset(
+            discovery,
+            tokenizer_model,
+            resumed_path,
+            shard_size=3,
+            validation_fraction=0.1,
+        )
+
+    assert staging.is_dir()
+    assert (staging / ".foundation-resume.sqlite3").is_file()
+
+    monkeypatch.setattr(foundation_prepare.shutil, "disk_usage", actual_disk_usage)
+    resumed = prepare_foundation_dataset(
+        discovery,
+        tokenizer_model,
+        resumed_path,
+        shard_size=3,
+        validation_fraction=0.1,
+    )
+    assert resumed.total_records > 0
+    assert not list(tmp_path.glob(".resumed.staging-*"))
+
+
+def test_streaming_disk_reserve_stops_at_a_recoverable_checkpoint(
+    tmp_path,
+    tokenizer_model,
+    monkeypatch,
+) -> None:
+    discovery = discover_monolingual_sources(
+        _resume_corpus(tmp_path / "corpus"),
+        ["ja"],
+    )
+    dataset = tmp_path / "resumed"
+    actual_disk_usage = foundation_prepare.shutil.disk_usage
+    probes = 0
+
+    def exhaust_after_first_checkpoint(_path):
+        nonlocal probes
+        probes += 1
+        # Initial estimate, then the first checkpoint, then exhaustion before
+        # the second checkpoint can become authoritative.
+        free = 1 << 60 if probes <= 2 else 0
+        return SimpleNamespace(free=free)
+
+    monkeypatch.setattr(foundation_prepare, "_FOUNDATION_CHECKPOINT_INTERVAL", 4)
+    monkeypatch.setattr(
+        foundation_prepare.shutil,
+        "disk_usage",
+        exhaust_after_first_checkpoint,
+    )
+    with pytest.raises(OSError, match="checkpoint disk reserve"):
+        prepare_foundation_dataset(
+            discovery,
+            tokenizer_model,
+            dataset,
+            shard_size=3,
+            validation_fraction=0.1,
+        )
+
+    staging = next(tmp_path.glob(".resumed.staging-*"))
+    connection = sqlite3.connect(staging / ".foundation-resume.sqlite3")
+    try:
+        state = json.loads(
+            connection.execute("SELECT payload FROM state WHERE singleton = 1").fetchone()[0]
+        )
+    finally:
+        connection.close()
+    assert state["cursor"]["total_physical_lines"] == 4
+
+    monkeypatch.setattr(foundation_prepare.shutil, "disk_usage", actual_disk_usage)
+    resumed_stats = prepare_foundation_dataset(
+        discovery,
+        tokenizer_model,
+        dataset,
+        shard_size=3,
+        validation_fraction=0.1,
+    )
+    clean_stats = prepare_foundation_dataset(
+        discovery,
+        tokenizer_model,
+        tmp_path / "clean",
+        shard_size=3,
+        validation_fraction=0.1,
+    )
+    assert resumed_stats == clean_stats
+    assert _tree_bytes(dataset) == _tree_bytes(tmp_path / "clean")
+
+
+def test_streaming_checkpoint_gate_reuses_the_capacity_plan_reserve(
+    tmp_path,
+    tokenizer_model,
+    monkeypatch,
+) -> None:
+    discovery = discover_monolingual_sources(_corpus(tmp_path / "corpus"), ["ko", "ja"])
+    planned_reserve = foundation_prepare._FOUNDATION_SPACE_RESERVE_BYTES + 123
+    observed_reserves = []
+    monkeypatch.setattr(
+        foundation_prepare,
+        "_preflight_foundation_disk_space",
+        lambda *_args, **_kwargs: planned_reserve,
+    )
+
+    def record_checkpoint_gate(_path, minimum_free_bytes):
+        observed_reserves.append(minimum_free_bytes)
+
+    monkeypatch.setattr(
+        foundation_prepare,
+        "_preflight_foundation_checkpoint_space",
+        record_checkpoint_gate,
+    )
+
+    prepare_foundation_dataset(discovery, tokenizer_model, tmp_path / "dataset")
+
+    assert observed_reserves
+    assert set(observed_reserves) == {planned_reserve}
+
+
+def test_checkpoint_inventory_hashes_each_immutable_shard_only_once_before_final_audit(
+    tmp_path,
+    tokenizer_model,
+    monkeypatch,
+) -> None:
+    discovery = discover_monolingual_sources(_corpus(tmp_path / "corpus"), ["ko", "ja"])
+    actual_file_sha256 = foundation_prepare.file_sha256
+    shard_hashes: dict[str, int] = {}
+
+    def count_shard_hashes(path):
+        path = Path(path)
+        if ".dataset.staging-" in path.as_posix() and path.parent.name in {
+            "train",
+            "validation",
+        }:
+            relative = "/".join(path.parts[-2:])
+            shard_hashes[relative] = shard_hashes.get(relative, 0) + 1
+        return actual_file_sha256(path)
+
+    monkeypatch.setattr(foundation_prepare, "_FOUNDATION_CHECKPOINT_INTERVAL", 10)
+    monkeypatch.setattr(foundation_prepare, "file_sha256", count_shard_hashes)
+    prepare_foundation_dataset(
+        discovery,
+        tokenizer_model,
+        tmp_path / "dataset",
+        shard_size=3,
+    )
+
+    assert shard_hashes
+    # One hash when a shard first enters the checkpoint inventory, then one
+    # complete-prefix authentication before manifest publication.
+    assert set(shard_hashes.values()) == {2}
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ["database", "dedup_content", "shard_hash", "shard_semantics"],
+)
+def test_corrupt_partial_checkpoint_is_discarded_before_rebuild(
+    tmp_path,
+    tokenizer_model,
+    monkeypatch,
+    corruption,
+) -> None:
+    discovery, resumed_path, staging = _leave_partial_foundation_generation(
+        tmp_path,
+        tokenizer_model,
+        monkeypatch,
+    )
+    database = staging / ".foundation-resume.sqlite3"
+    if corruption == "database":
+        connection = sqlite3.connect(database)
+        try:
+            connection.execute(
+                "UPDATE state SET payload_sha256 = ? WHERE singleton = 1",
+                ("0" * 64,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+    elif corruption == "dedup_content":
+        connection = sqlite3.connect(database)
+        try:
+            sequence, raw_digest = connection.execute(
+                "SELECT sequence, digest FROM digests ORDER BY sequence LIMIT 1"
+            ).fetchone()
+            changed = bytes([raw_digest[0] ^ 1]) + raw_digest[1:]
+            connection.execute(
+                "UPDATE digests SET digest = ? WHERE sequence = ?",
+                (sqlite3.Binary(changed), sequence),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+    elif corruption == "shard_hash":
+        payload = next(staging.glob("*/*.src.bin"))
+        original = payload.read_bytes()
+        assert original
+        payload.write_bytes(bytes([original[0] ^ 1]) + original[1:])
+    else:
+        index_path = next(staging.glob("*/*.idx.npy"))
+        index = np.load(index_path, allow_pickle=False)
+        assert len(index)
+        index["target_shared"][0] = 2
+        np.save(index_path, index, allow_pickle=False)
+        relative = index_path.relative_to(staging).as_posix()
+        connection = sqlite3.connect(database)
+        try:
+            raw_payload = connection.execute(
+                "SELECT payload FROM state WHERE singleton = 1"
+            ).fetchone()[0]
+            state = json.loads(raw_payload)
+            inventory_entry = next(
+                entry for entry in state["artifact_inventory"] if entry["path"] == relative
+            )
+            inventory_entry["size"] = index_path.stat().st_size
+            inventory_entry["sha256"] = hashlib.sha256(index_path.read_bytes()).hexdigest()
+            state_text = foundation_prepare._canonical_json(state)
+            connection.execute(
+                "UPDATE state SET payload = ?, payload_sha256 = ? WHERE singleton = 1",
+                (state_text, hashlib.sha256(state_text.encode("utf-8")).hexdigest()),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    rebuilt_stats = prepare_foundation_dataset(
+        discovery,
+        tokenizer_model,
+        resumed_path,
+        shard_size=3,
+        validation_fraction=0.1,
+    )
+    clean_stats = prepare_foundation_dataset(
+        discovery,
+        tokenizer_model,
+        tmp_path / "clean",
+        shard_size=3,
+        validation_fraction=0.1,
+    )
+
+    assert rebuilt_stats == clean_stats
+    assert _tree_bytes(resumed_path) == _tree_bytes(tmp_path / "clean")
+    assert not list(tmp_path.glob(".resumed.staging-*"))
+
+
+@pytest.mark.parametrize("drift", ["source", "options", "schema"])
+def test_resume_contract_drift_discards_the_old_checkpoint(
+    tmp_path,
+    tokenizer_model,
+    monkeypatch,
+    drift,
+) -> None:
+    discovery, resumed_path, _staging = _leave_partial_foundation_generation(
+        tmp_path,
+        tokenizer_model,
+        monkeypatch,
+    )
+    deduplicate = True
+    if drift == "source":
+        source_path = discovery.sources[0].path
+        original = source_path.read_bytes()
+        changed = original.replace(b" 0 ", b" 9 ", 1)
+        assert changed != original and len(changed) == len(original)
+        source_path.write_bytes(changed)
+    elif drift == "options":
+        deduplicate = False
+    else:
+        monkeypatch.setattr(
+            foundation_prepare,
+            "FOUNDATION_PREPROCESSING_SCHEMA",
+            "foundation-mixed-objectives-test-drift",
+        )
+
+    rebuilt_stats = prepare_foundation_dataset(
+        discovery,
+        tokenizer_model,
+        resumed_path,
+        deduplicate=deduplicate,
+        shard_size=3,
+        validation_fraction=0.1,
+    )
+    clean_stats = prepare_foundation_dataset(
+        discovery,
+        tokenizer_model,
+        tmp_path / "clean",
+        deduplicate=deduplicate,
+        shard_size=3,
+        validation_fraction=0.1,
+    )
+
+    assert rebuilt_stats == clean_stats
+    assert _tree_bytes(resumed_path) == _tree_bytes(tmp_path / "clean")
+    assert not list(tmp_path.glob(".resumed.staging-*"))
+
+
+def test_locked_partial_checkpoint_is_preserved_for_its_owner(
+    tmp_path,
+    tokenizer_model,
+    monkeypatch,
+) -> None:
+    discovery, resumed_path, staging = _leave_partial_foundation_generation(
+        tmp_path,
+        tokenizer_model,
+        monkeypatch,
+    )
+    database = staging / ".foundation-resume.sqlite3"
+    owner = sqlite3.connect(database, timeout=0.0, isolation_level=None)
+    owner.execute("PRAGMA locking_mode=EXCLUSIVE")
+    owner.execute("BEGIN EXCLUSIVE")
+    try:
+        with pytest.raises(
+            foundation_prepare._FoundationResumeBusy,
+            match="still active",
+        ):
+            prepare_foundation_dataset(
+                discovery,
+                tokenizer_model,
+                resumed_path,
+                shard_size=3,
+                validation_fraction=0.1,
+            )
+        assert staging.is_dir()
+        assert database.is_file()
+    finally:
+        owner.rollback()
+        owner.close()
+
+    stats = prepare_foundation_dataset(
+        discovery,
+        tokenizer_model,
+        resumed_path,
+        shard_size=3,
+        validation_fraction=0.1,
+    )
+    assert stats.total_records > 0
+    assert not list(tmp_path.glob(".resumed.staging-*"))
+
+
+def test_output_lock_refuses_a_concurrent_foundation_generation(
+    tmp_path,
+    tokenizer_model,
+) -> None:
+    discovery = discover_monolingual_sources(_corpus(tmp_path / "corpus"), ["ko", "ja"])
+    dataset = tmp_path / "dataset"
+
+    with foundation_prepare._foundation_output_lock(dataset):
+        with pytest.raises(RuntimeError, match="output is locked by another process"):
+            prepare_foundation_dataset(discovery, tokenizer_model, dataset)
+
+    assert not dataset.exists()
+    assert not list(tmp_path.glob(".dataset.staging-*"))
+    stats = prepare_foundation_dataset(discovery, tokenizer_model, dataset)
+    assert stats.total_records == 100
 
 
 def test_publish_collision_preserves_destination_and_removes_staging(
@@ -693,6 +1400,15 @@ def test_complete_exact_contract_orphan_staging_is_recovered(
         foundation_prepare,
         "_prepare_foundation_dataset_in_staging",
         forbid_rebuild,
+    )
+
+    def forbid_disk_preflight(_path):
+        raise AssertionError("a complete generation needs only an atomic rename")
+
+    monkeypatch.setattr(
+        foundation_prepare.shutil,
+        "disk_usage",
+        forbid_disk_preflight,
     )
 
     recovered_stats = prepare_foundation_dataset(discovery, tokenizer_model, dataset)
@@ -864,10 +1580,21 @@ def test_a_tokenizer_without_the_language_tags_is_refused(tmp_path, tokenizer_mo
         prepare_foundation_dataset(discovery, tokenizer_model, tmp_path / "dataset")
 
 
-def test_an_empty_discovery_is_refused(tmp_path, tokenizer_model) -> None:
+def test_an_empty_discovery_is_refused(tmp_path, tokenizer_model, monkeypatch) -> None:
     discovery = discover_monolingual_sources(tmp_path / "absent", ["ko"])
+
+    def forbid_disk_preflight(_path):
+        raise AssertionError("an empty discovery must fail before disk inspection")
+
+    monkeypatch.setattr(
+        foundation_prepare.shutil,
+        "disk_usage",
+        forbid_disk_preflight,
+    )
     with pytest.raises(ValueError, match="no usable training files"):
         prepare_foundation_dataset(discovery, tokenizer_model, tmp_path / "dataset")
+    assert not (tmp_path / "dataset").exists()
+    assert not list(tmp_path.glob(".dataset.staging-*"))
 
 
 def test_the_report_names_the_drop_reasons(tmp_path, tokenizer_model) -> None:
