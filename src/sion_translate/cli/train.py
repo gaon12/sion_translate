@@ -280,6 +280,7 @@ def preflight_dataset_direction_contract(
     config: AppConfig,
     *datasets: IndexedParallelDataset,
     require_all_pairs: bool = False,
+    require_all_directions: bool = False,
 ) -> None:
     """Refuse shards whose materialized graph differs from the run config."""
 
@@ -303,6 +304,20 @@ def preflight_dataset_direction_contract(
                 raise ValueError(
                     "prepared training split has no accepted rows for configured language "
                     f"pairs: missing={missing!r}"
+                )
+        if require_all_directions:
+            observed_directions = set(
+                dataset.observed_translation_directions_for_physical_mask(
+                    np.ones(dataset.pair_count, dtype=np.bool_)
+                )
+            )
+            missing_directions = [
+                direction for direction in expected if direction not in observed_directions
+            ]
+            if missing_directions:
+                raise ValueError(
+                    "prepared validation split has no held-out rows for configured "
+                    f"translation directions: missing={missing_directions!r}"
                 )
 
 
@@ -3835,7 +3850,11 @@ def main() -> None:
             verify_integrity=False,
         )
         preflight_dataset_direction_contract(config, train_dataset, require_all_pairs=True)
-        preflight_dataset_direction_contract(config, validation_dataset)
+        preflight_dataset_direction_contract(
+            config,
+            validation_dataset,
+            require_all_directions=True,
+        )
         announce(
             f"Data size: {len(train_dataset):,} training examples / "
             f"{len(validation_dataset):,} validation examples "

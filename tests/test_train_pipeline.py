@@ -165,6 +165,36 @@ def test_preflight_rejects_a_prepared_direction_graph_from_another_run() -> None
         )
 
 
+def test_preflight_requires_validation_evidence_for_every_configured_direction() -> None:
+    config = AppConfig()
+    config.data.language_pairs = [["pt-BR", "zh-Hant"], ["sw", "ar"]]
+    config.data.translation_directions = [
+        ["pt-BR", "zh-Hant"],
+        ["zh-Hant", "pt-BR"],
+        ["sw", "ar"],
+    ]
+    validation = SimpleNamespace(
+        language_pairs=(("pt-BR", "zh-Hant"), ("sw", "ar")),
+        translation_directions=(
+            ("pt-BR", "zh-Hant"),
+            ("zh-Hant", "pt-BR"),
+            ("sw", "ar"),
+        ),
+        pair_count=2,
+        observed_translation_directions_for_physical_mask=lambda _mask: (
+            ("pt-BR", "zh-Hant"),
+            ("zh-Hant", "pt-BR"),
+        ),
+    )
+
+    with pytest.raises(ValueError, match=r"validation split.*sw.*ar"):
+        train_module.preflight_dataset_direction_contract(  # type: ignore[arg-type]
+            config,
+            validation,
+            require_all_directions=True,
+        )
+
+
 def test_prepare_only_runs_training_contract_preflights_before_return(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
