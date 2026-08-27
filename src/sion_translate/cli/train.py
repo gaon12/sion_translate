@@ -1105,7 +1105,10 @@ def tokenizer_policy_problem(
             "The tokenizer control-token language set differs from the current configuration "
             f"(tokenizer={sorted(tokenizer.languages)}, config={sorted(expected_languages)})"
         )
-    expected_denoise_languages = set(foundation_languages or expected_languages)
+    # Tokenizer training creates denoising controls for every translation
+    # language, then adds any foundation-only languages. A configured
+    # foundation subset must therefore never remove translation controls.
+    expected_denoise_languages = expected_languages | set(foundation_languages or ())
     if set(tokenizer.denoise_tags) != expected_denoise_languages:
         return (
             "The tokenizer denoising-tag language set differs from the foundation configuration "

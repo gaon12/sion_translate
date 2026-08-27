@@ -2290,6 +2290,9 @@ def test_tokenizer_policy_requires_digit_splitting_and_matching_identity(
         )
         is None
     )
+    # Foundation languages extend the tokenizer's translation-language
+    # denoising controls; they do not replace that base set.
+    assert tokenizer_policy_problem(model_path, pairs, ("ko",)) is None
     assert "denoising-tag language set" in str(
         tokenizer_policy_problem(model_path, pairs, ("ko", "ja", "en"))
     )
