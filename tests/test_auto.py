@@ -17,6 +17,7 @@ from sion_translate.auto import (
     MODEL_REFERENCE_TOKENS_PER_PAIR,
     MODEL_SIZE_KEYS,
     _all_devices_support_native_bf16,
+    apply_auto_data_settings,
     apply_auto_settings,
     backup_stale_dataset,
     estimate_model_parameter_count,
@@ -446,6 +447,45 @@ def test_auto_sizing_uses_unique_tokens_for_an_arbitrary_direction_graph() -> No
     assert config.model.num_heads % config.model.num_kv_heads == 0
     assert any("80,000,000 unique physical training tokens" in line for line in decisions)
     assert any("virtual directions and epochs excluded" in line for line in decisions)
+
+
+def test_data_only_auto_settings_never_copy_local_cpu_runtime_choices() -> None:
+    config = AppConfig()
+    config.model.vocab_size = 64_000
+    config.data.language_pairs = [["de", "fr"], ["sw", "ar"]]
+    runtime_before = {
+        "gradient_checkpointing": config.model.gradient_checkpointing,
+        "precision": config.training.precision,
+        "batch_size_per_gpu": config.training.batch_size_per_gpu,
+        "gradient_accumulation_steps": config.training.gradient_accumulation_steps,
+        "parallel_strategy": config.training.parallel_strategy,
+        "fsdp_reduce_dtype": config.training.fsdp_reduce_dtype,
+        "num_workers": config.data.num_workers,
+    }
+
+    decisions = apply_auto_data_settings(
+        config,
+        raw={},
+        train_examples=20_000_000,
+        physical_train_pairs=2_000_000,
+        physical_train_tokens=80_000_000,
+        source_names=["real.jsonl", "bt_generated.jsonl"],
+    )
+
+    assert config.model.d_model % config.model.num_heads == 0
+    assert config.training.num_train_epochs == 5
+    assert config.data.source_sampling_weights == {"bt_generated.jsonl": 0.5}
+    assert runtime_before == {
+        "gradient_checkpointing": config.model.gradient_checkpointing,
+        "precision": config.training.precision,
+        "batch_size_per_gpu": config.training.batch_size_per_gpu,
+        "gradient_accumulation_steps": config.training.gradient_accumulation_steps,
+        "parallel_strategy": config.training.parallel_strategy,
+        "fsdp_reduce_dtype": config.training.fsdp_reduce_dtype,
+        "num_workers": config.data.num_workers,
+    }
+    assert not any("Precision:" in decision for decision in decisions)
+    assert not any("Per-device batch:" in decision for decision in decisions)
 
 
 def test_exact_prepared_tokens_override_the_legacy_pair_proxy() -> None:

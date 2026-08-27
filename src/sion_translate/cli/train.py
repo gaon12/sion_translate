@@ -48,6 +48,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from sion_translate.auto import (
+    apply_auto_data_settings,
     apply_auto_settings,
     backup_stale_dataset,
     describe_environment,
@@ -3863,18 +3864,28 @@ def main() -> None:
         )
 
         # ── Stage 4: derive settings from data and hardware ──────────────
-        decisions = apply_auto_settings(
-            config,
-            raw,
-            env,
-            train_examples=len(train_dataset),
-            validation_examples=len(validation_dataset),
-            physical_train_pairs=train_dataset.pair_count,
-            # ensure_artifacts authenticated the complete prepared inventory
-            # under the held artifact lease before these indexes were opened.
-            physical_train_tokens=train_dataset.physical_token_count,
-            source_names=train_dataset.source_names,
-        )
+        if args.prepare_only:
+            decisions = apply_auto_data_settings(
+                config,
+                raw,
+                train_examples=len(train_dataset),
+                physical_train_pairs=train_dataset.pair_count,
+                # ensure_artifacts authenticated the complete prepared inventory
+                # under the held artifact lease before these indexes were opened.
+                physical_train_tokens=train_dataset.physical_token_count,
+                source_names=train_dataset.source_names,
+            )
+        else:
+            decisions = apply_auto_settings(
+                config,
+                raw,
+                env,
+                train_examples=len(train_dataset),
+                validation_examples=len(validation_dataset),
+                physical_train_pairs=train_dataset.pair_count,
+                physical_train_tokens=train_dataset.physical_token_count,
+                source_names=train_dataset.source_names,
+            )
         if decisions:
             announce("Preparation 4: automatically selected settings —", context)
             for line in decisions:

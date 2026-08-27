@@ -292,8 +292,15 @@ def test_prepare_only_runs_training_contract_preflights_before_return(
     )
     monkeypatch.setattr(
         train_module,
+        "apply_auto_data_settings",
+        lambda *_args, **_kwargs: events.append("automatic data settings") or [],
+    )
+    monkeypatch.setattr(
+        train_module,
         "apply_auto_settings",
-        lambda *_args, **_kwargs: events.append("automatic settings") or [],
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("prepare-only must not apply local hardware settings")
+        ),
     )
     monkeypatch.setattr(train_module, "DistributedBucketBatchSampler", SamplerStub)
     monkeypatch.setattr(
@@ -315,7 +322,7 @@ def test_prepare_only_runs_training_contract_preflights_before_return(
         "token features",
         "direction graph",
         "direction graph",
-        "automatic settings",
+        "automatic data settings",
         "effective sampling",
         "cleanup",
     ]

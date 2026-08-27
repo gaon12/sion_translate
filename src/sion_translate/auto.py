@@ -716,30 +716,28 @@ def _clamp(value: int, low: int, high: int) -> int:
     return max(low, min(high, value))
 
 
-def apply_auto_settings(
+def apply_auto_data_settings(
     config: AppConfig,
     raw: dict[str, Any],
-    env: EnvironmentInfo,
     *,
     train_examples: int,
-    validation_examples: int,
     physical_train_pairs: int | None = None,
     physical_train_tokens: int | None = None,
     source_names: list[str] | None = None,
 ) -> list[str]:
-    """Fill settings that the user did not specify in ``sion_translate.yaml``.
+    """Apply only decisions derived from authenticated prepared data.
 
-    ``raw`` retains key presence from the source configuration so explicit
-    values are never overwritten. The return value contains readable summaries
-    of every automatic decision.
+    This phase deliberately has no execution-environment argument. It is safe
+    to run on a local CPU before a GPU upload because it cannot choose precision,
+    per-device batch size, accumulation, parallelism, or DataLoader workers.
     """
+
     raw_model = dict(raw.get("model") or {})
     raw_training = dict(raw.get("training") or {})
     raw_data = dict(raw.get("data") or {})
     decisions: list[str] = []
 
     def auto(section: dict[str, Any], key: str) -> bool:
-        """Return whether a key is eligible for automatic configuration."""
         return key not in section
 
     pair_count = _validated_pair_count(
@@ -784,6 +782,64 @@ def apply_auto_settings(
             f"parameters against a smooth {target_parameters:,}-parameter target "
             f"with vocabulary size {sizing_vocab:,}."
         )
+
+    if auto(raw_training, "num_train_epochs") and auto(raw_training, "max_steps"):
+        epochs = target_epochs(pair_count)
+        config.training.num_train_epochs = epochs
+        config.training.max_steps = None
+        decisions.append(
+            f"num_train_epochs: {epochs} complete corpus passes for {pair_count:,} physical pairs"
+        )
+
+    # Downweight synthetic sources unless the user supplies an explicit policy.
+    # Equal weighting can amplify systematic errors from a model's own output.
+    if auto(raw_data, "source_sampling_weights") and source_names:
+        prefixes = config.data.configured_synthetic_prefixes()
+        synthetic = [name for name in source_names if name.startswith(prefixes)]
+        if synthetic:
+            weight = config.data.synthetic_sampling_weight
+            config.data.source_sampling_weights = {name: weight for name in synthetic}
+            decisions.append(
+                f"Synthetic sampling: {len(synthetic)} source(s) matching "
+                f"{', '.join(prefixes)}* weighted by {weight:g}"
+            )
+
+    return decisions
+
+
+def apply_auto_settings(
+    config: AppConfig,
+    raw: dict[str, Any],
+    env: EnvironmentInfo,
+    *,
+    train_examples: int,
+    validation_examples: int,
+    physical_train_pairs: int | None = None,
+    physical_train_tokens: int | None = None,
+    source_names: list[str] | None = None,
+) -> list[str]:
+    """Fill settings that the user did not specify in ``sion_translate.yaml``.
+
+    ``raw`` retains key presence from the source configuration so explicit
+    values are never overwritten. The return value contains readable summaries
+    of every automatic decision.
+    """
+    raw_model = dict(raw.get("model") or {})
+    raw_training = dict(raw.get("training") or {})
+    raw_data = dict(raw.get("data") or {})
+    decisions = apply_auto_data_settings(
+        config,
+        raw,
+        train_examples=train_examples,
+        physical_train_pairs=physical_train_pairs,
+        physical_train_tokens=physical_train_tokens,
+        source_names=source_names,
+    )
+
+    def auto(section: dict[str, Any], key: str) -> bool:
+        """Return whether a key is eligible for automatic configuration."""
+        return key not in section
+
     if auto(raw_model, "gradient_checkpointing"):
         config.model.gradient_checkpointing = env.cuda and env.min_vram_gib < 70
         if config.model.gradient_checkpointing:
@@ -810,19 +866,12 @@ def apply_auto_settings(
             f"(effective batch {effective} sequences/update)"
         )
 
-    # Use complete epochs instead of truncating the corpus at an arbitrary step.
+    # Convert the data-derived complete-epoch budget into this runtime's step
+    # count only after per-device batch and accumulation have been selected.
     batches_per_epoch = math.ceil(
         train_examples / max(1, config.training.batch_size_per_gpu * env.world_size)
     )
     steps_per_epoch = math.ceil(batches_per_epoch / config.training.gradient_accumulation_steps)
-    epochs = target_epochs(pair_count)
-    if auto(raw_training, "num_train_epochs") and auto(raw_training, "max_steps"):
-        config.training.num_train_epochs = epochs
-        config.training.max_steps = None
-        decisions.append(
-            f"num_train_epochs: {epochs} "
-            f"(about {steps_per_epoch:,} optimizer steps per complete corpus pass)"
-        )
     planned_steps = config.training.max_steps or (
         config.training.num_train_epochs * steps_per_epoch
     )
@@ -870,18 +919,5 @@ def apply_auto_settings(
         per_rank = max(1, env.cpu_count // max(1, env.world_size))
         config.data.num_workers = min(16, max(0, per_rank - 1))
         decisions.append(f"DataLoader workers: {config.data.num_workers}")
-
-    # Downweight synthetic sources unless the user supplies an explicit policy.
-    # Equal weighting can amplify systematic errors from a model's own output.
-    if auto(raw_data, "source_sampling_weights") and source_names:
-        prefixes = config.data.configured_synthetic_prefixes()
-        synthetic = [name for name in source_names if name.startswith(prefixes)]
-        if synthetic:
-            weight = config.data.synthetic_sampling_weight
-            config.data.source_sampling_weights = {name: weight for name in synthetic}
-            decisions.append(
-                f"Synthetic sampling: {len(synthetic)} source(s) matching "
-                f"{', '.join(prefixes)}* weighted by {weight:g}"
-            )
 
     return decisions
