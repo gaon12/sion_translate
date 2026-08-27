@@ -1361,7 +1361,6 @@ def test_transformers_inspection_binds_reasoning_sidecars_to_config_default(
     tmp_path: Path,
 ) -> None:
     config = tiny_model_config()
-    config.experimental.candidate_refinement_enabled = True
     native = NativeSionForConditionalGeneration(config, pad_id=0)
     save_transformers_checkpoint(tmp_path, native.state_dict(), config)
     config_path = tmp_path / "config.json"
