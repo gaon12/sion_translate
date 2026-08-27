@@ -83,6 +83,7 @@ class IndexedParallelDataset(Dataset[dict[str, object]]):
         self.cumulative: list[int] = []
         total = 0
         lengths: list[np.ndarray] = []
+        physical_token_count = 0
         source_ids: list[np.ndarray] = []
         synthetic_flags: list[np.ndarray] = []
         forward_only_flags: list[np.ndarray] = []
@@ -94,9 +95,15 @@ class IndexedParallelDataset(Dataset[dict[str, object]]):
             self.cumulative.append(total)
             src_length = "src_length" if self.is_v3 else "ko_length"
             tgt_length = "tgt_length" if self.is_v3 else "ja_length"
-            lengths.append(
-                index[src_length].astype(np.uint32) + index[tgt_length].astype(np.uint32)
-            )
+            pair_lengths = index[src_length].astype(np.uint32) + index[tgt_length].astype(np.uint32)
+            lengths.append(pair_lengths)
+            # Sum each shard into a Python integer so corpus-scale token counts
+            # cannot wrap at uint32. Sum the two uint32 fields independently in
+            # uint64 as well, so even a malformed overlong row cannot wrap
+            # before the corpus total is widened. This counts each physical
+            # source/target sequence once, regardless of virtual directions.
+            physical_token_count += int(index[src_length].sum(dtype=np.uint64))
+            physical_token_count += int(index[tgt_length].sum(dtype=np.uint64))
             if index.dtype.names is not None and "source_id" in index.dtype.names:
                 source_ids.append(index["source_id"].astype(np.uint16))
             else:
@@ -115,6 +122,7 @@ class IndexedParallelDataset(Dataset[dict[str, object]]):
                 self.has_forward_only_metadata = False
                 forward_only_flags.append(np.zeros(len(index), dtype=np.bool_))
         self.pair_count = total
+        self.physical_token_count = physical_token_count
         self.pair_lengths: np.ndarray | None = np.concatenate(lengths)
         self.pair_source_ids: np.ndarray | None = np.concatenate(source_ids)
         self.pair_synthetic_flags: np.ndarray | None = np.concatenate(synthetic_flags)

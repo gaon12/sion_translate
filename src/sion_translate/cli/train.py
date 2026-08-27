@@ -8,8 +8,8 @@ Workflow:
        remain automatic; --config can select another file.
     3. Discover data/*.jsonl, train a tokenizer when needed, and rebuild prepared
        data when source files change.
-    4. Select model size, step count, batch size, and related values from the data
-       scale and available hardware.
+    4. Select a smooth token-scaled architecture, step count, batch size, and
+       related values from the prepared data and available hardware.
     5. Resume each stage automatically from checkpoints/latest when possible.
     6. Run SFT pretraining and store its artifacts under pretrain/.
     7. Run composite-reward MRT and multi-candidate preference training, storing
@@ -3860,6 +3860,9 @@ def main() -> None:
             train_examples=len(train_dataset),
             validation_examples=len(validation_dataset),
             physical_train_pairs=train_dataset.pair_count,
+            # ensure_artifacts authenticated the complete prepared inventory
+            # under the held artifact lease before these indexes were opened.
+            physical_train_tokens=train_dataset.physical_token_count,
             source_names=train_dataset.source_names,
         )
         if decisions:
