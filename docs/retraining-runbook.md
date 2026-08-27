@@ -367,6 +367,25 @@ path can feed a completed draft back through a trained revision edge. Export met
 binds the distribution-refinement feature and the exact translation and revision graphs,
 so inference fails closed instead of advertising an untrained capability.
 
+Held-out validation also measures the per-token difference
+`NLL(provisional) - NLL(final)`. Positive values mean refinement helped. The trainer records
+global, target-language, directed-edge, macro-direction, and worst-direction values without
+running a second decoder pass. It checks the raw or EMA family that will actually deploy.
+
+For translation-capable candidate-refinement runs, checkpoint selection is fail-closed:
+
+- run a step-zero validation before the first update so a neutral or useful incoming model
+  can remain the safe fallback;
+- require finite evidence for every exact configured directed edge;
+- reject a checkpoint when its worst edge is below `-1e-6`;
+- keep optimizer progress resumable even when no updated checkpoint is release-safe; and
+- publish only guard-approved `exports/best`, never an unvalidated `exports/latest`.
+
+A versioned attestation stores the deployed family, graph fingerprint, edge count, and
+worst gain with the best checkpoint record. A legacy run may resume its optimizer and data
+cursor, but it must establish new release evidence. `RELEASE_INELIGIBLE.json` blocks any
+stale inference directory until a successful safe-best export replaces it.
+
 MRT can use more memory than teacher-forced SFT. If it runs out of memory, reduce
 `posttraining.batch_size_per_gpu`, then candidate micro-batch size, candidates per source,
 and generation limits in that order. Keep at least two candidates per source.

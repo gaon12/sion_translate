@@ -283,11 +283,13 @@ For detailed H100 and distributed commands, see
 ## Candidate refinement and deployed output
 
 When `model.experimental.candidate_refinement_enabled` is true, both `forward()` and
-generation use the same two-step next-token computation:
+generation use the same staged next-token computation:
 
 1. Compute the first full-vocabulary distribution.
 2. Form its expected token embedding, update the decoder representation, and recompute
    the full-vocabulary logits.
+3. If more than one refinement step is configured, repeat step 2 and use the final trained
+   endpoint.
 
 Losses are applied to the refined logits during training, and beam or sampling decisions
 use the refined logits during inference. Therefore the final translation deployment uses
@@ -297,6 +299,28 @@ level against the model configuration.
 
 This is distribution refinement, not candidate reranking. Optional sequence-level MBR
 reranking remains a separate inference feature.
+
+Validation reports `candidate_refinement_nll_gain` as
+`NLL(provisional distribution) - NLL(final distribution)`. A positive value means the
+refined endpoint improved the held-out target token. Reports include token-weighted global
+and target-language values, exact directed-edge values, a direction macro mean, and the
+worst directed edge.
+
+Translation training treats this measurement as a release rule, not only a diagnostic.
+Before the first optimizer update, it records a safe step-zero fallback. A later checkpoint
+can become the deployable `best` only when all of these conditions hold:
+
+- the checked metrics come from the same raw or EMA weight family that deployment uses;
+- every exact edge in the configured language graph is present with finite token evidence;
+- every per-edge gain is finite; and
+- the worst edge is non-negative, allowing only `1e-6` of numerical tolerance around zero.
+
+The versioned checkpoint attestation binds the deployed weight family and a fingerprint of
+the complete directed graph. Legacy checkpoints can still resume optimizer progress, but
+their old best record is re-evaluated before release. Guarded runs keep `checkpoints/latest`
+for restart safety but do not create `exports/latest`. A `RELEASE_INELIGIBLE.json` marker
+blocks stale inference directories from discovery, direct native loading, and export
+validation until a guard-approved `best` export succeeds.
 
 ## Inference
 

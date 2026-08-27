@@ -283,10 +283,21 @@ live tensor still exists and needs investigation.
 
 ## 10. Create final exports
 
-Intermediate `exports/best` and `exports/latest` keep only lightweight native state so
-large CPU conversions do not stop the H100 at every evaluation. After all enabled stages
-finish, the CLI restores the selected best raw or EMA weights and generates the requested
-final formats once in a transactional directory.
+Intermediate `exports/best` keeps only lightweight native state so large CPU conversions
+do not stop the H100 at every evaluation. Runs without candidate refinement may also keep
+`exports/latest` for local inspection. Candidate-refinement runs deliberately keep latest
+weights only under `checkpoints/latest`: they are restartable, but they are not deployable
+until every configured direction passes the held-out no-regression guard. After all enabled
+stages finish, the CLI restores the selected best raw or EMA weights and generates the
+requested final formats once in a transactional directory.
+
+The release check uses `NLL(provisional) - NLL(final)`, so positive values are improvements.
+It verifies the exact configured graph using the deployed raw or EMA family and rejects
+missing, extra, non-finite, or negative worst-direction evidence. A tolerance of `1e-6`
+absorbs floating-point subtraction noise around an exactly neutral refiner. The run writes
+`RELEASE_INELIGIBLE.json` into stale best/latest inference directories before training; all
+normal discovery, native loading, and directory validation paths reject the marker. Only a
+successful guard-approved best export removes it.
 
 To recover formats manually, provide the exact graph policy:
 
@@ -364,6 +375,7 @@ Do not upload a directory that fails validation. Confirm that:
 - language pairs, trained directions, revision directions, release role, and pipeline
   lineage agree across native, GGUF, and Transformers metadata;
 - architecture feature flags exactly match the model configuration;
+- no `RELEASE_INELIGIBLE.json` marker exists in the directory;
 - bundled Transformers code imports and every safetensors key and shape validates.
 
 The final run report should include the Git commit and tree, complete configuration, data
