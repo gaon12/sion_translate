@@ -182,7 +182,17 @@ class SionForConditionalGeneration(PreTrainedModel, GenerationMixin):
         self,
         enable: bool = True,
         gradient_checkpointing_func: Callable[..., Any] = checkpoint,
+        every_n_layers: object = 1,
     ) -> None:
+        # Transformers 5.16 forwards its new selective-checkpointing argument
+        # even when the caller requests the default behavior. The native Sion
+        # model currently checkpoints every encoder and decoder layer as one
+        # policy, so accept the compatible value and reject a request that the
+        # runtime cannot honor instead of silently changing memory behavior.
+        if isinstance(every_n_layers, bool) or not isinstance(every_n_layers, int):
+            raise TypeError("every_n_layers must be a positive integer")
+        if every_n_layers != 1:
+            raise ValueError("Sion currently supports gradient checkpointing every layer only")
         del gradient_checkpointing_func
         self.model.config.gradient_checkpointing = enable
         self.config.gradient_checkpointing = enable

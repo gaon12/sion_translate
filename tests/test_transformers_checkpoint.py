@@ -369,6 +369,14 @@ def test_transformers_wrapper_matches_native_forward_and_config() -> None:
     model.gradient_checkpointing_disable()
     assert not model.config.gradient_checkpointing
 
+    # Transformers 5.16 always forwards this argument. Keep the default
+    # compatible while refusing a selective policy the native runtime cannot
+    # faithfully implement yet.
+    model._set_gradient_checkpointing(enable=True, every_n_layers=1)
+    assert model.model.config.gradient_checkpointing
+    with pytest.raises(ValueError, match="every layer only"):
+        model._set_gradient_checkpointing(enable=True, every_n_layers=2)
+
 
 def test_transformers_config_rejects_an_uncovered_language_pair() -> None:
     with pytest.raises(ValueError, match="every language pair"):
