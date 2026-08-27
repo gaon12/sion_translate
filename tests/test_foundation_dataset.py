@@ -1172,12 +1172,6 @@ def test_corrupt_partial_checkpoint_is_discarded_before_rebuild(
         assert original
         payload.write_bytes(bytes([original[0] ^ 1]) + original[1:])
     else:
-        index_path = next(staging.glob("*/*.idx.npy"))
-        index = np.load(index_path, allow_pickle=False)
-        assert len(index)
-        index["target_shared"][0] = 2
-        np.save(index_path, index, allow_pickle=False)
-        relative = index_path.relative_to(staging).as_posix()
         connection = sqlite3.connect(database)
         try:
             raw_payload = connection.execute(
@@ -1185,8 +1179,14 @@ def test_corrupt_partial_checkpoint_is_discarded_before_rebuild(
             ).fetchone()[0]
             state = json.loads(raw_payload)
             inventory_entry = next(
-                entry for entry in state["artifact_inventory"] if entry["path"] == relative
+                entry for entry in state["artifact_inventory"] if entry["path"].endswith(".idx.npy")
             )
+            relative = inventory_entry["path"]
+            index_path = staging / relative
+            index = np.load(index_path, allow_pickle=False)
+            assert len(index)
+            index["target_shared"][0] = 2
+            np.save(index_path, index, allow_pickle=False)
             inventory_entry["size"] = index_path.stat().st_size
             inventory_entry["sha256"] = hashlib.sha256(index_path.read_bytes()).hexdigest()
             state_text = foundation_prepare._canonical_json(state)
