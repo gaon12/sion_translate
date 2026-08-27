@@ -165,6 +165,15 @@ Preparation uses SQLite-backed exact deduplication by default, prevents approxim
 duplicates from crossing split boundaries, records source fingerprints, and writes a
 manifest for every generated shard.
 
+The dataset manifest names physical token totals by storage side, not by language. Under
+`stats_schema: sion-prepare-stats-src-tgt-v1`, `src_tokens` and `tgt_tokens` count the
+accepted content token IDs physically stored in the source and target shard files. They
+do not count padding, runtime language controls, virtual reverse examples, repeated
+epochs, or later training augmentation. This definition stays valid for any configured
+language graph. Authenticated v1.5 manifests without a statistics marker are still read
+when they contain the exact legacy `ko_tokens` and `ja_tokens` field set, but every new
+manifest writes only the storage-neutral names.
+
 Translation preparation writes deterministic, content-bound worker chunks beside the
 requested output. If tokenization is interrupted, run the same command again: compatible
 chunks are integrity-checked and reused in source order. A new parent process advances a

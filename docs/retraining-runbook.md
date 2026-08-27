@@ -117,6 +117,15 @@ retrain a tokenizer, partially append a dataset, or accept an incompatible direc
 Treat a graph, tokenizer, token-feature, source-fingerprint, or inventory mismatch as a
 hard failure. Investigate it instead of deleting metadata and forcing reuse.
 
+Inspect `artifacts/dataset/manifest.json` after preparation. New artifacts must declare
+`stats_schema` as `sion-prepare-stats-src-tgt-v1`. The `src_tokens` and `tgt_tokens`
+values are physical accepted content-token counts for the two stored shard sides; they
+are not Korean/Japanese totals and they do not include virtual reverse directions,
+padding, runtime controls, epoch repetition, or online augmentation. Their values must
+match the sums of `src_length` and `tgt_length` in the authenticated index shards. A
+markerless v1.5 manifest may retain the exact legacy `ko_tokens`/`ja_tokens` names for
+compatibility, but do not copy those misleading names into a new manifest.
+
 An interrupted translation build keeps deterministic gzip worker chunks in a hidden
 content-addressed progress directory next to `artifacts/dataset/`. The progress contract
 binds the exact source bytes, tokenizer, language graph, preprocessing options, worker
