@@ -263,3 +263,66 @@ def test_a_timeout_waits_before_giving_up(tmp_path) -> None:
     assert "artifact root is locked by another process" in result.stderr
     # Measure time inside artifact_lock, excluding child import and startup time.
     assert float(result.stdout.strip()) >= 0.15
+
+
+def test_lock_rejects_a_symbolic_link_without_touching_its_target(tmp_path) -> None:
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    sentinel = tmp_path / "sentinel.txt"
+    sentinel.write_text("must remain unchanged", encoding="utf-8")
+    lock_path = root / LOCK_FILENAME
+    try:
+        lock_path.symlink_to(sentinel)
+    except OSError as error:
+        pytest.skip(f"symbolic links are unavailable on this host: {error}")
+
+    with pytest.raises(ValueError, match="symbolic link or reparse point"):
+        with artifact_lock(root):
+            raise AssertionError("a linked lock file must never be opened")
+
+    assert sentinel.read_text(encoding="utf-8") == "must remain unchanged"
+    assert lock_path.is_symlink()
+
+
+def test_lock_does_not_create_directories_through_a_linked_parent(tmp_path) -> None:
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    linked_parent = tmp_path / "linked-parent"
+    try:
+        linked_parent.symlink_to(real_parent, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"directory symbolic links are unavailable on this host: {error}")
+
+    requested = linked_parent / "must-not-exist" / "artifacts"
+    with pytest.raises(ValueError, match="symbolic link or reparse point"):
+        with artifact_lock(requested):
+            raise AssertionError("a lock root must not traverse a linked parent")
+
+    assert not (real_parent / "must-not-exist").exists()
+
+
+def test_lock_rejects_a_hard_link_without_overwriting_the_shared_file(tmp_path) -> None:
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    sentinel = tmp_path / "sentinel.txt"
+    sentinel.write_text("shared bytes", encoding="utf-8")
+    lock_path = root / LOCK_FILENAME
+    os.link(sentinel, lock_path)
+
+    with pytest.raises(ValueError, match="multiple hard links"):
+        with artifact_lock(root):
+            raise AssertionError("a hard-linked lock file must never be opened")
+
+    assert sentinel.read_text(encoding="utf-8") == "shared bytes"
+
+
+def test_an_ordinary_stale_regular_lock_file_is_reusable(tmp_path) -> None:
+    lock_path = tmp_path / LOCK_FILENAME
+    lock_path.write_text("host=old pid=1 started=0\n", encoding="utf-8")
+
+    with artifact_lock(tmp_path) as acquired:
+        assert acquired == lock_path
+        current = lock_path.read_text(encoding="utf-8")
+        assert f"pid={os.getpid()}" in current
+
+    assert lock_path.is_file()
