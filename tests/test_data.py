@@ -177,8 +177,14 @@ def _write_atomic_prepare_source(path: Path, *, marker: str = "A") -> None:
     )
 
 
-def _atomic_prepare_fingerprint(source: Path, tokenizer: Path) -> DatasetFingerprint:
+def _atomic_prepare_fingerprint(
+    source: Path,
+    tokenizer: Path,
+    *,
+    language_pair: tuple[str, str] = ("ko", "ja"),
+) -> DatasetFingerprint:
     policy = QualityPolicy()
+    reverse_pair = (language_pair[1], language_pair[0])
     options = prepare_module.prepare_preprocessing_options(
         shard_size=8,
         validation_fraction=0.0,
@@ -190,14 +196,14 @@ def _atomic_prepare_fingerprint(source: Path, tokenizer: Path) -> DatasetFingerp
         approximate_split=False,
         dedup_backend="memory",
         source_only_languages=(),
-        translation_directions=(("ko", "ja"), ("ja", "ko")),
+        translation_directions=(language_pair, reverse_pair),
         train_only_prefixes=prepare_module.DEFAULT_TRAIN_ONLY_PREFIXES,
         synthetic_sampling_weight=0.25,
         language_pair_count=1,
     )
     return build_dataset_fingerprint(
         [source],
-        language_pairs=(("ko", "ja"),),
+        language_pairs=(language_pair,),
         tokenizer_model=tokenizer,
         preprocessing_options=options,
     )
@@ -209,6 +215,7 @@ def _prepare_atomic_dataset(
     output: Path,
     *,
     expected_fingerprint: DatasetFingerprint,
+    language_pair: tuple[str, str] = ("ko", "ja"),
 ) -> prepare_module.PrepareStats:
     return prepare_module.prepare_dataset(
         [source_pattern],
@@ -219,7 +226,7 @@ def _prepare_atomic_dataset(
         test_fraction=0.0,
         filter_quality=False,
         dedup_backend="memory",
-        language_pair=("ko", "ja"),
+        language_pair=language_pair,
         synthetic_sampling_weight=0.25,
         num_workers=1,
         expected_fingerprint=expected_fingerprint,
@@ -1622,18 +1629,38 @@ def test_prepare_reuses_an_authenticated_unmarked_v10_legacy_stats_manifest(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    language_pair = ("de", "fr")
+
+    class ConfigurableGraphTokenizer(_FakePrepareTokenizer):
+        languages = language_pair
+
     source = tmp_path / "pairs.jsonl"
     tokenizer = tmp_path / "sion.model"
     output = tmp_path / "dataset"
-    _write_atomic_prepare_source(source)
+    source.write_text(
+        json.dumps(
+            {
+                "de": "Eine absichtlich längere deutsche Quellsequenz für den Speichertest.",
+                "fr": "Une phrase française suffisamment longue.",
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     tokenizer.write_bytes(b"stable-tokenizer")
-    expected = _atomic_prepare_fingerprint(source, tokenizer)
-    monkeypatch.setattr(prepare_module, "SionTokenizer", _FakePrepareTokenizer)
+    expected = _atomic_prepare_fingerprint(
+        source,
+        tokenizer,
+        language_pair=language_pair,
+    )
+    monkeypatch.setattr(prepare_module, "SionTokenizer", ConfigurableGraphTokenizer)
     original_stats = _prepare_atomic_dataset(
         str(source),
         tokenizer,
         output,
         expected_fingerprint=expected,
+        language_pair=language_pair,
     )
     manifest_path = output / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -1657,11 +1684,13 @@ def test_prepare_reuses_an_authenticated_unmarked_v10_legacy_stats_manifest(
         tokenizer,
         output,
         expected_fingerprint=expected,
+        language_pair=language_pair,
     )
 
     assert reused_stats == original_stats
     assert reused_stats.src_tokens == original_stats.src_tokens
     assert reused_stats.tgt_tokens == original_stats.tgt_tokens
+    assert reused_stats.src_tokens != reused_stats.tgt_tokens
 
 
 def test_prepare_publication_failure_preserves_a_complete_resumable_generation(

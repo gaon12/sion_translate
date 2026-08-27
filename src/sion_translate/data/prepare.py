@@ -174,6 +174,55 @@ class PrepareStats:
     forward_only_pairs: int = 0
 
 
+# This tuple is the deployed v1 wire contract. Do not append a new in-memory
+# counter here: define a new statistics schema and an explicit migration map.
+# The import-time parity check below turns an accidental PrepareStats change
+# into a developer-visible error instead of silently changing persisted v1
+# manifests or making authenticated older artifacts unreadable.
+_PREPARE_STATS_V1_FIELDS = (
+    "physical_lines",
+    "valid_pairs",
+    "invalid_json",
+    "invalid_utf8",
+    "invalid_record",
+    "missing_text",
+    "non_string",
+    "invalid_language",
+    "unaligned_lists",
+    "duplicates",
+    "quality_filtered",
+    "too_short",
+    "identical_text",
+    "length_ratio_outlier",
+    "language_mismatch",
+    "control_characters",
+    "excessive_repetition",
+    "structured_span_rejections",
+    "structured_span_warnings",
+    "ja_no_kana_warnings",
+    "split_conflicts",
+    "too_long",
+    "train",
+    "validation",
+    "test",
+    "src_tokens",
+    "tgt_tokens",
+    "quality_score_sum",
+    "synthetic_pairs",
+    "forward_only_pairs",
+)
+if tuple(field.name for field in fields(PrepareStats)) != _PREPARE_STATS_V1_FIELDS:
+    raise RuntimeError("PrepareStats changed without a new explicit persisted statistics schema")
+_PREPARE_STATS_V1_FIELD_MAP = tuple((name, name) for name in _PREPARE_STATS_V1_FIELDS)
+_PREPARE_STATS_LEGACY_FIELD_MAP = tuple(
+    (
+        {"src_tokens": "ko_tokens", "tgt_tokens": "ja_tokens"}.get(name, name),
+        name,
+    )
+    for name in _PREPARE_STATS_V1_FIELDS
+)
+
+
 def prepare_stats_schema_from_manifest(
     manifest: Mapping[str, object],
     *,
@@ -207,26 +256,22 @@ def validated_prepare_stats(
     if not isinstance(value, Mapping):
         raise ValueError(f"{role} stats must be an object")
     raw = cast(Mapping[object, object], value)
-    neutral_names = tuple(field.name for field in fields(PrepareStats))
-    neutral_fields = set(neutral_names)
-    legacy_aliases = {"src_tokens": "ko_tokens", "tgt_tokens": "ja_tokens"}
     if stats_schema is None:
-        expected_fields = (neutral_fields - set(legacy_aliases)) | set(legacy_aliases.values())
+        field_map = _PREPARE_STATS_LEGACY_FIELD_MAP
     elif stats_schema == PREPARE_STATS_SCHEMA:
-        expected_fields = neutral_fields
-        legacy_aliases = {}
+        field_map = _PREPARE_STATS_V1_FIELD_MAP
     else:
         raise ValueError(f"{role} stats_schema is unsupported")
+    expected_fields = {serialized_name for serialized_name, _ in field_map}
     if set(raw) != expected_fields:
         raise ValueError(f"{role} stats fields do not match their schema")
 
     normalized: dict[str, int] = {}
-    for name in neutral_names:
-        serialized_name = legacy_aliases.get(name, name)
+    for serialized_name, internal_name in field_map:
         field_value = raw[serialized_name]
         if isinstance(field_value, bool) or not isinstance(field_value, int) or field_value < 0:
             raise ValueError(f"{role} stat is invalid: {serialized_name}")
-        normalized[name] = field_value
+        normalized[internal_name] = field_value
     return PrepareStats(**normalized)
 
 
