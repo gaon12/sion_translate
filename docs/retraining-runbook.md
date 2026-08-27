@@ -117,6 +117,22 @@ retrain a tokenizer, partially append a dataset, or accept an incompatible direc
 Treat a graph, tokenizer, token-feature, source-fingerprint, or inventory mismatch as a
 hard failure. Investigate it instead of deleting metadata and forcing reuse.
 
+An interrupted translation build keeps deterministic gzip worker chunks in a hidden
+content-addressed progress directory next to `artifacts/dataset/`. The progress contract
+binds the exact source bytes, tokenizer, language graph, preprocessing options, worker
+algorithm, Python version, SentencePiece version, and Unicode database version. Re-run the
+same command to reuse compatible chunks. Do not copy chunks between environments or edit
+their JSON payloads. A generation fence prevents workers orphaned by a terminated parent
+from writing after a new invocation begins.
+
+Worker checkpointing and final shard construction are separate phases. After all chunks
+are complete, preparation calculates a conservative staging requirement from their actual
+candidate rows, token IDs, and encoded metadata. An `ENOSPC` result at this boundary leaves
+the worker chunks intact, does not create a partial published dataset, and can be retried
+after freeing space. The fixed per-record safety contract is language-neutral: 16 MiB per
+raw line, 64 MiB of selected raw data per batch, 1,024 expanded physical pairs per line,
+256 KiB of supported metadata per pair, and 256 MiB maximum uncompressed chunk size.
+
 ### Manual diagnostic commands
 
 The unified preparation entry point is preferred. For a small manual diagnostic, pass

@@ -70,6 +70,11 @@ Run the preparation-only entry point once on the server:
 sion-train --config sion_translate.yaml --prepare-only
 ```
 
+If local translation indexing is interrupted, run the identical command again. It reuses
+content-bound worker chunks, fences workers left by a terminated parent, and waits until
+all chunks are complete before creating final shards. A post-worker disk failure preserves
+the reusable chunks and never publishes a partial `artifacts/dataset/` directory.
+
 For a fully prepared bundle, this should authenticate and reuse the tokenizer and both
 indexed datasets rather than rebuild them. If the bundle intentionally omitted an
 artifact, the command prepares only that missing artifact.

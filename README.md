@@ -165,6 +165,22 @@ Preparation uses SQLite-backed exact deduplication by default, prevents approxim
 duplicates from crossing split boundaries, records source fingerprints, and writes a
 manifest for every generated shard.
 
+Translation preparation writes deterministic, content-bound worker chunks beside the
+requested output. If tokenization is interrupted, run the same command again: compatible
+chunks are integrity-checked and reused in source order. A new parent process advances a
+generation fence before cleanup, so workers left alive by an abrupt parent termination
+cannot publish into the resumed generation. Chunk creation finishes before staging starts;
+the runner then derives a conservative staging-space plan from the actual candidate token
+and metadata totals. If that gate reports insufficient disk space, completed chunks remain
+reusable and no partial dataset directory is published.
+
+The language graph remains configuration-driven. Resource limits apply to record shape,
+not language names: one physical JSONL line may be at most 16 MiB, one worker batch may
+contain at most 64 MiB of selected raw records, one line may expand to at most 1,024
+physical pairs, and supported stored metadata for one pair may be at most 256 KiB. These
+limits prevent one nested record from exhausting memory or cleanup space. Split a record
+into smaller independent JSONL rows when a legitimate source exceeds one of them.
+
 ### Foundation corpus
 
 Store monolingual text below one directory per configured language tag:
