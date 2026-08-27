@@ -3763,11 +3763,10 @@ def main() -> None:
         checkpoint_lease_scope = ExitStack()
         run_scope.enter_context(checkpoint_lease_scope)
         announce(f"Preparation 2: configuration loaded — {source}", context)
-        if not args.prepare_only:
-            # The built-in collator has no dense alignment-label provider.
-            # Reject a permanently-zero BATS alignment objective before doing
-            # artifact preparation or allocating model parameters.
-            config.validate_training_supervision(alignment_targets_available=False)
+        # The built-in collator has no dense alignment-label provider. Reject a
+        # permanently-zero BATS alignment objective even for preparation-only
+        # runs so an upload-ready artifact set cannot hide a training failure.
+        config.validate_training_supervision(alignment_targets_available=False)
 
         # ── Stage 3: discover source data and prepare artifacts ──────────
         announce("Preparation 3: checking source data.", context)
@@ -3776,11 +3775,10 @@ def main() -> None:
             config,
             discovered_foundation_plan,
         )
-        if not args.prepare_only:
-            # Translation formats are unavoidable. Foundation-only converters
-            # are checked later, after downstream resume candidates have had a
-            # chance to supersede every base-stage action.
-            preflight_final_export_dependencies(config.training.final_export_formats)
+        # Translation formats are unavoidable. Check them locally during a
+        # preparation-only run as well; otherwise the same configuration can
+        # spend upload and GPU setup time before reporting a missing converter.
+        preflight_final_export_dependencies(config.training.final_export_formats)
         run_scope.enter_context(
             coordinated_artifact_run_locks(
                 config,
@@ -3819,13 +3817,6 @@ def main() -> None:
         tokenizer = SionTokenizer(config.data.tokenizer_model)
         config.model.vocab_size = len(tokenizer)
         preflight_morphoscript_token_features(config, tokenizer)
-        if args.prepare_only:
-            announce("Preparation-only run complete.", context)
-            return
-
-        # Initialize model parameters with the same rank-0 seed regardless of
-        # world size. Reseed runtime randomness per rank after model construction.
-        seed_everything(config.training.seed, 0)
 
         train_dataset = IndexedParallelDataset(
             config.data.dataset_dir,
@@ -3897,6 +3888,18 @@ def main() -> None:
             train_sampler,
             authenticated_revision_directions=revision_directions,
         )
+        if args.prepare_only:
+            announce(
+                "Preparation-only run complete: tokenizer, indexed shards, exact "
+                "language graph, sampling coverage, revision capabilities, automatic "
+                "model sizing, and export dependencies passed local preflight.",
+                context,
+            )
+            return
+
+        # Initialize model parameters with the same rank-0 seed regardless of
+        # world size. Reseed runtime randomness per rank after model construction.
+        seed_everything(config.training.seed, 0)
         if revision_directions:
             announce(
                 "Revision training directions authenticated with positive "

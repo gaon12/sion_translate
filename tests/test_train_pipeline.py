@@ -7,7 +7,7 @@ import subprocess
 import sys
 import textwrap
 import time
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -163,6 +163,132 @@ def test_preflight_rejects_a_prepared_direction_graph_from_another_run() -> None
             incomplete,
             require_all_pairs=True,
         )
+
+
+def test_prepare_only_runs_training_contract_preflights_before_return(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Local artifact preparation must expose failures before a GPU upload."""
+
+    config = AppConfig()
+    config.data.language_pair = ["de", "fr"]
+    config.foundation.enabled = False
+    config.training.output_dir = str(tmp_path / "run")
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+    events: list[str] = []
+
+    class TokenizerStub:
+        draft_id = 17
+
+        def __len__(self) -> int:
+            return 128
+
+    class DatasetStub:
+        def __init__(self, split: str) -> None:
+            self.split = split
+            self.pair_count = 7
+            self.physical_token_count = 113
+            self.source_names = ("parallel.jsonl",)
+
+        def __len__(self) -> int:
+            return 11 if self.split == config.data.train_split else 3
+
+    class SamplerStub:
+        def __init__(self, dataset: DatasetStub, *_args: object, **_kwargs: object) -> None:
+            self.dataset = dataset
+
+        def positive_sampling_pair_mask(self) -> object:
+            return object()
+
+    plan = SimpleNamespace(enabled=False, discovery=SimpleNamespace(sources=()))
+    monkeypatch.setattr(sys, "argv", ["sion-train", "--prepare-only"])
+    monkeypatch.setattr(train_module, "configure_stdio", lambda: None)
+    monkeypatch.setattr(train_module, "initialize_distributed", lambda: context)
+    monkeypatch.setattr(
+        train_module, "cleanup_distributed", lambda _context: events.append("cleanup")
+    )
+    monkeypatch.setattr(train_module, "probe_environment", lambda: SimpleNamespace())
+    monkeypatch.setattr(train_module, "synchronize_environment", lambda env, _context: env)
+    monkeypatch.setattr(train_module, "describe_environment", lambda _env: "local CPU")
+    monkeypatch.setattr(train_module, "resolve_config", lambda _args: (config, {}, "test config"))
+    monkeypatch.setattr(
+        train_module,
+        "coordinated_training_run_lock",
+        lambda *_args, **_kwargs: nullcontext(None),
+    )
+    monkeypatch.setattr(
+        train_module,
+        "coordinated_artifact_run_locks",
+        lambda *_args, **_kwargs: nullcontext(()),
+    )
+    monkeypatch.setattr(train_module, "plan_foundation_stage", lambda _config: plan)
+    monkeypatch.setattr(
+        train_module,
+        "_configured_foundation_branch_plan",
+        lambda _config, discovered: discovered,
+    )
+    monkeypatch.setattr(train_module, "_find_distributed_auto_resume", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        train_module.AppConfig,
+        "validate_training_supervision",
+        lambda *_args, **_kwargs: events.append("training supervision"),
+    )
+    monkeypatch.setattr(
+        train_module,
+        "preflight_final_export_dependencies",
+        lambda _formats: events.append("export dependencies"),
+    )
+    monkeypatch.setattr(
+        train_module,
+        "ensure_artifacts",
+        lambda *_args, **_kwargs: events.append("artifacts"),
+    )
+    monkeypatch.setattr(train_module, "SionTokenizer", lambda _path: TokenizerStub())
+    monkeypatch.setattr(
+        train_module,
+        "preflight_morphoscript_token_features",
+        lambda *_args: events.append("token features"),
+    )
+    monkeypatch.setattr(
+        train_module,
+        "IndexedParallelDataset",
+        lambda _root, split, **_kwargs: DatasetStub(split),
+    )
+    monkeypatch.setattr(
+        train_module,
+        "preflight_dataset_direction_contract",
+        lambda *_args, **_kwargs: events.append("direction graph"),
+    )
+    monkeypatch.setattr(
+        train_module,
+        "apply_auto_settings",
+        lambda *_args, **_kwargs: events.append("automatic settings") or [],
+    )
+    monkeypatch.setattr(train_module, "DistributedBucketBatchSampler", SamplerStub)
+    monkeypatch.setattr(
+        train_module, "resolve_training_revision_directions", lambda *_args, **_kwargs: ()
+    )
+    monkeypatch.setattr(
+        train_module,
+        "preflight_effective_translation_training",
+        lambda *_args, **_kwargs: events.append("effective sampling"),
+    )
+    monkeypatch.setattr(train_module, "announce", lambda *_args, **_kwargs: None)
+
+    train_module.main()
+
+    assert events == [
+        "training supervision",
+        "export dependencies",
+        "artifacts",
+        "token features",
+        "direction graph",
+        "direction graph",
+        "automatic settings",
+        "effective sampling",
+        "cleanup",
+    ]
 
 
 def test_training_resolves_revision_rows_to_an_exact_asymmetric_subgraph() -> None:
