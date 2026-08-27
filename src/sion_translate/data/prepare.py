@@ -1,7 +1,11 @@
 from __future__ import annotations
 
-import hashlib
+import errno
+import gzip
 import glob
+import hashlib
+import hmac
+from importlib.metadata import version as package_version
 import json
 import math
 import multiprocessing
@@ -10,9 +14,13 @@ import re
 import shutil
 import sqlite3
 import stat
+import sys
+import unicodedata
 import uuid
+import warnings
 from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import ProcessPoolExecutor
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, BinaryIO, Sequence, TypeAlias, cast
@@ -26,6 +34,7 @@ from sion_translate.fingerprint import (
     file_sha256,
 )
 from sion_translate.language_tags import canonicalize_language_tags, parse_language_tag
+from sion_translate.locking import _exclusive_lock  # pyright: ignore[reportPrivateUsage]
 from sion_translate.performance import bounded_ordered_map, build_cpu_plan
 from sion_translate.splitting import (
     TargetSplitGuard,
@@ -75,6 +84,39 @@ INDEX_FORMAT = "sion-indexed-parallel-v6"
 RAW_FINGERPRINT_FILENAME = "raw_fingerprint.json"
 PREPARE_COMPLETION_FILENAME = ".sion-prepare-complete.json"
 PREPARE_COMPLETION_SCHEMA = "sion-prepare-completion-v1"
+PREPARE_PROGRESS_SCHEMA = "sion-prepare-worker-progress-v2"
+PREPARE_PROGRESS_CONTRACT_FILENAME = "contract.json"
+PREPARE_PROGRESS_EPOCH_FILENAME = "generation.json"
+PREPARE_PROGRESS_EPOCH_SCHEMA = "sion-prepare-worker-generation-v1"
+PREPARE_PROGRESS_WRITER_LOCK_FILENAME = "writer.lock"
+PREPARE_PROGRESS_CHUNK_SCHEMA = "sion-prepare-worker-chunk-v2"
+PREPARE_WORKER_ALGORITHM_SCHEMA = "sion-prepare-worker-events-v2"
+PREPARE_BATCH_SIZE = 512
+PREPARE_OUTPUT_LOCK_SCHEMA = "sion-prepare-output-lock-v1"
+
+# These limits bound every supported language graph without naming any
+# language. They turn adversarial nested records into an early, reproducible
+# contract error instead of letting one JSON line exhaust worker memory or the
+# output filesystem. Ordinary corpora remain far below all four limits.
+PREPARE_MAX_RAW_LINE_BYTES = 16 * 1024 * 1024
+PREPARE_MAX_BATCH_RAW_BYTES = 64 * 1024 * 1024
+PREPARE_MAX_EXPANDED_PAIRS_PER_LINE = 1_024
+PREPARE_MAX_RECORD_METADATA_BYTES = 256 * 1024
+PREPARE_MAX_CHUNK_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
+
+# The v1.5 package used to calibrate this preflight contained 17,319,801,659
+# bytes of training JSONL and 1,757,541,972 bytes of prepared shards (a 0.102
+# final/input ratio); deflating the same JSONL used a 0.331 ratio. The larger
+# 0.85 and 0.55 estimates below leave substantial room for multilingual rows,
+# token-ID JSON, and per-row metadata. They are capacity estimates rather than
+# mathematical upper bounds, so the fixed reserve and per-chunk/shard checks
+# still stop a pathological corpus before it consumes cleanup space.
+_PREPARE_FINAL_BYTES_PER_INPUT_BYTE = 0.85
+_PREPARE_CACHE_BYTES_PER_INPUT_BYTE = 0.55
+_PREPARE_SPACE_RESERVE_BYTES = 512 * 1024 * 1024
+_PREPARE_FIXED_FINAL_OVERHEAD_BYTES = 32 * 1024 * 1024
+_PREPARE_PER_SHARD_OVERHEAD_BYTES = 128 * 1024
+_PREPARE_SQLITE_BYTES_PER_CANDIDATE = 192
 
 INDEX_DTYPE = np.dtype(
     [
@@ -181,6 +223,7 @@ class ShardWriter:
         language_to_id: dict[str, int],
         *,
         shared_targets: bool = False,
+        maximum_shard_bytes: int | None = None,
     ):
         self.root = root / split
         self.root.mkdir(parents=True, exist_ok=True)
@@ -188,6 +231,7 @@ class ShardWriter:
         self.shard_size = shard_size
         self.language_to_id = language_to_id
         self.shared_targets = shared_targets
+        self.maximum_shard_bytes = maximum_shard_bytes
         self.index_dtype = SHARED_TARGET_INDEX_DTYPE if shared_targets else INDEX_DTYPE
         self.shard_index = 0
         self.records: list[tuple[int, ...]] = []
@@ -203,6 +247,12 @@ class ShardWriter:
         return f"{self.shard_index:05d}"
 
     def _open_shard(self) -> None:
+        if self.maximum_shard_bytes is not None:
+            _ensure_prepare_write_reserve(
+                self.root,
+                self.maximum_shard_bytes,
+                role=f"next {self.split} dataset shard",
+            )
         self._src_handle = (self.root / f"{self._prefix()}.src.bin").open("wb")
         self._tgt_handle = (self.root / f"{self._prefix()}.tgt.bin").open("wb")
         self.records = []
@@ -315,12 +365,72 @@ _QUALITY_REASON_FIELDS = {
 
 _PrepareBatchInput: TypeAlias = tuple[
     int,
-    list[bytes],
+    list[tuple[int, bytes]],
     QualityPolicy,
     bool,
     tuple[tuple[str, str], ...],
+    int,
 ]
 _PrepareEvent: TypeAlias = tuple[str, tuple[Any, ...]]
+
+
+@dataclass(frozen=True)
+class _PrepareBatchDescriptor:
+    """Content-bound coordinates for one deterministic worker batch."""
+
+    synthetic_pass: bool
+    source_id: int
+    batch_index: int
+    start_offset: int
+    end_offset: int
+    row_count: int
+    raw_bytes: int
+    raw_sha256: str
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class _PrepareBatchJob:
+    descriptor: _PrepareBatchDescriptor
+    batch: _PrepareBatchInput
+    progress_chunks_dir: str
+    progress_contract_sha256: str
+    generation_epoch: int
+
+
+@dataclass(frozen=True)
+class _PrepareProgress:
+    root: Path
+    chunks_dir: Path
+    contract_sha256: str
+    generation_epoch: int = 0
+
+
+@dataclass
+class _PrepareCapacitySummary:
+    """Exact pre-dedup payload totals emitted by completed worker chunks."""
+
+    candidate_rows: int = 0
+    token_ids: int = 0
+    metadata_bytes: int = 0
+
+    def add_events(self, events: Sequence[_PrepareEvent]) -> None:
+        for status, payload in events:
+            if status != "candidate":
+                continue
+            metadata = cast(dict[str, object], payload[5])
+            ids_a = cast(list[int], payload[8])
+            ids_b = cast(list[int], payload[9])
+            self.candidate_rows += 1
+            self.token_ids += len(ids_a) + len(ids_b)
+            self.metadata_bytes += len(encode_record_metadata(metadata))
+
+
+class _PrepareProgressError(ValueError):
+    """Raised when persisted worker progress cannot be trusted."""
+
 
 _PREPARE_WORKER_TOKENIZER: SionTokenizer | None = None
 
@@ -335,12 +445,13 @@ def _initialize_prepare_worker(tokenizer_model: str) -> None:
 def _process_prepare_batch(args: _PrepareBatchInput) -> list[_PrepareEvent]:
     """CPU-heavy, order-preserving row work executed in worker processes."""
 
-    source_id, rows, quality_policy, filter_quality, language_pairs = args
+    source_id, rows, quality_policy, filter_quality, language_pairs, max_tokens_per_side = args
     tokenizer = _PREPARE_WORKER_TOKENIZER
     if tokenizer is None:
         raise RuntimeError("prepare worker tokenizer was not initialized")
     output: list[_PrepareEvent] = []
-    for raw_line in rows:
+    candidate_event_bytes = 0
+    for source_offset, raw_line in rows:
         output.append(("physical_line", (source_id,)))
         record_group_key = hashlib.sha256(raw_line.strip()).hexdigest()
         try:
@@ -355,6 +466,13 @@ def _process_prepare_batch(args: _PrepareBatchInput) -> list[_PrepareEvent]:
             continue
         record_is_synthetic = synthetic_record(row)
         expansion = expand_parallel_record(row, language_pairs)
+        if len(expansion.pairs) > PREPARE_MAX_EXPANDED_PAIRS_PER_LINE:
+            raise ValueError(
+                "A physical JSONL record expands beyond the configured safety limit: "
+                f"source_id={source_id}, byte_offset={source_offset}, "
+                f"expanded_pairs={len(expansion.pairs):,}, "
+                f"limit={PREPARE_MAX_EXPANDED_PAIRS_PER_LINE:,}"
+            )
         for issue in expansion.issues:
             output.append((issue, (source_id,)))
         for pair in expansion.pairs:
@@ -384,40 +502,76 @@ def _process_prepare_batch(args: _PrepareBatchInput) -> list[_PrepareEvent]:
                     )
                 )
                 continue
-            encoded_a, encoded_b = protect_shared_spans(text_a, text_b)
-            output.append(
-                (
-                    "candidate",
-                    (
-                        source_id,
-                        record_group_key,
-                        record_is_synthetic,
-                        pair.language_a,
-                        pair.language_b,
-                        pair.metadata,
-                        text_a,
-                        text_b,
-                        tokenizer.encode(encoded_a),
-                        tokenizer.encode(encoded_b),
-                        infer_register(text_a, pair.language_a),
-                        infer_register(text_b, pair.language_b),
-                        assessment.score,
-                        assessment.rejection_reasons,
-                        assessment.warning_reasons,
-                    ),
+            metadata_bytes = encode_record_metadata(pair.metadata)
+            if len(metadata_bytes) > PREPARE_MAX_RECORD_METADATA_BYTES:
+                raise ValueError(
+                    "A physical JSONL record contains supported metadata beyond the "
+                    "configured safety limit: "
+                    f"source_id={source_id}, byte_offset={source_offset}, "
+                    f"metadata_bytes={len(metadata_bytes):,}, "
+                    f"limit={PREPARE_MAX_RECORD_METADATA_BYTES:,}"
                 )
+            encoded_a, encoded_b = protect_shared_spans(text_a, text_b)
+            ids_a = tokenizer.encode(encoded_a)
+            ids_b = tokenizer.encode(encoded_b)
+            if len(ids_a) > max_tokens_per_side or len(ids_b) > max_tokens_per_side:
+                output.append(
+                    (
+                        "too_long",
+                        (
+                            source_id,
+                            assessment.rejection_reasons,
+                            assessment.warning_reasons,
+                        ),
+                    )
+                )
+                continue
+            candidate: _PrepareEvent = (
+                "candidate",
+                (
+                    source_id,
+                    record_group_key,
+                    record_is_synthetic,
+                    pair.language_a,
+                    pair.language_b,
+                    pair.metadata,
+                    text_a,
+                    text_b,
+                    ids_a,
+                    ids_b,
+                    infer_register(text_a, pair.language_a),
+                    infer_register(text_b, pair.language_b),
+                    assessment.score,
+                    assessment.rejection_reasons,
+                    assessment.warning_reasons,
+                ),
             )
+            candidate_event_bytes += len(
+                _prepare_event_json([candidate[0], list(candidate[1])]).encode("utf-8")
+            )
+            if candidate_event_bytes > PREPARE_MAX_CHUNK_UNCOMPRESSED_BYTES - 1024 * 1024:
+                raise ValueError(
+                    "A prepare batch expands beyond the deterministic worker-chunk limit: "
+                    f"source_id={source_id}, byte_offset={source_offset}, "
+                    f"limit={PREPARE_MAX_CHUNK_UNCOMPRESSED_BYTES:,} bytes"
+                )
+            output.append(candidate)
     return output
 
 
-def _prepare_input_batches(
+def _prepare_batch_records(
     paths: Sequence[Path],
     quality_policy: QualityPolicy,
     filter_quality: bool,
     language_pairs: tuple[tuple[str, str], ...],
     train_only_prefixes: tuple[str, ...],
-    batch_size: int = 512,
-) -> Iterator[_PrepareBatchInput]:
+    max_tokens_per_side: int,
+    batch_size: int | None = None,
+) -> Iterator[tuple[_PrepareBatchDescriptor, _PrepareBatchInput]]:
+    if batch_size is None:
+        batch_size = PREPARE_BATCH_SIZE
+    if batch_size < 1:
+        raise ValueError("prepare batch size must be positive")
     # Real rows own duplicate precedence even when a synthetic filename sorts
     # first or a single source mixes row-level ``synthetic`` markers. Reading
     # mixed files twice avoids buffering an unbounded corpus merely to reorder
@@ -428,8 +582,24 @@ def _prepare_input_batches(
             if path_is_synthetic != synthetic_pass and path_is_synthetic:
                 continue
             with path.open("rb") as handle:
-                rows: list[bytes] = []
-                for raw_line in handle:
+                rows: list[tuple[int, bytes]] = []
+                batch_index = 0
+                start_offset: int | None = None
+                end_offset = 0
+                batch_raw_bytes = 0
+                raw_digest = hashlib.sha256()
+                while True:
+                    line_offset = handle.tell()
+                    raw_line = handle.readline()
+                    if not raw_line:
+                        break
+                    if len(raw_line) > PREPARE_MAX_RAW_LINE_BYTES:
+                        raise ValueError(
+                            "A JSONL physical line exceeds the preparation safety limit: "
+                            f"path={path}, byte_offset={line_offset}, "
+                            f"line_bytes={len(raw_line):,}, "
+                            f"limit={PREPARE_MAX_RAW_LINE_BYTES:,}"
+                        )
                     row_is_synthetic = path_is_synthetic
                     if not path_is_synthetic:
                         try:
@@ -439,12 +609,92 @@ def _prepare_input_batches(
                             row_is_synthetic = False
                     if row_is_synthetic != synthetic_pass:
                         continue
-                    rows.append(raw_line)
-                    if len(rows) >= batch_size:
-                        yield source_id, rows, quality_policy, filter_quality, language_pairs
+                    if rows and batch_raw_bytes + len(raw_line) > PREPARE_MAX_BATCH_RAW_BYTES:
+                        assert start_offset is not None
+                        descriptor = _PrepareBatchDescriptor(
+                            synthetic_pass=synthetic_pass,
+                            source_id=source_id,
+                            batch_index=batch_index,
+                            start_offset=start_offset,
+                            end_offset=end_offset,
+                            row_count=len(rows),
+                            raw_bytes=batch_raw_bytes,
+                            raw_sha256=raw_digest.hexdigest(),
+                        )
+                        yield (
+                            descriptor,
+                            (
+                                source_id,
+                                rows,
+                                quality_policy,
+                                filter_quality,
+                                language_pairs,
+                                max_tokens_per_side,
+                            ),
+                        )
+                        batch_index += 1
                         rows = []
+                        start_offset = None
+                        batch_raw_bytes = 0
+                        raw_digest = hashlib.sha256()
+                    if start_offset is None:
+                        start_offset = line_offset
+                    rows.append((line_offset, raw_line))
+                    batch_raw_bytes += len(raw_line)
+                    raw_digest.update(len(raw_line).to_bytes(8, "little"))
+                    raw_digest.update(raw_line)
+                    end_offset = handle.tell()
+                    if len(rows) >= batch_size:
+                        assert start_offset is not None
+                        descriptor = _PrepareBatchDescriptor(
+                            synthetic_pass=synthetic_pass,
+                            source_id=source_id,
+                            batch_index=batch_index,
+                            start_offset=start_offset,
+                            end_offset=end_offset,
+                            row_count=len(rows),
+                            raw_bytes=batch_raw_bytes,
+                            raw_sha256=raw_digest.hexdigest(),
+                        )
+                        yield (
+                            descriptor,
+                            (
+                                source_id,
+                                rows,
+                                quality_policy,
+                                filter_quality,
+                                language_pairs,
+                                max_tokens_per_side,
+                            ),
+                        )
+                        batch_index += 1
+                        rows = []
+                        start_offset = None
+                        batch_raw_bytes = 0
+                        raw_digest = hashlib.sha256()
                 if rows:
-                    yield source_id, rows, quality_policy, filter_quality, language_pairs
+                    assert start_offset is not None
+                    descriptor = _PrepareBatchDescriptor(
+                        synthetic_pass=synthetic_pass,
+                        source_id=source_id,
+                        batch_index=batch_index,
+                        start_offset=start_offset,
+                        end_offset=end_offset,
+                        row_count=len(rows),
+                        raw_bytes=batch_raw_bytes,
+                        raw_sha256=raw_digest.hexdigest(),
+                    )
+                    yield (
+                        descriptor,
+                        (
+                            source_id,
+                            rows,
+                            quality_policy,
+                            filter_quality,
+                            language_pairs,
+                            max_tokens_per_side,
+                        ),
+                    )
 
 
 def _increment(stats: PrepareStats, field: str, amount: int = 1) -> None:
@@ -737,6 +987,21 @@ def _canonical_json(value: object) -> str:
     )
 
 
+def _prepare_event_json(value: object) -> str:
+    """Encode raw-record-derived events without losing permissive JSON values."""
+
+    return json.dumps(
+        value,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        # Python's input decoder has historically accepted NaN and infinities.
+        # Preserve those values inside optional metadata so checkpointing does
+        # not turn a formerly processable row into a fatal whole-corpus error.
+        allow_nan=True,
+    )
+
+
 def _fingerprint_from_snapshots(
     source_snapshots: tuple[_FileSnapshot, ...],
     tokenizer_snapshot: _FileSnapshot,
@@ -760,12 +1025,407 @@ def _fingerprint_from_snapshots(
     )
 
 
+def _prepare_chunk_filename(descriptor: _PrepareBatchDescriptor) -> str:
+    pass_index = 1 if descriptor.synthetic_pass else 0
+    return (
+        f"pass-{pass_index}-source-{descriptor.source_id:05d}-"
+        f"batch-{descriptor.batch_index:09d}.json.gz"
+    )
+
+
+def _prepare_descriptor_from_json(value: object) -> _PrepareBatchDescriptor:
+    if not isinstance(value, Mapping):
+        raise _PrepareProgressError("prepare progress chunk descriptor must be an object")
+    raw = cast(Mapping[object, object], value)
+    expected_fields = {
+        "synthetic_pass",
+        "source_id",
+        "batch_index",
+        "start_offset",
+        "end_offset",
+        "row_count",
+        "raw_bytes",
+        "raw_sha256",
+    }
+    if set(raw) != expected_fields:
+        raise _PrepareProgressError("prepare progress chunk descriptor fields are invalid")
+    synthetic_pass = raw["synthetic_pass"]
+    if not isinstance(synthetic_pass, bool):
+        raise _PrepareProgressError("prepare progress synthetic_pass must be boolean")
+    integer_values: dict[str, int] = {}
+    for name in (
+        "source_id",
+        "batch_index",
+        "start_offset",
+        "end_offset",
+        "row_count",
+        "raw_bytes",
+    ):
+        item = raw[name]
+        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+            raise _PrepareProgressError(f"prepare progress {name} must be non-negative")
+        integer_values[name] = item
+    if integer_values["row_count"] < 1:
+        raise _PrepareProgressError("prepare progress row_count must be positive")
+    if integer_values["end_offset"] <= integer_values["start_offset"]:
+        raise _PrepareProgressError("prepare progress byte offsets are invalid")
+    if not 0 < integer_values["raw_bytes"] <= PREPARE_MAX_BATCH_RAW_BYTES:
+        raise _PrepareProgressError("prepare progress raw byte count is invalid")
+    if integer_values["raw_bytes"] > (
+        integer_values["end_offset"] - integer_values["start_offset"]
+    ):
+        raise _PrepareProgressError("prepare progress raw bytes exceed their source span")
+    raw_sha256 = raw["raw_sha256"]
+    if (
+        not isinstance(raw_sha256, str)
+        or len(raw_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in raw_sha256)
+    ):
+        raise _PrepareProgressError("prepare progress raw SHA-256 is invalid")
+    return _PrepareBatchDescriptor(
+        synthetic_pass=synthetic_pass,
+        source_id=integer_values["source_id"],
+        batch_index=integer_values["batch_index"],
+        start_offset=integer_values["start_offset"],
+        end_offset=integer_values["end_offset"],
+        row_count=integer_values["row_count"],
+        raw_bytes=integer_values["raw_bytes"],
+        raw_sha256=raw_sha256,
+    )
+
+
+def _prepare_event_payload(
+    value: object,
+    *,
+    descriptor: _PrepareBatchDescriptor,
+    language_pairs: tuple[tuple[str, str], ...],
+    max_tokens_per_side: int,
+) -> list[_PrepareEvent]:
+    """Validate cached worker events before the reducer is allowed to consume them."""
+
+    if not isinstance(value, list):
+        raise _PrepareProgressError("prepare progress events must be an array")
+    simple_statuses = {
+        "physical_line",
+        "invalid_utf8",
+        "invalid_json",
+        "invalid_record",
+        "non_string",
+        "missing_text",
+        "invalid_language",
+        "unaligned_lists",
+    }
+    allowed_pairs = set(language_pairs)
+    validated: list[_PrepareEvent] = []
+    physical_lines = 0
+    for raw_event in cast(list[object], value):
+        if not isinstance(raw_event, list):
+            raise _PrepareProgressError("prepare progress event shape is invalid")
+        event_items = cast(list[object], raw_event)
+        if len(event_items) != 2:
+            raise _PrepareProgressError("prepare progress event shape is invalid")
+        status, raw_payload = event_items
+        if not isinstance(status, str) or not isinstance(raw_payload, list):
+            raise _PrepareProgressError("prepare progress event types are invalid")
+        payload = cast(list[object], raw_payload)
+        if not payload:
+            raise _PrepareProgressError("prepare progress event payload is empty")
+        source_id = payload[0]
+        if (
+            isinstance(source_id, bool)
+            or not isinstance(source_id, int)
+            or source_id != descriptor.source_id
+        ):
+            raise _PrepareProgressError("prepare progress event source identity is invalid")
+        if status in simple_statuses:
+            if len(payload) != 1:
+                raise _PrepareProgressError(f"prepare progress {status} payload is invalid")
+            if status == "physical_line":
+                physical_lines += 1
+        elif status in {"quality_filtered", "too_long"}:
+            if len(payload) != 3:
+                raise _PrepareProgressError(f"prepare progress {status} event is invalid")
+            for reasons in payload[1:]:
+                if not isinstance(reasons, list) or not all(
+                    isinstance(reason, str) for reason in cast(list[object], reasons)
+                ):
+                    raise _PrepareProgressError(f"prepare progress {status} reasons are invalid")
+        elif status == "candidate":
+            if len(payload) != 15:
+                raise _PrepareProgressError("prepare progress candidate payload is invalid")
+            group_key, synthetic, language_a, language_b, metadata = payload[1:6]
+            text_a, text_b, ids_a, ids_b = payload[6:10]
+            register_a, register_b, quality_score = payload[10:13]
+            if (
+                not isinstance(group_key, str)
+                or len(group_key) != 64
+                or any(character not in "0123456789abcdef" for character in group_key)
+                or not isinstance(synthetic, bool)
+                or not isinstance(language_a, str)
+                or not isinstance(language_b, str)
+                or (language_a, language_b) not in allowed_pairs
+                or not isinstance(metadata, dict)
+                or not isinstance(text_a, str)
+                or not isinstance(text_b, str)
+            ):
+                raise _PrepareProgressError("prepare progress candidate identity is invalid")
+            try:
+                metadata_size = len(encode_record_metadata(cast(dict[str, object], metadata)))
+            except (TypeError, ValueError) as error:
+                raise _PrepareProgressError(
+                    "prepare progress candidate metadata is invalid"
+                ) from error
+            if metadata_size > PREPARE_MAX_RECORD_METADATA_BYTES:
+                raise _PrepareProgressError("prepare progress candidate metadata exceeds its bound")
+            for token_ids in (ids_a, ids_b):
+                if not isinstance(token_ids, list):
+                    raise _PrepareProgressError("prepare progress token IDs are invalid")
+                normalized_token_ids = cast(list[object], token_ids)
+                if not all(
+                    not isinstance(token_id, bool)
+                    and isinstance(token_id, int)
+                    and 0 <= token_id <= np.iinfo(np.uint32).max
+                    for token_id in normalized_token_ids
+                ):
+                    raise _PrepareProgressError("prepare progress token IDs are invalid")
+                if len(normalized_token_ids) > max_tokens_per_side:
+                    raise _PrepareProgressError(
+                        "prepare progress candidate token IDs exceed the preprocessing contract"
+                    )
+            if any(
+                isinstance(register, bool)
+                or not isinstance(register, int)
+                or register not in (0, 1, 2, 3)
+                for register in (register_a, register_b)
+            ):
+                raise _PrepareProgressError("prepare progress register is invalid")
+            if (
+                isinstance(quality_score, bool)
+                or not isinstance(quality_score, int)
+                or not 0 <= quality_score <= 100
+            ):
+                raise _PrepareProgressError("prepare progress quality score is invalid")
+            for reasons in payload[13:]:
+                if not isinstance(reasons, list) or not all(
+                    isinstance(reason, str) for reason in cast(list[object], reasons)
+                ):
+                    raise _PrepareProgressError("prepare progress candidate reasons are invalid")
+        else:
+            raise _PrepareProgressError(f"prepare progress event status is invalid: {status!r}")
+        validated.append((status, tuple(payload)))
+    if physical_lines != descriptor.row_count:
+        raise _PrepareProgressError(
+            "prepare progress physical-line count does not match its source batch"
+        )
+    return validated
+
+
+def _prepare_chunk_uncompressed_limit(descriptor: _PrepareBatchDescriptor) -> int:
+    del descriptor
+    # Upstream line, fanout, metadata, and token limits cap production before
+    # serialization. This absolute ceiling makes recovery independent of a
+    # language graph's shape while still rejecting gzip bombs.
+    return PREPARE_MAX_CHUNK_UNCOMPRESSED_BYTES
+
+
+def _load_prepare_chunk(
+    path: Path,
+    *,
+    expected_descriptor: _PrepareBatchDescriptor,
+    progress_contract_sha256: str,
+    language_pairs: tuple[tuple[str, str], ...],
+    max_tokens_per_side: int,
+) -> tuple[_PrepareBatchDescriptor, list[_PrepareEvent]]:
+    try:
+        _regular_file_stat(path, role="prepare progress chunk")
+    except (OSError, ValueError) as error:
+        raise _PrepareProgressError(f"prepare progress chunk is unsafe: {path}") from error
+    try:
+        with gzip.open(path, "rb") as handle:
+            limit = _prepare_chunk_uncompressed_limit(expected_descriptor)
+            encoded = handle.read(limit + 1)
+    except (OSError, EOFError) as error:
+        raise _PrepareProgressError(f"cannot decompress prepare progress chunk: {path}") from error
+    if len(encoded) > limit:
+        raise _PrepareProgressError(f"prepare progress chunk expands beyond its bound: {path}")
+    try:
+        raw_document: object = json.loads(encoded.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise _PrepareProgressError(f"cannot decode prepare progress chunk: {path}") from error
+    if not isinstance(raw_document, Mapping):
+        raise _PrepareProgressError(f"prepare progress chunk must be an object: {path}")
+    document = cast(Mapping[object, object], raw_document)
+    if set(document) != {
+        "schema",
+        "contract_sha256",
+        "descriptor",
+        "integrity_sha256",
+        "events",
+    }:
+        raise _PrepareProgressError(f"prepare progress chunk fields are invalid: {path}")
+    if document["schema"] != PREPARE_PROGRESS_CHUNK_SCHEMA:
+        raise _PrepareProgressError(f"prepare progress chunk schema is incompatible: {path}")
+    if document["contract_sha256"] != progress_contract_sha256:
+        raise _PrepareProgressError(f"prepare progress chunk contract is incompatible: {path}")
+    descriptor = _prepare_descriptor_from_json(document["descriptor"])
+    if descriptor != expected_descriptor:
+        raise _PrepareProgressError(f"prepare progress chunk source coordinates changed: {path}")
+    if path.name != _prepare_chunk_filename(descriptor):
+        raise _PrepareProgressError(f"prepare progress chunk filename is invalid: {path}")
+    raw_events = document["events"]
+    payload_digest = document["integrity_sha256"]
+    integrity_payload = {
+        "contract_sha256": document["contract_sha256"],
+        "descriptor": document["descriptor"],
+        "events": raw_events,
+    }
+    if not isinstance(payload_digest, str) or not hmac.compare_digest(
+        payload_digest,
+        hashlib.sha256(_prepare_event_json(integrity_payload).encode("utf-8")).hexdigest(),
+    ):
+        raise _PrepareProgressError(f"prepare progress chunk integrity digest is invalid: {path}")
+    return descriptor, _prepare_event_payload(
+        raw_events,
+        descriptor=descriptor,
+        language_pairs=language_pairs,
+        max_tokens_per_side=max_tokens_per_side,
+    )
+
+
+def _write_prepare_chunk(job: _PrepareBatchJob, events: list[_PrepareEvent]) -> None:
+    chunks_dir = Path(job.progress_chunks_dir)
+    _assert_regular_directory(chunks_dir, role="prepare progress chunks")
+    path = chunks_dir / _prepare_chunk_filename(job.descriptor)
+    raw_events = [[status, list(payload)] for status, payload in events]
+    # Validate the exact representation that will be recovered, rather than
+    # trusting an in-memory worker result that JSON might coerce unexpectedly.
+    _prepare_event_payload(
+        json.loads(_prepare_event_json(raw_events)),
+        descriptor=job.descriptor,
+        language_pairs=job.batch[4],
+        max_tokens_per_side=job.batch[5],
+    )
+    document = {
+        "schema": PREPARE_PROGRESS_CHUNK_SCHEMA,
+        "contract_sha256": job.progress_contract_sha256,
+        "descriptor": job.descriptor.to_dict(),
+        "events": raw_events,
+    }
+    integrity_payload = {
+        "contract_sha256": document["contract_sha256"],
+        "descriptor": document["descriptor"],
+        "events": raw_events,
+    }
+    document["integrity_sha256"] = hashlib.sha256(
+        _prepare_event_json(integrity_payload).encode("utf-8")
+    ).hexdigest()
+    encoded = (_prepare_event_json(document) + "\n").encode("utf-8")
+    if len(encoded) > _prepare_chunk_uncompressed_limit(job.descriptor):
+        raise RuntimeError("prepare worker output exceeded its deterministic chunk bound")
+    progress = _PrepareProgress(
+        root=chunks_dir.parent,
+        chunks_dir=chunks_dir,
+        contract_sha256=job.progress_contract_sha256,
+        generation_epoch=job.generation_epoch,
+    )
+    with _prepare_writer_lease(progress.root):
+        observed_epoch = _read_prepare_generation_epoch(progress)
+        if observed_epoch != job.generation_epoch:
+            raise _PrepareProgressError("prepare worker belongs to a superseded parent generation")
+        if _path_exists(path):
+            _, winner = _load_prepare_chunk(
+                path,
+                expected_descriptor=job.descriptor,
+                progress_contract_sha256=job.progress_contract_sha256,
+                language_pairs=job.batch[4],
+                max_tokens_per_side=job.batch[5],
+            )
+            winner_json = _prepare_event_json(
+                [[status, list(payload)] for status, payload in winner]
+            )
+            if not hmac.compare_digest(winner_json, _prepare_event_json(raw_events)):
+                raise _PrepareProgressError(
+                    f"competing prepare worker published different events: {path}"
+                )
+            return
+        # Reserve inspection and publication share one kernel lease, so two
+        # workers cannot both spend the cleanup reserve observed by one check.
+        _ensure_prepare_write_reserve(chunks_dir, len(encoded))
+        temporary = chunks_dir / f".{path.name}.{uuid.uuid4().hex}.tmp"
+        try:
+            with temporary.open("xb") as raw_handle:
+                with gzip.GzipFile(
+                    filename="",
+                    mode="wb",
+                    compresslevel=6,
+                    fileobj=raw_handle,
+                    mtime=0,
+                ) as compressed:
+                    compressed.write(encoded)
+                raw_handle.flush()
+                os.fsync(raw_handle.fileno())
+            # A hard-link publication is atomic and refuses an existing name on
+            # both POSIX and Windows. The final checkpoint is therefore immutable.
+            try:
+                os.link(temporary, path)
+            except FileExistsError as error:
+                _, winner = _load_prepare_chunk(
+                    path,
+                    expected_descriptor=job.descriptor,
+                    progress_contract_sha256=job.progress_contract_sha256,
+                    language_pairs=job.batch[4],
+                    max_tokens_per_side=job.batch[5],
+                )
+                winner_json = _prepare_event_json(
+                    [[status, list(payload)] for status, payload in winner]
+                )
+                if not hmac.compare_digest(winner_json, _prepare_event_json(raw_events)):
+                    raise _PrepareProgressError(
+                        f"competing prepare worker published different events: {path}"
+                    ) from error
+            _fsync_directory(chunks_dir)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def _process_prepare_job(job: _PrepareBatchJob) -> list[_PrepareEvent]:
+    path = Path(job.progress_chunks_dir) / _prepare_chunk_filename(job.descriptor)
+    if _path_exists(path):
+        _, events = _load_prepare_chunk(
+            path,
+            expected_descriptor=job.descriptor,
+            progress_contract_sha256=job.progress_contract_sha256,
+            language_pairs=job.batch[4],
+            max_tokens_per_side=job.batch[5],
+        )
+        return events
+    events = _process_prepare_batch(job.batch)
+    _write_prepare_chunk(job, events)
+    return events
+
+
 def _write_json_durable(path: Path, value: object) -> None:
     with path.open("x", encoding="utf-8") as handle:
         json.dump(value, handle, ensure_ascii=False, indent=2, allow_nan=False)
         handle.write("\n")
         handle.flush()
         os.fsync(handle.fileno())
+
+
+def _replace_json_durable(path: Path, value: object) -> None:
+    """Atomically replace a small JSON control file and sync its directory."""
+
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("x", encoding="utf-8") as handle:
+            json.dump(value, handle, ensure_ascii=False, indent=2, allow_nan=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _read_json_object(path: Path, *, role: str) -> dict[str, Any]:
@@ -776,6 +1436,44 @@ def _read_json_object(path: Path, *, role: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{role} must be a JSON object: {path}")
     return cast(dict[str, Any], value)
+
+
+def _read_prepare_generation_epoch(progress: _PrepareProgress) -> int:
+    document = _read_json_object(
+        progress.root / PREPARE_PROGRESS_EPOCH_FILENAME,
+        role="prepare progress generation",
+    )
+    if set(document) != {"schema", "epoch"}:
+        raise _PrepareProgressError("prepare progress generation fields are invalid")
+    epoch = document.get("epoch")
+    if (
+        document.get("schema") != PREPARE_PROGRESS_EPOCH_SCHEMA
+        or isinstance(epoch, bool)
+        or not isinstance(epoch, int)
+        or epoch < 1
+    ):
+        raise _PrepareProgressError("prepare progress generation is invalid")
+    return epoch
+
+
+def _prepare_writer_conflict_message(root: Path, holder: str) -> str:
+    return (
+        f"prepare progress still has an active worker writer: {root}\n"
+        f"  current holder: {holder}\n"
+        "Wait for the writer to finish; its completed checkpoint remains reusable."
+    )
+
+
+@contextmanager  # pyright: ignore[reportDeprecated]
+def _prepare_writer_lease(progress_root: Path) -> Iterator[Path]:
+    with _exclusive_lock(
+        progress_root,
+        filename=PREPARE_PROGRESS_WRITER_LOCK_FILENAME,
+        conflict_message=_prepare_writer_conflict_message,
+        timeout=60.0,
+        poll_interval=0.1,
+    ) as lock_path:
+        yield lock_path
 
 
 def _fsync_directory(path: Path) -> None:
@@ -851,25 +1549,22 @@ def _quarantine_staging(candidate: Path, output_dir: Path) -> None:
     while pending:
         directory = pending.pop()
         try:
-            entries = list(os.scandir(directory))
+            with os.scandir(directory) as scanner:
+                entries = [
+                    (Path(entry.path), entry.stat(follow_symlinks=False)) for entry in scanner
+                ]
         except OSError as error:
             raise RuntimeError(f"Cannot inspect orphan dataset staging: {directory}") from error
-        for entry in entries:
-            try:
-                entry_stat = entry.stat(follow_symlinks=False)
-            except OSError as error:
-                raise RuntimeError(
-                    f"Cannot inspect orphan dataset staging artifact: {entry.path}"
-                ) from error
+        for entry_path, entry_stat in entries:
             if _is_reparse_stat(entry_stat):
                 raise RuntimeError(
                     "Refusing to clean orphan staging containing a symlink/reparse point: "
-                    f"{entry.path}"
+                    f"{entry_path}"
                 )
             if stat.S_ISDIR(entry_stat.st_mode):
-                pending.append(Path(entry.path))
+                pending.append(entry_path)
             elif not stat.S_ISREG(entry_stat.st_mode):
-                raise RuntimeError(f"Refusing to clean non-regular staging artifact: {entry.path}")
+                raise RuntimeError(f"Refusing to clean non-regular staging artifact: {entry_path}")
     while True:
         quarantine = output_dir.with_name(f".{output_dir.name}.rejected-{uuid.uuid4().hex}")
         if not _path_exists(quarantine):
@@ -884,6 +1579,384 @@ def _discard_private_staging(staging_dir: Path, output_dir: Path) -> None:
     if not _path_exists(staging_dir):
         return
     _quarantine_staging(staging_dir, output_dir)
+
+
+def _prepare_progress_disk_bytes(progress: _PrepareProgress) -> int:
+    """Return checkpoint file sizes without following filesystem links."""
+
+    total = 0
+    for root in (progress.root, progress.chunks_dir):
+        _assert_regular_directory(root, role="prepare progress directory")
+    for path in (
+        progress.root / PREPARE_PROGRESS_CONTRACT_FILENAME,
+        progress.root / PREPARE_PROGRESS_EPOCH_FILENAME,
+        *progress.chunks_dir.iterdir(),
+    ):
+        total += _regular_file_stat(path, role="prepare progress file").st_size
+    return total
+
+
+def _ensure_prepare_write_reserve(
+    directory: Path,
+    pending_bytes: int,
+    *,
+    role: str = "prepared worker checkpoint",
+) -> None:
+    """Keep enough free capacity for cleanup and filesystem metadata."""
+
+    if pending_bytes < 0:
+        raise ValueError("pending prepare bytes must be non-negative")
+    free_bytes = shutil.disk_usage(directory).free
+    required = pending_bytes + _PREPARE_SPACE_RESERVE_BYTES
+    if free_bytes < required:
+        raise OSError(
+            errno.ENOSPC,
+            f"Insufficient free disk space for {role}: "
+            f"need at least {required:,} bytes, found {free_bytes:,}",
+        )
+
+
+def _ensure_prepare_capacity(
+    output_dir: Path,
+    source_snapshots: tuple[_FileSnapshot, ...],
+    progress: _PrepareProgress,
+) -> None:
+    """Reject a build that is likely to exhaust its output filesystem."""
+
+    source_bytes = sum(snapshot.size for snapshot in source_snapshots)
+    estimated_final_bytes = math.ceil(source_bytes * _PREPARE_FINAL_BYTES_PER_INPUT_BYTE)
+    estimated_cache_bytes = math.ceil(source_bytes * _PREPARE_CACHE_BYTES_PER_INPUT_BYTE)
+    cached_bytes = _prepare_progress_disk_bytes(progress)
+    remaining_cache_bytes = max(0, estimated_cache_bytes - cached_bytes)
+    required = estimated_final_bytes + remaining_cache_bytes + _PREPARE_SPACE_RESERVE_BYTES
+    free_bytes = shutil.disk_usage(output_dir.parent).free
+    if free_bytes < required:
+        raise OSError(
+            errno.ENOSPC,
+            "Insufficient free disk space for resumable translation dataset preparation: "
+            f"estimated required={required:,} bytes "
+            f"(final={estimated_final_bytes:,}, remaining checkpoint={remaining_cache_bytes:,}, "
+            f"reserve={_PREPARE_SPACE_RESERVE_BYTES:,}), available={free_bytes:,}; "
+            f"reusable checkpoint={cached_bytes:,}",
+        )
+
+
+def _ensure_prepare_final_capacity(
+    output_dir: Path,
+    summary: _PrepareCapacitySummary,
+    *,
+    shard_size: int,
+    dedup_backend: str,
+    translation_directions: tuple[tuple[str, str], ...],
+) -> int:
+    """Gate staging on exact worker totals plus conservative format overhead."""
+
+    maximum_direction_payload = max(
+        (
+            len(encode_record_metadata({"training_direction": list(direction)}))
+            for direction in translation_directions
+        ),
+        default=0,
+    )
+    row_bytes = summary.candidate_rows * (
+        INDEX_DTYPE.itemsize + RECORD_METADATA_INDEX_DTYPE.itemsize + maximum_direction_payload
+    )
+    token_bytes = summary.token_ids * np.dtype(np.uint32).itemsize
+    # At most two additional nearly empty shards arise when candidates split
+    # over train, validation, and test. The per-shard allowance covers NumPy
+    # headers, directory entries, inventory records, and filesystem rounding.
+    maximum_shards = math.ceil(summary.candidate_rows / shard_size) + 2
+    shard_overhead = maximum_shards * _PREPARE_PER_SHARD_OVERHEAD_BYTES
+    sqlite_overhead = (
+        summary.candidate_rows * _PREPARE_SQLITE_BYTES_PER_CANDIDATE
+        if dedup_backend == "sqlite"
+        else 0
+    )
+    staging_capacity_plan = (
+        token_bytes
+        + row_bytes
+        + summary.metadata_bytes
+        + shard_overhead
+        + sqlite_overhead
+        + _PREPARE_FIXED_FINAL_OVERHEAD_BYTES
+    )
+    required = staging_capacity_plan + _PREPARE_SPACE_RESERVE_BYTES
+    free_bytes = shutil.disk_usage(output_dir.parent).free
+    if free_bytes < required:
+        raise OSError(
+            errno.ENOSPC,
+            "Insufficient free disk space after translation worker checkpointing: "
+            f"need at least {required:,} bytes "
+            f"(planned staging={staging_capacity_plan:,}, "
+            f"candidate rows={summary.candidate_rows:,}, "
+            f"candidate token IDs={summary.token_ids:,}, "
+            f"reserve={_PREPARE_SPACE_RESERVE_BYTES:,}), available={free_bytes:,}. "
+            "The completed worker checkpoints are reusable after space is freed.",
+        )
+    return staging_capacity_plan
+
+
+def _prepare_progress_contract(
+    dataset_fingerprint: DatasetFingerprint,
+    source_snapshots: tuple[_FileSnapshot, ...],
+    tokenizer_snapshot: _FileSnapshot,
+    *,
+    normalized_pairs: tuple[tuple[str, str], ...],
+    preprocessing_options: Mapping[str, Any],
+) -> tuple[dict[str, object], str]:
+    """Bind cached worker output to every input that can change its events."""
+
+    contract: dict[str, object] = {
+        "schema": PREPARE_PROGRESS_SCHEMA,
+        "chunk_schema": PREPARE_PROGRESS_CHUNK_SCHEMA,
+        "worker_algorithm_schema": PREPARE_WORKER_ALGORITHM_SCHEMA,
+        "worker_runtime": {
+            "python": ".".join(str(item) for item in sys.version_info[:3]),
+            "sentencepiece": package_version("sentencepiece"),
+            "unicode": unicodedata.unidata_version,
+        },
+        "batch_size": PREPARE_BATCH_SIZE,
+        "maximum_raw_line_bytes": PREPARE_MAX_RAW_LINE_BYTES,
+        "maximum_batch_raw_bytes": PREPARE_MAX_BATCH_RAW_BYTES,
+        "maximum_expanded_pairs_per_line": PREPARE_MAX_EXPANDED_PAIRS_PER_LINE,
+        "maximum_record_metadata_bytes": PREPARE_MAX_RECORD_METADATA_BYTES,
+        "maximum_chunk_uncompressed_bytes": PREPARE_MAX_CHUNK_UNCOMPRESSED_BYTES,
+        "dataset_format": INDEX_FORMAT,
+        "preprocessing_schema": PREPROCESSING_SCHEMA,
+        "fingerprint": dataset_fingerprint.to_dict(),
+        "preprocessing_options": json.loads(_canonical_json(preprocessing_options)),
+        "language_pairs": [list(pair) for pair in normalized_pairs],
+        "input_scan": "real-before-synthetic-binary-lines-v1",
+        "sources": [
+            {
+                "id": source_id,
+                "resolved_path": snapshot.resolved_path,
+                "size": snapshot.size,
+                "sha256": snapshot.sha256,
+            }
+            for source_id, snapshot in enumerate(source_snapshots)
+        ],
+        "tokenizer": {
+            "resolved_path": tokenizer_snapshot.resolved_path,
+            "size": tokenizer_snapshot.size,
+            "sha256": tokenizer_snapshot.sha256,
+        },
+    }
+    digest = hashlib.sha256(_canonical_json(contract).encode("utf-8")).hexdigest()
+    envelope: dict[str, object] = {
+        "schema": PREPARE_PROGRESS_SCHEMA,
+        "contract_sha256": digest,
+        "contract": contract,
+    }
+    return envelope, digest
+
+
+def _prepare_progress_candidates(output_dir: Path) -> list[Path]:
+    prefix = f".{output_dir.name}.prepare-progress-"
+    if not output_dir.parent.is_dir():
+        return []
+    return sorted(
+        (
+            candidate
+            for candidate in output_dir.parent.iterdir()
+            if candidate.name.startswith(prefix)
+        ),
+        key=lambda candidate: candidate.name,
+    )
+
+
+def _prepare_output_lock_filename(output_dir: Path) -> str:
+    """Return one portable lock identity for an exact dataset output path."""
+
+    identity = os.path.normcase(str(_absolute_path(output_dir))).encode("utf-8")
+    digest = hashlib.sha256(identity).hexdigest()
+    return f".{PREPARE_OUTPUT_LOCK_SCHEMA}-{digest}.lock"
+
+
+def _prepare_output_conflict_message(
+    output_dir: Path,
+) -> Callable[[Path, str], str]:
+    def describe(_root: Path, holder: str) -> str:
+        return (
+            f"dataset preparation output is locked by another process: {output_dir}\n"
+            f"  current holder: {holder}\n"
+            "  Wait for that preparation to finish or choose a different output directory."
+        )
+
+    return describe
+
+
+@contextmanager  # pyright: ignore[reportDeprecated]
+def _prepare_output_lock(output_dir: Path) -> Iterator[Path]:
+    """Hold the output-specific lease without overlapping the artifact-root lock."""
+
+    with _exclusive_lock(
+        output_dir.parent,
+        filename=_prepare_output_lock_filename(output_dir),
+        conflict_message=_prepare_output_conflict_message(output_dir),
+    ) as lock_path:
+        yield lock_path
+
+
+def _validate_prepare_progress_shape(
+    progress: _PrepareProgress,
+    expected_contract: Mapping[str, object],
+) -> None:
+    _assert_regular_directory(progress.root, role="prepare progress directory")
+    actual_top_level = {entry.name for entry in progress.root.iterdir()}
+    required_top_level = {
+        PREPARE_PROGRESS_CONTRACT_FILENAME,
+        PREPARE_PROGRESS_EPOCH_FILENAME,
+        "chunks",
+    }
+    if actual_top_level not in (
+        required_top_level,
+        required_top_level | {PREPARE_PROGRESS_WRITER_LOCK_FILENAME},
+    ):
+        raise _PrepareProgressError("prepare progress top-level artifacts are invalid")
+    _assert_regular_directory(progress.chunks_dir, role="prepare progress chunks")
+    _regular_file_stat(
+        progress.root / PREPARE_PROGRESS_EPOCH_FILENAME,
+        role="prepare progress generation",
+    )
+    if PREPARE_PROGRESS_WRITER_LOCK_FILENAME in actual_top_level:
+        _regular_file_stat(
+            progress.root / PREPARE_PROGRESS_WRITER_LOCK_FILENAME,
+            role="prepare progress writer lock",
+        )
+    observed_contract = _read_json_object(
+        progress.root / PREPARE_PROGRESS_CONTRACT_FILENAME,
+        role="prepare progress contract",
+    )
+    if observed_contract != expected_contract:
+        raise _PrepareProgressError("prepare progress contract is incompatible")
+
+    removed_temporary = False
+    chunk_pattern = re.compile(r"pass-[01]-source-\d{5}-batch-\d{9}\.json\.gz")
+    temporary_pattern = re.compile(
+        r"\.pass-[01]-source-\d{5}-batch-\d{9}\.json\.gz\.[0-9a-f]{32}\.tmp"
+    )
+    for entry in progress.chunks_dir.iterdir():
+        try:
+            entry_stat = os.lstat(entry)
+        except OSError as error:
+            raise _PrepareProgressError(
+                f"cannot inspect prepare progress entry: {entry}"
+            ) from error
+        if _is_reparse_stat(entry_stat) or not stat.S_ISREG(entry_stat.st_mode):
+            raise _PrepareProgressError(f"prepare progress entry is unsafe: {entry}")
+        if temporary_pattern.fullmatch(entry.name):
+            entry.unlink()
+            removed_temporary = True
+            continue
+        if not chunk_pattern.fullmatch(entry.name):
+            raise _PrepareProgressError(f"prepare progress entry is unexpected: {entry}")
+    if removed_temporary:
+        _fsync_directory(progress.chunks_dir)
+
+
+def _validate_prepare_progress_inventory(
+    progress: _PrepareProgress,
+    expected_chunk_names: set[str],
+) -> None:
+    """Reject checkpoint files that were not produced by this exact scan."""
+
+    _assert_regular_directory(progress.chunks_dir, role="prepare progress chunks")
+    actual_chunk_names = {entry.name for entry in progress.chunks_dir.iterdir()}
+    if actual_chunk_names != expected_chunk_names:
+        missing = sorted(expected_chunk_names - actual_chunk_names)
+        unexpected = sorted(actual_chunk_names - expected_chunk_names)
+        raise _PrepareProgressError(
+            "prepare progress inventory differs from the deterministic input scan; "
+            f"missing={missing[:3]!r}, unexpected={unexpected[:3]!r}"
+        )
+
+
+def _initialize_prepare_progress(
+    output_dir: Path,
+    expected_contract: dict[str, object],
+    contract_sha256: str,
+) -> _PrepareProgress:
+    suffix = contract_sha256[:24]
+    selected = output_dir.with_name(f".{output_dir.name}.prepare-progress-{suffix}")
+    for candidate in _prepare_progress_candidates(output_dir):
+        if candidate != selected:
+            _quarantine_staging(candidate, output_dir)
+    progress = _PrepareProgress(
+        root=selected,
+        chunks_dir=selected / "chunks",
+        contract_sha256=contract_sha256,
+    )
+    if _path_exists(selected):
+        try:
+            with _prepare_writer_lease(progress.root):
+                _validate_prepare_progress_shape(progress, expected_contract)
+                generation_epoch = _read_prepare_generation_epoch(progress) + 1
+                _replace_json_durable(
+                    progress.root / PREPARE_PROGRESS_EPOCH_FILENAME,
+                    {
+                        "schema": PREPARE_PROGRESS_EPOCH_SCHEMA,
+                        "epoch": generation_epoch,
+                    },
+                )
+            return _PrepareProgress(
+                root=progress.root,
+                chunks_dir=progress.chunks_dir,
+                contract_sha256=progress.contract_sha256,
+                generation_epoch=generation_epoch,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            _quarantine_staging(selected, output_dir)
+            warnings.warn(
+                f"Discarded incompatible or damaged prepare progress: {error}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+    selected.mkdir(exist_ok=False)
+    progress.chunks_dir.mkdir(exist_ok=False)
+    _write_json_durable(
+        selected / PREPARE_PROGRESS_CONTRACT_FILENAME,
+        expected_contract,
+    )
+    _write_json_durable(
+        selected / PREPARE_PROGRESS_EPOCH_FILENAME,
+        {
+            "schema": PREPARE_PROGRESS_EPOCH_SCHEMA,
+            "epoch": 1,
+        },
+    )
+    _fsync_directory(progress.chunks_dir)
+    _fsync_directory(selected)
+    _fsync_directory(output_dir.parent)
+    return _PrepareProgress(
+        root=progress.root,
+        chunks_dir=progress.chunks_dir,
+        contract_sha256=progress.contract_sha256,
+        generation_epoch=1,
+    )
+
+
+def _discard_prepare_progress(progress: _PrepareProgress, output_dir: Path) -> None:
+    if not _path_exists(progress.root):
+        return
+    try:
+        try:
+            _quarantine_staging(progress.root, output_dir)
+        except PermissionError as error:
+            if os.name != "nt" or getattr(error, "winerror", None) not in {5, 32}:
+                raise
+            # Windows may deny a directory rename briefly after gzip I/O even
+            # after all in-process handles have closed. The tree was fully
+            # checked before rename, so direct removal is the safe platform
+            # fallback.
+            shutil.rmtree(progress.root)
+            _fsync_directory(output_dir.parent)
+    except (OSError, RuntimeError, ValueError) as error:
+        warnings.warn(
+            f"Could not remove completed prepare progress at {progress.root}: {error}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
 
 def _publication_failure_is_resumable(
@@ -1538,7 +2611,7 @@ def _recover_or_clean_staging(
     return recovered_stats
 
 
-def prepare_dataset(
+def _prepare_dataset_locked(
     input_patterns: Sequence[str],
     tokenizer_model: str | Path,
     output_dir: str | Path,
@@ -1668,9 +2741,50 @@ def prepare_dataset(
         )
 
     output_dir = _absolute_path(Path(output_dir))
-    output_dir.parent.mkdir(parents=True, exist_ok=True)
     _assert_regular_directory(output_dir.parent, role="dataset output parent")
-    _refuse_or_remove_empty_output(output_dir)
+    progress_contract, progress_contract_sha256 = _prepare_progress_contract(
+        dataset_fingerprint,
+        source_snapshots,
+        tokenizer_snapshot,
+        normalized_pairs=normalized_pairs,
+        preprocessing_options=preprocessing_options,
+    )
+    if _path_exists(output_dir):
+        try:
+            completed_stats = _validate_complete_staging(
+                output_dir,
+                expected_fingerprint=dataset_fingerprint,
+                source_snapshots=source_snapshots,
+                tokenizer_snapshot=tokenizer_snapshot,
+                normalized_pairs=normalized_pairs,
+                translation_directions=normalized_directions,
+                languages=languages,
+                source_only=source_only,
+                train_only_prefixes=train_only_prefixes,
+                preprocessing_options=preprocessing_options,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError):
+            _refuse_or_remove_empty_output(output_dir)
+        else:
+            _verify_input_snapshots(
+                input_patterns,
+                paths,
+                source_snapshots,
+                tokenizer_path,
+                tokenizer_snapshot,
+            )
+            completed_progress = _PrepareProgress(
+                root=output_dir.with_name(
+                    f".{output_dir.name}.prepare-progress-{progress_contract_sha256[:24]}"
+                ),
+                chunks_dir=output_dir.with_name(
+                    f".{output_dir.name}.prepare-progress-{progress_contract_sha256[:24]}"
+                )
+                / "chunks",
+                contract_sha256=progress_contract_sha256,
+            )
+            _discard_prepare_progress(completed_progress, output_dir)
+            return completed_stats
     recovered = _recover_or_clean_staging(
         output_dir,
         input_patterns=input_patterns,
@@ -1687,20 +2801,137 @@ def prepare_dataset(
         preprocessing_options=preprocessing_options,
     )
     if recovered is not None:
+        completed_progress = _PrepareProgress(
+            root=output_dir.with_name(
+                f".{output_dir.name}.prepare-progress-{progress_contract_sha256[:24]}"
+            ),
+            chunks_dir=output_dir.with_name(
+                f".{output_dir.name}.prepare-progress-{progress_contract_sha256[:24]}"
+            )
+            / "chunks",
+            contract_sha256=progress_contract_sha256,
+        )
+        _discard_prepare_progress(completed_progress, output_dir)
         return recovered
+    progress = _initialize_prepare_progress(
+        output_dir,
+        progress_contract,
+        progress_contract_sha256,
+    )
+    _ensure_prepare_capacity(output_dir, source_snapshots, progress)
+    workers = num_workers or build_cpu_plan(input_files=len(paths)).dataset_workers
+    expected_chunk_names: set[str] = set()
+    expected_descriptors: list[_PrepareBatchDescriptor] = []
+
+    def prepare_jobs() -> Iterator[_PrepareBatchJob]:
+        for descriptor, batch in _prepare_batch_records(
+            paths,
+            quality_policy,
+            filter_quality,
+            normalized_pairs,
+            train_only_prefixes,
+            max_tokens_per_side,
+        ):
+            chunk_name = _prepare_chunk_filename(descriptor)
+            if chunk_name in expected_chunk_names:
+                raise RuntimeError(f"duplicate deterministic prepare batch: {chunk_name}")
+            expected_chunk_names.add(chunk_name)
+            expected_descriptors.append(descriptor)
+            yield _PrepareBatchJob(
+                descriptor=descriptor,
+                batch=batch,
+                progress_chunks_dir=str(progress.chunks_dir),
+                progress_contract_sha256=progress.contract_sha256,
+                generation_epoch=progress.generation_epoch,
+            )
+
+    inputs = prepare_jobs()
+    executor: ProcessPoolExecutor | None = None
+    capacity_summary = _PrepareCapacitySummary()
+    try:
+        if workers <= 1:
+            _initialize_prepare_worker(str(tokenizer_path))
+            processed_batches = map(_process_prepare_job, inputs)
+        else:
+            executor = ProcessPoolExecutor(
+                max_workers=workers,
+                mp_context=multiprocessing.get_context("spawn"),
+                initializer=_initialize_prepare_worker,
+                initargs=(str(tokenizer_path),),
+            )
+            processed_batches = bounded_ordered_map(
+                executor, _process_prepare_job, inputs, max_pending=workers * 2
+            )
+        for batch in processed_batches:
+            capacity_summary.add_events(batch)
+    except BaseException as error:
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+        if isinstance(error, _PrepareProgressError):
+            _discard_prepare_progress(progress, output_dir)
+        raise
+    else:
+        if executor is not None:
+            executor.shutdown()
+        executor = None
+
+    try:
+        _validate_prepare_progress_inventory(progress, expected_chunk_names)
+        # Finish and integrity-check every worker checkpoint before allocating any
+        # staging shard. A capacity failure therefore preserves all expensive
+        # tokenization work for the next invocation.
+        _verify_input_snapshots(
+            input_patterns,
+            paths,
+            source_snapshots,
+            tokenizer_path,
+            tokenizer_snapshot,
+        )
+        _ensure_prepare_final_capacity(
+            output_dir,
+            capacity_summary,
+            shard_size=shard_size,
+            dedup_backend=dedup_backend,
+            translation_directions=normalized_directions,
+        )
+    except BaseException as error:
+        if isinstance(error, _PrepareProgressError):
+            _discard_prepare_progress(progress, output_dir)
+        raise
+
     staging_dir = output_dir.with_name(f".{output_dir.name}.staging-{uuid.uuid4().hex}")
     staging_dir.mkdir(exist_ok=False)
+    maximum_shard_bytes = shard_size * (
+        max_tokens_per_side * np.dtype(np.uint32).itemsize * 2
+        + INDEX_DTYPE.itemsize
+        + RECORD_METADATA_INDEX_DTYPE.itemsize
+        + 512
+    )
+    # Three split writers stay open concurrently. The exact pre-dedup capacity
+    # plan above covers the complete staging generation; this smaller rolling
+    # reserve still catches external disk consumption between shard openings.
+    concurrent_shard_reserve = maximum_shard_bytes * 3
+    writers: dict[str, ShardWriter] = {}
     try:
-        writers = {
-            split: ShardWriter(staging_dir, split, shard_size, language_to_id)
-            for split in ("train", "validation", "test")
-        }
+        for split in ("train", "validation", "test"):
+            writers[split] = ShardWriter(
+                staging_dir,
+                split,
+                shard_size,
+                language_to_id,
+                maximum_shard_bytes=concurrent_shard_reserve,
+            )
         digest_store = (
             _SqliteDigestSet(staging_dir / ".dedup.sqlite3")
             if dedup_backend == "sqlite"
             else _MemoryDigestSet()
         )
     except BaseException:
+        for writer in writers.values():
+            try:
+                writer.close()
+            except Exception:
+                pass
         _discard_private_staging(staging_dir, output_dir)
         raise
     stats = PrepareStats()
@@ -1712,44 +2943,19 @@ def prepare_dataset(
         else None
     )
 
-    workers = num_workers or build_cpu_plan(input_files=len(paths)).dataset_workers
-    inputs = _prepare_input_batches(
-        paths,
-        quality_policy,
-        filter_quality,
-        normalized_pairs,
-        train_only_prefixes,
-    )
-    try:
-        if workers <= 1:
-            _initialize_prepare_worker(str(tokenizer_path))
-            processed_batches = map(_process_prepare_batch, inputs)
-            executor = None
-        else:
-            executor = ProcessPoolExecutor(
-                max_workers=workers,
-                mp_context=multiprocessing.get_context("spawn"),
-                initializer=_initialize_prepare_worker,
-                initargs=(str(tokenizer_path),),
+    def replay_batches() -> Iterator[list[_PrepareEvent]]:
+        for descriptor in expected_descriptors:
+            _, events = _load_prepare_chunk(
+                progress.chunks_dir / _prepare_chunk_filename(descriptor),
+                expected_descriptor=descriptor,
+                progress_contract_sha256=progress.contract_sha256,
+                language_pairs=normalized_pairs,
+                max_tokens_per_side=max_tokens_per_side,
             )
-            processed_batches = bounded_ordered_map(
-                executor, _process_prepare_batch, inputs, max_pending=workers * 2
-            )
-    except BaseException:
-        for writer in writers.values():
-            try:
-                writer.close()
-            except Exception:
-                pass
-        try:
-            digest_store.close()
-        except Exception:
-            pass
-        _discard_private_staging(staging_dir, output_dir)
-        raise
+            yield events
 
     try:
-        for batch in processed_batches:
+        for batch in replay_batches():
             for status, payload in batch:
                 source_id = int(payload[0])
                 source_stats = per_source_stats[source_id]
@@ -1783,6 +2989,19 @@ def prepare_dataset(
                             _increment(target, "ja_no_kana_warnings")
                     for target in targets:
                         _increment(target, "quality_filtered")
+                    continue
+
+                if status == "too_long":
+                    _, rejection_reasons, warning_reasons = payload
+                    _record_quality_reasons(targets, rejection_reasons)
+                    if "structured_span_mismatch" in warning_reasons:
+                        for target in targets:
+                            _increment(target, "structured_span_warnings")
+                    if "ja_no_kana" in warning_reasons:
+                        for target in targets:
+                            _increment(target, "ja_no_kana_warnings")
+                    for target in targets:
+                        _increment(target, "too_long")
                     continue
 
                 (
@@ -1946,9 +3165,12 @@ def prepare_dataset(
                         _increment(target, "synthetic_pairs")
                     if forward_only:
                         _increment(target, "forward_only_pairs")
-    except BaseException:
+    except BaseException as error:
         if executor is not None:
-            executor.shutdown(wait=False, cancel_futures=True)
+            # A failed future can leave later batches writing gzip chunks. Wait
+            # for those handles to close before quarantining the progress tree,
+            # especially on Windows where open files prevent directory moves.
+            executor.shutdown(wait=True, cancel_futures=True)
         for writer in writers.values():
             try:
                 writer.close()
@@ -1959,10 +3181,29 @@ def prepare_dataset(
         except Exception:
             pass
         _discard_private_staging(staging_dir, output_dir)
+        if isinstance(error, _PrepareProgressError):
+            _discard_prepare_progress(progress, output_dir)
         raise
     else:
         if executor is not None:
             executor.shutdown()
+
+    try:
+        _validate_prepare_progress_inventory(progress, expected_chunk_names)
+    except BaseException as error:
+        for writer in writers.values():
+            try:
+                writer.close()
+            except Exception:
+                pass
+        try:
+            digest_store.close()
+        except Exception:
+            pass
+        _discard_private_staging(staging_dir, output_dir)
+        if isinstance(error, _PrepareProgressError):
+            _discard_prepare_progress(progress, output_dir)
+        raise
 
     try:
         # This is the first complete post-worker boundary. Hashing again, rather
@@ -2106,4 +3347,58 @@ def prepare_dataset(
         if not _publication_failure_is_resumable(error, staging_dir, output_dir):
             _discard_private_staging(staging_dir, output_dir)
         raise
+    _discard_prepare_progress(progress, output_dir)
     return stats
+
+
+def prepare_dataset(
+    input_patterns: Sequence[str],
+    tokenizer_model: str | Path,
+    output_dir: str | Path,
+    *,
+    shard_size: int = 100_000,
+    validation_fraction: float = 0.005,
+    test_fraction: float = 0.005,
+    max_tokens_per_side: int = 510,
+    quality_policy: QualityPolicy | None = None,
+    filter_quality: bool = True,
+    prevent_target_leakage: bool = True,
+    approximate_split: bool = False,
+    dedup_backend: str = "sqlite",
+    language_pair: Sequence[str] | None = None,
+    source_only_languages: Sequence[str] = (),
+    language_pairs: Sequence[Sequence[str]] | None = None,
+    translation_directions: Sequence[Sequence[str]] | None = None,
+    train_only_prefixes: Sequence[str] = DEFAULT_TRAIN_ONLY_PREFIXES,
+    managed_augmentation_prefix: str | None = None,
+    synthetic_sampling_weight: float = DEFAULT_SYNTHETIC_SAMPLING_WEIGHT,
+    num_workers: int | None = None,
+    expected_fingerprint: DatasetFingerprint | None = None,
+) -> PrepareStats:
+    """Prepare one dataset generation under an output-scoped process lock."""
+
+    normalized_output = _absolute_path(Path(output_dir))
+    with _prepare_output_lock(normalized_output):
+        return _prepare_dataset_locked(
+            input_patterns,
+            tokenizer_model,
+            normalized_output,
+            shard_size=shard_size,
+            validation_fraction=validation_fraction,
+            test_fraction=test_fraction,
+            max_tokens_per_side=max_tokens_per_side,
+            quality_policy=quality_policy,
+            filter_quality=filter_quality,
+            prevent_target_leakage=prevent_target_leakage,
+            approximate_split=approximate_split,
+            dedup_backend=dedup_backend,
+            language_pair=language_pair,
+            source_only_languages=source_only_languages,
+            language_pairs=language_pairs,
+            translation_directions=translation_directions,
+            train_only_prefixes=train_only_prefixes,
+            managed_augmentation_prefix=managed_augmentation_prefix,
+            synthetic_sampling_weight=synthetic_sampling_weight,
+            num_workers=num_workers,
+            expected_fingerprint=expected_fingerprint,
+        )

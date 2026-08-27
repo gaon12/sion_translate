@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import errno
+import gzip
+from itertools import combinations
 import json
 import math
 import os
 import pickle
+import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import NoReturn
 
 import numpy as np
 import pytest
@@ -26,6 +32,7 @@ from sion_translate.data.quality import (
 )
 from sion_translate.data.prepare import infer_register, protect_shared_spans
 from sion_translate.glossary import restore_targets
+from sion_translate.locking import artifact_lock
 from sion_translate.structured import (
     extract_structured_spans,
     mask_structured_spans,
@@ -68,6 +75,21 @@ class _FakePrepareTokenizer:
 
     def encode(self, text: str) -> list[int]:
         return [4 + byte for byte in text.encode("utf-8")]
+
+
+def _initialize_fake_parallel_prepare_worker(_model_path: str) -> None:
+    prepare_module._PREPARE_WORKER_TOKENIZER = _FakePrepareTokenizer("unused")
+
+
+def _fail_first_parallel_prepare_job(
+    job: prepare_module._PrepareBatchJob,
+) -> list[prepare_module._PrepareEvent]:
+    if not job.descriptor.synthetic_pass and job.descriptor.batch_index == 0:
+        time.sleep(0.25)
+        raise RuntimeError("simulated out-of-order parallel interruption")
+    # A spawned interpreter imports the production module without the parent's
+    # monkeypatch, so this resolves to the real worker implementation there.
+    return prepare_module._process_prepare_job(job)
 
 
 @pytest.mark.parametrize(
@@ -147,6 +169,990 @@ def _prepare_atomic_dataset(
         num_workers=1,
         expected_fingerprint=expected_fingerprint,
     )
+
+
+def _write_resumable_prepare_source(path: Path) -> None:
+    rows = [
+        {
+            "ko": "재시작해도 첫 번째 문장의 결과를 안전하게 재사용합니다.",
+            "ja": "再起動後も最初の文の結果を安全に再利用します。",
+            "marker": "real-1",
+        },
+        {
+            "ko": "합성 문장은 실제 문장 뒤에서 처리되어야 합니다.",
+            "ja": "合成文は実文の後で処理されなければなりません。",
+            "marker": "synthetic-1",
+            "synthetic": True,
+        },
+        {
+            "ko": "마지막 문장까지 결정적인 순서를 유지합니다.",
+            "ja": "最後の文まで決定的な順序を維持します。",
+            "marker": "real-2",
+        },
+    ]
+    path.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+
+def _directory_bytes(root: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+def _leave_resumable_prepare_progress(
+    source: Path,
+    tokenizer: Path,
+    output: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[
+    DatasetFingerprint,
+    Path,
+    Callable[[prepare_module._PrepareBatchInput], list[prepare_module._PrepareEvent]],
+]:
+    expected = _atomic_prepare_fingerprint(source, tokenizer)
+    original_process = prepare_module._process_prepare_batch
+    process_calls = 0
+
+    def fail_on_second_batch(
+        batch: prepare_module._PrepareBatchInput,
+    ) -> list[prepare_module._PrepareEvent]:
+        nonlocal process_calls
+        process_calls += 1
+        if process_calls == 2:
+            raise RuntimeError("simulated worker interruption")
+        return original_process(batch)
+
+    monkeypatch.setattr(prepare_module, "_process_prepare_batch", fail_on_second_batch)
+    with pytest.raises(RuntimeError, match="simulated worker interruption"):
+        _prepare_atomic_dataset(
+            str(source),
+            tokenizer,
+            output,
+            expected_fingerprint=expected,
+        )
+
+    progress = list(output.parent.glob(f".{output.name}.prepare-progress-*"))
+    assert len(progress) == 1
+    assert len(list((progress[0] / "chunks").glob("*.json.gz"))) == 1
+    assert not list(output.parent.glob(f".{output.name}.staging-*"))
+    return expected, progress[0], original_process
+
+
+def test_prepare_resumes_worker_chunks_and_matches_a_clean_build_byte_for_byte(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "pairs.jsonl"
+    tokenizer = tmp_path / "sion.model"
+    resumed = tmp_path / "resumed"
+    clean = tmp_path / "clean"
+    _write_resumable_prepare_source(source)
+    tokenizer.write_bytes(b"stable-tokenizer")
+    monkeypatch.setattr(prepare_module, "SionTokenizer", _FakePrepareTokenizer)
+    monkeypatch.setattr(prepare_module, "PREPARE_BATCH_SIZE", 1)
+    expected, _, original_process = _leave_resumable_prepare_progress(
+        source,
+        tokenizer,
+        resumed,
+        monkeypatch,
+    )
+
+    resumed_calls = 0
+
+    def count_uncached_batches(
+        batch: prepare_module._PrepareBatchInput,
+    ) -> list[prepare_module._PrepareEvent]:
+        nonlocal resumed_calls
+        resumed_calls += 1
+        return original_process(batch)
+
+    monkeypatch.setattr(prepare_module, "_process_prepare_batch", count_uncached_batches)
+    resumed_stats = _prepare_atomic_dataset(
+        str(source),
+        tokenizer,
+        resumed,
+        expected_fingerprint=expected,
+    )
+    assert resumed_calls == 2
+    assert not list(tmp_path.glob(".resumed.prepare-progress-*"))
+
+    clean_stats = _prepare_atomic_dataset(
+        str(source),
+        tokenizer,
+        clean,
+        expected_fingerprint=expected,
+    )
+
+    assert resumed_stats == clean_stats
+    assert _directory_bytes(resumed) == _directory_bytes(clean)
+
+
+@pytest.mark.parametrize("dedup_backend", ["memory", "sqlite"])
+def test_prepare_resume_preserves_an_arbitrary_graph_and_real_row_precedence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    dedup_backend: str,
+) -> None:
+    class GraphTokenizer(_FakePrepareTokenizer):
+        languages = ("de", "fr", "es")
+
+    source = tmp_path / "graph.jsonl"
+    tokenizer = tmp_path / "sion.model"
+    resumed = tmp_path / f"resumed-{dedup_backend}"
+    clean = tmp_path / f"clean-{dedup_backend}"
+    duplicate = {
+        "de": "Eine ausreichend lange deutsche Zeile.",
+        "fr": "Une ligne française suffisamment longue.",
+        "es": "Una línea española suficientemente larga.",
+    }
+    rows = [
+        {**duplicate, "synthetic": True},
+        duplicate,
+        {
+            "de": "Eine zweite echte deutsche Zeile.",
+            "fr": "Une deuxième vraie ligne française.",
+            "es": "Una segunda línea española real.",
+        },
+    ]
+    source.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    tokenizer.write_bytes(b"stable-graph-tokenizer")
+    monkeypatch.setattr(prepare_module, "SionTokenizer", GraphTokenizer)
+    monkeypatch.setattr(prepare_module, "PREPARE_BATCH_SIZE", 1)
+    original_process = prepare_module._process_prepare_batch
+    process_calls = 0
+
+    def fail_on_second_batch(
+        batch: prepare_module._PrepareBatchInput,
+    ) -> list[prepare_module._PrepareEvent]:
+        nonlocal process_calls
+        process_calls += 1
+        if process_calls == 2:
+            raise RuntimeError("simulated graph worker interruption")
+        return original_process(batch)
+
+    def build(output: Path) -> prepare_module.PrepareStats:
+        return prepare_module.prepare_dataset(
+            [str(source)],
+            tokenizer,
+            output,
+            shard_size=8,
+            validation_fraction=0.0,
+            test_fraction=0.0,
+            filter_quality=False,
+            dedup_backend=dedup_backend,
+            language_pairs=(("de", "fr"), ("fr", "es")),
+            translation_directions=(("de", "fr"), ("fr", "es"), ("es", "fr")),
+            num_workers=1,
+        )
+
+    monkeypatch.setattr(prepare_module, "_process_prepare_batch", fail_on_second_batch)
+    with pytest.raises(RuntimeError, match="graph worker interruption"):
+        build(resumed)
+    assert (
+        len(
+            list(
+                next(tmp_path.glob(f".{resumed.name}.prepare-progress-*"))
+                .joinpath("chunks")
+                .glob("*.json.gz")
+            )
+        )
+        == 1
+    )
+
+    resumed_calls = 0
+
+    def count_uncached_batches(
+        batch: prepare_module._PrepareBatchInput,
+    ) -> list[prepare_module._PrepareEvent]:
+        nonlocal resumed_calls
+        resumed_calls += 1
+        return original_process(batch)
+
+    monkeypatch.setattr(prepare_module, "_process_prepare_batch", count_uncached_batches)
+    resumed_stats = build(resumed)
+    assert resumed_calls == 2
+    clean_stats = build(clean)
+
+    assert resumed_stats == clean_stats
+    assert resumed_stats.physical_lines == 3
+    assert resumed_stats.valid_pairs == 4
+    assert resumed_stats.duplicates == 2
+    assert resumed_stats.synthetic_pairs == 0
+    assert resumed_stats.forward_only_pairs == 2
+    assert _directory_bytes(resumed) == _directory_bytes(clean)
+
+
+def test_prepare_expands_a_six_language_complete_graph_without_language_branches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    languages = ("de", "fr", "es", "it", "pt", "nl")
+
+    class SixLanguageTokenizer(_FakePrepareTokenizer):
+        pass
+
+    SixLanguageTokenizer.languages = languages
+    source = tmp_path / "six-language.jsonl"
+    tokenizer = tmp_path / "sion.model"
+    output = tmp_path / "dataset"
+    source.write_text(
+        json.dumps(
+            {
+                language: f"A sufficiently long sentence for configurable language {language}."
+                for language in languages
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    tokenizer.write_bytes(b"six-language-tokenizer")
+    monkeypatch.setattr(prepare_module, "SionTokenizer", SixLanguageTokenizer)
+    graph = tuple(combinations(languages, 2))
+
+    stats = prepare_module.prepare_dataset(
+        [str(source)],
+        tokenizer,
+        output,
+        shard_size=32,
+        validation_fraction=0.0,
+        test_fraction=0.0,
+        filter_quality=False,
+        dedup_backend="memory",
+        language_pairs=graph,
+        num_workers=1,
+    )
+
+    assert stats.physical_lines == 1
+    assert stats.valid_pairs == len(graph) == 15
+    assert json.loads((output / "manifest.json").read_text(encoding="utf-8"))["language_pairs"] == [
+        list(pair) for pair in graph
+    ]
+
+
+def test_prepare_capacity_plan_covers_large_supported_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "metadata.jsonl"
+    tokenizer = tmp_path / "sion.model"
+    output = tmp_path / "dataset"
+    source.write_text(
+        json.dumps(
+            {
+                "ko": "용량 계획을 검증할 만큼 충분히 긴 한국어 문장입니다.",
+                "ja": "容量計画を検証するための十分に長い日本語文です。",
+                "metadata": {"provenance": "p" * 4096},
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    tokenizer.write_bytes(b"metadata-tokenizer")
+    monkeypatch.setattr(prepare_module, "SionTokenizer", _FakePrepareTokenizer)
+    actual_gate = prepare_module._ensure_prepare_final_capacity
+    planned_bytes = 0
+
+    def capture_plan(*args: object, **kwargs: object) -> int:
+        nonlocal planned_bytes
+        planned_bytes = actual_gate(*args, **kwargs)  # pyright: ignore[reportArgumentType]
+        return planned_bytes
+
+    monkeypatch.setattr(prepare_module, "_ensure_prepare_final_capacity", capture_plan)
+    stats = prepare_module.prepare_dataset(
+        [str(source)],
+        tokenizer,
+        output,
+        shard_size=8,
+        validation_fraction=0.0,
+        test_fraction=0.0,
+        filter_quality=False,
+        dedup_backend="memory",
+        language_pair=("ko", "ja"),
+        num_workers=1,
+    )
+
+    actual_bytes = sum(path.stat().st_size for path in output.rglob("*") if path.is_file())
+    assert stats.valid_pairs == 1
+    assert planned_bytes >= actual_bytes
+    assert any(path.name.endswith(".meta.bin") for path in output.rglob("*"))
+
+
+def test_prepare_rejects_unbounded_record_fanout_before_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class GraphTokenizer(_FakePrepareTokenizer):
+        languages = ("de", "fr", "es")
+
+    source = tmp_path / "fanout.jsonl"
+    tokenizer = tmp_path / "sion.model"
+    output = tmp_path / "dataset"
+    source.write_text(
+        json.dumps(
+            {
+                "de": "Eine ausreichend lange deutsche Zeile.",
+                "fr": "Une ligne française suffisamment longue.",
+                "es": "Una línea española suficientemente larga.",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    tokenizer.write_bytes(b"fanout-tokenizer")
+    monkeypatch.setattr(prepare_module, "SionTokenizer", GraphTokenizer)
+    monkeypatch.setattr(prepare_module, "PREPARE_MAX_EXPANDED_PAIRS_PER_LINE", 1)
+
+    with pytest.raises(ValueError, match="expands beyond.*source_id=0.*byte_offset=0"):
+        prepare_module.prepare_dataset(
+            [str(source)],
+            tokenizer,
+            output,
+            validation_fraction=0.0,
+            test_fraction=0.0,
+            filter_quality=False,
+            dedup_backend="memory",
+            language_pairs=(("de", "fr"), ("fr", "es")),
+            num_workers=1,
+        )
+
+    assert not output.exists()
+    assert not list(tmp_path.glob(".dataset.staging-*"))
+
+
+def test_prepare_reports_an_oversized_raw_line_with_its_exact_offset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "oversized-line.jsonl"
+    tokenizer = tmp_path / "sion.model"
+    output = tmp_path / "dataset"
+    source.write_text(
+        json.dumps({"ko": "가" * 100, "ja": "あ" * 100}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    tokenizer.write_bytes(b"raw-line-tokenizer")
+    monkeypatch.setattr(prepare_module, "SionTokenizer", _FakePrepareTokenizer)
+    monkeypatch.setattr(prepare_module, "PREPARE_MAX_RAW_LINE_BYTES", 64)
+
+    with pytest.raises(ValueError, match=r"path=.*oversized-line\.jsonl.*byte_offset=0"):
+        prepare_module.prepare_dataset(
+            [str(source)],
+            tokenizer,
+            output,
+            validation_fraction=0.0,
+            test_fraction=0.0,
+            filter_quality=False,
+            dedup_backend="memory",
+            language_pair=("ko", "ja"),
+            num_workers=1,
+        )
+
+    assert not output.exists()
+
+
+def test_prepare_reports_oversized_supported_metadata_before_checkpointing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "oversized-metadata.jsonl"
+    tokenizer = tmp_path / "sion.model"
+    output = tmp_path / "dataset"
+    source.write_text(
+        json.dumps(
+            {
+                "ko": "충분히 긴 한국어 메타데이터 검사 문장입니다.",
+                "ja": "十分に長い日本語のメタデータ検査文です。",
+                "metadata": {"provenance": "p" * 128},
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    tokenizer.write_bytes(b"metadata-limit-tokenizer")
+    monkeypatch.setattr(prepare_module, "SionTokenizer", _FakePrepareTokenizer)
+    monkeypatch.setattr(prepare_module, "PREPARE_MAX_RECORD_METADATA_BYTES", 64)
+
+    with pytest.raises(ValueError, match="supported metadata.*source_id=0.*byte_offset=0"):
+        prepare_module.prepare_dataset(
+            [str(source)],
+            tokenizer,
+            output,
+            validation_fraction=0.0,
+            test_fraction=0.0,
+            filter_quality=False,
+            dedup_backend="memory",
+            language_pair=("ko", "ja"),
+            num_workers=1,
+        )
+
+    assert not output.exists()
+    assert not list(tmp_path.glob(".dataset.staging-*"))
+
+
+@pytest.mark.parametrize("dedup_backend", ["memory", "sqlite"])
+def test_prepare_resumes_out_of_order_parallel_chunks_across_processes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    dedup_backend: str,
+) -> None:
+    source = tmp_path / "parallel.jsonl"
+    tokenizer = tmp_path / "sion.model"
+    resumed = tmp_path / f"resumed-{dedup_backend}"
+    clean = tmp_path / f"clean-{dedup_backend}"
+    rows = [
+        {
+            "ko": f"병렬 재개를 검증하는 충분히 긴 한국어 문장 {index}입니다.",
+            "ja": f"並列再開を検証するための十分に長い日本語文{index}です。",
+        }
+        for index in range(4)
+    ]
+    source.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    tokenizer.write_bytes(b"parallel-tokenizer")
+    monkeypatch.setattr(prepare_module, "SionTokenizer", _FakePrepareTokenizer)
+    monkeypatch.setattr(prepare_module, "PREPARE_BATCH_SIZE", 1)
+    monkeypatch.setattr(
+        prepare_module,
+        "_initialize_prepare_worker",
+        _initialize_fake_parallel_prepare_worker,
+    )
+    original_job = prepare_module._process_prepare_job
+
+    def build(output: Path) -> prepare_module.PrepareStats:
+        return prepare_module.prepare_dataset(
+            [str(source)],
+            tokenizer,
+            output,
+            shard_size=8,
+            validation_fraction=0.0,
+            test_fraction=0.0,
+            filter_quality=False,
+            dedup_backend=dedup_backend,
+            language_pair=("ko", "ja"),
+            num_workers=2,
+        )
+
+    monkeypatch.setattr(prepare_module, "_process_prepare_job", _fail_first_parallel_prepare_job)
+    with pytest.raises(RuntimeError, match="out-of-order parallel interruption"):
+        build(resumed)
+    progress = next(tmp_path.glob(f".{resumed.name}.prepare-progress-*"))
+    assert list((progress / "chunks").glob("*.json.gz"))
+
+    monkeypatch.setattr(prepare_module, "_process_prepare_job", original_job)
+    resumed_stats = build(resumed)
+    clean_stats = build(clean)
+
+    assert resumed_stats == clean_stats
+    assert _directory_bytes(resumed) == _directory_bytes(clean)
+
+
+def test_prepare_rejects_a_corrupt_worker_chunk_before_reduction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "pairs.jsonl"
+    tokenizer = tmp_path / "sion.model"
+    output = tmp_path / "dataset"
+    _write_resumable_prepare_source(source)
+    tokenizer.write_bytes(b"stable-tokenizer")
+    monkeypatch.setattr(prepare_module, "SionTokenizer", _FakePrepareTokenizer)
+    monkeypatch.setattr(prepare_module, "PREPARE_BATCH_SIZE", 1)
+    expected, progress, original_process = _leave_resumable_prepare_progress(
+        source,
+        tokenizer,
+        output,
+        monkeypatch,
+    )
+    chunk = next((progress / "chunks").glob("*.json.gz"))
+    chunk_document = json.loads(gzip.decompress(chunk.read_bytes()).decode("utf-8"))
+    chunk_document["events"][0][0] = "invalid_json"
+    chunk.write_bytes(
+        gzip.compress(
+            json.dumps(chunk_document, ensure_ascii=True, sort_keys=True).encode("utf-8"),
+            mtime=0,
+        )
+    )
+    monkeypatch.setattr(
+        prepare_module,
+        "_process_prepare_batch",
+        original_process,
+    )
+
+    with pytest.raises(prepare_module._PrepareProgressError, match="integrity digest"):
+        _prepare_atomic_dataset(
+            str(source),
+            tokenizer,
+            output,
+            expected_fingerprint=expected,
+        )
+
+    assert not output.exists()
+    assert not list(tmp_path.glob(".dataset.prepare-progress-*"))
+    assert not list(tmp_path.glob(".dataset.staging-*"))
+
+
+def test_prepare_generation_fences_orphan_workers_and_reuses_identical_winners(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "pairs.jsonl"
+    tokenizer = tmp_path / "sion.model"
+    output = tmp_path / "dataset"
+    _write_resumable_prepare_source(source)
+    tokenizer.write_bytes(b"stable-tokenizer")
+    monkeypatch.setattr(prepare_module, "SionTokenizer", _FakePrepareTokenizer)
+    monkeypatch.setattr(prepare_module, "PREPARE_BATCH_SIZE", 1)
+    _, progress_root, original_process = _leave_resumable_prepare_progress(
+        source,
+        tokenizer,
+        output,
+        monkeypatch,
+    )
+    contract = json.loads(
+        (progress_root / prepare_module.PREPARE_PROGRESS_CONTRACT_FILENAME).read_text(
+            encoding="utf-8"
+        )
+    )
+    contract_sha256 = contract["contract_sha256"]
+    batches = list(
+        prepare_module._prepare_batch_records(
+            (source,),
+            QualityPolicy(),
+            False,
+            (("ko", "ja"),),
+            prepare_module.DEFAULT_TRAIN_ONLY_PREFIXES,
+            510,
+        )
+    )
+    stale_epoch = json.loads(
+        (progress_root / prepare_module.PREPARE_PROGRESS_EPOCH_FILENAME).read_text(encoding="utf-8")
+    )["epoch"]
+    missing_descriptor, missing_batch = batches[1]
+    stale_job = prepare_module._PrepareBatchJob(
+        descriptor=missing_descriptor,
+        batch=missing_batch,
+        progress_chunks_dir=str(progress_root / "chunks"),
+        progress_contract_sha256=contract_sha256,
+        generation_epoch=stale_epoch,
+    )
+    resumed_progress = prepare_module._initialize_prepare_progress(
+        output,
+        contract,
+        contract_sha256,
+    )
+    missing_events = original_process(missing_batch)
+
+    with pytest.raises(prepare_module._PrepareProgressError, match="superseded parent"):
+        prepare_module._write_prepare_chunk(stale_job, missing_events)
+    assert not (
+        progress_root / "chunks" / prepare_module._prepare_chunk_filename(missing_descriptor)
+    ).exists()
+
+    winning_descriptor, winning_batch = batches[0]
+    winning_job = prepare_module._PrepareBatchJob(
+        descriptor=winning_descriptor,
+        batch=winning_batch,
+        progress_chunks_dir=str(progress_root / "chunks"),
+        progress_contract_sha256=contract_sha256,
+        generation_epoch=resumed_progress.generation_epoch,
+    )
+    prepare_module._write_prepare_chunk(winning_job, original_process(winning_batch))
+    assert (
+        progress_root / "chunks" / prepare_module._prepare_chunk_filename(winning_descriptor)
+    ).is_file()
+
+
+def test_prepare_rejects_an_unexpected_checkpoint_inventory_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "pairs.jsonl"
+    tokenizer = tmp_path / "sion.model"
+    output = tmp_path / "dataset"
+    _write_resumable_prepare_source(source)
+    tokenizer.write_bytes(b"stable-tokenizer")
+    monkeypatch.setattr(prepare_module, "SionTokenizer", _FakePrepareTokenizer)
+    monkeypatch.setattr(prepare_module, "PREPARE_BATCH_SIZE", 1)
+    expected, progress, original_process = _leave_resumable_prepare_progress(
+        source,
+        tokenizer,
+        output,
+        monkeypatch,
+    )
+    chunk = next((progress / "chunks").glob("*.json.gz"))
+    unexpected = progress / "chunks" / "pass-0-source-00000-batch-999999999.json.gz"
+    unexpected.write_bytes(chunk.read_bytes())
+    monkeypatch.setattr(prepare_module, "_process_prepare_batch", original_process)
+
+    with pytest.raises(prepare_module._PrepareProgressError, match="inventory differs"):
+        _prepare_atomic_dataset(
+            str(source),
+            tokenizer,
+            output,
+            expected_fingerprint=expected,
+        )
+
+    assert not output.exists()
+    assert not progress.exists()
+    assert not list(tmp_path.glob(".dataset.staging-*"))
+
+
+def test_prepare_discards_progress_when_the_exact_input_contract_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "pairs.jsonl"
+    tokenizer = tmp_path / "sion.model"
+    output = tmp_path / "dataset"
+    _write_resumable_prepare_source(source)
+    tokenizer.write_bytes(b"tokenizer-version-A")
+    monkeypatch.setattr(prepare_module, "SionTokenizer", _FakePrepareTokenizer)
+    monkeypatch.setattr(prepare_module, "PREPARE_BATCH_SIZE", 1)
+    _, old_progress, original_process = _leave_resumable_prepare_progress(
+        source,
+        tokenizer,
+        output,
+        monkeypatch,
+    )
+    tokenizer.write_bytes(b"tokenizer-version-B")
+    changed_fingerprint = _atomic_prepare_fingerprint(source, tokenizer)
+    processed_batches = 0
+
+    def count_recomputed_batches(
+        batch: prepare_module._PrepareBatchInput,
+    ) -> list[prepare_module._PrepareEvent]:
+        nonlocal processed_batches
+        processed_batches += 1
+        return original_process(batch)
+
+    monkeypatch.setattr(prepare_module, "_process_prepare_batch", count_recomputed_batches)
+    stats = _prepare_atomic_dataset(
+        str(source),
+        tokenizer,
+        output,
+        expected_fingerprint=changed_fingerprint,
+    )
+
+    assert stats.valid_pairs == 3
+    assert processed_batches == 3
+    assert not old_progress.exists()
+    assert not list(tmp_path.glob(".dataset.prepare-progress-*"))
+
+
+def test_prepare_never_reuses_progress_after_source_bytes_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "pairs.jsonl"
+    tokenizer = tmp_path / "sion.model"
+    output = tmp_path / "dataset"
+    _write_resumable_prepare_source(source)
+    tokenizer.write_bytes(b"stable-tokenizer")
+    monkeypatch.setattr(prepare_module, "SionTokenizer", _FakePrepareTokenizer)
+    monkeypatch.setattr(prepare_module, "PREPARE_BATCH_SIZE", 1)
+    _, old_progress, original_process = _leave_resumable_prepare_progress(
+        source,
+        tokenizer,
+        output,
+        monkeypatch,
+    )
+    _write_resumable_prepare_source(source)
+    source.write_text(
+        source.read_text(encoding="utf-8").replace("마지막 문장", "변경된 문장"),
+        encoding="utf-8",
+    )
+    changed_fingerprint = _atomic_prepare_fingerprint(source, tokenizer)
+    processed_batches = 0
+
+    def count_recomputed_batches(
+        batch: prepare_module._PrepareBatchInput,
+    ) -> list[prepare_module._PrepareEvent]:
+        nonlocal processed_batches
+        processed_batches += 1
+        return original_process(batch)
+
+    monkeypatch.setattr(prepare_module, "_process_prepare_batch", count_recomputed_batches)
+    stats = _prepare_atomic_dataset(
+        str(source),
+        tokenizer,
+        output,
+        expected_fingerprint=changed_fingerprint,
+    )
+
+    assert stats.valid_pairs == 3
+    assert processed_batches == 3
+    assert not old_progress.exists()
+    assert not list(tmp_path.glob(".dataset.prepare-progress-*"))
+
+
+def test_prepare_never_reuses_progress_after_the_language_graph_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "pairs.jsonl"
+    tokenizer = tmp_path / "sion.model"
+    output = tmp_path / "dataset"
+    _write_resumable_prepare_source(source)
+    tokenizer.write_bytes(b"stable-tokenizer")
+    monkeypatch.setattr(prepare_module, "SionTokenizer", _FakePrepareTokenizer)
+    monkeypatch.setattr(prepare_module, "PREPARE_BATCH_SIZE", 1)
+    _, old_progress, original_process = _leave_resumable_prepare_progress(
+        source,
+        tokenizer,
+        output,
+        monkeypatch,
+    )
+    processed_batches = 0
+
+    def count_recomputed_batches(
+        batch: prepare_module._PrepareBatchInput,
+    ) -> list[prepare_module._PrepareEvent]:
+        nonlocal processed_batches
+        processed_batches += 1
+        return original_process(batch)
+
+    monkeypatch.setattr(prepare_module, "_process_prepare_batch", count_recomputed_batches)
+    stats = prepare_module.prepare_dataset(
+        [str(source)],
+        tokenizer,
+        output,
+        shard_size=8,
+        validation_fraction=0.0,
+        test_fraction=0.0,
+        filter_quality=False,
+        dedup_backend="memory",
+        language_pair=("ko", "ja"),
+        translation_directions=(("ko", "ja"),),
+        synthetic_sampling_weight=0.25,
+        num_workers=1,
+    )
+
+    assert stats.valid_pairs == 3
+    assert stats.forward_only_pairs == 3
+    assert processed_batches == 3
+    assert not old_progress.exists()
+    assert not list(tmp_path.glob(".dataset.prepare-progress-*"))
+
+
+def test_prepare_retains_completed_chunks_across_enospc_and_reuses_them(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "pairs.jsonl"
+    tokenizer = tmp_path / "sion.model"
+    output = tmp_path / "dataset"
+    _write_resumable_prepare_source(source)
+    tokenizer.write_bytes(b"stable-tokenizer")
+    expected = _atomic_prepare_fingerprint(source, tokenizer)
+    monkeypatch.setattr(prepare_module, "SionTokenizer", _FakePrepareTokenizer)
+    monkeypatch.setattr(prepare_module, "PREPARE_BATCH_SIZE", 1)
+    original_reserve = prepare_module._ensure_prepare_write_reserve
+    original_process = prepare_module._process_prepare_batch
+    checkpoint_writes = 0
+
+    def exhaust_during_second_checkpoint(
+        directory: Path,
+        pending_bytes: int,
+        *,
+        role: str = "prepared worker checkpoint",
+    ) -> None:
+        nonlocal checkpoint_writes
+        if role == "prepared worker checkpoint":
+            checkpoint_writes += 1
+            if checkpoint_writes == 2:
+                raise OSError(errno.ENOSPC, "simulated checkpoint capacity exhaustion")
+        original_reserve(directory, pending_bytes, role=role)
+
+    monkeypatch.setattr(
+        prepare_module,
+        "_ensure_prepare_write_reserve",
+        exhaust_during_second_checkpoint,
+    )
+    with pytest.raises(OSError) as captured:
+        _prepare_atomic_dataset(
+            str(source),
+            tokenizer,
+            output,
+            expected_fingerprint=expected,
+        )
+    assert captured.value.errno == errno.ENOSPC
+    progress = next(tmp_path.glob(".dataset.prepare-progress-*"))
+    assert len(list((progress / "chunks").glob("*.json.gz"))) == 1
+    assert not list(tmp_path.glob(".dataset.staging-*"))
+
+    resumed_calls = 0
+
+    def count_recomputed_batches(
+        batch: prepare_module._PrepareBatchInput,
+    ) -> list[prepare_module._PrepareEvent]:
+        nonlocal resumed_calls
+        resumed_calls += 1
+        return original_process(batch)
+
+    monkeypatch.setattr(prepare_module, "_ensure_prepare_write_reserve", original_reserve)
+    monkeypatch.setattr(prepare_module, "_process_prepare_batch", count_recomputed_batches)
+    stats = _prepare_atomic_dataset(
+        str(source),
+        tokenizer,
+        output,
+        expected_fingerprint=expected,
+    )
+
+    assert stats.valid_pairs == 3
+    assert resumed_calls == 2
+    assert not progress.exists()
+
+
+def test_prepare_refuses_insufficient_disk_space_before_worker_processing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "pairs.jsonl"
+    tokenizer = tmp_path / "sion.model"
+    output = tmp_path / "dataset"
+    _write_atomic_prepare_source(source)
+    tokenizer.write_bytes(b"stable-tokenizer")
+    expected = _atomic_prepare_fingerprint(source, tokenizer)
+    disk_usage_type = type(prepare_module.shutil.disk_usage(tmp_path))
+
+    def forbid_processing(_batch: prepare_module._PrepareBatchInput) -> NoReturn:
+        raise AssertionError("disk preflight must run before worker processing")
+
+    monkeypatch.setattr(prepare_module, "SionTokenizer", _FakePrepareTokenizer)
+    monkeypatch.setattr(prepare_module, "_process_prepare_batch", forbid_processing)
+    monkeypatch.setattr(
+        prepare_module.shutil,
+        "disk_usage",
+        lambda _path: disk_usage_type(1_000_000, 999_999, 1),
+    )
+
+    with pytest.raises(OSError) as captured:
+        _prepare_atomic_dataset(
+            str(source),
+            tokenizer,
+            output,
+            expected_fingerprint=expected,
+        )
+
+    assert captured.value.errno == errno.ENOSPC
+    assert "Insufficient free disk space" in str(captured.value)
+    assert "estimated required=" in str(captured.value)
+    assert "reserve=" in str(captured.value)
+    assert "available=" in str(captured.value)
+    assert not output.exists()
+    assert not list(tmp_path.glob(".dataset.staging-*"))
+
+
+def test_prepare_keeps_completed_worker_chunks_when_final_capacity_is_insufficient(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "pairs.jsonl"
+    tokenizer = tmp_path / "sion.model"
+    output = tmp_path / "dataset"
+    _write_atomic_prepare_source(source)
+    tokenizer.write_bytes(b"stable-tokenizer")
+    expected = _atomic_prepare_fingerprint(source, tokenizer)
+    disk_usage_type = type(prepare_module.shutil.disk_usage(tmp_path))
+    usage_calls = 0
+
+    def capacity_then_exhausted(_path: object) -> object:
+        nonlocal usage_calls
+        usage_calls += 1
+        # Initial planning and the serialized chunk publication both pass. The
+        # post-worker exact payload gate then refuses to create staging.
+        free = 10**12 if usage_calls <= 2 else 1
+        return disk_usage_type(10**12, 10**12 - free, free)
+
+    monkeypatch.setattr(prepare_module, "SionTokenizer", _FakePrepareTokenizer)
+    monkeypatch.setattr(prepare_module.shutil, "disk_usage", capacity_then_exhausted)
+
+    with pytest.raises(OSError, match="after translation worker checkpointing") as captured:
+        _prepare_atomic_dataset(
+            str(source),
+            tokenizer,
+            output,
+            expected_fingerprint=expected,
+        )
+
+    assert captured.value.errno == errno.ENOSPC
+    assert not output.exists()
+    assert not list(tmp_path.glob(".dataset.staging-*"))
+    progress = list(tmp_path.glob(".dataset.prepare-progress-*"))
+    assert len(progress) == 1
+    assert list((progress[0] / "chunks").glob("*.json.gz"))
+
+
+def test_prepare_output_lock_rejects_a_competing_builder_without_stale_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "pairs.jsonl"
+    tokenizer = tmp_path / "sion.model"
+    output = tmp_path / "dataset"
+    _write_atomic_prepare_source(source)
+    tokenizer.write_bytes(b"stable-tokenizer")
+    expected = _atomic_prepare_fingerprint(source, tokenizer)
+    monkeypatch.setattr(prepare_module, "SionTokenizer", _FakePrepareTokenizer)
+
+    with prepare_module._prepare_output_lock(output):
+        with pytest.raises(RuntimeError, match="output is locked by another process"):
+            _prepare_atomic_dataset(
+                str(source),
+                tokenizer,
+                output,
+                expected_fingerprint=expected,
+            )
+
+    assert not output.exists()
+    assert not list(tmp_path.glob(".dataset.prepare-progress-*"))
+    lock_path = tmp_path / prepare_module._prepare_output_lock_filename(output)
+    assert lock_path.is_file()
+
+    stats = _prepare_atomic_dataset(
+        str(source),
+        tokenizer,
+        output,
+        expected_fingerprint=expected,
+    )
+    assert stats.valid_pairs == 1
+    assert lock_path.is_file()
+
+
+def test_prepare_output_lock_nests_under_the_cli_artifact_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "pairs.jsonl"
+    tokenizer = tmp_path / "sion.model"
+    output = tmp_path / "dataset"
+    _write_atomic_prepare_source(source)
+    tokenizer.write_bytes(b"stable-tokenizer")
+    expected = _atomic_prepare_fingerprint(source, tokenizer)
+    monkeypatch.setattr(prepare_module, "SionTokenizer", _FakePrepareTokenizer)
+
+    with artifact_lock(tmp_path):
+        stats = _prepare_atomic_dataset(
+            str(source),
+            tokenizer,
+            output,
+            expected_fingerprint=expected,
+        )
+
+    assert stats.valid_pairs == 1
+    assert output.is_dir()
 
 
 def test_legacy_unidirectional_runtime_does_not_require_current_forward_flags(
@@ -303,6 +1309,7 @@ def test_parallel_preparation_matches_single_worker(tmp_path: Path) -> None:
         num_workers=2,
     )
     assert single == parallel
+    assert _directory_bytes(tmp_path / "single") == _directory_bytes(tmp_path / "parallel")
     for split in ("train", "validation", "test"):
         single_index = IndexedParallelDataset(tmp_path / "single", split)
         parallel_index = IndexedParallelDataset(tmp_path / "parallel", split)
@@ -593,6 +1600,58 @@ def test_prepare_publication_failure_preserves_a_complete_resumable_generation(
     assert not list(tmp_path.glob(".dataset.staging-*"))
 
 
+def test_prepare_recovers_an_exact_output_stranded_after_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "pairs.jsonl"
+    tokenizer = tmp_path / "sion.model"
+    output = tmp_path / "dataset"
+    _write_atomic_prepare_source(source)
+    tokenizer.write_bytes(b"stable-tokenizer")
+    expected = _atomic_prepare_fingerprint(source, tokenizer)
+    actual_publish = prepare_module._publish_staged_directory
+    monkeypatch.setattr(prepare_module, "SionTokenizer", _FakePrepareTokenizer)
+
+    def strand_after_rename(
+        staging_dir: Path,
+        output_dir: Path,
+        *,
+        before_rename: Callable[[], None] | None = None,
+    ) -> None:
+        if before_rename is not None:
+            before_rename()
+        os.rename(staging_dir, output_dir)
+        raise RuntimeError("simulated directory-fsync and rollback failure")
+
+    monkeypatch.setattr(prepare_module, "_publish_staged_directory", strand_after_rename)
+    with pytest.raises(RuntimeError, match="rollback failure"):
+        _prepare_atomic_dataset(
+            str(source),
+            tokenizer,
+            output,
+            expected_fingerprint=expected,
+        )
+    assert (output / prepare_module.PREPARE_COMPLETION_FILENAME).is_file()
+
+    monkeypatch.setattr(prepare_module, "_publish_staged_directory", actual_publish)
+
+    def forbid_rebuild(_args: object) -> list[prepare_module._PrepareEvent]:
+        raise AssertionError("an exact already-published output must not be rebuilt")
+
+    monkeypatch.setattr(prepare_module, "_process_prepare_batch", forbid_rebuild)
+    recovered = _prepare_atomic_dataset(
+        str(source),
+        tokenizer,
+        output,
+        expected_fingerprint=expected,
+    )
+
+    assert recovered.valid_pairs == 1
+    assert (output / "manifest.json").is_file()
+    assert not list(tmp_path.glob(".dataset.prepare-progress-*"))
+
+
 def test_prepare_does_not_preserve_an_incomplete_staging_generation(tmp_path: Path) -> None:
     staging = tmp_path / ".dataset.staging-incomplete"
     output = tmp_path / "dataset"
@@ -792,7 +1851,7 @@ def test_prepare_rejects_critical_structured_corruption_when_quality_filter_is_d
     ).encode("utf-8")
 
     events = prepare_module._process_prepare_batch(  # pyright: ignore[reportPrivateUsage]
-        (0, [row], QualityPolicy(), False, (("en", "ja"),))
+        (0, [(0, row)], QualityPolicy(), False, (("en", "ja"),), 510)
     )
 
     quality_events = [event for event in events if event[0] == "quality_filtered"]
