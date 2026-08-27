@@ -13,9 +13,10 @@ The main sequence is:
 
    - checkpoints/best, checkpoints/latest, checkpoints/final
      for resume, including the large optimizer state.
-   - exports/best, exports/latest
-     for inference, including regular FP32 ``model.pt`` and quantized INT8
-     ``model_int8.pt`` artifacts.
+   - exports/best for guard-approved inference weights. Non-refinement runs also
+     keep exports/latest for convenient local inspection. Guarded refinement
+     runs deliberately keep latest as a resume-only checkpoint so an unapproved
+     intermediate model cannot be mistaken for a release.
 """
 
 # DataLoader samplers, AMP scalers, tqdm, and SummaryWriter expose dynamic hooks.
@@ -23,6 +24,7 @@ The main sequence is:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -41,7 +43,11 @@ from torch import nn
 from torch.nn import functional as F
 from tqdm.auto import tqdm
 
-from sion_translate.artifacts import TRANSLATION_RELEASE_NAME
+from sion_translate.artifacts import (
+    RELEASE_INELIGIBLE_FILENAME,
+    RELEASE_INELIGIBLE_SCHEMA,
+    TRANSLATION_RELEASE_NAME,
+)
 from sion_translate.config import AppConfig, TrainingConfig
 from sion_translate.language_tags import canonicalize_language_pair
 
@@ -84,8 +90,8 @@ class TrainingBudget:
         return step < self.max_optimizer_steps
 
 
-def _atomic_write_resolved_config(path: Path, payload: Mapping[str, Any]) -> None:
-    """Durably publish one complete resolved configuration generation."""
+def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
+    """Durably publish one complete JSON generation."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -116,12 +122,35 @@ def _atomic_write_resolved_config(path: Path, payload: Mapping[str, Any]) -> Non
         raise
 
 
+def _atomic_write_resolved_config(path: Path, payload: Mapping[str, Any]) -> None:
+    """Compatibility wrapper for tests and callers of the original helper name."""
+
+    _atomic_write_json(path, payload)
+
+
 def _is_sha256_digest(value: object) -> bool:
     return (
         isinstance(value, str)
         and len(value) == 64
         and all(character in "0123456789abcdef" for character in value)
     )
+
+
+def _reset_best_training_state(training_state: dict[str, Any]) -> None:
+    """Discard a best-record binding while preserving resumable optimizer progress."""
+
+    training_state.update(
+        {
+            "best_validation_loss": float("inf"),
+            "best_step": -1,
+            "early_stopping_bad_evals": 0,
+            "best_selection_metric": None,
+            "best_checkpoint_artifact_sha256": None,
+        }
+    )
+    for key in tuple(training_state):
+        if key.startswith("best_candidate_refinement_"):
+            training_state.pop(key)
 
 
 def _publish_resolved_config(
@@ -143,6 +172,50 @@ def _publish_resolved_config(
     if write_error is not None:
         raise write_error
     raise RuntimeError("rank 0 failed to publish resolved_config.json")
+
+
+def _mark_inference_exports_ineligible(
+    output_dir: Path,
+    names: Sequence[str],
+    context: DistributedContext,
+    *,
+    direction_fingerprint: str,
+    deployed_family: str,
+) -> None:
+    """Atomically block stale inference directories until a safe export replaces them."""
+
+    write_error: Exception | None = None
+    if context.is_main:
+        try:
+            for name in names:
+                directory = output_dir / "exports" / name
+                if directory.is_symlink():
+                    raise RuntimeError(
+                        f"refusing to mark a symlinked inference export directory: {directory}"
+                    )
+                directory.mkdir(parents=True, exist_ok=True)
+                if not directory.is_dir():
+                    raise RuntimeError(f"inference export path is not a directory: {directory}")
+                _atomic_write_json(
+                    directory / RELEASE_INELIGIBLE_FILENAME,
+                    {
+                        "schema": RELEASE_INELIGIBLE_SCHEMA,
+                        "reason": "candidate_refinement_release_guard_pending",
+                        "direction_fingerprint": direction_fingerprint,
+                        "deployed_family": deployed_family,
+                    },
+                )
+        except Exception as error:
+            write_error = error
+    write_failed = broadcast_bool(write_error is not None, context)
+    if not write_failed:
+        return
+    failure = RuntimeError(
+        "failed to invalidate stale inference exports on at least one distributed rank"
+    )
+    if write_error is not None:
+        raise failure from write_error
+    raise failure
 
 
 def resolve_training_budget(
@@ -436,11 +509,90 @@ def _selection_metric_label(key: str) -> str:
         "reward": "composite generation reward",
         "macro_direction_reward": "direction-balanced macro reward",
         "worst_direction_reward": "worst-direction reward",
+        "worst_direction_candidate_refinement_nll_gain": (
+            "worst-direction provisional-to-final NLL gain"
+        ),
         "nll": "overall token NLL",
         "loss": "validation loss",
     }
     label = labels.get(_validation_metric_suffix(key), key)
     return f"EMA {label}" if ema else label
+
+
+_CANDIDATE_REFINEMENT_GAIN_TOLERANCE = 1e-6
+_CANDIDATE_REFINEMENT_RELEASE_SCHEMA = "sion-candidate-refinement-release-v1"
+
+
+def _check_candidate_refinement_release(
+    metrics: Mapping[str, float],
+    *,
+    prefer_ema: bool,
+    expected_directions: Sequence[Sequence[str]],
+) -> tuple[bool, str, float]:
+    """Require complete held-out evidence that the deployed refiner does not regress.
+
+    A tiny negative tolerance absorbs FP32 subtraction noise around an exactly
+    neutral refiner. Missing, non-finite, partial, or extra direction evidence is
+    a validation-contract error rather than an ordinary non-improvement.
+    """
+
+    canonical_directions = tuple(tuple(direction) for direction in expected_directions)
+    if not canonical_directions:
+        raise ValueError("candidate-refinement release checks require at least one direction")
+    prefix = "validation_ema_" if prefer_ema else "validation_"
+    gain_key = f"{prefix}worst_direction_candidate_refinement_nll_gain"
+    count_key = f"{prefix}candidate_refinement_direction_count"
+    required_keys = [gain_key, count_key]
+    direction_metric_keys: list[tuple[str, str]] = []
+    for source_language, target_language in canonical_directions:
+        direction_prefix = f"{prefix}direction_{source_language}_to_{target_language}"
+        direction_gain_key = f"{direction_prefix}_candidate_refinement_nll_gain"
+        direction_tokens_key = f"{direction_prefix}_candidate_refinement_tokens"
+        required_keys.extend((direction_gain_key, direction_tokens_key))
+        direction_metric_keys.append((direction_gain_key, direction_tokens_key))
+    missing = [key for key in required_keys if key not in metrics]
+    if missing:
+        raise RuntimeError(
+            "candidate-refinement release evidence is incomplete; missing validation "
+            f"metric(s): {', '.join(missing)}"
+        )
+    reported_worst_gain = float(metrics[gain_key])
+    raw_direction_count = float(metrics[count_key])
+    if not math.isfinite(reported_worst_gain) or not math.isfinite(raw_direction_count):
+        raise RuntimeError("candidate-refinement release evidence must be finite")
+    if not raw_direction_count.is_integer():
+        raise RuntimeError("candidate-refinement validation direction count must be an integer")
+    observed_direction_count = int(raw_direction_count)
+    expected_direction_count = len(canonical_directions)
+    if observed_direction_count != expected_direction_count:
+        raise RuntimeError(
+            "candidate-refinement validation did not cover the exact configured translation "
+            f"graph: observed {observed_direction_count} directions, expected "
+            f"{expected_direction_count}"
+        )
+    direction_gains: list[float] = []
+    for direction_gain_key, direction_tokens_key in direction_metric_keys:
+        direction_gain = float(metrics[direction_gain_key])
+        direction_tokens = float(metrics[direction_tokens_key])
+        if not math.isfinite(direction_gain) or not math.isfinite(direction_tokens):
+            raise RuntimeError("candidate-refinement release evidence must be finite")
+        if direction_tokens <= 0:
+            raise RuntimeError(
+                "candidate-refinement release evidence must include at least one target token "
+                f"for {direction_gain_key}"
+            )
+        direction_gains.append(direction_gain)
+    worst_gain = min(direction_gains)
+    if not math.isclose(reported_worst_gain, worst_gain, rel_tol=0.0, abs_tol=1e-12):
+        raise RuntimeError(
+            "candidate-refinement worst-direction gain does not match the exact configured "
+            "direction metrics"
+        )
+    return (
+        worst_gain >= -_CANDIDATE_REFINEMENT_GAIN_TOLERANCE,
+        gain_key,
+        worst_gain,
+    )
 
 
 _ModelCallArgs = ParamSpec("_ModelCallArgs")
@@ -553,6 +705,10 @@ def evaluate(
                 valid_refinement_gain = raw_refinement_gain.detach().double() * valid_tokens.to(
                     dtype=torch.float64
                 )
+                if not torch.isfinite(valid_refinement_gain[valid_tokens]).all():
+                    raise ValueError(
+                        "candidate_refinement_token_nll_gain must be finite on target tokens"
+                    )
                 row_refinement_gain = valid_refinement_gain.sum(dim=1)
                 row_refinement_count = row_token_count
                 refinement_stats[0] += row_refinement_gain.sum()
@@ -815,6 +971,40 @@ def train(
     """Train sion_translate and return progress plus best-selection metadata."""
     config.validate()
     configured_revision_directions = config.data.configured_revision_directions()
+    configured_translation_directions = (
+        config.data.configured_translation_directions() if export_translation_capable else ()
+    )
+    requires_candidate_refinement_release_guard = bool(
+        export_translation_capable and config.model.experimental.candidate_refinement_enabled
+    )
+    expected_refinement_direction_count = len(configured_translation_directions)
+    candidate_refinement_direction_fingerprint = hashlib.sha256(
+        json.dumps(
+            configured_translation_directions,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    if requires_candidate_refinement_release_guard:
+        if not language_tags:
+            raise ValueError(
+                "candidate-refinement translation training requires language_tags so every "
+                "configured direction can be validated before release"
+            )
+        configured_languages = {
+            language for direction in configured_translation_directions for language in direction
+        }
+        missing_language_tags = sorted(configured_languages.difference(language_tags))
+        if missing_language_tags:
+            raise ValueError(
+                "candidate-refinement translation training is missing tokenizer language tags "
+                f"for: {', '.join(missing_language_tags)}"
+            )
+        if expected_refinement_direction_count == 0:
+            raise ValueError(
+                "candidate-refinement translation training requires at least one configured "
+                "translation direction"
+            )
     if not export_translation_capable:
         if authenticated_revision_directions:
             raise ValueError(
@@ -869,7 +1059,7 @@ def train(
         ),
         languages=export_languages,
         translation_directions=(
-            config.data.configured_translation_directions() if export_translation_capable else None
+            configured_translation_directions if export_translation_capable else None
         ),
         bidirectional=config.data.bidirectional,
         revision_directions=export_revision_directions,
@@ -942,8 +1132,16 @@ def train(
     # Update EMA shadows after each optimizer step and use them for evaluation
     # and export to stabilize translation quality.
     ema = EMAWeights(model, training.ema_decay) if training.ema_decay > 0 else None
+    candidate_refinement_deployed_family = "ema" if ema is not None else "raw"
     if ema is not None:
         announce(f"EMA weight averaging enabled (decay={training.ema_decay}).", context)
+    if requires_candidate_refinement_release_guard:
+        announce(
+            "Candidate-refinement release guard enabled. Resumable latest checkpoints will "
+            "not be duplicated as inference exports; only guard-approved best weights are "
+            "deployable.",
+            context,
+        )
     configured_selection_metric = (
         "validation_reward" if objective is not None else training.sft_selection_metric.lower()
     )
@@ -986,15 +1184,7 @@ def train(
                 f"{configured_selection_metric!r}).",
                 context,
             )
-            training_state.update(
-                {
-                    "best_validation_loss": float("inf"),
-                    "best_step": -1,
-                    "early_stopping_bad_evals": 0,
-                    "best_selection_metric": None,
-                    "best_checkpoint_artifact_sha256": None,
-                }
-            )
+            _reset_best_training_state(training_state)
         recorded_best_step = int(training_state.get("best_step", -1))
         recorded_best_value = float(training_state.get("best_validation_loss", float("inf")))
         recorded_best_artifact_sha256 = training_state.get("best_checkpoint_artifact_sha256")
@@ -1024,15 +1214,7 @@ def train(
                 "select a new best checkpoint.",
                 context,
             )
-            training_state.update(
-                {
-                    "best_validation_loss": float("inf"),
-                    "best_step": -1,
-                    "early_stopping_bad_evals": 0,
-                    "best_selection_metric": None,
-                    "best_checkpoint_artifact_sha256": None,
-                }
-            )
+            _reset_best_training_state(training_state)
     else:
         announce("Stage 2/4: no resume checkpoint; starting a new run.", context)
     # A retry becomes this run generation only after its checkpoint has loaded
@@ -1040,7 +1222,6 @@ def train(
     _publish_resolved_config(config, output_dir, context)
     training_state["configured_selection_metric"] = configured_selection_metric
 
-    writer = _make_summary_writer(training, output_dir, context, start_step)
     step = start_step
     epoch = int(training_state.get("epoch", 0))
     batch_in_epoch = int(training_state.get("batch_in_epoch", 0))
@@ -1061,6 +1242,69 @@ def train(
     best_selection_metric = (
         loaded_best_selection_metric if isinstance(loaded_best_selection_metric, str) else None
     )
+    raw_best_refinement_gain = training_state.get(
+        "best_candidate_refinement_worst_direction_nll_gain"
+    )
+    best_candidate_refinement_worst_direction_nll_gain = (
+        float(raw_best_refinement_gain)
+        if isinstance(raw_best_refinement_gain, (int, float))
+        and not isinstance(raw_best_refinement_gain, bool)
+        and math.isfinite(float(raw_best_refinement_gain))
+        else None
+    )
+    raw_attested_direction_count = training_state.get("best_candidate_refinement_direction_count")
+    attested_direction_count = (
+        raw_attested_direction_count
+        if isinstance(raw_attested_direction_count, int)
+        and not isinstance(raw_attested_direction_count, bool)
+        else None
+    )
+    best_candidate_refinement_release_guard_passed = bool(
+        best_step >= 0
+        and best_checkpoint_artifact_sha256 is not None
+        and training_state.get("best_candidate_refinement_release_guard_passed") is True
+        and training_state.get("best_candidate_refinement_guard_schema")
+        == _CANDIDATE_REFINEMENT_RELEASE_SCHEMA
+        and training_state.get("best_candidate_refinement_deployed_family")
+        == candidate_refinement_deployed_family
+        and training_state.get("best_candidate_refinement_direction_fingerprint")
+        == candidate_refinement_direction_fingerprint
+        and attested_direction_count == expected_refinement_direction_count
+        and best_candidate_refinement_worst_direction_nll_gain is not None
+        and best_candidate_refinement_worst_direction_nll_gain
+        >= -_CANDIDATE_REFINEMENT_GAIN_TOLERANCE
+    )
+    if (
+        requires_candidate_refinement_release_guard
+        and best_step >= 0
+        and not best_candidate_refinement_release_guard_passed
+    ):
+        announce(
+            "The resumed best checkpoint has no compatible versioned candidate-refinement "
+            "release attestation. Resetting best selection while retaining optimizer progress; "
+            "a new checkpoint must pass the complete directional no-regression guard before "
+            "deployment.",
+            context,
+        )
+        best_validation_loss = float("inf")
+        best_step = -1
+        bad_evals = 0
+        best_checkpoint_artifact_sha256 = None
+        best_selection_metric = None
+        best_candidate_refinement_worst_direction_nll_gain = None
+        best_candidate_refinement_release_guard_passed = False
+    if requires_candidate_refinement_release_guard:
+        ineligible_exports = ["latest"]
+        if not best_candidate_refinement_release_guard_passed:
+            ineligible_exports.append("best")
+        _mark_inference_exports_ineligible(
+            output_dir,
+            ineligible_exports,
+            context,
+            direction_fingerprint=candidate_refinement_direction_fingerprint,
+            deployed_family=candidate_refinement_deployed_family,
+        )
+    writer = _make_summary_writer(training, output_dir, context, start_step)
     stopped_early = False
     # A list permits the nested validation function to record this condition
     # without rebinding a local boolean.
@@ -1080,7 +1324,7 @@ def train(
         torch.cuda.reset_peak_memory_stats(context.device)
 
     def current_training_state() -> dict[str, Any]:
-        return {
+        state: dict[str, Any] = {
             "best_validation_loss": best_validation_loss,
             "best_step": best_step,
             "early_stopping_bad_evals": bad_evals,
@@ -1090,6 +1334,30 @@ def train(
             "epoch": epoch,
             "batch_in_epoch": batch_in_epoch,
         }
+        if requires_candidate_refinement_release_guard:
+            state.update(
+                {
+                    "best_candidate_refinement_guard_schema": (
+                        _CANDIDATE_REFINEMENT_RELEASE_SCHEMA
+                    ),
+                    "best_candidate_refinement_deployed_family": (
+                        candidate_refinement_deployed_family
+                    ),
+                    "best_candidate_refinement_direction_fingerprint": (
+                        candidate_refinement_direction_fingerprint
+                    ),
+                    "best_candidate_refinement_direction_count": (
+                        expected_refinement_direction_count
+                    ),
+                    "best_candidate_refinement_release_guard_passed": (
+                        best_candidate_refinement_release_guard_passed
+                    ),
+                    "best_candidate_refinement_worst_direction_nll_gain": (
+                        best_candidate_refinement_worst_direction_nll_gain
+                    ),
+                }
+            )
+        return state
 
     def save(path: Path) -> None:
         """Save model, optimizer, scheduler, and progress state for resume."""
@@ -1106,26 +1374,29 @@ def train(
             identity=checkpoint_identity,
         )
 
-    def export_models(name: str) -> None:
+    def export_models(name: str, *, artifact_step: int | None = None) -> None:
         """Save an inference model under ``exports/<name>/``.
 
         During training, save only ``model_ema.pt`` when EMA is enabled, or
         ``model.pt`` otherwise. Resume checkpoints already contain raw weights,
         so another full-state export would be redundant. Slow quantization and
         Hugging Face conversion run once from the selected best checkpoint after
-        all training stages finish.
+        all training stages finish. Candidate-refinement runs call this helper
+        only for a best checkpoint that passed every configured direction; a
+        successful export clears the directory's fail-closed release marker.
         """
         token_features_path = (
             config.data.tokenizer_features
             if config.model.experimental.morphoscript_enabled
             else None
         )
+        resolved_artifact_step = step if artifact_step is None else artifact_step
         manifest = export_inference_models(
             output_dir / "exports" / name,
             model,
             config.model,
             context,
-            step,
+            resolved_artifact_step,
             ema=ema,
             tokenizer_path=config.data.tokenizer_model,
             token_features_path=token_features_path,
@@ -1145,6 +1416,33 @@ def train(
             translation_capable=export_translation_capable,
             pipeline_identity=pipeline_identity,
         )
+        if requires_candidate_refinement_release_guard and name == "best":
+            marker_error: Exception | None = None
+            if context.is_main:
+                successful_formats = (
+                    [entry for entry in manifest["formats"].values() if entry.get("status") == "ok"]
+                    if manifest is not None
+                    else []
+                )
+                if not successful_formats:
+                    marker_error = RuntimeError(
+                        "guard-approved best weights produced no successful inference format"
+                    )
+                else:
+                    try:
+                        (output_dir / "exports" / name / RELEASE_INELIGIBLE_FILENAME).unlink(
+                            missing_ok=True
+                        )
+                    except OSError as error:
+                        marker_error = error
+            marker_failed = broadcast_bool(marker_error is not None, context)
+            if marker_failed:
+                failure = RuntimeError(
+                    "guard-approved best inference export could not clear its release block"
+                )
+                if marker_error is not None:
+                    raise failure from marker_error
+                raise failure
         if context.is_main and manifest is not None:
             successful = [
                 format_name
@@ -1158,7 +1456,8 @@ def train(
                 if entry.get("status") != "ok"
             ]
             announce(
-                f"Inference export complete: exports/{name} [{', '.join(successful)}]",
+                f"Inference export complete at step {resolved_artifact_step}: "
+                f"exports/{name} [{', '.join(successful)}]",
                 context,
             )
             if failed:
@@ -1175,6 +1474,8 @@ def train(
         """
         nonlocal best_validation_loss, best_step, bad_evals, last_eval_step
         nonlocal best_checkpoint_artifact_sha256, best_selection_metric
+        nonlocal best_candidate_refinement_release_guard_passed
+        nonlocal best_candidate_refinement_worst_direction_nll_gain
         announce(f"Validation starting at step {step}.", context)
         metrics = evaluate(
             model,
@@ -1221,11 +1522,8 @@ def train(
                 summary += ", worst-direction NLL={:.4f}".format(
                     metrics["validation_worst_direction_nll"]
                 )
-            refinement_gain_key = (
-                "validation_ema_candidate_refinement_nll_gain"
-                if "validation_ema_candidate_refinement_nll_gain" in metrics
-                else "validation_candidate_refinement_nll_gain"
-            )
+            refinement_prefix = "validation_ema_" if ema is not None else "validation_"
+            refinement_gain_key = f"{refinement_prefix}candidate_refinement_nll_gain"
             if refinement_gain_key in metrics:
                 refinement_label = (
                     "EMA provisional-to-final NLL gain"
@@ -1237,9 +1535,7 @@ def train(
                     metrics[refinement_gain_key],
                 )
             worst_refinement_gain_key = (
-                "validation_ema_worst_direction_candidate_refinement_nll_gain"
-                if "validation_ema_worst_direction_candidate_refinement_nll_gain" in metrics
-                else "validation_worst_direction_candidate_refinement_nll_gain"
+                f"{refinement_prefix}worst_direction_candidate_refinement_nll_gain"
             )
             if worst_refinement_gain_key in metrics:
                 worst_refinement_label = (
@@ -1296,7 +1592,32 @@ def train(
                     f"falling back to {selection_name}.",
                     context,
                 )
-        if best_selection_metric is not None and selection_key != best_selection_metric:
+        refinement_release_guard_passed = True
+        refinement_worst_gain: float | None = None
+        if requires_candidate_refinement_release_guard:
+            (
+                refinement_release_guard_passed,
+                refinement_gain_key,
+                refinement_worst_gain,
+            ) = _check_candidate_refinement_release(
+                metrics,
+                prefer_ema=ema is not None,
+                expected_directions=configured_translation_directions,
+            )
+            if not refinement_release_guard_passed:
+                announce(
+                    "Candidate-refinement release guard rejected this checkpoint: "
+                    f"{_selection_metric_label(refinement_gain_key)}="
+                    f"{refinement_worst_gain:.6f} is below the non-regression tolerance "
+                    f"(-{_CANDIDATE_REFINEMENT_GAIN_TOLERANCE:g}). The latest checkpoint "
+                    "remains resumable but cannot become the deployable best checkpoint.",
+                    context,
+                )
+        if (
+            refinement_release_guard_passed
+            and best_selection_metric is not None
+            and selection_key != best_selection_metric
+        ):
             announce(
                 "The validation selection metric differs from the previous best record. "
                 "Resetting the comparison baseline "
@@ -1308,13 +1629,20 @@ def train(
             bad_evals = 0
             best_checkpoint_artifact_sha256 = None
             best_selection_metric = None
-        improved_here = candidate < best_validation_loss - training.early_stopping_min_delta
+            best_candidate_refinement_worst_direction_nll_gain = None
+            best_candidate_refinement_release_guard_passed = False
+        improved_here = bool(
+            refinement_release_guard_passed
+            and candidate < best_validation_loss - training.early_stopping_min_delta
+        )
         improved = broadcast_bool(improved_here if context.is_main else False, context)
         if improved:
             best_validation_loss = candidate
             best_step = step
             bad_evals = 0
             best_selection_metric = selection_key
+            best_candidate_refinement_worst_direction_nll_gain = refinement_worst_gain
+            best_candidate_refinement_release_guard_passed = refinement_release_guard_passed
             announce(
                 f"New best {selection_name} ({selection_value:.4f}); saving best checkpoint.",
                 context,
@@ -1338,6 +1666,12 @@ def train(
             # without repeating completed optimizer/evaluation work.
             save(output_dir / "checkpoints" / "latest")
             export_models("best")
+        elif requires_candidate_refinement_release_guard and best_step < 0:
+            announce(
+                "No release-safe candidate-refinement baseline exists yet. Continuing without "
+                "consuming early-stopping patience so later updates can satisfy the guard.",
+                context,
+            )
         else:
             bad_evals += 1
             announce(
@@ -1357,6 +1691,26 @@ def train(
             writer.add_scalar("validation/early_stopping_bad_evals", bad_evals, step)
             writer.flush()
         return should_stop
+
+    if requires_candidate_refinement_release_guard and best_step < 0:
+        announce(
+            f"Establishing a step-{step} no-regression baseline before the first optimizer update.",
+            context,
+        )
+        try:
+            validate_and_update_early_stopping()
+        except BaseException:
+            if writer is not None:
+                writer.close()
+            raise
+        finally:
+            # Baseline validation and export are not training throughput or
+            # training-memory work. Start the first logging window afterward.
+            log_start = time.perf_counter()
+            data_wait_seconds = 0.0
+            steps_since_log = 0
+            if context.device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(context.device)
 
     # Stage 3/4: training loop.
     target_description = (
@@ -1635,7 +1989,8 @@ def train(
                         f"Saving latest checkpoint at step {step}: checkpoints/latest.", context
                     )
                     save(output_dir / "checkpoints" / "latest")
-                    export_models("latest")
+                    if not requires_candidate_refinement_release_guard:
+                        export_models("latest")
                 if not budget.epoch_limited and step >= budget.max_optimizer_steps:
                     epoch_completed = False
                     break
@@ -1672,24 +2027,29 @@ def train(
                     else step < budget.max_optimizer_steps
                 )
             )
-        announce(
-            "Stage 4/4: saving final model state "
-            "(checkpoints/final + checkpoints/latest + exports/latest)",
-            context,
-        )
+        final_artifacts = "checkpoints/final + checkpoints/latest"
+        if not requires_candidate_refinement_release_guard:
+            final_artifacts += " + exports/latest"
+        announce(f"Stage 4/4: saving final model state ({final_artifacts})", context)
         save(output_dir / "checkpoints" / "final")
         save(output_dir / "checkpoints" / "latest")
-        export_models("latest")
         best_checkpoint = output_dir / "checkpoints" / "best"
         if (
             best_step < 0
             or best_selection_metric is None
             or best_checkpoint_artifact_sha256 is None
+            or (
+                requires_candidate_refinement_release_guard
+                and not best_candidate_refinement_release_guard_passed
+            )
         ):
             raise RuntimeError(
                 "training produced no finite validation selection metric or authenticated "
-                "best checkpoint; refusing to publish unbound final weights"
+                "release-safe best checkpoint; refusing to publish unbound or regressive "
+                "final weights"
             )
+        if not requires_candidate_refinement_release_guard:
+            export_models("latest")
         # Do not infer safety from rank 0's `.metadata` existence. Rank 0 binds
         # an exact current/previous generation, every rank verifies its own bytes,
         # and the full load remains inside that one-shot lease.
@@ -1717,6 +2077,16 @@ def train(
         selected_weights = "EMA" if ema is not None else "raw"
         if ema is not None:
             ema.copy_to(model)
+        blocked_best_export = output_dir / "exports" / "best" / RELEASE_INELIGIBLE_FILENAME
+        if requires_candidate_refinement_release_guard and (
+            blocked_best_export.exists() or blocked_best_export.is_symlink()
+        ):
+            announce(
+                "Retrying the guard-approved best inference export after restoring its exact "
+                "checkpoint.",
+                context,
+            )
+            export_models("best", artifact_step=best_step)
         announce(
             f"Restored best checkpoint for the next stage (step {best_step}, "
             f"{selected_weights} weights).",
@@ -1759,4 +2129,12 @@ def train(
     }
     if objective is not None:
         result["best_validation_reward"] = -best_validation_loss
+    if requires_candidate_refinement_release_guard:
+        result["candidate_refinement_release_guard_passed"] = (
+            best_candidate_refinement_release_guard_passed
+        )
+        if best_candidate_refinement_worst_direction_nll_gain is not None:
+            result["candidate_refinement_worst_direction_nll_gain"] = (
+                best_candidate_refinement_worst_direction_nll_gain
+            )
     return result

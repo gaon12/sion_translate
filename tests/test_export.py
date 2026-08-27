@@ -16,6 +16,7 @@ import pytest
 import torch
 
 import sion_translate.training.export as export_module
+from sion_translate.artifacts import RELEASE_INELIGIBLE_FILENAME
 from sion_translate.config import ExperimentalConfig, ModelConfig
 from sion_translate.inference import find_exported_model
 from sion_translate.model import SionForConditionalGeneration
@@ -166,6 +167,21 @@ def _store_manifest(directory: Path, manifest: dict[str, Any]) -> None:
         json.dumps(manifest, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+
+def test_release_ineligible_marker_blocks_direct_load_and_validation(tmp_path: Path) -> None:
+    directory = tmp_path / "blocked-export"
+    directory.mkdir()
+    model_path = directory / "model.pt"
+    model_path.write_bytes(b"not consulted while the release block is present")
+    (directory / RELEASE_INELIGIBLE_FILENAME).write_text("{malformed", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="release-ineligible"):
+        load_exported_model(model_path)
+
+    report = validate_export_directory(directory)
+    assert report["valid"] is False
+    assert report["errors"][0]["error_type"] == "ReleaseIneligible"
 
 
 def test_loader_resolves_pre_rename_kjx_module_pickles(tmp_path: Path) -> None:

@@ -503,7 +503,25 @@ def test_dcp_resume_rejects_a_non_integer_step_before_model_mutation(tmp_path: P
     _assert_model_state_unchanged(target, before)
 
 
-def test_dcp_resume_restores_optional_best_generation_binding_fields(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "release_fields",
+    [
+        {},
+        {
+            "best_candidate_refinement_guard_schema": ("sion-candidate-refinement-release-v1"),
+            "best_candidate_refinement_deployed_family": "ema",
+            "best_candidate_refinement_direction_fingerprint": "b" * 64,
+            "best_candidate_refinement_direction_count": 2,
+            "best_candidate_refinement_release_guard_passed": True,
+            "best_candidate_refinement_worst_direction_nll_gain": 0.0125,
+        },
+    ],
+    ids=("legacy-without-release-attestation", "versioned-release-attestation"),
+)
+def test_dcp_resume_restores_optional_best_generation_binding_fields(
+    tmp_path: Path,
+    release_fields: dict[str, object],
+) -> None:
     from torch.distributed.checkpoint.state_dict import get_state_dict
 
     source, source_optimizer, source_scheduler, _ = _components()
@@ -519,6 +537,7 @@ def test_dcp_resume_restores_optional_best_generation_binding_fields(tmp_path: P
         "configured_selection_metric": "macro_direction_nll",
         "best_selection_metric": "validation_macro_direction_nll",
         "best_checkpoint_artifact_sha256": "a" * 64,
+        **release_fields,
     }
     _write_test_dcp_generation(
         checkpoint,

@@ -25,6 +25,11 @@ DEFAULT_FOUNDATION_DATASET_DIRECTORY = f"{DEFAULT_ARTIFACT_ROOT}/foundation_data
 # prevent users from confusing which weights are allowed to translate.
 FOUNDATION_RELEASE_NAME = "sion"
 TRANSLATION_RELEASE_NAME = "sion_translate"
+# A guarded training run places this marker beside any superseded inference
+# export. Discovery and direct native loading reject the directory until an
+# atomic, guard-approved export replaces it.
+RELEASE_INELIGIBLE_FILENAME = "RELEASE_INELIGIBLE.json"
+RELEASE_INELIGIBLE_SCHEMA = "sion-release-ineligible-v1"
 # Public model generation. The Python package uses semantic versioning, while
 # model lineage uses the user-facing major.minor label. Foundation and derived
 # translation releases record the same generation value.
@@ -48,6 +53,8 @@ __all__ = [
     "FOUNDATION_STAGE_DIRECTORY",
     "MODEL_RELEASE_VERSION",
     "POSTTRAINING_STAGE_DIRECTORY",
+    "RELEASE_INELIGIBLE_FILENAME",
+    "RELEASE_INELIGIBLE_SCHEMA",
     "SUPERVISED_STAGE_DIRECTORY",
     "TRANSLATION_RELEASE_NAME",
 ]

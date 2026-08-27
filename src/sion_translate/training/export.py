@@ -54,6 +54,7 @@ from torch import nn
 from sion_translate.artifacts import (
     FOUNDATION_RELEASE_NAME,
     MODEL_RELEASE_VERSION,
+    RELEASE_INELIGIBLE_FILENAME,
     TRANSLATION_RELEASE_NAME,
 )
 from sion_translate.config import ExperimentalConfig, ModelConfig
@@ -3446,6 +3447,12 @@ def load_exported_model(
     """
 
     path = Path(path)
+    release_marker = path.parent / RELEASE_INELIGIBLE_FILENAME
+    if release_marker.exists() or release_marker.is_symlink():
+        raise RuntimeError(
+            f"{path} belongs to a release-ineligible export directory; select a "
+            "candidate-refinement guard-approved best export instead"
+        )
     if unsafe_allow_pickle:
         warnings.warn(
             "unsafe_allow_pickle=True can execute code embedded in the model file. "
@@ -3585,7 +3592,6 @@ def validate_export_directory(
 
     directory = Path(directory)
     manifest_path = directory / "export_manifest.json"
-    manifest = _read_manifest(manifest_path)
     report: dict[str, Any] = {
         "valid": False,
         "directory": str(directory),
@@ -3594,6 +3600,16 @@ def validate_export_directory(
         "formats": {},
         "errors": [],
     }
+    release_marker = directory / RELEASE_INELIGIBLE_FILENAME
+    if release_marker.exists() or release_marker.is_symlink():
+        report["errors"].append(
+            {
+                "error_type": "ReleaseIneligible",
+                "message": f"release-ineligible marker is present: {release_marker}",
+            }
+        )
+        return report
+    manifest = _read_manifest(manifest_path)
     if manifest is None:
         report["errors"].append(
             {

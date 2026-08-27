@@ -2966,6 +2966,12 @@ def _load_checkpoint_impl(
             "configured_selection_metric",
             "best_selection_metric",
             "best_checkpoint_artifact_sha256",
+            "best_candidate_refinement_guard_schema",
+            "best_candidate_refinement_deployed_family",
+            "best_candidate_refinement_direction_fingerprint",
+            "best_candidate_refinement_direction_count",
+            "best_candidate_refinement_release_guard_passed",
+            "best_candidate_refinement_worst_direction_nll_gain",
         ):
             if (
                 optional_key not in progress_template

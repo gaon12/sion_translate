@@ -10,6 +10,7 @@ import torch
 
 import sion_translate.fp8_runtime as fp8_runtime
 import sion_translate.inference as inference
+from sion_translate.artifacts import RELEASE_INELIGIBLE_FILENAME
 from sion_translate.config import ExperimentalConfig, ModelConfig
 from sion_translate.fp8 import FORWARD_DTYPE, Fp8Policy
 from sion_translate.fp8_runtime import Fp8Linear, apply_fp8_weights
@@ -329,8 +330,11 @@ def test_find_exported_model_preserves_best_semantic_priority(tmp_path: Path) ->
         return artifact
 
     best = write_export("best", 10.0)
-    write_export("latest", 20.0)
+    latest = write_export("latest", 20.0)
     assert inference.find_exported_model(tmp_path / "run") == best
+
+    (best.parent / RELEASE_INELIGIBLE_FILENAME).write_text("{}", encoding="utf-8")
+    assert inference.find_exported_model(tmp_path / "run") == latest
 
 
 def test_find_exported_model_rejects_manifest_artifact_tampering(tmp_path: Path) -> None:

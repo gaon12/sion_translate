@@ -17,6 +17,7 @@ from typing import Any, Sequence, cast
 import numpy as np
 import torch
 
+from sion_translate.artifacts import RELEASE_INELIGIBLE_FILENAME
 from sion_translate.generation import (
     DEFAULT_LENGTH_PENALTY,
     DEFAULT_MAX_OUTPUT_LENGTH_MARGIN,
@@ -252,6 +253,9 @@ def find_exported_model(
     for exports in export_roots:
         for stage in ("best", "latest"):
             directory = exports / stage
+            release_marker = directory / RELEASE_INELIGIBLE_FILENAME
+            if release_marker.exists() or release_marker.is_symlink():
+                continue
             manifested = _manifest_artifact(directory, int8=int8)
             if manifested is not None:
                 return manifested
