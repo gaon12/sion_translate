@@ -297,6 +297,11 @@ class SionConfig(PretrainedConfig):
             raise TypeError("default_reasoning_level must be an integer from 0 to 9")
         if not 0 <= self.default_reasoning_level <= 9:
             raise ValueError("default_reasoning_level must be between 0 and 9")
+        if self.experimental.candidate_refinement_enabled and self.default_reasoning_level != 9:
+            raise ValueError(
+                "candidate-refinement checkpoints require default_reasoning_level=9 "
+                "so default generation deploys the final trained refinement endpoint"
+            )
         if self.pad_token_id is None or self.pad_token_id < 0:
             raise ValueError("pad_token_id must be a non-negative integer")
         for name in ("bos_token_id", "eos_token_id", "decoder_start_token_id"):

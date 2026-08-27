@@ -331,6 +331,49 @@ def test_greedy_sampling_beam_and_hf_beam_all_use_refined_decoder_states(
     assert hf_calls > 0
 
 
+def test_hf_default_forward_and_generation_use_the_final_refinement_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    native_config = _config(steps=3)
+    with pytest.raises(ValueError, match="default_reasoning_level=9"):
+        SionConfig.from_model_config(
+            native_config,
+            default_reasoning_level=0,
+        )
+
+    hf_model = HFSionForConditionalGeneration(
+        SionConfig.from_model_config(
+            native_config,
+            default_reasoning_level=9,
+        )
+    ).eval()
+    assert hf_model.model.candidate_refinement is not None
+    refinement_calls = 0
+    original = hf_model.model.candidate_refinement.forward
+
+    def counted(*args: object, **kwargs: object):
+        nonlocal refinement_calls
+        refinement_calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(hf_model.model.candidate_refinement, "forward", counted)
+    batch = _batch()
+    hf_model(
+        input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
+        decoder_input_ids=batch["decoder_input_ids"],
+    )
+    assert refinement_calls == native_config.experimental.candidate_refinement_steps
+
+    refinement_calls = 0
+    hf_model.generate(
+        input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
+        max_new_tokens=1,
+    )
+    assert refinement_calls == native_config.experimental.candidate_refinement_steps
+
+
 def test_disabled_state_is_strictly_compatible_but_cannot_fake_trained_refinement() -> None:
     torch.manual_seed(17)  # pyright: ignore[reportUnknownMemberType]
     old_model = SionForConditionalGeneration(_config(enabled=False))
