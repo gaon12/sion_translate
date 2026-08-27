@@ -739,6 +739,100 @@ def test_current_indexed_audit_accepts_only_a_fully_published_prepare_artifact(
     assert report["virtual_translation_examples"] == 6
 
 
+def test_current_indexed_audit_accepts_authenticated_legacy_storage_side_stats(
+    corpus_and_tokenizer: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    corpus, tokenizer_model = corpus_and_tokenizer
+    dataset = tmp_path / "current-legacy-stats"
+    prepare_dataset(
+        [str(corpus)],
+        tokenizer_model,
+        dataset,
+        validation_fraction=0.0,
+        test_fraction=0.0,
+        filter_quality=False,
+        prevent_target_leakage=False,
+        dedup_backend="memory",
+        language_pair=("ko", "ja"),
+        translation_directions=(("ko", "ja"), ("ja", "ko")),
+        num_workers=1,
+    )
+    manifest_path = dataset / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.pop("stats_schema")
+    for stats in (manifest["stats"], manifest["sources"][0]["stats"]):
+        stats["ko_tokens"] = stats.pop("src_tokens")
+        stats["ja_tokens"] = stats.pop("tgt_tokens")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    _reauthenticate_current_payload(dataset)
+
+    report = audit_indexed_token_exposure(dataset, tokenizer_model)
+
+    assert report["parameters"]["dataset_contract"] == "current-integrity-verified"
+    assert report["physical_pairs"] == 3
+
+
+def test_current_indexed_audit_rejects_an_explicit_null_stats_schema(
+    corpus_and_tokenizer: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    corpus, tokenizer_model = corpus_and_tokenizer
+    dataset = tmp_path / "current-null-stats-schema"
+    prepare_dataset(
+        [str(corpus)],
+        tokenizer_model,
+        dataset,
+        validation_fraction=0.0,
+        test_fraction=0.0,
+        filter_quality=False,
+        prevent_target_leakage=False,
+        dedup_backend="memory",
+        language_pair=("ko", "ja"),
+        translation_directions=(("ko", "ja"), ("ja", "ko")),
+        num_workers=1,
+    )
+    manifest_path = dataset / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["stats_schema"] = None
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    _reauthenticate_current_payload(dataset)
+
+    with pytest.raises(ValueError, match="stats_schema is unsupported"):
+        audit_indexed_token_exposure(dataset, tokenizer_model)
+
+
+def test_current_indexed_audit_rejects_per_source_legacy_keys_under_the_new_schema(
+    corpus_and_tokenizer: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    corpus, tokenizer_model = corpus_and_tokenizer
+    dataset = tmp_path / "current-mixed-source-stats"
+    prepare_dataset(
+        [str(corpus)],
+        tokenizer_model,
+        dataset,
+        validation_fraction=0.0,
+        test_fraction=0.0,
+        filter_quality=False,
+        prevent_target_leakage=False,
+        dedup_backend="memory",
+        language_pair=("ko", "ja"),
+        translation_directions=(("ko", "ja"), ("ja", "ko")),
+        num_workers=1,
+    )
+    manifest_path = dataset / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    source_stats = manifest["sources"][0]["stats"]
+    source_stats["ko_tokens"] = source_stats.pop("src_tokens")
+    source_stats["ja_tokens"] = source_stats.pop("tgt_tokens")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    _reauthenticate_current_payload(dataset)
+
+    with pytest.raises(ValueError, match="stats fields do not match their schema"):
+        audit_indexed_token_exposure(dataset, tokenizer_model)
+
+
 def test_current_indexed_audit_rejects_rebound_split_stats(
     corpus_and_tokenizer: tuple[Path, Path],
     tmp_path: Path,

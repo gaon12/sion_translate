@@ -93,6 +93,7 @@ PREPARE_PROGRESS_CHUNK_SCHEMA = "sion-prepare-worker-chunk-v2"
 PREPARE_WORKER_ALGORITHM_SCHEMA = "sion-prepare-worker-events-v2"
 PREPARE_BATCH_SIZE = 512
 PREPARE_OUTPUT_LOCK_SCHEMA = "sion-prepare-output-lock-v1"
+PREPARE_STATS_SCHEMA = "sion-prepare-stats-src-tgt-v1"
 
 # These limits bound every supported language graph without naming any
 # language. They turn adversarial nested records into an early, reproducible
@@ -166,11 +167,67 @@ class PrepareStats:
     train: int = 0
     validation: int = 0
     test: int = 0
-    ko_tokens: int = 0
-    ja_tokens: int = 0
+    src_tokens: int = 0
+    tgt_tokens: int = 0
     quality_score_sum: int = 0
     synthetic_pairs: int = 0
     forward_only_pairs: int = 0
+
+
+def prepare_stats_schema_from_manifest(
+    manifest: Mapping[str, object],
+    *,
+    role: str,
+) -> str | None:
+    """Return the manifest-wide storage-side statistics schema.
+
+    Manifests written before this schema marker used ``ko_tokens`` and
+    ``ja_tokens`` for the physical source and target sides even when the
+    configured graph contained other languages. A missing marker is therefore
+    the only accepted legacy representation. An explicit null or an unknown
+    marker is rejected instead of being guessed.
+    """
+
+    if "stats_schema" not in manifest:
+        return None
+    value = manifest.get("stats_schema")
+    if value != PREPARE_STATS_SCHEMA:
+        raise ValueError(f"{role} stats_schema is unsupported")
+    return PREPARE_STATS_SCHEMA
+
+
+def validated_prepare_stats(
+    value: object,
+    *,
+    stats_schema: str | None,
+    role: str,
+) -> PrepareStats:
+    """Validate and normalize one total or per-source statistics object."""
+
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{role} stats must be an object")
+    raw = cast(Mapping[object, object], value)
+    neutral_names = tuple(field.name for field in fields(PrepareStats))
+    neutral_fields = set(neutral_names)
+    legacy_aliases = {"src_tokens": "ko_tokens", "tgt_tokens": "ja_tokens"}
+    if stats_schema is None:
+        expected_fields = (neutral_fields - set(legacy_aliases)) | set(legacy_aliases.values())
+    elif stats_schema == PREPARE_STATS_SCHEMA:
+        expected_fields = neutral_fields
+        legacy_aliases = {}
+    else:
+        raise ValueError(f"{role} stats_schema is unsupported")
+    if set(raw) != expected_fields:
+        raise ValueError(f"{role} stats fields do not match their schema")
+
+    normalized: dict[str, int] = {}
+    for name in neutral_names:
+        serialized_name = legacy_aliases.get(name, name)
+        field_value = raw[serialized_name]
+        if isinstance(field_value, bool) or not isinstance(field_value, int) or field_value < 0:
+            raise ValueError(f"{role} stat is invalid: {serialized_name}")
+        normalized[name] = field_value
+    return PrepareStats(**normalized)
 
 
 def infer_register(text: str, language: str) -> int:
@@ -2007,20 +2064,12 @@ def _validate_staging_tree_shape(staging_dir: Path) -> None:
 
 
 def _prepare_stats_from_manifest(manifest: Mapping[str, Any]) -> PrepareStats:
-    raw_stats: object = manifest.get("stats")
-    if not isinstance(raw_stats, Mapping):
-        raise ValueError("Dataset manifest stats must be an object")
-    stats_mapping = cast(Mapping[object, object], raw_stats)
-    expected_fields = {field.name for field in fields(PrepareStats)}
-    if set(stats_mapping) != expected_fields:
-        raise ValueError("Dataset manifest stats fields differ from PrepareStats")
-    normalized: dict[str, int] = {}
-    for name in expected_fields:
-        value = stats_mapping[name]
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise ValueError(f"Dataset manifest stat is invalid: {name}")
-        normalized[name] = value
-    return PrepareStats(**normalized)
+    stats_schema = prepare_stats_schema_from_manifest(manifest, role="Dataset manifest")
+    return validated_prepare_stats(
+        manifest.get("stats"),
+        stats_schema=stats_schema,
+        role="Dataset manifest",
+    )
 
 
 def _validate_manifest_sources(
@@ -2029,6 +2078,7 @@ def _validate_manifest_sources(
     train_only_prefixes: tuple[str, ...],
     stats: PrepareStats,
 ) -> tuple[PrepareStats, ...]:
+    stats_schema = prepare_stats_schema_from_manifest(manifest, role="Dataset manifest")
     raw_sources: object = manifest.get("sources")
     if not isinstance(raw_sources, list):
         raise ValueError("Dataset manifest source list differs from its input snapshot")
@@ -2061,7 +2111,11 @@ def _validate_manifest_sources(
             != synthetic_path(source_path, train_only_prefixes)
         ):
             raise ValueError(f"Dataset manifest source {source_id} identity is invalid")
-        source_stats = _prepare_stats_from_manifest({"stats": source_mapping.get("stats")})
+        source_stats = validated_prepare_stats(
+            source_mapping.get("stats"),
+            stats_schema=stats_schema,
+            role=f"Dataset manifest source {source_id}",
+        )
         validated_stats.append(source_stats)
         for field in fields(PrepareStats):
             accumulated[field.name] += getattr(source_stats, field.name)
@@ -2320,8 +2374,8 @@ def _validate_indexed_payload_semantics(
             "synthetic_pairs": int(source_synthetic[source_id]),
             "forward_only_pairs": int(source_forward_only[source_id]),
             "quality_score_sum": int(source_quality[source_id]),
-            "ko_tokens": int(source_src_tokens[source_id]),
-            "ja_tokens": int(source_tgt_tokens[source_id]),
+            "src_tokens": int(source_src_tokens[source_id]),
+            "tgt_tokens": int(source_tgt_tokens[source_id]),
         }
         for name, value in derived.items():
             if getattr(expected, name) != value:
@@ -3158,8 +3212,8 @@ def _prepare_dataset_locked(
                 for target in targets:
                     _increment(target, split)
                     _increment(target, "valid_pairs")
-                    _increment(target, "ko_tokens", len(ids_a))
-                    _increment(target, "ja_tokens", len(ids_b))
+                    _increment(target, "src_tokens", len(ids_a))
+                    _increment(target, "tgt_tokens", len(ids_b))
                     _increment(target, "quality_score_sum", quality_score)
                     if is_synthetic:
                         _increment(target, "synthetic_pairs")
@@ -3243,6 +3297,7 @@ def _prepare_dataset_locked(
         artifact_inventory = build_dataset_artifact_inventory(staging_dir)
         manifest = {
             "format": INDEX_FORMAT,
+            "stats_schema": PREPARE_STATS_SCHEMA,
             "language_pair": list(primary_pair),
             "language_pairs": [list(pair) for pair in normalized_pairs],
             "translation_directions": [list(direction) for direction in normalized_directions],

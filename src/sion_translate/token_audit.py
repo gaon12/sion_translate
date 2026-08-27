@@ -18,7 +18,7 @@ import math
 from copy import deepcopy
 from collections.abc import Mapping
 from collections import Counter
-from dataclasses import fields
+from dataclasses import asdict, fields
 from pathlib import Path
 from typing import Any, Iterator, Sequence, cast
 
@@ -33,7 +33,8 @@ from sion_translate.data.prepare import (
     PREPARE_COMPLETION_SCHEMA,
     RAW_FINGERPRINT_FILENAME,
     SHARED_TARGET_INDEX_DTYPE,
-    PrepareStats,
+    prepare_stats_schema_from_manifest,
+    validated_prepare_stats,
 )
 from sion_translate.data.quality import QualityPolicy, assess_pair, canonical_text
 from sion_translate.data.record_metadata import (
@@ -657,20 +658,19 @@ def _validate_legacy_index_dtype(
             )
 
 
-def _validated_prepare_stats(value: object, *, role: str) -> dict[str, int]:
-    if not isinstance(value, Mapping):
-        raise ValueError(f"{role} stats must be an object")
-    raw = cast(Mapping[object, object], value)
-    expected_fields = {field.name for field in fields(PrepareStats)}
-    if set(raw) != expected_fields:
-        raise ValueError(f"{role} stats fields differ from PrepareStats")
-    result: dict[str, int] = {}
-    for name in expected_fields:
-        field_value = raw[name]
-        if isinstance(field_value, bool) or not isinstance(field_value, int) or field_value < 0:
-            raise ValueError(f"{role} stat is invalid: {name}")
-        result[name] = field_value
-    return result
+def _validated_prepare_stats(
+    value: object,
+    *,
+    stats_schema: str | None,
+    role: str,
+) -> dict[str, int]:
+    return asdict(
+        validated_prepare_stats(
+            value,
+            stats_schema=stats_schema,
+            role=role,
+        )
+    )
 
 
 def _valid_sha256(value: object) -> bool:
@@ -1037,7 +1037,15 @@ def _validate_current_manifest_contract(
     if manifest.get("split_key") != options.get("split_key"):
         raise ValueError("Current dataset split key contradicts preprocessing options")
 
-    stats = _validated_prepare_stats(manifest.get("stats"), role="Current dataset manifest")
+    stats_schema = prepare_stats_schema_from_manifest(
+        manifest,
+        role="Current dataset manifest",
+    )
+    stats = _validated_prepare_stats(
+        manifest.get("stats"),
+        stats_schema=stats_schema,
+        role="Current dataset manifest",
+    )
     raw_sources = manifest.get("sources")
     if not isinstance(raw_sources, list) or not raw_sources:
         raise ValueError("Current dataset manifest sources must be a non-empty list")
@@ -1071,6 +1079,7 @@ def _validate_current_manifest_contract(
             raise ValueError(f"Current dataset manifest source {source_id} identity is invalid")
         normalized_stats = _validated_prepare_stats(
             source.get("stats"),
+            stats_schema=stats_schema,
             role=f"Current dataset manifest source {source_id}",
         )
         expected_mean = normalized_stats["quality_score_sum"] / max(
@@ -1398,8 +1407,8 @@ def _validate_current_indexed_payload(
             "synthetic_pairs": int(source_synthetic[source_id]),
             "forward_only_pairs": int(source_forward_only[source_id]),
             "quality_score_sum": int(source_quality[source_id]),
-            "ko_tokens": int(source_src_tokens[source_id]),
-            "ja_tokens": int(source_tgt_tokens[source_id]),
+            "src_tokens": int(source_src_tokens[source_id]),
+            "tgt_tokens": int(source_tgt_tokens[source_id]),
         }
         for name, value in derived.items():
             if expected[name] != value:

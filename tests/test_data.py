@@ -107,6 +107,61 @@ def test_register_inference_inherits_the_primary_language_policy(
     assert infer_register(text, variant_language) == infer_register(text, base_language) == 2
 
 
+def test_prepare_stats_normalize_only_the_exact_unmarked_legacy_representation() -> None:
+    neutral = vars(prepare_module.PrepareStats(src_tokens=17, tgt_tokens=23))
+    legacy = dict(neutral)
+    legacy["ko_tokens"] = legacy.pop("src_tokens")
+    legacy["ja_tokens"] = legacy.pop("tgt_tokens")
+
+    schema = prepare_module.prepare_stats_schema_from_manifest({}, role="Test manifest")
+    normalized = prepare_module.validated_prepare_stats(
+        legacy,
+        stats_schema=schema,
+        role="Test manifest",
+    )
+
+    assert normalized.src_tokens == 17
+    assert normalized.tgt_tokens == 23
+
+
+@pytest.mark.parametrize("marker", [None, False, 0, [], {}, "unknown-stats-schema"])
+def test_prepare_stats_reject_an_explicit_or_unknown_schema_marker(marker: object) -> None:
+    with pytest.raises(ValueError, match="stats_schema is unsupported"):
+        prepare_module.prepare_stats_schema_from_manifest(
+            {"stats_schema": marker},
+            role="Test manifest",
+        )
+
+
+def test_prepare_stats_reject_schema_field_mismatches_and_invalid_counts() -> None:
+    neutral = dict(vars(prepare_module.PrepareStats(src_tokens=17, tgt_tokens=23)))
+    legacy = dict(neutral)
+    legacy["ko_tokens"] = legacy.pop("src_tokens")
+    legacy["ja_tokens"] = legacy.pop("tgt_tokens")
+
+    for payload, schema in (
+        (neutral, None),
+        (legacy, prepare_module.PREPARE_STATS_SCHEMA),
+        ({**neutral, "ko_tokens": 17}, prepare_module.PREPARE_STATS_SCHEMA),
+        ({**legacy, "src_tokens": 17}, None),
+    ):
+        with pytest.raises(ValueError, match="stats fields do not match their schema"):
+            prepare_module.validated_prepare_stats(
+                payload,
+                stats_schema=schema,
+                role="Test manifest",
+            )
+
+    for invalid_count in (True, -1, 1.5, "17"):
+        payload = {**neutral, "src_tokens": invalid_count}
+        with pytest.raises(ValueError, match="stat is invalid: src_tokens"):
+            prepare_module.validated_prepare_stats(
+                payload,
+                stats_schema=prepare_module.PREPARE_STATS_SCHEMA,
+                role="Test manifest",
+            )
+
+
 def _write_atomic_prepare_source(path: Path, *, marker: str = "A") -> None:
     path.write_text(
         json.dumps(
@@ -406,8 +461,11 @@ def test_prepare_expands_a_six_language_complete_graph_without_language_branches
     source.write_text(
         json.dumps(
             {
-                language: f"A sufficiently long sentence for configurable language {language}."
-                for language in languages
+                language: (
+                    f"A sufficiently long sentence for configurable language {language}. "
+                    + "Deliberately unequal expansion. " * (position + 1)
+                )
+                for position, language in enumerate(languages)
             }
         )
         + "\n",
@@ -430,11 +488,23 @@ def test_prepare_expands_a_six_language_complete_graph_without_language_branches
         num_workers=1,
     )
 
+    manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+    index = np.load(next((output / "train").glob("*.idx.npy")), allow_pickle=False)
+    expected_src_tokens = int(index["src_length"].sum(dtype=np.uint64))
+    expected_tgt_tokens = int(index["tgt_length"].sum(dtype=np.uint64))
+
+    assert expected_tgt_tokens > expected_src_tokens
     assert stats.physical_lines == 1
     assert stats.valid_pairs == len(graph) == 15
-    assert json.loads((output / "manifest.json").read_text(encoding="utf-8"))["language_pairs"] == [
-        list(pair) for pair in graph
-    ]
+    assert manifest["language_pairs"] == [list(pair) for pair in graph]
+    assert manifest["stats_schema"] == prepare_module.PREPARE_STATS_SCHEMA
+    for serialized in (manifest["stats"], manifest["sources"][0]["stats"]):
+        assert "ko_tokens" not in serialized
+        assert "ja_tokens" not in serialized
+        assert serialized["src_tokens"] == expected_src_tokens
+        assert serialized["tgt_tokens"] == expected_tgt_tokens
+    assert stats.src_tokens == expected_src_tokens
+    assert stats.tgt_tokens == expected_tgt_tokens
 
 
 def test_prepare_capacity_plan_covers_large_supported_metadata(
@@ -1546,6 +1616,52 @@ def test_prepare_recovers_a_complete_exact_orphan_without_rebuilding(
     assert recovered == original_stats
     assert output.is_dir()
     assert not orphan.exists()
+
+
+def test_prepare_reuses_an_authenticated_unmarked_v10_legacy_stats_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "pairs.jsonl"
+    tokenizer = tmp_path / "sion.model"
+    output = tmp_path / "dataset"
+    _write_atomic_prepare_source(source)
+    tokenizer.write_bytes(b"stable-tokenizer")
+    expected = _atomic_prepare_fingerprint(source, tokenizer)
+    monkeypatch.setattr(prepare_module, "SionTokenizer", _FakePrepareTokenizer)
+    original_stats = _prepare_atomic_dataset(
+        str(source),
+        tokenizer,
+        output,
+        expected_fingerprint=expected,
+    )
+    manifest_path = output / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.pop("stats_schema")
+    for serialized in (manifest["stats"], manifest["sources"][0]["stats"]):
+        serialized["ko_tokens"] = serialized.pop("src_tokens")
+        serialized["ja_tokens"] = serialized.pop("tgt_tokens")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    completion_path = output / prepare_module.PREPARE_COMPLETION_FILENAME
+    completion_path.write_text(
+        json.dumps(prepare_module._completion_payload(output, manifest)),
+        encoding="utf-8",
+    )
+
+    def forbid_rebuild(_args: object) -> list[prepare_module._PrepareEvent]:
+        raise AssertionError("an authenticated legacy manifest must be reused")
+
+    monkeypatch.setattr(prepare_module, "_process_prepare_batch", forbid_rebuild)
+    reused_stats = _prepare_atomic_dataset(
+        str(source),
+        tokenizer,
+        output,
+        expected_fingerprint=expected,
+    )
+
+    assert reused_stats == original_stats
+    assert reused_stats.src_tokens == original_stats.src_tokens
+    assert reused_stats.tgt_tokens == original_stats.tgt_tokens
 
 
 def test_prepare_publication_failure_preserves_a_complete_resumable_generation(
