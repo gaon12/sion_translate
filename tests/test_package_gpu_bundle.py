@@ -181,6 +181,56 @@ def test_tracked_data_keeps_its_semantic_origin_and_opt_in_boundary(tmp_path: Pa
     assert corpus_origins["data/corpus/ko/wiki.txt"] == "monolingual-corpus"
 
 
+@pytest.mark.parametrize(
+    ("payload_path", "forged_origin", "message"),
+    [
+        ("README.md", "data-jsonl", "outside the configured immediate raw corpus"),
+        ("README.md", "evaluation-only", "evaluation-only origin is outside"),
+        ("README.md", "monolingual-corpus", "outside the configured readable corpus"),
+        ("data/corpus.jsonl", "git-index", "masks a path with a semantic data role"),
+    ],
+)
+def test_tree_verification_rejects_forged_semantic_origin_paths(
+    tmp_path: Path,
+    payload_path: str,
+    forged_origin: str,
+    message: str,
+) -> None:
+    root = _repository(tmp_path)
+    archive_path = tmp_path / "origin-contract.zip"
+    package_gpu_bundle.build_bundle(root, archive_path)
+    extracted = tmp_path / "origin-contract"
+    with zipfile.ZipFile(archive_path) as archive:
+        archive.extractall(extracted)
+    tree = extracted / "sion_translate"
+    manifest_path = tree / "PACKAGE_MANIFEST.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    record = next(entry for entry in manifest["files"] if entry["path"] == payload_path)
+    record["origin"] = forged_origin
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    checksums_path = tree / "SHA256SUMS"
+    checksum_lines = checksums_path.read_text(encoding="utf-8").splitlines()
+    manifest_checksum = _file_sha256(manifest_path)
+    checksums_path.write_text(
+        "\n".join(
+            (
+                f"{manifest_checksum}  PACKAGE_MANIFEST.json"
+                if line.endswith("  PACKAGE_MANIFEST.json")
+                else line
+            )
+            for line in checksum_lines
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(package_gpu_bundle.BundleError, match=message):
+        package_gpu_bundle.verify_tree(tree)
+
+
 def _with_monolingual_corpus(root: Path) -> None:
     corpus = root / "data" / "corpus"
     for language, text in (

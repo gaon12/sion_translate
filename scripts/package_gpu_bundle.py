@@ -1567,6 +1567,64 @@ def _validated_config_from_payload(content: bytes, name: str) -> object:
         raise BundleError(f"could not validate bundled training config {name}: {error}") from error
 
 
+def _validate_payload_origin_paths(
+    config: object,
+    origins: Mapping[str, str],
+) -> None:
+    """Bind every semantic origin label to the path consumed for that role."""
+
+    from sion_translate.config import AppConfig
+
+    if not isinstance(config, AppConfig):
+        raise BundleError("validated bundle config returned an unexpected object")
+    raw_root = PurePosixPath(
+        _validated_config_relative_path(config.data.raw_dir, field="data.raw_dir")
+    )
+    evaluation_root = raw_root / "evaluation_only"
+    corpus_root = PurePosixPath(
+        _validated_config_relative_path(
+            config.foundation.corpus_dir,
+            field="foundation.corpus_dir",
+        )
+    )
+    foundation_languages = set(config.foundation_languages())
+
+    for raw_path, origin in origins.items():
+        path = _validated_relative_path(raw_path)
+        immediate_parallel = path.parent == raw_root and path.suffix == ".jsonl"
+        evaluation = evaluation_root in path.parents
+        monolingual = corpus_root in path.parents and path.suffix.lower() in MONOLINGUAL_SUFFIXES
+        if origin == "data-jsonl" and not immediate_parallel:
+            raise BundleError(
+                f"data-jsonl origin is outside the configured immediate raw corpus: {raw_path}"
+            )
+        if origin == "evaluation-only" and not evaluation:
+            raise BundleError(
+                f"evaluation-only origin is outside {evaluation_root.as_posix()}: {raw_path}"
+            )
+        if origin == "monolingual-corpus":
+            if not monolingual:
+                raise BundleError(
+                    "monolingual-corpus origin is outside the configured readable corpus: "
+                    f"{raw_path}"
+                )
+            logical_path = path.relative_to(corpus_root)
+            if len(logical_path.parts) < 2:
+                raise BundleError(f"monolingual corpus path has no language directory: {raw_path}")
+            language = _canonical_language(
+                logical_path.parts[0],
+                field=f"monolingual origin language for {raw_path}",
+            )
+            if language not in foundation_languages:
+                raise BundleError(
+                    f"monolingual origin language is not configured for foundation: {raw_path}"
+                )
+        if origin == "git-index" and (immediate_parallel or evaluation or monolingual):
+            raise BundleError(
+                f"git-index origin masks a path with a semantic data role: {raw_path}"
+            )
+
+
 def _training_contract_payload(
     config_path: PurePosixPath,
     config_sha256: str,
@@ -2035,6 +2093,7 @@ def _validate_training_contract(
     if len(config_content) != config_size:
         raise BundleError("selected training config size changed during validation")
     config = _validated_config_from_payload(config_content, config_key)
+    _validate_payload_origin_paths(config, origins)
     payload_raw_parallel_paths = {
         path for path, origin in origins.items() if origin == "data-jsonl"
     }
