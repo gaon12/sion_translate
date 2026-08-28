@@ -15,6 +15,10 @@ import numpy as np
 import pytest
 
 from scripts import package_gpu_bundle
+from sion_translate.bundle_contract import (
+    load_embedded_training_contract,
+    verify_embedded_bundle_payload,
+)
 
 
 def _git(repository: Path, *arguments: str) -> str:
@@ -279,6 +283,10 @@ def test_build_is_deterministic_allowlisted_and_verifiable(tmp_path: Path) -> No
         archive.extractall(extracted)
     tree_result = package_gpu_bundle.verify_tree(extracted)
     assert tree_result == archive_result
+    runtime_contract = load_embedded_training_contract(extracted / "sion_translate")
+    assert runtime_contract is not None
+    assert runtime_contract.raw_parallel_data_included is True
+    verify_embedded_bundle_payload(runtime_contract)
 
 
 def test_bundle_requires_the_committed_gpu_lock(tmp_path: Path) -> None:

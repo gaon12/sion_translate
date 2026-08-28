@@ -1081,10 +1081,10 @@ class _UniqueKeySafeLoader(yaml.SafeLoader):
         return mapping
 
 
-def load_raw_config(path: str | Path) -> dict[str, Any]:
-    """Read a config file and reject ambiguous or misspelled top-level keys."""
-    with Path(path).open("r", encoding="utf-8") as handle:
-        raw = yaml.load(handle, Loader=_UniqueKeySafeLoader) or {}
+def parse_raw_config_text(content: str) -> dict[str, Any]:
+    """Parse config text and reject ambiguous or misspelled top-level keys."""
+
+    raw = yaml.load(content, Loader=_UniqueKeySafeLoader) or {}
     if not isinstance(raw, dict):
         raise ValueError("config root must be a mapping")
 
@@ -1094,6 +1094,12 @@ def load_raw_config(path: str | Path) -> dict[str, Any]:
         expected = ", ".join(sorted(_CONFIG_TOP_LEVEL_KEYS))
         raise ValueError(f"unknown top-level config key(s): {rendered}; expected only: {expected}")
     return raw
+
+
+def load_raw_config(path: str | Path) -> dict[str, Any]:
+    """Read a config file and reject ambiguous or misspelled top-level keys."""
+
+    return parse_raw_config_text(Path(path).read_text(encoding="utf-8"))
 
 
 def config_from_raw(raw: dict[str, Any]) -> AppConfig:
