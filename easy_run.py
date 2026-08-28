@@ -2,12 +2,14 @@
 
 On Linux, this script places source data and preprocessing outputs on a RAM disk
 when ``/dev/shm`` has enough free space. Before training, it also synchronizes
-the tokenizer and dataset atomically to the persistent ``artifacts/`` directory.
+the tokenizer and prepared datasets atomically to the persistent ``artifacts/``
+directory.
 Checkpoints and exports are always written to persistent storage.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import hashlib
 import os
 import shlex
@@ -21,12 +23,28 @@ from pathlib import Path
 import yaml
 
 from sion_translate.artifacts import DEFAULT_ARTIFACT_ROOT
+from sion_translate.bundle_contract import (
+    BundleContractError,
+    load_embedded_training_contract,
+    verify_embedded_bundle_payload,
+)
 
 
 ROOT = Path(__file__).resolve().parent
 PERSISTENT_ARTIFACTS = ROOT / DEFAULT_ARTIFACT_ROOT
 EXPRESSIVE_CORPUS_NAME = "synthetic_expressive_cultural.jsonl"
 MIN_RAM_HEADROOM = 8 * 2**30
+PREPARED_ARTIFACT_DIRECTORIES = ("tokenizer", "dataset", "foundation_dataset")
+
+
+@dataclass(frozen=True)
+class EmbeddedBundlePolicy:
+    """Launch choices already authenticated by an extracted GPU bundle."""
+
+    config_path: Path
+    raw_parallel_data_included: bool
+    monolingual_corpus_included: bool
+    foundation_enabled: bool
 
 
 def _tmux_session_name() -> str:
@@ -172,10 +190,10 @@ def _runtime_artifact_directory(ram_workspace: Path | None) -> Path:
 
 
 def _restore_active_artifacts(source: Path, destination: Path) -> None:
-    """Restore only live tokenizer/dataset directories into a RAM workspace."""
+    """Restore only live prepared directories into a RAM workspace."""
 
     destination.mkdir(parents=True, exist_ok=True)
-    for name in ("tokenizer", "dataset"):
+    for name in PREPARED_ARTIFACT_DIRECTORIES:
         active = source / name
         if active.exists():
             shutil.copytree(active, destination / name)
@@ -193,6 +211,8 @@ def _generated_config(raw_dir: Path, artifacts_dir: Path) -> Path:
     data["tokenizer_model"] = str(artifacts_dir / "tokenizer" / "sion.model")
     data["tokenizer_features"] = str(artifacts_dir / "tokenizer" / "token_features.npz")
     data["dataset_dir"] = str(artifacts_dir / "dataset")
+    foundation = raw.setdefault("foundation", {})
+    foundation["dataset_dir"] = str(artifacts_dir / "foundation_dataset")
 
     handle = tempfile.NamedTemporaryFile(
         mode="w", encoding="utf-8", suffix=".yaml", prefix="sion-easy-", delete=False
@@ -258,6 +278,69 @@ def _discover_raw_files(data_dir: Path, env: dict[str, str]) -> list[Path]:
     if not raw_files:
         raise SystemExit("No data/*.jsonl files were found.")
     return raw_files
+
+
+def _embedded_bundle_policy(root: Path | None = None) -> EmbeddedBundlePolicy | None:
+    """Authenticate an extracted bundle before the launcher makes any choices."""
+
+    bundle_root = (root or ROOT).resolve()
+    try:
+        contract = load_embedded_training_contract(
+            bundle_root,
+            require_project_identity=True,
+        )
+        if contract is None:
+            return None
+        verify_embedded_bundle_payload(contract)
+    except BundleContractError as error:
+        raise SystemExit(
+            "[easy_run] The extracted GPU bundle failed runtime authentication: "
+            f"{error}. Re-extract the archive and run verify-tree again."
+        ) from error
+    return EmbeddedBundlePolicy(
+        config_path=contract.root / contract.config_path,
+        raw_parallel_data_included=contract.raw_parallel_data_included,
+        monolingual_corpus_included=bool(contract.records_for_origin("monolingual-corpus")),
+        foundation_enabled=contract.foundation_enabled,
+    )
+
+
+def _existing_bundle_raw_files(data_dir: Path, policy: EmbeddedBundlePolicy) -> list[Path]:
+    """List authenticated raw shards without rebuilding or modifying them."""
+
+    if not policy.raw_parallel_data_included:
+        return []
+    raw_files = sorted(data_dir.glob("*.jsonl"))
+    if not raw_files:
+        raise SystemExit(
+            "[easy_run] The verified bundle declares raw parallel data, but no "
+            "data/*.jsonl payload is present. Re-extract and verify the archive."
+        )
+    return raw_files
+
+
+def _report_embedded_bundle_policy(policy: EmbeddedBundlePolicy) -> None:
+    if policy.raw_parallel_data_included:
+        print(
+            "[easy_run] The verified bundle includes raw parallel data. Existing "
+            "payload files will be used without modifying them.",
+            flush=True,
+        )
+    else:
+        print(
+            "[easy_run] The prepared-only bundle omits raw parallel data. "
+            "sion-train will authenticate and reuse the prepared tokenizer and shards.",
+            flush=True,
+        )
+    if not policy.foundation_enabled:
+        print("[easy_run] Foundation training is disabled by the authenticated config.")
+    elif policy.monolingual_corpus_included:
+        print("[easy_run] The bundle includes the configured foundation source corpus.")
+    else:
+        print(
+            "[easy_run] The foundation source corpus is omitted. sion-train will "
+            "authenticate the prepared foundation generation before allocating the model."
+        )
 
 
 def _validate_gpu_runtime(torch_module) -> tuple[int, tuple[str, ...]]:
@@ -440,6 +523,10 @@ def _verify_tokenizer(
 
 
 def main() -> None:
+    # Hash the complete immutable package before importing the heavy GPU
+    # runtime, creating a terminal session, or allowing the launcher to select
+    # a data/artifact layout.
+    bundle_policy = _embedded_bundle_policy()
     _enter_tmux()
 
     import torch
@@ -451,35 +538,49 @@ def main() -> None:
     env["PYTHONPATH"] = src_path + os.pathsep + env.get("PYTHONPATH", "")
 
     source_data = ROOT / "data"
-    raw_files = _discover_raw_files(source_data, env)
-
-    required = sum(path.stat().st_size for path in raw_files)
-    active_artifact_size = sum(
-        _directory_size(PERSISTENT_ARTIFACTS / name) for name in ("tokenizer", "dataset")
-    )
-    required += max(active_artifact_size, required * 3)
-    ram = _ram_workspace(required)
-    runtime_artifacts = _runtime_artifact_directory(ram)
-    if ram is None:
+    remove_generated_config = False
+    if bundle_policy is not None:
+        # A bundle's config hash and canonical paths are authenticated. Moving
+        # its artifacts to RAM would require a new config, which the training
+        # preflight correctly rejects. Keep this mode immutable and in place.
+        raw_files = _existing_bundle_raw_files(source_data, bundle_policy)
+        ram = None
         runtime_data = source_data
-        print("[easy_run] Running from persistent storage without a RAM disk.")
+        runtime_artifacts = PERSISTENT_ARTIFACTS
+        generated_config = bundle_policy.config_path
+        print("[easy_run] Running the verified bundle in its authenticated layout.")
+        _report_embedded_bundle_policy(bundle_policy)
     else:
-        runtime_data = ram / "data"
-        print(f"[easy_run] Using RAM disk: {ram}")
-        print(f"[easy_run] Copying {len(raw_files)} source data files to RAM.")
-        shutil.rmtree(runtime_data, ignore_errors=True)
-        _copy_files_parallel(source_data, runtime_data)
-        # The /dev/shm workspace has a stable checkout-derived name and can
-        # survive a crashed run. Never inherit an orphaned cache implicitly.
-        shutil.rmtree(runtime_artifacts, ignore_errors=True)
-        if PERSISTENT_ARTIFACTS.exists():
-            _restore_active_artifacts(PERSISTENT_ARTIFACTS, runtime_artifacts)
+        raw_files = _discover_raw_files(source_data, env)
+        required = sum(path.stat().st_size for path in raw_files)
+        active_artifact_size = sum(
+            _directory_size(PERSISTENT_ARTIFACTS / name) for name in PREPARED_ARTIFACT_DIRECTORIES
+        )
+        required += max(active_artifact_size, required * 3)
+        ram = _ram_workspace(required)
+        runtime_artifacts = _runtime_artifact_directory(ram)
+        if ram is None:
+            runtime_data = source_data
+            print("[easy_run] Running from persistent storage without a RAM disk.")
+        else:
+            runtime_data = ram / "data"
+            print(f"[easy_run] Using RAM disk: {ram}")
+            print(f"[easy_run] Copying {len(raw_files)} source data files to RAM.")
+            shutil.rmtree(runtime_data, ignore_errors=True)
+            _copy_files_parallel(source_data, runtime_data)
+            # The /dev/shm workspace has a stable checkout-derived name and can
+            # survive a crashed run. Never inherit an orphaned cache implicitly.
+            shutil.rmtree(runtime_artifacts, ignore_errors=True)
+            if PERSISTENT_ARTIFACTS.exists():
+                _restore_active_artifacts(PERSISTENT_ARTIFACTS, runtime_artifacts)
+        generated_config = _generated_config(runtime_data, runtime_artifacts)
+        remove_generated_config = True
 
-    generated_config = _generated_config(runtime_data, runtime_artifacts)
     # Before anything expensive: a shard the pipeline cannot read is worth
     # catching now rather than after hours of training.
-    _check_shard_keys(env)
-    _report_foundation_corpus(generated_config)
+    if bundle_policy is None:
+        _check_shard_keys(env)
+        _report_foundation_corpus(generated_config)
     try:
         # Complete preprocessing on one rank so torchrun workers do not wait at
         # a barrier for an extended period or hit a communication timeout.
@@ -501,13 +602,14 @@ def main() -> None:
 
         if ram is not None:
             print(
-                "[easy_run] Preserving tokenizer and dataset on persistent "
+                "[easy_run] Preserving tokenizer and prepared datasets on persistent "
                 f"storage at {DEFAULT_ARTIFACT_ROOT}/."
             )
-            _atomic_sync_directory(
-                runtime_artifacts / "tokenizer", PERSISTENT_ARTIFACTS / "tokenizer"
-            )
-            _atomic_sync_directory(runtime_artifacts / "dataset", PERSISTENT_ARTIFACTS / "dataset")
+            for name in PREPARED_ARTIFACT_DIRECTORIES:
+                _atomic_sync_directory(
+                    runtime_artifacts / name,
+                    PERSISTENT_ARTIFACTS / name,
+                )
 
         command = [
             sys.executable,
@@ -523,7 +625,8 @@ def main() -> None:
         print(f"[easy_run] Starting training on {gpu_count} CUDA GPUs ({', '.join(gpu_names)}).")
         _run(command, env)
     finally:
-        generated_config.unlink(missing_ok=True)
+        if remove_generated_config:
+            generated_config.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

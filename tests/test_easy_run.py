@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+from bundle_contract_fixtures import rewrite_manifest, write_test_bundle
 import easy_run
 import pytest
 
@@ -24,6 +25,7 @@ def test_ram_restore_excludes_historical_artifact_backups(tmp_path: Path) -> Non
     runtime = tmp_path / "runtime"
     (persistent / "tokenizer").mkdir(parents=True)
     (persistent / "dataset").mkdir()
+    (persistent / "foundation_dataset").mkdir()
     (persistent / "tokenizer.incompatible-old").mkdir()
     (persistent / "tokenizer" / "sion.model").write_bytes(b"active")
 
@@ -31,6 +33,7 @@ def test_ram_restore_excludes_historical_artifact_backups(tmp_path: Path) -> Non
 
     assert (runtime / "tokenizer" / "sion.model").read_bytes() == b"active"
     assert (runtime / "dataset").is_dir()
+    assert (runtime / "foundation_dataset").is_dir()
     assert not (runtime / "tokenizer.incompatible-old").exists()
 
 
@@ -90,6 +93,9 @@ def test_generated_config_points_only_data_artifacts_to_runtime(
         raw = easy_run.yaml.safe_load(config_path.read_text(encoding="utf-8"))
         assert raw["data"]["raw_dir"] == str(tmp_path / "ram-data")
         assert raw["data"]["dataset_dir"] == str(tmp_path / "ram-artifacts" / "dataset")
+        assert raw["foundation"]["dataset_dir"] == str(
+            tmp_path / "ram-artifacts" / "foundation_dataset"
+        )
         assert raw["data"]["source_sampling_alpha"] == 0.9
         assert raw["training"]["output_dir"] == "runs/auto"
     finally:
@@ -174,6 +180,175 @@ def test_raw_discovery_builds_generated_corpus_before_listing(tmp_path: Path, mo
 
     assert observed == [data_dir / easy_run.EXPRESSIVE_CORPUS_NAME]
     assert raw_files == observed
+
+
+def _write_bundle_manifest(
+    root: Path,
+    *,
+    raw_parallel_data_included: bool,
+    monolingual_corpus_included: bool = False,
+    foundation_enabled: bool = True,
+) -> None:
+    write_test_bundle(
+        root,
+        raw_files=(
+            {"data/custom-language-graph.jsonl": b"{}\n"} if raw_parallel_data_included else None
+        ),
+        monolingual_files=(
+            {"data/corpus/de/news.txt": b"Ein ausreichend langer Beispielsatz.\n"}
+            if monolingual_corpus_included
+            else None
+        ),
+        foundation_enabled=foundation_enabled,
+    )
+
+
+def test_embedded_bundle_policy_preserves_config_and_source_choices(tmp_path: Path) -> None:
+    _write_bundle_manifest(
+        tmp_path,
+        raw_parallel_data_included=False,
+        monolingual_corpus_included=False,
+    )
+
+    policy = easy_run._embedded_bundle_policy(tmp_path)
+
+    assert policy == easy_run.EmbeddedBundlePolicy(
+        config_path=tmp_path / "sion_translate.yaml",
+        raw_parallel_data_included=False,
+        monolingual_corpus_included=False,
+        foundation_enabled=True,
+    )
+    assert easy_run._existing_bundle_raw_files(tmp_path / "data", policy) == []
+
+
+def test_embedded_bundle_policy_rejects_an_inventory_disagreement(tmp_path: Path) -> None:
+    manifest = write_test_bundle(
+        tmp_path,
+        raw_files={"data/corpus.jsonl": b"{}\n"},
+    )
+    manifest["training_contract"]["raw_parallel_data_included"] = False
+    rewrite_manifest(tmp_path, manifest)
+
+    with pytest.raises(SystemExit, match="raw data payload"):
+        easy_run._embedded_bundle_policy(tmp_path)
+
+
+def test_raw_bundle_lists_existing_payload_without_running_a_builder(tmp_path: Path) -> None:
+    _write_bundle_manifest(tmp_path, raw_parallel_data_included=True)
+    data_dir = tmp_path / "data"
+    shard = data_dir / "custom-language-graph.jsonl"
+    policy = easy_run._embedded_bundle_policy(tmp_path)
+    assert policy is not None
+
+    assert easy_run._existing_bundle_raw_files(data_dir, policy) == [shard]
+
+
+def test_bundle_authentication_fails_before_gpu_runtime_preflight(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "sion_translate"
+    _write_bundle_manifest(root, raw_parallel_data_included=False)
+    (root / "sion_translate.yaml").write_text(
+        "data:\n  language_pairs: [[es, it]]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(easy_run, "ROOT", root)
+    monkeypatch.setattr(easy_run, "PERSISTENT_ARTIFACTS", root / "artifacts")
+    monkeypatch.setattr(
+        easy_run,
+        "_enter_tmux",
+        lambda: (_ for _ in ()).throw(AssertionError("tmux must not start for an invalid bundle")),
+    )
+    monkeypatch.setattr(
+        easy_run,
+        "_validate_gpu_runtime",
+        lambda _torch: (_ for _ in ()).throw(
+            AssertionError("GPU preflight must not run for an invalid bundle")
+        ),
+    )
+
+    with pytest.raises(SystemExit, match="failed runtime authentication"):
+        easy_run.main()
+
+
+def test_stripped_bundle_metadata_fails_before_tmux_or_gpu_preflight(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "sion_translate"
+    _write_bundle_manifest(root, raw_parallel_data_included=False)
+    (root / "PACKAGE_MANIFEST.json").unlink()
+    (root / "SHA256SUMS").unlink()
+    (root / "pyproject.toml").unlink()
+    (root / ".git").mkdir()
+    monkeypatch.setattr(easy_run, "ROOT", root)
+    monkeypatch.setattr(easy_run, "PERSISTENT_ARTIFACTS", root / "artifacts")
+    monkeypatch.setattr(
+        easy_run,
+        "_enter_tmux",
+        lambda: (_ for _ in ()).throw(AssertionError("tmux must not start")),
+    )
+    monkeypatch.setattr(
+        easy_run,
+        "_validate_gpu_runtime",
+        lambda _torch: (_ for _ in ()).throw(AssertionError("GPU preflight must not run")),
+    )
+
+    with pytest.raises(SystemExit, match="not a valid Git checkout"):
+        easy_run.main()
+
+
+def test_prepared_bundle_main_never_requires_or_mutates_raw_data(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "sion_translate"
+    root.mkdir()
+    (root / "data").mkdir()
+    (root / "artifacts" / "tokenizer").mkdir(parents=True)
+    _write_bundle_manifest(root, raw_parallel_data_included=False)
+    monkeypatch.setattr(easy_run, "ROOT", root)
+    monkeypatch.setattr(easy_run, "PERSISTENT_ARTIFACTS", root / "artifacts")
+    monkeypatch.setattr(easy_run, "_enter_tmux", lambda: None)
+    monkeypatch.setattr(
+        easy_run,
+        "_validate_gpu_runtime",
+        lambda _torch: (2, ("NVIDIA H100",)),
+    )
+    for forbidden in (
+        "_discover_raw_files",
+        "_ram_workspace",
+        "_generated_config",
+        "_check_shard_keys",
+        "_report_foundation_corpus",
+        "_atomic_sync_directory",
+    ):
+        monkeypatch.setattr(
+            easy_run,
+            forbidden,
+            lambda *args, _name=forbidden, **kwargs: (_ for _ in ()).throw(
+                AssertionError(f"prepared bundle must not call {_name}")
+            ),
+        )
+    verified_tokenizers: list[tuple[Path, Path]] = []
+    monkeypatch.setattr(
+        easy_run,
+        "_verify_tokenizer",
+        lambda model, data: verified_tokenizers.append((model, data)),
+    )
+    commands: list[list[str]] = []
+    monkeypatch.setattr(easy_run, "_run", lambda command, env: commands.append(command))
+
+    easy_run.main()
+
+    config_path = root / "sion_translate.yaml"
+    assert config_path.is_file()
+    assert len(commands) == 2
+    assert commands[0][-3:] == ["--config", str(config_path), "--prepare-only"]
+    assert commands[0][commands[0].index("--config") + 1] == str(config_path)
+    assert commands[1][commands[1].index("--config") + 1] == str(config_path)
+    assert verified_tokenizers == [(root / "artifacts/tokenizer/sion.model", root / "data")]
 
 
 def test_enter_tmux_is_noop_inside_existing_tmux(monkeypatch) -> None:
