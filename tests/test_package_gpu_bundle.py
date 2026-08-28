@@ -37,9 +37,25 @@ def _repository(tmp_path: Path) -> Path:
     (root / "src").mkdir()
     (root / "src" / "train.py").write_text("print('train')\n", encoding="utf-8")
     (root / "README.md").write_text("training bundle\n", encoding="utf-8")
+    (root / "sion_translate.yaml").write_text(
+        """\
+data:
+  language_pair: [ko, ja]
+foundation:
+  languages: [ko]
+""",
+        encoding="utf-8",
+    )
     (root / "data").mkdir()
     (root / "data" / ".gitkeep").write_text("", encoding="utf-8")
-    _git(root, "add", "README.md", "src/train.py", "data/.gitkeep")
+    _git(
+        root,
+        "add",
+        "README.md",
+        "sion_translate.yaml",
+        "src/train.py",
+        "data/.gitkeep",
+    )
     _git(root, "commit", "-qm", "initial source")
 
     (root / "data" / "corpus.jsonl").write_text(
@@ -82,6 +98,7 @@ def test_build_is_deterministic_allowlisted_and_verifiable(tmp_path: Path) -> No
         names = set(archive.namelist())
         assert names == {
             "sion_translate/README.md",
+            "sion_translate/sion_translate.yaml",
             "sion_translate/src/train.py",
             "sion_translate/data/.gitkeep",
             "sion_translate/data/corpus.jsonl",
@@ -98,19 +115,70 @@ def test_build_is_deterministic_allowlisted_and_verifiable(tmp_path: Path) -> No
         "commit": _git(root, "rev-parse", "HEAD"),
         "tree": _git(root, "rev-parse", "HEAD^{tree}"),
     }
+    assert manifest["training_contract"] == {
+        "schema": "sion-gpu-training-contract-v1",
+        "config_path": "sion_translate.yaml",
+        "config_sha256": _file_sha256(root / "sion_translate.yaml"),
+        "raw_parallel_data_included": True,
+        "language_pairs": [["ko", "ja"]],
+        "translation_directions": [["ko", "ja"], ["ja", "ko"]],
+        "source_only_languages": [],
+        "foundation_enabled": True,
+        "foundation_languages": ["ko"],
+        "paths": {
+            "raw_dir": "data",
+            "tokenizer_model": "artifacts/tokenizer/sion.model",
+            "tokenizer_features": "artifacts/tokenizer/token_features.npz",
+            "translation_dataset": "artifacts/dataset",
+            "foundation_dataset": "artifacts/foundation_dataset",
+        },
+    }
     origins = {entry["path"]: entry["origin"] for entry in manifest["files"]}
     assert origins["README.md"] == "git-index"
     assert origins["data/corpus.jsonl"] == "data-jsonl"
     assert origins["data/evaluation_only/holdout.jsonl"] == "evaluation-only"
 
     archive_result = package_gpu_bundle.verify_archive(first)
-    assert archive_result.file_count == 5
+    assert archive_result.file_count == 6
 
     extracted = tmp_path / "extracted"
     with zipfile.ZipFile(first) as archive:
         archive.extractall(extracted)
     tree_result = package_gpu_bundle.verify_tree(extracted)
     assert tree_result == archive_result
+
+
+def test_tracked_data_keeps_its_semantic_origin_and_opt_in_boundary(tmp_path: Path) -> None:
+    root = _repository(tmp_path)
+    monolingual = root / "data" / "corpus" / "ko" / "wiki.txt"
+    monolingual.parent.mkdir(parents=True)
+    monolingual.write_text("단일어 문장\n", encoding="utf-8")
+    _git(
+        root,
+        "add",
+        "data/corpus.jsonl",
+        "data/evaluation_only/holdout.jsonl",
+        "data/corpus/ko/wiki.txt",
+    )
+    _git(root, "commit", "-qm", "track every data role")
+
+    default_bundle = tmp_path / "tracked-default.zip"
+    package_gpu_bundle.build_bundle(root, default_bundle)
+    default_manifest = _manifest(default_bundle)
+    default_origins = {entry["path"]: entry["origin"] for entry in default_manifest["files"]}
+    assert default_origins["data/corpus.jsonl"] == "data-jsonl"
+    assert default_origins["data/evaluation_only/holdout.jsonl"] == "evaluation-only"
+    assert "data/corpus/ko/wiki.txt" not in default_origins
+    assert default_manifest["training_contract"]["raw_parallel_data_included"] is True
+
+    corpus_bundle = tmp_path / "tracked-with-monolingual.zip"
+    package_gpu_bundle.build_bundle(
+        root,
+        corpus_bundle,
+        include_monolingual_corpus=True,
+    )
+    corpus_origins = {entry["path"]: entry["origin"] for entry in _manifest(corpus_bundle)["files"]}
+    assert corpus_origins["data/corpus/ko/wiki.txt"] == "monolingual-corpus"
 
 
 def _with_monolingual_corpus(root: Path) -> None:
@@ -152,16 +220,78 @@ def _file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _rewrite_tokenizer_metadata(root: Path) -> None:
+def _rewrite_tokenizer_metadata(
+    root: Path,
+    *,
+    monolingual_sources: list[dict[str, object]] | None = None,
+) -> None:
+    from sion_translate.config import load_config
+
+    config = load_config(root / "sion_translate.yaml")
+    translation_languages = [
+        language for pair in config.data.configured_language_pairs() for language in pair
+    ]
+    denoise_languages = list(
+        dict.fromkeys([*translation_languages, *config.foundation_languages()])
+    )
     tokenizer = root / "artifacts" / "tokenizer"
     model = tokenizer / "sion.model"
     vocab = tokenizer / "sion.vocab"
     features = tokenizer / "token_features.npz"
+    raw_source = root / "data" / "corpus.jsonl"
+    contract_sources: list[dict[str, object]] = [
+        {
+            "role": "parallel",
+            "path": raw_source.name,
+            "size": raw_source.stat().st_size,
+            "sha256": _file_sha256(raw_source),
+        }
+    ]
+    for source in monolingual_sources or []:
+        contract_sources.append(
+            {
+                "role": "monolingual",
+                "path": source["logical_path"],
+                "size": source["size_bytes"],
+                "sha256": source["sha256"],
+                "language": source["language"],
+            }
+        )
+    reasoning_languages = list(
+        dict.fromkeys(
+            str(source["language"])
+            for source in monolingual_sources or []
+            if source["task"] == "reasoning"
+        )
+    )
+    training_contract = {
+        "schema": "sion-tokenizer-training-v4",
+        "input_traversal_policy": "portable-input-order-v1",
+        "sources": contract_sources,
+        "language_pairs": [list(pair) for pair in config.data.configured_language_pairs()],
+        "translation_directions": [
+            list(direction) for direction in config.data.configured_translation_directions()
+        ],
+        "denoise_languages": denoise_languages,
+        "reasoning_languages": reasoning_languages,
+        "approximate_split": config.data.approximate_split,
+        "source_only_languages": list(config.data.configured_source_only_languages()),
+        "train_only_prefixes": list(config.data.configured_synthetic_prefixes()),
+        "split_digits": True,
+        "monolingual_sample_ratio": config.foundation.tokenizer_sample_ratio,
+    }
     (tokenizer / "tokenizer_metadata.json").write_text(
         json.dumps(
             {
                 "version": 2,
                 "split_digits": True,
+                "language_pair": list(config.data.configured_language_pairs()[0]),
+                "language_pairs": [list(pair) for pair in config.data.configured_language_pairs()],
+                "translation_directions": [
+                    list(direction) for direction in config.data.configured_translation_directions()
+                ],
+                "denoise_languages": denoise_languages,
+                "reasoning_languages": reasoning_languages,
                 "model_file": model.name,
                 "model_sha256": _file_sha256(model),
                 "vocab_file": vocab.name,
@@ -169,6 +299,8 @@ def _rewrite_tokenizer_metadata(root: Path) -> None:
                 "token_features_file": features.name,
                 "token_features_size": features.stat().st_size,
                 "token_features_sha256": _file_sha256(features),
+                "training_contract": training_contract,
+                "training_contract_sha256": _canonical_json_sha256(training_contract),
             },
             sort_keys=True,
         )
@@ -230,6 +362,25 @@ def _with_dataset(
     include_manifest: bool = True,
     include_completion: bool = True,
 ) -> None:
+    from sion_translate.config import load_config
+    from sion_translate.data.prepare import prepare_preprocessing_options
+    from sion_translate.fingerprint import PREPROCESSING_SCHEMA
+
+    config = load_config(root / "sion_translate.yaml")
+    language_pairs = [list(pair) for pair in config.data.configured_language_pairs()]
+    translation_directions = [
+        list(direction) for direction in config.data.configured_translation_directions()
+    ]
+    source_only_languages = list(config.data.configured_source_only_languages())
+    preprocessing_options = prepare_preprocessing_options(
+        approximate_split=config.data.approximate_split,
+        source_only_languages=config.data.configured_source_only_languages(),
+        translation_directions=config.data.configured_translation_directions(),
+        train_only_prefixes=config.data.configured_synthetic_prefixes(),
+        managed_augmentation_prefix=config.data.synthetic_prefix,
+        synthetic_sampling_weight=config.data.synthetic_sampling_weight,
+        language_pair_count=len(config.data.configured_language_pairs()),
+    )
     dataset = root / "artifacts" / "dataset"
     dataset.mkdir(parents=True)
     for split in ("train", "validation", "test"):
@@ -243,7 +394,16 @@ def _with_dataset(
     )
     fingerprint = {
         "schema": "sion-dataset-fingerprint-v2",
+        "preprocessing_schema": PREPROCESSING_SCHEMA,
+        "language_pairs": language_pairs,
         "tokenizer_sha256": digest,
+        "preprocessing_options": preprocessing_options,
+        "files": {
+            "corpus.jsonl": {
+                "size": (root / "data" / "corpus.jsonl").stat().st_size,
+                "sha256": _file_sha256(root / "data" / "corpus.jsonl"),
+            }
+        },
     }
     raw_fingerprint = dataset / "raw_fingerprint.json"
     if include_raw_fingerprint:
@@ -254,8 +414,13 @@ def _with_dataset(
             json.dumps(
                 {
                     "format": "sion-indexed-parallel-v6",
+                    "language_pairs": language_pairs,
+                    "translation_directions": translation_directions,
+                    "source_only_languages": source_only_languages,
+                    "preprocessing_schema": PREPROCESSING_SCHEMA,
+                    "preprocessing_options": preprocessing_options,
                     "fingerprint": {
-                        "schema": "sion-dataset-fingerprint-v2",
+                        **fingerprint,
                         "tokenizer_sha256": manifest_tokenizer_sha256 or digest,
                     },
                     "artifact_inventory": _artifact_inventory(dataset),
@@ -288,6 +453,9 @@ def _with_foundation_dataset(
     tokenizer_sha256: str | None = None,
     manifest_updates: dict[str, object] | None = None,
 ) -> None:
+    from sion_translate.config import load_config
+
+    config = load_config(root / "sion_translate.yaml")
     dataset = root / "artifacts" / "foundation_dataset"
     (dataset / "train").mkdir(parents=True)
     (dataset / "validation").mkdir()
@@ -329,6 +497,7 @@ def _with_foundation_dataset(
             "task": "reasoning",
         },
     ]
+    _rewrite_tokenizer_metadata(root, monolingual_sources=sources)
     source_identities = [
         {
             "language": source["language"],
@@ -342,9 +511,9 @@ def _with_foundation_dataset(
     manifest: dict[str, object] = {
         "format": "sion-foundation-indexed-v3",
         "stage": "foundation",
-        "release_name": "sion",
+        "release_name": config.foundation.release_name,
         "objective": "span-corruption-denoising+structured-reasoning",
-        "languages": ["ko"],
+        "languages": list(config.foundation_languages()),
         "language_to_id": {"ko": 0},
         "language_pairs": [["ko", "ko"]],
         "source_only_languages": [],
@@ -361,22 +530,24 @@ def _with_foundation_dataset(
         },
         "preprocessing_schema": "foundation-mixed-objectives-v6",
         "preprocessing_options": {
-            "deduplicate": True,
-            "deduplication_backend": "sqlite-blake2b-128-v1",
-            "maximum_characters": 4000,
-            "max_tokens": 510,
-            "max_target_tokens": 510,
-            "minimum_characters": 8,
-            "reasoning_sample_share": 0.05,
-            "shard_size": 200_000,
-            "validation_fraction": 0.002,
+            "deduplicate": config.foundation.deduplicate,
+            "deduplication_backend": (
+                "sqlite-blake2b-128-v1" if config.foundation.deduplicate else "disabled"
+            ),
+            "maximum_characters": config.foundation.maximum_characters,
+            "max_tokens": config.data.max_source_length - 2,
+            "max_target_tokens": config.data.max_target_length - 1,
+            "minimum_characters": config.foundation.minimum_characters,
+            "reasoning_sample_share": config.foundation.reasoning_sample_share,
+            "shard_size": config.foundation.shard_size,
+            "validation_fraction": config.foundation.validation_fraction,
         },
         "source_identity_schema": "corpus-relative-posix-sha256-v1",
         "sources_sha256": _canonical_json_sha256(source_identities),
         "sources": sources,
         "language_sampling": {
-            "alpha": 0.3,
-            "minimum_share": 0.05,
+            "alpha": config.foundation.language_sampling_alpha,
+            "minimum_share": config.foundation.minimum_language_share,
             "weights": {"ko": 1.0},
             "counts": {"ko": 4},
             "warnings": [],
@@ -558,6 +729,94 @@ def test_the_dataset_identity_sources_must_agree(tmp_path: Path) -> None:
         )
 
 
+def test_prepared_artifacts_must_match_the_selected_language_graph(tmp_path: Path) -> None:
+    root = _repository(tmp_path)
+    _with_tokenizer(root, complete=True)
+    _with_dataset(root)
+    config = root / "sion_translate.yaml"
+    config.write_text(
+        "data:\n  language_pair: [de, fr]\nfoundation:\n  languages: [de]\n",
+        encoding="utf-8",
+    )
+    _git(root, "add", config.name)
+    _git(root, "commit", "-qm", "change the configured language graph")
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="language_pairs disagrees"):
+        package_gpu_bundle.build_bundle(
+            root,
+            tmp_path / "wrong-language-graph.zip",
+            include_tokenizer=True,
+            include_dataset=True,
+        )
+
+
+def test_tokenizer_sources_must_match_the_current_parallel_corpus(tmp_path: Path) -> None:
+    root = _repository(tmp_path)
+    _with_tokenizer(root, complete=True)
+    (root / "data" / "corpus.jsonl").write_text(
+        '{"ko":"토크나이저 이후 변경","ja":"変更後"}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="parallel-source provenance"):
+        package_gpu_bundle.build_bundle(
+            root,
+            tmp_path / "stale-tokenizer.zip",
+            include_tokenizer=True,
+        )
+
+
+def test_tokenizer_requires_an_authenticated_training_contract(tmp_path: Path) -> None:
+    root = _repository(tmp_path)
+    _with_tokenizer(root, complete=True)
+    metadata_path = root / "artifacts" / "tokenizer" / "tokenizer_metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    del metadata["training_contract"]
+    del metadata["training_contract_sha256"]
+    metadata_path.write_text(json.dumps(metadata) + "\n", encoding="utf-8")
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="training_contract"):
+        package_gpu_bundle.build_bundle(
+            root,
+            tmp_path / "unauthenticated-tokenizer.zip",
+            include_tokenizer=True,
+        )
+
+
+def test_tokenizer_bundle_requires_digit_splitting(tmp_path: Path) -> None:
+    root = _repository(tmp_path)
+    _with_tokenizer(root, complete=True)
+    metadata_path = root / "artifacts" / "tokenizer" / "tokenizer_metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["split_digits"] = False
+    metadata_path.write_text(json.dumps(metadata) + "\n", encoding="utf-8")
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="split_digits=true"):
+        package_gpu_bundle.build_bundle(
+            root,
+            tmp_path / "merged-digit-tokenizer.zip",
+            include_tokenizer=True,
+        )
+
+
+def test_included_raw_corpus_must_match_the_prepared_dataset(tmp_path: Path) -> None:
+    root = _repository(tmp_path)
+    _with_tokenizer(root, complete=True)
+    _with_dataset(root)
+    (root / "data" / "corpus.jsonl").write_text(
+        '{"ko":"바뀜","ja":"変更"}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="differs from the prepared dataset"):
+        package_gpu_bundle.build_bundle(
+            root,
+            tmp_path / "stale-prepared-dataset.zip",
+            include_tokenizer=True,
+            include_dataset=True,
+        )
+
+
 def test_dataset_payload_must_match_the_manifest_inventory(tmp_path: Path) -> None:
     root = _repository(tmp_path)
     _with_tokenizer(root)
@@ -656,7 +915,7 @@ def test_foundation_dataset_rejects_the_legacy_v2_generation(tmp_path: Path) -> 
     ("manifest_updates", "message"),
     [
         ({"stage": "translation"}, "stage marker"),
-        ({"release_name": "translation"}, "release_name must be"),
+        ({"release_name": "translation"}, "release_name disagrees"),
         ({"preprocessing_schema": "foundation-mixed-objectives-v5"}, "mixed-objectives-v6"),
         ({"target_storage": "duplicated-target-v1"}, "target_storage marker"),
         ({"storage_sides": ["source", "target"]}, "storage_sides marker"),
@@ -676,6 +935,61 @@ def test_foundation_dataset_requires_every_v3_contract_marker(
         package_gpu_bundle.build_bundle(
             root,
             tmp_path / "invalid-foundation-marker.zip",
+            include_tokenizer=True,
+            include_foundation_dataset=True,
+        )
+
+
+def test_foundation_dataset_accepts_the_configured_release_name(tmp_path: Path) -> None:
+    root = _repository(tmp_path)
+    config = root / "sion_translate.yaml"
+    config.write_text(
+        "data:\n  language_pair: [ko, ja]\nfoundation:\n  languages: [ko]\n"
+        "  release_name: sion_base\n",
+        encoding="utf-8",
+    )
+    _git(root, "add", config.name)
+    _git(root, "commit", "-qm", "configure a custom foundation release")
+    _with_tokenizer(root)
+    _with_foundation_dataset(root)
+
+    archive = tmp_path / "custom-foundation-release.zip"
+    package_gpu_bundle.build_bundle(
+        root,
+        archive,
+        include_tokenizer=True,
+        include_foundation_dataset=True,
+    )
+    package_gpu_bundle.verify_archive(archive)
+
+
+def test_foundation_sources_must_match_the_included_monolingual_corpus(
+    tmp_path: Path,
+) -> None:
+    root = _repository(tmp_path)
+    _with_tokenizer(root)
+    _with_foundation_dataset(root)
+    corpus_root = root / "data" / "corpus" / "ko"
+    corpus_root.mkdir(parents=True)
+    (corpus_root / "corpus.txt").write_bytes(b"source corpus")
+    reasoning = corpus_root / "reasoning.jsonl"
+    reasoning.write_bytes(b"reasoning corpus")
+
+    valid = tmp_path / "foundation-sources.zip"
+    package_gpu_bundle.build_bundle(
+        root,
+        valid,
+        include_monolingual_corpus=True,
+        include_tokenizer=True,
+        include_foundation_dataset=True,
+    )
+    reasoning.write_bytes(b"changed reasoning corpus")
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="monolingual corpus differs"):
+        package_gpu_bundle.build_bundle(
+            root,
+            tmp_path / "stale-foundation-sources.zip",
+            include_monolingual_corpus=True,
             include_tokenizer=True,
             include_foundation_dataset=True,
         )
@@ -801,6 +1115,27 @@ def test_requesting_an_absent_optional_tree_is_an_error(tmp_path: Path) -> None:
     with pytest.raises(package_gpu_bundle.BundleError, match="configured corpus directory"):
         package_gpu_bundle.build_bundle(
             root, tmp_path / "no-corpus.zip", include_monolingual_corpus=True
+        )
+
+
+def test_bundle_rejects_a_config_path_the_default_train_command_would_ignore(
+    tmp_path: Path,
+) -> None:
+    root = _repository(tmp_path)
+    alternate = root / "configs" / "alternate.yaml"
+    alternate.parent.mkdir()
+    alternate.write_text(
+        "data:\n  language_pair: [ko, ja]\nfoundation:\n  languages: [ko]\n",
+        encoding="utf-8",
+    )
+    _git(root, "add", alternate.relative_to(root).as_posix())
+    _git(root, "commit", "-qm", "add an alternate training config")
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="default sion-train command"):
+        package_gpu_bundle.build_bundle(
+            root,
+            tmp_path / "alternate-config.zip",
+            config_path="configs/alternate.yaml",
         )
 
 

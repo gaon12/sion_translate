@@ -74,7 +74,11 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 ARCHIVE_ROOT = "sion_translate"
 MANIFEST_NAME = "PACKAGE_MANIFEST.json"
 CHECKSUMS_NAME = "SHA256SUMS"
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
+TRAINING_CONTRACT_SCHEMA = "sion-gpu-training-contract-v1"
+TOKENIZER_TRAINING_SCHEMA = "sion-tokenizer-training-v4"
+TOKENIZER_INPUT_TRAVERSAL_POLICY = "portable-input-order-v1"
+DEFAULT_CONFIG_PATH = "sion_translate.yaml"
 DATASET_FINGERPRINT_SCHEMA = "sion-dataset-fingerprint-v2"
 DATASET_ARTIFACT_INVENTORY_SCHEMA = "sion-indexed-artifact-inventory-v1"
 TRANSLATION_DATASET_FORMAT = "sion-indexed-parallel-v6"
@@ -260,6 +264,14 @@ class MonolingualSelection:
     require_all_languages: bool
 
 
+@dataclass(frozen=True)
+class ConfigSelection:
+    """Validated project configuration selected for this exact bundle."""
+
+    config_path: PurePosixPath
+    config: object
+
+
 def _run_git(root: Path, *arguments: str) -> bytes:
     completed = subprocess.run(
         ["git", *arguments],
@@ -386,11 +398,11 @@ def _canonical_language(value: object, *, field: str) -> str:
         raise BundleError(str(error)) from error
 
 
-def _load_monolingual_selection(
+def _load_config_selection(
     root: Path,
     config_path: Path | str | None,
-) -> MonolingualSelection:
-    raw_config_path = Path(config_path) if config_path is not None else Path("sion_translate.yaml")
+) -> ConfigSelection:
+    raw_config_path = Path(config_path) if config_path is not None else Path(DEFAULT_CONFIG_PATH)
     if raw_config_path.is_absolute():
         resolved_candidate = raw_config_path.resolve(strict=False)
         try:
@@ -407,7 +419,19 @@ def _load_monolingual_selection(
 
     if not isinstance(config_object, AppConfig):
         raise BundleError("validated bundle config returned an unexpected object")
-    config = config_object
+    return ConfigSelection(config_path=config_relative, config=config_object)
+
+
+def _load_monolingual_selection(
+    root: Path,
+    config_path: Path | str | None,
+) -> MonolingualSelection:
+    config_selection = _load_config_selection(root, config_path)
+    config = config_selection.config
+    from sion_translate.config import AppConfig
+
+    if not isinstance(config, AppConfig):
+        raise BundleError("validated bundle config returned an unexpected object")
     if not config.foundation.enabled:
         raise BundleError(
             "--with-monolingual-corpus conflicts with foundation.enabled=false in the config"
@@ -421,14 +445,20 @@ def _load_monolingual_selection(
         field="foundation.corpus_dir",
     )
     return MonolingualSelection(
-        config_path=config_relative,
+        config_path=config_selection.config_path,
         corpus_root=corpus_root,
         languages=selected_languages,
         require_all_languages=config.foundation.require_all_languages,
     )
 
 
-def _tracked_stage_zero_entries(root: Path) -> list[SourceEntry]:
+def _tracked_stage_zero_entries(
+    root: Path,
+    *,
+    reserved_roots: tuple[PurePosixPath, ...] = (),
+) -> list[SourceEntry]:
+    """Collect ordinary tracked files outside separately classified data trees."""
+
     output = _run_git(root, "ls-files", "--stage", "-z")
     entries: list[SourceEntry] = []
     for raw_record in output.split(b"\0"):
@@ -447,6 +477,11 @@ def _tracked_stage_zero_entries(root: Path) -> list[SourceEntry]:
 
         relative_path = _validated_relative_path(path_text)
         if _is_excluded_tracked_path(relative_path):
+            continue
+        if any(
+            relative_path == reserved_root or reserved_root in relative_path.parents
+            for reserved_root in reserved_roots
+        ):
             continue
         if mode not in REGULAR_GIT_MODES:
             raise BundleError(
@@ -727,6 +762,8 @@ def _validate_tokenizer_contract(
     version = metadata.get("version")
     if isinstance(version, bool) or not isinstance(version, int) or version < 2:
         raise BundleError("tokenizer metadata must use version 2 or newer")
+    if metadata.get("split_digits") is not True:
+        raise BundleError("tokenizer metadata must require split_digits=true")
     if metadata.get("model_file") != "sion.model":
         raise BundleError("tokenizer metadata model_file must be 'sion.model'")
     if metadata.get("vocab_file") != "sion.vocab":
@@ -756,6 +793,17 @@ def _validate_tokenizer_contract(
                 or recorded_size != size
             ):
                 raise BundleError(f"tokenizer metadata {size_field} does not match {path}")
+    raw_training_contract = metadata.get("training_contract")
+    if not isinstance(raw_training_contract, Mapping):
+        raise BundleError("tokenizer metadata has no authenticated training_contract")
+    training_contract = dict(cast(Mapping[str, object], raw_training_contract))
+    if training_contract.get("schema") != TOKENIZER_TRAINING_SCHEMA:
+        raise BundleError(f"tokenizer training contract must use {TOKENIZER_TRAINING_SCHEMA}")
+    if training_contract.get("input_traversal_policy") != TOKENIZER_INPUT_TRAVERSAL_POLICY:
+        raise BundleError("tokenizer training contract has an obsolete input traversal policy")
+    training_contract_sha256 = hashlib.sha256(_canonical_json_bytes(training_contract)).hexdigest()
+    if metadata.get("training_contract_sha256") != training_contract_sha256:
+        raise BundleError("tokenizer training contract digest does not match its payload")
     return identities[TOKENIZER_MODEL_PATH][1]
 
 
@@ -1131,8 +1179,14 @@ def _validate_foundation_dataset_contract(
 ) -> None:
     if manifest.get("stage") != "foundation":
         raise BundleError("foundation manifest has an invalid stage marker")
-    if manifest.get("release_name") != FOUNDATION_RELEASE_NAME:
-        raise BundleError(f"foundation manifest release_name must be {FOUNDATION_RELEASE_NAME!r}")
+    release_name = manifest.get("release_name")
+    if (
+        not isinstance(release_name, str)
+        or not release_name
+        or release_name != release_name.strip()
+        or not release_name.isascii()
+    ):
+        raise BundleError("foundation manifest release_name must be normalized non-empty ASCII")
     if manifest.get("preprocessing_schema") != FOUNDATION_PREPROCESSING_SCHEMA:
         raise BundleError(f"foundation manifest does not use {FOUNDATION_PREPROCESSING_SCHEMA}")
     preprocessing_options = _foundation_preprocessing_options(manifest)
@@ -1394,6 +1448,494 @@ def _validate_artifact_contracts(
     )
 
 
+def _validated_config_relative_path(value: object, *, field: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise BundleError(f"bundle config {field} must be a non-empty path string")
+    path = Path(value)
+    if path.is_absolute():
+        raise BundleError(f"bundle config {field} must be repository-relative")
+    return _validated_relative_path(path.as_posix()).as_posix()
+
+
+def _validated_config_from_payload(content: bytes, name: str) -> object:
+    try:
+        decoded = cast(object, yaml.safe_load(content.decode("utf-8")))
+    except (UnicodeDecodeError, yaml.YAMLError) as error:
+        raise BundleError(f"{name} is not valid UTF-8 YAML") from error
+    if decoded is None:
+        raw: dict[str, object] = {}
+    elif isinstance(decoded, dict) and all(isinstance(key, str) for key in decoded):
+        raw = cast(dict[str, object], decoded)
+    else:
+        raise BundleError(f"{name} must contain a YAML mapping")
+    source_root = REPOSITORY_ROOT / "src"
+    source_root_text = str(source_root)
+    if source_root_text not in sys.path:
+        sys.path.insert(0, source_root_text)
+    try:
+        from sion_translate.config import config_from_raw
+
+        return config_from_raw(raw)
+    except (TypeError, ValueError) as error:
+        raise BundleError(f"could not validate bundled training config {name}: {error}") from error
+
+
+def _training_contract_payload(
+    config_path: PurePosixPath,
+    config_sha256: str,
+    config: object,
+    *,
+    raw_parallel_data_included: bool,
+) -> dict[str, object]:
+    from sion_translate.config import AppConfig
+
+    if not isinstance(config, AppConfig):
+        raise BundleError("validated bundle config returned an unexpected object")
+    if config_path != PurePosixPath(DEFAULT_CONFIG_PATH):
+        raise BundleError(
+            "GPU bundles require sion_translate.yaml as the selected config so the "
+            "default sion-train command cannot silently load a different file"
+        )
+    paths = {
+        "raw_dir": _validated_config_relative_path(config.data.raw_dir, field="data.raw_dir"),
+        "tokenizer_model": _validated_config_relative_path(
+            config.data.tokenizer_model,
+            field="data.tokenizer_model",
+        ),
+        "tokenizer_features": _validated_config_relative_path(
+            config.data.tokenizer_features,
+            field="data.tokenizer_features",
+        ),
+        "translation_dataset": _validated_config_relative_path(
+            config.data.dataset_dir,
+            field="data.dataset_dir",
+        ),
+        "foundation_dataset": _validated_config_relative_path(
+            config.foundation.dataset_dir,
+            field="foundation.dataset_dir",
+        ),
+    }
+    expected_paths = {
+        "raw_dir": "data",
+        "tokenizer_model": TOKENIZER_MODEL_PATH,
+        "tokenizer_features": TOKENIZER_FEATURES_PATH,
+        "translation_dataset": TRANSLATION_DATASET_ROOT_PATH,
+        "foundation_dataset": FOUNDATION_DATASET_ROOT_PATH,
+    }
+    if paths != expected_paths:
+        mismatches = {
+            field: {"config": paths[field], "bundle": expected}
+            for field, expected in expected_paths.items()
+            if paths[field] != expected
+        }
+        raise BundleError(
+            "GPU bundle artifact collection currently requires the canonical repository paths; "
+            f"configured path mismatches={mismatches}"
+        )
+    return {
+        "schema": TRAINING_CONTRACT_SCHEMA,
+        "config_path": config_path.as_posix(),
+        "config_sha256": config_sha256,
+        "raw_parallel_data_included": raw_parallel_data_included,
+        "language_pairs": [list(pair) for pair in config.data.configured_language_pairs()],
+        "translation_directions": [
+            list(direction) for direction in config.data.configured_translation_directions()
+        ],
+        "source_only_languages": list(config.data.configured_source_only_languages()),
+        "foundation_enabled": config.foundation.enabled,
+        "foundation_languages": list(config.foundation_languages()),
+        "paths": paths,
+    }
+
+
+def _validated_tokenizer_source_records(
+    raw_sources: object,
+) -> dict[tuple[str, str], tuple[int, str, str | None]]:
+    """Normalize the source identities authenticated by tokenizer training."""
+
+    if not isinstance(raw_sources, list) or not raw_sources:
+        raise BundleError("tokenizer training contract has no source identities")
+    records: dict[tuple[str, str], tuple[int, str, str | None]] = {}
+    for raw_source in cast(list[object], raw_sources):
+        if not isinstance(raw_source, Mapping):
+            raise BundleError("tokenizer training contract contains a non-object source")
+        source = cast(Mapping[object, object], raw_source)
+        role = source.get("role")
+        if role not in {"parallel", "monolingual"}:
+            raise BundleError("tokenizer training contract source role is invalid")
+        expected_fields = {"role", "path", "size", "sha256"}
+        if role == "monolingual":
+            expected_fields.add("language")
+        if set(source) != expected_fields:
+            raise BundleError("tokenizer training contract source fields are invalid")
+        raw_path = source.get("path")
+        if not isinstance(raw_path, str):
+            raise BundleError("tokenizer training contract source path must be a string")
+        path = _validated_relative_path(raw_path).as_posix()
+        size = source.get("size")
+        digest = source.get("sha256")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise BundleError(f"tokenizer training source size is invalid: {path}")
+        if not isinstance(digest, str) or not SHA256_PATTERN.fullmatch(digest):
+            raise BundleError(f"tokenizer training source SHA-256 is invalid: {path}")
+        language: str | None = None
+        if role == "monolingual":
+            language = _canonical_language(
+                source.get("language"),
+                field=f"tokenizer source language for {path}",
+            )
+        key = (role, path)
+        if key in records:
+            raise BundleError(f"tokenizer training contract repeats source {role}:{path}")
+        records[key] = (size, digest, language)
+    return records
+
+
+def _validated_fingerprint_file_identities(
+    raw_files: object,
+) -> dict[str, tuple[int, str]]:
+    if not isinstance(raw_files, Mapping) or not raw_files:
+        raise BundleError("prepared translation fingerprint has no raw file inventory")
+    identities: dict[str, tuple[int, str]] = {}
+    for raw_name, raw_identity in cast(Mapping[object, object], raw_files).items():
+        if not isinstance(raw_name, str):
+            raise BundleError("prepared translation fingerprint filename must be a string")
+        name = _validated_relative_path(raw_name)
+        if len(name.parts) != 1:
+            raise BundleError("prepared translation fingerprint filenames must be basenames")
+        if not isinstance(raw_identity, Mapping):
+            raise BundleError(f"prepared translation fingerprint identity is invalid: {raw_name}")
+        identity = cast(Mapping[object, object], raw_identity)
+        if set(identity) != {"size", "sha256"}:
+            raise BundleError(
+                f"prepared translation fingerprint identity fields are invalid: {raw_name}"
+            )
+        size = identity.get("size")
+        digest = identity.get("sha256")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise BundleError(f"prepared translation fingerprint size is invalid: {raw_name}")
+        if not isinstance(digest, str) or not SHA256_PATTERN.fullmatch(digest):
+            raise BundleError(f"prepared translation fingerprint SHA-256 is invalid: {raw_name}")
+        identities[name.as_posix()] = (size, digest)
+    return identities
+
+
+def _validated_foundation_source_identities(
+    manifest: Mapping[str, object],
+) -> dict[str, tuple[int, str, str]]:
+    raw_sources = manifest.get("sources")
+    if not isinstance(raw_sources, list) or not raw_sources:
+        raise BundleError("prepared foundation dataset has no source identities")
+    identities: dict[str, tuple[int, str, str]] = {}
+    for raw_source in cast(list[object], raw_sources):
+        if not isinstance(raw_source, Mapping):
+            raise BundleError("prepared foundation dataset contains a non-object source")
+        source = cast(Mapping[object, object], raw_source)
+        raw_path = source.get("logical_path")
+        if not isinstance(raw_path, str):
+            raise BundleError("prepared foundation source logical_path must be a string")
+        path = _validated_relative_path(raw_path).as_posix()
+        size = source.get("size_bytes")
+        digest = source.get("sha256")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise BundleError(f"prepared foundation source size is invalid: {path}")
+        if not isinstance(digest, str) or not SHA256_PATTERN.fullmatch(digest):
+            raise BundleError(f"prepared foundation source SHA-256 is invalid: {path}")
+        language = _canonical_language(
+            source.get("language"),
+            field=f"prepared foundation source language for {path}",
+        )
+        if path in identities:
+            raise BundleError(f"prepared foundation dataset repeats source {path}")
+        identities[path] = (size, digest, language)
+    return identities
+
+
+def _validate_config_artifact_semantics(
+    config: object,
+    *,
+    payload_paths: set[str],
+    identities: Mapping[str, tuple[int, str]],
+    read_payload: Callable[[str], bytes],
+    raw_parallel_paths: set[str],
+    monolingual_paths: set[str],
+) -> None:
+    from sion_translate.config import AppConfig
+    from sion_translate.data.prepare import prepare_preprocessing_options
+    from sion_translate.fingerprint import PREPROCESSING_SCHEMA
+
+    if not isinstance(config, AppConfig):
+        raise BundleError("validated bundle config returned an unexpected object")
+    expected_pairs = [list(pair) for pair in config.data.configured_language_pairs()]
+    expected_directions = [
+        list(direction) for direction in config.data.configured_translation_directions()
+    ]
+    expected_source_only = list(config.data.configured_source_only_languages())
+    translation_languages = [
+        language for pair in config.data.configured_language_pairs() for language in pair
+    ]
+    expected_denoise_languages = list(
+        dict.fromkeys([*translation_languages, *config.foundation_languages()])
+    )
+    tokenizer_source_records: dict[tuple[str, str], tuple[int, str, str | None]] = {}
+    tokenizer_reasoning_languages: list[str] = []
+    translation_source_identities: dict[str, tuple[int, str]] = {}
+    foundation_source_identities: dict[str, tuple[int, str, str]] = {}
+    foundation_reasoning_languages: list[str] = []
+
+    if TOKENIZER_METADATA_PATH in payload_paths:
+        tokenizer_metadata = _parse_json_object(
+            read_payload(TOKENIZER_METADATA_PATH),
+            TOKENIZER_METADATA_PATH,
+        )
+        tokenizer_expected = {
+            "language_pairs": expected_pairs,
+            "translation_directions": expected_directions,
+            "denoise_languages": expected_denoise_languages,
+        }
+        for field, expected in tokenizer_expected.items():
+            if tokenizer_metadata.get(field) != expected:
+                raise BundleError(
+                    f"tokenizer metadata {field} disagrees with the selected training config"
+                )
+        raw_reasoning_languages = tokenizer_metadata.get("reasoning_languages")
+        if not isinstance(raw_reasoning_languages, list) or any(
+            not isinstance(language, str)
+            for language in cast(list[object], raw_reasoning_languages)
+        ):
+            raise BundleError("tokenizer metadata reasoning_languages are invalid")
+        tokenizer_reasoning_languages = cast(list[str], raw_reasoning_languages)
+        raw_tokenizer_contract = tokenizer_metadata.get("training_contract")
+        if not isinstance(raw_tokenizer_contract, Mapping):
+            raise BundleError("tokenizer metadata has no authenticated training_contract")
+        tokenizer_contract = cast(Mapping[object, object], raw_tokenizer_contract)
+        tokenizer_contract_expected: dict[str, object] = {
+            "language_pairs": expected_pairs,
+            "translation_directions": expected_directions,
+            "denoise_languages": expected_denoise_languages,
+            "reasoning_languages": tokenizer_reasoning_languages,
+            "approximate_split": config.data.approximate_split,
+            "source_only_languages": expected_source_only,
+            "train_only_prefixes": list(config.data.configured_synthetic_prefixes()),
+            "split_digits": True,
+            "monolingual_sample_ratio": config.foundation.tokenizer_sample_ratio,
+        }
+        for field, expected in tokenizer_contract_expected.items():
+            if tokenizer_contract.get(field) != expected:
+                raise BundleError(
+                    f"tokenizer training contract {field} disagrees with the selected config"
+                )
+        tokenizer_source_records = _validated_tokenizer_source_records(
+            tokenizer_contract.get("sources")
+        )
+
+    if DATASET_MANIFEST_PATH in payload_paths:
+        manifest = _parse_json_object(
+            read_payload(DATASET_MANIFEST_PATH),
+            DATASET_MANIFEST_PATH,
+        )
+        expected_options = prepare_preprocessing_options(
+            approximate_split=config.data.approximate_split,
+            source_only_languages=config.data.configured_source_only_languages(),
+            translation_directions=config.data.configured_translation_directions(),
+            train_only_prefixes=config.data.configured_synthetic_prefixes(),
+            managed_augmentation_prefix=config.data.synthetic_prefix,
+            synthetic_sampling_weight=config.data.synthetic_sampling_weight,
+            language_pair_count=len(config.data.configured_language_pairs()),
+        )
+        expected_manifest_fields: dict[str, object] = {
+            "language_pairs": expected_pairs,
+            "translation_directions": expected_directions,
+            "source_only_languages": expected_source_only,
+            "preprocessing_schema": PREPROCESSING_SCHEMA,
+            "preprocessing_options": expected_options,
+        }
+        for field, expected in expected_manifest_fields.items():
+            if manifest.get(field) != expected:
+                raise BundleError(
+                    f"prepared translation dataset {field} disagrees with the selected training config"
+                )
+        fingerprint = manifest.get("fingerprint")
+        if not isinstance(fingerprint, Mapping):
+            raise BundleError("prepared translation dataset has no valid fingerprint")
+        fingerprint_values = cast(Mapping[object, object], fingerprint)
+        if fingerprint_values.get("language_pairs") != expected_pairs:
+            raise BundleError(
+                "prepared translation fingerprint language_pairs disagree with config"
+            )
+        if fingerprint_values.get("preprocessing_schema") != PREPROCESSING_SCHEMA:
+            raise BundleError("prepared translation fingerprint preprocessing schema is stale")
+        if fingerprint_values.get("preprocessing_options") != expected_options:
+            raise BundleError(
+                "prepared translation fingerprint preprocessing options disagree with config"
+            )
+        translation_source_identities = _validated_fingerprint_file_identities(
+            fingerprint_values.get("files")
+        )
+        if raw_parallel_paths:
+            expected_raw_files = {
+                PurePosixPath(path).name: identities[path] for path in sorted(raw_parallel_paths)
+            }
+            if translation_source_identities != expected_raw_files:
+                raise BundleError(
+                    "included raw parallel corpus differs from the prepared dataset fingerprint"
+                )
+
+    if FOUNDATION_DATASET_MANIFEST_PATH in payload_paths:
+        if not config.foundation.enabled:
+            raise BundleError(
+                "a prepared foundation dataset cannot ship with foundation.enabled=false"
+            )
+        foundation_manifest = _parse_json_object(
+            read_payload(FOUNDATION_DATASET_MANIFEST_PATH),
+            FOUNDATION_DATASET_MANIFEST_PATH,
+        )
+        expected_foundation_options = {
+            "deduplicate": config.foundation.deduplicate,
+            "deduplication_backend": (
+                "sqlite-blake2b-128-v1" if config.foundation.deduplicate else "disabled"
+            ),
+            "maximum_characters": config.foundation.maximum_characters,
+            "max_tokens": config.data.max_source_length - 2,
+            "max_target_tokens": config.data.max_target_length - 1,
+            "minimum_characters": config.foundation.minimum_characters,
+            "reasoning_sample_share": config.foundation.reasoning_sample_share,
+            "shard_size": config.foundation.shard_size,
+            "validation_fraction": config.foundation.validation_fraction,
+        }
+        expected_foundation_fields: dict[str, object] = {
+            "release_name": config.foundation.release_name,
+            "languages": list(config.foundation_languages()),
+            "preprocessing_options": expected_foundation_options,
+        }
+        for field, expected in expected_foundation_fields.items():
+            if foundation_manifest.get(field) != expected:
+                raise BundleError(
+                    f"prepared foundation dataset {field} disagrees with the selected training config"
+                )
+        sampling = foundation_manifest.get("language_sampling")
+        if not isinstance(sampling, Mapping):
+            raise BundleError("prepared foundation dataset has no language_sampling contract")
+        if sampling.get("alpha") != config.foundation.language_sampling_alpha:
+            raise BundleError("foundation language sampling alpha disagrees with config")
+        if sampling.get("minimum_share") != config.foundation.minimum_language_share:
+            raise BundleError("foundation minimum language share disagrees with config")
+        foundation_source_identities = _validated_foundation_source_identities(foundation_manifest)
+        raw_reasoning = foundation_manifest.get("reasoning")
+        if not isinstance(raw_reasoning, Mapping):
+            raise BundleError("prepared foundation dataset has no reasoning contract")
+        raw_foundation_reasoning_languages = raw_reasoning.get("languages")
+        if not isinstance(raw_foundation_reasoning_languages, list) or any(
+            not isinstance(language, str)
+            for language in cast(list[object], raw_foundation_reasoning_languages)
+        ):
+            raise BundleError("prepared foundation reasoning languages are invalid")
+        foundation_reasoning_languages = cast(
+            list[str],
+            raw_foundation_reasoning_languages,
+        )
+
+    parallel_tokenizer_sources = {
+        path: (size, digest)
+        for (role, path), (size, digest, _language) in tokenizer_source_records.items()
+        if role == "parallel"
+    }
+    expected_parallel_sources = translation_source_identities or {
+        PurePosixPath(path).name: identities[path] for path in sorted(raw_parallel_paths)
+    }
+    if tokenizer_source_records and parallel_tokenizer_sources != expected_parallel_sources:
+        raise BundleError(
+            "tokenizer parallel-source provenance differs from the prepared or included corpus"
+        )
+
+    tokenizer_monolingual_sources = {
+        path: (size, digest, cast(str, language))
+        for (role, path), (size, digest, language) in tokenizer_source_records.items()
+        if role == "monolingual"
+    }
+    if foundation_source_identities:
+        if tokenizer_monolingual_sources != foundation_source_identities:
+            raise BundleError(
+                "tokenizer monolingual-source provenance differs from the foundation dataset"
+            )
+        if tokenizer_reasoning_languages != foundation_reasoning_languages:
+            raise BundleError("tokenizer reasoning languages differ from the foundation dataset")
+    if monolingual_paths:
+        corpus_root = PurePosixPath(config.foundation.corpus_dir)
+        included_monolingual_sources: dict[str, tuple[int, str, str]] = {}
+        for path in sorted(monolingual_paths):
+            try:
+                logical_path = PurePosixPath(path).relative_to(corpus_root)
+            except ValueError as error:
+                raise BundleError(
+                    f"included monolingual source is outside {corpus_root}: {path}"
+                ) from error
+            language = _canonical_language(
+                logical_path.parts[0],
+                field=f"included monolingual source language for {logical_path}",
+            )
+            included_monolingual_sources[logical_path.as_posix()] = (
+                identities[path][0],
+                identities[path][1],
+                language,
+            )
+        if foundation_source_identities and (
+            included_monolingual_sources != foundation_source_identities
+        ):
+            raise BundleError(
+                "included monolingual corpus differs from the prepared foundation dataset"
+            )
+        if tokenizer_source_records and (
+            included_monolingual_sources != tokenizer_monolingual_sources
+        ):
+            raise BundleError(
+                "included monolingual corpus differs from tokenizer training provenance"
+            )
+
+
+def _validate_training_contract(
+    contract: object,
+    *,
+    payload_paths: set[str],
+    identities: Mapping[str, tuple[int, str]],
+    origins: Mapping[str, str],
+    read_payload: Callable[[str], bytes],
+) -> None:
+    if not isinstance(contract, Mapping):
+        raise BundleError("package manifest training_contract is missing")
+    contract_values = cast(Mapping[object, object], contract)
+    config_path_value = contract_values.get("config_path")
+    if not isinstance(config_path_value, str):
+        raise BundleError("training contract config_path must be a string")
+    config_path = _validated_relative_path(config_path_value)
+    config_key = config_path.as_posix()
+    if config_key not in payload_paths or origins.get(config_key) != "git-index":
+        raise BundleError("selected training config is not an authenticated Git payload file")
+    config_size, config_sha256 = identities[config_key]
+    config_content = read_payload(config_key)
+    if len(config_content) != config_size:
+        raise BundleError("selected training config size changed during validation")
+    config = _validated_config_from_payload(config_content, config_key)
+    raw_parallel_paths = {path for path, origin in origins.items() if origin == "data-jsonl"}
+    monolingual_paths = {path for path, origin in origins.items() if origin == "monolingual-corpus"}
+    expected_contract = _training_contract_payload(
+        config_path,
+        config_sha256,
+        config,
+        raw_parallel_data_included=bool(raw_parallel_paths),
+    )
+    if dict(contract_values) != expected_contract:
+        raise BundleError("package training contract disagrees with its selected config or payload")
+    _validate_config_artifact_semantics(
+        config,
+        payload_paths=payload_paths,
+        identities=identities,
+        read_payload=read_payload,
+        raw_parallel_paths=raw_parallel_paths,
+        monolingual_paths=monolingual_paths,
+    )
+
+
 def _collect_sources(
     root: Path,
     *,
@@ -1403,6 +1945,23 @@ def _collect_sources(
     include_dataset: bool = False,
     include_foundation_dataset: bool = False,
 ) -> list[SourceEntry]:
+    config_selection = _load_config_selection(root, config_path)
+    from sion_translate.config import AppConfig
+
+    config = config_selection.config
+    if not isinstance(config, AppConfig):
+        raise BundleError("validated bundle config returned an unexpected object")
+    raw_root_relative = _repository_relative_path(
+        root,
+        config.data.raw_dir,
+        field="data.raw_dir",
+    )
+    evaluation_root_relative = raw_root_relative / "evaluation_only"
+    monolingual_root_relative = _repository_relative_path(
+        root,
+        config.foundation.corpus_dir,
+        field="foundation.corpus_dir",
+    )
     selected: dict[PurePosixPath, SourceEntry] = {}
     portable_paths = {
         _portable_path_key(PurePosixPath(MANIFEST_NAME)): MANIFEST_NAME,
@@ -1415,6 +1974,8 @@ def _collect_sources(
         if previous is not None:
             if previous.source_path.resolve() != entry.source_path.resolve():
                 raise BundleError(f"multiple sources map to {entry.relative_path}")
+            if previous.origin == "git-index" and entry.origin != "git-index":
+                selected[entry.relative_path] = entry
             return
         portable_key = _portable_path_key(entry.relative_path)
         collision = portable_paths.get(portable_key)
@@ -1426,10 +1987,18 @@ def _collect_sources(
         portable_paths[portable_key] = entry.relative_path.as_posix()
         selected[entry.relative_path] = entry
 
-    for entry in _tracked_stage_zero_entries(root):
+    for entry in _tracked_stage_zero_entries(
+        root,
+        reserved_roots=(evaluation_root_relative, monolingual_root_relative),
+    ):
         add(entry)
+    if config_selection.config_path not in selected:
+        raise BundleError(
+            "the selected training config is not a tracked bundle file: "
+            f"{config_selection.config_path}"
+        )
 
-    data_root = root / "data"
+    data_root = root.joinpath(*raw_root_relative.parts)
     if _tree_root_is_directory(root, data_root, "data corpus"):
         for source_path in sorted(data_root.glob("*.jsonl"), key=lambda path: path.name):
             if not source_path.name.endswith(".jsonl"):
@@ -1449,7 +2018,7 @@ def _collect_sources(
         add(entry)
 
     if include_monolingual_corpus:
-        selection = _load_monolingual_selection(root, config_path)
+        selection = _load_monolingual_selection(root, config_selection.config_path)
         if selection.config_path not in selected:
             raise BundleError(
                 "the config used to select monolingual corpora is not a tracked bundle file: "
@@ -1516,35 +2085,52 @@ def _collect_sources(
         for entry in foundation_entries:
             add(entry)
 
-    artifact_entries = {
-        entry.relative_path.as_posix(): entry
-        for entry in selected.values()
-        if entry.origin in {"tokenizer", "dataset", "foundation-dataset"}
-    }
-    if artifact_entries:
-        identities = {
-            path: _hash_file(entry.source_path) for path, entry in artifact_entries.items()
-        }
-
-        def read_payload(relative_path: str) -> bytes:
-            entry = artifact_entries[relative_path]
-            size = identities[relative_path][0]
-            with entry.source_path.open("rb") as source:
-                return _read_limited(source, size, relative_path)
-
-        _validate_artifact_contracts(set(artifact_entries), identities, read_payload)
-
     entries = [selected[path] for path in sorted(selected, key=lambda item: item.as_posix())]
-    if not any(
-        len(entry.relative_path.parts) == 2
-        and entry.relative_path.parts[0] == "data"
-        and entry.relative_path.name.endswith(".jsonl")
-        for entry in entries
-    ):
-        raise BundleError("no immediate data/*.jsonl training corpus files were selected")
-    if not any(entry.relative_path.parts[:2] == ("data", "evaluation_only") for entry in entries):
-        raise BundleError("data/evaluation_only is missing or contains no regular files")
+    if not any(entry.origin == "data-jsonl" for entry in entries):
+        raise BundleError(
+            f"no immediate {raw_root_relative.as_posix()}/*.jsonl training corpus files "
+            "were selected"
+        )
+    if not any(entry.origin == "evaluation-only" for entry in entries):
+        raise BundleError(
+            f"{evaluation_root_relative.as_posix()} is missing or contains no regular files"
+        )
     return entries
+
+
+def _training_contract_from_sources(
+    sources: list[SourceEntry],
+    config_path: PurePosixPath,
+) -> tuple[
+    dict[str, object],
+    dict[str, tuple[int, str]],
+    dict[str, str],
+    Callable[[str], bytes],
+]:
+    entries = {entry.relative_path.as_posix(): entry for entry in sources}
+    config_key = config_path.as_posix()
+    if config_key not in entries:
+        raise BundleError(f"selected training config is absent from bundle sources: {config_key}")
+    identities = {path: _hash_file(entry.source_path) for path, entry in entries.items()}
+    origins = {path: entry.origin for path, entry in entries.items()}
+
+    def read_payload(relative_path: str) -> bytes:
+        entry = entries.get(relative_path)
+        if entry is None:
+            raise BundleError(f"training contract references an absent payload: {relative_path}")
+        size = identities[relative_path][0]
+        with entry.source_path.open("rb") as source:
+            return _read_limited(source, size, relative_path)
+
+    config = _validated_config_from_payload(read_payload(config_key), config_key)
+    raw_parallel_data_included = any(origin == "data-jsonl" for origin in origins.values())
+    contract = _training_contract_payload(
+        config_path,
+        identities[config_key][1],
+        config,
+        raw_parallel_data_included=raw_parallel_data_included,
+    )
+    return contract, identities, origins, read_payload
 
 
 def _zip_info(relative_path: str, mode: str) -> zipfile.ZipInfo:
@@ -1654,6 +2240,7 @@ def _manifest_bytes(
     commit: str,
     tree: str,
     records: list[FileRecord],
+    training_contract: Mapping[str, object],
 ) -> bytes:
     manifest = {
         "archive_root": ARCHIVE_ROOT,
@@ -1667,6 +2254,7 @@ def _manifest_bytes(
             "file_count": len(records),
             "total_bytes": sum(record.size for record in records),
         },
+        "training_contract": dict(training_contract),
         "zip_metadata": {
             "compression": "deflate",
             "timestamp": "1980-01-01T00:00:00Z",
@@ -1700,7 +2288,14 @@ def _write_archive(
     tree: str,
     *,
     expected_source_identities: Mapping[str, tuple[int, ...]] | None = None,
+    training_contract: Mapping[str, object] | None = None,
+    config_path: PurePosixPath | None = None,
 ) -> None:
+    if training_contract is None:
+        training_contract, _identities, _origins, _reader = _training_contract_from_sources(
+            sources,
+            config_path or PurePosixPath(DEFAULT_CONFIG_PATH),
+        )
     with zipfile.ZipFile(
         destination,
         mode="w",
@@ -1721,7 +2316,7 @@ def _write_archive(
             )
             for entry in sources
         ]
-        manifest = _manifest_bytes(commit, tree, records)
+        manifest = _manifest_bytes(commit, tree, records, training_contract)
         manifest_sha256 = _write_bytes(archive, MANIFEST_NAME, manifest)
         _write_bytes(
             archive,
@@ -1749,6 +2344,7 @@ def _estimated_archive_size_bound(
     sources: list[SourceEntry],
     commit: str,
     tree: str,
+    training_contract: Mapping[str, object],
 ) -> tuple[int, dict[str, tuple[int, ...]]]:
     records: list[FileRecord] = []
     source_identities: dict[str, tuple[int, ...]] = {}
@@ -1770,7 +2366,7 @@ def _estimated_archive_size_bound(
         records.append(record)
         total += _zip_member_size_bound(record.path, record.size)
 
-    manifest = _manifest_bytes(commit, tree, records)
+    manifest = _manifest_bytes(commit, tree, records, training_contract)
     checksums = _checksums_bytes(records, "0" * 64)
     total += _zip_member_size_bound(MANIFEST_NAME, len(manifest))
     total += _zip_member_size_bound(CHECKSUMS_NAME, len(checksums))
@@ -1789,8 +2385,14 @@ def _ensure_free_disk_for_archive(
     sources: list[SourceEntry],
     commit: str,
     tree: str,
+    training_contract: Mapping[str, object],
 ) -> tuple[int, dict[str, tuple[int, ...]]]:
-    archive_bound, source_identities = _estimated_archive_size_bound(sources, commit, tree)
+    archive_bound, source_identities = _estimated_archive_size_bound(
+        sources,
+        commit,
+        tree,
+        training_contract,
+    )
     reserve = max(MIN_FREE_DISK_RESERVE, archive_bound // FREE_DISK_RESERVE_DIVISOR)
     required = archive_bound + reserve
     try:
@@ -1886,10 +2488,11 @@ def _parse_manifest(content: bytes) -> tuple[dict[str, object], list[FileRecord]
         "format_version",
         "git",
         "payload",
+        "training_contract",
         "zip_metadata",
     }
     if set(raw) != expected_top_level:
-        raise BundleError("package manifest fields do not match format version 1")
+        raise BundleError(f"package manifest fields do not match format version {FORMAT_VERSION}")
     format_version = raw.get("format_version")
     if isinstance(format_version, bool) or format_version != FORMAT_VERSION:
         raise BundleError("unsupported package manifest format version")
@@ -2173,6 +2776,13 @@ def verify_archive(archive_path: Path | str) -> VerificationResult:
                 {record.path: (record.size, record.sha256) for record in records},
                 read_payload,
             )
+            _validate_training_contract(
+                raw_manifest.get("training_contract"),
+                payload_paths=set(records_by_path),
+                identities={record.path: (record.size, record.sha256) for record in records},
+                origins={record.path: record.origin for record in records},
+                read_payload=read_payload,
+            )
             if _zip_mode(manifest_info) != "100644":
                 raise BundleError(f"ZIP mode mismatch for {MANIFEST_NAME}")
             if _zip_mode(checksums_info) != "100644":
@@ -2270,6 +2880,13 @@ def verify_tree(tree_path: Path | str) -> VerificationResult:
         {record.path: (record.size, record.sha256) for record in records},
         read_payload,
     )
+    _validate_training_contract(
+        raw_manifest.get("training_contract"),
+        payload_paths=set(records_by_path),
+        identities={record.path: (record.size, record.sha256) for record in records},
+        origins={record.path: record.origin for record in records},
+        read_payload=read_payload,
+    )
 
     git_identity = raw_manifest["git"]
     assert isinstance(git_identity, dict)
@@ -2337,6 +2954,19 @@ def build_bundle(
     )
     if not sources:
         raise BundleError("the bundle source allowlist selected no files")
+    config_selection = _load_config_selection(root, config_path)
+    training_contract, identities, origins, read_payload = _training_contract_from_sources(
+        sources,
+        config_selection.config_path,
+    )
+    _validate_artifact_contracts(set(identities), identities, read_payload)
+    _validate_training_contract(
+        training_contract,
+        payload_paths=set(identities),
+        identities=identities,
+        origins=origins,
+        read_payload=read_payload,
+    )
     if any(source.source_path.resolve() == output for source in sources):
         raise BundleError("bundle output may not overwrite a selected source file")
     archive_size_bound, source_identities = _ensure_free_disk_for_archive(
@@ -2344,6 +2974,7 @@ def build_bundle(
         sources,
         commit,
         tree,
+        training_contract,
     )
 
     descriptor, temporary_name = tempfile.mkstemp(
@@ -2360,6 +2991,8 @@ def build_bundle(
             commit,
             tree,
             expected_source_identities=source_identities,
+            training_contract=training_contract,
+            config_path=config_selection.config_path,
         )
         _fsync_file(temporary_path)
         verification = verify_archive(temporary_path)
