@@ -46,6 +46,14 @@ The package version is `1.5.0`. Model release metadata uses the generation label
 - A CUDA GPU for real training; CPU execution is intended for tests and small preparation
   jobs
 - Enough local disk space for the raw data, tokenizer, indexed datasets, and final ZIP
+- Git when running directly from an editable source tree
+
+Run editable installs from a real Git clone. A metadata-free source directory is accepted
+only when Git resolves a committed project root containing the runtime bundle verifier.
+This prevents a damaged GPU bundle from silently becoming an unauthenticated local run.
+A prepared GPU ZIP does not need a `.git` directory because its manifest and checksum list
+provide the stronger identity. For a downloaded source archive, install a built wheel or
+clone the repository before using the editable commands below.
 
 Linux or macOS:
 
