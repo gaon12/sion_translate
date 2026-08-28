@@ -859,6 +859,81 @@ def test_foundation_dataset_has_an_explicit_authenticated_opt_in(tmp_path: Path)
     package_gpu_bundle.verify_archive(archive_path)
 
 
+def test_prepared_only_bundle_omits_raw_inputs_and_includes_complete_artifacts(
+    tmp_path: Path,
+) -> None:
+    root = _repository(tmp_path)
+    _with_tokenizer(root)
+    _with_dataset(root)
+    _with_foundation_dataset(root)
+    monolingual = root / "data" / "corpus" / "ko" / "corpus.txt"
+    monolingual.parent.mkdir(parents=True)
+    monolingual.write_bytes(b"source corpus")
+    _git(root, "add", "data/corpus.jsonl", "data/corpus/ko/corpus.txt")
+    _git(root, "commit", "-qm", "track raw inputs")
+
+    archive_path = tmp_path / "prepared-only.zip"
+    package_gpu_bundle.build_bundle(root, archive_path, prepared_only=True)
+
+    manifest = _manifest(archive_path)
+    paths = {entry["path"] for entry in manifest["files"]}
+    assert "data/corpus.jsonl" not in paths
+    assert "data/corpus/ko/corpus.txt" not in paths
+    assert "data/.gitkeep" not in paths
+    assert "data/evaluation_only/holdout.jsonl" in paths
+    assert "artifacts/tokenizer/sion.model" in paths
+    assert "artifacts/dataset/manifest.json" in paths
+    assert "artifacts/foundation_dataset/manifest.json" in paths
+    assert manifest["training_contract"]["raw_parallel_data_included"] is False
+    package_gpu_bundle.verify_archive(archive_path)
+
+
+def test_prepared_only_requires_every_configured_prepared_artifact(tmp_path: Path) -> None:
+    root = _repository(tmp_path)
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="--with-tokenizer was requested"):
+        package_gpu_bundle.build_bundle(
+            root,
+            tmp_path / "missing-prepared-artifacts.zip",
+            prepared_only=True,
+        )
+
+
+def test_prepared_only_conflicts_with_raw_monolingual_opt_in(tmp_path: Path) -> None:
+    root = _repository(tmp_path)
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="cannot include the monolingual"):
+        package_gpu_bundle.build_bundle(
+            root,
+            tmp_path / "contradictory-prepared-only.zip",
+            prepared_only=True,
+            include_monolingual_corpus=True,
+        )
+
+
+def test_prepared_only_skips_foundation_dataset_when_the_stage_is_disabled(
+    tmp_path: Path,
+) -> None:
+    root = _repository(tmp_path)
+    config = root / "sion_translate.yaml"
+    config.write_text(
+        "data:\n  language_pair: [ko, ja]\nfoundation:\n  enabled: false\n  languages: [ko]\n",
+        encoding="utf-8",
+    )
+    _git(root, "add", config.name)
+    _git(root, "commit", "-qm", "disable foundation pretraining")
+    _with_tokenizer(root)
+    _with_dataset(root)
+
+    archive_path = tmp_path / "translation-prepared-only.zip"
+    package_gpu_bundle.build_bundle(root, archive_path, prepared_only=True)
+
+    paths = {entry["path"] for entry in _manifest(archive_path)["files"]}
+    assert "artifacts/dataset/manifest.json" in paths
+    assert not any(path.startswith("artifacts/foundation_dataset/") for path in paths)
+    package_gpu_bundle.verify_archive(archive_path)
+
+
 def test_bundle_foundation_markers_match_the_current_preparer_contract() -> None:
     from sion_translate.artifacts import FOUNDATION_RELEASE_NAME
     from sion_translate.data.prepare import SHARED_TARGET_INDEX_DTYPE

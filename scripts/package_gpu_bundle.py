@@ -42,6 +42,12 @@ All four are recorded in the manifest with their own origin, so
 ``verify-archive`` and ``verify-tree`` cover them like everything else.
 Shipping fourteen gigabytes of corpus outside the manifest would leave the
 largest part of the payload with no integrity check at all.
+
+``--prepared-only`` selects the tokenizer and both applicable indexed datasets
+as one coherent upload unit, while omitting parallel and monolingual source
+corpora even when those files are tracked. The authenticated artifact contracts
+remain in the archive, so the GPU host can train without repeating CPU-heavy
+tokenization and preparation.
 """
 
 from __future__ import annotations
@@ -1944,6 +1950,7 @@ def _collect_sources(
     include_tokenizer: bool = False,
     include_dataset: bool = False,
     include_foundation_dataset: bool = False,
+    include_raw_parallel_data: bool = True,
 ) -> list[SourceEntry]:
     config_selection = _load_config_selection(root, config_path)
     from sion_translate.config import AppConfig
@@ -1987,9 +1994,14 @@ def _collect_sources(
         portable_paths[portable_key] = entry.relative_path.as_posix()
         selected[entry.relative_path] = entry
 
+    reserved_roots = [evaluation_root_relative, monolingual_root_relative]
+    if not include_raw_parallel_data:
+        # Exclude the complete configured raw tree from generic Git payload
+        # collection. Evaluation inputs are added back with their own role.
+        reserved_roots.append(raw_root_relative)
     for entry in _tracked_stage_zero_entries(
         root,
-        reserved_roots=(evaluation_root_relative, monolingual_root_relative),
+        reserved_roots=tuple(reserved_roots),
     ):
         add(entry)
     if config_selection.config_path not in selected:
@@ -1999,7 +2011,7 @@ def _collect_sources(
         )
 
     data_root = root.joinpath(*raw_root_relative.parts)
-    if _tree_root_is_directory(root, data_root, "data corpus"):
+    if include_raw_parallel_data and _tree_root_is_directory(root, data_root, "data corpus"):
         for source_path in sorted(data_root.glob("*.jsonl"), key=lambda path: path.name):
             if not source_path.name.endswith(".jsonl"):
                 continue
@@ -2086,7 +2098,7 @@ def _collect_sources(
             add(entry)
 
     entries = [selected[path] for path in sorted(selected, key=lambda item: item.as_posix())]
-    if not any(entry.origin == "data-jsonl" for entry in entries):
+    if include_raw_parallel_data and not any(entry.origin == "data-jsonl" for entry in entries):
         raise BundleError(
             f"no immediate {raw_root_relative.as_posix()}/*.jsonl training corpus files "
             "were selected"
@@ -2927,6 +2939,7 @@ def build_bundle(
     include_tokenizer: bool = False,
     include_dataset: bool = False,
     include_foundation_dataset: bool = False,
+    prepared_only: bool = False,
 ) -> BuildResult:
     """Build, verify, and atomically publish a deterministic GPU bundle."""
 
@@ -2944,6 +2957,21 @@ def build_bundle(
 
     _ensure_clean_tracked_tree(root)
     commit, tree = _git_identity(root)
+    config_selection = _load_config_selection(root, config_path)
+    if prepared_only:
+        if include_monolingual_corpus:
+            raise BundleError(
+                "--prepared-only cannot include the monolingual corpus; the mode exists "
+                "to avoid uploading raw preparation inputs"
+            )
+        from sion_translate.config import AppConfig
+
+        config = config_selection.config
+        if not isinstance(config, AppConfig):
+            raise BundleError("validated bundle config returned an unexpected object")
+        include_tokenizer = True
+        include_dataset = True
+        include_foundation_dataset = config.foundation.enabled
     sources = _collect_sources(
         root,
         config_path=config_path,
@@ -2951,10 +2979,10 @@ def build_bundle(
         include_tokenizer=include_tokenizer,
         include_dataset=include_dataset,
         include_foundation_dataset=include_foundation_dataset,
+        include_raw_parallel_data=not prepared_only,
     )
     if not sources:
         raise BundleError("the bundle source allowlist selected no files")
-    config_selection = _load_config_selection(root, config_path)
     training_contract, identities, origins, read_payload = _training_contract_from_sources(
         sources,
         config_selection.config_path,
@@ -3051,8 +3079,16 @@ def _argument_parser() -> argparse.ArgumentParser:
         "--config",
         type=Path,
         help=(
-            "repository-relative YAML configuration used to select the monolingual "
-            "corpus (default: ROOT/sion_translate.yaml)"
+            "tracked YAML configuration authenticated by the bundle. Format version 2 "
+            "requires ROOT/sion_translate.yaml so plain sion-train uses the same file."
+        ),
+    )
+    build_parser.add_argument(
+        "--prepared-only",
+        action="store_true",
+        help=(
+            "ship the tokenizer and all configured prepared datasets but omit raw "
+            "parallel and monolingual corpora, including tracked corpus files"
         ),
     )
     build_parser.add_argument(
@@ -3117,6 +3153,7 @@ def main(arguments: list[str] | None = None) -> int:
                 include_tokenizer=parsed.with_tokenizer,
                 include_dataset=parsed.with_dataset,
                 include_foundation_dataset=parsed.with_foundation_dataset,
+                prepared_only=parsed.prepared_only,
             )
             print(f"bundle: {result.output_path}")
             print(f"sha256: {result.archive_sha256}")
