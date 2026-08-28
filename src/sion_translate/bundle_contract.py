@@ -168,6 +168,29 @@ def _metadata_is_link_like(metadata: os.stat_result) -> bool:
     )
 
 
+def _entry_exists(path: Path, *, label: str) -> bool:
+    """Check directory-entry presence without following a dangling link."""
+
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise BundleContractError(f"cannot inspect {label}: {path}") from error
+    return True
+
+
+def _looks_like_project_source_tree(root: Path) -> bool:
+    """Recognize a source-layout project after its bundle metadata was stripped."""
+
+    markers = (
+        root / "pyproject.toml",
+        root / DEFAULT_CONFIG_PATH,
+        root / "src" / "sion_translate",
+    )
+    return all(_entry_exists(path, label="project source marker") for path in markers)
+
+
 def _validated_relative_path(value: str) -> PurePosixPath:
     if not value or "\\" in value or "\r" in value or "\n" in value:
         raise BundleContractError(f"bundle path is not canonical POSIX text: {value!r}")
@@ -460,9 +483,21 @@ def load_embedded_training_contract(
     bundle_root = unresolved_root.resolve()
     manifest_path = bundle_root / MANIFEST_NAME
     checksums_path = bundle_root / CHECKSUMS_NAME
-    manifest_exists = manifest_path.exists()
-    checksums_exists = checksums_path.exists()
+    manifest_exists = _entry_exists(manifest_path, label=MANIFEST_NAME)
+    checksums_exists = _entry_exists(checksums_path, label=CHECKSUMS_NAME)
     if not manifest_exists and not checksums_exists:
+        # A normal Git checkout has an administrative entry and intentionally
+        # carries no package manifest. An extracted source-layout bundle has no
+        # such entry, so losing both integrity files must not silently downgrade
+        # it to an unauthenticated checkout.
+        if _looks_like_project_source_tree(bundle_root) and not _entry_exists(
+            bundle_root / ".git",
+            label="Git administrative entry",
+        ):
+            raise BundleContractError(
+                "the source-layout project has no GPU bundle integrity metadata and no "
+                "Git administrative entry; re-extract the reviewed bundle"
+            )
         return None
     if not manifest_exists or not checksums_exists:
         raise BundleContractError(
@@ -713,6 +748,7 @@ def _walk_runtime_payload(
 def verify_embedded_bundle_payload(contract: EmbeddedTrainingContract) -> None:
     """Hash every immutable payload and reject unexpected project-tree files."""
 
+    _verify_embedded_metadata_identity(contract)
     expected = {record.path for record in contract.records} | {MANIFEST_NAME, CHECKSUMS_NAME}
     mutable_artifact_roots = tuple(
         PurePosixPath(root)
@@ -741,6 +777,43 @@ def verify_embedded_bundle_payload(contract: EmbeddedTrainingContract) -> None:
             raise BundleContractError(f"the GPU bundle payload is not regular: {record.path}")
         if metadata.st_size != record.size or file_sha256(path) != record.sha256:
             raise BundleContractError(f"the GPU bundle payload hash differs: {record.path}")
+    # Close the manifest-swap window across the potentially long payload hash
+    # pass. The same cached contract must still authenticate the tree when the
+    # verifier returns.
+    _verify_embedded_metadata_identity(contract)
+
+
+def _verify_embedded_metadata_identity(contract: EmbeddedTrainingContract) -> None:
+    """Require live metadata to remain identical to one cached contract."""
+
+    manifest_content = _read_regular_file(
+        contract.root / MANIFEST_NAME,
+        MANIFEST_NAME,
+        limit=MAX_METADATA_BYTES,
+    )
+    manifest_sha256 = hashlib.sha256(manifest_content).hexdigest()
+    if manifest_sha256 != contract.manifest_sha256:
+        raise BundleContractError(
+            "the GPU bundle manifest changed after its training contract was selected"
+        )
+    checksums_content = _read_regular_file(
+        contract.root / CHECKSUMS_NAME,
+        CHECKSUMS_NAME,
+        limit=MAX_METADATA_BYTES,
+    )
+    checksums = _parse_checksums(checksums_content)
+    expected_paths = [record.path for record in contract.records] + [MANIFEST_NAME]
+    if list(checksums) != expected_paths:
+        raise BundleContractError(
+            "the GPU bundle checksum list changed after its training contract was selected"
+        )
+    for record in contract.records:
+        if checksums.get(record.path) != record.sha256:
+            raise BundleContractError(f"the GPU bundle checksum identity changed for {record.path}")
+    if checksums.get(MANIFEST_NAME) != contract.manifest_sha256:
+        raise BundleContractError(
+            "the GPU bundle manifest checksum changed after its training contract was selected"
+        )
 
 
 def _source_identity_difference(

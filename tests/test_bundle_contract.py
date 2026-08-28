@@ -90,6 +90,57 @@ def test_rejects_partial_bundle_metadata_instead_of_downgrading_to_a_checkout(
         load_embedded_training_contract(tmp_path)
 
 
+def test_rejects_complete_bundle_metadata_removal_instead_of_failing_open(
+    tmp_path: Path,
+) -> None:
+    write_test_bundle(tmp_path)
+    (tmp_path / "PACKAGE_MANIFEST.json").unlink()
+    (tmp_path / "SHA256SUMS").unlink()
+
+    with pytest.raises(BundleContractError, match="no GPU bundle integrity metadata"):
+        load_embedded_training_contract(tmp_path)
+
+
+def test_source_layout_git_checkout_without_bundle_metadata_remains_supported(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "src" / "sion_translate").mkdir(parents=True)
+    (tmp_path / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+    (tmp_path / "sion_translate.yaml").write_text("data: {}\n", encoding="utf-8")
+    (tmp_path / ".git").mkdir()
+
+    assert load_embedded_training_contract(tmp_path) is None
+
+
+def test_dangling_integrity_metadata_is_not_treated_as_absent(tmp_path: Path) -> None:
+    write_test_bundle(tmp_path)
+    (tmp_path / "PACKAGE_MANIFEST.json").unlink()
+    try:
+        (tmp_path / "PACKAGE_MANIFEST.json").symlink_to(tmp_path / "missing-manifest")
+    except OSError:
+        pytest.skip("this host does not permit file symlink creation")
+
+    with pytest.raises(BundleContractError, match="must be a regular file"):
+        load_embedded_training_contract(tmp_path)
+
+
+def test_cached_contract_rejects_a_self_consistent_manifest_replacement(
+    tmp_path: Path,
+) -> None:
+    write_test_bundle(tmp_path)
+    contract = load_embedded_training_contract(tmp_path)
+    assert contract is not None
+    write_test_bundle(
+        tmp_path,
+        language_pairs=(("es", "it"),),
+        translation_directions=(("es", "it"),),
+        foundation_languages=("es", "it"),
+    )
+
+    with pytest.raises(BundleContractError, match="manifest changed after"):
+        verify_embedded_bundle_payload(contract)
+
+
 def test_runtime_payload_verification_allows_only_known_generated_namespaces(
     tmp_path: Path,
 ) -> None:
