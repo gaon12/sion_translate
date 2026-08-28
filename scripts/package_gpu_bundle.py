@@ -1695,12 +1695,16 @@ def _training_contract_payload(
 
 def _validated_tokenizer_source_records(
     raw_sources: object,
-) -> dict[tuple[str, str], tuple[int, str, str | None]]:
+) -> tuple[
+    dict[tuple[str, str], tuple[int, str, str | None]],
+    tuple[tuple[str, str], ...],
+]:
     """Normalize the source identities authenticated by tokenizer training."""
 
     if not isinstance(raw_sources, list) or not raw_sources:
         raise BundleError("tokenizer training contract has no source identities")
     records: dict[tuple[str, str], tuple[int, str, str | None]] = {}
+    order: list[tuple[str, str]] = []
     for raw_source in cast(list[object], raw_sources):
         if not isinstance(raw_source, Mapping):
             raise BundleError("tokenizer training contract contains a non-object source")
@@ -1733,7 +1737,62 @@ def _validated_tokenizer_source_records(
         if key in records:
             raise BundleError(f"tokenizer training contract repeats source {role}:{path}")
         records[key] = (size, digest, language)
-    return records
+        order.append(key)
+    return records, tuple(order)
+
+
+def _validate_tokenizer_source_order(
+    records: Mapping[tuple[str, str], tuple[int, str, str | None]],
+    order: tuple[tuple[str, str], ...],
+    config: object,
+) -> None:
+    """Enforce the portable traversal order authenticated by tokenizer training."""
+
+    from sion_translate.config import AppConfig
+
+    if not isinstance(config, AppConfig):
+        raise BundleError("validated bundle config returned an unexpected object")
+
+    def portable_key(path: str) -> tuple[str, str]:
+        return path.casefold(), path
+
+    expected: list[tuple[str, str]] = sorted(
+        (key for key in records if key[0] == "parallel"),
+        key=lambda key: portable_key(key[1]),
+    )
+    monolingual_by_language: dict[str, list[tuple[str, str]]] = {}
+    for key, (_size, _digest, language) in records.items():
+        if key[0] != "monolingual":
+            continue
+        assert language is not None
+        logical_path = PurePosixPath(key[1])
+        if (
+            len(logical_path.parts) < 2
+            or _canonical_language(
+                logical_path.parts[0],
+                field=f"tokenizer monolingual source directory for {key[1]}",
+            )
+            != language
+        ):
+            raise BundleError(
+                f"tokenizer monolingual source language disagrees with its path: {key[1]}"
+            )
+        monolingual_by_language.setdefault(language, []).append(key)
+    for language in config.foundation_languages():
+        expected.extend(
+            sorted(
+                monolingual_by_language.pop(language, []),
+                key=lambda key: portable_key(
+                    PurePosixPath(*PurePosixPath(key[1]).parts[1:]).as_posix()
+                ),
+            )
+        )
+    if monolingual_by_language:
+        raise BundleError(
+            "tokenizer sources contain monolingual languages outside the configured foundation"
+        )
+    if tuple(expected) != order:
+        raise BundleError("tokenizer source identities do not follow portable-input-order-v1")
 
 
 def _validated_fingerprint_file_identities(
@@ -1823,6 +1882,7 @@ def _validate_config_artifact_semantics(
         dict.fromkeys([*translation_languages, *config.foundation_languages()])
     )
     tokenizer_source_records: dict[tuple[str, str], tuple[int, str, str | None]] = {}
+    tokenizer_source_order: tuple[tuple[str, str], ...] = ()
     tokenizer_reasoning_languages: list[str] = []
     translation_source_identities: dict[str, tuple[int, str]] = {}
     foundation_source_identities: dict[str, tuple[int, str, str]] = {}
@@ -1870,8 +1930,13 @@ def _validate_config_artifact_semantics(
                 raise BundleError(
                     f"tokenizer training contract {field} disagrees with the selected config"
                 )
-        tokenizer_source_records = _validated_tokenizer_source_records(
+        tokenizer_source_records, tokenizer_source_order = _validated_tokenizer_source_records(
             tokenizer_contract.get("sources")
+        )
+        _validate_tokenizer_source_order(
+            tokenizer_source_records,
+            tokenizer_source_order,
+            config,
         )
 
     if DATASET_MANIFEST_PATH in payload_paths:

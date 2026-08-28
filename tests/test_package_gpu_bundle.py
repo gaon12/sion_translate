@@ -844,6 +844,26 @@ def test_tokenizer_requires_an_authenticated_training_contract(tmp_path: Path) -
         )
 
 
+def test_tokenizer_training_contract_preserves_portable_source_order(tmp_path: Path) -> None:
+    root = _repository(tmp_path)
+    _with_tokenizer(root, complete=True)
+    _with_foundation_dataset(root)
+    metadata_path = root / "artifacts" / "tokenizer" / "tokenizer_metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    training_contract = metadata["training_contract"]
+    training_contract["sources"][1:] = reversed(training_contract["sources"][1:])
+    metadata["training_contract_sha256"] = _canonical_json_sha256(training_contract)
+    metadata_path.write_text(json.dumps(metadata) + "\n", encoding="utf-8")
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="portable-input-order-v1"):
+        package_gpu_bundle.build_bundle(
+            root,
+            tmp_path / "reordered-tokenizer-sources.zip",
+            include_tokenizer=True,
+            include_foundation_dataset=True,
+        )
+
+
 def test_tokenizer_bundle_requires_digit_splitting(tmp_path: Path) -> None:
     root = _repository(tmp_path)
     _with_tokenizer(root, complete=True)
