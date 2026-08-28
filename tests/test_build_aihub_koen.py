@@ -66,9 +66,7 @@ def test_labels_can_be_dropped(tmp_path: Path) -> None:
     write_archive(tmp_path / "dist" / "TL1.zip", [record()])
     output = tmp_path / "shard.jsonl"
 
-    BUILD.main(
-        ["--input", str(tmp_path / "dist"), "--output", str(output), "--drop-labels"]
-    )
+    BUILD.main(["--input", str(tmp_path / "dist"), "--output", str(output), "--drop-labels"])
 
     assert set(read_shard(output)[0]) == {"ko", "en"}
 
@@ -82,9 +80,7 @@ def test_rows_missing_a_human_side_are_counted_not_written(tmp_path: Path) -> No
 
     BUILD.main(["--input", str(tmp_path / "dist"), "--output", str(output)])
 
-    manifest = json.loads(
-        (tmp_path / "shard.jsonl.manifest.json").read_text(encoding="utf-8")
-    )
+    manifest = json.loads((tmp_path / "shard.jsonl.manifest.json").read_text(encoding="utf-8"))
     assert manifest["scanned_records"] == 4
     assert manifest["row_count"] == 1
     assert manifest["unusable_records"] == 3

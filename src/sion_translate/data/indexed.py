@@ -599,9 +599,7 @@ class IndexedParallelDataset(Dataset[dict[str, object]]):
             source_ids = np.asarray(index["src_language_id"], dtype=np.int64)
             target_ids = np.asarray(index["tgt_language_id"], dtype=np.int64)
             blocks.append(table[source_ids * language_count + target_ids])
-        codes = (
-            np.concatenate(blocks) if blocks else np.zeros(self.pair_count, dtype=np.uint16)
-        )
+        codes = np.concatenate(blocks) if blocks else np.zeros(self.pair_count, dtype=np.uint16)
         self._pair_language_pair_ids = codes
         return codes
 

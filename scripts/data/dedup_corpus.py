@@ -260,7 +260,9 @@ def expand_flat_record(
     return expanded
 
 
-def reference_expansion(row: object, pairs: Sequence[Sequence[str]]) -> list[tuple[str, str, str, str]]:
+def reference_expansion(
+    row: object, pairs: Sequence[Sequence[str]]
+) -> list[tuple[str, str, str, str]]:
     return [
         (pair.language_a, pair.text_a, pair.language_b, pair.text_b)
         for pair in expand_parallel_record(row, pairs).pairs
@@ -461,7 +463,6 @@ def resolve(
     """Decide every row of every shard, one language edge at a time."""
 
     names = [str(shard["file"]) for shard in shards]
-    index_of = {name: position for position, name in enumerate(names)}
     tier_ranks = np.array([tier_of(name, tiers) for name in names], dtype=np.uint32)
     loose_allowed = np.array(
         [not any(name.startswith(prefix) for prefix in exact_only) for name in names],
@@ -629,9 +630,7 @@ def apply_decisions(
     counts["rows_without_a_pair_kept"] = 0
     counts["no_configured_pair"] = 0
     kept_writer = AtomicJsonlWriter(destination / path.name) if destination else None
-    archive_writer = (
-        AtomicJsonlWriter(archive / f"{path.stem}.removed.jsonl") if archive else None
-    )
+    archive_writer = AtomicJsonlWriter(archive / f"{path.stem}.removed.jsonl") if archive else None
     kept_rows = 0
     removed_rows = 0
     index = 0
@@ -926,8 +925,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             # corpus, so an unchanged shard is copied there like any other.
             losses = int(np.count_nonzero(has_pairs & ~kept[name]))
             unpaired = int(np.count_nonzero(~has_pairs))
-            if args.in_place and losses == 0 and (
-                not args.drop_rows_without_a_pair or unpaired == 0
+            if (
+                args.in_place
+                and losses == 0
+                and (not args.drop_rows_without_a_pair or unpaired == 0)
             ):
                 unchanged.append(name)
                 rows_kept = int(np.count_nonzero(has_pairs)) + unpaired
@@ -986,8 +987,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.report.write_text(
                 json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
             )
-        print(json.dumps({key: report[key] for key in ("rows_in", "rows_out", "removed", "edges")},
-                         ensure_ascii=False, indent=2))
+        print(
+            json.dumps(
+                {key: report[key] for key in ("rows_in", "rows_out", "removed", "edges")},
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
     finally:
         if staging_context is not None:
             staging_context.cleanup()

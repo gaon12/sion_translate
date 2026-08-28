@@ -354,9 +354,7 @@ def test_reuse_staging_rejects_an_older_staging_format(tmp_path: Path) -> None:
 
 
 FAST_PATH_PAIRS = (("ko", "ja"), ("ko", "en"), ("en", "ja"), ("jd", "ko"), ("jd", "ja"))
-FAST_PATH_LANGUAGES = frozenset(
-    language for pair in FAST_PATH_PAIRS for language in pair
-)
+FAST_PATH_LANGUAGES = frozenset(language for pair in FAST_PATH_PAIRS for language in pair)
 
 
 def fast(row: object) -> list[tuple[str, str, str, str]] | None:

@@ -237,4 +237,6 @@ def test_aggregate_manifest_totals_its_members(tmp_path: Path) -> None:
 
 
 def test_missing_registry_is_rejected(tmp_path: Path) -> None:
-    assert REFRESH.main(["--registry", str(tmp_path / "nope.tsv"), "--data-root", str(tmp_path)]) == 2
+    assert (
+        REFRESH.main(["--registry", str(tmp_path / "nope.tsv"), "--data-root", str(tmp_path)]) == 2
+    )

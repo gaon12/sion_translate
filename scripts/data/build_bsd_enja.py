@@ -44,7 +44,9 @@ DEFAULT_SPLITS = ("train", "dev", "test")
 LICENCE = "CC BY-NC-SA (non-commercial, share-alike)"
 
 
-def load_conversations(root: Path, splits: Sequence[str]) -> Iterator[tuple[str, dict[str, object]]]:
+def load_conversations(
+    root: Path, splits: Sequence[str]
+) -> Iterator[tuple[str, dict[str, object]]]:
     for split in splits:
         path = root / f"{split}.json"
         if not path.is_file():
