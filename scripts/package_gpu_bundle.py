@@ -1811,7 +1811,6 @@ def _validate_config_artifact_semantics(
         }
         expected_foundation_fields: dict[str, object] = {
             "release_name": config.foundation.release_name,
-            "languages": list(config.foundation_languages()),
             "preprocessing_options": expected_foundation_options,
         }
         for field, expected in expected_foundation_fields.items():
@@ -1819,6 +1818,38 @@ def _validate_config_artifact_semantics(
                 raise BundleError(
                     f"prepared foundation dataset {field} disagrees with the selected training config"
                 )
+        raw_foundation_languages = foundation_manifest.get("languages")
+        if not isinstance(raw_foundation_languages, list) or not raw_foundation_languages:
+            raise BundleError("prepared foundation dataset has no language list")
+        foundation_languages = [
+            _canonical_language(
+                language,
+                field=f"prepared foundation languages[{index}]",
+            )
+            for index, language in enumerate(cast(list[object], raw_foundation_languages))
+        ]
+        if foundation_languages != raw_foundation_languages or len(foundation_languages) != len(
+            set(foundation_languages)
+        ):
+            raise BundleError("prepared foundation languages must be canonical and unique")
+        configured_foundation_languages = config.foundation_languages()
+        prepared_language_set = set(foundation_languages)
+        if tuple(foundation_languages) != tuple(
+            language
+            for language in configured_foundation_languages
+            if language in prepared_language_set
+        ):
+            raise BundleError(
+                "prepared foundation languages are not an ordered subset of the config"
+            )
+        if (
+            config.foundation.require_all_languages
+            and tuple(foundation_languages) != configured_foundation_languages
+        ):
+            raise BundleError(
+                "foundation.require_all_languages=true, but the prepared dataset "
+                "does not cover every configured language"
+            )
         sampling = foundation_manifest.get("language_sampling")
         if not isinstance(sampling, Mapping):
             raise BundleError("prepared foundation dataset has no language_sampling contract")

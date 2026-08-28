@@ -452,10 +452,12 @@ def _with_foundation_dataset(
     *,
     tokenizer_sha256: str | None = None,
     manifest_updates: dict[str, object] | None = None,
+    prepared_languages: list[str] | None = None,
 ) -> None:
     from sion_translate.config import load_config
 
     config = load_config(root / "sion_translate.yaml")
+    languages = prepared_languages or list(config.foundation_languages())
     dataset = root / "artifacts" / "foundation_dataset"
     (dataset / "train").mkdir(parents=True)
     (dataset / "validation").mkdir()
@@ -513,9 +515,9 @@ def _with_foundation_dataset(
         "stage": "foundation",
         "release_name": config.foundation.release_name,
         "objective": "span-corruption-denoising+structured-reasoning",
-        "languages": list(config.foundation_languages()),
-        "language_to_id": {"ko": 0},
-        "language_pairs": [["ko", "ko"]],
+        "languages": languages,
+        "language_to_id": {language: index for index, language in enumerate(languages)},
+        "language_pairs": [[language, language] for language in languages],
         "source_only_languages": [],
         "storage_sides": ["src", "tgt"],
         "target_storage": "row-shared-source-v1",
@@ -1036,6 +1038,54 @@ def test_foundation_dataset_accepts_the_configured_release_name(tmp_path: Path) 
         include_foundation_dataset=True,
     )
     package_gpu_bundle.verify_archive(archive)
+
+
+def test_foundation_dataset_may_cover_an_ordered_configured_language_subset(
+    tmp_path: Path,
+) -> None:
+    root = _repository(tmp_path)
+    config = root / "sion_translate.yaml"
+    config.write_text(
+        "data:\n  language_pair: [ko, ja]\nfoundation:\n  languages: [ko, ja]\n",
+        encoding="utf-8",
+    )
+    _git(root, "add", config.name)
+    _git(root, "commit", "-qm", "reserve an optional foundation language")
+    _with_tokenizer(root)
+    _with_foundation_dataset(root, prepared_languages=["ko"])
+
+    archive = tmp_path / "foundation-language-subset.zip"
+    package_gpu_bundle.build_bundle(
+        root,
+        archive,
+        include_tokenizer=True,
+        include_foundation_dataset=True,
+    )
+    package_gpu_bundle.verify_archive(archive)
+
+
+def test_foundation_dataset_requires_full_coverage_when_configured(
+    tmp_path: Path,
+) -> None:
+    root = _repository(tmp_path)
+    config = root / "sion_translate.yaml"
+    config.write_text(
+        "data:\n  language_pair: [ko, ja]\nfoundation:\n  languages: [ko, ja]\n"
+        "  require_all_languages: true\n",
+        encoding="utf-8",
+    )
+    _git(root, "add", config.name)
+    _git(root, "commit", "-qm", "require every foundation language")
+    _with_tokenizer(root)
+    _with_foundation_dataset(root, prepared_languages=["ko"])
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="does not cover every"):
+        package_gpu_bundle.build_bundle(
+            root,
+            tmp_path / "incomplete-foundation-languages.zip",
+            include_tokenizer=True,
+            include_foundation_dataset=True,
+        )
 
 
 def test_foundation_sources_must_match_the_included_monolingual_corpus(
