@@ -50,6 +50,7 @@ from sion_translate.artifacts import FOUNDATION_RELEASE_NAME
 from sion_translate.data.monolingual import (
     DEFAULT_LANGUAGE_SAMPLING_ALPHA,
     MonolingualDiscovery,
+    MonolingualSource,
     assess_language_balance,
     discover_monolingual_sources,
     segment_text,
@@ -2075,6 +2076,7 @@ def foundation_dataset_problem(
     minimum_language_share: float,
     reasoning_sample_share: float,
     release_name: str,
+    allow_offline_sources: bool = False,
 ) -> str | None:
     """Return why a prepared foundation dataset must be rebuilt, if anything."""
 
@@ -2181,50 +2183,6 @@ def foundation_dataset_problem(
             )
         except (TypeError, ValueError):
             return "Foundation source entry is invalid"
-    # Preserve a path-specific diagnostic when a source from the caller's
-    # discovery vanished; rediscovery alone would only report a set mismatch.
-    for source in discovery.sources:
-        if not source.path.is_file():
-            try:
-                _source_sha256(source.path)
-            except OSError as error:
-                return str(error)
-    configured_languages = tuple(
-        dict.fromkeys((*discovery.languages, *discovery.languages_without_data))
-    )
-    rediscovered = discover_monolingual_sources(discovery.root, configured_languages)
-    rediscovered_sources: set[tuple[str, str, int, str, str]] = set()
-    for source in rediscovered.sources:
-        try:
-            source_hash = _source_sha256(source.path)
-            logical_path = _source_logical_path(rediscovered, source.path)
-        except (OSError, ValueError) as error:
-            return str(error)
-        rediscovered_sources.add(
-            (
-                source.language,
-                logical_path,
-                source.size_bytes,
-                "reasoning" if is_reasoning_jsonl(source.path) else "denoising",
-                source_hash,
-            )
-        )
-    expected_sources: list[tuple[str, str, int, str, str]] = []
-    for source in discovery.sources:
-        try:
-            source_hash = _source_sha256(source.path)
-            logical_path = _source_logical_path(discovery, source.path)
-        except (OSError, ValueError) as error:
-            return str(error)
-        expected_sources.append(
-            (
-                source.language,
-                logical_path,
-                source.size_bytes,
-                "reasoning" if is_reasoning_jsonl(source.path) else "denoising",
-                source_hash,
-            )
-        )
     identity_payload: list[dict[str, object]] = [
         {
             "language": language,
@@ -2237,23 +2195,85 @@ def foundation_dataset_problem(
     ]
     if manifest.get("sources_sha256") != _source_identity_digest(identity_payload):
         return "Foundation aggregate source fingerprint is invalid"
-    if (
-        len(rediscovered_sources) != len(rediscovered.sources)
-        or rediscovered_sources != set(expected_sources)
-        or actual_sources != expected_sources
-        or len(actual_sources) != len(source_values)
-    ):
-        return "Foundation source list, size, or content changed"
+    semantic_discovery = discovery
+    if allow_offline_sources and not discovery.sources:
+        # A prepared-only GPU bundle intentionally omits source corpora. Build a
+        # manifest-backed discovery view for semantic/index validation while
+        # retaining the aggregate source digest as the provenance authority.
+        semantic_discovery = MonolingualDiscovery(
+            root=discovery.root,
+            sources=tuple(
+                MonolingualSource(
+                    language=language,
+                    path=discovery.root.joinpath(*PurePosixPath(logical_path).parts),
+                    size_bytes=size_bytes,
+                )
+                for language, logical_path, size_bytes, _task, _digest in actual_sources
+            ),
+        )
+    else:
+        # Preserve a path-specific diagnostic when a source from the caller's
+        # discovery vanished; rediscovery alone would only report a set mismatch.
+        for source in discovery.sources:
+            if not source.path.is_file():
+                try:
+                    _source_sha256(source.path)
+                except OSError as error:
+                    return str(error)
+        configured_languages = tuple(
+            dict.fromkeys((*discovery.languages, *discovery.languages_without_data))
+        )
+        rediscovered = discover_monolingual_sources(discovery.root, configured_languages)
+        rediscovered_sources: set[tuple[str, str, int, str, str]] = set()
+        for source in rediscovered.sources:
+            try:
+                source_hash = _source_sha256(source.path)
+                logical_path = _source_logical_path(rediscovered, source.path)
+            except (OSError, ValueError) as error:
+                return str(error)
+            rediscovered_sources.add(
+                (
+                    source.language,
+                    logical_path,
+                    source.size_bytes,
+                    "reasoning" if is_reasoning_jsonl(source.path) else "denoising",
+                    source_hash,
+                )
+            )
+        expected_sources: list[tuple[str, str, int, str, str]] = []
+        for source in discovery.sources:
+            try:
+                source_hash = _source_sha256(source.path)
+                logical_path = _source_logical_path(discovery, source.path)
+            except (OSError, ValueError) as error:
+                return str(error)
+            expected_sources.append(
+                (
+                    source.language,
+                    logical_path,
+                    source.size_bytes,
+                    "reasoning" if is_reasoning_jsonl(source.path) else "denoising",
+                    source_hash,
+                )
+            )
+        if (
+            len(rediscovered_sources) != len(rediscovered.sources)
+            or rediscovered_sources != set(expected_sources)
+            or actual_sources != expected_sources
+            or len(actual_sources) != len(source_values)
+        ):
+            return "Foundation source list, size, or content changed"
     artifact_problem = dataset_artifact_problem(output_dir)
     if artifact_problem is not None:
         return f"Foundation indexed payload is corrupt: {artifact_problem}"
     semantic_problem = _foundation_manifest_semantic_problem(
         Path(output_dir),
         manifest,
-        discovery,
+        semantic_discovery,
         language_sampling_alpha=language_sampling_alpha,
         minimum_language_share=minimum_language_share,
         reasoning_sample_share=reasoning_sample_share,
+        sources_offline=allow_offline_sources and not discovery.sources,
     )
     if semantic_problem is not None:
         return semantic_problem
@@ -2384,6 +2404,7 @@ def _foundation_manifest_semantic_problem(
     language_sampling_alpha: float,
     minimum_language_share: float,
     reasoning_sample_share: float,
+    sources_offline: bool = False,
 ) -> str | None:
     """Validate every manifest field consumed after dataset preparation."""
 
@@ -2537,10 +2558,13 @@ def _foundation_manifest_semantic_problem(
             return f"Foundation manifest source name is invalid: {source_id}"
         if source.get("language") != expected_source.language:
             return f"Foundation manifest source language is invalid: {source_id}"
-        try:
-            expected_logical_path = _source_logical_path(discovery, expected_source.path)
-        except ValueError as error:
-            return str(error)
+        if sources_offline:
+            expected_logical_path = expected_source.path.relative_to(discovery.root).as_posix()
+        else:
+            try:
+                expected_logical_path = _source_logical_path(discovery, expected_source.path)
+            except ValueError as error:
+                return str(error)
         if source.get("logical_path") != expected_logical_path:
             return f"Foundation manifest source logical_path is invalid: {source_id}"
         size_bytes = source.get("size_bytes")

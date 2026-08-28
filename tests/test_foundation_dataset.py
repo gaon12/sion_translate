@@ -98,6 +98,7 @@ def _dataset_problem(
     *,
     language_sampling_alpha=0.7,
     minimum_language_share=0.05,
+    allow_offline_sources=False,
 ) -> str | None:
     return foundation_dataset_problem(
         tmp_path / "dataset",
@@ -114,6 +115,7 @@ def _dataset_problem(
         minimum_language_share=minimum_language_share,
         reasoning_sample_share=0.05,
         release_name="sion",
+        allow_offline_sources=allow_offline_sources,
     )
 
 
@@ -348,6 +350,29 @@ def test_manifest_source_identities_survive_corpus_relocation(
     relocated = discover_monolingual_sources(relocated_root, ["ko", "ja"])
 
     assert _dataset_problem(tmp_path, relocated, tokenizer_model) is None
+
+
+def test_manifest_can_authenticate_prepared_shards_while_sources_are_offline(
+    tmp_path,
+    tokenizer_model,
+) -> None:
+    discovery, _ = _prepare(tmp_path, tokenizer_model)
+    offline = MonolingualDiscovery(
+        root=discovery.root,
+        languages_without_data=discovery.languages,
+    )
+    shutil.rmtree(discovery.root)
+
+    assert (
+        _dataset_problem(
+            tmp_path,
+            offline,
+            tokenizer_model,
+            allow_offline_sources=True,
+        )
+        is None
+    )
+    assert _dataset_problem(tmp_path, offline, tokenizer_model) is not None
 
 
 def test_absolute_path_manifest_requires_a_clear_portable_identity_migration(
