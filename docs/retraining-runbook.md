@@ -239,18 +239,17 @@ artifacts:
 
 ```bash
 python scripts/package_gpu_bundle.py build \
-  --output sion_translate.zip \
-  --with-tokenizer \
-  --with-dataset \
-  --with-foundation-dataset
+  --output sion_translate-prepared.zip \
+  --prepared-only
 
-python scripts/package_gpu_bundle.py verify-archive sion_translate.zip
+python scripts/package_gpu_bundle.py verify-archive sion_translate-prepared.zip
 ```
 
-Use `--with-monolingual-corpus` only when the GPU server must rebuild the foundation
-dataset. If `artifacts/foundation_dataset/` is already complete and authenticated,
-omitting raw monolingual corpora makes the upload smaller and prevents accidental
-server-side re-preparation.
+Prepared-only mode includes the complete tokenizer and every applicable indexed dataset,
+but omits raw parallel and monolingual training corpora even when they are tracked. Use
+the individual `--with-*` switches only for a deliberate server-side rebuild.
+`--with-monolingual-corpus` is required when the GPU server must rebuild the foundation
+dataset and intentionally conflicts with `--prepared-only`.
 
 Record the archive path, byte size, SHA-256, source commit, Git tree, configuration
 fingerprint, and artifact inventory. Do not upload an archive that fails verification.
@@ -261,9 +260,9 @@ Compare the archive digest with the value recorded locally, test the ZIP contain
 verify the extracted tree:
 
 ```bash
-sha256sum sion_translate.zip
-python3 -m zipfile -t sion_translate.zip
-unzip sion_translate.zip
+sha256sum sion_translate-prepared.zip
+python3 -m zipfile -t sion_translate-prepared.zip
+unzip sion_translate-prepared.zip
 cd sion_translate
 python3 scripts/package_gpu_bundle.py verify-tree .
 ```
@@ -293,6 +292,10 @@ Authenticate the prepared inputs once more without starting model training:
 ```bash
 sion-train --config sion_translate.yaml --prepare-only
 ```
+
+In a prepared-only tree this is an offline verification pass. A missing tokenizer or
+dataset is an error because the raw source corpus was intentionally not shipped. The
+runner completes this check before allocating model or optimizer storage.
 
 A complete bundle should reuse every included artifact.
 

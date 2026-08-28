@@ -1,17 +1,17 @@
 # Start the verified GPU training bundle
 
-Use this checklist after receiving `sion_translate.zip`. The recommended bundle already
-contains the tokenizer and indexed datasets prepared on the local machine, so the GPU
-server can begin model training without repeating CPU-heavy work.
+Use this checklist after receiving `sion_translate-prepared.zip`. The recommended bundle
+already contains the tokenizer and indexed datasets prepared on the local machine, so the
+GPU server can begin model training without repeating CPU-heavy work.
 
 ## 1. Verify the archive before extraction
 
 Compare the first command with the SHA-256 supplied by the bundle builder:
 
 ```bash
-sha256sum sion_translate.zip
-python3 -m zipfile -t sion_translate.zip
-unzip sion_translate.zip
+sha256sum sion_translate-prepared.zip
+python3 -m zipfile -t sion_translate-prepared.zip
+unzip sion_translate-prepared.zip
 cd sion_translate
 python3 scripts/package_gpu_bundle.py verify-tree .
 ```
@@ -24,13 +24,16 @@ The exact contents depend on the options used at build time. A prepared training
 normally includes:
 
 - all tracked source, configuration, tests, and documentation;
-- approved top-level training JSONL and isolated `data/evaluation_only/` files;
+- configured `data/evaluation_only/` files, but no raw parallel training JSONL;
 - `artifacts/tokenizer/`, including the authenticated token-feature sidecar;
 - `artifacts/dataset/` for translation training;
 - `artifacts/foundation_dataset/` when foundation data was prepared locally.
 
-Excluded data, old runs, checkpoints, virtual environments, and caches must not appear.
-Use the manifest as the authority instead of relying on a hard-coded file count.
+The prepared-only format also excludes the raw monolingual foundation corpus, including
+tracked corpus files. Old runs, checkpoints, virtual environments, and caches must not
+appear. Use the manifest as the authority instead of relying on a hard-coded file count.
+Manifest format 2 binds the exact tracked `sion_translate.yaml` digest, configured graph,
+source provenance, tokenizer, datasets, and canonical paths used by the default runner.
 
 ## 2. Install a compatible GPU environment
 
@@ -76,8 +79,9 @@ all chunks are complete before creating final shards. A post-worker disk failure
 the reusable chunks and never publishes a partial `artifacts/dataset/` directory.
 
 For a fully prepared bundle, this should authenticate and reuse the tokenizer and both
-indexed datasets rather than rebuild them. If the bundle intentionally omitted an
-artifact, the command prepares only that missing artifact.
+indexed datasets rather than rebuild them. A prepared-only bundle has no raw training
+corpus from which to reconstruct a missing artifact, so absence is a preflight error.
+This check finishes before model or optimizer allocation.
 
 Do not continue when it reports a tokenizer, graph, source fingerprint, token-feature,
 or dataset inventory mismatch. Those errors mean the server files do not represent the

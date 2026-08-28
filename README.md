@@ -385,28 +385,40 @@ After local tokenizer and dataset preparation succeeds, build a self-contained a
 
 ```bash
 python scripts/package_gpu_bundle.py build \
-  --output sion_translate.zip \
-  --with-tokenizer \
-  --with-dataset \
-  --with-foundation-dataset
+  --output sion_translate-prepared.zip \
+  --prepared-only
 
-python scripts/package_gpu_bundle.py verify-archive sion_translate.zip
+python scripts/package_gpu_bundle.py verify-archive sion_translate-prepared.zip
 ```
 
-Add `--with-monolingual-corpus` only when the GPU server must rebuild the foundation
-dataset. If the foundation dataset was already prepared locally, the prepared artifact is
-normally faster to upload and start.
+`--prepared-only` is the recommended GPU handoff. It includes the complete tokenizer,
+the translation dataset, and the foundation dataset when foundation training is enabled.
+It omits the raw parallel and monolingual training corpora, even if a corpus file happens
+to be tracked, while retaining configured evaluation-only material. The extracted server
+tree can therefore authenticate and train from the prepared shards without repeating
+CPU-heavy tokenization or indexing.
+
+Use the individual `--with-*` switches only for an intentional rebuild workflow. For
+example, add `--with-monolingual-corpus` when the GPU server must build the foundation
+dataset itself. That raw-corpus option deliberately conflicts with `--prepared-only`.
 
 The builder authenticates the tokenizer, token features, translation dataset, foundation
-dataset, configuration-selected languages, Git tree, file sizes, and SHA-256 digests. It
-publishes the ZIP atomically and refuses to overwrite an existing archive unless
-`--overwrite` is explicit.
+dataset, source provenance, configuration-selected graph, Git tree, file sizes, and
+SHA-256 digests. Manifest format 2 also binds the exact tracked `sion_translate.yaml`
+path and digest used by the default training command. The current format intentionally
+requires the canonical artifact and corpus paths so an alternate local layout cannot be
+packaged and then interpreted differently on the server. The builder publishes the ZIP
+atomically and refuses to overwrite an existing archive unless `--overwrite` is explicit.
 
 After extraction on the GPU server, verify the tree before training:
 
 ```bash
 python scripts/package_gpu_bundle.py verify-tree sion_translate
 ```
+
+Run `sion-train --config sion_translate.yaml --prepare-only` once after verification. In
+a prepared-only tree this is an offline authentication pass: missing or inconsistent
+prepared artifacts are errors instead of a request to rediscover omitted raw corpora.
 
 ## Export and repository roles
 

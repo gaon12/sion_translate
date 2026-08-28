@@ -80,22 +80,27 @@ When local preparation is complete:
 
 ```bash
 python scripts/package_gpu_bundle.py build \
-  --output sion_translate.zip \
-  --with-tokenizer \
-  --with-dataset \
-  --with-foundation-dataset
+  --output sion_translate-prepared.zip \
+  --prepared-only
 
-python scripts/package_gpu_bundle.py verify-archive sion_translate.zip
+python scripts/package_gpu_bundle.py verify-archive sion_translate-prepared.zip
 ```
 
-Use `--with-monolingual-corpus` only if the server must prepare the foundation dataset.
+Prepared-only bundles include authenticated tokenizer, translation, and enabled
+foundation artifacts while omitting raw parallel and monolingual training corpora. This
+is the normal path when local preparation has completed. Use the individual `--with-*`
+options only for a deliberate server-side rebuild; `--with-monolingual-corpus` is needed
+when the server must prepare the foundation dataset and conflicts with `--prepared-only`.
 After extraction on the server:
 
 ```bash
 python scripts/package_gpu_bundle.py verify-tree sion_translate
+sion-train --config sion_translate.yaml --prepare-only
 ```
 
-Do not train from an archive that fails either verification command.
+The second command performs an offline artifact preflight and stops before model
+allocation. Do not train from an archive that fails either verification command or this
+preflight.
 
 ## 3. Run on one H100
 

@@ -1,5 +1,5 @@
-HOW TO RUN sion_translate.zip ON A GPU SERVER
-==============================================
+HOW TO RUN sion_translate-prepared.zip ON A GPU SERVER
+=======================================================
 
 This is the plain-text companion to START-HERE.md.
 
@@ -9,9 +9,9 @@ This is the plain-text companion to START-HERE.md.
 
 Compare the first command with the SHA-256 supplied by the bundle builder.
 
-sha256sum sion_translate.zip
-python3 -m zipfile -t sion_translate.zip
-unzip sion_translate.zip
+sha256sum sion_translate-prepared.zip
+python3 -m zipfile -t sion_translate-prepared.zip
+unzip sion_translate-prepared.zip
 cd sion_translate
 python3 scripts/package_gpu_bundle.py verify-tree .
 
@@ -20,8 +20,10 @@ verified archive again.
 
 The manifest is the authority for the bundle contents. A fully prepared bundle normally
 contains the authenticated tokenizer, token features, translation dataset, and foundation
-dataset. Excluded data, old runs, checkpoints, virtual environments, and caches must not
-be present.
+dataset. It retains configured evaluation-only files but excludes raw parallel and
+monolingual training corpora, including tracked corpus files. Excluded data, old runs,
+checkpoints, virtual environments, and caches must not be present. Manifest format 2 also
+binds the exact tracked sion_translate.yaml digest and configured training contract.
 
 
 2. INSTALL THE PACKAGE AND CHECK CUDA
@@ -60,7 +62,8 @@ sion-train --config sion_translate.yaml --prepare-only
 
 A fully prepared bundle should reuse its tokenizer and indexed datasets. Do not continue
 if this command reports a graph, tokenizer, token-feature, fingerprint, or inventory
-mismatch.
+mismatch. A prepared-only bundle cannot rebuild a missing artifact because its raw
+training corpora were intentionally omitted; the command fails before allocating a model.
 
 
 4. START OR RESUME TRAINING
