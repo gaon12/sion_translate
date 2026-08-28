@@ -15,8 +15,10 @@ from typing import Any, cast
 import pytest
 import torch
 
+from bundle_contract_fixtures import write_test_bundle
 import sion_translate.cli.train as train_module
 import sion_translate.training.distributed as distributed_module
+from sion_translate.bundle_contract import BundleContractError
 from sion_translate.cli.train import (
     build_collator_args,
     construct_training_model,
@@ -64,18 +66,8 @@ class LoaderStub:
 
 
 def test_embedded_gpu_bundle_requires_its_authenticated_config(tmp_path: Path) -> None:
+    write_test_bundle(tmp_path)
     config = tmp_path / "sion_translate.yaml"
-    config.write_text("data:\n  language_pair: [ko, ja]\n", encoding="utf-8")
-    manifest = {
-        "training_contract": {
-            "config_path": "sion_translate.yaml",
-            "config_sha256": file_sha256(config),
-        }
-    }
-    (tmp_path / "PACKAGE_MANIFEST.json").write_text(
-        json.dumps(manifest) + "\n",
-        encoding="utf-8",
-    )
 
     train_module.preflight_embedded_bundle_config(None, root=tmp_path)
     with pytest.raises(RuntimeError, match="refusing alternate config"):
@@ -84,7 +76,7 @@ def test_embedded_gpu_bundle_requires_its_authenticated_config(tmp_path: Path) -
             root=tmp_path,
         )
 
-    config.write_text("data:\n  language_pair: [de, fr]\n", encoding="utf-8")
+    config.write_text("data:\n  language_pairs: [[es, it]]\n", encoding="utf-8")
     with pytest.raises(RuntimeError, match="differs from the GPU bundle"):
         train_module.preflight_embedded_bundle_config(None, root=tmp_path)
 
@@ -105,21 +97,9 @@ def test_embedded_gpu_bundle_rejects_every_config_mutating_cli_override(
     monkeypatch: pytest.MonkeyPatch,
     arguments: list[str],
 ) -> None:
-    config = tmp_path / "sion_translate.yaml"
-    config.write_text("data:\n  language_pair: [de, fr]\n", encoding="utf-8")
-    (tmp_path / "PACKAGE_MANIFEST.json").write_text(
-        json.dumps(
-            {
-                "training_contract": {
-                    "config_path": "sion_translate.yaml",
-                    "config_sha256": file_sha256(config),
-                }
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+    write_test_bundle(tmp_path)
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(train_module, "SOURCE_PROJECT_ROOT", tmp_path)
     args = train_module.build_parser().parse_args(arguments)
 
     with pytest.raises(RuntimeError, match="config-mutating command-line overrides"):
@@ -130,27 +110,190 @@ def test_embedded_gpu_bundle_allows_nonmutating_prepare_only_mode(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = tmp_path / "sion_translate.yaml"
-    config.write_text("data:\n  language_pair: [de, fr]\n", encoding="utf-8")
-    (tmp_path / "PACKAGE_MANIFEST.json").write_text(
-        json.dumps(
-            {
-                "training_contract": {
-                    "config_path": "sion_translate.yaml",
-                    "config_sha256": file_sha256(config),
-                }
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+    write_test_bundle(tmp_path)
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(train_module, "SOURCE_PROJECT_ROOT", tmp_path)
     args = train_module.build_parser().parse_args(["--prepare-only"])
 
     resolved, _raw, source = train_module.resolve_config(args)
 
     assert resolved.data.configured_language_pairs() == (("de", "fr"),)
     assert source == "sion_translate.yaml"
+
+
+def test_bundle_config_cannot_bypass_enforcement_from_an_outside_working_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = tmp_path / "bundle"
+    write_test_bundle(bundle)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    monkeypatch.chdir(outside)
+    args = train_module.build_parser().parse_args(
+        ["--config", str(bundle / "sion_translate.yaml"), "--epochs", "1"]
+    )
+
+    with pytest.raises(RuntimeError, match="must run from its extracted root"):
+        train_module.resolve_config(args)
+
+
+@pytest.mark.parametrize("copy_authenticated_config", [False, True])
+def test_bundle_source_identity_prevents_an_outside_cwd_downgrade(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    copy_authenticated_config: bool,
+) -> None:
+    bundle = tmp_path / "bundle"
+    write_test_bundle(bundle)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    if copy_authenticated_config:
+        (outside / "sion_translate.yaml").write_bytes((bundle / "sion_translate.yaml").read_bytes())
+    monkeypatch.setattr(train_module, "SOURCE_PROJECT_ROOT", bundle)
+    monkeypatch.chdir(outside)
+    args = train_module.build_parser().parse_args([])
+
+    with pytest.raises(RuntimeError, match="must run from its extracted root"):
+        train_module.resolve_config(args)
+
+
+def test_bundle_rejects_a_training_cli_loaded_from_another_source_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = tmp_path / "bundle"
+    write_test_bundle(bundle)
+    unrelated_source = tmp_path / "installed-package"
+    unrelated_source.mkdir()
+    monkeypatch.setattr(train_module, "SOURCE_PROJECT_ROOT", unrelated_source)
+    monkeypatch.chdir(bundle)
+    args = train_module.build_parser().parse_args([])
+
+    with pytest.raises(RuntimeError, match="must execute the source tree carried"):
+        train_module.resolve_config(args)
+
+
+def test_bundle_config_is_parsed_from_the_authenticated_bytes_only_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    write_test_bundle(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(train_module, "SOURCE_PROJECT_ROOT", tmp_path)
+    original_preflight = train_module.preflight_embedded_bundle_config
+
+    def swap_config_after_preflight(*args: Any, **kwargs: Any):
+        contract = original_preflight(*args, **kwargs)
+        assert contract is not None
+        (tmp_path / "sion_translate.yaml").write_text(
+            "data:\n  language_pairs: [[es, it]]\n",
+            encoding="utf-8",
+        )
+        return contract
+
+    monkeypatch.setattr(
+        train_module,
+        "preflight_embedded_bundle_config",
+        swap_config_after_preflight,
+    )
+    monkeypatch.setattr(
+        train_module,
+        "load_raw_config",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("authenticated config must not be reopened")
+        ),
+    )
+    args = train_module.build_parser().parse_args([])
+
+    resolved, _raw, source = train_module.resolve_config(args)
+
+    assert resolved.data.configured_language_pairs() == (("de", "fr"),)
+    assert source == "sion_translate.yaml"
+
+
+def test_failed_rebuild_restores_the_previous_dataset_generation(tmp_path: Path) -> None:
+    active = tmp_path / "dataset"
+    active.mkdir()
+    (active / "manifest.json").write_text("old\n", encoding="utf-8")
+    backup = train_module.backup_stale_dataset(active)
+    failure = RuntimeError("injected preparation failure")
+
+    train_module._restore_stale_dataset_after_failed_rebuild(
+        active,
+        backup,
+        failure,
+        DistributedContext(0, 0, 1, torch.device("cpu"), False),
+        label="translation dataset",
+    )
+
+    assert (active / "manifest.json").read_text(encoding="utf-8") == "old\n"
+    assert not backup.exists()
+
+
+def test_artifact_preparation_rejects_rogue_bundle_sources_before_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    write_test_bundle(tmp_path)
+    rogue = tmp_path / "data" / "rogue.jsonl"
+    rogue.parent.mkdir(exist_ok=True)
+    rogue.write_text('{"de":"eins","fr":"un"}\n', encoding="utf-8")
+    translation_manifest = tmp_path / "artifacts" / "dataset" / "manifest.json"
+    original_manifest = translation_manifest.read_bytes()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(train_module, "SOURCE_PROJECT_ROOT", tmp_path)
+    config = config_from_raw(
+        {
+            "data": {
+                "language_pairs": [["de", "fr"]],
+                "translation_directions": [["de", "fr"], ["fr", "de"]],
+            },
+            "foundation": {"enabled": False},
+        }
+    )
+
+    with pytest.raises(BundleContractError, match="extra=.*rogue.jsonl"):
+        train_module._ensure_artifacts_on_main(
+            config,
+            SimpleNamespace(is_main=True),
+            locks_held=True,
+        )
+
+    assert translation_manifest.read_bytes() == original_manifest
+    assert not list((tmp_path / "artifacts").glob("dataset.incompatible-*"))
+
+
+def test_artifact_preparation_hashes_the_full_bundle_before_scanning_sources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    write_test_bundle(tmp_path)
+    tokenizer = tmp_path / "artifacts" / "tokenizer" / "sion.model"
+    tokenizer.write_bytes(b"tampered-tokenizer")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(train_module, "SOURCE_PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(
+        train_module,
+        "scan_configured_raw_data",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("scan must not run")),
+    )
+    config = config_from_raw(
+        {
+            "data": {
+                "language_pairs": [["de", "fr"]],
+                "translation_directions": [["de", "fr"], ["fr", "de"]],
+            },
+            "foundation": {"enabled": False},
+        }
+    )
+
+    with pytest.raises(BundleContractError, match="payload hash differs.*sion.model"):
+        train_module._ensure_artifacts_on_main(
+            config,
+            SimpleNamespace(is_main=True),
+            locks_held=True,
+        )
 
 
 def test_dataloader_runtime_settings_separate_training_and_validation() -> None:
@@ -2462,6 +2605,25 @@ def test_tokenizer_policy_requires_digit_splitting_and_matching_identity(
         )
         is None
     )
+    features_path = tmp_path / "token_features.npz"
+    features_path.write_bytes(b"authenticated-features")
+    metadata.update(
+        token_features_file=features_path.name,
+        token_features_size=features_path.stat().st_size,
+        token_features_sha256=file_sha256(features_path),
+    )
+    assert tokenizer_policy_problem(model_path, pairs) is None
+    features_path.write_bytes(b"corrupt-features")
+    assert "token_features_size" in str(tokenizer_policy_problem(model_path, pairs))
+    metadata["token_features_size"] = features_path.stat().st_size
+    assert "token_features_sha256" in str(tokenizer_policy_problem(model_path, pairs))
+    features_path.unlink()
+    for field in (
+        "token_features_file",
+        "token_features_size",
+        "token_features_sha256",
+    ):
+        metadata.pop(field)
     # Foundation languages extend the tokenizer's translation-language
     # denoising controls; they do not replace that base set.
     assert tokenizer_policy_problem(model_path, pairs, ("ko",)) is None

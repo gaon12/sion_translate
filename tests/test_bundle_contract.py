@@ -221,6 +221,8 @@ def test_generated_tokenizer_provenance_matches_arbitrary_authenticated_sources(
     tokenizer_contract = {
         "schema": "sion-tokenizer-training-v4",
         "input_traversal_policy": "portable-input-order-v1",
+        "language_pairs": [["de", "fr"]],
+        "approximate_split": False,
         "sources": [
             {
                 "role": "parallel",
@@ -255,6 +257,10 @@ def test_generated_tokenizer_provenance_matches_arbitrary_authenticated_sources(
         "training_contract": tokenizer_contract,
         "training_contract_sha256": digest,
     }
+    expected_policy = {
+        "language_pairs": [["de", "fr"]],
+        "approximate_split": False,
+    }
 
     validate_tokenizer_source_inventory(
         contract,
@@ -262,7 +268,29 @@ def test_generated_tokenizer_provenance_matches_arbitrary_authenticated_sources(
         fingerprint,
         tmp_path / "data" / "corpus",
         sources,
+        expected_policy=expected_policy,
     )
+
+    wrong_policy = copy.deepcopy(tokenizer_contract)
+    wrong_policy["approximate_split"] = True
+    metadata["training_contract"] = wrong_policy
+    metadata["training_contract_sha256"] = hashlib.sha256(
+        json.dumps(
+            wrong_policy,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    with pytest.raises(BundleContractError, match="policy approximate_split differs"):
+        validate_tokenizer_source_inventory(
+            contract,
+            metadata,
+            fingerprint,
+            tmp_path / "data" / "corpus",
+            sources,
+            expected_policy=expected_policy,
+        )
 
     stale_contract = copy.deepcopy(tokenizer_contract)
     stale_contract["sources"][0]["sha256"] = "0" * 64
@@ -282,6 +310,7 @@ def test_generated_tokenizer_provenance_matches_arbitrary_authenticated_sources(
             fingerprint,
             tmp_path / "data" / "corpus",
             sources,
+            expected_policy=expected_policy,
         )
 
 

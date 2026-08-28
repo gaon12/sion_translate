@@ -822,6 +822,8 @@ def validate_tokenizer_source_inventory(
     fingerprint: DatasetFingerprint,
     monolingual_root: Path,
     monolingual_sources: Sequence[Any],
+    *,
+    expected_policy: Mapping[str, object] | None = None,
 ) -> None:
     """Bind a generated tokenizer to the exact authenticated source traversal."""
 
@@ -849,6 +851,11 @@ def validate_tokenizer_source_inventory(
     ).encode("utf-8")
     if metadata.get("training_contract_sha256") != hashlib.sha256(canonical_contract).hexdigest():
         raise BundleContractError("the generated tokenizer training-contract digest differs")
+    for field, expected in (expected_policy or {}).items():
+        if training_contract.get(field) != expected:
+            raise BundleContractError(
+                f"generated tokenizer policy {field} differs from the authenticated GPU config"
+            )
 
     expected_sources: list[dict[str, object]] = [
         {

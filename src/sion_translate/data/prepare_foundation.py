@@ -622,6 +622,45 @@ def _capture_source_snapshots(
     return tuple(snapshots)
 
 
+def _verify_expected_source_identities(
+    snapshots: tuple[_FileSnapshot, ...],
+    expected: Mapping[str, tuple[int, str]] | None,
+) -> None:
+    """Bind bundle-authorized source bytes before any output can be replaced."""
+
+    if expected is None:
+        return
+    normalized_expected: dict[str, tuple[int, str]] = {}
+    for raw_path, raw_identity in expected.items():
+        if not raw_path:
+            raise ValueError("expected foundation source paths must be non-empty strings")
+        if (
+            raw_identity[0] < 0
+            or len(raw_identity[1]) != 64
+            or any(character not in "0123456789abcdef" for character in raw_identity[1])
+        ):
+            raise ValueError(f"expected foundation source identity is invalid: {raw_path}")
+        normalized_path = str(Path(raw_path).resolve())
+        if normalized_path in normalized_expected:
+            raise ValueError(f"expected foundation source path is repeated: {normalized_path}")
+        normalized_expected[normalized_path] = raw_identity
+    actual = {
+        snapshot.resolved_path: (snapshot.size_bytes, snapshot.sha256) for snapshot in snapshots
+    }
+    if actual != normalized_expected:
+        missing = sorted(set(normalized_expected) - set(actual))
+        extra = sorted(set(actual) - set(normalized_expected))
+        changed = sorted(
+            path
+            for path in set(actual).intersection(normalized_expected)
+            if actual[path] != normalized_expected[path]
+        )
+        raise RuntimeError(
+            "Foundation sources differ from the caller's authenticated identities; "
+            f"missing={missing}, extra={extra}, changed={changed}"
+        )
+
+
 def _build_resume_contract(
     discovery: MonolingualDiscovery,
     source_snapshots: tuple[_FileSnapshot, ...],
@@ -3426,6 +3465,7 @@ def _prepare_foundation_dataset_locked(
     minimum_language_share: float = 0.05,
     reasoning_sample_share: float = 0.05,
     release_name: str = FOUNDATION_RELEASE_NAME,
+    expected_source_identities: Mapping[str, tuple[int, str]] | None = None,
 ) -> FoundationPrepareStats:
     """Prepare one generation while the caller owns the exact output lease."""
 
@@ -3444,6 +3484,7 @@ def _prepare_foundation_dataset_locked(
     final_output.parent.mkdir(parents=True, exist_ok=True)
     _assert_regular_directory(final_output.parent, role="output parent")
     source_snapshots = _capture_source_snapshots(discovery)
+    _verify_expected_source_identities(source_snapshots, expected_source_identities)
     tokenizer_snapshot = _tokenizer_snapshot(Path(tokenizer_model))
     # This immediate rediscovery also rejects a plan whose source list changed
     # before preparation acquired its artifact lock.
@@ -3591,6 +3632,7 @@ def prepare_foundation_dataset(
     minimum_language_share: float = 0.05,
     reasoning_sample_share: float = 0.05,
     release_name: str = FOUNDATION_RELEASE_NAME,
+    expected_source_identities: Mapping[str, tuple[int, str]] | None = None,
 ) -> FoundationPrepareStats:
     """Transactionally prepare and atomically publish one foundation generation."""
 
@@ -3619,6 +3661,7 @@ def prepare_foundation_dataset(
             minimum_language_share=minimum_language_share,
             reasoning_sample_share=reasoning_sample_share,
             release_name=release_name,
+            expected_source_identities=expected_source_identities,
         )
 
 

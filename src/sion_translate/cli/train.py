@@ -59,7 +59,12 @@ from sion_translate.auto import (
     stored_fingerprint,
     synchronize_environment,
 )
-from sion_translate.config import AppConfig, config_from_raw, load_raw_config
+from sion_translate.config import (
+    AppConfig,
+    config_from_raw,
+    load_raw_config,
+    parse_raw_config_text,
+)
 from sion_translate.console import configure_stdio
 from sion_translate.data import (
     DistributedBucketBatchSampler,
@@ -70,6 +75,15 @@ from sion_translate.artifacts import (
     FOUNDATION_STAGE_DIRECTORY,
     MODEL_RELEASE_VERSION,
     TRANSLATION_RELEASE_NAME,
+)
+from sion_translate.bundle_contract import (
+    EmbeddedTrainingContract,
+    load_embedded_training_contract,
+    resolved_origin_identities,
+    validate_monolingual_source_inventory,
+    validate_parallel_source_inventory,
+    validate_tokenizer_source_inventory,
+    verify_embedded_bundle_payload,
 )
 from sion_translate.data.collate import load_morphoscript_token_features
 from sion_translate.data.integrity import (
@@ -135,6 +149,13 @@ from sion_translate.training.trainer import (
     train,
 )
 from sion_translate.performance import build_cpu_plan
+
+
+# Editable GPU-bundle installs execute this module directly from
+# ``<bundle>/src/sion_translate/cli/train.py``.  That source identity remains
+# authoritative even when an entry-point script is launched from another
+# working directory.
+SOURCE_PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 DEFAULT_CONFIG_FILE = "sion_translate.yaml"
 FINAL_EXPORT_DEPENDENCIES = {
@@ -1062,6 +1083,24 @@ def tokenizer_policy_problem(
     vocab_path = tokenizer_path.with_suffix(".vocab")
     if not vocab_path.is_file() or metadata.get("vocab_sha256") != file_sha256(vocab_path):
         return "tokenizer_metadata.json vocab_sha256 does not match the vocabulary file"
+    features_path = tokenizer_path.parent / "token_features.npz"
+    feature_identity_recorded = any(
+        field in metadata
+        for field in (
+            "token_features_file",
+            "token_features_size",
+            "token_features_sha256",
+        )
+    )
+    if features_path.is_file() or feature_identity_recorded:
+        if metadata.get("token_features_file") != features_path.name:
+            return "tokenizer_metadata.json token_features_file does not match the feature file"
+        if not features_path.is_file():
+            return "tokenizer_metadata.json records a missing token feature file"
+        if metadata.get("token_features_size") != features_path.stat().st_size:
+            return "tokenizer_metadata.json token_features_size does not match the feature file"
+        if metadata.get("token_features_sha256") != file_sha256(features_path):
+            return "tokenizer_metadata.json token_features_sha256 does not match the feature file"
     raw_pairs = metadata.get("language_pairs")
     recorded_pairs = (
         tuple((str(pair[0]), str(pair[1])) for pair in raw_pairs)
@@ -1288,49 +1327,66 @@ def seed_everything(seed: int, rank: int) -> None:
         torch.cuda.manual_seed_all(seed + rank)
 
 
+def _resolve_runtime_bundle_contract(
+    root: Path | None = None,
+) -> tuple[Path, EmbeddedTrainingContract | None]:
+    """Find the bundle policy without trusting the caller's working directory."""
+
+    if root is not None:
+        explicit_root = root.resolve()
+        return explicit_root, load_embedded_training_contract(explicit_root)
+
+    working_root = Path.cwd().resolve()
+    source_root = SOURCE_PROJECT_ROOT.resolve()
+    source_contract = load_embedded_training_contract(source_root)
+    if source_contract is not None:
+        if working_root != source_root:
+            raise RuntimeError(
+                "An authenticated GPU bundle must run from its extracted root so all "
+                "relative data and artifact paths stay bound to the manifest. Change the "
+                f"working directory to {source_root} and run again."
+            )
+        return source_root, source_contract
+    working_contract = load_embedded_training_contract(working_root)
+    if working_contract is not None and source_root != working_root:
+        raise RuntimeError(
+            "An authenticated GPU bundle must execute the source tree carried by that "
+            "bundle. The active sion-train installation resolves to "
+            f"{source_root}, not {working_root}. Install this extracted project with its "
+            "reviewed editable-install command and run again."
+        )
+    return working_root, working_contract
+
+
 def preflight_embedded_bundle_config(
     requested_config: str | None,
     *,
     override_flags: tuple[str, ...] = (),
     root: Path | None = None,
-) -> None:
+) -> EmbeddedTrainingContract | None:
     """Require an extracted GPU bundle to use its authenticated effective config."""
 
-    bundle_root = (root or Path.cwd()).resolve()
-    manifest_path = bundle_root / "PACKAGE_MANIFEST.json"
-    if not manifest_path.is_file():
-        return
-    try:
-        raw_manifest: object = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise RuntimeError(
-            f"Cannot read the embedded GPU bundle manifest: {manifest_path}"
-        ) from error
-    if not isinstance(raw_manifest, dict):
-        raise RuntimeError("The embedded GPU bundle manifest must be a JSON object")
-    raw_contract = cast(dict[str, Any], raw_manifest).get("training_contract")
-    if not isinstance(raw_contract, dict):
-        raise RuntimeError("The embedded GPU bundle has no authenticated training contract")
-    contract = cast(dict[str, Any], raw_contract)
-    config_path = contract.get("config_path")
-    config_sha256 = contract.get("config_sha256")
-    if config_path != DEFAULT_CONFIG_FILE or not isinstance(config_sha256, str):
-        raise RuntimeError(
-            "The embedded GPU bundle does not authenticate the default sion_translate.yaml"
-        )
-    expected_path = (bundle_root / DEFAULT_CONFIG_FILE).resolve()
+    bundle_root, contract = _resolve_runtime_bundle_contract(root)
     selected_path = (
-        Path(requested_config).resolve() if requested_config is not None else expected_path
+        Path(requested_config).resolve()
+        if requested_config is not None
+        else bundle_root / DEFAULT_CONFIG_FILE
     )
+    if requested_config is not None and selected_path.parent != bundle_root:
+        outside_contract = load_embedded_training_contract(selected_path.parent)
+        if outside_contract is not None:
+            raise RuntimeError(
+                "An authenticated GPU bundle must run from its extracted root so all "
+                "relative data and artifact paths stay bound to the manifest. Change the "
+                f"working directory to {selected_path.parent} and run again."
+            )
+    if contract is None:
+        return None
+    expected_path = (bundle_root / DEFAULT_CONFIG_FILE).resolve()
     if selected_path != expected_path:
         raise RuntimeError(
             "This GPU bundle must be trained with its authenticated sion_translate.yaml; "
             f"refusing alternate config {selected_path}"
-        )
-    if not expected_path.is_file() or file_sha256(expected_path) != config_sha256:
-        raise RuntimeError(
-            "The extracted sion_translate.yaml differs from the GPU bundle training contract. "
-            "Re-extract and verify the bundle before training."
         )
     if override_flags:
         raise RuntimeError(
@@ -1338,6 +1394,7 @@ def preflight_embedded_bundle_config(
             f"{', '.join(override_flags)}. Update the tracked sion_translate.yaml, "
             "prepare matching artifacts, and build a new bundle instead."
         )
+    return contract
 
 
 def bundle_config_override_flags(args: argparse.Namespace) -> tuple[str, ...]:
@@ -1360,11 +1417,18 @@ def resolve_config(args: argparse.Namespace) -> tuple[AppConfig, dict[str, Any],
     The raw dictionary records which keys the user supplied explicitly.
     Automatic settings fill only keys that the user did not provide.
     """
-    preflight_embedded_bundle_config(
+    embedded_contract = preflight_embedded_bundle_config(
         args.config,
         override_flags=bundle_config_override_flags(args),
     )
-    if args.config:
+    if embedded_contract is not None:
+        try:
+            config_text = embedded_contract.config_content.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise RuntimeError("The authenticated GPU bundle config is not valid UTF-8") from error
+        raw = parse_raw_config_text(config_text)
+        source = embedded_contract.config_path
+    elif args.config:
         raw = load_raw_config(args.config)
         source = args.config
     elif Path(DEFAULT_CONFIG_FILE).exists():
@@ -1540,6 +1604,38 @@ def _verify_prepared_artifact_consensus(
     return identity
 
 
+def _restore_stale_dataset_after_failed_rebuild(
+    active: Path,
+    backup: Path | None,
+    failure: BaseException,
+    context: DistributedContext,
+    *,
+    label: str,
+) -> None:
+    """Restore a recoverable generation when a replacement fails before publish."""
+
+    if backup is None:
+        return
+    if active.exists() or active.is_symlink():
+        failure.add_note(
+            f"The failed {label} rebuild left an active path. The previous generation "
+            f"remains recoverable at {backup}."
+        )
+        return
+    try:
+        backup.replace(active)
+    except BaseException as restore_error:
+        failure.add_note(
+            f"Could not restore the previous {label}; recover it manually from {backup}. "
+            f"Restore error: {type(restore_error).__name__}: {restore_error}"
+        )
+        return
+    announce(
+        f"The {label} rebuild failed before publication; restored the previous generation.",
+        context,
+    )
+
+
 def _ensure_artifacts_on_main(
     config: AppConfig,
     context: DistributedContext,
@@ -1566,6 +1662,17 @@ def _ensure_artifacts_on_main(
 
     if foundation_plan is None:
         foundation_plan = plan_foundation_stage(config)
+    _, embedded_contract = _resolve_runtime_bundle_contract()
+    if embedded_contract is not None:
+        # This internal function runs only on rank zero. Hash the immutable
+        # package once before any augmentation recovery, artifact backup, or
+        # preparation code can alter the extracted tree.
+        verify_embedded_bundle_payload(embedded_contract)
+    expected_foundation_source_identities = (
+        resolved_origin_identities(embedded_contract, "monolingual-corpus")
+        if embedded_contract is not None
+        else None
+    )
     reasoning_languages = (
         tuple(
             dict.fromkeys(
@@ -1605,7 +1712,19 @@ def _ensure_artifacts_on_main(
             data_dir = Path(config.data.raw_dir)
             tokenizer_path = Path(config.data.tokenizer_model)
             dataset_dir = Path(config.data.dataset_dir)
-            files = scan_configured_raw_data(config, data_dir, tokenizer_path)
+
+            def authenticated_raw_fingerprint() -> DatasetFingerprint:
+                fingerprint = scan_configured_raw_data(config, data_dir, tokenizer_path)
+                if embedded_contract is not None:
+                    validate_parallel_source_inventory(embedded_contract, fingerprint)
+                return fingerprint
+
+            files = authenticated_raw_fingerprint()
+            if embedded_contract is not None:
+                validate_monolingual_source_inventory(
+                    embedded_contract,
+                    foundation_plan.discovery.sources,
+                )
             dataset_ready = (dataset_dir / "manifest.json").exists()
             existing_checkpoint = find_existing_checkpoint(config)
 
@@ -1706,7 +1825,43 @@ def _ensure_artifacts_on_main(
                     )
                     announce("Tokenizer training complete.", context)
                     # The tokenizer file's SHA-256 is part of the dataset fingerprint.
-                    files = scan_configured_raw_data(config, data_dir, tokenizer_path)
+                    files = authenticated_raw_fingerprint()
+
+                if embedded_contract is not None:
+                    translation_languages = tuple(
+                        language
+                        for pair in config.data.configured_language_pairs()
+                        for language in pair
+                    )
+                    validate_tokenizer_source_inventory(
+                        embedded_contract,
+                        load_tokenizer_metadata(tokenizer_path),
+                        files,
+                        foundation_plan.discovery.root,
+                        foundation_plan.discovery.sources,
+                        expected_policy={
+                            "language_pairs": [
+                                list(pair) for pair in config.data.configured_language_pairs()
+                            ],
+                            "translation_directions": [
+                                list(direction)
+                                for direction in config.data.configured_translation_directions()
+                            ],
+                            "denoise_languages": list(
+                                dict.fromkeys([*translation_languages, *foundation_plan.languages])
+                            ),
+                            "reasoning_languages": list(reasoning_languages),
+                            "approximate_split": config.data.approximate_split,
+                            "source_only_languages": list(
+                                config.data.configured_source_only_languages()
+                            ),
+                            "train_only_prefixes": list(
+                                config.data.configured_synthetic_prefixes()
+                            ),
+                            "split_digits": True,
+                            "monolingual_sample_ratio": (config.foundation.tokenizer_sample_ratio),
+                        },
+                    )
 
                 # ── Dataset with fingerprint-based change detection ───────
                 policy_problem = tokenizer_policy_problem(
@@ -1731,7 +1886,7 @@ def _ensure_artifacts_on_main(
                             language_pairs=config.data.configured_language_pairs(),
                             translation_directions=config.data.configured_translation_directions(),
                         )
-                        files = scan_configured_raw_data(config, data_dir, tokenizer_path)
+                        files = authenticated_raw_fingerprint()
                         policy_problem = tokenizer_policy_problem(
                             tokenizer_path,
                             config.data.configured_language_pairs(),
@@ -1763,6 +1918,12 @@ def _ensure_artifacts_on_main(
                 if not dataset_ready or stored != files or integrity_problem is not None:
                     from sion_translate.data.prepare import prepare_dataset
 
+                    if embedded_contract is not None:
+                        # Close the inspection-to-mutation window. prepare_dataset
+                        # captures the same expected fingerprint again and watches
+                        # those snapshots until its atomic publication.
+                        files = authenticated_raw_fingerprint()
+                    backup: Path | None = None
                     if dataset_ready:
                         backup = backup_stale_dataset(dataset_dir)
                         reason = (
@@ -1784,20 +1945,32 @@ def _ensure_artifacts_on_main(
                         "and tokenization). This may take time.",
                         context,
                     )
-                    prepare_dataset(
-                        [str(data_dir / "*.jsonl")],
-                        tokenizer_path,
-                        dataset_dir,
-                        language_pairs=config.data.configured_language_pairs(),
-                        translation_directions=config.data.configured_translation_directions(),
-                        source_only_languages=config.data.configured_source_only_languages(),
-                        approximate_split=config.data.approximate_split,
-                        train_only_prefixes=config.data.configured_synthetic_prefixes(),
-                        managed_augmentation_prefix=config.data.synthetic_prefix,
-                        synthetic_sampling_weight=config.data.synthetic_sampling_weight,
-                        num_workers=cpu_plan.dataset_workers,
-                        expected_fingerprint=files,
-                    )
+                    try:
+                        prepare_dataset(
+                            [str(data_dir / "*.jsonl")],
+                            tokenizer_path,
+                            dataset_dir,
+                            language_pairs=config.data.configured_language_pairs(),
+                            translation_directions=(
+                                config.data.configured_translation_directions()
+                            ),
+                            source_only_languages=(config.data.configured_source_only_languages()),
+                            approximate_split=config.data.approximate_split,
+                            train_only_prefixes=config.data.configured_synthetic_prefixes(),
+                            managed_augmentation_prefix=config.data.synthetic_prefix,
+                            synthetic_sampling_weight=config.data.synthetic_sampling_weight,
+                            num_workers=cpu_plan.dataset_workers,
+                            expected_fingerprint=files,
+                        )
+                    except BaseException as error:
+                        _restore_stale_dataset_after_failed_rebuild(
+                            dataset_dir,
+                            backup,
+                            error,
+                            context,
+                            label="translation dataset",
+                        )
+                        raise
                     announce("Dataset preparation complete.", context)
                 else:
                     announce("Dataset is current; source data has not changed.", context)
@@ -1839,14 +2012,20 @@ def _ensure_artifacts_on_main(
                         minimum_language_share=config.foundation.minimum_language_share,
                         release_name=config.foundation.release_name,
                     )
+                    if embedded_contract is not None:
+                        validate_monolingual_source_inventory(
+                            embedded_contract,
+                            foundation_plan.discovery.sources,
+                        )
                     if foundation_problem is None:
                         announce("Foundation dataset is current.", context)
                     else:
+                        foundation_backup: Path | None = None
                         if foundation_dataset.exists() or foundation_dataset.is_symlink():
-                            backup = backup_stale_dataset(foundation_dataset)
+                            foundation_backup = backup_stale_dataset(foundation_dataset)
                             announce(
                                 f"{foundation_problem}; preserving the existing "
-                                f"foundation dataset under {backup.name}/.",
+                                f"foundation dataset under {foundation_backup.name}/.",
                                 context,
                             )
 
@@ -1855,22 +2034,33 @@ def _ensure_artifacts_on_main(
                             "reasoning tokenization). This may take time.",
                             context,
                         )
-                        foundation_stats = prepare_foundation_dataset(
-                            foundation_plan.discovery,
-                            tokenizer_path,
-                            foundation_dataset,
-                            minimum_characters=config.foundation.minimum_characters,
-                            maximum_characters=config.foundation.maximum_characters,
-                            max_tokens=config.data.max_source_length - 2,
-                            max_target_tokens=config.data.max_target_length - 1,
-                            deduplicate=config.foundation.deduplicate,
-                            shard_size=config.foundation.shard_size,
-                            validation_fraction=config.foundation.validation_fraction,
-                            language_sampling_alpha=config.foundation.language_sampling_alpha,
-                            minimum_language_share=config.foundation.minimum_language_share,
-                            reasoning_sample_share=config.foundation.reasoning_sample_share,
-                            release_name=config.foundation.release_name,
-                        )
+                        try:
+                            foundation_stats = prepare_foundation_dataset(
+                                foundation_plan.discovery,
+                                tokenizer_path,
+                                foundation_dataset,
+                                minimum_characters=config.foundation.minimum_characters,
+                                maximum_characters=config.foundation.maximum_characters,
+                                max_tokens=config.data.max_source_length - 2,
+                                max_target_tokens=config.data.max_target_length - 1,
+                                deduplicate=config.foundation.deduplicate,
+                                shard_size=config.foundation.shard_size,
+                                validation_fraction=config.foundation.validation_fraction,
+                                language_sampling_alpha=(config.foundation.language_sampling_alpha),
+                                minimum_language_share=config.foundation.minimum_language_share,
+                                reasoning_sample_share=config.foundation.reasoning_sample_share,
+                                release_name=config.foundation.release_name,
+                                expected_source_identities=(expected_foundation_source_identities),
+                            )
+                        except BaseException as error:
+                            _restore_stale_dataset_after_failed_rebuild(
+                                foundation_dataset,
+                                foundation_backup,
+                                error,
+                                context,
+                                label="foundation dataset",
+                            )
+                            raise
                         for line in render_prepare_report(foundation_stats):
                             announce(f"  {line}", context)
 

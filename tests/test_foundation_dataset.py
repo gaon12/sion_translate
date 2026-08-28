@@ -119,6 +119,28 @@ def _dataset_problem(
     )
 
 
+def test_authenticated_source_identities_fail_before_foundation_output_mutation(
+    tmp_path: Path,
+    tokenizer_model: Path,
+) -> None:
+    corpus = tmp_path / "corpus"
+    discovery = discover_monolingual_sources(_corpus(corpus), ["ko", "ja"])
+    source = discovery.sources[0].path.resolve()
+    expected = {str(item.path.resolve()): (item.size_bytes, "0" * 64) for item in discovery.sources}
+    output = tmp_path / "dataset"
+
+    with pytest.raises(RuntimeError, match="authenticated identities.*changed"):
+        prepare_foundation_dataset(
+            discovery,
+            tokenizer_model,
+            output,
+            expected_source_identities=expected,
+        )
+
+    assert source.is_file()
+    assert not output.exists()
+
+
 def _tree_bytes(root: Path) -> dict[str, bytes]:
     return {
         path.relative_to(root).as_posix(): path.read_bytes()
