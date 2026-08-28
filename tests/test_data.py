@@ -2346,3 +2346,89 @@ def test_shared_complex_placeable_is_replaced_once() -> None:
     assert right.count("<slot_0>") == 1
     assert "numeric" not in left
     assert "numeric" not in right
+
+
+def test_language_pair_temperature_lifts_the_edge_that_fell_behind() -> None:
+    class DummyDataset:
+        bidirectional = False
+        pair_count = 10_000
+        # Two edges, one source per edge: 9,000 ko-ja rows against 1,000 ko-en.
+        pair_source_ids = np.asarray([0] * 9_000 + [1] * 1_000, dtype=np.uint16)
+        source_names = ["koja.jsonl", "koen.jsonl"]
+
+        def __len__(self) -> int:
+            return self.pair_count
+
+        def lengths_for_indices(self, indices: np.ndarray) -> np.ndarray:
+            return np.ones_like(indices)
+
+        def language_pair_ids_for_pairs(self) -> np.ndarray:
+            return np.asarray([0] * 9_000 + [1] * 1_000, dtype=np.uint16)
+
+    dataset = DummyDataset()
+    natural = DistributedBucketBatchSampler(dataset, batch_size=10, bucket_size=100, seed=3)
+    balanced = DistributedBucketBatchSampler(
+        dataset,
+        batch_size=10,
+        bucket_size=100,
+        seed=3,
+        language_pair_sampling_alpha=0.0,
+        max_source_upsampling=3.0,
+    )
+
+    def small_edge_share(sampler: DistributedBucketBatchSampler) -> float:
+        indices = [index for batch in sampler for index in batch]
+        return sum(index >= 9_000 for index in indices) / len(indices)
+
+    assert small_edge_share(natural) < 0.15
+    # The cap holds the rare edge to three times its natural share rather than
+    # letting equal-edge sampling take half the batch.
+    assert 0.25 < small_edge_share(balanced) <= 0.32
+
+
+def test_language_pair_temperature_of_one_changes_nothing() -> None:
+    class DummyDataset:
+        bidirectional = False
+        pair_count = 1_000
+        pair_source_ids = np.asarray([0] * 700 + [1] * 300, dtype=np.uint16)
+        source_names = ["a.jsonl", "b.jsonl"]
+
+        def __len__(self) -> int:
+            return self.pair_count
+
+        def lengths_for_indices(self, indices: np.ndarray) -> np.ndarray:
+            return np.ones_like(indices)
+
+        def language_pair_ids_for_pairs(self) -> np.ndarray:
+            return np.asarray([0] * 700 + [1] * 300, dtype=np.uint16)
+
+    dataset = DummyDataset()
+    plain = DistributedBucketBatchSampler(dataset, batch_size=10, bucket_size=100, seed=11)
+    explicit = DistributedBucketBatchSampler(
+        dataset,
+        batch_size=10,
+        bucket_size=100,
+        seed=11,
+        language_pair_sampling_alpha=1.0,
+    )
+
+    assert [batch for batch in plain] == [batch for batch in explicit]
+
+
+def test_language_pair_alpha_is_validated() -> None:
+    class DummyDataset:
+        bidirectional = False
+        pair_count = 10
+        pair_source_ids = np.zeros(10, dtype=np.uint16)
+        source_names = ["a.jsonl"]
+
+        def __len__(self) -> int:
+            return self.pair_count
+
+        def lengths_for_indices(self, indices: np.ndarray) -> np.ndarray:
+            return np.ones_like(indices)
+
+    with pytest.raises(ValueError, match="language_pair_sampling_alpha"):
+        DistributedBucketBatchSampler(
+            DummyDataset(), batch_size=2, language_pair_sampling_alpha=1.5
+        )

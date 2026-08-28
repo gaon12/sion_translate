@@ -343,6 +343,13 @@ class DataConfig:
     source_sampling_alpha: float = 1.0
     source_sampling_weights: dict[str, float] = field(default_factory=dict)
     max_source_upsampling: float = 3.0
+    # Temperature over language pairs, applied on top of source balancing and
+    # derived from the rows the dataset actually holds, so an edge that falls
+    # behind is compensated without hand-written per-source weights. 1.0 follows
+    # the corpus as built; 0.0 samples every configured pair equally. The
+    # ``max_source_upsampling`` cap still bounds what any one source may become,
+    # so a tiny edge cannot take over the batch.
+    language_pair_sampling_alpha: float = 1.0
 
     def configured_language_pairs(self) -> tuple[tuple[str, str], ...]:
         has_single = bool(self.language_pair)
@@ -774,6 +781,8 @@ class AppConfig:
             raise ValueError("source_sampling_alpha must be positive")
         if self.data.max_source_upsampling < 1.0:
             raise ValueError("max_source_upsampling must be at least 1")
+        if not 0.0 <= self.data.language_pair_sampling_alpha <= 1.0:
+            raise ValueError("language_pair_sampling_alpha must be in [0, 1]")
         if any(
             not name or weight < 0 for name, weight in self.data.source_sampling_weights.items()
         ):

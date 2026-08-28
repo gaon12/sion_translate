@@ -568,6 +568,43 @@ class IndexedParallelDataset(Dataset[dict[str, object]]):
             np.ones(self.pair_count, dtype=np.bool_)
         )
 
+    def language_pair_ids_for_pairs(self) -> np.ndarray:
+        """Index into ``language_pairs`` for every physical row.
+
+        Language-pair balancing needs to know which edge each row belongs to.
+        A legacy dense dataset holds exactly one edge, so every row maps to
+        zero; a row whose edge is not configured is given its own trailing id
+        rather than silently joining a configured edge.
+        """
+
+        cached = getattr(self, "_pair_language_pair_ids", None)
+        if cached is not None:
+            return cast(np.ndarray, cached)
+        if not self.is_v3:
+            codes = np.zeros(self.pair_count, dtype=np.uint16)
+            self._pair_language_pair_ids = codes
+            return codes
+        language_count = len(self.languages)
+        unknown = len(self.language_pairs)
+        table = np.full(language_count * language_count, unknown, dtype=np.uint16)
+        language_index = {language: position for position, language in enumerate(self.languages)}
+        for position, pair in enumerate(self.language_pairs):
+            first, second = language_index.get(pair[0]), language_index.get(pair[1])
+            if first is None or second is None:
+                continue
+            table[first * language_count + second] = position
+            table[second * language_count + first] = position
+        blocks: list[np.ndarray] = []
+        for index in self.indices:
+            source_ids = np.asarray(index["src_language_id"], dtype=np.int64)
+            target_ids = np.asarray(index["tgt_language_id"], dtype=np.int64)
+            blocks.append(table[source_ids * language_count + target_ids])
+        codes = (
+            np.concatenate(blocks) if blocks else np.zeros(self.pair_count, dtype=np.uint16)
+        )
+        self._pair_language_pair_ids = codes
+        return codes
+
     def observed_language_pairs_for_physical_mask(
         self,
         mask: np.ndarray,
@@ -1172,6 +1209,7 @@ class DistributedBucketBatchSampler(Sampler[list[int]]):
         source_sampling_weights: dict[str, float] | None = None,
         source_sampling_weights_by_id: dict[int, float] | None = None,
         max_source_upsampling: float = 3.0,
+        language_pair_sampling_alpha: float = 1.0,
         synthetic_sampling_weight: float | None = None,
     ):
         if batch_size <= 0:
@@ -1195,6 +1233,9 @@ class DistributedBucketBatchSampler(Sampler[list[int]]):
         self.source_sampling_weights = dict(source_sampling_weights or {})
         self.source_sampling_weights_by_id = dict(source_sampling_weights_by_id or {})
         self.max_source_upsampling = max_source_upsampling
+        if not 0.0 <= language_pair_sampling_alpha <= 1.0:
+            raise ValueError("language_pair_sampling_alpha must be in [0, 1]")
+        self.language_pair_sampling_alpha = language_pair_sampling_alpha
         self.synthetic_sampling_weight = (
             float(synthetic_sampling_weight)
             if synthetic_sampling_weight is not None
@@ -1227,6 +1268,7 @@ class DistributedBucketBatchSampler(Sampler[list[int]]):
         has_synthetic = synthetic_flags is not None and bool(np.asarray(synthetic_flags).any())
         self._balance_sources = (
             not math.isclose(source_sampling_alpha, 1.0)
+            or not math.isclose(self.language_pair_sampling_alpha, 1.0)
             or any(
                 not math.isclose(weight, 1.0) for weight in self.source_sampling_weights.values()
             )
@@ -1335,7 +1377,20 @@ class DistributedBucketBatchSampler(Sampler[list[int]]):
         if pair_synthetic_flags is None:
             pair_synthetic_flags = np.zeros(len(source_ids_for_pairs), dtype=np.bool_)
         synthetic_flags = np.asarray(pair_synthetic_flags, dtype=np.uint32)
-        pair_group_codes = source_ids_for_pairs * np.uint32(2) + synthetic_flags
+        # Grouping by language pair as well as by source lets an edge that fell
+        # behind be compensated without naming any source by hand. With the
+        # default alpha of one the extra split changes no probability, because
+        # each subgroup keeps its own share of the corpus.
+        edge_id_source = getattr(self.dataset, "language_pair_ids_for_pairs", None)
+        edge_ids = (
+            np.asarray(edge_id_source(), dtype=np.uint32)
+            if callable(edge_id_source)
+            else np.zeros(len(source_ids_for_pairs), dtype=np.uint32)
+        )
+        edge_slots = np.uint32(int(edge_ids.max(initial=0)) + 1)
+        pair_group_codes = (
+            source_ids_for_pairs * np.uint32(2) + synthetic_flags
+        ) * edge_slots + edge_ids
         direction_multiplicity = np.ones(len(source_ids_for_pairs), dtype=np.float64)
         if self.dataset.bidirectional:
             direction_multiplicity.fill(2.0)
@@ -1352,9 +1407,18 @@ class DistributedBucketBatchSampler(Sampler[list[int]]):
         counts = counts_all[group_codes].astype(np.float64)
         natural = counts / counts.sum()
         raw = np.power(counts, self.source_sampling_alpha)
+        if not math.isclose(self.language_pair_sampling_alpha, 1.0):
+            group_edge_ids = group_codes % edge_slots
+            edge_counts = np.bincount(group_edge_ids, weights=counts)
+            # p(edge) proportional to n**alpha, spread over the groups of that
+            # edge in proportion to what each already holds.
+            raw = raw * np.power(
+                edge_counts[group_edge_ids],
+                self.language_pair_sampling_alpha - 1.0,
+            )
         for position, group_code in enumerate(group_codes):
-            source_id = int(group_code) // 2
-            group_is_synthetic = bool(int(group_code) % 2)
+            source_id = int(group_code) // (2 * int(edge_slots))
+            group_is_synthetic = bool((int(group_code) // int(edge_slots)) % 2)
             name = (
                 self.dataset.source_names[source_id]
                 if source_id < len(self.dataset.source_names)

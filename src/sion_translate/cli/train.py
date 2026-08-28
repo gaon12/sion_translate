@@ -4137,6 +4137,7 @@ def main() -> None:
             source_sampling_alpha=config.data.source_sampling_alpha,
             source_sampling_weights=config.data.source_sampling_weights,
             max_source_upsampling=config.data.max_source_upsampling,
+            language_pair_sampling_alpha=config.data.language_pair_sampling_alpha,
         )
         positive_sampling_mask = train_sampler.positive_sampling_pair_mask()
         revision_directions = resolve_training_revision_directions(
@@ -4230,6 +4231,7 @@ def main() -> None:
                 source_sampling_alpha=config.data.source_sampling_alpha,
                 source_sampling_weights=config.data.source_sampling_weights,
                 max_source_upsampling=config.data.max_source_upsampling,
+                language_pair_sampling_alpha=config.data.language_pair_sampling_alpha,
             )
             post_validation_sampler = DistributedBucketBatchSampler(
                 validation_dataset,

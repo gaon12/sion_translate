@@ -126,6 +126,16 @@ data:
   # requested output languages.
   source_only_languages: [kj, kd, jd]
 
+  # Corpus-wide deduplication (2026-08-28) removed a different share of each
+  # edge -- ko-en 6.05%, ko-ja 4.53%, en-ja 4.09% -- so the row counts no longer
+  # balance: ko-ja 9,882,248 / en-ja 9,204,513 / ko-en 8,929,306, a 10.7% spread.
+  # Sampling every configured pair equally recovers the balance from the data
+  # itself instead of from a million newly acquired rows, and it re-derives on
+  # its own whenever the corpus changes. max_source_upsampling still caps any
+  # one source at three times its natural share, which is what keeps a tiny edge
+  # such as kj-ko (10,731 pairs) from taking over the batch.
+  language_pair_sampling_alpha: 0.0
+
   # Dialect region is row metadata, not a target control tag. Generating one
   # named regional dialect would require a separate reviewed tag design.
   #
