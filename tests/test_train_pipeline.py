@@ -89,6 +89,70 @@ def test_embedded_gpu_bundle_requires_its_authenticated_config(tmp_path: Path) -
         train_module.preflight_embedded_bundle_config(None, root=tmp_path)
 
 
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--epochs", "1"],
+        ["--max-steps", "1"],
+        ["--posttrain-epochs", "1"],
+        ["--posttrain-steps", "1"],
+        ["--skip-posttraining"],
+        ["--resume-from", "runs/manual/checkpoint"],
+    ],
+)
+def test_embedded_gpu_bundle_rejects_every_config_mutating_cli_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    arguments: list[str],
+) -> None:
+    config = tmp_path / "sion_translate.yaml"
+    config.write_text("data:\n  language_pair: [de, fr]\n", encoding="utf-8")
+    (tmp_path / "PACKAGE_MANIFEST.json").write_text(
+        json.dumps(
+            {
+                "training_contract": {
+                    "config_path": "sion_translate.yaml",
+                    "config_sha256": file_sha256(config),
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    args = train_module.build_parser().parse_args(arguments)
+
+    with pytest.raises(RuntimeError, match="config-mutating command-line overrides"):
+        train_module.resolve_config(args)
+
+
+def test_embedded_gpu_bundle_allows_nonmutating_prepare_only_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "sion_translate.yaml"
+    config.write_text("data:\n  language_pair: [de, fr]\n", encoding="utf-8")
+    (tmp_path / "PACKAGE_MANIFEST.json").write_text(
+        json.dumps(
+            {
+                "training_contract": {
+                    "config_path": "sion_translate.yaml",
+                    "config_sha256": file_sha256(config),
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    args = train_module.build_parser().parse_args(["--prepare-only"])
+
+    resolved, _raw, source = train_module.resolve_config(args)
+
+    assert resolved.data.configured_language_pairs() == (("de", "fr"),)
+    assert source == "sion_translate.yaml"
+
+
 def test_dataloader_runtime_settings_separate_training_and_validation() -> None:
     device = torch.device("cuda")
     training = dataloader_runtime_kwargs(12, device, training=True)

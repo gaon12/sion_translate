@@ -1291,9 +1291,10 @@ def seed_everything(seed: int, rank: int) -> None:
 def preflight_embedded_bundle_config(
     requested_config: str | None,
     *,
+    override_flags: tuple[str, ...] = (),
     root: Path | None = None,
 ) -> None:
-    """Require an extracted GPU bundle to train with its authenticated config."""
+    """Require an extracted GPU bundle to use its authenticated effective config."""
 
     bundle_root = (root or Path.cwd()).resolve()
     manifest_path = bundle_root / "PACKAGE_MANIFEST.json"
@@ -1331,6 +1332,26 @@ def preflight_embedded_bundle_config(
             "The extracted sion_translate.yaml differs from the GPU bundle training contract. "
             "Re-extract and verify the bundle before training."
         )
+    if override_flags:
+        raise RuntimeError(
+            "This GPU bundle does not permit config-mutating command-line overrides: "
+            f"{', '.join(override_flags)}. Update the tracked sion_translate.yaml, "
+            "prepare matching artifacts, and build a new bundle instead."
+        )
+
+
+def bundle_config_override_flags(args: argparse.Namespace) -> tuple[str, ...]:
+    """Return CLI flags that mutate the authenticated YAML training contract."""
+
+    candidates = (
+        ("--epochs", args.epochs is not None),
+        ("--max-steps", args.max_steps is not None),
+        ("--posttrain-epochs", args.posttrain_epochs is not None),
+        ("--posttrain-steps", args.posttrain_steps is not None),
+        ("--skip-posttraining", bool(args.skip_posttraining)),
+        ("--resume-from", args.resume_from is not None),
+    )
+    return tuple(flag for flag, active in candidates if active)
 
 
 def resolve_config(args: argparse.Namespace) -> tuple[AppConfig, dict[str, Any], str]:
@@ -1339,7 +1360,10 @@ def resolve_config(args: argparse.Namespace) -> tuple[AppConfig, dict[str, Any],
     The raw dictionary records which keys the user supplied explicitly.
     Automatic settings fill only keys that the user did not provide.
     """
-    preflight_embedded_bundle_config(args.config)
+    preflight_embedded_bundle_config(
+        args.config,
+        override_flags=bundle_config_override_flags(args),
+    )
     if args.config:
         raw = load_raw_config(args.config)
         source = args.config
