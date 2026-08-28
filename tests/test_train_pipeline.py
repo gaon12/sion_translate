@@ -63,6 +63,32 @@ class LoaderStub:
         self._iterator = WorkerIterator()
 
 
+def test_embedded_gpu_bundle_requires_its_authenticated_config(tmp_path: Path) -> None:
+    config = tmp_path / "sion_translate.yaml"
+    config.write_text("data:\n  language_pair: [ko, ja]\n", encoding="utf-8")
+    manifest = {
+        "training_contract": {
+            "config_path": "sion_translate.yaml",
+            "config_sha256": file_sha256(config),
+        }
+    }
+    (tmp_path / "PACKAGE_MANIFEST.json").write_text(
+        json.dumps(manifest) + "\n",
+        encoding="utf-8",
+    )
+
+    train_module.preflight_embedded_bundle_config(None, root=tmp_path)
+    with pytest.raises(RuntimeError, match="refusing alternate config"):
+        train_module.preflight_embedded_bundle_config(
+            str(tmp_path / "alternate.yaml"),
+            root=tmp_path,
+        )
+
+    config.write_text("data:\n  language_pair: [de, fr]\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="differs from the GPU bundle"):
+        train_module.preflight_embedded_bundle_config(None, root=tmp_path)
+
+
 def test_dataloader_runtime_settings_separate_training_and_validation() -> None:
     device = torch.device("cuda")
     training = dataloader_runtime_kwargs(12, device, training=True)
@@ -586,10 +612,15 @@ def test_foundation_preparation_backs_up_a_file_at_the_dataset_path(
     config.data.dataset_dir = str(dataset)
     config.foundation.dataset_dir = str(foundation_dataset)
     raw_identity = {"parallel.jsonl": 128}
+    monolingual_source = tmp_path / "corpus" / "ko" / "wiki.txt"
+    monolingual_source.parent.mkdir(parents=True)
+    monolingual_source.write_text("충분히 긴 단일어 문장입니다\n", encoding="utf-8")
     plan = SimpleNamespace(
         enabled=True,
-        discovery=SimpleNamespace(sources=()),
-        languages=(),
+        discovery=SimpleNamespace(
+            sources=(SimpleNamespace(language="ko", path=monolingual_source),)
+        ),
+        languages=("ko",),
         report=(),
         warnings=(),
     )
@@ -2318,6 +2349,107 @@ def test_tokenizer_policy_requires_digit_splitting_and_matching_identity(
         lambda _: WrongLanguageTokenizer(),
     )
     assert "language set" in str(tokenizer_policy_problem(model_path, pairs))
+
+
+def test_raw_free_artifact_preflight_still_checks_tokenizer_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = AppConfig()
+    config.data.language_pair = ["ko", "ja"]
+    config.data.raw_dir = str(tmp_path / "raw")
+    tokenizer = tmp_path / "tokenizer" / "sion.model"
+    tokenizer.parent.mkdir(parents=True)
+    tokenizer.write_bytes(b"tokenizer")
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    (dataset / "manifest.json").write_text("{}\n", encoding="utf-8")
+    config.data.tokenizer_model = str(tokenizer)
+    config.data.dataset_dir = str(dataset)
+    plan = SimpleNamespace(enabled=False)
+    observed: list[tuple[str, ...]] = []
+
+    monkeypatch.setattr(train_module, "scan_configured_raw_data", lambda *_args: {})
+    monkeypatch.setattr(train_module, "find_existing_checkpoint", lambda *_args: None)
+    monkeypatch.setattr(train_module, "dataset_artifact_problem", lambda *_args: None)
+
+    def reject_policy(
+        _path: Path,
+        _pairs: tuple[tuple[str, str], ...],
+        _foundation_languages: tuple[str, ...],
+        reasoning_languages: tuple[str, ...],
+        **_kwargs: object,
+    ) -> str:
+        observed.append(reasoning_languages)
+        return "split_digits policy mismatch"
+
+    monkeypatch.setattr(train_module, "tokenizer_policy_problem", reject_policy)
+
+    with pytest.raises(RuntimeError, match="no source data.*split_digits policy mismatch"):
+        train_module._ensure_artifacts_on_main(
+            config,
+            DistributedContext(0, 0, 1, torch.device("cpu"), False),
+            plan,
+            prepare_foundation=False,
+            locks_held=True,
+        )
+
+    assert observed == [()]
+
+
+def test_raw_free_fresh_run_preflights_foundation_before_tokenizer_use(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = AppConfig()
+    config.data.language_pair = ["ko", "ja"]
+    config.data.raw_dir = str(tmp_path / "raw")
+    tokenizer = tmp_path / "tokenizer" / "sion.model"
+    tokenizer.parent.mkdir(parents=True)
+    tokenizer.write_bytes(b"tokenizer")
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    (dataset / "manifest.json").write_text("{}\n", encoding="utf-8")
+    config.data.tokenizer_model = str(tokenizer)
+    config.data.dataset_dir = str(dataset)
+    plan = SimpleNamespace(
+        enabled=True,
+        discovery=SimpleNamespace(sources=()),
+        languages=("ko", "ja"),
+    )
+    events: list[object] = []
+
+    monkeypatch.setattr(train_module, "scan_configured_raw_data", lambda *_args: {})
+    monkeypatch.setattr(train_module, "find_existing_checkpoint", lambda *_args: None)
+    monkeypatch.setattr(train_module, "dataset_artifact_problem", lambda *_args: None)
+    monkeypatch.setattr(
+        train_module,
+        "_preflight_offline_foundation_dataset",
+        lambda _config, _plan: events.append("foundation") or ("ja",),
+    )
+
+    def accept_policy(
+        _path: Path,
+        _pairs: tuple[tuple[str, str], ...],
+        _foundation_languages: tuple[str, ...],
+        reasoning_languages: tuple[str, ...],
+        **_kwargs: object,
+    ) -> None:
+        events.append(reasoning_languages)
+        return None
+
+    monkeypatch.setattr(train_module, "tokenizer_policy_problem", accept_policy)
+
+    train_module._ensure_artifacts_on_main(
+        config,
+        DistributedContext(0, 0, 1, torch.device("cpu"), False),
+        plan,
+        prepare_foundation=False,
+        require_offline_foundation=True,
+        locks_held=True,
+    )
+
+    assert events == ["foundation", ("ja",)]
 
 
 def test_explicit_direction_graph_cannot_be_backfilled_onto_a_legacy_tokenizer(

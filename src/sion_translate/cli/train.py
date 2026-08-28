@@ -90,7 +90,10 @@ from sion_translate.foundation import (
 )
 from sion_translate.fingerprint import DatasetFingerprint, file_sha256
 from sion_translate.data.prepare_foundation import foundation_dataset_problem
-from sion_translate.language_tags import canonicalize_language_pair
+from sion_translate.language_tags import (
+    canonicalize_language_pair,
+    canonicalize_language_tags,
+)
 from sion_translate.model import SionForConditionalGeneration
 from sion_translate.tokenizer import (
     SionTokenizer,
@@ -1125,6 +1128,110 @@ def tokenizer_policy_problem(
     return None
 
 
+def _prepared_foundation_manifest_policy(
+    config: AppConfig,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Read language controls from an offline prepared foundation generation."""
+
+    manifest_path = Path(config.foundation.dataset_dir) / "manifest.json"
+    try:
+        raw_manifest: object = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            "The configured foundation source corpus is offline and the prepared "
+            f"foundation manifest cannot be read: {manifest_path}"
+        ) from error
+    if not isinstance(raw_manifest, dict):
+        raise RuntimeError("The prepared foundation manifest must be a JSON object")
+    manifest = cast(dict[str, Any], raw_manifest)
+    raw_languages = manifest.get("languages")
+    if not isinstance(raw_languages, list):
+        raise RuntimeError("The prepared foundation manifest has no language list")
+    try:
+        languages = canonicalize_language_tags(
+            cast(list[object], raw_languages),
+            field="prepared foundation languages",
+        )
+    except ValueError as error:
+        raise RuntimeError(str(error)) from error
+    if list(languages) != raw_languages or not languages:
+        raise RuntimeError("The prepared foundation language list must be non-empty and canonical")
+    configured = config.foundation_languages()
+    language_set = set(languages)
+    if languages != tuple(language for language in configured if language in language_set):
+        raise RuntimeError(
+            "The prepared foundation languages are not an ordered subset of the "
+            "configured foundation reservation"
+        )
+    if config.foundation.require_all_languages and languages != configured:
+        raise RuntimeError(
+            "foundation.require_all_languages=true, but the prepared foundation "
+            "dataset does not cover every configured language"
+        )
+
+    raw_reasoning = manifest.get("reasoning")
+    if not isinstance(raw_reasoning, dict):
+        raise RuntimeError("The prepared foundation manifest has no reasoning policy")
+    raw_reasoning_languages = cast(dict[str, Any], raw_reasoning).get("languages")
+    if not isinstance(raw_reasoning_languages, list):
+        raise RuntimeError("The prepared foundation reasoning language list is invalid")
+    try:
+        reasoning_languages = canonicalize_language_tags(
+            cast(list[object], raw_reasoning_languages),
+            field="prepared foundation reasoning languages",
+        )
+    except ValueError as error:
+        raise RuntimeError(str(error)) from error
+    if list(reasoning_languages) != raw_reasoning_languages or not set(
+        reasoning_languages
+    ).issubset(language_set):
+        raise RuntimeError(
+            "The prepared foundation reasoning languages must be canonical members "
+            "of its language list"
+        )
+    return languages, reasoning_languages
+
+
+def _preflight_offline_foundation_dataset(
+    config: AppConfig,
+    foundation_plan: Any,
+) -> tuple[str, ...]:
+    """Authenticate prepared foundation shards when their raw corpus is omitted."""
+
+    languages, reasoning_languages = _prepared_foundation_manifest_policy(config)
+    if languages != tuple(
+        language for language in foundation_plan.languages if language in set(languages)
+    ):
+        raise RuntimeError(
+            "The offline foundation plan and prepared dataset reserve different languages"
+        )
+    from sion_translate.data.prepare_foundation import foundation_dataset_problem
+
+    problem = foundation_dataset_problem(
+        config.foundation.dataset_dir,
+        foundation_plan.discovery,
+        config.data.tokenizer_model,
+        minimum_characters=config.foundation.minimum_characters,
+        maximum_characters=config.foundation.maximum_characters,
+        max_tokens=config.data.max_source_length - 2,
+        max_target_tokens=config.data.max_target_length - 1,
+        deduplicate=config.foundation.deduplicate,
+        shard_size=config.foundation.shard_size,
+        validation_fraction=config.foundation.validation_fraction,
+        reasoning_sample_share=config.foundation.reasoning_sample_share,
+        language_sampling_alpha=config.foundation.language_sampling_alpha,
+        minimum_language_share=config.foundation.minimum_language_share,
+        release_name=config.foundation.release_name,
+        allow_offline_sources=True,
+    )
+    if problem is not None:
+        raise RuntimeError(
+            "The prepared foundation dataset is incompatible or corrupt, and its raw "
+            f"source corpus is unavailable for a rebuild: {problem}"
+        )
+    return reasoning_languages
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -1181,12 +1288,58 @@ def seed_everything(seed: int, rank: int) -> None:
         torch.cuda.manual_seed_all(seed + rank)
 
 
+def preflight_embedded_bundle_config(
+    requested_config: str | None,
+    *,
+    root: Path | None = None,
+) -> None:
+    """Require an extracted GPU bundle to train with its authenticated config."""
+
+    bundle_root = (root or Path.cwd()).resolve()
+    manifest_path = bundle_root / "PACKAGE_MANIFEST.json"
+    if not manifest_path.is_file():
+        return
+    try:
+        raw_manifest: object = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            f"Cannot read the embedded GPU bundle manifest: {manifest_path}"
+        ) from error
+    if not isinstance(raw_manifest, dict):
+        raise RuntimeError("The embedded GPU bundle manifest must be a JSON object")
+    raw_contract = cast(dict[str, Any], raw_manifest).get("training_contract")
+    if not isinstance(raw_contract, dict):
+        raise RuntimeError("The embedded GPU bundle has no authenticated training contract")
+    contract = cast(dict[str, Any], raw_contract)
+    config_path = contract.get("config_path")
+    config_sha256 = contract.get("config_sha256")
+    if config_path != DEFAULT_CONFIG_FILE or not isinstance(config_sha256, str):
+        raise RuntimeError(
+            "The embedded GPU bundle does not authenticate the default sion_translate.yaml"
+        )
+    expected_path = (bundle_root / DEFAULT_CONFIG_FILE).resolve()
+    selected_path = (
+        Path(requested_config).resolve() if requested_config is not None else expected_path
+    )
+    if selected_path != expected_path:
+        raise RuntimeError(
+            "This GPU bundle must be trained with its authenticated sion_translate.yaml; "
+            f"refusing alternate config {selected_path}"
+        )
+    if not expected_path.is_file() or file_sha256(expected_path) != config_sha256:
+        raise RuntimeError(
+            "The extracted sion_translate.yaml differs from the GPU bundle training contract. "
+            "Re-extract and verify the bundle before training."
+        )
+
+
 def resolve_config(args: argparse.Namespace) -> tuple[AppConfig, dict[str, Any], str]:
     """Resolve and return the configuration, raw dictionary, and source label.
 
     The raw dictionary records which keys the user supplied explicitly.
     Automatic settings fill only keys that the user did not provide.
     """
+    preflight_embedded_bundle_config(args.config)
     if args.config:
         raw = load_raw_config(args.config)
         source = args.config
@@ -1369,6 +1522,7 @@ def _ensure_artifacts_on_main(
     foundation_plan: Any | None = None,
     *,
     prepare_foundation: bool = True,
+    require_offline_foundation: bool = False,
     locks_held: bool = False,
 ) -> None:
     """Create the tokenizer and prepared datasets when absent or stale.
@@ -1399,6 +1553,16 @@ def _ensure_artifacts_on_main(
         if foundation_plan.enabled
         else ()
     )
+    offline_foundation_required = bool(
+        foundation_plan.enabled
+        and not foundation_plan.discovery.sources
+        and (prepare_foundation or require_offline_foundation)
+    )
+    if offline_foundation_required:
+        reasoning_languages = _preflight_offline_foundation_dataset(
+            config,
+            foundation_plan,
+        )
     # If two jobs sharing artifacts/ both decide that outputs are absent, tokenizer
     # and dataset generations can be mixed under one path. This is not an obvious
     # failure: fingerprinting would merely see the mixed combination as new.
@@ -1439,6 +1603,28 @@ def _ensure_artifacts_on_main(
                         "The prepared translation dataset payload is corrupt, and "
                         "no source data is available to rebuild it: "
                         f"{integrity_problem}"
+                    )
+                if not reasoning_languages:
+                    metadata = load_tokenizer_metadata(tokenizer_path)
+                    raw_reasoning_languages = (
+                        metadata.get("reasoning_languages") if isinstance(metadata, dict) else None
+                    )
+                    if isinstance(raw_reasoning_languages, list) and all(
+                        isinstance(language, str) for language in raw_reasoning_languages
+                    ):
+                        reasoning_languages = tuple(cast(list[str], raw_reasoning_languages))
+                policy_problem = tokenizer_policy_problem(
+                    tokenizer_path,
+                    config.data.configured_language_pairs(),
+                    config.foundation_languages(),
+                    reasoning_languages,
+                    translation_directions=config.data.configured_translation_directions(),
+                    require_recorded_directions=bool(config.data.translation_directions),
+                )
+                if policy_problem is not None:
+                    raise RuntimeError(
+                        "The prepared tokenizer is incompatible, and no source data is "
+                        f"available to rebuild it: {policy_problem}"
                     )
 
             if files:
@@ -1671,6 +1857,7 @@ def ensure_artifacts(
     foundation_plan: Any | None = None,
     *,
     prepare_foundation: bool = True,
+    require_offline_foundation: bool = False,
     locks_held: bool = False,
 ) -> None:
     """Prepare artifacts on rank 0 without timing out the training process group."""
@@ -1684,6 +1871,7 @@ def ensure_artifacts(
                 context,
                 foundation_plan,
                 prepare_foundation=prepare_foundation,
+                require_offline_foundation=require_offline_foundation,
                 locks_held=True,
             )
         return
@@ -1696,6 +1884,7 @@ def ensure_artifacts(
             context,
             foundation_plan,
             prepare_foundation=prepare_foundation,
+            require_offline_foundation=require_offline_foundation,
             locks_held=locks_held,
         ),
     )
@@ -1703,7 +1892,7 @@ def ensure_artifacts(
         config,
         foundation_plan,
         context,
-        prepare_foundation=prepare_foundation,
+        prepare_foundation=prepare_foundation or require_offline_foundation,
     )
 
 
@@ -3822,15 +4011,27 @@ def main() -> None:
                 context=context,
                 stage="posttraining",
             )
+        require_offline_foundation = bool(
+            args.prepare_only
+            or (
+                foundation_plan.enabled
+                and not discovered_foundation_plan.discovery.sources
+                and pretrain_resume_candidate is None
+                and posttrain_resume_candidate is None
+            )
+        )
         ensure_artifacts(
             config,
             context,
-            discovered_foundation_plan,
+            foundation_plan,
             # Effective auto-sized training identity and the exact SFT resume
             # generation must be known before deciding whether base preparation
             # can safely be skipped. A coarse `.metadata` presence check is not
             # authority to bypass the foundation path.
             prepare_foundation=args.prepare_only,
+            # A raw-free fresh run must authenticate its prepared base shards
+            # before constructing or placing a model on paid GPU memory.
+            require_offline_foundation=require_offline_foundation,
             locks_held=True,
         )
         tokenizer = SionTokenizer(config.data.tokenizer_model)
