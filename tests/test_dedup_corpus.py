@@ -351,3 +351,86 @@ def test_reuse_staging_rejects_an_older_staging_format(tmp_path: Path) -> None:
     summary_path.write_text(json.dumps(summary), encoding="utf-8")
 
     assert DEDUP.reuse_scan(shard, staging) is None
+
+
+FAST_PATH_PAIRS = (("ko", "ja"), ("ko", "en"), ("en", "ja"), ("jd", "ko"), ("jd", "ja"))
+FAST_PATH_LANGUAGES = frozenset(
+    language for pair in FAST_PATH_PAIRS for language in pair
+)
+
+
+def fast(row: object) -> list[tuple[str, str, str, str]] | None:
+    return DEDUP.expand_flat_record(row, FAST_PATH_PAIRS, FAST_PATH_LANGUAGES)
+
+
+def reference(row: object) -> list[tuple[str, str, str, str]]:
+    return DEDUP.reference_expansion(row, [list(pair) for pair in FAST_PATH_PAIRS])
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        {"ko": "가", "ja": "あ"},
+        {"ko": "가", "en": "a", "ja": "あ"},
+        {"jd": "あー", "ko": "가", "ja": "あ"},
+        {"ko": "가", "ja": "あ", "domain": "일상생활", "style": "구어체"},
+        {"en": ["one", "two"], "ja": ["いち", "に"]},
+        {"en": ["one", "one"], "ja": ["いち", "いち"]},
+        {"ko": "가", "ja": "  "},
+        {"ko": "가"},
+        {"note": "no language keys"},
+    ],
+)
+def test_fast_path_matches_the_reference_expansion(row: dict[str, object]) -> None:
+    expanded = fast(row)
+
+    assert expanded is not None
+    assert expanded == reference(row)
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        {"ko-ja": {"ko": "가", "ja": "あ"}},
+        {"records": [{"ko": "가", "ja": "あ"}]},
+        {"source_language": "ko", "target_language": "ja", "source": "가", "target": "あ"},
+        {"en": ["one", "two"], "ja": ["いち"]},
+        {"ko": 5, "ja": "あ"},
+    ],
+)
+def test_layouts_outside_the_flat_shape_defer_to_the_reference(row: dict[str, object]) -> None:
+    assert fast(row) is None
+
+
+def test_verify_sample_reports_the_offending_line(tmp_path: Path, monkeypatch) -> None:
+    shard = write_shard(tmp_path / "data01.jsonl", [{"ko": "가", "ja": "あ"}])
+    monkeypatch.setattr(DEDUP, "reference_expansion", lambda row, pairs: [])
+
+    with pytest.raises(ValueError, match="data01.jsonl:1"):
+        DEDUP.scan_shard((str(shard), str(tmp_path / "staging"), [["ko", "ja"]], 500))
+
+
+def test_verify_sample_can_be_switched_off(tmp_path: Path, monkeypatch) -> None:
+    shard = write_shard(tmp_path / "data01.jsonl", [{"ko": "가", "ja": "あ"}])
+    monkeypatch.setattr(DEDUP, "reference_expansion", lambda row, pairs: [])
+
+    summary = DEDUP.scan_shard((str(shard), str(tmp_path / "staging"), [["ko", "ja"]], 0))
+
+    assert summary["rows"] == 1
+
+
+def test_a_shard_that_loses_nothing_is_left_untouched(tmp_path: Path) -> None:
+    untouched = write_shard(tmp_path / "data01.jsonl", [{"ko": "가", "ja": "あ"}])
+    losing = write_shard(
+        tmp_path / "data02.jsonl",
+        [{"ko": "가", "ja": "あ"}, {"ko": "나", "ja": "い"}],
+    )
+    before = untouched.stat().st_mtime_ns
+
+    report = run(tmp_path, [untouched, losing], "--in-place", "--archive-dir", str(tmp_path / "a"))
+
+    assert untouched.stat().st_mtime_ns == before
+    assert report["unchanged_shards"] == 1
+    assert report["files"]["data01.jsonl"]["rewritten"] is False
+    assert report["files"]["data02.jsonl"]["rewritten"] is True
+    assert kept_rows(losing) == [{"ko": "나", "ja": "い"}]

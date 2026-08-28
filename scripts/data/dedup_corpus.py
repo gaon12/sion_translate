@@ -119,6 +119,30 @@ _META_COLUMNS = 3
 # Bumped whenever the staged array layout changes, so --reuse-staging cannot
 # read arrays written by an older version of this script.
 _STAGING_FORMAT = "dedup-corpus-staging-v1"
+# Keys that give a record a meaning the flat fast path does not implement: the
+# explicit source/target layouts and the nested containers of records.py. A
+# record carrying any of them, or any key that could be read as a pair label, is
+# handed to the reference expansion instead of being expanded by a weaker rule.
+_RESERVED_RECORD_KEYS = frozenset(
+    {
+        "source",
+        "src",
+        "input",
+        "target",
+        "tgt",
+        "reference",
+        "translation",
+        "output",
+        "source_language",
+        "src_language",
+        "target_language",
+        "tgt_language",
+        "records",
+        "items",
+        "pairs",
+        "translations",
+    }
+)
 
 
 def exact_identity(text: str) -> str:
@@ -176,13 +200,81 @@ def edge_name(language_a: str, language_b: str) -> str:
     return f"{language_a}-{language_b}"
 
 
+def expand_flat_record(
+    row: object,
+    pairs: Sequence[tuple[str, str]],
+    languages: frozenset[str],
+) -> list[tuple[str, str, str, str]] | None:
+    """Expand a flat language-keyed record, or return ``None`` to fall back.
+
+    ``expand_parallel_record`` re-validates every configured language tag on
+    every call, which a profile puts at 87% of the scan. That cost is worth
+    paying for the arbitrary nested layouts it supports, but every shard in this
+    corpus is a flat object whose values are strings or equal-length lists of
+    strings. This handles exactly that shape and defers anything else -- nested
+    containers, pair-labelled keys, explicit source/target fields -- to the
+    reference implementation, so no record is expanded by a weaker rule.
+
+    ``--verify-sample`` checks the two against each other on real rows.
+    """
+
+    if not isinstance(row, dict):
+        return None
+    values: dict[str, list[str]] = {}
+    for key, value in row.items():
+        if not isinstance(key, str):
+            return None
+        if key not in languages:
+            # A container under an unconfigured key may hold nested records, a
+            # key such as "ko-ja" is a pair label, and the reserved keys select
+            # the explicit source/target layouts. All need the full walk.
+            if isinstance(value, (dict, list, tuple)):
+                return None
+            if key in _RESERVED_RECORD_KEYS or "-" in key:
+                return None
+            continue
+        if isinstance(value, str):
+            values[key] = [value]
+        elif isinstance(value, (list, tuple)) and all(isinstance(item, str) for item in value):
+            values[key] = list(value)
+        else:
+            return None
+
+    expanded: list[tuple[str, str, str, str]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for language_a, language_b in pairs:
+        texts_a = values.get(language_a)
+        texts_b = values.get(language_b)
+        if texts_a is None or texts_b is None:
+            continue
+        if len(texts_a) != len(texts_b):
+            return None
+        for text_a, text_b in zip(texts_a, texts_b, strict=True):
+            if not text_a.strip() or not text_b.strip():
+                continue
+            key = (language_a, text_a, language_b, text_b)
+            if key in seen:
+                continue
+            seen.add(key)
+            expanded.append(key)
+    return expanded
+
+
+def reference_expansion(row: object, pairs: Sequence[Sequence[str]]) -> list[tuple[str, str, str, str]]:
+    return [
+        (pair.language_a, pair.text_a, pair.language_b, pair.text_b)
+        for pair in expand_parallel_record(row, pairs).pairs
+    ]
+
+
 def scan_shard(job: tuple[str, str, list[list[str]]]) -> dict[str, object]:
     """Hash every configured pair of one shard into per-edge staging arrays."""
 
-    raw_path, raw_staging, raw_pairs = job
+    raw_path, raw_staging, raw_pairs, verify_sample = job
     path = Path(raw_path)
     staging = Path(raw_staging)
     pairs = normalize_language_pairs(language_pairs=raw_pairs)
+    languages = frozenset(language for pair in pairs for language in pair)
     name = path.name
 
     # Flat typed arrays, not lists of tuples: the largest shard expands to over
@@ -193,33 +285,46 @@ def scan_shard(job: tuple[str, str, list[list[str]]]) -> dict[str, object]:
     issues: dict[str, int] = {}
     rows = 0
 
-    for _, row in iter_rows(path):
+    fallbacks = 0
+    for number, row in iter_rows(path):
         index = rows
         rows += 1
-        expansion = expand_parallel_record(row, pairs)
-        for issue in expansion.issues:
-            issues[issue] = issues.get(issue, 0) + 1
-        if not expansion.pairs:
+        expanded = expand_flat_record(row, pairs, languages)
+        if expanded is None:
+            fallbacks += 1
+            expansion = expand_parallel_record(row, pairs)
+            for issue in expansion.issues:
+                issues[issue] = issues.get(issue, 0) + 1
+            expanded = [
+                (item.language_a, item.text_a, item.language_b, item.text_b)
+                for item in expansion.pairs
+            ]
+        elif number <= verify_sample and expanded != reference_expansion(row, pairs):
+            raise ValueError(
+                f"{path}:{number} expands differently under the flat-record fast path; "
+                "re-run with --verify-sample 0 only after fixing it"
+            )
+        if not expanded:
             has_pairs.append(0)
             continue
         has_pairs.append(1)
-        edges_in_row = len(expansion.pairs)
-        for pair in expansion.pairs:
-            score = cleanliness_score((pair.text_a, pair.text_b))
-            exact_a = exact_identity(pair.text_a)
-            exact_b = exact_identity(pair.text_b)
-            loose_a = loose_identity(pair.text_a)
-            loose_b = loose_identity(pair.text_b)
-            edge = edge_name(pair.language_a, pair.language_b)
+        edges_in_row = len(expanded)
+        for language_a, text_a, language_b, text_b in expanded:
+            score = cleanliness_score((text_a, text_b))
+            exact_a = exact_identity(text_a)
+            exact_b = exact_identity(text_b)
+            loose_a = loose_identity(text_a)
+            loose_b = loose_identity(text_b)
+            edge = edge_name(language_a, language_b)
             if edge not in keys:
                 keys[edge] = array("Q")
                 meta[edge] = array("I")
             keys[edge].extend(
                 (
-                    *pair_digest(pair.language_a, exact_a, pair.language_b, exact_b),
-                    *pair_digest(pair.language_a, loose_a, pair.language_b, loose_b),
-                    *side_digest(pair.language_a, loose_a),
-                    *side_digest(pair.language_b, loose_b),
+                    *pair_digest(language_a, exact_a, language_b, exact_b),
+                    *pair_digest(language_a, loose_a, language_b, loose_b),
+                    *side_digest(language_a, loose_a),
+                    *side_digest(language_b, loose_b),
                 )
             )
             meta[edge].extend((index, score + _SCORE_OFFSET, edges_in_row))
@@ -245,6 +350,7 @@ def scan_shard(job: tuple[str, str, list[list[str]]]) -> dict[str, object]:
         "rows_without_a_pair": int(len(has_pairs) - sum(has_pairs)),
         "pairs": counts,
         "expansion_issues": issues,
+        "reference_expansion_rows": fallbacks,
         "source_bytes": stat.st_size,
         "source_modified_ns": stat.st_mtime_ns,
         "format": _STAGING_FORMAT,
@@ -708,6 +814,15 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         help="where per-shard hashes are staged (default: a temporary directory)",
     )
     parser.add_argument(
+        "--verify-sample",
+        type=int,
+        default=500,
+        help=(
+            "cross-check the flat-record fast path against expand_parallel_record "
+            "on this many leading rows of each shard (0 disables)"
+        ),
+    )
+    parser.add_argument(
         "--reuse-staging",
         action="store_true",
         help=(
@@ -760,7 +875,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 shards.append(reused)
                 print(f"reused {path.name} rows={reused['rows']}", flush=True)
             else:
-                pending.append((str(path), str(staging), [list(pair) for pair in pairs]))
+                pending.append(
+                    (str(path), str(staging), [list(pair) for pair in pairs], args.verify_sample)
+                )
 
         if args.jobs > 1 and len(pending) > 1:
             with ProcessPoolExecutor(max_workers=args.jobs) as pool:
@@ -796,10 +913,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         per_shard: dict[str, object] = {}
         totals = {name: 0 for name in REASON_NAMES.values()}
         emptied: list[str] = []
+        unchanged: list[str] = []
         kept_rows = 0
         for path in paths:
             name = path.name
             has_pairs = np.load(staging / f"{name}.rows.npy")
+            # A shard that loses nothing is already the file it would be
+            # rewritten into. Skipping it keeps an unchanged shard's timestamp
+            # and digest stable, and turns the publish pass from a rewrite of
+            # the whole corpus into a rewrite of the shards that changed.
+            # Only in place: an --output-dir run must still produce the whole
+            # corpus, so an unchanged shard is copied there like any other.
+            losses = int(np.count_nonzero(has_pairs & ~kept[name]))
+            unpaired = int(np.count_nonzero(~has_pairs))
+            if args.in_place and losses == 0 and (
+                not args.drop_rows_without_a_pair or unpaired == 0
+            ):
+                unchanged.append(name)
+                rows_kept = int(np.count_nonzero(has_pairs)) + unpaired
+                per_shard[name] = {"kept": rows_kept, "removed": 0, "rewritten": False}
+                kept_rows += rows_kept
+                continue
             target = destination
             if args.in_place:
                 target = path.parent
@@ -812,6 +946,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 archive=archive,
                 keep_unpaired=not args.drop_rows_without_a_pair,
             )
+            counts["rewritten"] = True
             per_shard[name] = counts
             kept_rows += counts["kept"]
             for label in totals:
@@ -838,6 +973,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "rows_out": kept_rows,
             "removed": totals,
             "emptied_shards": emptied,
+            "unchanged_shards": len(unchanged),
             "edges": edge_report,
             "files": per_shard,
             "written": (
