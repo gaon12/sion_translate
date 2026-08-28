@@ -38,6 +38,17 @@ def _repository(tmp_path: Path) -> Path:
     (root / "src").mkdir()
     (root / "src" / "train.py").write_text("print('train')\n", encoding="utf-8")
     (root / "README.md").write_text("training bundle\n", encoding="utf-8")
+    (root / "requirements").mkdir()
+    for relative_path in (
+        ".gitattributes",
+        "pyproject.toml",
+        "requirements/gpu-build.in",
+        "requirements/gpu-lock-provenance.json",
+        "requirements/pylock.gpu-cp311-linux-x86_64-cu128.toml",
+    ):
+        source = package_gpu_bundle.REPOSITORY_ROOT / relative_path
+        destination = root / relative_path
+        destination.write_bytes(source.read_bytes())
     (root / "sion_translate.yaml").write_text(
         """\
 data:
@@ -53,6 +64,11 @@ foundation:
         root,
         "add",
         "README.md",
+        ".gitattributes",
+        "pyproject.toml",
+        "requirements/gpu-build.in",
+        "requirements/gpu-lock-provenance.json",
+        "requirements/pylock.gpu-cp311-linux-x86_64-cu128.toml",
         "sion_translate.yaml",
         "src/train.py",
         "data/.gitkeep",
@@ -98,7 +114,12 @@ def test_build_is_deterministic_allowlisted_and_verifiable(tmp_path: Path) -> No
     with zipfile.ZipFile(first) as archive:
         names = set(archive.namelist())
         assert names == {
+            "sion_translate/.gitattributes",
             "sion_translate/README.md",
+            "sion_translate/pyproject.toml",
+            "sion_translate/requirements/gpu-build.in",
+            "sion_translate/requirements/gpu-lock-provenance.json",
+            "sion_translate/requirements/pylock.gpu-cp311-linux-x86_64-cu128.toml",
             "sion_translate/sion_translate.yaml",
             "sion_translate/src/train.py",
             "sion_translate/data/.gitkeep",
@@ -116,8 +137,10 @@ def test_build_is_deterministic_allowlisted_and_verifiable(tmp_path: Path) -> No
         "commit": _git(root, "rev-parse", "HEAD"),
         "tree": _git(root, "rev-parse", "HEAD^{tree}"),
     }
-    assert manifest["training_contract"] == {
-        "schema": "sion-gpu-training-contract-v1",
+    training_contract = copy.deepcopy(manifest["training_contract"])
+    dependency_environment = training_contract.pop("dependency_environment")
+    assert training_contract == {
+        "schema": "sion-gpu-training-contract-v2",
         "config_path": "sion_translate.yaml",
         "config_sha256": _file_sha256(root / "sion_translate.yaml"),
         "raw_parallel_data_included": True,
@@ -134,19 +157,265 @@ def test_build_is_deterministic_allowlisted_and_verifiable(tmp_path: Path) -> No
             "foundation_dataset": "artifacts/foundation_dataset",
         },
     }
+    assert dependency_environment == {
+        "schema": "sion-gpu-dependency-environment-v1",
+        "generator": {"name": "uv", "version": "0.12.3"},
+        "target": {
+            "machine": "x86_64",
+            "manylinux": "2_28",
+            "os": "linux",
+            "python_implementation": "cpython",
+            "python_version": "3.11",
+            "torch_backend": "cu128",
+        },
+        "inputs": {
+            "pyproject.toml": {
+                "sha256": _file_sha256(root / "pyproject.toml"),
+                "size": (root / "pyproject.toml").stat().st_size,
+            },
+            "requirements/gpu-build.in": {
+                "sha256": _file_sha256(root / "requirements/gpu-build.in"),
+                "size": (root / "requirements/gpu-build.in").stat().st_size,
+            },
+        },
+        "normalization": {
+            "path": ".gitattributes",
+            "sha256": _file_sha256(root / ".gitattributes"),
+            "size": (root / ".gitattributes").stat().st_size,
+        },
+        "provenance": {
+            "path": "requirements/gpu-lock-provenance.json",
+            "sha256": _file_sha256(root / "requirements/gpu-lock-provenance.json"),
+            "size": (root / "requirements/gpu-lock-provenance.json").stat().st_size,
+        },
+        "lock": {
+            "format": "pep751",
+            "lock_version": "1.0",
+            "package_count": 72,
+            "path": "requirements/pylock.gpu-cp311-linux-x86_64-cu128.toml",
+            "sha256": _file_sha256(root / "requirements/pylock.gpu-cp311-linux-x86_64-cu128.toml"),
+            "size": (root / "requirements/pylock.gpu-cp311-linux-x86_64-cu128.toml").stat().st_size,
+            "wheel_count": 76,
+        },
+        "venv_command": [
+            "uv",
+            "venv",
+            "--no-config",
+            ".venv",
+            "--python",
+            "cpython@3.11",
+            "--managed-python",
+        ],
+        "compile_command": [
+            "uv",
+            "pip",
+            "compile",
+            "--no-config",
+            "pyproject.toml",
+            "requirements/gpu-build.in",
+            "--extra",
+            "export",
+            "--python-version",
+            "3.11",
+            "--python-platform",
+            "x86_64-manylinux_2_28",
+            "--torch-backend",
+            "cu128",
+            "--only-binary",
+            ":all:",
+            "--generate-hashes",
+            "--exclude-newer",
+            "2026-08-28T00:00:00Z",
+            "--format",
+            "pylock.toml",
+            "--output-file",
+            "requirements/pylock.gpu-cp311-linux-x86_64-cu128.toml",
+        ],
+        "sync_command": [
+            "uv",
+            "pip",
+            "sync",
+            "--no-config",
+            "requirements/pylock.gpu-cp311-linux-x86_64-cu128.toml",
+            "--python",
+            ".venv/bin/python",
+            "--require-hashes",
+            "--strict",
+            "--only-binary",
+            ":all:",
+        ],
+        "project_install_command": [
+            "uv",
+            "pip",
+            "install",
+            "--no-config",
+            "--python",
+            ".venv/bin/python",
+            "--no-deps",
+            "--no-build-isolation",
+            "--editable",
+            ".",
+        ],
+        "resolved_runtime_versions": {
+            "numpy": "2.4.6",
+            "sentencepiece": "0.2.1",
+            "torch": "2.10.0+cu128",
+            "torchao": "0.17.0+cu128",
+            "transformers": "5.16.1",
+        },
+    }
     origins = {entry["path"]: entry["origin"] for entry in manifest["files"]}
     assert origins["README.md"] == "git-index"
+    assert origins["requirements/gpu-lock-provenance.json"] == "git-index"
+    assert origins["requirements/pylock.gpu-cp311-linux-x86_64-cu128.toml"] == "git-index"
     assert origins["data/corpus.jsonl"] == "data-jsonl"
     assert origins["data/evaluation_only/holdout.jsonl"] == "evaluation-only"
 
     archive_result = package_gpu_bundle.verify_archive(first)
-    assert archive_result.file_count == 6
+    assert archive_result.file_count == 11
 
     extracted = tmp_path / "extracted"
     with zipfile.ZipFile(first) as archive:
         archive.extractall(extracted)
     tree_result = package_gpu_bundle.verify_tree(extracted)
     assert tree_result == archive_result
+
+
+def test_bundle_requires_the_committed_gpu_lock(tmp_path: Path) -> None:
+    root = _repository(tmp_path)
+    lock_path = "requirements/pylock.gpu-cp311-linux-x86_64-cu128.toml"
+    _git(root, "rm", "-q", lock_path)
+    _git(root, "commit", "-qm", "remove the GPU lock")
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="GPU dependency file"):
+        package_gpu_bundle.build_bundle(root, tmp_path / "missing-lock.zip")
+
+
+def test_bundle_rejects_stale_gpu_lock_provenance(tmp_path: Path) -> None:
+    root = _repository(tmp_path)
+    project = root / "pyproject.toml"
+    project.write_bytes(
+        project.read_bytes() + b"\n# Harmless input change for freshness testing.\n"
+    )
+    _git(root, "add", "pyproject.toml")
+    _git(root, "commit", "-qm", "change a dependency input without regenerating")
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="provenance is stale"):
+        package_gpu_bundle.build_bundle(root, tmp_path / "stale-provenance.zip")
+
+
+def test_bundle_rejects_a_changed_constraint_with_an_old_lock(tmp_path: Path) -> None:
+    root = _repository(tmp_path)
+    project = root / "pyproject.toml"
+    project.write_bytes(project.read_bytes().replace(b'"torch>=2.8"', b'"torch>=999"'))
+
+    provenance_path = root / "requirements" / "gpu-lock-provenance.json"
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    provenance["inputs"]["pyproject.toml"] = {
+        "sha256": _file_sha256(project),
+        "size": project.stat().st_size,
+    }
+    provenance_path.write_text(
+        json.dumps(provenance, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    _git(root, "add", "pyproject.toml", "requirements/gpu-lock-provenance.json")
+    _git(root, "commit", "-qm", "forge provenance without resolving the new constraint")
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="core requirements changed"):
+        package_gpu_bundle.build_bundle(root, tmp_path / "stale-constraint.zip")
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "message"),
+    [
+        (
+            b"https://files.pythonhosted.org",
+            b"https://untrusted.invalid",
+            "trusted HTTPS indexes",
+        ),
+        (
+            b"2026-07-03T10:57:46Z",
+            b"2026-08-29T10:57:46Z",
+            "resolution cutoff",
+        ),
+        (
+            b"absl_py-2.5.0-py3-none-any.whl",
+            b"absl_py-2.5.0-py3-none-win_amd64.whl",
+            "manylinux_2_28",
+        ),
+        (
+            b"0f17b89f2a4eaaedc4f28c622998aa690564b3012a396a4ffad0821007fe03ba",
+            b"0F17B89F2A4EAAEDC4F28C622998AA690564B3012A396A4FFAD0821007FE03BA",
+            "exact SHA-256",
+        ),
+        (b'version = "2.10.0+cu128"', b'version = "2.10.0+cpu"', "runtime versions"),
+    ],
+)
+def test_bundle_rejects_unsafe_gpu_lock_mutations(
+    tmp_path: Path,
+    old: bytes,
+    new: bytes,
+    message: str,
+) -> None:
+    root = _repository(tmp_path)
+    lock = root / "requirements" / "pylock.gpu-cp311-linux-x86_64-cu128.toml"
+    content = lock.read_bytes()
+    assert old in content
+    lock.write_bytes(content.replace(old, new, 1))
+    _git(root, "add", lock.relative_to(root).as_posix())
+    _git(root, "commit", "-qm", "introduce an unsafe GPU lock mutation")
+
+    with pytest.raises(package_gpu_bundle.BundleError, match=message):
+        package_gpu_bundle.build_bundle(root, tmp_path / "unsafe-lock.zip")
+
+
+def test_archive_and_tree_reject_a_forged_dependency_contract(tmp_path: Path) -> None:
+    root = _repository(tmp_path)
+    original = tmp_path / "dependency-contract.zip"
+    forged = tmp_path / "forged-dependency-contract.zip"
+    package_gpu_bundle.build_bundle(root, original)
+
+    with zipfile.ZipFile(original) as source:
+        contents = {info.filename: source.read(info) for info in source.infolist()}
+        member_order = [info.filename for info in source.infolist()]
+    manifest_name = "sion_translate/PACKAGE_MANIFEST.json"
+    checksums_name = "sion_translate/SHA256SUMS"
+    manifest = json.loads(contents[manifest_name].decode("utf-8"))
+    manifest["training_contract"]["dependency_environment"]["target"]["python_version"] = "3.12"
+    contents[manifest_name] = (
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    manifest_digest = hashlib.sha256(contents[manifest_name]).hexdigest()
+    checksum_lines = contents[checksums_name].decode("utf-8").splitlines()
+    contents[checksums_name] = (
+        "\n".join(
+            f"{manifest_digest}  PACKAGE_MANIFEST.json"
+            if line.endswith("  PACKAGE_MANIFEST.json")
+            else line
+            for line in checksum_lines
+        )
+        + "\n"
+    ).encode("utf-8")
+
+    with zipfile.ZipFile(forged, mode="w", allowZip64=True) as destination:
+        for member_name in member_order:
+            relative_path = member_name.removeprefix("sion_translate/")
+            package_gpu_bundle._write_bytes(
+                destination,
+                relative_path,
+                contents[member_name],
+            )
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="training contract disagrees"):
+        package_gpu_bundle.verify_archive(forged)
+
+    extracted = tmp_path / "forged-dependency-contract"
+    with zipfile.ZipFile(forged) as archive:
+        archive.extractall(extracted)
+    with pytest.raises(package_gpu_bundle.BundleError, match="training contract disagrees"):
+        package_gpu_bundle.verify_tree(extracted)
 
 
 def test_tracked_data_keeps_its_semantic_origin_and_opt_in_boundary(tmp_path: Path) -> None:

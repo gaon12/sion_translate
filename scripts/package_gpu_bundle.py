@@ -57,6 +57,7 @@ import ast
 from collections.abc import Mapping
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import hashlib
 import io
 import json
@@ -69,8 +70,10 @@ import stat
 import subprocess
 import sys
 import tempfile
+import tomllib
 from typing import Callable, Generator, IO, Iterable, cast
 import unicodedata
+from urllib.parse import urlsplit
 import zipfile
 
 import numpy as np
@@ -82,7 +85,145 @@ ARCHIVE_ROOT = "sion_translate"
 MANIFEST_NAME = "PACKAGE_MANIFEST.json"
 CHECKSUMS_NAME = "SHA256SUMS"
 FORMAT_VERSION = 2
-TRAINING_CONTRACT_SCHEMA = "sion-gpu-training-contract-v1"
+TRAINING_CONTRACT_SCHEMA = "sion-gpu-training-contract-v2"
+GPU_DEPENDENCY_CONTRACT_SCHEMA = "sion-gpu-dependency-environment-v1"
+GPU_LOCK_PROVENANCE_SCHEMA = "sion-gpu-lock-provenance-v1"
+GPU_LOCK_PATH = "requirements/pylock.gpu-cp311-linux-x86_64-cu128.toml"
+GPU_BUILD_INPUT_PATH = "requirements/gpu-build.in"
+GPU_LOCK_PROVENANCE_PATH = "requirements/gpu-lock-provenance.json"
+GPU_PROJECT_INPUT_PATH = "pyproject.toml"
+GPU_GIT_ATTRIBUTES_PATH = ".gitattributes"
+GPU_LOCK_UV_VERSION = "0.12.3"
+GPU_LOCK_EXCLUDE_NEWER = "2026-08-28T00:00:00Z"
+GPU_LOCK_EXPECTED_SHA256 = "0820c94d97a424e7c051cec1e01bba452a038904ae0df4730849fdabe50f350f"
+GPU_LOCK_PYTHON_VERSION = "3.11"
+GPU_LOCK_PLATFORM = "x86_64-manylinux_2_28"
+GPU_LOCK_TORCH_BACKEND = "cu128"
+GPU_LOCK_TRUSTED_HOSTS = frozenset(
+    {
+        "download-r2.pytorch.org",
+        "download.pytorch.org",
+        "files.pythonhosted.org",
+    }
+)
+GPU_LOCK_COMPILE_COMMAND = (
+    "uv",
+    "pip",
+    "compile",
+    "--no-config",
+    GPU_PROJECT_INPUT_PATH,
+    GPU_BUILD_INPUT_PATH,
+    "--extra",
+    "export",
+    "--python-version",
+    GPU_LOCK_PYTHON_VERSION,
+    "--python-platform",
+    GPU_LOCK_PLATFORM,
+    "--torch-backend",
+    GPU_LOCK_TORCH_BACKEND,
+    "--only-binary",
+    ":all:",
+    "--generate-hashes",
+    "--exclude-newer",
+    GPU_LOCK_EXCLUDE_NEWER,
+    "--format",
+    "pylock.toml",
+    "--output-file",
+    GPU_LOCK_PATH,
+)
+GPU_LOCK_SYNC_COMMAND = (
+    "uv",
+    "pip",
+    "sync",
+    "--no-config",
+    GPU_LOCK_PATH,
+    "--python",
+    ".venv/bin/python",
+    "--require-hashes",
+    "--strict",
+    "--only-binary",
+    ":all:",
+)
+GPU_VENV_CREATE_COMMAND = (
+    "uv",
+    "venv",
+    "--no-config",
+    ".venv",
+    "--python",
+    "cpython@3.11",
+    "--managed-python",
+)
+GPU_PROJECT_INSTALL_COMMAND = (
+    "uv",
+    "pip",
+    "install",
+    "--no-config",
+    "--python",
+    ".venv/bin/python",
+    "--no-deps",
+    "--no-build-isolation",
+    "--editable",
+    ".",
+)
+GPU_LOCK_REQUIRED_VERSIONS = {
+    "numpy": "2.4.6",
+    "sentencepiece": "0.2.1",
+    "torch": "2.10.0+cu128",
+    "torchao": "0.17.0+cu128",
+    "transformers": "5.16.1",
+}
+GPU_LOCK_REQUIRED_PACKAGES = frozenset(
+    {
+        "gguf",
+        "numpy",
+        "pyyaml",
+        "sacrebleu",
+        "safetensors",
+        "sentencepiece",
+        "setuptools",
+        "tensorboard",
+        "torch",
+        "torchao",
+        "tqdm",
+        "transformers",
+        "wheel",
+    }
+)
+GPU_PROJECT_CORE_PACKAGES = frozenset(
+    {
+        "numpy",
+        "pyyaml",
+        "sacrebleu",
+        "safetensors",
+        "sentencepiece",
+        "tensorboard",
+        "torch",
+        "tqdm",
+        "transformers",
+    }
+)
+GPU_PROJECT_EXPORT_PACKAGES = frozenset({"gguf", "torchao"})
+GPU_PROJECT_BUILD_PACKAGES = frozenset({"setuptools", "wheel"})
+GPU_PROJECT_CORE_REQUIREMENTS = (
+    "numpy>=2.0",
+    "PyYAML>=6.0",
+    "sacrebleu>=2.5",
+    "sentencepiece==0.2.1",
+    "safetensors>=0.5",
+    "tensorboard>=2.18",
+    "torch>=2.8",
+    "tqdm>=4.66",
+    "transformers>=5.0,<6",
+)
+GPU_PROJECT_EXPORT_REQUIREMENTS = ("gguf>=0.19", "torchao>=0.17")
+GPU_PROJECT_BUILD_REQUIREMENTS = ("setuptools>=77", "wheel")
+GPU_GIT_ATTRIBUTE_RULES = (
+    ".gitattributes text eol=lf",
+    "pyproject.toml text eol=lf",
+    "requirements/gpu-build.in text eol=lf",
+    "requirements/gpu-lock-provenance.json text eol=lf",
+    "requirements/pylock.gpu-*.toml text eol=lf",
+)
 TOKENIZER_TRAINING_SCHEMA = "sion-tokenizer-training-v4"
 TOKENIZER_INPUT_TRAVERSAL_POLICY = "portable-input-order-v1"
 DEFAULT_CONFIG_PATH = "sion_translate.yaml"
@@ -2608,12 +2749,393 @@ def _validate_payload_origin_paths(
             )
 
 
+def _normalized_distribution_name(value: str) -> str:
+    """Return the normalized package name used by dependency metadata."""
+
+    return re.sub(r"[-_.]+", "-", value).lower()
+
+
+def _dependency_names(raw_specs: object, *, field: str) -> frozenset[str]:
+    if not isinstance(raw_specs, list) or not raw_specs:
+        raise BundleError(f"{field} must be a non-empty dependency list")
+    names: set[str] = set()
+    for index, raw_spec in enumerate(cast(list[object], raw_specs)):
+        if not isinstance(raw_spec, str):
+            raise BundleError(f"{field}[{index}] must be a dependency string")
+        match = re.match(r"[A-Za-z0-9][A-Za-z0-9._-]*", raw_spec.strip())
+        if match is None:
+            raise BundleError(f"{field}[{index}] has no valid distribution name")
+        names.add(_normalized_distribution_name(match.group(0)))
+    return frozenset(names)
+
+
+def _parse_toml_object(content: bytes, path: str) -> Mapping[object, object]:
+    try:
+        parsed = tomllib.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise BundleError(f"{path} is not valid UTF-8 TOML") from error
+    return cast(Mapping[object, object], parsed)
+
+
+def _authenticated_git_payload(
+    path: str,
+    *,
+    payload_paths: set[str],
+    identities: Mapping[str, tuple[int, str]],
+    origins: Mapping[str, str],
+    read_payload: Callable[[str], bytes],
+) -> tuple[int, str, bytes]:
+    if path not in payload_paths or origins.get(path) != "git-index":
+        raise BundleError(f"GPU dependency file is not an authenticated Git payload: {path}")
+    size, digest = identities[path]
+    content = read_payload(path)
+    if len(content) != size or hashlib.sha256(content).hexdigest() != digest:
+        raise BundleError(f"GPU dependency file changed during validation: {path}")
+    return size, digest, content
+
+
+def _validate_gpu_wheel_target(url: str, *, package: str) -> None:
+    """Reject wheels that cannot run on the bundle's exact GPU host target."""
+
+    parsed_url = urlsplit(url)
+    try:
+        port = parsed_url.port
+    except ValueError as error:
+        raise BundleError(f"GPU lock wheel URL has an invalid port: {package}") from error
+    if (
+        parsed_url.scheme != "https"
+        or parsed_url.hostname not in GPU_LOCK_TRUSTED_HOSTS
+        or parsed_url.username is not None
+        or parsed_url.password is not None
+        or port not in {None, 443}
+    ):
+        raise BundleError(f"GPU lock wheel URL is outside the trusted HTTPS indexes: {package}")
+    filename = parsed_url.path.rsplit("/", 1)[-1]
+    if not filename.endswith(".whl"):
+        raise BundleError(f"GPU lock contains a non-wheel artifact: {package}")
+    components = filename[:-4].split("-")
+    if len(components) < 5:
+        raise BundleError(f"GPU lock wheel filename is malformed: {filename}")
+    python_tag, abi_tag, platform_tag = components[-3:]
+
+    python_tags = python_tag.split(".")
+    if python_tags in (["py3"], ["py2", "py3"]):
+        if abi_tag != "none":
+            raise BundleError(f"GPU lock has an incompatible Python ABI: {filename}")
+    else:
+        for tag in python_tags:
+            match = re.fullmatch(r"cp(\d{2,3})", tag)
+            if match is None:
+                raise BundleError(f"GPU lock has an incompatible Python tag: {filename}")
+            tagged_version = int(match.group(1))
+            if tagged_version == 311 and abi_tag in {"cp311", "abi3"}:
+                continue
+            if tagged_version < 311 and abi_tag == "abi3":
+                continue
+            raise BundleError(f"GPU lock wheel does not support CPython 3.11: {filename}")
+
+    if platform_tag == "any":
+        if abi_tag != "none":
+            raise BundleError(f"GPU lock has an invalid platform-independent ABI: {filename}")
+        return
+    legacy_manylinux = {
+        "manylinux1_x86_64",
+        "manylinux2010_x86_64",
+        "manylinux2014_x86_64",
+    }
+    for tag in platform_tag.split("."):
+        if tag in legacy_manylinux:
+            continue
+        match = re.fullmatch(r"manylinux_2_(\d+)_x86_64", tag)
+        if match is None or int(match.group(1)) > 28:
+            raise BundleError(f"GPU lock wheel is outside Linux x86_64/manylinux_2_28: {filename}")
+
+
+def _validate_gpu_project_inputs(project_content: bytes, build_content: bytes) -> None:
+    project_toml = _parse_toml_object(project_content, GPU_PROJECT_INPUT_PATH)
+    raw_project = project_toml.get("project")
+    if not isinstance(raw_project, Mapping):
+        raise BundleError("pyproject.toml has no project table")
+    project = cast(Mapping[object, object], raw_project)
+    if project.get("requires-python") != ">=3.11":
+        raise BundleError("GPU lock requires the project's Python floor to remain >=3.11")
+    raw_core_dependencies = project.get("dependencies")
+    core_names = _dependency_names(
+        raw_core_dependencies,
+        field="pyproject.toml project.dependencies",
+    )
+    if core_names != GPU_PROJECT_CORE_PACKAGES or raw_core_dependencies != list(
+        GPU_PROJECT_CORE_REQUIREMENTS
+    ):
+        raise BundleError(
+            "GPU lock project core requirements changed without updating the reviewed recipe"
+        )
+
+    raw_optional = project.get("optional-dependencies")
+    if not isinstance(raw_optional, Mapping):
+        raise BundleError("pyproject.toml has no optional dependency table")
+    raw_export_dependencies = cast(Mapping[object, object], raw_optional).get("export")
+    export_names = _dependency_names(
+        raw_export_dependencies,
+        field="pyproject.toml project.optional-dependencies.export",
+    )
+    if export_names != GPU_PROJECT_EXPORT_PACKAGES or raw_export_dependencies != list(
+        GPU_PROJECT_EXPORT_REQUIREMENTS
+    ):
+        raise BundleError(
+            "GPU lock export requirements changed without updating the reviewed recipe"
+        )
+
+    raw_build_system = project_toml.get("build-system")
+    if not isinstance(raw_build_system, Mapping):
+        raise BundleError("pyproject.toml has no build-system table")
+    raw_build_dependencies = cast(Mapping[object, object], raw_build_system).get("requires")
+    build_names = _dependency_names(
+        raw_build_dependencies,
+        field="pyproject.toml build-system.requires",
+    )
+    if build_names != GPU_PROJECT_BUILD_PACKAGES or raw_build_dependencies != list(
+        GPU_PROJECT_BUILD_REQUIREMENTS
+    ):
+        raise BundleError(
+            "GPU lock build requirements changed without updating the reviewed recipe"
+        )
+
+    try:
+        build_lines = [
+            line.strip()
+            for line in build_content.decode("utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+    except UnicodeDecodeError as error:
+        raise BundleError(f"{GPU_BUILD_INPUT_PATH} is not valid UTF-8") from error
+    if build_lines != list(GPU_PROJECT_BUILD_REQUIREMENTS):
+        raise BundleError(f"{GPU_BUILD_INPUT_PATH} must explicitly select setuptools>=77 and wheel")
+
+
+def _validate_gpu_line_endings_contract(content: bytes) -> None:
+    try:
+        lines = [
+            line.strip()
+            for line in content.decode("utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+    except UnicodeDecodeError as error:
+        raise BundleError(f"{GPU_GIT_ATTRIBUTES_PATH} is not valid UTF-8") from error
+    if lines != list(GPU_GIT_ATTRIBUTE_RULES):
+        raise BundleError("GPU dependency files are not protected by the reviewed LF rules")
+
+
+def _validated_gpu_lock(
+    lock_content: bytes,
+) -> tuple[dict[str, str], int, int]:
+    lock = _parse_toml_object(lock_content, GPU_LOCK_PATH)
+    if set(lock) != {"lock-version", "created-by", "requires-python", "packages"}:
+        raise BundleError("GPU pylock top-level fields do not match the pinned PEP 751 format")
+    if lock.get("lock-version") != "1.0" or lock.get("created-by") != "uv":
+        raise BundleError("GPU pylock was not generated by the supported uv PEP 751 format")
+    if lock.get("requires-python") != ">=3.11":
+        raise BundleError("GPU pylock requires-python must remain >=3.11")
+    raw_packages = lock.get("packages")
+    if not isinstance(raw_packages, list) or not raw_packages:
+        raise BundleError("GPU pylock contains no packages")
+
+    cutoff = datetime.fromisoformat(GPU_LOCK_EXCLUDE_NEWER.replace("Z", "+00:00"))
+    packages: dict[str, str] = {}
+    wheel_urls: set[str] = set()
+    wheel_count = 0
+    for package_index, raw_package in enumerate(cast(list[object], raw_packages)):
+        if not isinstance(raw_package, Mapping):
+            raise BundleError(f"GPU pylock package {package_index} is not an object")
+        package = cast(Mapping[object, object], raw_package)
+        fields = set(package)
+        if not {"name", "version", "wheels"}.issubset(fields) or not fields.issubset(
+            {"name", "version", "marker", "wheels"}
+        ):
+            raise BundleError(f"GPU pylock package {package_index} has unsupported fields")
+        raw_name = package.get("name")
+        version = package.get("version")
+        if not isinstance(raw_name, str) or not isinstance(version, str) or not version:
+            raise BundleError(f"GPU pylock package {package_index} has an invalid name or version")
+        name = _normalized_distribution_name(raw_name)
+        if raw_name != name or name in packages:
+            raise BundleError(f"GPU pylock package name is non-canonical or repeated: {raw_name}")
+        marker = package.get("marker")
+        if marker is not None and (not isinstance(marker, str) or not marker.strip()):
+            raise BundleError(f"GPU pylock package marker is invalid: {name}")
+        raw_wheels = package.get("wheels")
+        if not isinstance(raw_wheels, list) or not raw_wheels:
+            raise BundleError(f"GPU pylock package has no binary wheels: {name}")
+
+        for wheel_index, raw_wheel in enumerate(cast(list[object], raw_wheels)):
+            if not isinstance(raw_wheel, Mapping):
+                raise BundleError(f"GPU pylock wheel {name}[{wheel_index}] is not an object")
+            wheel = cast(Mapping[object, object], raw_wheel)
+            wheel_fields = set(wheel)
+            if not {"url", "upload-time", "hashes"}.issubset(wheel_fields) or not (
+                wheel_fields <= {"url", "upload-time", "size", "hashes"}
+            ):
+                raise BundleError(f"GPU pylock wheel fields are invalid: {name}[{wheel_index}]")
+            url = wheel.get("url")
+            if not isinstance(url, str) or url in wheel_urls:
+                raise BundleError(f"GPU pylock wheel URL is invalid or repeated: {name}")
+            _validate_gpu_wheel_target(url, package=name)
+            wheel_urls.add(url)
+            size = wheel.get("size")
+            if size is not None and (
+                isinstance(size, bool) or not isinstance(size, int) or size <= 0
+            ):
+                raise BundleError(f"GPU pylock wheel size is invalid: {name}")
+            upload_time = wheel.get("upload-time")
+            if (
+                not isinstance(upload_time, datetime)
+                or upload_time.tzinfo is None
+                or upload_time.utcoffset() is None
+                or upload_time.astimezone(timezone.utc) > cutoff
+            ):
+                raise BundleError(f"GPU pylock wheel violates the resolution cutoff: {name}")
+            raw_hashes = wheel.get("hashes")
+            if not isinstance(raw_hashes, Mapping):
+                raise BundleError(f"GPU pylock wheel has no hash object: {name}")
+            hashes = cast(Mapping[object, object], raw_hashes)
+            digest = hashes.get("sha256")
+            if (
+                set(hashes) != {"sha256"}
+                or not isinstance(digest, str)
+                or not (SHA256_PATTERN.fullmatch(digest))
+            ):
+                raise BundleError(f"GPU pylock wheel has no exact SHA-256: {name}")
+            wheel_count += 1
+        packages[name] = version
+
+    missing = sorted(GPU_LOCK_REQUIRED_PACKAGES - packages.keys())
+    if missing:
+        raise BundleError(f"GPU pylock omits required training packages: {missing}")
+    wrong_versions = {
+        name: {"expected": expected, "locked": packages.get(name)}
+        for name, expected in GPU_LOCK_REQUIRED_VERSIONS.items()
+        if packages.get(name) != expected
+    }
+    if wrong_versions:
+        raise BundleError(f"GPU pylock has unsupported runtime versions: {wrong_versions}")
+    return packages, len(packages), wheel_count
+
+
+def _validated_gpu_dependency_environment(
+    *,
+    payload_paths: set[str],
+    identities: Mapping[str, tuple[int, str]],
+    origins: Mapping[str, str],
+    read_payload: Callable[[str], bytes],
+) -> dict[str, object]:
+    authenticated: dict[str, tuple[int, str, bytes]] = {}
+    for path in (
+        GPU_PROJECT_INPUT_PATH,
+        GPU_BUILD_INPUT_PATH,
+        GPU_LOCK_PATH,
+        GPU_LOCK_PROVENANCE_PATH,
+        GPU_GIT_ATTRIBUTES_PATH,
+    ):
+        authenticated[path] = _authenticated_git_payload(
+            path,
+            payload_paths=payload_paths,
+            identities=identities,
+            origins=origins,
+            read_payload=read_payload,
+        )
+
+    _validate_gpu_project_inputs(
+        authenticated[GPU_PROJECT_INPUT_PATH][2],
+        authenticated[GPU_BUILD_INPUT_PATH][2],
+    )
+    _validate_gpu_line_endings_contract(authenticated[GPU_GIT_ATTRIBUTES_PATH][2])
+    packages, package_count, wheel_count = _validated_gpu_lock(authenticated[GPU_LOCK_PATH][2])
+    if authenticated[GPU_LOCK_PATH][1] != GPU_LOCK_EXPECTED_SHA256:
+        raise BundleError(
+            "GPU pylock bytes differ from the reviewed dependency environment; "
+            "regenerate and review the lock before updating its expected digest"
+        )
+
+    provenance = _parse_json_object(
+        authenticated[GPU_LOCK_PROVENANCE_PATH][2],
+        GPU_LOCK_PROVENANCE_PATH,
+    )
+    input_identities = {
+        path: {
+            "sha256": authenticated[path][1],
+            "size": authenticated[path][0],
+        }
+        for path in (GPU_PROJECT_INPUT_PATH, GPU_BUILD_INPUT_PATH)
+    }
+    expected_target = {
+        "machine": "x86_64",
+        "manylinux": "2_28",
+        "os": "linux",
+        "python_implementation": "cpython",
+        "python_version": GPU_LOCK_PYTHON_VERSION,
+        "torch_backend": GPU_LOCK_TORCH_BACKEND,
+    }
+    expected_provenance = {
+        "command": list(GPU_LOCK_COMPILE_COMMAND),
+        "generator": {"name": "uv", "version": GPU_LOCK_UV_VERSION},
+        "inputs": input_identities,
+        "lock": {
+            "path": GPU_LOCK_PATH,
+            "sha256": authenticated[GPU_LOCK_PATH][1],
+            "size": authenticated[GPU_LOCK_PATH][0],
+        },
+        "normalization": {
+            "path": GPU_GIT_ATTRIBUTES_PATH,
+            "sha256": authenticated[GPU_GIT_ATTRIBUTES_PATH][1],
+            "size": authenticated[GPU_GIT_ATTRIBUTES_PATH][0],
+        },
+        "schema": GPU_LOCK_PROVENANCE_SCHEMA,
+        "target": expected_target,
+    }
+    if dict(provenance) != expected_provenance:
+        raise BundleError(
+            "GPU lock provenance is stale; regenerate the lock and provenance from its inputs"
+        )
+
+    return {
+        "schema": GPU_DEPENDENCY_CONTRACT_SCHEMA,
+        "generator": {"name": "uv", "version": GPU_LOCK_UV_VERSION},
+        "target": expected_target,
+        "inputs": input_identities,
+        "normalization": {
+            "path": GPU_GIT_ATTRIBUTES_PATH,
+            "sha256": authenticated[GPU_GIT_ATTRIBUTES_PATH][1],
+            "size": authenticated[GPU_GIT_ATTRIBUTES_PATH][0],
+        },
+        "provenance": {
+            "path": GPU_LOCK_PROVENANCE_PATH,
+            "sha256": authenticated[GPU_LOCK_PROVENANCE_PATH][1],
+            "size": authenticated[GPU_LOCK_PROVENANCE_PATH][0],
+        },
+        "lock": {
+            "format": "pep751",
+            "lock_version": "1.0",
+            "package_count": package_count,
+            "path": GPU_LOCK_PATH,
+            "sha256": authenticated[GPU_LOCK_PATH][1],
+            "size": authenticated[GPU_LOCK_PATH][0],
+            "wheel_count": wheel_count,
+        },
+        "venv_command": list(GPU_VENV_CREATE_COMMAND),
+        "compile_command": list(GPU_LOCK_COMPILE_COMMAND),
+        "sync_command": list(GPU_LOCK_SYNC_COMMAND),
+        "project_install_command": list(GPU_PROJECT_INSTALL_COMMAND),
+        "resolved_runtime_versions": {name: packages[name] for name in GPU_LOCK_REQUIRED_VERSIONS},
+    }
+
+
 def _training_contract_payload(
     config_path: PurePosixPath,
     config_sha256: str,
     config: object,
     *,
     raw_parallel_data_included: bool,
+    dependency_environment: Mapping[str, object],
 ) -> dict[str, object]:
     from sion_translate.config import AppConfig
 
@@ -2673,6 +3195,7 @@ def _training_contract_payload(
         "foundation_enabled": config.foundation.enabled,
         "foundation_languages": list(config.foundation_languages()),
         "paths": paths,
+        "dependency_environment": dict(dependency_environment),
     }
 
 
@@ -3163,11 +3686,18 @@ def _validate_training_contract(
         semantic_identities.update(omitted_source_freshness.identities)
         raw_parallel_paths.update(omitted_source_freshness.raw_parallel_paths)
         monolingual_paths.update(omitted_source_freshness.monolingual_paths)
+    dependency_environment = _validated_gpu_dependency_environment(
+        payload_paths=payload_paths,
+        identities=identities,
+        origins=origins,
+        read_payload=read_payload,
+    )
     expected_contract = _training_contract_payload(
         config_path,
         config_sha256,
         config,
         raw_parallel_data_included=bool(payload_raw_parallel_paths),
+        dependency_environment=dependency_environment,
     )
     if dict(contract_values) != expected_contract:
         raise BundleError("package training contract disagrees with its selected config or payload")
@@ -3377,11 +3907,18 @@ def _training_contract_from_sources(
 
     config = _validated_config_from_payload(read_payload(config_key), config_key)
     raw_parallel_data_included = any(origin == "data-jsonl" for origin in origins.values())
+    dependency_environment = _validated_gpu_dependency_environment(
+        payload_paths=set(entries),
+        identities=identities,
+        origins=origins,
+        read_payload=read_payload,
+    )
     contract = _training_contract_payload(
         config_path,
         identities[config_key][1],
         config,
         raw_parallel_data_included=raw_parallel_data_included,
+        dependency_environment=dependency_environment,
     )
     return contract, identities, origins, read_payload, open_payload
 

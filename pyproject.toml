@@ -25,6 +25,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# GPU release bundles resolve the core and export groups into the reviewed
+# CPython 3.11/Linux x86_64/CUDA 12.8 lock under requirements/.
 # ruff is pinned to a minor range on purpose. Its formatter changes between
 # minor versions, so an open bound lets CI reformat code the maintainer never
 # touched and fail `ruff format --check` with no commit to blame.

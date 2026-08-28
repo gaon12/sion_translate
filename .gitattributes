@@ -1,0 +1,7 @@
+# The GPU dependency contract hashes exact bytes. Force every contract input
+# to LF so Windows and Linux checkouts validate the same reviewed environment.
+.gitattributes text eol=lf
+pyproject.toml text eol=lf
+requirements/gpu-build.in text eol=lf
+requirements/gpu-lock-provenance.json text eol=lf
+requirements/pylock.gpu-*.toml text eol=lf

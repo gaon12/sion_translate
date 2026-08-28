@@ -1,0 +1,4 @@
+# Build tools are explicit because the final editable install runs without
+# dependency resolution or build isolation on the GPU server.
+setuptools>=77
+wheel

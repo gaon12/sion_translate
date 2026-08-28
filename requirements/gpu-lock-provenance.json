@@ -1,0 +1,60 @@
+{
+  "command": [
+    "uv",
+    "pip",
+    "compile",
+    "--no-config",
+    "pyproject.toml",
+    "requirements/gpu-build.in",
+    "--extra",
+    "export",
+    "--python-version",
+    "3.11",
+    "--python-platform",
+    "x86_64-manylinux_2_28",
+    "--torch-backend",
+    "cu128",
+    "--only-binary",
+    ":all:",
+    "--generate-hashes",
+    "--exclude-newer",
+    "2026-08-28T00:00:00Z",
+    "--format",
+    "pylock.toml",
+    "--output-file",
+    "requirements/pylock.gpu-cp311-linux-x86_64-cu128.toml"
+  ],
+  "generator": {
+    "name": "uv",
+    "version": "0.12.3"
+  },
+  "inputs": {
+    "pyproject.toml": {
+      "sha256": "e0597fef4f79c69c0818783ce7a55f33554fc8dc6254b5469196b3b91f823ffe",
+      "size": 3016
+    },
+    "requirements/gpu-build.in": {
+      "sha256": "ad3eff8213b717fddf55c4147eaa0cdbd1ef084417e3b5bf34779940231e31b7",
+      "size": 158
+    }
+  },
+  "lock": {
+    "path": "requirements/pylock.gpu-cp311-linux-x86_64-cu128.toml",
+    "sha256": "0820c94d97a424e7c051cec1e01bba452a038904ae0df4730849fdabe50f350f",
+    "size": 29575
+  },
+  "normalization": {
+    "path": ".gitattributes",
+    "sha256": "18f61172548ee06e4ab0639dd8e0366db90379a0185bb0dbf128fd2fdfaf24a4",
+    "size": 341
+  },
+  "schema": "sion-gpu-lock-provenance-v1",
+  "target": {
+    "machine": "x86_64",
+    "manylinux": "2_28",
+    "os": "linux",
+    "python_implementation": "cpython",
+    "python_version": "3.11",
+    "torch_backend": "cu128"
+  }
+}
