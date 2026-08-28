@@ -457,7 +457,16 @@ def _with_foundation_dataset(
     from sion_translate.config import load_config
 
     config = load_config(root / "sion_translate.yaml")
-    languages = prepared_languages or list(config.foundation_languages())
+    languages = (
+        list(config.foundation_languages()) if prepared_languages is None else prepared_languages
+    )
+    if not languages:
+        raise AssertionError("foundation test fixtures require at least one prepared language")
+    source_language = languages[0]
+    source_root = root / "data" / "corpus" / source_language
+    source_root.mkdir(parents=True, exist_ok=True)
+    (source_root / "corpus.txt").write_bytes(b"source corpus")
+    (source_root / "reasoning.jsonl").write_bytes(b"reasoning corpus")
     dataset = root / "artifacts" / "foundation_dataset"
     (dataset / "train").mkdir(parents=True)
     (dataset / "validation").mkdir()
@@ -477,11 +486,11 @@ def _with_foundation_dataset(
             np.asarray([6, 7, 8, 9], dtype=np.uint32).tobytes()
         )
     digest = tokenizer_sha256 or _file_sha256(root / "artifacts" / "tokenizer" / "sion.model")
-    sources = [
+    sources: list[dict[str, object]] = [
         {
             "id": 0,
-            "language": "ko",
-            "logical_path": "ko/corpus.txt",
+            "language": source_language,
+            "logical_path": f"{source_language}/corpus.txt",
             "name": "corpus.txt",
             "records": 2,
             "sha256": hashlib.sha256(b"source corpus").hexdigest(),
@@ -490,8 +499,8 @@ def _with_foundation_dataset(
         },
         {
             "id": 1,
-            "language": "ko",
-            "logical_path": "ko/reasoning.jsonl",
+            "language": source_language,
+            "logical_path": f"{source_language}/reasoning.jsonl",
             "name": "reasoning.jsonl",
             "records": 2,
             "sha256": hashlib.sha256(b"reasoning corpus").hexdigest(),
@@ -550,13 +559,13 @@ def _with_foundation_dataset(
         "language_sampling": {
             "alpha": config.foundation.language_sampling_alpha,
             "minimum_share": config.foundation.minimum_language_share,
-            "weights": {"ko": 1.0},
-            "counts": {"ko": 4},
+            "weights": {source_language: 1.0},
+            "counts": {source_language: 4},
             "warnings": [],
         },
         "reasoning": {
             "contract": "prompt-to-delimited-trace-v1",
-            "languages": ["ko"],
+            "languages": [source_language],
             "records": 2,
             "sample_share": 0.05,
             "trace_symbols": ["<think>", "</think>", "<answer>", "</answer>"],
@@ -869,7 +878,7 @@ def test_prepared_only_bundle_omits_raw_inputs_and_includes_complete_artifacts(
     _with_dataset(root)
     _with_foundation_dataset(root)
     monolingual = root / "data" / "corpus" / "ko" / "corpus.txt"
-    monolingual.parent.mkdir(parents=True)
+    monolingual.parent.mkdir(parents=True, exist_ok=True)
     monolingual.write_bytes(b"source corpus")
     _git(root, "add", "data/corpus.jsonl", "data/corpus/ko/corpus.txt")
     _git(root, "commit", "-qm", "track raw inputs")
@@ -881,6 +890,7 @@ def test_prepared_only_bundle_omits_raw_inputs_and_includes_complete_artifacts(
     paths = {entry["path"] for entry in manifest["files"]}
     assert "data/corpus.jsonl" not in paths
     assert "data/corpus/ko/corpus.txt" not in paths
+    assert "data/corpus/ko/reasoning.jsonl" not in paths
     assert "data/.gitkeep" not in paths
     assert "data/evaluation_only/holdout.jsonl" in paths
     assert "artifacts/tokenizer/sion.model" in paths
@@ -888,6 +898,71 @@ def test_prepared_only_bundle_omits_raw_inputs_and_includes_complete_artifacts(
     assert "artifacts/foundation_dataset/manifest.json" in paths
     assert manifest["training_contract"]["raw_parallel_data_included"] is False
     package_gpu_bundle.verify_archive(archive_path)
+
+
+def test_prepared_only_rejects_translation_artifacts_stale_against_local_raw_data(
+    tmp_path: Path,
+) -> None:
+    root = _repository(tmp_path)
+    _with_tokenizer(root)
+    _with_dataset(root)
+    _with_foundation_dataset(root)
+    (root / "data" / "corpus.jsonl").write_text(
+        '{"ko":"바뀜","ja":"変更"}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="raw parallel corpus differs"):
+        package_gpu_bundle.build_bundle(
+            root,
+            tmp_path / "stale-translation-prepared-only.zip",
+            prepared_only=True,
+        )
+
+
+def test_prepared_only_rejects_foundation_artifacts_stale_against_local_raw_data(
+    tmp_path: Path,
+) -> None:
+    root = _repository(tmp_path)
+    _with_tokenizer(root)
+    _with_dataset(root)
+    _with_foundation_dataset(root)
+    (root / "data" / "corpus" / "ko" / "reasoning.jsonl").write_bytes(b"changed reasoning corpus")
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="monolingual corpus differs"):
+        package_gpu_bundle.build_bundle(
+            root,
+            tmp_path / "stale-foundation-prepared-only.zip",
+            prepared_only=True,
+        )
+
+
+def test_prepared_only_rejects_an_omitted_source_changed_during_archive_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _repository(tmp_path)
+    _with_tokenizer(root)
+    _with_dataset(root)
+    _with_foundation_dataset(root)
+    raw_source = root / "data" / "corpus.jsonl"
+    original_write_archive = package_gpu_bundle._write_archive
+
+    def write_then_mutate(*args: object, **kwargs: object) -> None:
+        original_write_archive(*args, **kwargs)  # pyright: ignore[reportArgumentType]
+        raw_source.write_text(
+            '{"ko":"아카이브 중 변경","ja":"作成中の変更"}\n',
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(package_gpu_bundle, "_write_archive", write_then_mutate)
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="changed after bundle preflight"):
+        package_gpu_bundle.build_bundle(
+            root,
+            tmp_path / "raced-prepared-only.zip",
+            prepared_only=True,
+        )
 
 
 def test_prepared_only_requires_every_configured_prepared_artifact(tmp_path: Path) -> None:
@@ -1040,19 +1115,19 @@ def test_foundation_dataset_accepts_the_configured_release_name(tmp_path: Path) 
     package_gpu_bundle.verify_archive(archive)
 
 
-def test_foundation_dataset_may_cover_an_ordered_configured_language_subset(
+def test_foundation_dataset_may_cover_a_nonleading_configured_language_subset(
     tmp_path: Path,
 ) -> None:
     root = _repository(tmp_path)
     config = root / "sion_translate.yaml"
     config.write_text(
-        "data:\n  language_pair: [ko, ja]\nfoundation:\n  languages: [ko, ja]\n",
+        "data:\n  language_pair: [de, fr]\nfoundation:\n  languages: [de, zh-Hant]\n",
         encoding="utf-8",
     )
     _git(root, "add", config.name)
     _git(root, "commit", "-qm", "reserve an optional foundation language")
     _with_tokenizer(root)
-    _with_foundation_dataset(root, prepared_languages=["ko"])
+    _with_foundation_dataset(root, prepared_languages=["zh-Hant"])
 
     archive = tmp_path / "foundation-language-subset.zip"
     package_gpu_bundle.build_bundle(
@@ -1078,6 +1153,9 @@ def test_foundation_dataset_requires_full_coverage_when_configured(
     _git(root, "commit", "-qm", "require every foundation language")
     _with_tokenizer(root)
     _with_foundation_dataset(root, prepared_languages=["ko"])
+    missing_language_source = root / "data" / "corpus" / "ja" / "corpus.txt"
+    missing_language_source.parent.mkdir(parents=True)
+    missing_language_source.write_bytes(b"Japanese source corpus")
 
     with pytest.raises(package_gpu_bundle.BundleError, match="does not cover every"):
         package_gpu_bundle.build_bundle(
@@ -1095,7 +1173,7 @@ def test_foundation_sources_must_match_the_included_monolingual_corpus(
     _with_tokenizer(root)
     _with_foundation_dataset(root)
     corpus_root = root / "data" / "corpus" / "ko"
-    corpus_root.mkdir(parents=True)
+    corpus_root.mkdir(parents=True, exist_ok=True)
     (corpus_root / "corpus.txt").write_bytes(b"source corpus")
     reasoning = corpus_root / "reasoning.jsonl"
     reasoning.write_bytes(b"reasoning corpus")

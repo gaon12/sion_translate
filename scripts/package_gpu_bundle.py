@@ -219,6 +219,16 @@ class SourceEntry:
 
 
 @dataclass(frozen=True)
+class OmittedSourceFreshness:
+    """Hashes and metadata for prepared-artifact sources omitted from the ZIP."""
+
+    identities: dict[str, tuple[int, str]]
+    raw_parallel_paths: frozenset[str]
+    monolingual_paths: frozenset[str]
+    metadata: tuple[tuple[SourceEntry, tuple[int, ...]], ...]
+
+
+@dataclass(frozen=True)
 class FileRecord:
     """Integrity metadata for one payload file."""
 
@@ -637,6 +647,29 @@ def _collect_tree(
     return entries
 
 
+def _collect_configured_parallel_sources(
+    root: Path,
+    raw_root_relative: PurePosixPath,
+) -> list[SourceEntry]:
+    """Collect the immediate JSONL files used by translation preparation."""
+
+    data_root = root.joinpath(*raw_root_relative.parts)
+    if not _tree_root_is_directory(root, data_root, "data corpus"):
+        return []
+    entries: list[SourceEntry] = []
+    for source_path in sorted(data_root.glob("*.jsonl"), key=lambda path: path.name):
+        relative_path = _validated_relative_path(source_path.relative_to(root).as_posix())
+        entries.append(
+            SourceEntry(
+                relative_path=relative_path,
+                source_path=source_path,
+                origin="data-jsonl",
+                mode="100644",
+            )
+        )
+    return entries
+
+
 def _collect_configured_monolingual_sources(
     root: Path,
     selection: MonolingualSelection,
@@ -707,6 +740,54 @@ def _collect_configured_monolingual_sources(
             f"foundation languages: {', '.join(selection.languages)}"
         )
     return entries
+
+
+def _collect_omitted_source_freshness(
+    root: Path,
+    config_selection: ConfigSelection,
+    *,
+    parallel: bool,
+    monolingual: bool,
+) -> OmittedSourceFreshness | None:
+    """Authenticate local sources that prepared artifacts replace in the ZIP."""
+
+    if not parallel and not monolingual:
+        return None
+    from sion_translate.config import AppConfig
+
+    config = config_selection.config
+    if not isinstance(config, AppConfig):
+        raise BundleError("validated bundle config returned an unexpected object")
+    entries: list[SourceEntry] = []
+    if parallel:
+        raw_root = _repository_relative_path(root, config.data.raw_dir, field="data.raw_dir")
+        parallel_entries = _collect_configured_parallel_sources(root, raw_root)
+        if not parallel_entries:
+            raise BundleError(
+                "prepared artifacts cannot be freshness-checked because the configured "
+                f"{raw_root.as_posix()}/*.jsonl sources are absent"
+            )
+        entries.extend(parallel_entries)
+    if monolingual:
+        selection = _load_monolingual_selection(
+            root,
+            config_selection.config_path.as_posix(),
+        )
+        entries.extend(_collect_configured_monolingual_sources(root, selection))
+
+    identities, metadata = _hash_omitted_sources(root, entries)
+    return OmittedSourceFreshness(
+        identities=identities,
+        raw_parallel_paths=frozenset(
+            entry.relative_path.as_posix() for entry in entries if entry.origin == "data-jsonl"
+        ),
+        monolingual_paths=frozenset(
+            entry.relative_path.as_posix()
+            for entry in entries
+            if entry.origin == "monolingual-corpus"
+        ),
+        metadata=metadata,
+    )
 
 
 def _parse_json_object(content: bytes, name: str) -> dict[str, object]:
@@ -1784,7 +1865,7 @@ def _validate_config_artifact_semantics(
             }
             if translation_source_identities != expected_raw_files:
                 raise BundleError(
-                    "included raw parallel corpus differs from the prepared dataset fingerprint"
+                    "current raw parallel corpus differs from the prepared dataset fingerprint"
                 )
 
     if FOUNDATION_DATASET_MANIFEST_PATH in payload_paths:
@@ -1920,13 +2001,13 @@ def _validate_config_artifact_semantics(
             included_monolingual_sources != foundation_source_identities
         ):
             raise BundleError(
-                "included monolingual corpus differs from the prepared foundation dataset"
+                "current monolingual corpus differs from the prepared foundation dataset"
             )
         if tokenizer_source_records and (
             included_monolingual_sources != tokenizer_monolingual_sources
         ):
             raise BundleError(
-                "included monolingual corpus differs from tokenizer training provenance"
+                "current monolingual corpus differs from tokenizer training provenance"
             )
 
 
@@ -1937,6 +2018,7 @@ def _validate_training_contract(
     identities: Mapping[str, tuple[int, str]],
     origins: Mapping[str, str],
     read_payload: Callable[[str], bytes],
+    omitted_source_freshness: OmittedSourceFreshness | None = None,
 ) -> None:
     if not isinstance(contract, Mapping):
         raise BundleError("package manifest training_contract is missing")
@@ -1953,20 +2035,33 @@ def _validate_training_contract(
     if len(config_content) != config_size:
         raise BundleError("selected training config size changed during validation")
     config = _validated_config_from_payload(config_content, config_key)
-    raw_parallel_paths = {path for path, origin in origins.items() if origin == "data-jsonl"}
+    payload_raw_parallel_paths = {
+        path for path, origin in origins.items() if origin == "data-jsonl"
+    }
+    raw_parallel_paths = set(payload_raw_parallel_paths)
     monolingual_paths = {path for path, origin in origins.items() if origin == "monolingual-corpus"}
+    semantic_identities = dict(identities)
+    if omitted_source_freshness is not None:
+        collisions = set(semantic_identities).intersection(omitted_source_freshness.identities)
+        if collisions:
+            raise BundleError(
+                f"omitted-source freshness paths collide with bundle payloads: {sorted(collisions)}"
+            )
+        semantic_identities.update(omitted_source_freshness.identities)
+        raw_parallel_paths.update(omitted_source_freshness.raw_parallel_paths)
+        monolingual_paths.update(omitted_source_freshness.monolingual_paths)
     expected_contract = _training_contract_payload(
         config_path,
         config_sha256,
         config,
-        raw_parallel_data_included=bool(raw_parallel_paths),
+        raw_parallel_data_included=bool(payload_raw_parallel_paths),
     )
     if dict(contract_values) != expected_contract:
         raise BundleError("package training contract disagrees with its selected config or payload")
     _validate_config_artifact_semantics(
         config,
         payload_paths=payload_paths,
-        identities=identities,
+        identities=semantic_identities,
         read_payload=read_payload,
         raw_parallel_paths=raw_parallel_paths,
         monolingual_paths=monolingual_paths,
@@ -2042,26 +2137,19 @@ def _collect_sources(
         )
 
     data_root = root.joinpath(*raw_root_relative.parts)
-    if include_raw_parallel_data and _tree_root_is_directory(root, data_root, "data corpus"):
-        for source_path in sorted(data_root.glob("*.jsonl"), key=lambda path: path.name):
-            if not source_path.name.endswith(".jsonl"):
-                continue
-            relative_path = _validated_relative_path(source_path.relative_to(root).as_posix())
-            add(
-                SourceEntry(
-                    relative_path=relative_path,
-                    source_path=source_path,
-                    origin="data-jsonl",
-                    mode="100644",
-                )
-            )
+    if include_raw_parallel_data:
+        for entry in _collect_configured_parallel_sources(root, raw_root_relative):
+            add(entry)
 
     evaluation_root = data_root / "evaluation_only"
     for entry in _collect_tree(root, evaluation_root, "evaluation-only"):
         add(entry)
 
     if include_monolingual_corpus:
-        selection = _load_monolingual_selection(root, config_selection.config_path)
+        selection = _load_monolingual_selection(
+            root,
+            config_selection.config_path.as_posix(),
+        )
         if selection.config_path not in selected:
             raise BundleError(
                 "the config used to select monolingual corpora is not a tracked bundle file: "
@@ -2221,6 +2309,46 @@ def _source_metadata_identity(metadata: os.stat_result) -> tuple[int, ...]:
         int(metadata.st_ino),
         int(getattr(metadata, "st_file_attributes", 0)),
     )
+
+
+def _hash_omitted_sources(
+    root: Path,
+    entries: Iterable[SourceEntry],
+) -> tuple[dict[str, tuple[int, str]], tuple[tuple[SourceEntry, tuple[int, ...]], ...]]:
+    """Hash omitted preparation inputs and prove each hash came from stable bytes."""
+
+    identities: dict[str, tuple[int, str]] = {}
+    snapshots: list[tuple[SourceEntry, tuple[int, ...]]] = []
+    for entry in entries:
+        key = entry.relative_path.as_posix()
+        if key in identities:
+            raise BundleError(f"duplicate omitted preparation source: {key}")
+        before = _assert_regular_source(root, entry.source_path, entry.relative_path)
+        identity = _source_metadata_identity(before)
+        identities[key] = _hash_file(entry.source_path)
+        after = _assert_regular_source(root, entry.source_path, entry.relative_path)
+        if _source_metadata_identity(after) != identity:
+            raise BundleError(f"omitted preparation source changed while hashing: {key}")
+        snapshots.append((entry, identity))
+    return identities, tuple(snapshots)
+
+
+def _assert_omitted_sources_unchanged(freshness: OmittedSourceFreshness | None) -> None:
+    """Reject a bundle if an omitted source changed after freshness validation."""
+
+    if freshness is None:
+        return
+    for entry, expected in freshness.metadata:
+        current = _assert_regular_source(
+            _source_root(entry),
+            entry.source_path,
+            entry.relative_path,
+        )
+        if _source_metadata_identity(current) != expected:
+            raise BundleError(
+                "omitted preparation source changed after bundle preflight: "
+                f"{entry.relative_path.as_posix()}"
+            )
 
 
 def _write_source(
@@ -3014,6 +3142,12 @@ def build_bundle(
     )
     if not sources:
         raise BundleError("the bundle source allowlist selected no files")
+    omitted_source_freshness = _collect_omitted_source_freshness(
+        root,
+        config_selection,
+        parallel=prepared_only and include_dataset,
+        monolingual=include_foundation_dataset and not include_monolingual_corpus,
+    )
     training_contract, identities, origins, read_payload = _training_contract_from_sources(
         sources,
         config_selection.config_path,
@@ -3025,6 +3159,7 @@ def build_bundle(
         identities=identities,
         origins=origins,
         read_payload=read_payload,
+        omitted_source_freshness=omitted_source_freshness,
     )
     if any(source.source_path.resolve() == output for source in sources):
         raise BundleError("bundle output may not overwrite a selected source file")
@@ -3061,6 +3196,7 @@ def build_bundle(
                 "temporary ZIP exceeded the conservative disk-space estimate; "
                 "refusing to publish it"
             )
+        _assert_omitted_sources_unchanged(omitted_source_freshness)
         _ensure_clean_tracked_tree(root)
         if _git_identity(root) != (commit, tree):
             raise BundleError("Git HEAD changed while the bundle was being built")
