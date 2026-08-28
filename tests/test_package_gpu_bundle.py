@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -270,6 +271,78 @@ def _file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _tokenizer_language_contract(root: Path) -> tuple[list[str], list[str], list[str]]:
+    from sion_translate.config import load_config
+
+    config = load_config(root / "sion_translate.yaml")
+    translation_languages = list(
+        dict.fromkeys(
+            language for pair in config.data.configured_language_pairs() for language in pair
+        )
+    )
+    denoise_languages = list(
+        dict.fromkeys([*translation_languages, *config.foundation_languages()])
+    )
+    reasoning_languages = list(config.foundation_languages())
+    return translation_languages, denoise_languages, reasoning_languages
+
+
+def _sentencepiece_artifacts(
+    *,
+    translation_languages: list[str],
+    denoise_languages: list[str],
+    reasoning_languages: list[str],
+    variant: str = "x",
+) -> tuple[bytes, str]:
+    """Build a tiny valid model without invoking the SentencePiece trainer."""
+
+    from sentencepiece import sentencepiece_model_pb2 as sentencepiece_pb2
+    from sion_translate.tokenizer import SLOT_SYMBOLS, control_symbols
+
+    model = sentencepiece_pb2.ModelProto()
+    model.trainer_spec.model_type = sentencepiece_pb2.TrainerSpec.UNIGRAM
+    model.trainer_spec.unk_id = 1
+    model.trainer_spec.bos_id = 2
+    model.trainer_spec.eos_id = 3
+    model.trainer_spec.pad_id = 0
+    model.trainer_spec.split_digits = True
+    model.normalizer_spec.name = "identity"
+    model.normalizer_spec.add_dummy_prefix = False
+    model.normalizer_spec.remove_extra_whitespaces = False
+    model.normalizer_spec.escape_whitespaces = False
+    controls = (
+        control_symbols(
+            translation_languages,
+            denoise_languages=denoise_languages,
+            reasoning_languages=reasoning_languages,
+        )
+        + SLOT_SYMBOLS
+    )
+    pieces = [
+        ("<pad>", 0.0, sentencepiece_pb2.ModelProto.SentencePiece.CONTROL),
+        ("<unk>", 0.0, sentencepiece_pb2.ModelProto.SentencePiece.UNKNOWN),
+        ("<s>", 0.0, sentencepiece_pb2.ModelProto.SentencePiece.CONTROL),
+        ("</s>", 0.0, sentencepiece_pb2.ModelProto.SentencePiece.CONTROL),
+        *(
+            (piece, -1.0, sentencepiece_pb2.ModelProto.SentencePiece.USER_DEFINED)
+            for piece in controls
+        ),
+        *(
+            (digit, -1.0, sentencepiece_pb2.ModelProto.SentencePiece.NORMAL)
+            for digit in "0123456789"
+        ),
+        (variant, -1.0, sentencepiece_pb2.ModelProto.SentencePiece.NORMAL),
+    ]
+    model.trainer_spec.vocab_size = len(pieces)
+    for piece, score, piece_type in pieces:
+        record = model.pieces.add()
+        record.piece = piece
+        record.score = score
+        record.type = piece_type
+    vocab = "".join(f"{piece}\t{score:g}\n" for piece, score, _piece_type in pieces)
+    return model.SerializeToString(), vocab
+
+
 def _rewrite_tokenizer_metadata(
     root: Path,
     *,
@@ -288,6 +361,9 @@ def _rewrite_tokenizer_metadata(
     model = tokenizer / "sion.model"
     vocab = tokenizer / "sion.vocab"
     features = tokenizer / "token_features.npz"
+    import sentencepiece as spm
+
+    processor = spm.SentencePieceProcessor(model_proto=model.read_bytes())
     raw_source = root / "data" / "corpus.jsonl"
     contract_sources: list[dict[str, object]] = [
         {
@@ -307,11 +383,15 @@ def _rewrite_tokenizer_metadata(
                 "language": source["language"],
             }
         )
-    reasoning_languages = list(
-        dict.fromkeys(
-            str(source["language"])
-            for source in monolingual_sources or []
-            if source["task"] == "reasoning"
+    reasoning_languages = (
+        list(config.foundation_languages())
+        if monolingual_sources is None
+        else list(
+            dict.fromkeys(
+                str(source["language"])
+                for source in monolingual_sources
+                if source["task"] == "reasoning"
+            )
         )
     )
     training_contract = {
@@ -342,6 +422,7 @@ def _rewrite_tokenizer_metadata(
                 ],
                 "denoise_languages": denoise_languages,
                 "reasoning_languages": reasoning_languages,
+                "vocab_size": processor.vocab_size(),
                 "model_file": model.name,
                 "model_sha256": _file_sha256(model),
                 "vocab_file": vocab.name,
@@ -359,15 +440,37 @@ def _rewrite_tokenizer_metadata(
     )
 
 
-def _with_tokenizer(root: Path, *, complete: bool = True) -> None:
+def _write_test_tokenizer_artifacts(
+    root: Path,
+    *,
+    reasoning_languages: list[str],
+) -> None:
+    from sion_translate.tokenizer import write_token_features
+
     tokenizer = root / "artifacts" / "tokenizer"
     tokenizer.mkdir(parents=True, exist_ok=True)
-    (tokenizer / "sion.model").write_bytes(b"model")
+    translation_languages, denoise_languages, _configured_reasoning = _tokenizer_language_contract(
+        root
+    )
+    model_bytes, vocab_text = _sentencepiece_artifacts(
+        translation_languages=translation_languages,
+        denoise_languages=denoise_languages,
+        reasoning_languages=reasoning_languages,
+    )
+    (tokenizer / "sion.model").write_bytes(model_bytes)
+    (tokenizer / "sion.vocab").write_text(vocab_text, encoding="utf-8")
+    write_token_features(tokenizer / "sion.model", tokenizer / "token_features.npz")
+
+
+def _with_tokenizer(root: Path, *, complete: bool = True) -> None:
+    _translation, _denoise, reasoning_languages = _tokenizer_language_contract(root)
+    _write_test_tokenizer_artifacts(root, reasoning_languages=reasoning_languages)
+    tokenizer = root / "artifacts" / "tokenizer"
     if complete:
-        (tokenizer / "sion.vocab").write_text("piece\t0\n", encoding="utf-8")
-        (tokenizer / "token_features.npz").write_bytes(b"features")
         _rewrite_tokenizer_metadata(root)
     else:
+        (tokenizer / "sion.vocab").unlink()
+        (tokenizer / "token_features.npz").unlink()
         (tokenizer / "tokenizer_metadata.json").write_text(
             '{"version":2,"split_digits":true}\n',
             encoding="utf-8",
@@ -413,11 +516,12 @@ def _with_dataset(
     include_completion: bool = True,
 ) -> None:
     from sion_translate.config import load_config
-    from sion_translate.data.prepare import prepare_preprocessing_options
+    from sion_translate.data.prepare import INDEX_DTYPE, prepare_preprocessing_options
     from sion_translate.fingerprint import PREPROCESSING_SCHEMA
 
     config = load_config(root / "sion_translate.yaml")
     language_pairs = [list(pair) for pair in config.data.configured_language_pairs()]
+    languages = list(dict.fromkeys(language for pair in language_pairs for language in pair))
     translation_directions = [
         list(direction) for direction in config.data.configured_translation_directions()
     ]
@@ -435,7 +539,18 @@ def _with_dataset(
     dataset.mkdir(parents=True)
     for split in ("train", "validation", "test"):
         (dataset / split).mkdir()
-    (dataset / "train" / "train.00000.idx.npy").write_bytes(b"ids")
+    index = np.asarray(
+        [(0, 2, 0, 2, 0, 0, 0, 1, 0, 100, 0, 0)],
+        dtype=INDEX_DTYPE,
+    )
+    for split in ("train", "validation"):
+        np.save(dataset / split / "00000.idx.npy", index, allow_pickle=False)
+        (dataset / split / "00000.src.bin").write_bytes(
+            np.asarray([4, 5], dtype=np.uint32).tobytes()
+        )
+        (dataset / split / "00000.tgt.bin").write_bytes(
+            np.asarray([6, 7], dtype=np.uint32).tobytes()
+        )
     digest = (
         tokenizer_sha256
         or hashlib.sha256(
@@ -466,9 +581,12 @@ def _with_dataset(
                     "format": "sion-indexed-parallel-v6",
                     "language_pairs": language_pairs,
                     "translation_directions": translation_directions,
+                    "languages": languages,
+                    "language_to_id": {language: index for index, language in enumerate(languages)},
                     "source_only_languages": source_only_languages,
                     "preprocessing_schema": PREPROCESSING_SCHEMA,
                     "preprocessing_options": preprocessing_options,
+                    "sources": [{"id": 0, "synthetic_file": False}],
                     "fingerprint": {
                         **fingerprint,
                         "tokenizer_sha256": manifest_tokenizer_sha256 or digest,
@@ -495,6 +613,27 @@ def _with_dataset(
             + "\n",
             encoding="utf-8",
         )
+
+
+def _refresh_dataset_inventory(root: Path) -> None:
+    dataset = root / "artifacts" / "dataset"
+    manifest_path = dataset / "manifest.json"
+    raw_fingerprint = dataset / "raw_fingerprint.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["artifact_inventory"] = _artifact_inventory(dataset)
+    manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+    (dataset / ".sion-prepare-complete.json").write_text(
+        json.dumps(
+            {
+                "schema": "sion-prepare-completion-v1",
+                "manifest_sha256": _file_sha256(manifest_path),
+                "raw_fingerprint_sha256": _file_sha256(raw_fingerprint),
+                "artifact_inventory_sha256": _canonical_json_sha256(manifest["artifact_inventory"]),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 def _with_foundation_dataset(
@@ -535,7 +674,6 @@ def _with_foundation_dataset(
         (dataset / split / "00000.tgt.bin").write_bytes(
             np.asarray([6, 7, 8, 9], dtype=np.uint32).tobytes()
         )
-    digest = tokenizer_sha256 or _file_sha256(root / "artifacts" / "tokenizer" / "sion.model")
     sources: list[dict[str, object]] = [
         {
             "id": 0,
@@ -558,7 +696,19 @@ def _with_foundation_dataset(
             "task": "reasoning",
         },
     ]
+    _write_test_tokenizer_artifacts(root, reasoning_languages=[source_language])
+    import sentencepiece as spm
+
+    processor = spm.SentencePieceProcessor(
+        model_file=str(root / "artifacts" / "tokenizer" / "sion.model")
+    )
+    reasoning_id = processor.piece_to_id(f"<reason_{source_language}>")
+    for split in ("train", "validation"):
+        (dataset / split / "00000.src.bin").write_bytes(
+            np.asarray([1, 2, 3, reasoning_id, 5], dtype=np.uint32).tobytes()
+        )
     _rewrite_tokenizer_metadata(root, monolingual_sources=sources)
+    digest = tokenizer_sha256 or _file_sha256(root / "artifacts" / "tokenizer" / "sion.model")
     source_identities = [
         {
             "language": source["language"],
@@ -620,7 +770,28 @@ def _with_foundation_dataset(
             "sample_share": 0.05,
             "trace_symbols": ["<think>", "</think>", "<answer>", "</answer>"],
         },
-        "stats": {"train_records": 2, "validation_records": 2},
+        "stats": {
+            "train_records": 2,
+            "validation_records": 2,
+            "languages": {
+                source_language: {
+                    "lines_read": 4,
+                    "accepted": 4,
+                    "too_short": 0,
+                    "too_long": 0,
+                    "segmented_documents": 0,
+                    "segments": 0,
+                    "duplicate": 0,
+                    "empty_after_tokenization": 0,
+                    "reasoning_records": 2,
+                    "reasoning_rejected": 0,
+                    "reasoning_prompt_truncated": 0,
+                    "reasoning_think_truncated": 0,
+                    "reasoning_answer_truncated": 0,
+                    "read_rejects": {},
+                }
+            },
+        },
         "artifact_inventory": _artifact_inventory(dataset),
     }
     if manifest_updates:
@@ -722,11 +893,11 @@ def test_the_dataset_needs_the_tokenizer_that_produced_its_ids(tmp_path: Path) -
     package_gpu_bundle.build_bundle(root, both, include_tokenizer=True, include_dataset=True)
     with zipfile.ZipFile(both) as archive:
         names = set(archive.namelist())
-    assert "sion_translate/artifacts/dataset/train/train.00000.idx.npy" in names
+    assert "sion_translate/artifacts/dataset/train/00000.idx.npy" in names
     assert "sion_translate/artifacts/tokenizer/sion.model" in names
 
     origins = {entry["path"]: entry["origin"] for entry in _manifest(both)["files"]}
-    assert origins["artifacts/dataset/train/train.00000.idx.npy"] == "dataset"
+    assert origins["artifacts/dataset/train/00000.idx.npy"] == "dataset"
     archive_result = package_gpu_bundle.verify_archive(both)
     extracted = tmp_path / "both-extracted"
     with zipfile.ZipFile(both) as archive:
@@ -864,6 +1035,87 @@ def test_tokenizer_training_contract_preserves_portable_source_order(tmp_path: P
         )
 
 
+def test_tokenizer_metadata_vocab_size_must_match_the_actual_model(tmp_path: Path) -> None:
+    root = _repository(tmp_path)
+    _with_tokenizer(root, complete=True)
+    metadata_path = root / "artifacts" / "tokenizer" / "tokenizer_metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["vocab_size"] += 1
+    metadata_path.write_text(json.dumps(metadata) + "\n", encoding="utf-8")
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="actual sion.model vocabulary"):
+        package_gpu_bundle.build_bundle(
+            root,
+            tmp_path / "wrong-tokenizer-vocab-size.zip",
+            include_tokenizer=True,
+        )
+
+
+def test_tokenizer_model_must_satisfy_the_runtime_control_contract(tmp_path: Path) -> None:
+    from sentencepiece import sentencepiece_model_pb2 as sentencepiece_pb2
+
+    root = _repository(tmp_path)
+    _with_tokenizer(root, complete=True)
+    model_path = root / "artifacts" / "tokenizer" / "sion.model"
+    model = sentencepiece_pb2.ModelProto()
+    model.ParseFromString(model_path.read_bytes())
+    mask_piece = next(piece for piece in model.pieces if piece.piece == "<mask>")
+    mask_piece.piece = "<missing_mask>"
+    model_path.write_bytes(model.SerializeToString())
+    _rewrite_tokenizer_metadata(root)
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="SionTokenizer runtime contract"):
+        package_gpu_bundle.build_bundle(
+            root,
+            tmp_path / "missing-runtime-special-id.zip",
+            include_tokenizer=True,
+        )
+
+
+def test_tokenizer_feature_arrays_must_match_the_actual_vocabulary(tmp_path: Path) -> None:
+    import sentencepiece as spm
+
+    root = _repository(tmp_path)
+    _with_tokenizer(root, complete=True)
+    tokenizer_root = root / "artifacts" / "tokenizer"
+    vocab_size = spm.SentencePieceProcessor(
+        model_file=str(tokenizer_root / "sion.model")
+    ).vocab_size()
+    wrong = np.zeros(vocab_size - 1, dtype=np.uint8)
+    np.savez_compressed(
+        tokenizer_root / "token_features.npz",
+        script=wrong,
+        onset=wrong,
+        vowel=wrong,
+        coda=wrong,
+    )
+    _rewrite_tokenizer_metadata(root)
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="vector of length"):
+        package_gpu_bundle.build_bundle(
+            root,
+            tmp_path / "wrong-token-features.zip",
+            include_tokenizer=True,
+        )
+
+
+def test_tokenizer_vocab_must_preserve_model_piece_order(tmp_path: Path) -> None:
+    root = _repository(tmp_path)
+    _with_tokenizer(root, complete=True)
+    vocab_path = root / "artifacts" / "tokenizer" / "sion.vocab"
+    lines = vocab_path.read_text(encoding="utf-8").splitlines()
+    lines[4], lines[5] = lines[5], lines[4]
+    vocab_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _rewrite_tokenizer_metadata(root)
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="ordered sion.model vocabulary"):
+        package_gpu_bundle.build_bundle(
+            root,
+            tmp_path / "reordered-vocabulary.zip",
+            include_tokenizer=True,
+        )
+
+
 def test_tokenizer_bundle_requires_digit_splitting(tmp_path: Path) -> None:
     root = _repository(tmp_path)
     _with_tokenizer(root, complete=True)
@@ -902,12 +1154,99 @@ def test_dataset_payload_must_match_the_manifest_inventory(tmp_path: Path) -> No
     root = _repository(tmp_path)
     _with_tokenizer(root)
     _with_dataset(root)
-    (root / "artifacts" / "dataset" / "train" / "train.00000.idx.npy").write_bytes(b"changed ids")
+    (root / "artifacts" / "dataset" / "train" / "00000.idx.npy").write_bytes(b"changed ids")
 
     with pytest.raises(package_gpu_bundle.BundleError, match="artifact identity mismatch"):
         package_gpu_bundle.build_bundle(
             root,
             tmp_path / "changed-dataset.zip",
+            include_tokenizer=True,
+            include_dataset=True,
+        )
+
+
+def test_translation_dataset_rejects_a_self_consistent_unreadable_index(tmp_path: Path) -> None:
+    root = _repository(tmp_path)
+    _with_tokenizer(root)
+    _with_dataset(root)
+    index_path = root / "artifacts" / "dataset" / "train" / "00000.idx.npy"
+    index_path.write_bytes(b"ids")
+    _refresh_dataset_inventory(root)
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="payload is truncated"):
+        package_gpu_bundle.build_bundle(
+            root,
+            tmp_path / "unreadable-translation-index.zip",
+            include_tokenizer=True,
+            include_dataset=True,
+        )
+
+
+@pytest.mark.parametrize("payload_name", ["00000.src.bin", "00000.tgt.bin"])
+def test_translation_dataset_rejects_tokens_outside_the_actual_vocabulary(
+    tmp_path: Path,
+    payload_name: str,
+) -> None:
+    import sentencepiece as spm
+
+    root = _repository(tmp_path)
+    _with_tokenizer(root)
+    _with_dataset(root)
+    tokenizer_model = root / "artifacts" / "tokenizer" / "sion.model"
+    vocab_size = spm.SentencePieceProcessor(model_file=str(tokenizer_model)).vocab_size()
+    payload = root / "artifacts" / "dataset" / "train" / payload_name
+    tokens = np.frombuffer(payload.read_bytes(), dtype="<u4").copy()
+    tokens[-1] = vocab_size
+    payload.write_bytes(tokens.tobytes())
+    _refresh_dataset_inventory(root)
+
+    with pytest.raises(
+        package_gpu_bundle.BundleError,
+        match=rf"translation token id {vocab_size}.*vocabulary size {vocab_size}",
+    ):
+        package_gpu_bundle.build_bundle(
+            root,
+            tmp_path / f"out-of-range-{payload_name}.zip",
+            include_tokenizer=True,
+            include_dataset=True,
+        )
+
+
+def test_translation_dataset_requires_validation_shards(tmp_path: Path) -> None:
+    root = _repository(tmp_path)
+    _with_tokenizer(root)
+    _with_dataset(root)
+    validation_root = root / "artifacts" / "dataset" / "validation"
+    for path in validation_root.iterdir():
+        path.unlink()
+    _refresh_dataset_inventory(root)
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="no validation shards"):
+        package_gpu_bundle.build_bundle(
+            root,
+            tmp_path / "missing-translation-validation.zip",
+            include_tokenizer=True,
+            include_dataset=True,
+        )
+
+
+def test_translation_dataset_rejects_invalid_record_metadata(tmp_path: Path) -> None:
+    root = _repository(tmp_path)
+    _with_tokenizer(root)
+    _with_dataset(root)
+    train_root = root / "artifacts" / "dataset" / "train"
+    np.save(
+        train_root / "00000.meta.npy",
+        np.asarray([(0, 1)], dtype=package_gpu_bundle.RECORD_METADATA_INDEX_DTYPE),
+        allow_pickle=False,
+    )
+    (train_root / "00000.meta.bin").write_bytes(b"{")
+    _refresh_dataset_inventory(root)
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="metadata row is invalid"):
+        package_gpu_bundle.build_bundle(
+            root,
+            tmp_path / "invalid-translation-metadata.zip",
             include_tokenizer=True,
             include_dataset=True,
         )
@@ -1293,6 +1632,167 @@ def test_foundation_dataset_rejects_self_consistent_invalid_target_aliases(
         )
 
 
+def test_foundation_index_header_limit_matches_the_runtime_numpy_loader() -> None:
+    header_size = package_gpu_bundle.MAX_NPY_HEADER_SIZE + 1
+    payload = b"\x93NUMPY\x02\x00" + header_size.to_bytes(4, "little") + b" " * header_size
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="header size is invalid"):
+        package_gpu_bundle._read_npy_header(io.BytesIO(payload), "oversized.idx.npy")
+
+
+def test_foundation_dataset_rejects_reasoning_sequences_above_runtime_limits(
+    tmp_path: Path,
+) -> None:
+    root = _repository(tmp_path)
+    _with_tokenizer(root)
+    _with_foundation_dataset(root)
+    dataset = root / "artifacts" / "foundation_dataset"
+    manifest_path = dataset / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    index_path = dataset / "train" / "00000.idx.npy"
+    index = np.load(index_path, allow_pickle=False)
+    index["tgt_length"][1] = manifest["preprocessing_options"]["max_target_tokens"] + 1
+    np.save(index_path, index, allow_pickle=False)
+    manifest["artifact_inventory"] = _artifact_inventory(dataset)
+    manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="preprocessing limit"):
+        package_gpu_bundle.build_bundle(
+            root,
+            tmp_path / "overlong-foundation-reasoning.zip",
+            include_tokenizer=True,
+            include_foundation_dataset=True,
+        )
+
+
+def test_foundation_dataset_authenticates_each_reasoning_task_token(tmp_path: Path) -> None:
+    root = _repository(tmp_path)
+    _with_tokenizer(root)
+    _with_foundation_dataset(root)
+    dataset = root / "artifacts" / "foundation_dataset"
+    payload = dataset / "train" / "00000.src.bin"
+    tokens = np.frombuffer(payload.read_bytes(), dtype="<u4").copy()
+    tokens[3] = 1
+    payload.write_bytes(tokens.tobytes())
+    manifest_path = dataset / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["artifact_inventory"] = _artifact_inventory(dataset)
+    manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="reasoning task token is invalid"):
+        package_gpu_bundle.build_bundle(
+            root,
+            tmp_path / "wrong-foundation-reasoning-task.zip",
+            include_tokenizer=True,
+            include_foundation_dataset=True,
+        )
+
+
+def test_foundation_dataset_requires_complete_runtime_statistics(tmp_path: Path) -> None:
+    root = _repository(tmp_path)
+    _with_tokenizer(root)
+    _with_foundation_dataset(root)
+    manifest_path = root / "artifacts" / "foundation_dataset" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    del manifest["stats"]["languages"]
+    manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="statistics fields"):
+        package_gpu_bundle.build_bundle(
+            root,
+            tmp_path / "incomplete-foundation-statistics.zip",
+            include_tokenizer=True,
+            include_foundation_dataset=True,
+        )
+
+
+@pytest.mark.parametrize("payload_name", ["00000.src.bin", "00000.tgt.bin"])
+def test_foundation_dataset_rejects_token_ids_outside_the_actual_vocabulary(
+    tmp_path: Path,
+    payload_name: str,
+) -> None:
+    root = _repository(tmp_path)
+    _with_tokenizer(root)
+    _with_foundation_dataset(root)
+    dataset = root / "artifacts" / "foundation_dataset"
+    payload = dataset / "train" / payload_name
+    tokens = np.frombuffer(payload.read_bytes(), dtype="<u4").copy()
+    import sentencepiece as spm
+
+    vocab_size = spm.SentencePieceProcessor(
+        model_file=str(root / "artifacts" / "tokenizer" / "sion.model")
+    ).vocab_size()
+    tokens[-1] = vocab_size
+    payload.write_bytes(tokens.tobytes())
+    manifest_path = dataset / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["artifact_inventory"] = _artifact_inventory(dataset)
+    manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+
+    with pytest.raises(
+        package_gpu_bundle.BundleError,
+        match=rf"token id {vocab_size}.*vocabulary size {vocab_size}",
+    ):
+        package_gpu_bundle.build_bundle(
+            root,
+            tmp_path / f"invalid-{payload_name}.zip",
+            include_tokenizer=True,
+            include_foundation_dataset=True,
+        )
+
+
+def test_foundation_binary_validation_uses_streams_instead_of_metadata_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _repository(tmp_path)
+    _with_tokenizer(root)
+    _with_foundation_dataset(root)
+    original_read_limited = package_gpu_bundle._read_limited
+
+    def reject_binary_metadata_read(source, declared_size: int, name: str) -> bytes:
+        if name.endswith((".idx.npy", ".src.bin", ".tgt.bin")):
+            raise AssertionError(f"large binary artifact was read as metadata: {name}")
+        return original_read_limited(source, declared_size, name)
+
+    monkeypatch.setattr(package_gpu_bundle, "_read_limited", reject_binary_metadata_read)
+    archive = tmp_path / "streamed-foundation.zip"
+    package_gpu_bundle.build_bundle(
+        root,
+        archive,
+        include_tokenizer=True,
+        include_foundation_dataset=True,
+    )
+    package_gpu_bundle.verify_archive(archive)
+
+
+def test_foundation_streaming_validation_carries_offsets_across_chunks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _repository(tmp_path)
+    _with_tokenizer(root)
+    _with_foundation_dataset(root)
+    dataset = root / "artifacts" / "foundation_dataset"
+    index_path = dataset / "train" / "00000.idx.npy"
+    index = np.load(index_path, allow_pickle=False)
+    index["src_offset"][1] += 1
+    np.save(index_path, index, allow_pickle=False)
+    manifest_path = dataset / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["artifact_inventory"] = _artifact_inventory(dataset)
+    manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+    monkeypatch.setattr(package_gpu_bundle, "FOUNDATION_INDEX_CHUNK_RECORDS", 1)
+
+    with pytest.raises(package_gpu_bundle.BundleError, match="offsets are not contiguous"):
+        package_gpu_bundle.build_bundle(
+            root,
+            tmp_path / "cross-chunk-offset.zip",
+            include_tokenizer=True,
+            include_foundation_dataset=True,
+        )
+
+
 @pytest.mark.parametrize(
     ("section", "field", "replacement", "message"),
     [
@@ -1340,7 +1840,20 @@ def test_archive_and_tree_verification_recheck_dataset_tokenizer_semantics(
     # Emulate a tokenizer replacement after source selection. Rewriting the
     # tokenizer sidecar makes that artifact internally valid, while the dataset
     # remains bound to the previous model hash.
-    (root / "artifacts" / "tokenizer" / "sion.model").write_bytes(b"replacement model")
+    translation_languages, denoise_languages, reasoning_languages = _tokenizer_language_contract(
+        root
+    )
+    replacement_model, replacement_vocab = _sentencepiece_artifacts(
+        translation_languages=translation_languages,
+        denoise_languages=denoise_languages,
+        reasoning_languages=reasoning_languages,
+        variant="y",
+    )
+    (root / "artifacts" / "tokenizer" / "sion.model").write_bytes(replacement_model)
+    (root / "artifacts" / "tokenizer" / "sion.vocab").write_text(
+        replacement_vocab,
+        encoding="utf-8",
+    )
     _rewrite_tokenizer_metadata(root)
     archive = tmp_path / "semantic-mismatch.zip"
     commit, tree = package_gpu_bundle._git_identity(root)

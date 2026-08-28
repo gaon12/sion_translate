@@ -53,7 +53,9 @@ tokenization and preparation.
 from __future__ import annotations
 
 import argparse
+import ast
 from collections.abc import Mapping
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 import hashlib
 import io
@@ -67,12 +69,11 @@ import stat
 import subprocess
 import sys
 import tempfile
-from typing import Callable, IO, Iterable, cast
+from typing import Callable, Generator, IO, Iterable, cast
 import unicodedata
 import zipfile
 
 import numpy as np
-from numpy.typing import NDArray
 import yaml
 
 
@@ -112,6 +113,13 @@ FOUNDATION_INDEX_DTYPE = np.dtype(
         ("target_shared", "u1"),
     ]
 )
+TRANSLATION_INDEX_DTYPE = np.dtype(FOUNDATION_INDEX_DTYPE.descr[:-1])
+RECORD_METADATA_INDEX_DTYPE = np.dtype(
+    [
+        ("offset", "<u8"),
+        ("length", "<u4"),
+    ]
+)
 PREPARE_COMPLETION_SCHEMA = "sion-prepare-completion-v1"
 TOKENIZER_ROOT_PATH = "artifacts/tokenizer"
 TOKENIZER_MODEL_PATH = "artifacts/tokenizer/sion.model"
@@ -127,8 +135,34 @@ FOUNDATION_DATASET_MANIFEST_PATH = "artifacts/foundation_dataset/manifest.json"
 COPY_BUFFER_SIZE = 8 * 1024 * 1024
 ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 MAX_METADATA_SIZE = 64 * 1024 * 1024
+# NumPy's runtime loader rejects larger headers by default. Accepting a header
+# here that training later rejects would turn bundle verification into a false
+# promise, so this limit intentionally matches numpy.load's public default.
+MAX_NPY_HEADER_SIZE = 10_000
+FOUNDATION_INDEX_CHUNK_RECORDS = 65_536
 MIN_FREE_DISK_RESERVE = 512 * 1024 * 1024
 FREE_DISK_RESERVE_DIVISOR = 50
+TOKEN_FEATURE_CLASS_COUNTS = {
+    "script": 9,
+    "onset": 20,
+    "vowel": 22,
+    "coda": 29,
+}
+FOUNDATION_LANGUAGE_STAT_INTEGER_FIELDS = (
+    "lines_read",
+    "accepted",
+    "too_short",
+    "too_long",
+    "segmented_documents",
+    "segments",
+    "duplicate",
+    "empty_after_tokenization",
+    "reasoning_records",
+    "reasoning_rejected",
+    "reasoning_prompt_truncated",
+    "reasoning_think_truncated",
+    "reasoning_answer_truncated",
+)
 
 EXCLUDED_TOP_LEVEL = {
     ".git",
@@ -249,6 +283,35 @@ class FileRecord:
 
 
 @dataclass(frozen=True)
+class FoundationShardSummary:
+    """Streaming validation totals for one foundation index shard."""
+
+    records: int
+    source_records: tuple[int, ...]
+    source_tokens: int
+    target_tokens: int
+
+
+@dataclass(frozen=True)
+class TranslationShardSummary:
+    """Streaming validation totals for one translation index shard."""
+
+    records: int
+    source_records: tuple[int, ...]
+    source_tokens: int
+    target_tokens: int
+
+
+@dataclass(frozen=True)
+class ValidatedTokenizer:
+    """Tokenizer identity used to authenticate every prepared token payload."""
+
+    model_sha256: str
+    vocab_size: int
+    reasoning_tag_ids: tuple[tuple[str, int], ...]
+
+
+@dataclass(frozen=True)
 class VerificationResult:
     """Summary returned by archive and extracted-tree verification."""
 
@@ -268,6 +331,9 @@ class BuildResult:
     total_bytes: int
     git_commit: str
     git_tree: str
+
+
+PayloadOpener = Callable[[str], AbstractContextManager[IO[bytes]]]
 
 
 @dataclass(frozen=True)
@@ -819,11 +885,181 @@ def _canonical_json_bytes(value: object) -> bytes:
     ).encode("utf-8")
 
 
+def _metadata_language_list(
+    metadata: Mapping[str, object],
+    field: str,
+    *,
+    require_nonempty: bool,
+) -> tuple[str, ...]:
+    raw_languages = metadata.get(field)
+    if not isinstance(raw_languages, list) or (require_nonempty and not raw_languages):
+        raise BundleError(f"tokenizer metadata {field} must be a language list")
+    languages = tuple(
+        _canonical_language(value, field=f"tokenizer metadata {field}[{index}]")
+        for index, value in enumerate(cast(list[object], raw_languages))
+    )
+    if list(languages) != raw_languages or len(languages) != len(set(languages)):
+        raise BundleError(f"tokenizer metadata {field} must be canonical and unique")
+    return languages
+
+
+def _metadata_translation_languages(metadata: Mapping[str, object]) -> tuple[str, ...]:
+    raw_pairs = metadata.get("language_pairs")
+    if not isinstance(raw_pairs, list) or not raw_pairs:
+        raise BundleError("tokenizer metadata language_pairs must be a non-empty list")
+    languages: list[str] = []
+    for pair_index, raw_pair in enumerate(cast(list[object], raw_pairs)):
+        if not isinstance(raw_pair, list):
+            raise BundleError(
+                "tokenizer metadata language_pairs entries must contain two languages"
+            )
+        pair_values = cast(list[object], raw_pair)
+        if len(pair_values) != 2:
+            raise BundleError(
+                "tokenizer metadata language_pairs entries must contain two languages"
+            )
+        for side_index, value in enumerate(pair_values):
+            language = _canonical_language(
+                value,
+                field=f"tokenizer metadata language_pairs[{pair_index}][{side_index}]",
+            )
+            if language != value:
+                raise BundleError("tokenizer metadata language_pairs must use canonical languages")
+            if language not in languages:
+                languages.append(language)
+    if len(languages) < 2:
+        raise BundleError("tokenizer metadata must describe at least two translation languages")
+    return tuple(sorted(languages))
+
+
+def _validate_tokenizer_vocabulary(
+    content: bytes,
+    *,
+    pieces: tuple[str, ...],
+) -> None:
+    try:
+        lines = content.decode("utf-8").splitlines()
+    except UnicodeDecodeError as error:
+        raise BundleError("sion.vocab is not valid UTF-8") from error
+    if len(lines) != len(pieces):
+        raise BundleError("sion.vocab row count does not match the actual sion.model vocabulary")
+    for token_id, (line, expected_piece) in enumerate(zip(lines, pieces, strict=True)):
+        piece, separator, raw_score = line.rpartition("\t")
+        try:
+            score = float(raw_score)
+        except ValueError as error:
+            raise BundleError(f"sion.vocab row {token_id} has an invalid score") from error
+        if not separator or piece != expected_piece or not math.isfinite(score):
+            raise BundleError(
+                f"sion.vocab row {token_id} does not match the ordered sion.model vocabulary"
+            )
+
+
+def _validate_token_features(content: bytes, *, vocab_size: int) -> None:
+    expected_members = {f"{name}.npy" for name in TOKEN_FEATURE_CLASS_COUNTS}
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            members = archive.infolist()
+            member_names = [member.filename for member in members]
+            if set(member_names) != expected_members or len(member_names) != len(expected_members):
+                raise BundleError(
+                    "token_features.npz must contain exactly script, onset, vowel, and coda"
+                )
+            maximum_member_size = vocab_size + MAX_NPY_HEADER_SIZE + 16
+            if any(member.is_dir() or member.file_size > maximum_member_size for member in members):
+                raise BundleError("token_features.npz contains a non-canonical or oversized array")
+    except (OSError, zipfile.BadZipFile) as error:
+        raise BundleError("token_features.npz is not a readable NPZ archive") from error
+
+    try:
+        with np.load(io.BytesIO(content), allow_pickle=False) as loaded:
+            if set(loaded.files) != set(TOKEN_FEATURE_CLASS_COUNTS):
+                raise BundleError(
+                    "token_features.npz must contain exactly script, onset, vowel, and coda"
+                )
+            for name, class_count in TOKEN_FEATURE_CLASS_COUNTS.items():
+                values = np.asarray(loaded[name])
+                if values.shape != (vocab_size,) or values.dtype != np.dtype("u1"):
+                    raise BundleError(
+                        f"token feature {name} must be a uint8 vector of length {vocab_size}"
+                    )
+                if values.size and int(values.max()) >= class_count:
+                    raise BundleError(
+                        f"token feature {name} contains an ID outside [0, {class_count})"
+                    )
+    except BundleError:
+        raise
+    except (EOFError, KeyError, OSError, ValueError, zipfile.BadZipFile) as error:
+        raise BundleError("token_features.npz arrays cannot be loaded safely") from error
+
+
+def _validated_runtime_tokenizer(
+    model_content: bytes,
+    metadata: Mapping[str, object],
+) -> tuple[int, tuple[str, ...], tuple[tuple[str, int], ...]]:
+    source_root = REPOSITORY_ROOT / "src"
+    source_root_text = str(source_root)
+    if source_root_text not in sys.path:
+        sys.path.insert(0, source_root_text)
+    from sion_translate.tokenizer import SionTokenizer
+
+    descriptor, temporary_name = tempfile.mkstemp(prefix="sion-bundle-tokenizer-", suffix=".model")
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as destination:
+            destination.write(model_content)
+        descriptor = -1
+        tokenizer = SionTokenizer(temporary_path)
+        if not tokenizer.splits_digits:
+            raise BundleError("sion.model does not preserve digit splitting at runtime")
+        translation_languages = _metadata_translation_languages(metadata)
+        denoise_languages = _metadata_language_list(
+            metadata,
+            "denoise_languages",
+            require_nonempty=True,
+        )
+        reasoning_languages = _metadata_language_list(
+            metadata,
+            "reasoning_languages",
+            require_nonempty=False,
+        )
+        if tokenizer.languages != translation_languages:
+            raise BundleError(
+                "sion.model translation controls disagree with tokenizer metadata languages"
+            )
+        if tokenizer.denoise_languages != tuple(sorted(denoise_languages)):
+            raise BundleError(
+                "sion.model denoising controls disagree with tokenizer metadata languages"
+            )
+        if tokenizer.reasoning_languages != tuple(sorted(reasoning_languages)):
+            raise BundleError(
+                "sion.model reasoning controls disagree with tokenizer metadata languages"
+            )
+        pieces = tuple(
+            tokenizer.processor.id_to_piece(token_id) for token_id in range(len(tokenizer))
+        )
+        return (
+            len(tokenizer),
+            pieces,
+            tuple(sorted(tokenizer.reasoning_tags.items())),
+        )
+    except BundleError:
+        raise
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        raise BundleError(
+            "sion.model does not satisfy the SionTokenizer runtime contract"
+        ) from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary_path.unlink(missing_ok=True)
+
+
 def _validate_tokenizer_contract(
     payload_paths: set[str],
     identities: Mapping[str, tuple[int, str]],
     read_payload: Callable[[str], bytes],
-) -> str | None:
+) -> ValidatedTokenizer | None:
     tokenizer_prefix = f"{TOKENIZER_ROOT_PATH}/"
     tokenizer_paths = {path for path in payload_paths if path.startswith(tokenizer_prefix)}
     if not tokenizer_paths:
@@ -880,6 +1116,26 @@ def _validate_tokenizer_contract(
                 or recorded_size != size
             ):
                 raise BundleError(f"tokenizer metadata {size_field} does not match {path}")
+    model_content = read_payload(TOKENIZER_MODEL_PATH)
+    actual_vocab_size, pieces, reasoning_tag_ids = _validated_runtime_tokenizer(
+        model_content,
+        metadata,
+    )
+    recorded_vocab_size = metadata.get("vocab_size")
+    if (
+        actual_vocab_size <= 0
+        or isinstance(recorded_vocab_size, bool)
+        or not isinstance(recorded_vocab_size, int)
+        or recorded_vocab_size != actual_vocab_size
+    ):
+        raise BundleError(
+            "tokenizer metadata vocab_size does not match the actual sion.model vocabulary"
+        )
+    _validate_tokenizer_vocabulary(read_payload(TOKENIZER_VOCAB_PATH), pieces=pieces)
+    _validate_token_features(
+        read_payload(TOKENIZER_FEATURES_PATH),
+        vocab_size=actual_vocab_size,
+    )
     raw_training_contract = metadata.get("training_contract")
     if not isinstance(raw_training_contract, Mapping):
         raise BundleError("tokenizer metadata has no authenticated training_contract")
@@ -891,7 +1147,11 @@ def _validate_tokenizer_contract(
     training_contract_sha256 = hashlib.sha256(_canonical_json_bytes(training_contract)).hexdigest()
     if metadata.get("training_contract_sha256") != training_contract_sha256:
         raise BundleError("tokenizer training contract digest does not match its payload")
-    return identities[TOKENIZER_MODEL_PATH][1]
+    return ValidatedTokenizer(
+        model_sha256=identities[TOKENIZER_MODEL_PATH][1],
+        vocab_size=actual_vocab_size,
+        reasoning_tag_ids=reasoning_tag_ids,
+    )
 
 
 def _validated_artifact_inventory(
@@ -1241,19 +1501,762 @@ def _validate_foundation_sampling_contract(
         raise BundleError("foundation objective contradicts its indexed reasoning rows")
 
 
-def _load_foundation_index(content: bytes, path: str) -> NDArray[np.void]:
+def _validate_foundation_stats_contract(
+    manifest: Mapping[str, object],
+    *,
+    languages: tuple[str, ...],
+    source_tasks: tuple[str, ...],
+    source_records: tuple[int, ...],
+    source_language_ids: tuple[int, ...],
+    split_records: Mapping[str, int],
+) -> None:
+    raw_stats = manifest.get("stats")
+    if not isinstance(raw_stats, Mapping):
+        raise BundleError("foundation manifest has no valid stats object")
+    stats = cast(Mapping[object, object], raw_stats)
+    if set(stats) != {"train_records", "validation_records", "languages"}:
+        raise BundleError("foundation statistics fields do not match the runtime contract")
+    for split, field in (("train", "train_records"), ("validation", "validation_records")):
+        value = stats.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value != split_records[split]:
+            raise BundleError(f"foundation {field} disagrees with indexed rows")
+
+    raw_language_stats = stats.get("languages")
+    if not isinstance(raw_language_stats, Mapping):
+        raise BundleError("foundation language statistics must be an object")
+    language_stats = cast(Mapping[object, object], raw_language_stats)
+    if set(language_stats) != set(languages):
+        raise BundleError("foundation language statistics keys disagree with languages")
+    expected_accepted = {language: 0 for language in languages}
+    expected_reasoning = {language: 0 for language in languages}
+    for task, records, language_id in zip(
+        source_tasks,
+        source_records,
+        source_language_ids,
+        strict=True,
+    ):
+        language = languages[language_id]
+        expected_accepted[language] += records
+        if task == "reasoning":
+            expected_reasoning[language] += records
+
+    required_fields = {*FOUNDATION_LANGUAGE_STAT_INTEGER_FIELDS, "read_rejects"}
+    for language in languages:
+        raw_values = language_stats.get(language)
+        if not isinstance(raw_values, Mapping):
+            raise BundleError(f"foundation language statistics are invalid for {language}")
+        values = cast(Mapping[object, object], raw_values)
+        if set(values) != required_fields:
+            raise BundleError(f"foundation language statistics fields are invalid for {language}")
+        for field in FOUNDATION_LANGUAGE_STAT_INTEGER_FIELDS:
+            value = values.get(field)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise BundleError(
+                    f"foundation language statistic {field} is invalid for {language}"
+                )
+        if values.get("accepted") != expected_accepted[language]:
+            raise BundleError(f"foundation accepted rows disagree for {language}")
+        if values.get("reasoning_records") != expected_reasoning[language]:
+            raise BundleError(f"foundation reasoning rows disagree for {language}")
+        raw_rejects = values.get("read_rejects")
+        if not isinstance(raw_rejects, Mapping) or any(
+            not isinstance(reason, str)
+            or not reason
+            or isinstance(count, bool)
+            or not isinstance(count, int)
+            or count < 0
+            for reason, count in cast(Mapping[object, object], raw_rejects).items()
+        ):
+            raise BundleError(f"foundation read_rejects are invalid for {language}")
+
+
+def _read_exact_stream(source: IO[bytes], size: int, path: str) -> bytes:
+    """Read exactly ``size`` bytes without assuming one read fills the buffer."""
+
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        chunk = source.read(remaining)
+        if not chunk:
+            raise BundleError(f"foundation payload is truncated: {path}")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _read_npy_header(
+    source: IO[bytes],
+    path: str,
+    *,
+    expected_dtype: np.dtype[np.void] = FOUNDATION_INDEX_DTYPE,
+) -> tuple[int, np.dtype[np.void], int]:
+    """Read a bounded, non-pickle NPY header for a one-dimensional structured array."""
+
+    if _read_exact_stream(source, 6, path) != b"\x93NUMPY":
+        raise BundleError(f"foundation index has no NPY magic header: {path}")
+    version = tuple(_read_exact_stream(source, 2, path))
+    if version == (1, 0):
+        length_size = 2
+        encoding = "latin-1"
+    elif version == (2, 0):
+        length_size = 4
+        encoding = "latin-1"
+    elif version == (3, 0):
+        length_size = 4
+        encoding = "utf-8"
+    else:
+        raise BundleError(f"foundation index uses an unsupported NPY version: {path}")
+    header_size = int.from_bytes(
+        _read_exact_stream(source, length_size, path),
+        byteorder="little",
+    )
+    if header_size <= 0 or header_size > MAX_NPY_HEADER_SIZE:
+        raise BundleError(f"foundation index header size is invalid: {path}")
     try:
-        raw_loaded: object = np.load(io.BytesIO(content), allow_pickle=False)
-    except (OSError, ValueError) as error:
-        raise BundleError(f"foundation index cannot be read: {path}") from error
-    if not isinstance(raw_loaded, np.ndarray):
-        raise BundleError(f"foundation index is not an array: {path}")
-    loaded = cast(NDArray[np.void], raw_loaded)
-    if loaded.ndim != 1 or loaded.dtype != FOUNDATION_INDEX_DTYPE:
+        header_text = _read_exact_stream(source, header_size, path).decode(encoding)
+        raw_header: object = ast.literal_eval(header_text.strip())
+    except (UnicodeDecodeError, SyntaxError, ValueError) as error:
+        raise BundleError(f"foundation index header cannot be parsed: {path}") from error
+    if not isinstance(raw_header, dict):
+        raise BundleError(f"foundation index header fields are invalid: {path}")
+    untyped_header = cast(dict[object, object], raw_header)
+    if any(not isinstance(key, str) for key in untyped_header):
+        raise BundleError(f"foundation index header fields are invalid: {path}")
+    header = {cast(str, key): value for key, value in untyped_header.items()}
+    if set(header) != {
+        "descr",
+        "fortran_order",
+        "shape",
+    }:
+        raise BundleError(f"foundation index header fields are invalid: {path}")
+    raw_shape = header["shape"]
+    if not isinstance(raw_shape, tuple):
         raise BundleError(f"foundation index dtype or shape is invalid: {path}")
-    if len(loaded) == 0:
-        raise BundleError(f"foundation index shard is empty: {path}")
-    return loaded
+    shape = cast(tuple[object, ...], raw_shape)
+    if (
+        len(shape) != 1
+        or isinstance(shape[0], bool)
+        or not isinstance(shape[0], int)
+        or shape[0] <= 0
+        or header["fortran_order"] is not False
+        or header["descr"] != expected_dtype.descr
+    ):
+        raise BundleError(f"foundation index dtype or shape is invalid: {path}")
+    records = shape[0]
+    header_bytes = 6 + 2 + length_size + header_size
+    return records, expected_dtype, header_bytes
+
+
+def _validate_foundation_index_stream(
+    source: IO[bytes],
+    source_tokens: IO[bytes],
+    path: str,
+    *,
+    source_tasks: tuple[str, ...],
+    source_language_ids: tuple[int, ...],
+    source_reasoning_ids: tuple[int, ...],
+    shard_size: int,
+    max_tokens: int,
+    max_target_tokens: int,
+    expected_size: int,
+    expected_source_bytes: int,
+    vocab_size: int,
+) -> FoundationShardSummary:
+    """Validate one NPY shard in bounded row chunks and return its exact totals."""
+
+    records, dtype, header_bytes = _read_npy_header(source, path)
+    if records > shard_size:
+        raise BundleError(f"foundation shard exceeds configured shard_size: {path}")
+    if expected_size != header_bytes + records * dtype.itemsize:
+        raise BundleError(f"foundation index byte size disagrees with its NPY header: {path}")
+    observed_source_records = np.zeros(len(source_tasks), dtype=np.uint64)
+    source_token_cursor = 0
+    target_token_cursor = 0
+    language_ids = np.asarray(source_language_ids, dtype=np.int64)
+    denoising_tasks = np.asarray(
+        [task == "denoising" for task in source_tasks],
+        dtype=np.bool_,
+    )
+    reasoning_ids = np.asarray(source_reasoning_ids, dtype=np.int64)
+    maximum_source_tokens = max_tokens + 1
+    token_budget_records = max(1, (4 * 1024 * 1024) // (maximum_source_tokens * 4))
+    remaining = records
+    while remaining:
+        chunk_records = min(
+            remaining,
+            FOUNDATION_INDEX_CHUNK_RECORDS,
+            token_budget_records,
+        )
+        content = _read_exact_stream(source, chunk_records * dtype.itemsize, path)
+        index = np.frombuffer(content, dtype=dtype, count=chunk_records)
+
+        source_ids = np.asarray(index["source_id"], dtype=np.int64)
+        if int(source_ids.min()) < 0 or int(source_ids.max()) >= len(source_tasks):
+            raise BundleError(f"foundation source_id is out of range: {path}")
+        observed_source_records += np.bincount(
+            source_ids,
+            minlength=len(source_tasks),
+        )[: len(source_tasks)].astype(np.uint64)
+
+        source_languages = np.asarray(index["src_language_id"], dtype=np.int64)
+        target_languages = np.asarray(index["tgt_language_id"], dtype=np.int64)
+        expected_languages = language_ids[source_ids]
+        if not np.array_equal(source_languages, expected_languages) or not np.array_equal(
+            target_languages,
+            expected_languages,
+        ):
+            raise BundleError(f"foundation index language ids disagree with sources: {path}")
+        if not bool((np.asarray(index["forward_only"], dtype=np.uint8) == 1).all()):
+            raise BundleError(f"foundation index contains a reverse-enabled row: {path}")
+
+        target_shared = np.asarray(index["target_shared"], dtype=np.uint8)
+        if not bool(np.isin(target_shared, (0, 1)).all()):
+            raise BundleError(f"foundation target_shared flag is invalid: {path}")
+        shared_mask = target_shared.astype(np.bool_)
+        expected_shared = denoising_tasks[source_ids]
+        if not np.array_equal(shared_mask, expected_shared):
+            raise BundleError(f"foundation target aliases disagree with source tasks: {path}")
+
+        source_offsets = np.asarray(index["src_offset"], dtype=np.uint64)
+        source_lengths = np.asarray(index["src_length"], dtype=np.uint64)
+        target_offsets = np.asarray(index["tgt_offset"], dtype=np.uint64)
+        target_lengths = np.asarray(index["tgt_length"], dtype=np.uint64)
+        if not bool((source_lengths > 0).all()) or not bool((target_lengths > 0).all()):
+            raise BundleError(f"foundation index contains an empty token sequence: {path}")
+        reasoning_mask = ~shared_mask
+        if (
+            bool(shared_mask.any())
+            and (
+                int(source_lengths[shared_mask].max()) > max_tokens
+                or int(target_lengths[shared_mask].max()) > max_tokens
+            )
+        ) or (
+            bool(reasoning_mask.any())
+            and (
+                int(source_lengths[reasoning_mask].min()) < 2
+                or int(source_lengths[reasoning_mask].max()) > max_tokens + 1
+                or int(target_lengths[reasoning_mask].max()) > max_target_tokens
+            )
+        ):
+            raise BundleError(f"foundation token sequence exceeds its preprocessing limit: {path}")
+        if not bool((np.asarray(index["quality_score"], dtype=np.uint8) == 100).all()):
+            raise BundleError(f"foundation index quality_score is not canonical: {path}")
+        if not bool((np.asarray(index["synthetic"], dtype=np.uint8) == 0).all()):
+            raise BundleError(f"foundation index unexpectedly marks synthetic rows: {path}")
+        if not bool(np.isin(np.asarray(index["src_register"]), (0, 1, 2, 3)).all()) or not bool(
+            np.isin(np.asarray(index["tgt_register"]), (0, 1, 2, 3)).all()
+        ):
+            raise BundleError(f"foundation index register is out of range: {path}")
+        source_chunk_tokens = int(source_lengths.sum(dtype=np.uint64))
+        stored_target_lengths = np.where(shared_mask, 0, target_lengths).astype(np.uint64)
+        target_chunk_tokens = int(stored_target_lengths.sum(dtype=np.uint64))
+        uint64_max = int(np.iinfo(np.uint64).max)
+        if (
+            source_token_cursor > uint64_max - source_chunk_tokens
+            or target_token_cursor > uint64_max - target_chunk_tokens
+        ):
+            raise BundleError(f"foundation token offsets overflow uint64: {path}")
+        expected_source_offsets = np.concatenate(
+            (
+                np.asarray([source_token_cursor], dtype=np.uint64),
+                np.asarray(source_token_cursor, dtype=np.uint64)
+                + np.cumsum(source_lengths[:-1], dtype=np.uint64),
+            )
+        )
+        expected_target_offsets = np.concatenate(
+            (
+                np.asarray([target_token_cursor], dtype=np.uint64),
+                np.asarray(target_token_cursor, dtype=np.uint64)
+                + np.cumsum(stored_target_lengths[:-1], dtype=np.uint64),
+            )
+        )
+        if not np.array_equal(source_offsets, expected_source_offsets) or not np.array_equal(
+            target_offsets,
+            expected_target_offsets,
+        ):
+            raise BundleError(f"foundation token offsets are not contiguous: {path}")
+        if bool(shared_mask.any()) and (
+            not np.array_equal(source_lengths[shared_mask], target_lengths[shared_mask])
+            or not np.array_equal(
+                np.asarray(index["src_register"])[shared_mask],
+                np.asarray(index["tgt_register"])[shared_mask],
+            )
+            or not bool((np.asarray(index["synthetic"], dtype=np.uint8)[shared_mask] == 0).all())
+        ):
+            raise BundleError(f"foundation shared targets contradict source rows: {path}")
+
+        source_content = _read_exact_stream(
+            source_tokens,
+            source_chunk_tokens * 4,
+            path.replace(".idx.npy", ".src.bin"),
+        )
+        stored_source_tokens = np.frombuffer(source_content, dtype="<u4")
+        if stored_source_tokens.size and int(stored_source_tokens.max()) >= vocab_size:
+            maximum = int(stored_source_tokens.max())
+            raise BundleError(
+                f"foundation token id {maximum} in {path.replace('.idx.npy', '.src.bin')} "
+                f"exceeds tokenizer vocabulary size {vocab_size}"
+            )
+        if bool(reasoning_mask.any()):
+            relative_offsets = (source_offsets - np.uint64(source_token_cursor)).astype(
+                np.int64,
+                copy=False,
+            )
+            observed_reasoning_ids = stored_source_tokens[relative_offsets[reasoning_mask]].astype(
+                np.int64,
+                copy=False,
+            )
+            expected_reasoning_ids = reasoning_ids[source_ids[reasoning_mask]]
+            if bool((expected_reasoning_ids < 0).any()) or not np.array_equal(
+                observed_reasoning_ids,
+                expected_reasoning_ids,
+            ):
+                raise BundleError(f"foundation reasoning task token is invalid: {path}")
+
+        source_token_cursor += source_chunk_tokens
+        target_token_cursor += target_chunk_tokens
+        remaining -= chunk_records
+
+    if source.read(1):
+        raise BundleError(f"foundation index contains trailing bytes: {path}")
+    if source_token_cursor * 4 != expected_source_bytes or source_tokens.read(1):
+        raise BundleError(f"foundation source token payload size is invalid: {path}")
+    return FoundationShardSummary(
+        records=records,
+        source_records=tuple(int(value) for value in observed_source_records.tolist()),
+        source_tokens=source_token_cursor,
+        target_tokens=target_token_cursor,
+    )
+
+
+def _validate_uint32_token_stream(
+    source: IO[bytes],
+    path: str,
+    *,
+    expected_bytes: int,
+    expected_tokens: int,
+    vocab_size: int,
+    role: str = "foundation",
+) -> None:
+    """Validate a little-endian uint32 token payload in bounded chunks."""
+
+    if expected_bytes != expected_tokens * 4:
+        raise BundleError(f"{role} token payload size is invalid: {path}")
+    remaining = expected_bytes
+    chunk_bytes = 4 * 1024 * 1024
+    while remaining:
+        size = min(remaining, chunk_bytes)
+        content = _read_exact_stream(source, size, path)
+        tokens = np.frombuffer(content, dtype="<u4")
+        if len(tokens):
+            maximum = int(tokens.max())
+            if maximum >= vocab_size:
+                raise BundleError(
+                    f"{role} token id {maximum} in {path} exceeds tokenizer "
+                    f"vocabulary size {vocab_size}"
+                )
+        remaining -= size
+    if source.read(1):
+        raise BundleError(f"{role} token payload contains trailing bytes: {path}")
+
+
+def _translation_shard_groups(
+    inventory: Mapping[str, tuple[int, str]],
+) -> dict[tuple[str, str], dict[str, str]]:
+    groups: dict[tuple[str, str], dict[str, str]] = {}
+    pattern = re.compile(
+        r"(?P<prefix>[0-9]{5,})\."
+        r"(?P<kind>idx\.npy|src\.bin|tgt\.bin|meta\.npy|meta\.bin)"
+    )
+    for raw_path in inventory:
+        relative = PurePosixPath(raw_path)
+        if len(relative.parts) != 2 or relative.parts[0] not in {
+            "train",
+            "validation",
+            "test",
+        }:
+            raise BundleError(f"translation inventory contains a non-shard path: {raw_path}")
+        match = pattern.fullmatch(relative.name)
+        if match is None:
+            raise BundleError(f"translation inventory has an invalid shard name: {raw_path}")
+        key = (relative.parts[0], match.group("prefix"))
+        members = groups.setdefault(key, {})
+        kind = match.group("kind")
+        if kind in members:
+            raise BundleError(f"translation inventory repeats shard member: {raw_path}")
+        members[kind] = raw_path
+
+    core_kinds = {"idx.npy", "src.bin", "tgt.bin"}
+    metadata_kinds = {"meta.npy", "meta.bin"}
+    for (split, prefix), members in groups.items():
+        if not core_kinds <= set(members):
+            raise BundleError(
+                f"translation shard {split}/{prefix} is incomplete: "
+                f"missing={sorted(core_kinds - set(members))}"
+            )
+        present_metadata = set(members) & metadata_kinds
+        if present_metadata and present_metadata != metadata_kinds:
+            raise BundleError(f"translation shard {split}/{prefix} has incomplete metadata")
+    for split in ("train", "validation", "test"):
+        prefixes = sorted(prefix for candidate, prefix in groups if candidate == split)
+        if split in {"train", "validation"} and not prefixes:
+            raise BundleError(f"translation inventory has no {split} shards")
+        expected = [f"{index:05d}" for index in range(len(prefixes))]
+        if prefixes != expected:
+            raise BundleError(f"translation {split} shard sequence is not contiguous")
+    return groups
+
+
+def _translation_manifest_contract(
+    manifest: Mapping[str, object],
+) -> tuple[
+    tuple[str, ...],
+    frozenset[tuple[int, int]],
+    frozenset[int],
+    tuple[bool, ...],
+    int,
+    int,
+]:
+    raw_languages = manifest.get("languages")
+    if not isinstance(raw_languages, list):
+        raise BundleError("translation manifest languages must contain at least two entries")
+    language_values = cast(list[object], raw_languages)
+    if len(language_values) < 2:
+        raise BundleError("translation manifest languages must contain at least two entries")
+    languages = tuple(
+        _canonical_language(value, field=f"translation manifest languages[{index}]")
+        for index, value in enumerate(language_values)
+    )
+    if list(languages) != raw_languages or len(languages) != len(set(languages)):
+        raise BundleError("translation manifest languages must be canonical and unique")
+    language_to_id = {language: index for index, language in enumerate(languages)}
+    if manifest.get("language_to_id") != language_to_id:
+        raise BundleError("translation manifest language_to_id must be contiguous")
+
+    raw_directions = manifest.get("translation_directions")
+    if not isinstance(raw_directions, list) or not raw_directions:
+        raise BundleError("translation manifest has no translation directions")
+    direction_ids: set[tuple[int, int]] = set()
+    canonical_directions: list[list[str]] = []
+    for index, raw_direction in enumerate(cast(list[object], raw_directions)):
+        if not isinstance(raw_direction, list):
+            raise BundleError("translation manifest direction entries must be lists")
+        direction = cast(list[object], raw_direction)
+        if len(direction) != 2:
+            raise BundleError("translation manifest directions must contain two languages")
+        source = _canonical_language(
+            direction[0],
+            field=f"translation manifest direction[{index}] source",
+        )
+        target = _canonical_language(
+            direction[1],
+            field=f"translation manifest direction[{index}] target",
+        )
+        if source not in language_to_id or target not in language_to_id or source == target:
+            raise BundleError("translation manifest direction is outside its language graph")
+        pair = (language_to_id[source], language_to_id[target])
+        if pair in direction_ids:
+            raise BundleError("translation manifest repeats a translation direction")
+        direction_ids.add(pair)
+        canonical_directions.append([source, target])
+    if canonical_directions != raw_directions:
+        raise BundleError("translation manifest directions must use canonical languages")
+
+    raw_source_only = manifest.get("source_only_languages")
+    if not isinstance(raw_source_only, list):
+        raise BundleError("translation manifest source_only_languages must be a list")
+    source_only_languages = tuple(
+        _canonical_language(value, field=f"translation source-only language[{index}]")
+        for index, value in enumerate(cast(list[object], raw_source_only))
+    )
+    if list(source_only_languages) != raw_source_only or len(source_only_languages) != len(
+        set(source_only_languages)
+    ):
+        raise BundleError("translation source-only languages must be canonical and unique")
+    try:
+        source_only_ids = frozenset(language_to_id[language] for language in source_only_languages)
+    except KeyError as error:
+        raise BundleError(
+            "translation source-only language is outside the language graph"
+        ) from error
+
+    raw_sources = manifest.get("sources")
+    if not isinstance(raw_sources, list) or not raw_sources:
+        raise BundleError("translation manifest has no source identities")
+    source_synthetic: list[bool] = []
+    for source_id, raw_source in enumerate(cast(list[object], raw_sources)):
+        if not isinstance(raw_source, Mapping):
+            raise BundleError("translation manifest source identities must be objects")
+        source = cast(Mapping[object, object], raw_source)
+        synthetic_file = source.get("synthetic_file")
+        if source.get("id") != source_id or not isinstance(synthetic_file, bool):
+            raise BundleError("translation manifest source ids or synthetic markers are invalid")
+        source_synthetic.append(synthetic_file)
+
+    raw_options = manifest.get("preprocessing_options")
+    if not isinstance(raw_options, Mapping):
+        raise BundleError("translation manifest has no preprocessing_options")
+    options = cast(Mapping[object, object], raw_options)
+    shard_size = options.get("shard_size")
+    max_tokens = options.get("max_tokens_per_side")
+    for field, value in (("shard_size", shard_size), ("max_tokens_per_side", max_tokens)):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise BundleError(f"translation preprocessing option {field} must be positive")
+    return (
+        languages,
+        frozenset(direction_ids),
+        source_only_ids,
+        tuple(source_synthetic),
+        cast(int, shard_size),
+        cast(int, max_tokens),
+    )
+
+
+def _validate_translation_index_stream(
+    source: IO[bytes],
+    path: str,
+    *,
+    split: str,
+    language_count: int,
+    direction_ids: frozenset[tuple[int, int]],
+    source_only_ids: frozenset[int],
+    source_synthetic: tuple[bool, ...],
+    shard_size: int,
+    max_tokens: int,
+    expected_size: int,
+) -> TranslationShardSummary:
+    records, dtype, header_bytes = _read_npy_header(
+        source,
+        path,
+        expected_dtype=TRANSLATION_INDEX_DTYPE,
+    )
+    if records > shard_size:
+        raise BundleError(f"translation shard exceeds configured shard_size: {path}")
+    if expected_size != header_bytes + records * dtype.itemsize:
+        raise BundleError(f"translation index byte size disagrees with its NPY header: {path}")
+
+    source_counts = np.zeros(len(source_synthetic), dtype=np.uint64)
+    source_token_cursor = 0
+    target_token_cursor = 0
+    remaining = records
+    while remaining:
+        chunk_records = min(remaining, FOUNDATION_INDEX_CHUNK_RECORDS)
+        content = _read_exact_stream(source, chunk_records * dtype.itemsize, path)
+        index = np.frombuffer(content, dtype=dtype, count=chunk_records)
+        source_ids = np.asarray(index["source_id"], dtype=np.int64)
+        if int(source_ids.min()) < 0 or int(source_ids.max()) >= len(source_synthetic):
+            raise BundleError(f"translation source_id is out of range: {path}")
+        source_counts += np.bincount(source_ids, minlength=len(source_synthetic))[
+            : len(source_synthetic)
+        ].astype(np.uint64)
+
+        source_languages = np.asarray(index["src_language_id"], dtype=np.int64)
+        target_languages = np.asarray(index["tgt_language_id"], dtype=np.int64)
+        if (
+            int(source_languages.min()) < 0
+            or int(source_languages.max()) >= language_count
+            or int(target_languages.min()) < 0
+            or int(target_languages.max()) >= language_count
+        ):
+            raise BundleError(f"translation language id is out of range: {path}")
+        forward_only = np.asarray(index["forward_only"], dtype=np.uint8)
+        synthetic = np.asarray(index["synthetic"], dtype=np.uint8)
+        if not bool(np.isin(forward_only, (0, 1)).all()) or not bool(
+            np.isin(synthetic, (0, 1)).all()
+        ):
+            raise BundleError(f"translation boolean flags are invalid: {path}")
+        for source_id, target_id, one_way in zip(
+            source_languages.tolist(),
+            target_languages.tolist(),
+            forward_only.tolist(),
+            strict=True,
+        ):
+            direction = (int(source_id), int(target_id))
+            if direction not in direction_ids:
+                raise BundleError(f"translation row uses an unconfigured direction: {path}")
+            if int(target_id) in source_only_ids or (
+                not bool(one_way) and (int(target_id), int(source_id)) not in direction_ids
+            ):
+                raise BundleError(f"translation row contradicts its direction policy: {path}")
+        expected_synthetic = np.asarray(source_synthetic, dtype=np.uint8)[source_ids]
+        if not np.array_equal(synthetic, expected_synthetic) or (
+            split != "train" and bool(synthetic.any())
+        ):
+            raise BundleError(f"translation synthetic flags contradict source policy: {path}")
+
+        source_offsets = np.asarray(index["src_offset"], dtype=np.uint64)
+        target_offsets = np.asarray(index["tgt_offset"], dtype=np.uint64)
+        source_lengths = np.asarray(index["src_length"], dtype=np.uint64)
+        target_lengths = np.asarray(index["tgt_length"], dtype=np.uint64)
+        if (
+            not bool((source_lengths > 0).all())
+            or not bool((target_lengths > 0).all())
+            or int(source_lengths.max()) > max_tokens
+            or int(target_lengths.max()) > max_tokens
+        ):
+            raise BundleError(f"translation token sequence length is invalid: {path}")
+        expected_source_offsets = np.concatenate(
+            (
+                np.asarray([source_token_cursor], dtype=np.uint64),
+                np.asarray(source_token_cursor, dtype=np.uint64)
+                + np.cumsum(source_lengths[:-1], dtype=np.uint64),
+            )
+        )
+        expected_target_offsets = np.concatenate(
+            (
+                np.asarray([target_token_cursor], dtype=np.uint64),
+                np.asarray(target_token_cursor, dtype=np.uint64)
+                + np.cumsum(target_lengths[:-1], dtype=np.uint64),
+            )
+        )
+        if not np.array_equal(source_offsets, expected_source_offsets) or not np.array_equal(
+            target_offsets,
+            expected_target_offsets,
+        ):
+            raise BundleError(f"translation token offsets are not contiguous: {path}")
+        if not bool(np.isin(np.asarray(index["src_register"]), (0, 1, 2, 3)).all()) or not bool(
+            np.isin(np.asarray(index["tgt_register"]), (0, 1, 2, 3)).all()
+        ):
+            raise BundleError(f"translation register is out of range: {path}")
+        quality = np.asarray(index["quality_score"], dtype=np.uint8)
+        if int(quality.max()) > 100:
+            raise BundleError(f"translation quality score is out of range: {path}")
+        source_token_cursor += int(source_lengths.sum(dtype=np.uint64))
+        target_token_cursor += int(target_lengths.sum(dtype=np.uint64))
+        remaining -= chunk_records
+    if source.read(1):
+        raise BundleError(f"translation index contains trailing bytes: {path}")
+    return TranslationShardSummary(
+        records=records,
+        source_records=tuple(int(value) for value in source_counts.tolist()),
+        source_tokens=source_token_cursor,
+        target_tokens=target_token_cursor,
+    )
+
+
+def _validate_translation_metadata_streams(
+    index_source: IO[bytes],
+    data_source: IO[bytes],
+    *,
+    index_path: str,
+    data_path: str,
+    expected_records: int,
+    expected_index_size: int,
+    expected_data_size: int,
+) -> None:
+    records, dtype, header_bytes = _read_npy_header(
+        index_source,
+        index_path,
+        expected_dtype=RECORD_METADATA_INDEX_DTYPE,
+    )
+    if (
+        records != expected_records
+        or expected_index_size != header_bytes + records * dtype.itemsize
+    ):
+        raise BundleError(f"translation metadata row count or byte size is invalid: {index_path}")
+    source_root = REPOSITORY_ROOT / "src"
+    source_root_text = str(source_root)
+    if source_root_text not in sys.path:
+        sys.path.insert(0, source_root_text)
+    from sion_translate.data.record_metadata import decode_record_metadata
+
+    data_cursor = 0
+    remaining = records
+    while remaining:
+        chunk_records = min(remaining, FOUNDATION_INDEX_CHUNK_RECORDS)
+        content = _read_exact_stream(index_source, chunk_records * dtype.itemsize, index_path)
+        rows = np.frombuffer(content, dtype=dtype, count=chunk_records)
+        offsets = np.asarray(rows["offset"], dtype=np.uint64)
+        lengths = np.asarray(rows["length"], dtype=np.uint64)
+        expected_offsets = np.concatenate(
+            (
+                np.asarray([data_cursor], dtype=np.uint64),
+                np.asarray(data_cursor, dtype=np.uint64) + np.cumsum(lengths[:-1], dtype=np.uint64),
+            )
+        )
+        if not np.array_equal(offsets, expected_offsets):
+            raise BundleError(f"translation metadata offsets are not contiguous: {index_path}")
+        for raw_length in lengths.tolist():
+            length = int(raw_length)
+            if length > MAX_METADATA_SIZE:
+                raise BundleError(f"translation metadata row is unreasonably large: {data_path}")
+            payload = _read_exact_stream(data_source, length, data_path)
+            try:
+                decode_record_metadata(payload)
+            except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as error:
+                raise BundleError(f"translation metadata row is invalid: {data_path}") from error
+            data_cursor += length
+        remaining -= chunk_records
+    if data_cursor != expected_data_size or index_source.read(1) or data_source.read(1):
+        raise BundleError(f"translation metadata payload size is invalid: {data_path}")
+
+
+def _validate_translation_dataset_contract(
+    *,
+    manifest: Mapping[str, object],
+    inventory: Mapping[str, tuple[int, str]],
+    open_payload: PayloadOpener,
+    tokenizer: ValidatedTokenizer,
+) -> None:
+    (
+        languages,
+        direction_ids,
+        source_only_ids,
+        source_synthetic,
+        shard_size,
+        max_tokens,
+    ) = _translation_manifest_contract(manifest)
+    shard_groups = _translation_shard_groups(inventory)
+    dataset_prefix = f"{TRANSLATION_DATASET_ROOT_PATH}/"
+    for (split, _prefix), members in sorted(shard_groups.items()):
+        index_relative = members["idx.npy"]
+        index_path = f"{dataset_prefix}{index_relative}"
+        with open_payload(index_path) as source:
+            summary = _validate_translation_index_stream(
+                source,
+                index_path,
+                split=split,
+                language_count=len(languages),
+                direction_ids=direction_ids,
+                source_only_ids=source_only_ids,
+                source_synthetic=source_synthetic,
+                shard_size=shard_size,
+                max_tokens=max_tokens,
+                expected_size=inventory[index_relative][0],
+            )
+        for kind, token_count in (
+            ("src.bin", summary.source_tokens),
+            ("tgt.bin", summary.target_tokens),
+        ):
+            relative = members[kind]
+            path = f"{dataset_prefix}{relative}"
+            with open_payload(path) as source:
+                _validate_uint32_token_stream(
+                    source,
+                    path,
+                    expected_bytes=inventory[relative][0],
+                    expected_tokens=token_count,
+                    vocab_size=tokenizer.vocab_size,
+                    role="translation",
+                )
+        if "meta.npy" in members:
+            metadata_index_relative = members["meta.npy"]
+            metadata_data_relative = members["meta.bin"]
+            metadata_index_path = f"{dataset_prefix}{metadata_index_relative}"
+            metadata_data_path = f"{dataset_prefix}{metadata_data_relative}"
+            with (
+                open_payload(metadata_index_path) as index_source,
+                open_payload(metadata_data_path) as data_source,
+            ):
+                _validate_translation_metadata_streams(
+                    index_source,
+                    data_source,
+                    index_path=metadata_index_path,
+                    data_path=metadata_data_path,
+                    expected_records=summary.records,
+                    expected_index_size=inventory[metadata_index_relative][0],
+                    expected_data_size=inventory[metadata_data_relative][0],
+                )
 
 
 def _validate_foundation_dataset_contract(
@@ -1262,7 +2265,8 @@ def _validate_foundation_dataset_contract(
     inventory: Mapping[str, tuple[int, str]],
     identities: Mapping[str, tuple[int, str]],
     read_payload: Callable[[str], bytes],
-    tokenizer_sha256: str,
+    open_payload: PayloadOpener,
+    tokenizer: ValidatedTokenizer,
 ) -> None:
     if manifest.get("stage") != "foundation":
         raise BundleError("foundation manifest has an invalid stage marker")
@@ -1292,13 +2296,13 @@ def _validate_foundation_dataset_contract(
     expected_tokenizer_identity = {
         "schema": FOUNDATION_TOKENIZER_IDENTITY_SCHEMA,
         "size_bytes": model_size,
-        "sha256": tokenizer_sha256,
+        "sha256": tokenizer.model_sha256,
     }
     if tokenizer_identity != expected_tokenizer_identity:
         raise BundleError("foundation tokenizer_identity does not authenticate sion.model")
     if manifest.get("tokenizer_model") != "sion.model":
         raise BundleError("foundation tokenizer_model must be the portable sion.model name")
-    if manifest.get("fingerprint") != {"tokenizer_sha256": tokenizer_sha256}:
+    if manifest.get("fingerprint") != {"tokenizer_sha256": tokenizer.model_sha256}:
         raise BundleError("foundation fingerprint disagrees with its tokenizer identity")
 
     source_tasks, expected_source_records, source_language_ids = _foundation_source_contract(
@@ -1316,98 +2320,63 @@ def _validate_foundation_dataset_contract(
     observed_split_records = {"train": 0, "validation": 0}
     dataset_prefix = f"{FOUNDATION_DATASET_ROOT_PATH}/"
     shard_size = cast(int, preprocessing_options["shard_size"])
+    max_tokens = cast(int, preprocessing_options["max_tokens"])
+    max_target_tokens = cast(int, preprocessing_options["max_target_tokens"])
+    languages = tuple(cast(list[str], manifest["languages"]))
+    reasoning_tag_ids = dict(tokenizer.reasoning_tag_ids)
+    source_reasoning_ids = tuple(
+        reasoning_tag_ids.get(languages[language_id], -1) if task == "reasoning" else -1
+        for task, language_id in zip(source_tasks, source_language_ids, strict=True)
+    )
+    if any(
+        task == "reasoning" and task_id < 0
+        for task, task_id in zip(source_tasks, source_reasoning_ids, strict=True)
+    ):
+        raise BundleError("foundation reasoning source has no tokenizer task control")
 
     for (split, _prefix), members in sorted(shard_groups.items()):
         index_relative = members["idx.npy"]
-        index_path = f"{dataset_prefix}{index_relative}"
-        index = _load_foundation_index(read_payload(index_path), index_path)
-        if len(index) > shard_size:
-            raise BundleError(f"foundation shard exceeds configured shard_size: {index_path}")
-
-        source_ids = np.asarray(index["source_id"], dtype=np.int64)
-        if int(source_ids.min()) < 0 or int(source_ids.max()) >= len(source_tasks):
-            raise BundleError(f"foundation source_id is out of range: {index_path}")
-        observed_source_records += np.bincount(
-            source_ids,
-            minlength=len(source_tasks),
-        )[: len(source_tasks)].astype(np.uint64)
-        observed_split_records[split] += len(index)
-
-        source_languages = np.asarray(index["src_language_id"], dtype=np.int64)
-        target_languages = np.asarray(index["tgt_language_id"], dtype=np.int64)
-        expected_languages = np.asarray(source_language_ids, dtype=np.int64)[source_ids]
-        if not np.array_equal(source_languages, expected_languages) or not np.array_equal(
-            target_languages,
-            expected_languages,
-        ):
-            raise BundleError(f"foundation index language ids disagree with sources: {index_path}")
-        if not bool((np.asarray(index["forward_only"], dtype=np.uint8) == 1).all()):
-            raise BundleError(f"foundation index contains a reverse-enabled row: {index_path}")
-
-        target_shared = np.asarray(index["target_shared"], dtype=np.uint8)
-        if not bool(np.isin(target_shared, (0, 1)).all()):
-            raise BundleError(f"foundation target_shared flag is invalid: {index_path}")
-        shared_mask = target_shared.astype(np.bool_)
-        expected_shared = np.fromiter(
-            (source_tasks[int(source_id)] == "denoising" for source_id in source_ids.tolist()),
-            dtype=np.bool_,
-            count=len(source_ids),
-        )
-        if not np.array_equal(shared_mask, expected_shared):
-            raise BundleError(f"foundation target aliases disagree with source tasks: {index_path}")
-
-        source_offsets = np.asarray(index["src_offset"], dtype=np.uint64)
-        source_lengths = np.asarray(index["src_length"], dtype=np.uint64)
-        target_offsets = np.asarray(index["tgt_offset"], dtype=np.uint64)
-        target_lengths = np.asarray(index["tgt_length"], dtype=np.uint64)
-        expected_source_offsets = np.concatenate(
-            (np.zeros(1, dtype=np.uint64), np.cumsum(source_lengths[:-1], dtype=np.uint64))
-        )
-        stored_target_lengths = np.where(shared_mask, 0, target_lengths)
-        expected_target_offsets = np.concatenate(
-            (
-                np.zeros(1, dtype=np.uint64),
-                np.cumsum(stored_target_lengths[:-1], dtype=np.uint64),
-            )
-        )
-        if not np.array_equal(source_offsets, expected_source_offsets) or not np.array_equal(
-            target_offsets,
-            expected_target_offsets,
-        ):
-            raise BundleError(f"foundation token offsets are not contiguous: {index_path}")
-        if bool(shared_mask.any()) and (
-            not np.array_equal(source_lengths[shared_mask], target_lengths[shared_mask])
-            or not np.array_equal(
-                np.asarray(index["src_register"])[shared_mask],
-                np.asarray(index["tgt_register"])[shared_mask],
-            )
-            or not bool((np.asarray(index["synthetic"], dtype=np.uint8)[shared_mask] == 0).all())
-        ):
-            raise BundleError(f"foundation shared targets contradict source rows: {index_path}")
-
         source_relative = members["src.bin"]
+        index_path = f"{dataset_prefix}{index_relative}"
+        source_path = f"{dataset_prefix}{source_relative}"
+        with open_payload(index_path) as source, open_payload(source_path) as source_tokens:
+            summary = _validate_foundation_index_stream(
+                source,
+                source_tokens,
+                index_path,
+                source_tasks=source_tasks,
+                source_language_ids=source_language_ids,
+                source_reasoning_ids=source_reasoning_ids,
+                shard_size=shard_size,
+                max_tokens=max_tokens,
+                max_target_tokens=max_target_tokens,
+                expected_size=inventory[index_relative][0],
+                expected_source_bytes=inventory[source_relative][0],
+                vocab_size=tokenizer.vocab_size,
+            )
+        observed_source_records += np.asarray(summary.source_records, dtype=np.uint64)
+        observed_split_records[split] += summary.records
         target_relative = members["tgt.bin"]
-        expected_source_size = int(source_lengths.sum(dtype=np.uint64)) * 4
-        expected_target_size = int(stored_target_lengths.sum(dtype=np.uint64)) * 4
-        if inventory[source_relative][0] != expected_source_size:
-            raise BundleError(f"foundation source payload size is invalid: {source_relative}")
-        if inventory[target_relative][0] != expected_target_size:
-            raise BundleError(f"foundation target payload size is invalid: {target_relative}")
+        target_path = f"{dataset_prefix}{target_relative}"
+        with open_payload(target_path) as source:
+            _validate_uint32_token_stream(
+                source,
+                target_path,
+                expected_bytes=inventory[target_relative][0],
+                expected_tokens=summary.target_tokens,
+                vocab_size=tokenizer.vocab_size,
+            )
 
     if observed_source_records.tolist() != list(expected_source_records):
         raise BundleError("foundation source record counts disagree with indexed rows")
-    stats = manifest.get("stats")
-    if not isinstance(stats, Mapping):
-        raise BundleError("foundation manifest has no valid stats object")
-    stat_values = cast(Mapping[str, object], stats)
-    for split, field in (("train", "train_records"), ("validation", "validation_records")):
-        value = stat_values.get(field)
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, int)
-            or value != observed_split_records[split]
-        ):
-            raise BundleError(f"foundation {field} disagrees with indexed rows")
+    _validate_foundation_stats_contract(
+        manifest,
+        languages=languages,
+        source_tasks=source_tasks,
+        source_records=expected_source_records,
+        source_language_ids=source_language_ids,
+        split_records=observed_split_records,
+    )
 
 
 def _validate_dataset_contract(
@@ -1415,17 +2384,18 @@ def _validate_dataset_contract(
     payload_paths: set[str],
     identities: Mapping[str, tuple[int, str]],
     read_payload: Callable[[str], bytes],
+    open_payload: PayloadOpener,
     dataset_root: str,
     manifest_path: str,
     expected_format: str,
-    tokenizer_sha256: str | None,
+    tokenizer: ValidatedTokenizer | None,
     translation: bool,
 ) -> None:
     prefix = f"{dataset_root}/"
     dataset_paths = {path for path in payload_paths if path.startswith(prefix)}
     if not dataset_paths:
         return
-    if tokenizer_sha256 is None:
+    if tokenizer is None:
         raise BundleError(f"{dataset_root} requires the complete tokenizer in the same payload")
     if manifest_path not in dataset_paths:
         raise BundleError(f"{dataset_root} is missing manifest.json")
@@ -1483,27 +2453,34 @@ def _validate_dataset_contract(
             raise BundleError(
                 "prepared dataset completion marker does not authenticate its sidecars"
             )
+        _validate_translation_dataset_contract(
+            manifest=manifest,
+            inventory=inventory,
+            open_payload=open_payload,
+            tokenizer=tokenizer,
+        )
     else:
         recorded_hash = manifest.get("tokenizer_sha256")
         if not isinstance(recorded_hash, str) or not SHA256_PATTERN.fullmatch(recorded_hash):
             raise BundleError(f"{manifest_path} has no valid tokenizer_sha256")
-        if recorded_hash != tokenizer_sha256:
+        if recorded_hash != tokenizer.model_sha256:
             raise BundleError(
                 f"{dataset_root} tokenizer mismatch: manifest records {recorded_hash}, "
-                f"but {TOKENIZER_MODEL_PATH} is {tokenizer_sha256}"
+                f"but {TOKENIZER_MODEL_PATH} is {tokenizer.model_sha256}"
             )
         _validate_foundation_dataset_contract(
             manifest=manifest,
             inventory=inventory,
             identities=identities,
             read_payload=read_payload,
-            tokenizer_sha256=tokenizer_sha256,
+            open_payload=open_payload,
+            tokenizer=tokenizer,
         )
 
-    if recorded_hash != tokenizer_sha256:
+    if recorded_hash != tokenizer.model_sha256:
         raise BundleError(
             f"{dataset_root} tokenizer mismatch: manifest records {recorded_hash}, "
-            f"but {TOKENIZER_MODEL_PATH} is {tokenizer_sha256}"
+            f"but {TOKENIZER_MODEL_PATH} is {tokenizer.model_sha256}"
         )
 
 
@@ -1511,26 +2488,29 @@ def _validate_artifact_contracts(
     payload_paths: set[str],
     identities: Mapping[str, tuple[int, str]],
     read_payload: Callable[[str], bytes],
+    open_payload: PayloadOpener,
 ) -> None:
-    tokenizer_sha256 = _validate_tokenizer_contract(payload_paths, identities, read_payload)
+    tokenizer = _validate_tokenizer_contract(payload_paths, identities, read_payload)
     _validate_dataset_contract(
         payload_paths=payload_paths,
         identities=identities,
         read_payload=read_payload,
+        open_payload=open_payload,
         dataset_root=TRANSLATION_DATASET_ROOT_PATH,
         manifest_path=DATASET_MANIFEST_PATH,
         expected_format=TRANSLATION_DATASET_FORMAT,
-        tokenizer_sha256=tokenizer_sha256,
+        tokenizer=tokenizer,
         translation=True,
     )
     _validate_dataset_contract(
         payload_paths=payload_paths,
         identities=identities,
         read_payload=read_payload,
+        open_payload=open_payload,
         dataset_root=FOUNDATION_DATASET_ROOT_PATH,
         manifest_path=FOUNDATION_DATASET_MANIFEST_PATH,
         expected_format=FOUNDATION_DATASET_FORMAT,
-        tokenizer_sha256=tokenizer_sha256,
+        tokenizer=tokenizer,
         translation=False,
     )
 
@@ -1551,8 +2531,11 @@ def _validated_config_from_payload(content: bytes, name: str) -> object:
         raise BundleError(f"{name} is not valid UTF-8 YAML") from error
     if decoded is None:
         raw: dict[str, object] = {}
-    elif isinstance(decoded, dict) and all(isinstance(key, str) for key in decoded):
-        raw = cast(dict[str, object], decoded)
+    elif isinstance(decoded, dict):
+        untyped_raw = cast(dict[object, object], decoded)
+        if any(not isinstance(key, str) for key in untyped_raw):
+            raise BundleError(f"{name} must contain a YAML mapping")
+        raw = {cast(str, key): value for key, value in untyped_raw.items()}
     else:
         raise BundleError(f"{name} must contain a YAML mapping")
     source_root = REPOSITORY_ROOT / "src"
@@ -1709,9 +2692,13 @@ def _validated_tokenizer_source_records(
         if not isinstance(raw_source, Mapping):
             raise BundleError("tokenizer training contract contains a non-object source")
         source = cast(Mapping[object, object], raw_source)
-        role = source.get("role")
-        if role not in {"parallel", "monolingual"}:
+        raw_role = source.get("role")
+        if not isinstance(raw_role, str) or raw_role not in {
+            "parallel",
+            "monolingual",
+        }:
             raise BundleError("tokenizer training contract source role is invalid")
+        role = raw_role
         expected_fields = {"role", "path", "size", "sha256"}
         if role == "monolingual":
             expected_fields.add("language")
@@ -2054,9 +3041,10 @@ def _validate_config_artifact_semantics(
                 "foundation.require_all_languages=true, but the prepared dataset "
                 "does not cover every configured language"
             )
-        sampling = foundation_manifest.get("language_sampling")
-        if not isinstance(sampling, Mapping):
+        raw_sampling = foundation_manifest.get("language_sampling")
+        if not isinstance(raw_sampling, Mapping):
             raise BundleError("prepared foundation dataset has no language_sampling contract")
+        sampling = cast(Mapping[object, object], raw_sampling)
         if sampling.get("alpha") != config.foundation.language_sampling_alpha:
             raise BundleError("foundation language sampling alpha disagrees with config")
         if sampling.get("minimum_share") != config.foundation.minimum_language_share:
@@ -2065,7 +3053,8 @@ def _validate_config_artifact_semantics(
         raw_reasoning = foundation_manifest.get("reasoning")
         if not isinstance(raw_reasoning, Mapping):
             raise BundleError("prepared foundation dataset has no reasoning contract")
-        raw_foundation_reasoning_languages = raw_reasoning.get("languages")
+        reasoning = cast(Mapping[object, object], raw_reasoning)
+        raw_foundation_reasoning_languages = reasoning.get("languages")
         if not isinstance(raw_foundation_reasoning_languages, list) or any(
             not isinstance(language, str)
             for language in cast(list[object], raw_foundation_reasoning_languages)
@@ -2361,6 +3350,7 @@ def _training_contract_from_sources(
     dict[str, tuple[int, str]],
     dict[str, str],
     Callable[[str], bytes],
+    PayloadOpener,
 ]:
     entries = {entry.relative_path.as_posix(): entry for entry in sources}
     config_key = config_path.as_posix()
@@ -2377,6 +3367,14 @@ def _training_contract_from_sources(
         with entry.source_path.open("rb") as source:
             return _read_limited(source, size, relative_path)
 
+    @contextmanager
+    def open_payload(relative_path: str) -> Generator[IO[bytes], None, None]:
+        entry = entries.get(relative_path)
+        if entry is None:
+            raise BundleError(f"artifact contract references an absent payload: {relative_path}")
+        with entry.source_path.open("rb") as source:
+            yield source
+
     config = _validated_config_from_payload(read_payload(config_key), config_key)
     raw_parallel_data_included = any(origin == "data-jsonl" for origin in origins.values())
     contract = _training_contract_payload(
@@ -2385,7 +3383,7 @@ def _training_contract_from_sources(
         config,
         raw_parallel_data_included=raw_parallel_data_included,
     )
-    return contract, identities, origins, read_payload
+    return contract, identities, origins, read_payload, open_payload
 
 
 def _zip_info(relative_path: str, mode: str) -> zipfile.ZipInfo:
@@ -2587,9 +3585,11 @@ def _write_archive(
     config_path: PurePosixPath | None = None,
 ) -> None:
     if training_contract is None:
-        training_contract, _identities, _origins, _reader = _training_contract_from_sources(
-            sources,
-            config_path or PurePosixPath(DEFAULT_CONFIG_PATH),
+        training_contract, _identities, _origins, _reader, _opener = (
+            _training_contract_from_sources(
+                sources,
+                config_path or PurePosixPath(DEFAULT_CONFIG_PATH),
+            )
         )
     with zipfile.ZipFile(
         destination,
@@ -3066,10 +4066,21 @@ def verify_archive(archive_path: Path | str) -> VerificationResult:
                         relative_path,
                     )
 
+            @contextmanager
+            def open_payload(relative_path: str) -> Generator[IO[bytes], None, None]:
+                info = by_relative_path.get(relative_path)
+                if info is None:
+                    raise BundleError(
+                        f"artifact contract references an absent ZIP payload: {relative_path}"
+                    )
+                with archive.open(info, mode="r") as source:
+                    yield source
+
             _validate_artifact_contracts(
                 set(records_by_path),
                 {record.path: (record.size, record.sha256) for record in records},
                 read_payload,
+                open_payload,
             )
             _validate_training_contract(
                 raw_manifest.get("training_contract"),
@@ -3170,10 +4181,20 @@ def verify_tree(tree_path: Path | str) -> VerificationResult:
         source_path = root.joinpath(*PurePosixPath(relative_path).parts)
         return _read_tree_metadata(source_path, relative_path)
 
+    @contextmanager
+    def open_payload(relative_path: str) -> Generator[IO[bytes], None, None]:
+        source_path = root.joinpath(*_validated_relative_path(relative_path).parts)
+        metadata = source_path.lstat()
+        if _metadata_is_link_like(metadata) or not stat.S_ISREG(metadata.st_mode):
+            raise BundleError(f"{relative_path} is not a regular file")
+        with source_path.open("rb") as source:
+            yield source
+
     _validate_artifact_contracts(
         set(records_by_path),
         {record.path: (record.size, record.sha256) for record in records},
         read_payload,
+        open_payload,
     )
     _validate_training_contract(
         raw_manifest.get("training_contract"),
@@ -3272,11 +4293,13 @@ def build_bundle(
         parallel=prepared_only and include_dataset,
         monolingual=include_foundation_dataset and not include_monolingual_corpus,
     )
-    training_contract, identities, origins, read_payload = _training_contract_from_sources(
-        sources,
-        config_selection.config_path,
+    training_contract, identities, origins, read_payload, open_payload = (
+        _training_contract_from_sources(
+            sources,
+            config_selection.config_path,
+        )
     )
-    _validate_artifact_contracts(set(identities), identities, read_payload)
+    _validate_artifact_contracts(set(identities), identities, read_payload, open_payload)
     _validate_training_contract(
         training_contract,
         payload_paths=set(identities),
