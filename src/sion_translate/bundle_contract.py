@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import unicodedata
@@ -185,24 +186,36 @@ def _entry_exists(path: Path, *, label: str) -> bool:
 def _looks_like_project_source_tree(root: Path) -> bool:
     """Recognize a source-layout project after its bundle metadata was stripped."""
 
-    markers = (
-        root / GIT_CHECKOUT_SENTINEL,
-        root / "easy_run.py",
+    return _entry_exists(
+        root / "src" / "sion_translate",
+        label="project source package",
     )
-    return any(_entry_exists(path, label="project source marker") for path in markers)
 
 
 def _is_valid_project_git_checkout(root: Path) -> bool:
     """Accept only a real rooted Git checkout with the runtime verifier tracked."""
 
+    git_command = shutil.which("git")
+    if git_command is None:
+        return False
+    git_executable = Path(git_command).resolve()
+    try:
+        git_executable.relative_to(root)
+    except ValueError:
+        pass
+    else:
+        return False
     common_arguments = [
-        "git",
+        str(git_executable),
+        "--no-replace-objects",
         "-C",
         str(root),
     ]
     environment = {
         name: value for name, value in os.environ.items() if not name.upper().startswith("GIT_")
     }
+    environment["GIT_NO_LAZY_FETCH"] = "1"
+    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
     environment["GIT_OPTIONAL_LOCKS"] = "0"
     environment["GIT_TERMINAL_PROMPT"] = "0"
     try:
@@ -228,21 +241,33 @@ def _is_valid_project_git_checkout(root: Path) -> bool:
         committed = subprocess.run(
             [
                 *common_arguments,
-                "cat-file",
-                "-t",
-                f"HEAD:{GIT_CHECKOUT_SENTINEL}",
+                "ls-tree",
+                "-z",
+                "HEAD",
+                "--",
+                GIT_CHECKOUT_SENTINEL,
             ],
             check=False,
             capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="strict",
             timeout=5,
             env=environment,
         )
     except (OSError, subprocess.SubprocessError, UnicodeError):
         return False
-    return committed.returncode == 0 and committed.stdout.strip() == "blob"
+    if committed.returncode != 0 or not committed.stdout.endswith(b"\0"):
+        return False
+    try:
+        metadata, path = committed.stdout[:-1].split(b"\t", 1)
+        mode, object_type, object_id = metadata.split(b" ", 2)
+        decoded_object_id = object_id.decode("ascii")
+    except (ValueError, UnicodeError):
+        return False
+    return bool(
+        mode in {b"100644", b"100755"}
+        and object_type == b"blob"
+        and GIT_OBJECT_PATTERN.fullmatch(decoded_object_id)
+        and path == GIT_CHECKOUT_SENTINEL.encode("ascii")
+    )
 
 
 def _validated_relative_path(value: str) -> PurePosixPath:
@@ -527,12 +552,22 @@ def load_embedded_training_contract(
     *,
     require_project_identity: bool = False,
 ) -> EmbeddedTrainingContract | None:
-    """Load and validate an extracted format-2 training contract, if present."""
+    """Load and validate an extracted format-2 training contract, if present.
+
+    A metadata-free source tree is accepted only as an existing operator-owned
+    Git checkout. This prevents accidental or partial bundle stripping; it is
+    not an out-of-tree signature against an account owner who deliberately
+    creates and commits a new repository after deleting the bundle contract.
+    """
 
     unresolved_root = Path(root)
     try:
         root_metadata = unresolved_root.lstat()
-    except FileNotFoundError:
+    except FileNotFoundError as error:
+        if require_project_identity:
+            raise BundleContractError(
+                f"the required project root does not exist: {unresolved_root}"
+            ) from error
         return None
     if _metadata_is_link_like(root_metadata) or not stat.S_ISDIR(root_metadata.st_mode):
         raise BundleContractError("the extracted GPU bundle root must be a real directory")

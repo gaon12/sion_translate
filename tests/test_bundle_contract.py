@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from bundle_contract_fixtures import rewrite_manifest, write_test_bundle
+import sion_translate.bundle_contract as bundle_contract_module
 from sion_translate.bundle_contract import (
     BundleContractError,
     load_embedded_training_contract,
@@ -195,6 +196,82 @@ def test_git_environment_cannot_inject_a_decoy_checkout(
         load_embedded_training_contract(stripped)
 
 
+def test_git_replacement_refs_cannot_forge_a_committed_verifier(tmp_path: Path) -> None:
+    (tmp_path / "README.md").write_text("original tree\n", encoding="utf-8")
+    _git(tmp_path, "init", "-q")
+    _git(tmp_path, "config", "user.name", "Bundle Contract Test")
+    _git(tmp_path, "config", "user.email", "bundle-contract@example.invalid")
+    _git(tmp_path, "add", "README.md")
+    _git(tmp_path, "commit", "-qm", "original tree")
+    original = _git(tmp_path, "rev-parse", "HEAD")
+
+    sentinel = tmp_path / "src" / "sion_translate" / "bundle_contract.py"
+    sentinel.parent.mkdir(parents=True)
+    sentinel.write_text('"""Replacement-only verifier."""\n', encoding="utf-8")
+    _git(tmp_path, "add", sentinel.relative_to(tmp_path).as_posix())
+    _git(tmp_path, "commit", "-qm", "replacement tree")
+    replacement = _git(tmp_path, "rev-parse", "HEAD")
+    _git(tmp_path, "reset", "--hard", original)
+    _git(tmp_path, "replace", original, replacement)
+    sentinel.parent.mkdir(parents=True)
+    sentinel.write_text('"""Uncommitted source marker."""\n', encoding="utf-8")
+
+    with pytest.raises(BundleContractError, match="not a valid Git checkout"):
+        load_embedded_training_contract(tmp_path, require_project_identity=True)
+
+
+def test_committed_symlink_cannot_stand_in_for_the_runtime_verifier(tmp_path: Path) -> None:
+    (tmp_path / "README.md").write_text("repository with a link entry\n", encoding="utf-8")
+    _git(tmp_path, "init", "-q")
+    _git(tmp_path, "config", "user.name", "Bundle Contract Test")
+    _git(tmp_path, "config", "user.email", "bundle-contract@example.invalid")
+    _git(tmp_path, "add", "README.md")
+    _git(tmp_path, "commit", "-qm", "original tree")
+    sentinel = tmp_path / "src" / "sion_translate" / "bundle_contract.py"
+    sentinel.parent.mkdir(parents=True)
+    link_blob = subprocess.run(
+        ["git", "hash-object", "-w", "--stdin"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+        input="outside-verifier.py",
+    ).stdout.strip()
+    _git(
+        tmp_path,
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        f"120000,{link_blob},{sentinel.relative_to(tmp_path).as_posix()}",
+    )
+    _git(tmp_path, "commit", "-qm", "commit verifier link")
+
+    with pytest.raises(BundleContractError, match="not a valid Git checkout"):
+        load_embedded_training_contract(tmp_path, require_project_identity=True)
+
+
+def test_project_local_git_executable_cannot_forge_checkout_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sentinel = tmp_path / "src" / "sion_translate" / "bundle_contract.py"
+    sentinel.parent.mkdir(parents=True)
+    sentinel.write_text('"""Untrusted project verifier."""\n', encoding="utf-8")
+    fake_git = tmp_path / "git.exe"
+    fake_git.write_bytes(b"not a trusted Git executable")
+    monkeypatch.setattr(bundle_contract_module.shutil, "which", lambda _name: str(fake_git))
+
+    with pytest.raises(BundleContractError, match="not a valid Git checkout"):
+        load_embedded_training_contract(tmp_path, require_project_identity=True)
+
+
+def test_required_project_identity_rejects_a_missing_root(tmp_path: Path) -> None:
+    missing = tmp_path / "missing-project"
+
+    with pytest.raises(BundleContractError, match="required project root does not exist"):
+        load_embedded_training_contract(missing, require_project_identity=True)
+
+
 def test_removing_a_mutable_project_marker_cannot_hide_stripped_metadata(
     tmp_path: Path,
 ) -> None:
@@ -202,9 +279,18 @@ def test_removing_a_mutable_project_marker_cannot_hide_stripped_metadata(
     (tmp_path / "PACKAGE_MANIFEST.json").unlink()
     (tmp_path / "SHA256SUMS").unlink()
     (tmp_path / "pyproject.toml").unlink()
+    (tmp_path / "src" / "sion_translate" / "bundle_contract.py").unlink()
 
     with pytest.raises(BundleContractError, match="not a valid Git checkout"):
         load_embedded_training_contract(tmp_path)
+
+
+def test_unrelated_directory_with_easy_run_filename_is_not_a_project_checkout(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "easy_run.py").write_text("print('unrelated experiment')\n", encoding="utf-8")
+
+    assert load_embedded_training_contract(tmp_path) is None
 
 
 def test_required_project_identity_rejects_a_fully_gutted_bundle_root(tmp_path: Path) -> None:
