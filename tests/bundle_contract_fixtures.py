@@ -70,7 +70,7 @@ def write_test_bundle(
         "requirements/gpu-build.in": b"setuptools>=77\nwheel\n",
         "requirements/gpu-lock-provenance.json": b"{}\n",
         "requirements/pylock.gpu-cp311-linux-x86_64-cu128.toml": b"lock-version='1.0'\n",
-        "src/sion_translate/__init__.py": b'"""Test bundle package marker."""\n',
+        "src/sion_translate/bundle_contract.py": b'"""Test bundle verifier sentinel."""\n',
     }
     for path, content in dependency_payloads.items():
         records.append(_write_payload(root, path, content))

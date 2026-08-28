@@ -18,6 +18,7 @@ import json
 import os
 import re
 import stat
+import subprocess
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -33,6 +34,7 @@ FORMAT_VERSION = 2
 TRAINING_CONTRACT_SCHEMA = "sion-gpu-training-contract-v2"
 DEPENDENCY_CONTRACT_SCHEMA = "sion-gpu-dependency-environment-v1"
 DEFAULT_CONFIG_PATH = "sion_translate.yaml"
+GIT_CHECKOUT_SENTINEL = "src/sion_translate/bundle_contract.py"
 
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 GIT_OBJECT_PATTERN = re.compile(r"[0-9a-f]{40,64}")
@@ -184,11 +186,63 @@ def _looks_like_project_source_tree(root: Path) -> bool:
     """Recognize a source-layout project after its bundle metadata was stripped."""
 
     markers = (
-        root / "pyproject.toml",
-        root / DEFAULT_CONFIG_PATH,
-        root / "src" / "sion_translate",
+        root / GIT_CHECKOUT_SENTINEL,
+        root / "easy_run.py",
     )
-    return all(_entry_exists(path, label="project source marker") for path in markers)
+    return any(_entry_exists(path, label="project source marker") for path in markers)
+
+
+def _is_valid_project_git_checkout(root: Path) -> bool:
+    """Accept only a real rooted Git checkout with the runtime verifier tracked."""
+
+    common_arguments = [
+        "git",
+        "-C",
+        str(root),
+    ]
+    environment = {
+        name: value for name, value in os.environ.items() if not name.upper().startswith("GIT_")
+    }
+    environment["GIT_OPTIONAL_LOCKS"] = "0"
+    environment["GIT_TERMINAL_PROMPT"] = "0"
+    try:
+        identity = subprocess.run(
+            [*common_arguments, "rev-parse", "--show-toplevel", "HEAD^{commit}"],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="strict",
+            timeout=5,
+            env=environment,
+        )
+        if identity.returncode != 0:
+            return False
+        lines = identity.stdout.splitlines()
+        if (
+            len(lines) != 2
+            or Path(lines[0]).resolve() != root
+            or GIT_OBJECT_PATTERN.fullmatch(lines[1]) is None
+        ):
+            return False
+        committed = subprocess.run(
+            [
+                *common_arguments,
+                "cat-file",
+                "-t",
+                f"HEAD:{GIT_CHECKOUT_SENTINEL}",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="strict",
+            timeout=5,
+            env=environment,
+        )
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        return False
+    return committed.returncode == 0 and committed.stdout.strip() == "blob"
 
 
 def _validated_relative_path(value: str) -> PurePosixPath:
@@ -470,6 +524,8 @@ def _validate_pair_sequence(value: object, label: str) -> None:
 
 def load_embedded_training_contract(
     root: str | Path = ".",
+    *,
+    require_project_identity: bool = False,
 ) -> EmbeddedTrainingContract | None:
     """Load and validate an extracted format-2 training contract, if present."""
 
@@ -486,17 +542,15 @@ def load_embedded_training_contract(
     manifest_exists = _entry_exists(manifest_path, label=MANIFEST_NAME)
     checksums_exists = _entry_exists(checksums_path, label=CHECKSUMS_NAME)
     if not manifest_exists and not checksums_exists:
-        # A normal Git checkout has an administrative entry and intentionally
-        # carries no package manifest. An extracted source-layout bundle has no
-        # such entry, so losing both integrity files must not silently downgrade
-        # it to an unauthenticated checkout.
-        if _looks_like_project_source_tree(bundle_root) and not _entry_exists(
-            bundle_root / ".git",
-            label="Git administrative entry",
-        ):
+        # Source-layout callers are either authenticated bundles or real Git
+        # checkouts. A directory merely named .git is not enough: require a
+        # resolvable HEAD rooted here and the verifier itself in the index.
+        if (
+            require_project_identity or _looks_like_project_source_tree(bundle_root)
+        ) and not _is_valid_project_git_checkout(bundle_root):
             raise BundleContractError(
-                "the source-layout project has no GPU bundle integrity metadata and no "
-                "Git administrative entry; re-extract the reviewed bundle"
+                "the source-layout project has no GPU bundle integrity metadata and is "
+                "not a valid Git checkout; re-extract the reviewed bundle"
             )
         return None
     if not manifest_exists or not checksums_exists:

@@ -1335,11 +1335,19 @@ def _resolve_runtime_bundle_contract(
 
     if root is not None:
         explicit_root = root.resolve()
-        return explicit_root, load_embedded_training_contract(explicit_root)
+        return explicit_root, load_embedded_training_contract(
+            explicit_root,
+            require_project_identity=True,
+        )
 
     working_root = Path.cwd().resolve()
     source_root = SOURCE_PROJECT_ROOT.resolve()
-    source_contract = load_embedded_training_contract(source_root)
+    source_layout_entry = source_root / "src" / "sion_translate" / "cli" / "train.py"
+    source_uses_project_layout = source_layout_entry.resolve() == Path(__file__).resolve()
+    source_contract = load_embedded_training_contract(
+        source_root,
+        require_project_identity=source_uses_project_layout,
+    )
     if source_contract is not None:
         if working_root != source_root:
             raise RuntimeError(
