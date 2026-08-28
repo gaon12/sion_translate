@@ -1311,6 +1311,45 @@ def _tokenizer_source_records(
     return records
 
 
+def _verify_expected_tokenizer_source_identities(
+    paths: Sequence[Path],
+    monolingual: MonolingualDiscovery | None,
+    source_records: Sequence[Mapping[str, object]],
+    expected: Mapping[str, tuple[int, str]],
+) -> None:
+    """Bind the initial tokenizer snapshot to an external immutable contract."""
+
+    source_paths = [*paths]
+    if monolingual is not None:
+        source_paths.extend(source.path for source in monolingual.sources)
+    if len(source_paths) != len(source_records):
+        raise RuntimeError("tokenizer source snapshot has an inconsistent file count")
+
+    actual: dict[str, tuple[int, str]] = {}
+    for path, record in zip(source_paths, source_records, strict=True):
+        identity = str(path.resolve())
+        if identity in actual:
+            raise RuntimeError(f"tokenizer source was selected more than once: {identity}")
+        size = record.get("size")
+        sha256 = record.get("sha256")
+        if type(size) is not int or not isinstance(sha256, str):
+            raise RuntimeError(f"tokenizer source snapshot is invalid: {identity}")
+        actual[identity] = (size, sha256)
+
+    missing = sorted(set(expected) - set(actual))
+    extra = sorted(set(actual) - set(expected))
+    changed = sorted(
+        identity
+        for identity in set(expected).intersection(actual)
+        if expected[identity] != actual[identity]
+    )
+    if missing or extra or changed:
+        raise RuntimeError(
+            "tokenizer sources differ from the immutable preparation contract; "
+            f"missing={missing}, extra={extra}, changed={changed}"
+        )
+
+
 def _tokenizer_training_contract(
     *,
     source_records: Sequence[Mapping[str, object]],
@@ -1545,6 +1584,7 @@ def train_tokenizer(
     monolingual_sample_ratio: float = 0.0,
     foundation_languages: Sequence[str] = (),
     reasoning_languages: Sequence[str] = (),
+    expected_source_identities: Mapping[str, tuple[int, str]] | None = None,
 ) -> Path:
     """Train a joint SentencePiece tokenizer transactionally.
 
@@ -1650,6 +1690,13 @@ def train_tokenizer(
     )
     normalized_synthetic_prefixes = normalize_synthetic_prefixes(train_only_prefixes)
     initial_source_records = _tokenizer_source_records(paths, monolingual)
+    if expected_source_identities is not None:
+        _verify_expected_tokenizer_source_identities(
+            paths,
+            monolingual,
+            initial_source_records,
+            expected_source_identities,
+        )
     sampling_description = (
         "all accepted sentences"
         if input_sentence_size == 0

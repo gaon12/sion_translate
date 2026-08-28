@@ -212,6 +212,116 @@ def test_bundle_config_is_parsed_from_the_authenticated_bytes_only_once(
     assert source == "sion_translate.yaml"
 
 
+def test_resolved_config_rejects_a_self_consistent_bundle_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    write_test_bundle(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(train_module, "SOURCE_PROJECT_ROOT", tmp_path)
+    args = train_module.build_parser().parse_args([])
+    _resolved, raw, _source = train_module.resolve_config(args)
+    write_test_bundle(
+        tmp_path,
+        language_pairs=(("es", "it"),),
+        translation_directions=(("es", "it"),),
+        foundation_languages=("es", "it"),
+    )
+
+    with pytest.raises(BundleContractError, match="changed after configuration resolution"):
+        train_module._bind_resolved_config_to_embedded_contract(args, raw)
+
+
+def test_artifact_preparation_rejects_a_contract_swap_before_source_scanning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    write_test_bundle(tmp_path)
+    contract = train_module.load_embedded_training_contract(tmp_path)
+    assert contract is not None
+    config = config_from_raw(
+        {
+            "data": {
+                "language_pairs": [["de", "fr"]],
+                "translation_directions": [["de", "fr"], ["fr", "de"]],
+            },
+            "foundation": {"enabled": False},
+        }
+    )
+    write_test_bundle(
+        tmp_path,
+        language_pairs=(("es", "it"),),
+        translation_directions=(("es", "it"),),
+        foundation_languages=("es", "it"),
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(train_module, "SOURCE_PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(
+        train_module,
+        "scan_configured_raw_data",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("source scan must not run")),
+    )
+
+    with pytest.raises(BundleContractError, match="changed after configuration resolution"):
+        train_module._ensure_artifacts_on_main(
+            config,
+            SimpleNamespace(is_main=True),
+            locks_held=True,
+            embedded_contract=contract,
+        )
+
+
+def test_raw_bundle_passes_exact_source_identities_into_tokenizer_training(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ExpectedStop(RuntimeError):
+        pass
+
+    content = b'{"de":"Ein ausreichend langer deutscher Satz.","fr":"Une phrase francaise assez longue."}\n'
+    write_test_bundle(tmp_path, raw_files={"data/parallel.jsonl": content})
+    contract = train_module.load_embedded_training_contract(tmp_path)
+    assert contract is not None
+    config = config_from_raw(
+        {
+            "data": {
+                "language_pairs": [["de", "fr"]],
+                "translation_directions": [["de", "fr"], ["fr", "de"]],
+            },
+            "foundation": {"enabled": False},
+        }
+    )
+    discovery = SimpleNamespace(sources=(), root=tmp_path / "data" / "corpus")
+    foundation_plan = SimpleNamespace(enabled=False, discovery=discovery, languages=())
+    captured: dict[str, tuple[int, str]] | None = None
+
+    def capture_source_contract(
+        *_args: object,
+        expected_source_identities: dict[str, tuple[int, str]] | None = None,
+        **_kwargs: object,
+    ) -> None:
+        nonlocal captured
+        captured = expected_source_identities
+        raise ExpectedStop
+
+    import sion_translate.tokenizer as tokenizer_module
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(train_module, "SOURCE_PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(tokenizer_module, "train_tokenizer", capture_source_contract)
+
+    with pytest.raises(ExpectedStop):
+        train_module._ensure_artifacts_on_main(
+            config,
+            SimpleNamespace(is_main=True),
+            foundation_plan,
+            locks_held=True,
+            embedded_contract=contract,
+        )
+
+    assert captured == train_module.resolved_origin_identities(contract, "data-jsonl")
+
+
 def test_failed_rebuild_restores_the_previous_dataset_generation(tmp_path: Path) -> None:
     active = tmp_path / "dataset"
     active.mkdir()

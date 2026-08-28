@@ -77,6 +77,7 @@ from sion_translate.artifacts import (
     TRANSLATION_RELEASE_NAME,
 )
 from sion_translate.bundle_contract import (
+    BundleContractError,
     EmbeddedTrainingContract,
     load_embedded_training_contract,
     resolved_origin_identities,
@@ -1456,6 +1457,30 @@ def resolve_config(args: argparse.Namespace) -> tuple[AppConfig, dict[str, Any],
     return config_from_raw(raw), raw, source
 
 
+def _bind_resolved_config_to_embedded_contract(
+    args: argparse.Namespace,
+    raw: dict[str, Any],
+) -> EmbeddedTrainingContract | None:
+    """Rebind a resolved config to the exact bundle contract used afterward."""
+
+    contract = preflight_embedded_bundle_config(
+        args.config,
+        override_flags=bundle_config_override_flags(args),
+    )
+    if contract is None:
+        return None
+    try:
+        authenticated_raw = parse_raw_config_text(contract.config_content.decode("utf-8"))
+    except UnicodeDecodeError as error:
+        raise RuntimeError("The authenticated GPU bundle config is not valid UTF-8") from error
+    if raw != authenticated_raw:
+        raise BundleContractError(
+            "the GPU bundle contract changed after configuration resolution; "
+            "re-extract the reviewed bundle and restart"
+        )
+    return contract
+
+
 def _artifact_mutation_roots(
     config: AppConfig,
     foundation_plan: Any,
@@ -1644,6 +1669,7 @@ def _ensure_artifacts_on_main(
     prepare_foundation: bool = True,
     require_offline_foundation: bool = False,
     locks_held: bool = False,
+    embedded_contract: EmbeddedTrainingContract | None = None,
 ) -> None:
     """Create the tokenizer and prepared datasets when absent or stale.
 
@@ -1662,7 +1688,18 @@ def _ensure_artifacts_on_main(
 
     if foundation_plan is None:
         foundation_plan = plan_foundation_stage(config)
-    _, embedded_contract = _resolve_runtime_bundle_contract()
+    _, live_embedded_contract = _resolve_runtime_bundle_contract()
+    if embedded_contract is None:
+        embedded_contract = live_embedded_contract
+    elif (
+        live_embedded_contract is None
+        or live_embedded_contract.root != embedded_contract.root
+        or live_embedded_contract.manifest_sha256 != embedded_contract.manifest_sha256
+    ):
+        raise BundleContractError(
+            "the GPU bundle contract changed after configuration resolution; "
+            "re-extract the reviewed bundle and restart"
+        )
     if embedded_contract is not None:
         # This internal function runs only on rank zero. Hash the immutable
         # package once before any augmentation recovery, artifact backup, or
@@ -1671,6 +1708,14 @@ def _ensure_artifacts_on_main(
     expected_foundation_source_identities = (
         resolved_origin_identities(embedded_contract, "monolingual-corpus")
         if embedded_contract is not None
+        else None
+    )
+    expected_tokenizer_source_identities = (
+        {
+            **resolved_origin_identities(embedded_contract, "data-jsonl"),
+            **resolved_origin_identities(embedded_contract, "monolingual-corpus"),
+        }
+        if embedded_contract is not None and embedded_contract.raw_parallel_data_included
         else None
     )
     reasoning_languages = (
@@ -1822,6 +1867,7 @@ def _ensure_artifacts_on_main(
                         train_only_prefixes=config.data.configured_synthetic_prefixes(),
                         num_workers=cpu_plan.preprocess_workers,
                         num_threads=cpu_plan.sentencepiece_threads,
+                        expected_source_identities=expected_tokenizer_source_identities,
                     )
                     announce("Tokenizer training complete.", context)
                     # The tokenizer file's SHA-256 is part of the dataset fingerprint.
@@ -2073,6 +2119,7 @@ def ensure_artifacts(
     prepare_foundation: bool = True,
     require_offline_foundation: bool = False,
     locks_held: bool = False,
+    embedded_contract: EmbeddedTrainingContract | None = None,
 ) -> None:
     """Prepare artifacts on rank 0 without timing out the training process group."""
 
@@ -2087,6 +2134,7 @@ def ensure_artifacts(
                 prepare_foundation=prepare_foundation,
                 require_offline_foundation=require_offline_foundation,
                 locks_held=True,
+                embedded_contract=embedded_contract,
             )
         return
     _run_long_rank_zero_action(
@@ -2100,6 +2148,7 @@ def ensure_artifacts(
             prepare_foundation=prepare_foundation,
             require_offline_foundation=require_offline_foundation,
             locks_held=locks_held,
+            embedded_contract=embedded_contract,
         ),
     )
     _verify_prepared_artifact_consensus(
@@ -4182,6 +4231,7 @@ def main() -> None:
 
         # ── Stage 2: load configuration ──────────────────────────────────
         config, raw, source = resolve_config(args)
+        embedded_contract = _bind_resolved_config_to_embedded_contract(args, raw)
         run_scope.enter_context(coordinated_training_run_lock(config.training.output_dir, context))
         checkpoint_lease_scope = ExitStack()
         run_scope.enter_context(checkpoint_lease_scope)
@@ -4252,6 +4302,7 @@ def main() -> None:
             # before constructing or placing a model on paid GPU memory.
             require_offline_foundation=require_offline_foundation,
             locks_held=True,
+            embedded_contract=embedded_contract,
         )
         tokenizer = SionTokenizer(config.data.tokenizer_model)
         config.model.vocab_size = len(tokenizer)
@@ -4595,6 +4646,7 @@ def main() -> None:
                     discovered_foundation_plan,
                     prepare_foundation=True,
                     locks_held=True,
+                    embedded_contract=embedded_contract,
                 )
             elif foundation_plan.enabled:
                 _verify_prepared_artifact_consensus(

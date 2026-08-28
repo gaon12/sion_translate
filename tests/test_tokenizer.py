@@ -251,6 +251,25 @@ def test_train_tokenizer_rejects_missing_language_graph_without_output_state(
     assert not output_dir.exists()
 
 
+def test_train_tokenizer_rejects_changed_authenticated_sources_before_output_state(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "parallel.jsonl"
+    source.write_text('{"de": "Hallo", "fr": "Bonjour"}\n', encoding="utf-8")
+    output_dir = tmp_path / "tokenizer"
+    expected = {str(source.resolve()): (source.stat().st_size, "0" * 64)}
+
+    with pytest.raises(RuntimeError, match="changed=.*parallel.jsonl"):
+        train_tokenizer(
+            [str(source)],
+            output_dir,
+            language_pair=("de", "fr"),
+            expected_source_identities=expected,
+        )
+
+    assert not output_dir.exists()
+
+
 def test_the_block_elements_are_reserved_and_never_required() -> None:
     """SentencePiece discards an **entire sentence** containing block elements.
 
