@@ -2378,6 +2378,13 @@ def test_translation_initialization_log_states_the_no_corpus_release_contract() 
     assert "SFT/MRT" in message
     assert "only sion_translate" in message
 
+    custom_message = train_module.translation_initialization_message(
+        FoundationOutcome(ran=False, reason="missing corpus"),
+        resume_from=None,
+        foundation_release_name="sion_base",
+    )
+    assert "foundation model (sion_base) will not be trained or exported" in custom_message
+
 
 def test_validated_sft_resume_takes_priority_without_touching_foundation(monkeypatch) -> None:
     def _fail(*_args: object, **_kwargs: object) -> None:

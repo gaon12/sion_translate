@@ -3262,8 +3262,8 @@ def _argument_parser() -> argparse.ArgumentParser:
         "--with-monolingual-corpus",
         action="store_true",
         help=(
-            "also ship data/corpus (foundation pretraining input). Without it the "
-            "foundation stage finds no monolingual text and is skipped."
+            "also ship data/corpus (foundation preparation input). Without it, the "
+            "foundation stage requires authenticated prepared foundation shards or is skipped."
         ),
     )
     build_parser.add_argument(

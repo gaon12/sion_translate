@@ -3972,7 +3972,8 @@ def translation_initialization_message(
             f"({foundation_release_name} step {foundation_outcome.selected_step:,})."
         )
     return (
-        "The foundation model (sion) will not be trained or exported. Starting "
+        f"The foundation model ({foundation_release_name}) will not be trained or exported. "
+        "Starting "
         "from fresh initialization and proceeding directly through translation "
         "SFT/MRT to produce only sion_translate."
     )
