@@ -4016,8 +4016,12 @@ def main() -> None:
             or (
                 foundation_plan.enabled
                 and not discovered_foundation_plan.discovery.sources
-                and pretrain_resume_candidate is None
-                and posttrain_resume_candidate is None
+                # Automatic checkpoints are only candidates until their full
+                # lineage and state authentication succeeds. If one is stale,
+                # execution falls back to foundation training, so raw-free base
+                # shards must pass the complete preflight before model placement.
+                # An explicit SFT resume fails closed instead of falling back.
+                and not explicit_pretrain_resume
             )
         )
         ensure_artifacts(

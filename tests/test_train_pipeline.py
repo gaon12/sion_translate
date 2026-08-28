@@ -354,6 +354,76 @@ def test_prepare_only_runs_training_contract_preflights_before_return(
     ]
 
 
+def test_automatic_resume_candidate_cannot_skip_raw_free_foundation_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale automatic checkpoint may fall back, so base shards must be safe first."""
+
+    class ExpectedStop(RuntimeError):
+        pass
+
+    config = AppConfig()
+    config.data.language_pair = ["de", "fr"]
+    config.training.output_dir = str(tmp_path / "run")
+    config.posttraining.enabled = False
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+    plan = SimpleNamespace(enabled=True, discovery=SimpleNamespace(sources=()))
+    observed_requirements: list[bool] = []
+
+    monkeypatch.setattr(sys, "argv", ["sion-train"])
+    monkeypatch.setattr(train_module, "configure_stdio", lambda: None)
+    monkeypatch.setattr(train_module, "initialize_distributed", lambda: context)
+    monkeypatch.setattr(train_module, "cleanup_distributed", lambda _context: None)
+    monkeypatch.setattr(train_module, "probe_environment", lambda: SimpleNamespace())
+    monkeypatch.setattr(train_module, "synchronize_environment", lambda env, _context: env)
+    monkeypatch.setattr(train_module, "describe_environment", lambda _env: "local CPU")
+    monkeypatch.setattr(train_module, "resolve_config", lambda _args: (config, {}, "test config"))
+    monkeypatch.setattr(
+        train_module,
+        "coordinated_training_run_lock",
+        lambda *_args, **_kwargs: nullcontext(None),
+    )
+    monkeypatch.setattr(
+        train_module,
+        "coordinated_artifact_run_locks",
+        lambda *_args, **_kwargs: nullcontext(()),
+    )
+    monkeypatch.setattr(train_module, "plan_foundation_stage", lambda _config: plan)
+    monkeypatch.setattr(
+        train_module,
+        "_configured_foundation_branch_plan",
+        lambda _config, discovered: discovered,
+    )
+    monkeypatch.setattr(
+        train_module,
+        "_find_distributed_auto_resume",
+        lambda **_kwargs: str(tmp_path / "automatic-checkpoint"),
+    )
+    monkeypatch.setattr(
+        train_module.AppConfig,
+        "validate_training_supervision",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(train_module, "preflight_final_export_dependencies", lambda _formats: None)
+    monkeypatch.setattr(train_module, "announce", lambda *_args, **_kwargs: None)
+
+    def stop_after_artifact_policy(
+        *_args: object,
+        require_offline_foundation: bool = False,
+        **_kwargs: object,
+    ) -> None:
+        observed_requirements.append(require_offline_foundation)
+        raise ExpectedStop
+
+    monkeypatch.setattr(train_module, "ensure_artifacts", stop_after_artifact_policy)
+
+    with pytest.raises(ExpectedStop):
+        train_module.main()
+
+    assert observed_requirements == [True]
+
+
 def test_training_resolves_revision_rows_to_an_exact_asymmetric_subgraph() -> None:
     config = AppConfig()
     config.data.language_pairs = [["pt-BR", "zh-Hant"]]
