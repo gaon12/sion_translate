@@ -48,12 +48,14 @@ The package version is `1.5.0`. Model release metadata uses the generation label
 - Enough local disk space for the raw data, tokenizer, indexed datasets, and final ZIP
 - Git when running directly from an editable source tree
 
-Run editable installs from a real Git clone. A metadata-free source directory is accepted
-only when Git resolves a committed project root containing the runtime bundle verifier.
-This prevents a damaged GPU bundle from silently becoming an unauthenticated local run.
-A prepared GPU ZIP does not need a `.git` directory because its manifest and checksum list
-provide the stronger identity. For a downloaded source archive, install a built wheel or
-clone the repository before using the editable commands below.
+Run editable installs from a real Git clone and pass `--allow-local-checkout` to `easy_run.py`
+or `sion-train`. The flag is an explicit opt-in to a metadata-free development tree; never
+use it for an extracted GPU bundle. This prevents a damaged bundle from silently becoming
+an unauthenticated local run. A prepared GPU ZIP does not need a `.git` directory or the
+flag because its manifest and checksum list provide the stronger identity. For a downloaded
+source archive, install a built wheel or clone the repository before using editable mode.
+Package installation and quality checks do not need the flag; only `easy_run.py` and
+`sion-train` launches from a metadata-free source checkout do.
 
 Linux or macOS:
 
@@ -127,7 +129,7 @@ data, prepared datasets, checkpoints, and weights are intentionally excluded fro
 Place one or more JSONL files under `data/`, review `sion_translate.yaml`, and run:
 
 ```bash
-python easy_run.py
+python easy_run.py --allow-local-checkout
 ```
 
 On a supported CUDA server, the automatic runner discovers the input graph, prepares or
@@ -137,7 +139,7 @@ valid stage, and runs foundation, SFT, and MRT in order.
 To perform every safe CPU-side preparation step and stop before allocating the model:
 
 ```bash
-sion-train --config sion_translate.yaml --prepare-only
+sion-train --allow-local-checkout --config sion_translate.yaml --prepare-only
 ```
 
 This is the recommended local workflow before uploading a GPU bundle. It can train the
@@ -265,7 +267,7 @@ continuous target, selected architecture, vocabulary size, and estimated paramet
 Run the configured pipeline with:
 
 ```bash
-sion-train --config sion_translate.yaml
+sion-train --allow-local-checkout --config sion_translate.yaml
 ```
 
 All stages use complete shuffled dataset passes by default. `max_steps` exists for smoke

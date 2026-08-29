@@ -64,6 +64,8 @@ A fully prepared bundle should reuse its tokenizer and indexed datasets. Do not 
 if this command reports a graph, tokenizer, token-feature, fingerprint, or inventory
 mismatch. A prepared-only bundle cannot rebuild a missing artifact because its raw
 training corpora were intentionally omitted; the command fails before allocating a model.
+Do not pass --allow-local-checkout here. That option is only for a trusted development
+clone without bundle metadata and must not replace this bundle's manifest verification.
 
 
 4. START OR RESUME TRAINING

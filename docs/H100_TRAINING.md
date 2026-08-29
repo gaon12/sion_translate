@@ -41,7 +41,7 @@ Tokenizer training and dataset indexing are CPU and storage work. Run them local
 the local machine has enough memory and disk space:
 
 ```bash
-sion-train --config sion_translate.yaml --prepare-only
+sion-train --allow-local-checkout --config sion_translate.yaml --prepare-only
 ```
 
 This command stops before model allocation. It authenticates and reuses complete
@@ -100,7 +100,8 @@ sion-train --config sion_translate.yaml --prepare-only
 
 The second command performs an offline artifact preflight and stops before model
 allocation. Do not train from an archive that fails either verification command or this
-preflight.
+preflight. Do not pass `--allow-local-checkout` in the extracted bundle; its manifest and
+checksum list are the required trust boundary.
 
 ## 3. Run on one H100
 

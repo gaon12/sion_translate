@@ -120,10 +120,12 @@ For every run, record `macro_direction_nll`, `worst_direction_nll`, ko→ja and 
 
 ## Retraining procedure
 
-On the GPU server, the following command connects expressive-seed generation, tokenizer and dataset construction, SFT, and MRT.
+In a trusted editable checkout on the GPU server, the following command connects
+expressive-seed generation, tokenizer and dataset construction, SFT, and MRT. An
+authenticated extracted GPU bundle must omit the local-checkout option.
 
 ```bash
-python3 easy_run.py
+python3 easy_run.py --allow-local-checkout
 ```
 
 If legacy `artifacts/tokenizer` or `artifacts/dataset` contents fail identity checks, training stops instead of replacing them automatically. Because multiple runs may share the vocabulary, an operator must inspect related checkpoints and manually move both directories to a separate recoverable location. A valid run uses these stable public paths:

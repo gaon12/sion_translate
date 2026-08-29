@@ -83,6 +83,10 @@ indexed datasets rather than rebuild them. A prepared-only bundle has no raw tra
 corpus from which to reconstruct a missing artifact, so absence is a preflight error.
 This check finishes before model or optimizer allocation.
 
+Do not pass `--allow-local-checkout` for this workflow. That option is only for a trusted
+development clone without bundle metadata; it must never replace the manifest and checksum
+verification of an extracted GPU bundle.
+
 Do not continue when it reports a tokenizer, graph, source fingerprint, token-feature,
 or dataset inventory mismatch. Those errors mean the server files do not represent the
 same training contract as the bundle configuration.

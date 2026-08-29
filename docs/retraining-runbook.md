@@ -90,7 +90,7 @@ Tokenizer training and indexing are CPU, RAM, and storage work. Run them on the 
 machine before renting the GPU server:
 
 ```bash
-sion-train --config sion_translate.yaml --prepare-only
+sion-train --allow-local-checkout --config sion_translate.yaml --prepare-only
 ```
 
 This command stops before allocating a model. It prepares and authenticates:
@@ -109,7 +109,7 @@ silently crowd every smaller configured language out of the sample.
 Run the same command a second time:
 
 ```bash
-sion-train --config sion_translate.yaml --prepare-only
+sion-train --allow-local-checkout --config sion_translate.yaml --prepare-only
 ```
 
 The second run must authenticate and reuse the complete artifacts. It must not silently
@@ -295,7 +295,9 @@ sion-train --config sion_translate.yaml --prepare-only
 
 In a prepared-only tree this is an offline verification pass. A missing tokenizer or
 dataset is an error because the raw source corpus was intentionally not shipped. The
-runner completes this check before allocating model or optimizer storage.
+runner completes this check before allocating model or optimizer storage. Do not pass
+`--allow-local-checkout` in this extracted bundle; the authenticated bundle metadata must
+remain authoritative.
 
 A complete bundle should reuse every included artifact.
 
