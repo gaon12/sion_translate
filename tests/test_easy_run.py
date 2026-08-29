@@ -255,6 +255,7 @@ def test_bundle_authentication_fails_before_gpu_runtime_preflight(
     )
     monkeypatch.setattr(easy_run, "ROOT", root)
     monkeypatch.setattr(easy_run, "PERSISTENT_ARTIFACTS", root / "artifacts")
+    monkeypatch.setattr(easy_run.sys, "argv", ["easy_run.py"])
     monkeypatch.setattr(
         easy_run,
         "_enter_tmux",
@@ -284,6 +285,7 @@ def test_stripped_bundle_metadata_fails_before_tmux_or_gpu_preflight(
     (root / ".git").mkdir()
     monkeypatch.setattr(easy_run, "ROOT", root)
     monkeypatch.setattr(easy_run, "PERSISTENT_ARTIFACTS", root / "artifacts")
+    monkeypatch.setattr(easy_run.sys, "argv", ["easy_run.py", easy_run.LOCAL_CHECKOUT_FLAG])
     monkeypatch.setattr(
         easy_run,
         "_enter_tmux",
@@ -308,9 +310,10 @@ def test_prepared_bundle_main_never_requires_or_mutates_raw_data(
     (root / "data").mkdir()
     (root / "artifacts" / "tokenizer").mkdir(parents=True)
     _write_bundle_manifest(root, raw_parallel_data_included=False)
+    monkeypatch.setattr(easy_run.sys, "argv", ["easy_run.py"])
     monkeypatch.setattr(easy_run, "ROOT", root)
     monkeypatch.setattr(easy_run, "PERSISTENT_ARTIFACTS", root / "artifacts")
-    monkeypatch.setattr(easy_run, "_enter_tmux", lambda: None)
+    monkeypatch.setattr(easy_run, "_enter_tmux", lambda **_kwargs: None)
     monkeypatch.setattr(
         easy_run,
         "_validate_gpu_runtime",
@@ -346,9 +349,39 @@ def test_prepared_bundle_main_never_requires_or_mutates_raw_data(
     assert config_path.is_file()
     assert len(commands) == 2
     assert commands[0][-3:] == ["--config", str(config_path), "--prepare-only"]
+    assert easy_run.LOCAL_CHECKOUT_FLAG not in commands[0]
     assert commands[0][commands[0].index("--config") + 1] == str(config_path)
+    assert easy_run.LOCAL_CHECKOUT_FLAG not in commands[1]
     assert commands[1][commands[1].index("--config") + 1] == str(config_path)
     assert verified_tokenizers == [(root / "artifacts/tokenizer/sion.model", root / "data")]
+
+
+def test_prepared_bundle_rejects_local_checkout_mode_before_tmux_or_gpu(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "sion_translate"
+    _write_bundle_manifest(root, raw_parallel_data_included=False)
+    monkeypatch.setattr(easy_run, "ROOT", root)
+    monkeypatch.setattr(easy_run, "PERSISTENT_ARTIFACTS", root / "artifacts")
+    monkeypatch.setattr(easy_run.sys, "argv", ["easy_run.py", easy_run.LOCAL_CHECKOUT_FLAG])
+    monkeypatch.setattr(
+        easy_run,
+        "_enter_tmux",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("tmux must not start for a conflicting trust mode")
+        ),
+    )
+    monkeypatch.setattr(
+        easy_run,
+        "_validate_gpu_runtime",
+        lambda _torch: (_ for _ in ()).throw(
+            AssertionError("GPU preflight must not run for a conflicting trust mode")
+        ),
+    )
+
+    with pytest.raises(SystemExit, match="cannot be used with an authenticated GPU bundle"):
+        easy_run.main()
 
 
 def test_enter_tmux_is_noop_inside_existing_tmux(monkeypatch) -> None:
@@ -372,7 +405,7 @@ def test_install_tmux_skips_when_already_available(monkeypatch) -> None:
 
 
 def test_enter_tmux_is_noop_for_noninteractive_launch(monkeypatch) -> None:
-    monkeypatch.setattr(easy_run.os, "name", "posix")
+    monkeypatch.setattr(easy_run, "TMUX_SUPPORTED", True)
     monkeypatch.delenv("TMUX", raising=False)
     monkeypatch.delenv("SION_TMUX_ACTIVE", raising=False)
     monkeypatch.setattr(easy_run.sys.stdin, "isatty", lambda: False)
@@ -382,6 +415,53 @@ def test_enter_tmux_is_noop_for_noninteractive_launch(monkeypatch) -> None:
         lambda: (_ for _ in ()).throw(AssertionError("must not install in Slurm/nohup")),
     )
     easy_run._enter_tmux()
+
+
+def test_enter_tmux_preserves_explicit_local_checkout_opt_in(monkeypatch) -> None:
+    class ExpectedExec(RuntimeError):
+        pass
+
+    observed: list[object] = []
+    monkeypatch.setattr(easy_run, "TMUX_SUPPORTED", True)
+    monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.delenv("SION_TMUX_ACTIVE", raising=False)
+    monkeypatch.delenv("SION_NO_TMUX", raising=False)
+    monkeypatch.setattr(easy_run.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(easy_run.sys.stdout, "isatty", lambda: True)
+    monkeypatch.setattr(easy_run, "_install_tmux", lambda: "/usr/bin/tmux")
+    monkeypatch.setattr(easy_run, "_tmux_session_name", lambda: "sion-test")
+    monkeypatch.setattr(
+        easy_run.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=1),
+    )
+
+    def capture_execve(executable, arguments, environment):
+        observed.extend((executable, arguments, environment))
+        raise ExpectedExec
+
+    monkeypatch.setattr(easy_run.os, "execve", capture_execve)
+
+    with pytest.raises(ExpectedExec):
+        easy_run._enter_tmux(allow_local_checkout=True)
+
+    command = easy_run.shlex.split(observed[1][-1])
+    assert command[-1] == easy_run.LOCAL_CHECKOUT_FLAG
+    assert observed[2]["SION_TMUX_ACTIVE"] == "1"
+
+
+def test_tmux_training_command_omits_unrequested_local_trust() -> None:
+    command = easy_run._tmux_training_command()
+
+    assert easy_run.LOCAL_CHECKOUT_FLAG not in command
+
+
+def test_launcher_argument_parser_accepts_only_the_documented_option() -> None:
+    assert easy_run._parse_allow_local_checkout([]) is False
+    assert easy_run._parse_allow_local_checkout([easy_run.LOCAL_CHECKOUT_FLAG]) is True
+
+    with pytest.raises(SystemExit):
+        easy_run._parse_allow_local_checkout(["--unknown-option"])
 
 
 def test_missing_tmux_continues_in_foreground(monkeypatch, capsys) -> None:

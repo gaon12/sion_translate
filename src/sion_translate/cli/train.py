@@ -1,6 +1,7 @@
 """Fully automated sion_translate training entry point.
 
-    sion-train            # This is the only command required.
+    sion-train --allow-local-checkout  # Trusted editable checkout.
+    sion-train                           # Authenticated GPU bundle or installed package.
 
 Workflow:
     1. Detect the execution environment, including GPU count, VRAM, bf16, and CPU.
@@ -715,6 +716,19 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
         raise
 
 
+def _verify_embedded_bundle_before_distributed(contract: EmbeddedTrainingContract) -> None:
+    """Authenticate this rank's bundle view before any distributed or CUDA setup.
+
+    Every worker verifies independently. Filesystem status channels cannot prove
+    that a terminal record belongs to the current torchrun invocation, and a
+    shared status directory can also make otherwise independent nodes contend.
+    The extra reads are deliberate: each rank must authenticate the exact files
+    it can access before it joins the process group.
+    """
+
+    verify_embedded_bundle_payload(contract)
+
+
 def _control_status_paths(status_path: Path) -> tuple[Path, Path]:
     return status_path, status_path.with_name(f"{status_path.name}.backup")
 
@@ -1275,8 +1289,9 @@ def _preflight_offline_foundation_dataset(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Train sion_translate. With no arguments, detect the environment and "
-            "data automatically."
+            "Train sion_translate. An authenticated GPU bundle or installed package can "
+            "detect the environment and data with no arguments; an editable Git checkout "
+            "must explicitly use --allow-local-checkout."
         )
     )
     parser.add_argument(
@@ -1284,6 +1299,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             f"Configuration file (default: {DEFAULT_CONFIG_FILE} in the project "
             "root; fully automatic when absent)"
+        ),
+    )
+    parser.add_argument(
+        "--allow-local-checkout",
+        action="store_true",
+        help=(
+            "Explicitly trust a metadata-free Git development checkout. Never use this "
+            "flag for an extracted GPU training bundle."
         ),
     )
     parser.add_argument(
@@ -1330,6 +1353,8 @@ def seed_everything(seed: int, rank: int) -> None:
 
 def _resolve_runtime_bundle_contract(
     root: Path | None = None,
+    *,
+    allow_local_checkout: bool = False,
 ) -> tuple[Path, EmbeddedTrainingContract | None]:
     """Find the bundle policy without trusting the caller's working directory."""
 
@@ -1338,6 +1363,7 @@ def _resolve_runtime_bundle_contract(
         return explicit_root, load_embedded_training_contract(
             explicit_root,
             require_project_identity=True,
+            allow_local_checkout=allow_local_checkout,
         )
 
     working_root = Path.cwd().resolve()
@@ -1347,6 +1373,7 @@ def _resolve_runtime_bundle_contract(
     source_contract = load_embedded_training_contract(
         source_root,
         require_project_identity=source_uses_project_layout,
+        allow_local_checkout=allow_local_checkout,
     )
     if source_contract is not None:
         if working_root != source_root:
@@ -1356,7 +1383,10 @@ def _resolve_runtime_bundle_contract(
                 f"working directory to {source_root} and run again."
             )
         return source_root, source_contract
-    working_contract = load_embedded_training_contract(working_root)
+    working_contract = load_embedded_training_contract(
+        working_root,
+        allow_local_checkout=allow_local_checkout,
+    )
     if working_contract is not None and source_root != working_root:
         raise RuntimeError(
             "An authenticated GPU bundle must execute the source tree carried by that "
@@ -1372,17 +1402,29 @@ def preflight_embedded_bundle_config(
     *,
     override_flags: tuple[str, ...] = (),
     root: Path | None = None,
+    allow_local_checkout: bool = False,
 ) -> EmbeddedTrainingContract | None:
     """Require an extracted GPU bundle to use its authenticated effective config."""
 
-    bundle_root, contract = _resolve_runtime_bundle_contract(root)
+    bundle_root, contract = _resolve_runtime_bundle_contract(
+        root,
+        allow_local_checkout=allow_local_checkout,
+    )
+    if contract is not None and allow_local_checkout:
+        raise BundleContractError(
+            "--allow-local-checkout cannot be used with an authenticated GPU bundle; "
+            "run the verified bundle without the local-checkout option"
+        )
     selected_path = (
         Path(requested_config).resolve()
         if requested_config is not None
         else bundle_root / DEFAULT_CONFIG_FILE
     )
     if requested_config is not None and selected_path.parent != bundle_root:
-        outside_contract = load_embedded_training_contract(selected_path.parent)
+        outside_contract = load_embedded_training_contract(
+            selected_path.parent,
+            allow_local_checkout=allow_local_checkout,
+        )
         if outside_contract is not None:
             raise RuntimeError(
                 "An authenticated GPU bundle must run from its extracted root so all "
@@ -1420,23 +1462,34 @@ def bundle_config_override_flags(args: argparse.Namespace) -> tuple[str, ...]:
     return tuple(flag for flag, active in candidates if active)
 
 
-def resolve_config(args: argparse.Namespace) -> tuple[AppConfig, dict[str, Any], str]:
+_UNRESOLVED_EMBEDDED_CONTRACT = object()
+
+
+def resolve_config(
+    args: argparse.Namespace,
+    *,
+    embedded_contract: EmbeddedTrainingContract | None | object = _UNRESOLVED_EMBEDDED_CONTRACT,
+) -> tuple[AppConfig, dict[str, Any], str]:
     """Resolve and return the configuration, raw dictionary, and source label.
 
     The raw dictionary records which keys the user supplied explicitly.
     Automatic settings fill only keys that the user did not provide.
     """
-    embedded_contract = preflight_embedded_bundle_config(
-        args.config,
-        override_flags=bundle_config_override_flags(args),
-    )
-    if embedded_contract is not None:
+    if embedded_contract is _UNRESOLVED_EMBEDDED_CONTRACT:
+        resolved_contract = preflight_embedded_bundle_config(
+            args.config,
+            override_flags=bundle_config_override_flags(args),
+            allow_local_checkout=args.allow_local_checkout,
+        )
+    else:
+        resolved_contract = cast(EmbeddedTrainingContract | None, embedded_contract)
+    if resolved_contract is not None:
         try:
-            config_text = embedded_contract.config_content.decode("utf-8")
+            config_text = resolved_contract.config_content.decode("utf-8")
         except UnicodeDecodeError as error:
             raise RuntimeError("The authenticated GPU bundle config is not valid UTF-8") from error
         raw = parse_raw_config_text(config_text)
-        source = embedded_contract.config_path
+        source = resolved_contract.config_path
     elif args.config:
         raw = load_raw_config(args.config)
         source = args.config
@@ -1468,15 +1521,28 @@ def resolve_config(args: argparse.Namespace) -> tuple[AppConfig, dict[str, Any],
 def _bind_resolved_config_to_embedded_contract(
     args: argparse.Namespace,
     raw: dict[str, Any],
+    *,
+    expected_contract: EmbeddedTrainingContract | None,
 ) -> EmbeddedTrainingContract | None:
     """Rebind a resolved config to the exact bundle contract used afterward."""
 
     contract = preflight_embedded_bundle_config(
         args.config,
         override_flags=bundle_config_override_flags(args),
+        allow_local_checkout=args.allow_local_checkout,
     )
-    if contract is None:
+    if expected_contract is None and contract is None:
         return None
+    if (
+        expected_contract is None
+        or contract is None
+        or contract.root != expected_contract.root
+        or contract.manifest_sha256 != expected_contract.manifest_sha256
+    ):
+        raise BundleContractError(
+            "the GPU bundle contract changed after configuration resolution; "
+            "re-extract the reviewed bundle and restart"
+        )
     try:
         authenticated_raw = parse_raw_config_text(contract.config_content.decode("utf-8"))
     except UnicodeDecodeError as error:
@@ -1678,6 +1744,7 @@ def _ensure_artifacts_on_main(
     require_offline_foundation: bool = False,
     locks_held: bool = False,
     embedded_contract: EmbeddedTrainingContract | None = None,
+    allow_local_checkout: bool = False,
 ) -> None:
     """Create the tokenizer and prepared datasets when absent or stale.
 
@@ -1696,13 +1763,16 @@ def _ensure_artifacts_on_main(
 
     if foundation_plan is None:
         foundation_plan = plan_foundation_stage(config)
-    _, live_embedded_contract = _resolve_runtime_bundle_contract()
-    if embedded_contract is None:
-        embedded_contract = live_embedded_contract
-    elif (
-        live_embedded_contract is None
-        or live_embedded_contract.root != embedded_contract.root
-        or live_embedded_contract.manifest_sha256 != embedded_contract.manifest_sha256
+    _, live_embedded_contract = _resolve_runtime_bundle_contract(
+        allow_local_checkout=allow_local_checkout,
+    )
+    if (embedded_contract is None) != (live_embedded_contract is None) or (
+        embedded_contract is not None
+        and live_embedded_contract is not None
+        and (
+            live_embedded_contract.root != embedded_contract.root
+            or live_embedded_contract.manifest_sha256 != embedded_contract.manifest_sha256
+        )
     ):
         raise BundleContractError(
             "the GPU bundle contract changed after configuration resolution; "
@@ -2128,6 +2198,7 @@ def ensure_artifacts(
     require_offline_foundation: bool = False,
     locks_held: bool = False,
     embedded_contract: EmbeddedTrainingContract | None = None,
+    allow_local_checkout: bool = False,
 ) -> None:
     """Prepare artifacts on rank 0 without timing out the training process group."""
 
@@ -2143,6 +2214,7 @@ def ensure_artifacts(
                 require_offline_foundation=require_offline_foundation,
                 locks_held=True,
                 embedded_contract=embedded_contract,
+                allow_local_checkout=allow_local_checkout,
             )
         return
     _run_long_rank_zero_action(
@@ -2157,6 +2229,7 @@ def ensure_artifacts(
             require_offline_foundation=require_offline_foundation,
             locks_held=locks_held,
             embedded_contract=embedded_contract,
+            allow_local_checkout=allow_local_checkout,
         ),
     )
     _verify_prepared_artifact_consensus(
@@ -4229,6 +4302,27 @@ def translation_initialization_message(
 def main() -> None:
     configure_stdio()
     args = build_parser().parse_args()
+    initial_embedded_contract = preflight_embedded_bundle_config(
+        args.config,
+        override_flags=bundle_config_override_flags(args),
+        allow_local_checkout=args.allow_local_checkout,
+    )
+    config, raw, source = resolve_config(
+        args,
+        embedded_contract=initial_embedded_contract,
+    )
+    embedded_contract = _bind_resolved_config_to_embedded_contract(
+        args,
+        raw,
+        expected_contract=initial_embedded_contract,
+    )
+    # Authenticate every immutable payload byte and reject configuration or
+    # optional-export failures before allocating a process group or touching
+    # GPU state on any torchrun rank.
+    if embedded_contract is not None:
+        _verify_embedded_bundle_before_distributed(embedded_contract)
+    config.validate_training_supervision(alignment_targets_available=False)
+    preflight_final_export_dependencies(config.training.final_export_formats)
     context = initialize_distributed()
     run_scope = ExitStack()
     try:
@@ -4237,18 +4331,11 @@ def main() -> None:
         env = synchronize_environment(env, context)
         announce(f"Preparation 1: execution environment — {describe_environment(env)}", context)
 
-        # ── Stage 2: load configuration ──────────────────────────────────
-        config, raw, source = resolve_config(args)
-        embedded_contract = _bind_resolved_config_to_embedded_contract(args, raw)
+        # ── Stage 2: announce the preflighted configuration ──────────────
         run_scope.enter_context(coordinated_training_run_lock(config.training.output_dir, context))
         checkpoint_lease_scope = ExitStack()
         run_scope.enter_context(checkpoint_lease_scope)
         announce(f"Preparation 2: configuration loaded — {source}", context)
-        # The built-in collator has no dense alignment-label provider. Reject a
-        # permanently-zero BATS alignment objective even for preparation-only
-        # runs so an upload-ready artifact set cannot hide a training failure.
-        config.validate_training_supervision(alignment_targets_available=False)
-
         # ── Stage 3: discover source data and prepare artifacts ──────────
         announce("Preparation 3: checking source data.", context)
         discovered_foundation_plan = plan_foundation_stage(config)
@@ -4256,10 +4343,6 @@ def main() -> None:
             config,
             discovered_foundation_plan,
         )
-        # Translation formats are unavoidable. Check them locally during a
-        # preparation-only run as well; otherwise the same configuration can
-        # spend upload and GPU setup time before reporting a missing converter.
-        preflight_final_export_dependencies(config.training.final_export_formats)
         run_scope.enter_context(
             coordinated_artifact_run_locks(
                 config,
@@ -4311,6 +4394,7 @@ def main() -> None:
             require_offline_foundation=require_offline_foundation,
             locks_held=True,
             embedded_contract=embedded_contract,
+            allow_local_checkout=args.allow_local_checkout,
         )
         tokenizer = SionTokenizer(config.data.tokenizer_model)
         config.model.vocab_size = len(tokenizer)
@@ -4655,6 +4739,7 @@ def main() -> None:
                     prepare_foundation=True,
                     locks_held=True,
                     embedded_contract=embedded_contract,
+                    allow_local_checkout=args.allow_local_checkout,
                 )
             elif foundation_plan.enabled:
                 _verify_prepared_artifact_consensus(

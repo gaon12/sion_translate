@@ -1,4 +1,4 @@
-"""High-performance sion_translate training entry point with no arguments.
+"""High-performance sion_translate training entry point.
 
 On Linux, this script places source data and preprocessing outputs on a RAM disk
 when ``/dev/shm`` has enough free space. Before training, it also synchronizes
@@ -9,6 +9,8 @@ Checkpoints and exports are always written to persistent storage.
 
 from __future__ import annotations
 
+import argparse
+from collections.abc import Sequence
 from dataclasses import dataclass
 import hashlib
 import os
@@ -35,6 +37,8 @@ PERSISTENT_ARTIFACTS = ROOT / DEFAULT_ARTIFACT_ROOT
 EXPRESSIVE_CORPUS_NAME = "synthetic_expressive_cultural.jsonl"
 MIN_RAM_HEADROOM = 8 * 2**30
 PREPARED_ARTIFACT_DIRECTORIES = ("tokenizer", "dataset", "foundation_dataset")
+LOCAL_CHECKOUT_FLAG = "--allow-local-checkout"
+TMUX_SUPPORTED = os.name != "nt"
 
 
 @dataclass(frozen=True)
@@ -68,11 +72,38 @@ def _install_tmux() -> str | None:
     return tmux
 
 
-def _enter_tmux() -> None:
+def _parse_allow_local_checkout(arguments: Sequence[str] | None = None) -> bool:
+    """Parse the launcher's one explicit development-trust option."""
+
+    parser = argparse.ArgumentParser(
+        description="Prepare, authenticate, and run the configured Sion training pipeline."
+    )
+    parser.add_argument(
+        LOCAL_CHECKOUT_FLAG,
+        action="store_true",
+        help=(
+            "trust this metadata-free Git development checkout; never use this option "
+            "for an extracted GPU bundle"
+        ),
+    )
+    return bool(parser.parse_args(arguments).allow_local_checkout)
+
+
+def _tmux_training_command(*, allow_local_checkout: bool = False) -> list[str]:
+    """Build the exact launcher command that a new tmux session must retain."""
+
+    return [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        *([LOCAL_CHECKOUT_FLAG] if allow_local_checkout else []),
+    ]
+
+
+def _enter_tmux(*, allow_local_checkout: bool = False) -> None:
     """Re-exec easy_run inside a durable tmux session when launched interactively."""
 
     if (
-        os.name == "nt"
+        not TMUX_SUPPORTED
         or os.environ.get("TMUX")
         or os.environ.get("SION_TMUX_ACTIVE") == "1"
         or os.environ.get("SION_NO_TMUX") == "1"
@@ -115,7 +146,7 @@ def _enter_tmux() -> None:
             "new-session",
             "-s",
             session,
-            shlex.join([sys.executable, str(Path(__file__).resolve())]),
+            shlex.join(_tmux_training_command(allow_local_checkout=allow_local_checkout)),
         ],
         environment,
     )
@@ -280,7 +311,11 @@ def _discover_raw_files(data_dir: Path, env: dict[str, str]) -> list[Path]:
     return raw_files
 
 
-def _embedded_bundle_policy(root: Path | None = None) -> EmbeddedBundlePolicy | None:
+def _embedded_bundle_policy(
+    root: Path | None = None,
+    *,
+    allow_local_checkout: bool = False,
+) -> EmbeddedBundlePolicy | None:
     """Authenticate an extracted bundle before the launcher makes any choices."""
 
     bundle_root = (root or ROOT).resolve()
@@ -288,6 +323,7 @@ def _embedded_bundle_policy(root: Path | None = None) -> EmbeddedBundlePolicy | 
         contract = load_embedded_training_contract(
             bundle_root,
             require_project_identity=True,
+            allow_local_checkout=allow_local_checkout,
         )
         if contract is None:
             return None
@@ -526,8 +562,14 @@ def main() -> None:
     # Hash the complete immutable package before importing the heavy GPU
     # runtime, creating a terminal session, or allowing the launcher to select
     # a data/artifact layout.
-    bundle_policy = _embedded_bundle_policy()
-    _enter_tmux()
+    allow_local_checkout = _parse_allow_local_checkout()
+    bundle_policy = _embedded_bundle_policy(allow_local_checkout=allow_local_checkout)
+    if bundle_policy is not None and allow_local_checkout:
+        raise SystemExit(
+            f"[easy_run] {LOCAL_CHECKOUT_FLAG} cannot be used with an authenticated GPU "
+            "bundle. Run the verified bundle without the local-checkout option."
+        )
+    _enter_tmux(allow_local_checkout=allow_local_checkout)
 
     import torch
 
@@ -538,6 +580,9 @@ def main() -> None:
     env["PYTHONPATH"] = src_path + os.pathsep + env.get("PYTHONPATH", "")
 
     source_data = ROOT / "data"
+    local_checkout_arguments = (
+        [LOCAL_CHECKOUT_FLAG] if allow_local_checkout and bundle_policy is None else []
+    )
     remove_generated_config = False
     if bundle_policy is not None:
         # A bundle's config hash and canonical paths are authenticated. Moving
@@ -589,6 +634,7 @@ def main() -> None:
                 sys.executable,
                 "-m",
                 "sion_translate.cli.train",
+                *local_checkout_arguments,
                 "--config",
                 str(generated_config),
                 "--prepare-only",
@@ -619,6 +665,7 @@ def main() -> None:
             f"--nproc-per-node={gpu_count}",
             "-m",
             "sion_translate.cli.train",
+            *local_checkout_arguments,
             "--config",
             str(generated_config),
         ]

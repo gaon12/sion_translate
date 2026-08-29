@@ -20,6 +20,7 @@ import re
 import shutil
 import stat
 import subprocess
+import tomllib
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -184,17 +185,138 @@ def _entry_exists(path: Path, *, label: str) -> bool:
 
 
 def _looks_like_project_source_tree(root: Path) -> bool:
-    """Recognize a source-layout project after its bundle metadata was stripped."""
+    """Recognize this project after one obvious source marker was removed."""
 
-    return _entry_exists(
+    source_package_exists = _entry_exists(
         root / "src" / "sion_translate",
         label="project source package",
     )
+    bundle_builder_exists = _entry_exists(
+        root / "scripts" / "package_gpu_bundle.py",
+        label="GPU bundle builder",
+    )
+    project_metadata = root / "pyproject.toml"
+    sion_project_metadata = False
+    if _entry_exists(project_metadata, label="project metadata"):
+        try:
+            raw_metadata = _read_regular_file(
+                project_metadata,
+                "project metadata",
+                limit=1024 * 1024,
+            ).decode("utf-8")
+            parsed_metadata = tomllib.loads(raw_metadata)
+        except (BundleContractError, UnicodeError, tomllib.TOMLDecodeError):
+            pass
+        else:
+            project = parsed_metadata.get("project")
+            if isinstance(project, dict):
+                project_table = cast(dict[str, object], project)
+                sion_project_metadata = project_table.get("name") == "sion-translate"
+    dependency_contract_exists = all(
+        _entry_exists(root / relative_path, label="GPU dependency contract marker")
+        for relative_path in (
+            "requirements/gpu-build.in",
+            "requirements/gpu-lock-provenance.json",
+            "sion_translate.yaml",
+        )
+    )
+    return bool(
+        source_package_exists
+        or bundle_builder_exists
+        or sion_project_metadata
+        or dependency_contract_exists
+    )
+
+
+def _read_git_control_text(path: Path, label: str) -> str | None:
+    try:
+        content = _read_regular_file(path, label, limit=16 * 1024)
+        text = content.decode("utf-8")
+    except (BundleContractError, UnicodeError):
+        return None
+    if "\x00" in text or "\r" in text or text.count("\n") > 1:
+        return None
+    value = text.removesuffix("\n")
+    return value if value else None
+
+
+def _real_directory(path: Path) -> bool:
+    try:
+        metadata = path.lstat()
+    except OSError:
+        return False
+    return not _metadata_is_link_like(metadata) and stat.S_ISDIR(metadata.st_mode)
+
+
+def _git_administrative_directories(root: Path) -> tuple[Path, Path] | None:
+    """Resolve a main, linked-worktree, submodule, or separate-Git-dir layout."""
+
+    entry = root / ".git"
+    try:
+        metadata = entry.lstat()
+    except OSError:
+        return None
+    if _metadata_is_link_like(metadata):
+        return None
+    if stat.S_ISDIR(metadata.st_mode):
+        git_directory = entry.resolve()
+    elif stat.S_ISREG(metadata.st_mode):
+        pointer = _read_git_control_text(entry, "Git worktree pointer")
+        if pointer is None or not pointer.startswith("gitdir: "):
+            return None
+        raw_git_directory = Path(pointer.removeprefix("gitdir: "))
+        if not raw_git_directory.is_absolute():
+            raw_git_directory = entry.parent / raw_git_directory
+        git_directory = raw_git_directory.resolve()
+        if not _real_directory(git_directory):
+            return None
+        backlink_path = git_directory / "gitdir"
+        if _entry_exists(backlink_path, label="Git worktree backlink"):
+            backlink = _read_git_control_text(backlink_path, "Git worktree backlink")
+            if backlink is None:
+                return None
+            raw_backlink = Path(backlink)
+            if not raw_backlink.is_absolute():
+                raw_backlink = git_directory / raw_backlink
+            if raw_backlink.resolve() != entry.resolve():
+                return None
+    else:
+        return None
+
+    head = _read_git_control_text(git_directory / "HEAD", "Git HEAD")
+    if head is None or not (head.startswith("ref: refs/") or GIT_OBJECT_PATTERN.fullmatch(head)):
+        return None
+    common_pointer = git_directory / "commondir"
+    if _entry_exists(common_pointer, label="Git common-directory pointer"):
+        raw_common = _read_git_control_text(common_pointer, "Git common-directory pointer")
+        if raw_common is None:
+            return None
+        common_candidate = Path(raw_common)
+        if not common_candidate.is_absolute():
+            common_candidate = git_directory / common_candidate
+        common_directory = common_candidate.resolve()
+    else:
+        common_directory = git_directory
+    if not _real_directory(common_directory) or not _real_directory(common_directory / "objects"):
+        return None
+    try:
+        _read_regular_file(common_directory / "config", "Git config", limit=1024 * 1024)
+    except BundleContractError:
+        return None
+    return git_directory, common_directory
 
 
 def _is_valid_project_git_checkout(root: Path) -> bool:
-    """Accept only a real rooted Git checkout with the runtime verifier tracked."""
+    """Sanity-check an explicitly trusted local checkout.
 
+    This is not the integrity boundary. The caller must opt into metadata-free
+    development before this check is consulted.
+    """
+
+    administrative_directories = _git_administrative_directories(root)
+    if administrative_directories is None:
+        return False
+    expected_git_directory, expected_common_directory = administrative_directories
     git_command = shutil.which("git")
     if git_command is None:
         return False
@@ -220,7 +342,14 @@ def _is_valid_project_git_checkout(root: Path) -> bool:
     environment["GIT_TERMINAL_PROMPT"] = "0"
     try:
         identity = subprocess.run(
-            [*common_arguments, "rev-parse", "--show-toplevel", "HEAD^{commit}"],
+            [
+                *common_arguments,
+                "rev-parse",
+                "--show-toplevel",
+                "--absolute-git-dir",
+                "--git-common-dir",
+                "HEAD^{commit}",
+            ],
             check=False,
             capture_output=True,
             text=True,
@@ -232,10 +361,18 @@ def _is_valid_project_git_checkout(root: Path) -> bool:
         if identity.returncode != 0:
             return False
         lines = identity.stdout.splitlines()
+        raw_common_directory = Path(lines[2]) if len(lines) >= 3 else Path()
+        reported_common_directory = (
+            raw_common_directory.resolve()
+            if raw_common_directory.is_absolute()
+            else (root / raw_common_directory).resolve()
+        )
         if (
-            len(lines) != 2
+            len(lines) != 4
             or Path(lines[0]).resolve() != root
-            or GIT_OBJECT_PATTERN.fullmatch(lines[1]) is None
+            or Path(lines[1]).resolve() != expected_git_directory
+            or reported_common_directory != expected_common_directory
+            or GIT_OBJECT_PATTERN.fullmatch(lines[3]) is None
         ):
             return False
         committed = subprocess.run(
@@ -551,13 +688,13 @@ def load_embedded_training_contract(
     root: str | Path = ".",
     *,
     require_project_identity: bool = False,
+    allow_local_checkout: bool = False,
 ) -> EmbeddedTrainingContract | None:
     """Load and validate an extracted format-2 training contract, if present.
 
-    A metadata-free source tree is accepted only as an existing operator-owned
-    Git checkout. This prevents accidental or partial bundle stripping; it is
-    not an out-of-tree signature against an account owner who deliberately
-    creates and commits a new repository after deleting the bundle contract.
+    A metadata-free source tree fails closed unless the caller explicitly opts
+    into local checkout mode. Git validation is then a development sanity check,
+    not an integrity substitute for the missing manifest.
     """
 
     unresolved_root = Path(root)
@@ -577,16 +714,18 @@ def load_embedded_training_contract(
     manifest_exists = _entry_exists(manifest_path, label=MANIFEST_NAME)
     checksums_exists = _entry_exists(checksums_path, label=CHECKSUMS_NAME)
     if not manifest_exists and not checksums_exists:
-        # Source-layout callers are either authenticated bundles or real Git
-        # checkouts. A directory merely named .git is not enough: require a
-        # resolvable HEAD rooted here and the verifier itself in the index.
-        if (
-            require_project_identity or _looks_like_project_source_tree(bundle_root)
-        ) and not _is_valid_project_git_checkout(bundle_root):
-            raise BundleContractError(
-                "the source-layout project has no GPU bundle integrity metadata and is "
-                "not a valid Git checkout; re-extract the reviewed bundle"
-            )
+        project_source = require_project_identity or _looks_like_project_source_tree(bundle_root)
+        if project_source:
+            if not allow_local_checkout:
+                raise BundleContractError(
+                    "the source-layout project has no GPU bundle integrity metadata; "
+                    "re-extract a reviewed bundle, or pass --allow-local-checkout only "
+                    "for an intentionally trusted development checkout"
+                )
+            if not _is_valid_project_git_checkout(bundle_root):
+                raise BundleContractError(
+                    "the explicitly trusted local source tree is not a valid Git checkout"
+                )
         return None
     if not manifest_exists or not checksums_exists:
         raise BundleContractError(

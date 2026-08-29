@@ -121,6 +121,17 @@ def test_embedded_gpu_bundle_allows_nonmutating_prepare_only_mode(
     assert source == "sion_translate.yaml"
 
 
+def test_embedded_gpu_bundle_rejects_local_checkout_mode(tmp_path: Path) -> None:
+    write_test_bundle(tmp_path)
+
+    with pytest.raises(BundleContractError, match="cannot be used with an authenticated"):
+        train_module.preflight_embedded_bundle_config(
+            None,
+            root=tmp_path,
+            allow_local_checkout=True,
+        )
+
+
 def test_bundle_config_cannot_bypass_enforcement_from_an_outside_working_directory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -131,11 +142,104 @@ def test_bundle_config_cannot_bypass_enforcement_from_an_outside_working_directo
     outside.mkdir()
     monkeypatch.chdir(outside)
     args = train_module.build_parser().parse_args(
-        ["--config", str(bundle / "sion_translate.yaml"), "--epochs", "1"]
+        [
+            "--allow-local-checkout",
+            "--config",
+            str(bundle / "sion_translate.yaml"),
+            "--epochs",
+            "1",
+        ]
     )
 
     with pytest.raises(RuntimeError, match="must run from its extracted root"):
         train_module.resolve_config(args)
+
+
+def test_local_checkout_opt_in_reaches_an_external_config_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    active_root = tmp_path / "active"
+    external_root = tmp_path / "external"
+    active_root.mkdir()
+    external_root.mkdir()
+    config_path = external_root / "experiment.yaml"
+    config_path.write_text("{}\n", encoding="utf-8")
+    observed: list[tuple[Path, bool]] = []
+
+    def capture_contract(
+        root: str | Path,
+        *,
+        require_project_identity: bool = False,
+        allow_local_checkout: bool = False,
+    ) -> None:
+        del require_project_identity
+        observed.append((Path(root).resolve(), allow_local_checkout))
+        return None
+
+    monkeypatch.setattr(
+        train_module,
+        "load_embedded_training_contract",
+        capture_contract,
+    )
+
+    assert (
+        train_module.preflight_embedded_bundle_config(
+            str(config_path),
+            root=active_root,
+            allow_local_checkout=True,
+        )
+        is None
+    )
+    assert observed == [(active_root.resolve(), True), (external_root.resolve(), True)]
+
+
+def test_transient_contract_cannot_be_consumed_between_absent_observations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    (local_root / "sion_translate.yaml").write_text(
+        "data:\n  language_pairs: [[de, fr]]\n",
+        encoding="utf-8",
+    )
+    transient_root = tmp_path / "transient-bundle"
+    write_test_bundle(
+        transient_root,
+        language_pairs=(("es", "it"),),
+        translation_directions=(("es", "it"),),
+    )
+    transient_contract = train_module.load_embedded_training_contract(transient_root)
+    assert transient_contract is not None
+    observations = iter([None, transient_contract, None])
+    observation_count = 0
+
+    def next_contract(*_args: object, **_kwargs: object):
+        nonlocal observation_count
+        observation_count += 1
+        return next(observations)
+
+    monkeypatch.chdir(local_root)
+    monkeypatch.setattr(
+        train_module,
+        "preflight_embedded_bundle_config",
+        next_contract,
+    )
+    args = train_module.build_parser().parse_args([])
+    initial_contract = train_module.preflight_embedded_bundle_config(None)
+    _resolved, raw, _source = train_module.resolve_config(
+        args,
+        embedded_contract=initial_contract,
+    )
+
+    with pytest.raises(BundleContractError, match="changed after configuration resolution"):
+        train_module._bind_resolved_config_to_embedded_contract(
+            args,
+            raw,
+            expected_contract=initial_contract,
+        )
+    assert observation_count == 2
 
 
 @pytest.mark.parametrize("copy_authenticated_config", [False, True])
@@ -171,6 +275,25 @@ def test_bundle_rejects_a_training_cli_loaded_from_another_source_tree(
     args = train_module.build_parser().parse_args([])
 
     with pytest.raises(RuntimeError, match="must execute the source tree carried"):
+        train_module.resolve_config(args)
+
+
+def test_installed_cli_cannot_downgrade_a_bundle_after_source_removal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = tmp_path / "bundle"
+    write_test_bundle(bundle)
+    (bundle / "PACKAGE_MANIFEST.json").unlink()
+    (bundle / "SHA256SUMS").unlink()
+    (bundle / "src").rename(bundle / "removed-source")
+    installed_source = tmp_path / "installed-package"
+    installed_source.mkdir()
+    monkeypatch.setattr(train_module, "SOURCE_PROJECT_ROOT", installed_source)
+    monkeypatch.chdir(bundle)
+    args = train_module.build_parser().parse_args([])
+
+    with pytest.raises(BundleContractError, match="pass --allow-local-checkout"):
         train_module.resolve_config(args)
 
 
@@ -220,6 +343,8 @@ def test_resolved_config_rejects_a_self_consistent_bundle_swap(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(train_module, "SOURCE_PROJECT_ROOT", tmp_path)
     args = train_module.build_parser().parse_args([])
+    initial_contract = train_module.load_embedded_training_contract(tmp_path)
+    assert initial_contract is not None
     _resolved, raw, _source = train_module.resolve_config(args)
     write_test_bundle(
         tmp_path,
@@ -229,7 +354,49 @@ def test_resolved_config_rejects_a_self_consistent_bundle_swap(
     )
 
     with pytest.raises(BundleContractError, match="changed after configuration resolution"):
-        train_module._bind_resolved_config_to_embedded_contract(args, raw)
+        train_module._bind_resolved_config_to_embedded_contract(
+            args,
+            raw,
+            expected_contract=initial_contract,
+        )
+
+
+def test_resolved_bundle_cannot_downgrade_to_local_checkout_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    write_test_bundle(tmp_path)
+
+    def run_git(*arguments: str) -> None:
+        subprocess.run(
+            ["git", *arguments],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    run_git("init", "-q")
+    run_git("config", "user.name", "Bundle Contract Test")
+    run_git("config", "user.email", "bundle-contract@example.invalid")
+    run_git("add", ".")
+    run_git("commit", "-qm", "initialize authenticated bundle")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(train_module, "SOURCE_PROJECT_ROOT", tmp_path)
+    args = train_module.build_parser().parse_args([])
+    initial_contract = train_module.load_embedded_training_contract(tmp_path)
+    assert initial_contract is not None
+    _resolved, raw, _source = train_module.resolve_config(args)
+    (tmp_path / "PACKAGE_MANIFEST.json").unlink()
+    (tmp_path / "SHA256SUMS").unlink()
+    args.allow_local_checkout = True
+
+    with pytest.raises(BundleContractError, match="changed after configuration resolution"):
+        train_module._bind_resolved_config_to_embedded_contract(
+            args,
+            raw,
+            expected_contract=initial_contract,
+        )
 
 
 def test_artifact_preparation_rejects_a_contract_swap_before_source_scanning(
@@ -346,6 +513,8 @@ def test_artifact_preparation_rejects_rogue_bundle_sources_before_mutation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     write_test_bundle(tmp_path)
+    contract = train_module.load_embedded_training_contract(tmp_path)
+    assert contract is not None
     rogue = tmp_path / "data" / "rogue.jsonl"
     rogue.parent.mkdir(exist_ok=True)
     rogue.write_text('{"de":"eins","fr":"un"}\n', encoding="utf-8")
@@ -368,6 +537,7 @@ def test_artifact_preparation_rejects_rogue_bundle_sources_before_mutation(
             config,
             SimpleNamespace(is_main=True),
             locks_held=True,
+            embedded_contract=contract,
         )
 
     assert translation_manifest.read_bytes() == original_manifest
@@ -379,6 +549,8 @@ def test_artifact_preparation_hashes_the_full_bundle_before_scanning_sources(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     write_test_bundle(tmp_path)
+    contract = train_module.load_embedded_training_contract(tmp_path)
+    assert contract is not None
     tokenizer = tmp_path / "artifacts" / "tokenizer" / "sion.model"
     tokenizer.write_bytes(b"tampered-tokenizer")
     monkeypatch.chdir(tmp_path)
@@ -403,6 +575,7 @@ def test_artifact_preparation_hashes_the_full_bundle_before_scanning_sources(
             config,
             SimpleNamespace(is_main=True),
             locks_held=True,
+            embedded_contract=contract,
         )
 
 
@@ -538,6 +711,125 @@ def test_preflight_requires_validation_evidence_for_every_configured_direction()
         )
 
 
+def test_authentication_failure_precedes_distributed_initialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "src" / "sion_translate").mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(train_module, "SOURCE_PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(sys, "argv", ["sion-train"])
+    monkeypatch.setattr(train_module, "configure_stdio", lambda: None)
+    monkeypatch.setattr(
+        train_module,
+        "initialize_distributed",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("distributed initialization must follow authentication")
+        ),
+    )
+
+    with pytest.raises(BundleContractError, match="pass --allow-local-checkout"):
+        train_module.main()
+
+
+def test_payload_authentication_precedes_distributed_initialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    write_test_bundle(tmp_path)
+    (tmp_path / "artifacts" / "tokenizer" / "sion.model").write_bytes(b"tampered")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(train_module, "SOURCE_PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(sys, "argv", ["sion-train"])
+    monkeypatch.setattr(train_module, "configure_stdio", lambda: None)
+    monkeypatch.setattr(
+        train_module,
+        "initialize_distributed",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("distributed initialization must follow payload authentication")
+        ),
+    )
+
+    with pytest.raises(BundleContractError, match="payload hash differs.*sion.model"):
+        train_module.main()
+
+
+def test_preinit_payload_hash_runs_on_every_local_torchrun_rank(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    write_test_bundle(tmp_path)
+    contract = train_module.load_embedded_training_contract(tmp_path)
+    assert contract is not None
+    verified: list[str] = []
+    monkeypatch.setattr(
+        train_module,
+        "verify_embedded_bundle_payload",
+        lambda observed: verified.append(observed.manifest_sha256),
+    )
+    for name, value in {
+        "WORLD_SIZE": "2",
+        "LOCAL_WORLD_SIZE": "2",
+        "GROUP_RANK": "0",
+        "MASTER_ADDR": "localhost",
+        "MASTER_PORT": "29876",
+        "TORCHELASTIC_RUN_ID": "test-preinit-payload-run",
+        "TORCHELASTIC_RESTART_COUNT": "0",
+    }.items():
+        monkeypatch.setenv(name, value)
+
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    train_module._verify_embedded_bundle_before_distributed(contract)
+    monkeypatch.setenv("LOCAL_RANK", "1")
+    train_module._verify_embedded_bundle_before_distributed(contract)
+
+    assert verified == [contract.manifest_sha256, contract.manifest_sha256]
+
+
+def test_preinit_payload_hash_ignores_untrusted_stale_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = tmp_path / "bundle"
+    write_test_bundle(bundle)
+    contract = train_module.load_embedded_training_contract(bundle)
+    assert contract is not None
+    stale_status = bundle / "runs" / ".bundle-preflight" / "forged.json"
+    stale_status.parent.mkdir(parents=True)
+    stale_status.write_text(
+        json.dumps(
+            {
+                "schema": "sion-preinit-bundle-verification-v1",
+                "manifest_sha256": contract.manifest_sha256,
+                "state": "complete",
+            }
+        ),
+        encoding="utf-8",
+    )
+    verified: list[str] = []
+    monkeypatch.setattr(
+        train_module,
+        "verify_embedded_bundle_payload",
+        lambda observed: verified.append(observed.manifest_sha256),
+    )
+    for name, value in {
+        "WORLD_SIZE": "2",
+        "LOCAL_WORLD_SIZE": "2",
+        "LOCAL_RANK": "1",
+        "GROUP_RANK": "0",
+        "MASTER_ADDR": "localhost",
+        "MASTER_PORT": "29877",
+        "TORCHELASTIC_RUN_ID": "test-linked-preinit-status",
+        "TORCHELASTIC_RESTART_COUNT": "0",
+    }.items():
+        monkeypatch.setenv(name, value)
+
+    train_module._verify_embedded_bundle_before_distributed(contract)
+
+    assert verified == [contract.manifest_sha256]
+    assert stale_status.exists()
+
+
 def test_prepare_only_runs_training_contract_preflights_before_return(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -575,7 +867,11 @@ def test_prepare_only_runs_training_contract_preflights_before_return(
             return object()
 
     plan = SimpleNamespace(enabled=False, discovery=SimpleNamespace(sources=()))
-    monkeypatch.setattr(sys, "argv", ["sion-train", "--prepare-only"])
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["sion-train", "--allow-local-checkout", "--prepare-only"],
+    )
     monkeypatch.setattr(train_module, "configure_stdio", lambda: None)
     monkeypatch.setattr(train_module, "initialize_distributed", lambda: context)
     monkeypatch.setattr(
@@ -584,7 +880,11 @@ def test_prepare_only_runs_training_contract_preflights_before_return(
     monkeypatch.setattr(train_module, "probe_environment", lambda: SimpleNamespace())
     monkeypatch.setattr(train_module, "synchronize_environment", lambda env, _context: env)
     monkeypatch.setattr(train_module, "describe_environment", lambda _env: "local CPU")
-    monkeypatch.setattr(train_module, "resolve_config", lambda _args: (config, {}, "test config"))
+    monkeypatch.setattr(
+        train_module,
+        "resolve_config",
+        lambda _args, **_kwargs: (config, {}, "test config"),
+    )
     monkeypatch.setattr(
         train_module,
         "coordinated_training_run_lock",
@@ -688,14 +988,18 @@ def test_automatic_resume_candidate_cannot_skip_raw_free_foundation_preflight(
     plan = SimpleNamespace(enabled=True, discovery=SimpleNamespace(sources=()))
     observed_requirements: list[bool] = []
 
-    monkeypatch.setattr(sys, "argv", ["sion-train"])
+    monkeypatch.setattr(sys, "argv", ["sion-train", "--allow-local-checkout"])
     monkeypatch.setattr(train_module, "configure_stdio", lambda: None)
     monkeypatch.setattr(train_module, "initialize_distributed", lambda: context)
     monkeypatch.setattr(train_module, "cleanup_distributed", lambda _context: None)
     monkeypatch.setattr(train_module, "probe_environment", lambda: SimpleNamespace())
     monkeypatch.setattr(train_module, "synchronize_environment", lambda env, _context: env)
     monkeypatch.setattr(train_module, "describe_environment", lambda _env: "local CPU")
-    monkeypatch.setattr(train_module, "resolve_config", lambda _args: (config, {}, "test config"))
+    monkeypatch.setattr(
+        train_module,
+        "resolve_config",
+        lambda _args, **_kwargs: (config, {}, "test config"),
+    )
     monkeypatch.setattr(
         train_module,
         "coordinated_training_run_lock",
@@ -1041,6 +1345,7 @@ def test_foundation_preparation_backs_up_a_file_at_the_dataset_path(
         DistributedContext(0, 0, 1, torch.device("cpu"), False),
         plan,
         locks_held=True,
+        allow_local_checkout=True,
     )
 
     assert prepared == [foundation_dataset]
@@ -2805,6 +3110,7 @@ def test_raw_free_artifact_preflight_still_checks_tokenizer_policy(
             plan,
             prepare_foundation=False,
             locks_held=True,
+            allow_local_checkout=True,
         )
 
     assert observed == [()]
@@ -2860,6 +3166,7 @@ def test_raw_free_fresh_run_preflights_foundation_before_tokenizer_use(
         prepare_foundation=False,
         require_offline_foundation=True,
         locks_held=True,
+        allow_local_checkout=True,
     )
 
     assert events == ["foundation", ("ja",)]
@@ -2911,6 +3218,7 @@ def test_explicit_direction_graph_cannot_be_backfilled_onto_a_legacy_tokenizer(
             plan,
             prepare_foundation=False,
             locks_held=True,
+            allow_local_checkout=True,
         )
 
     assert metadata_writes == []

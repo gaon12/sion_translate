@@ -110,7 +110,7 @@ def test_rejects_complete_bundle_metadata_removal_instead_of_failing_open(
     (tmp_path / "PACKAGE_MANIFEST.json").unlink()
     (tmp_path / "SHA256SUMS").unlink()
 
-    with pytest.raises(BundleContractError, match="no GPU bundle integrity metadata"):
+    with pytest.raises(BundleContractError, match="pass --allow-local-checkout"):
         load_embedded_training_contract(tmp_path)
 
 
@@ -130,7 +130,9 @@ def test_source_layout_git_checkout_without_bundle_metadata_remains_supported(
     _git(tmp_path, "add", ".")
     _git(tmp_path, "commit", "-qm", "initialize checkout")
 
-    assert load_embedded_training_contract(tmp_path) is None
+    with pytest.raises(BundleContractError, match="pass --allow-local-checkout"):
+        load_embedded_training_contract(tmp_path)
+    assert load_embedded_training_contract(tmp_path, allow_local_checkout=True) is None
     worktree = tmp_path.with_name(f"{tmp_path.name}-worktree")
     _git(
         tmp_path,
@@ -141,7 +143,32 @@ def test_source_layout_git_checkout_without_bundle_metadata_remains_supported(
         "bundle-contract-worktree",
         str(worktree),
     )
-    assert load_embedded_training_contract(worktree) is None
+    assert load_embedded_training_contract(worktree, allow_local_checkout=True) is None
+
+
+def test_source_checkout_with_a_separate_git_directory_remains_supported(
+    tmp_path: Path,
+) -> None:
+    checkout = tmp_path / "checkout"
+    git_directory = tmp_path / "separate-git-directory"
+    checkout.mkdir()
+    sentinel = checkout / "src" / "sion_translate" / "bundle_contract.py"
+    sentinel.parent.mkdir(parents=True)
+    sentinel.write_text('"""Checkout sentinel."""\n', encoding="utf-8")
+    _git(
+        tmp_path,
+        "init",
+        "-q",
+        "--separate-git-dir",
+        str(git_directory),
+        str(checkout),
+    )
+    _git(checkout, "config", "user.name", "Bundle Contract Test")
+    _git(checkout, "config", "user.email", "bundle-contract@example.invalid")
+    _git(checkout, "add", ".")
+    _git(checkout, "commit", "-qm", "initialize separate checkout")
+
+    assert load_embedded_training_contract(checkout, allow_local_checkout=True) is None
 
 
 def test_empty_git_directory_cannot_replace_removed_bundle_metadata(tmp_path: Path) -> None:
@@ -151,7 +178,7 @@ def test_empty_git_directory_cannot_replace_removed_bundle_metadata(tmp_path: Pa
     (tmp_path / ".git").mkdir()
 
     with pytest.raises(BundleContractError, match="not a valid Git checkout"):
-        load_embedded_training_contract(tmp_path)
+        load_embedded_training_contract(tmp_path, allow_local_checkout=True)
 
 
 def test_index_only_verifier_cannot_turn_a_directory_into_a_checkout(tmp_path: Path) -> None:
@@ -167,7 +194,7 @@ def test_index_only_verifier_cannot_turn_a_directory_into_a_checkout(tmp_path: P
     _git(tmp_path, "add", sentinel.relative_to(tmp_path).as_posix())
 
     with pytest.raises(BundleContractError, match="not a valid Git checkout"):
-        load_embedded_training_contract(tmp_path)
+        load_embedded_training_contract(tmp_path, allow_local_checkout=True)
 
 
 def test_git_environment_cannot_inject_a_decoy_checkout(
@@ -193,7 +220,7 @@ def test_git_environment_cannot_inject_a_decoy_checkout(
     monkeypatch.setenv("GIT_INDEX_FILE", str(decoy / ".git" / "index"))
 
     with pytest.raises(BundleContractError, match="not a valid Git checkout"):
-        load_embedded_training_contract(stripped)
+        load_embedded_training_contract(stripped, allow_local_checkout=True)
 
 
 def test_git_replacement_refs_cannot_forge_a_committed_verifier(tmp_path: Path) -> None:
@@ -217,7 +244,11 @@ def test_git_replacement_refs_cannot_forge_a_committed_verifier(tmp_path: Path) 
     sentinel.write_text('"""Uncommitted source marker."""\n', encoding="utf-8")
 
     with pytest.raises(BundleContractError, match="not a valid Git checkout"):
-        load_embedded_training_contract(tmp_path, require_project_identity=True)
+        load_embedded_training_contract(
+            tmp_path,
+            require_project_identity=True,
+            allow_local_checkout=True,
+        )
 
 
 def test_committed_symlink_cannot_stand_in_for_the_runtime_verifier(tmp_path: Path) -> None:
@@ -247,7 +278,11 @@ def test_committed_symlink_cannot_stand_in_for_the_runtime_verifier(tmp_path: Pa
     _git(tmp_path, "commit", "-qm", "commit verifier link")
 
     with pytest.raises(BundleContractError, match="not a valid Git checkout"):
-        load_embedded_training_contract(tmp_path, require_project_identity=True)
+        load_embedded_training_contract(
+            tmp_path,
+            require_project_identity=True,
+            allow_local_checkout=True,
+        )
 
 
 def test_project_local_git_executable_cannot_forge_checkout_identity(
@@ -257,12 +292,47 @@ def test_project_local_git_executable_cannot_forge_checkout_identity(
     sentinel = tmp_path / "src" / "sion_translate" / "bundle_contract.py"
     sentinel.parent.mkdir(parents=True)
     sentinel.write_text('"""Untrusted project verifier."""\n', encoding="utf-8")
+    _git(tmp_path, "init", "-q")
+    _git(tmp_path, "config", "user.name", "Bundle Contract Test")
+    _git(tmp_path, "config", "user.email", "bundle-contract@example.invalid")
+    _git(tmp_path, "add", ".")
+    _git(tmp_path, "commit", "-qm", "initialize checkout")
     fake_git = tmp_path / "git.exe"
     fake_git.write_bytes(b"not a trusted Git executable")
     monkeypatch.setattr(bundle_contract_module.shutil, "which", lambda _name: str(fake_git))
 
     with pytest.raises(BundleContractError, match="not a valid Git checkout"):
-        load_embedded_training_contract(tmp_path, require_project_identity=True)
+        load_embedded_training_contract(
+            tmp_path,
+            require_project_identity=True,
+            allow_local_checkout=True,
+        )
+
+
+def test_sibling_git_executable_cannot_replace_missing_git_administration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "stripped-project"
+    project.mkdir()
+    fake_git = tmp_path / "attacker-bin" / "git.exe"
+    fake_git.parent.mkdir()
+    fake_git.write_bytes(b"not a trusted Git executable")
+    monkeypatch.setattr(bundle_contract_module.shutil, "which", lambda _name: str(fake_git))
+    monkeypatch.setattr(
+        bundle_contract_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Git must not run without real administrative state")
+        ),
+    )
+
+    with pytest.raises(BundleContractError, match="not a valid Git checkout"):
+        load_embedded_training_contract(
+            project,
+            require_project_identity=True,
+            allow_local_checkout=True,
+        )
 
 
 def test_required_project_identity_rejects_a_missing_root(tmp_path: Path) -> None:
@@ -282,6 +352,18 @@ def test_removing_a_mutable_project_marker_cannot_hide_stripped_metadata(
     (tmp_path / "src" / "sion_translate" / "bundle_contract.py").unlink()
 
     with pytest.raises(BundleContractError, match="not a valid Git checkout"):
+        load_embedded_training_contract(tmp_path, allow_local_checkout=True)
+
+
+def test_renaming_source_cannot_hide_a_stripped_bundle_from_an_installed_cli(
+    tmp_path: Path,
+) -> None:
+    write_test_bundle(tmp_path)
+    (tmp_path / "PACKAGE_MANIFEST.json").unlink()
+    (tmp_path / "SHA256SUMS").unlink()
+    (tmp_path / "src").rename(tmp_path / "removed-source")
+
+    with pytest.raises(BundleContractError, match="pass --allow-local-checkout"):
         load_embedded_training_contract(tmp_path)
 
 
@@ -289,6 +371,10 @@ def test_unrelated_directory_with_easy_run_filename_is_not_a_project_checkout(
     tmp_path: Path,
 ) -> None:
     (tmp_path / "easy_run.py").write_text("print('unrelated experiment')\n", encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "unrelated-application"\n',
+        encoding="utf-8",
+    )
 
     assert load_embedded_training_contract(tmp_path) is None
 
@@ -301,7 +387,11 @@ def test_required_project_identity_rejects_a_fully_gutted_bundle_root(tmp_path: 
     (tmp_path / "easy_run.py").unlink(missing_ok=True)
 
     with pytest.raises(BundleContractError, match="not a valid Git checkout"):
-        load_embedded_training_contract(tmp_path, require_project_identity=True)
+        load_embedded_training_contract(
+            tmp_path,
+            require_project_identity=True,
+            allow_local_checkout=True,
+        )
 
 
 def test_dangling_integrity_metadata_is_not_treated_as_absent(tmp_path: Path) -> None:
