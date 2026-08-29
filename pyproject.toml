@@ -11,7 +11,9 @@ requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE"]
 dependencies = [
-  "numpy>=2.0",
+  # NumPy 2.5 exposes partially unknown public-function signatures to strict
+  # Pyright 1.1.411. Keep runtime and CI on the fully type-checked 2.4 line.
+  "numpy>=2.0,<2.5",
   "PyYAML>=6.0",
   "sacrebleu>=2.5",
   # 0.2.2 drops the normalization offset buffer used by the trainer and
