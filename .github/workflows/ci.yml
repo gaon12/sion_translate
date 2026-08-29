@@ -37,6 +37,9 @@ jobs:
       - name: Lint
         run: ruff check .
 
+      - name: Type check
+        run: pyright
+
       - name: Reject tracked corpus artifacts
         run: python scripts/check_repository_data.py
 
