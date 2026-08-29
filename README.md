@@ -450,10 +450,10 @@ real artifact exists.
 Use the same order for every change:
 
 ```bash
-python -m ruff format src tests
-python -m ruff check src tests
-python -m pyright src
-python -m pytest -q
+python -m ruff format .
+python -m ruff check .
+python -m pyright
+python -m pytest -p no:cacheprovider
 ```
 
 If a check fails, return to the code change, fix the cause, and run formatting, linting,
