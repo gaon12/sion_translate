@@ -36,6 +36,10 @@ import numpy as np
 import torch
 from torch import nn
 
+from sion_translate.config import (
+    DEFAULT_CANDIDATE_REFINEMENT_MIN_WORST_DIRECTION_NLL_GAIN,
+)
+
 from .distributed import DistributedContext, broadcast_text
 
 CHECKPOINT_SCHEMA = "sion-training-checkpoint-v2"
@@ -401,6 +405,7 @@ _SUPERVISED_OBJECTIVE_FIELDS = (
     "precision",
     "ema_decay",
     "sft_selection_metric",
+    "candidate_refinement_min_worst_direction_nll_gain",
 )
 
 # In MRT, the reward definition is the selection metric. Changing even one
@@ -581,6 +586,35 @@ def _normalize_identity_for_comparison(identity: Mapping[str, Any]) -> dict[str,
                     typed_model_identity["config_sha256"] = hashlib.sha256(
                         _canonical_json(typed_model_config).encode("utf-8")
                     ).hexdigest()
+    objective_identity = payload.get("objective")
+    if isinstance(objective_identity, dict):
+        typed_objective_identity = cast(dict[str, Any], objective_identity)
+        supervised_identity = typed_objective_identity.get("supervised")
+        release_margin_field = "candidate_refinement_min_worst_direction_nll_gain"
+        if (
+            isinstance(supervised_identity, dict)
+            and release_margin_field not in supervised_identity
+        ):
+            typed_supervised_identity = cast(dict[str, Any], supervised_identity)
+            # Authenticate the legacy objective before adding the new default.
+            # This preserves optimizer progress while the v2 release attestation
+            # still forces the deployable best checkpoint to be reselected.
+            old_objective = {
+                key: value for key, value in typed_objective_identity.items() if key != "sha256"
+            }
+            old_objective_sha256 = hashlib.sha256(
+                _canonical_json(old_objective).encode("utf-8")
+            ).hexdigest()
+            if typed_objective_identity.get("sha256") == old_objective_sha256:
+                typed_supervised_identity[release_margin_field] = (
+                    DEFAULT_CANDIDATE_REFINEMENT_MIN_WORST_DIRECTION_NLL_GAIN
+                )
+                normalized_objective = {
+                    key: value for key, value in typed_objective_identity.items() if key != "sha256"
+                }
+                typed_objective_identity["sha256"] = hashlib.sha256(
+                    _canonical_json(normalized_objective).encode("utf-8")
+                ).hexdigest()
     pipeline_identity = payload.get("pipeline")
     if pipeline_identity == {
         "schema": "sion-translation-pipeline-v1",
@@ -2972,6 +3006,9 @@ def _load_checkpoint_impl(
             "best_candidate_refinement_direction_count",
             "best_candidate_refinement_release_guard_passed",
             "best_candidate_refinement_worst_direction_nll_gain",
+            "best_candidate_refinement_min_worst_direction_nll_gain",
+            "candidate_refinement_sft_baseline_loss",
+            "candidate_refinement_sft_baseline_selection_metric",
         ):
             if (
                 optional_key not in progress_template

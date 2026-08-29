@@ -25,7 +25,7 @@ from sion_translate.inference import find_exported_model
 from sion_translate.model import SionForConditionalGeneration
 from sion_translate.training.distributed import DistributedContext
 from sion_translate.training.export import load_exported_model
-from sion_translate.training.objectives import MinimumRiskObjective
+from sion_translate.training.objectives import MinimumRiskObjective, ObjectiveOutput
 from sion_translate.training.trainer import (
     build_optimizer_param_groups,
     cosine_scheduler,
@@ -754,18 +754,37 @@ def refinement_release_metrics(
 
 def test_candidate_refinement_release_check_uses_the_deployed_ema_family() -> None:
     directions = (("de", "fr"), ("sw", "ar"))
-    metrics = refinement_release_metrics(directions, (0.5, 0.6))
-    metrics.update(refinement_release_metrics(directions, (-5e-7, 0.2), ema=True))
+    metrics = refinement_release_metrics(directions, (-0.5, -0.6))
+    metrics.update(refinement_release_metrics(directions, (2e-5, 0.2), ema=True))
 
     passed, key, worst_gain = trainer_module._check_candidate_refinement_release(
         metrics,
         prefer_ema=True,
         expected_directions=directions,
+        minimum_worst_direction_gain=1e-5,
     )
 
     assert passed
     assert key == "validation_ema_worst_direction_candidate_refinement_nll_gain"
-    assert worst_gain == pytest.approx(-5e-7)
+    assert worst_gain == pytest.approx(2e-5)
+
+
+@pytest.mark.parametrize("worst_gain", (0.0, 5e-6, -1e-6))
+def test_candidate_refinement_release_check_requires_a_positive_margin(
+    worst_gain: float,
+) -> None:
+    directions = (("de", "fr"), ("sw", "ar"))
+    metrics = refinement_release_metrics(directions, (worst_gain, 0.2))
+
+    passed, _, observed_worst_gain = trainer_module._check_candidate_refinement_release(
+        metrics,
+        prefer_ema=False,
+        expected_directions=directions,
+        minimum_worst_direction_gain=1e-5,
+    )
+
+    assert passed is False
+    assert observed_worst_gain == pytest.approx(worst_gain)
 
 
 def test_candidate_refinement_release_check_rejects_incomplete_evidence() -> None:
@@ -775,6 +794,7 @@ def test_candidate_refinement_release_check_rejects_incomplete_evidence() -> Non
             {},
             prefer_ema=False,
             expected_directions=directions,
+            minimum_worst_direction_gain=1e-5,
         )
 
     malformed_cases = (
@@ -800,6 +820,7 @@ def test_candidate_refinement_release_check_rejects_incomplete_evidence() -> Non
                 metrics,
                 prefer_ema=False,
                 expected_directions=directions,
+                minimum_worst_direction_gain=1e-5,
             )
 
 
@@ -813,6 +834,7 @@ def test_candidate_refinement_release_check_rejects_same_size_wrong_graph() -> N
             metrics,
             prefer_ema=False,
             expected_directions=expected_directions,
+            minimum_worst_direction_gain=1e-5,
         )
 
 
@@ -1271,20 +1293,24 @@ def test_guard_approved_export_failure_keeps_the_release_block(
             "formats": {"fp32": {"status": "error", "message": "simulated failure"}}
         },
     )
-    validation_metrics = {
-        "validation_loss": 0.5,
-        "validation_nll": 0.5,
-        "validation_perplexity": math.exp(0.5),
-        "validation_auxiliary_loss": 0.0,
-        "validation_tokens": 6.0,
-        "validation_candidate_refinement_nll_gain": 0.05,
-        **refinement_release_metrics((("ko", "ja"), ("ja", "ko")), (0.02, 0.01)),
-    }
-    monkeypatch.setattr(
-        trainer_module,
-        "evaluate",
-        lambda *args, **kwargs: dict(validation_metrics),
-    )
+    validation_calls = 0
+
+    def improving_validation_metrics(*args: object, **kwargs: object) -> dict[str, float]:
+        nonlocal validation_calls
+        validation_event = validation_calls // 2
+        validation_calls += 1
+        nll = 0.6 if validation_event == 0 else 0.5
+        return {
+            "validation_loss": nll,
+            "validation_nll": nll,
+            "validation_perplexity": math.exp(nll),
+            "validation_auxiliary_loss": 0.0,
+            "validation_tokens": 6.0,
+            "validation_candidate_refinement_nll_gain": 0.05,
+            **refinement_release_metrics((("ko", "ja"), ("ja", "ko")), (0.02, 0.01)),
+        }
+
+    monkeypatch.setattr(trainer_module, "evaluate", improving_validation_metrics)
     config = tiny_app_config(tmp_path, max_steps=1)
     config.model.experimental.candidate_refinement_enabled = True
     context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
@@ -1308,36 +1334,48 @@ def test_guard_approved_export_failure_keeps_the_release_block(
     assert latest["training_state"]["best_candidate_refinement_release_guard_passed"] is True
 
 
-def test_refinement_release_attestation_is_resumable_and_legacy_best_is_reselected(
+def test_zero_gain_identity_baseline_is_resume_only_and_attestation_is_resumable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    export_calls: list[Path] = []
+    export_calls: list[tuple[Path, int]] = []
 
-    def record_successful_export(path: Path, *args, **kwargs) -> dict[str, object]:
-        export_calls.append(Path(path))
+    def record_successful_export(
+        path: Path,
+        _model: nn.Module,
+        _model_config: ModelConfig,
+        _context: DistributedContext,
+        artifact_step: int,
+        **kwargs: object,
+    ) -> dict[str, object]:
+        export_calls.append((Path(path), artifact_step))
         return {"formats": {"fp32": {"status": "ok"}}}
 
     monkeypatch.setattr(
         "sion_translate.training.trainer.export_inference_models",
         record_successful_export,
     )
-    validation_metrics = {
-        "validation_loss": 0.5,
-        "validation_nll": 0.5,
-        "validation_perplexity": math.exp(0.5),
-        "validation_auxiliary_loss": 0.0,
-        "validation_tokens": 6.0,
-        "validation_candidate_refinement_nll_gain": 0.05,
-    }
-    validation_metrics.update(
-        refinement_release_metrics((("ko", "ja"), ("ja", "ko")), (0.02, 0.01))
-    )
-    monkeypatch.setattr(
-        trainer_module,
-        "evaluate",
-        lambda *args, **kwargs: dict(validation_metrics),
-    )
+    evaluation_calls = 0
+
+    def staged_validation_metrics(*args: object, **kwargs: object) -> dict[str, float]:
+        nonlocal evaluation_calls
+        # Raw and EMA evaluation form one validation event. Step 0 is an exact
+        # identity baseline; the first post-update event improves every edge.
+        validation_event = evaluation_calls // 2
+        evaluation_calls += 1
+        gains = (0.0, 0.0) if validation_event == 0 else (0.02, 0.01)
+        nll = 0.6 if validation_event == 0 else 0.5
+        return {
+            "validation_loss": nll,
+            "validation_nll": nll,
+            "validation_perplexity": math.exp(nll),
+            "validation_auxiliary_loss": 0.0,
+            "validation_tokens": 6.0,
+            "validation_candidate_refinement_nll_gain": min(gains),
+            **refinement_release_metrics((("ko", "ja"), ("ja", "ko")), gains),
+        }
+
+    monkeypatch.setattr(trainer_module, "evaluate", staged_validation_metrics)
     config = tiny_app_config(tmp_path, max_steps=1)
     config.model.experimental.candidate_refinement_enabled = True
     context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
@@ -1351,9 +1389,10 @@ def test_refinement_release_attestation_is_resumable_and_legacy_best_is_reselect
         language_tags={"ko": 4, "ja": 5},
     )
 
-    assert first["best_step"] == 0
+    assert first["best_step"] == 1
     assert first["candidate_refinement_release_guard_passed"] is True
-    assert export_calls == [tmp_path / "run" / "exports" / "best"]
+    assert first["candidate_refinement_min_worst_direction_nll_gain"] == pytest.approx(1e-5)
+    assert export_calls == [(tmp_path / "run" / "exports" / "best", 1)]
     assert not (tmp_path / "run" / "exports" / "best" / RELEASE_INELIGIBLE_FILENAME).exists()
     assert (tmp_path / "run" / "exports" / "latest" / RELEASE_INELIGIBLE_FILENAME).is_file()
     latest_file = tmp_path / "run" / "checkpoints" / "latest" / "checkpoint.pt"
@@ -1361,7 +1400,7 @@ def test_refinement_release_attestation_is_resumable_and_legacy_best_is_reselect
     attestation_keys = {
         key for key in payload["training_state"] if key.startswith("best_candidate_refinement_")
     }
-    assert len(attestation_keys) == 6
+    assert len(attestation_keys) == 7
     for key in attestation_keys:
         payload["training_state"].pop(key)
     torch.save(payload, latest_file)
@@ -1381,7 +1420,148 @@ def test_refinement_release_attestation_is_resumable_and_legacy_best_is_reselect
     assert resumed["step"] == 2
     assert resumed["best_step"] == 1
     assert resumed["candidate_refinement_release_guard_passed"] is True
-    assert export_calls == [tmp_path / "run" / "exports" / "best"]
+    assert export_calls == [(tmp_path / "run" / "exports" / "best", 1)]
+
+
+def test_positive_gain_sft_step_zero_is_not_deployable_or_a_regression_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Foundation-initialized weights cannot bypass the first translation update."""
+
+    export_steps: list[int] = []
+
+    def record_successful_export(
+        _path: Path,
+        _model: nn.Module,
+        _model_config: ModelConfig,
+        _context: DistributedContext,
+        artifact_step: int,
+        **kwargs: object,
+    ) -> dict[str, object]:
+        export_steps.append(artifact_step)
+        return {"formats": {"fp32": {"status": "ok"}}}
+
+    validation_calls = 0
+
+    def staged_sft_metrics(*args: object, **kwargs: object) -> dict[str, float]:
+        nonlocal validation_calls
+        nll = 0.4 if validation_calls == 0 else 0.5
+        validation_calls += 1
+        return {
+            "validation_loss": nll,
+            "validation_nll": nll,
+            "validation_perplexity": math.exp(nll),
+            "validation_auxiliary_loss": 0.0,
+            "validation_tokens": 6.0,
+            "validation_candidate_refinement_nll_gain": 0.02,
+            **refinement_release_metrics((("ko", "ja"), ("ja", "ko")), (0.02, 0.01)),
+        }
+
+    monkeypatch.setattr(trainer_module, "export_inference_models", record_successful_export)
+    monkeypatch.setattr(trainer_module, "evaluate", staged_sft_metrics)
+    config = tiny_app_config(tmp_path, max_steps=1, ema_decay=0.0)
+    config.model.experimental.candidate_refinement_enabled = True
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+
+    with pytest.raises(RuntimeError, match="release-safe best checkpoint"):
+        train(
+            SionForConditionalGeneration(config.model),
+            [tiny_batch()],
+            [tiny_batch()],
+            config,
+            context,
+            language_tags={"ko": 4, "ja": 5},
+        )
+
+    checkpoint_root = tmp_path / "run" / "checkpoints"
+    latest = torch.load(
+        checkpoint_root / "latest" / "checkpoint.pt",
+        map_location="cpu",
+        weights_only=True,
+    )
+    assert not (checkpoint_root / "best").exists()
+    assert export_steps == []
+    assert latest["training_state"]["candidate_refinement_sft_baseline_loss"] == pytest.approx(0.4)
+    assert (
+        latest["training_state"]["candidate_refinement_sft_baseline_selection_metric"]
+        == "validation_nll"
+    )
+
+
+def test_positive_gain_posttraining_stage_zero_remains_the_reward_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An inherited SFT model must survive a worse first MRT optimizer update."""
+
+    export_steps: list[int] = []
+
+    def record_successful_export(
+        _path: Path,
+        _model: nn.Module,
+        _model_config: ModelConfig,
+        _context: DistributedContext,
+        artifact_step: int,
+        **kwargs: object,
+    ) -> dict[str, object]:
+        export_steps.append(artifact_step)
+        return {"formats": {"fp32": {"status": "ok"}}}
+
+    validation_calls = 0
+
+    def staged_reward_metrics(*args: object, **kwargs: object) -> dict[str, float]:
+        nonlocal validation_calls
+        reward = 0.9 if validation_calls == 0 else 0.8
+        validation_calls += 1
+        return {
+            "validation_loss": 0.5,
+            "validation_nll": 0.5,
+            "validation_perplexity": math.exp(0.5),
+            "validation_auxiliary_loss": 0.0,
+            "validation_tokens": 6.0,
+            "validation_reward": reward,
+            "validation_candidate_refinement_nll_gain": 0.02,
+            **refinement_release_metrics((("ko", "ja"), ("ja", "ko")), (0.02, 0.01)),
+        }
+
+    class DifferentiableObjective:
+        def __call__(self, model: nn.Module, batch: dict[str, torch.Tensor]) -> ObjectiveOutput:
+            anchor = next(model.parameters()).sum() * 0.0
+            normalizer = torch.tensor(
+                float(batch["input_ids"].shape[0]),
+                device=anchor.device,
+            )
+            return ObjectiveOutput(
+                loss_sum=anchor,
+                normalizer=normalizer,
+                processed_tokens=normalizer,
+                auxiliary_loss=anchor.detach(),
+                metrics={},
+            )
+
+    monkeypatch.setattr(trainer_module, "export_inference_models", record_successful_export)
+    monkeypatch.setattr(trainer_module, "evaluate", staged_reward_metrics)
+    config = tiny_app_config(tmp_path, max_steps=1, ema_decay=0.0)
+    config.model.experimental.candidate_refinement_enabled = True
+    config.posttraining.selection_metric = "reward"
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+
+    result = train(
+        SionForConditionalGeneration(config.model),
+        [tiny_batch()],
+        [tiny_batch()],
+        config,
+        context,
+        objective=DifferentiableObjective(),
+        stage_name="posttrain/MRT",
+        language_tags={"ko": 4, "ja": 5},
+    )
+
+    assert result["best_step"] == 0
+    assert result["best_validation_reward"] == pytest.approx(0.9)
+    assert result["candidate_refinement_release_guard_passed"] is True
+    assert export_steps == [0]
 
 
 def test_guard_ineligible_resume_keeps_the_attested_best_and_selection_family(
@@ -1407,11 +1587,24 @@ def test_guard_ineligible_resume_keeps_the_attested_best_and_selection_family(
         "sion_translate.training.trainer.export_inference_models",
         record_successful_export,
     )
-    monkeypatch.setattr(
-        trainer_module,
-        "evaluate",
-        lambda *args, **kwargs: dict(active_metrics),
-    )
+    initial_validation_calls = 0
+    resumed_regression = False
+
+    def staged_guard_metrics(*args: object, **kwargs: object) -> dict[str, float]:
+        nonlocal initial_validation_calls
+        if resumed_regression:
+            return dict(active_metrics)
+        validation_event = initial_validation_calls // 2
+        initial_validation_calls += 1
+        nll = 0.6 if validation_event == 0 else 0.5
+        return {
+            **active_metrics,
+            "validation_loss": nll,
+            "validation_nll": nll,
+            "validation_perplexity": math.exp(nll),
+        }
+
+    monkeypatch.setattr(trainer_module, "evaluate", staged_guard_metrics)
     config = tiny_app_config(tmp_path, max_steps=1)
     config.model.experimental.candidate_refinement_enabled = True
     context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
@@ -1425,7 +1618,7 @@ def test_guard_ineligible_resume_keeps_the_attested_best_and_selection_family(
     )
     best_file = tmp_path / "run" / "checkpoints" / "best" / "checkpoint.pt"
     original_best_digest = hashlib.sha256(best_file.read_bytes()).hexdigest()
-    assert first["best_step"] == 0
+    assert first["best_step"] == 1
     assert first["best_selection_metric"] == "validation_ema_nll"
 
     active_metrics.update(
@@ -1438,6 +1631,7 @@ def test_guard_ineligible_resume_keeps_the_attested_best_and_selection_family(
             ),
         }
     )
+    resumed_regression = True
     export_calls.clear()
     config.training.max_steps = 2
     config.training.resume_from = str(tmp_path / "run" / "checkpoints" / "latest")
@@ -1451,7 +1645,7 @@ def test_guard_ineligible_resume_keeps_the_attested_best_and_selection_family(
     )
 
     assert resumed["step"] == 2
-    assert resumed["best_step"] == 0
+    assert resumed["best_step"] == 1
     assert resumed["best_selection_metric"] == "validation_ema_nll"
     assert resumed["selected_checkpoint_artifact_sha256"] == original_best_digest
     assert export_calls == []

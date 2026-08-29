@@ -519,8 +519,7 @@ def _selection_metric_label(key: str) -> str:
     return f"EMA {label}" if ema else label
 
 
-_CANDIDATE_REFINEMENT_GAIN_TOLERANCE = 1e-6
-_CANDIDATE_REFINEMENT_RELEASE_SCHEMA = "sion-candidate-refinement-release-v1"
+_CANDIDATE_REFINEMENT_RELEASE_SCHEMA = "sion-candidate-refinement-release-v2"
 
 
 def _check_candidate_refinement_release(
@@ -528,14 +527,22 @@ def _check_candidate_refinement_release(
     *,
     prefer_ema: bool,
     expected_directions: Sequence[Sequence[str]],
+    minimum_worst_direction_gain: float,
 ) -> tuple[bool, str, float]:
-    """Require complete held-out evidence that the deployed refiner does not regress.
+    """Require complete held-out evidence that the deployed refiner improves every edge.
 
-    A tiny negative tolerance absorbs FP32 subtraction noise around an exactly
-    neutral refiner. Missing, non-finite, partial, or extra direction evidence is
-    a validation-contract error rather than an ordinary non-improvement.
+    The strictly positive margin prevents an identity-initialized or numerically
+    neutral refiner from becoming deployable. Missing, non-finite, partial, or
+    extra direction evidence is a validation-contract error rather than an
+    ordinary non-improvement.
     """
 
+    if (
+        isinstance(minimum_worst_direction_gain, bool)
+        or not math.isfinite(minimum_worst_direction_gain)
+        or minimum_worst_direction_gain <= 0.0
+    ):
+        raise ValueError("minimum_worst_direction_gain must be finite and positive")
     canonical_directions = tuple(tuple(direction) for direction in expected_directions)
     if not canonical_directions:
         raise ValueError("candidate-refinement release checks require at least one direction")
@@ -589,7 +596,7 @@ def _check_candidate_refinement_release(
             "direction metrics"
         )
     return (
-        worst_gain >= -_CANDIDATE_REFINEMENT_GAIN_TOLERANCE,
+        worst_gain >= minimum_worst_direction_gain,
         gain_key,
         worst_gain,
     )
@@ -1185,6 +1192,8 @@ def train(
                 context,
             )
             _reset_best_training_state(training_state)
+            training_state.pop("candidate_refinement_sft_baseline_loss", None)
+            training_state.pop("candidate_refinement_sft_baseline_selection_metric", None)
         recorded_best_step = int(training_state.get("best_step", -1))
         recorded_best_value = float(training_state.get("best_validation_loss", float("inf")))
         recorded_best_artifact_sha256 = training_state.get("best_checkpoint_artifact_sha256")
@@ -1242,6 +1251,22 @@ def train(
     best_selection_metric = (
         loaded_best_selection_metric if isinstance(loaded_best_selection_metric, str) else None
     )
+    raw_sft_baseline_loss = training_state.get("candidate_refinement_sft_baseline_loss")
+    candidate_refinement_sft_baseline_loss = (
+        float(raw_sft_baseline_loss)
+        if isinstance(raw_sft_baseline_loss, (int, float))
+        and not isinstance(raw_sft_baseline_loss, bool)
+        and math.isfinite(float(raw_sft_baseline_loss))
+        else float("inf")
+    )
+    raw_sft_baseline_metric = training_state.get(
+        "candidate_refinement_sft_baseline_selection_metric"
+    )
+    candidate_refinement_sft_baseline_selection_metric = (
+        raw_sft_baseline_metric if isinstance(raw_sft_baseline_metric, str) else None
+    )
+    if not math.isfinite(candidate_refinement_sft_baseline_loss):
+        candidate_refinement_sft_baseline_selection_metric = None
     raw_best_refinement_gain = training_state.get(
         "best_candidate_refinement_worst_direction_nll_gain"
     )
@@ -1259,8 +1284,18 @@ def train(
         and not isinstance(raw_attested_direction_count, bool)
         else None
     )
+    raw_attested_minimum_gain = training_state.get(
+        "best_candidate_refinement_min_worst_direction_nll_gain"
+    )
+    attested_minimum_gain = (
+        float(raw_attested_minimum_gain)
+        if isinstance(raw_attested_minimum_gain, (int, float))
+        and not isinstance(raw_attested_minimum_gain, bool)
+        and math.isfinite(float(raw_attested_minimum_gain))
+        else None
+    )
     best_candidate_refinement_release_guard_passed = bool(
-        best_step >= 0
+        (best_step > 0 or (best_step == 0 and objective is not None))
         and best_checkpoint_artifact_sha256 is not None
         and training_state.get("best_candidate_refinement_release_guard_passed") is True
         and training_state.get("best_candidate_refinement_guard_schema")
@@ -1272,7 +1307,8 @@ def train(
         and attested_direction_count == expected_refinement_direction_count
         and best_candidate_refinement_worst_direction_nll_gain is not None
         and best_candidate_refinement_worst_direction_nll_gain
-        >= -_CANDIDATE_REFINEMENT_GAIN_TOLERANCE
+        >= training.candidate_refinement_min_worst_direction_nll_gain
+        and attested_minimum_gain == training.candidate_refinement_min_worst_direction_nll_gain
     )
     if (
         requires_candidate_refinement_release_guard
@@ -1282,7 +1318,7 @@ def train(
         announce(
             "The resumed best checkpoint has no compatible versioned candidate-refinement "
             "release attestation. Resetting best selection while retaining optimizer progress; "
-            "a new checkpoint must pass the complete directional no-regression guard before "
+            "a new checkpoint must pass the complete directional positive-improvement guard before "
             "deployment.",
             context,
         )
@@ -1355,8 +1391,26 @@ def train(
                     "best_candidate_refinement_worst_direction_nll_gain": (
                         best_candidate_refinement_worst_direction_nll_gain
                     ),
+                    "best_candidate_refinement_min_worst_direction_nll_gain": (
+                        training.candidate_refinement_min_worst_direction_nll_gain
+                    ),
                 }
             )
+            if (
+                objective is None
+                and candidate_refinement_sft_baseline_selection_metric is not None
+                and math.isfinite(candidate_refinement_sft_baseline_loss)
+            ):
+                state.update(
+                    {
+                        "candidate_refinement_sft_baseline_loss": (
+                            candidate_refinement_sft_baseline_loss
+                        ),
+                        "candidate_refinement_sft_baseline_selection_metric": (
+                            candidate_refinement_sft_baseline_selection_metric
+                        ),
+                    }
+                )
         return state
 
     def save(path: Path) -> None:
@@ -1476,6 +1530,8 @@ def train(
         nonlocal best_checkpoint_artifact_sha256, best_selection_metric
         nonlocal best_candidate_refinement_release_guard_passed
         nonlocal best_candidate_refinement_worst_direction_nll_gain
+        nonlocal candidate_refinement_sft_baseline_loss
+        nonlocal candidate_refinement_sft_baseline_selection_metric
         announce(f"Validation starting at step {step}.", context)
         metrics = evaluate(
             model,
@@ -1603,16 +1659,45 @@ def train(
                 metrics,
                 prefer_ema=ema is not None,
                 expected_directions=configured_translation_directions,
+                minimum_worst_direction_gain=(
+                    training.candidate_refinement_min_worst_direction_nll_gain
+                ),
             )
-            if not refinement_release_guard_passed:
+            if objective is None and step <= 0:
+                refinement_release_guard_passed = False
+                if math.isfinite(candidate):
+                    candidate_refinement_sft_baseline_loss = candidate
+                    candidate_refinement_sft_baseline_selection_metric = selection_key
+                announce(
+                    "Candidate-refinement release guard kept the SFT step-0 checkpoint "
+                    "resume-only because no translation optimizer update has completed. Its "
+                    "selection metric remains the floor that later SFT checkpoints must beat.",
+                    context,
+                )
+            elif not refinement_release_guard_passed:
                 announce(
                     "Candidate-refinement release guard rejected this checkpoint: "
                     f"{_selection_metric_label(refinement_gain_key)}="
-                    f"{refinement_worst_gain:.6f} is below the non-regression tolerance "
-                    f"(-{_CANDIDATE_REFINEMENT_GAIN_TOLERANCE:g}). The latest checkpoint "
-                    "remains resumable but cannot become the deployable best checkpoint.",
+                    f"{refinement_worst_gain:.6f} is below the required positive improvement "
+                    f"({training.candidate_refinement_min_worst_direction_nll_gain:g}). "
+                    "The latest checkpoint remains resumable but cannot become the deployable "
+                    "best checkpoint.",
                     context,
                 )
+        if (
+            refinement_release_guard_passed
+            and best_step < 0
+            and candidate_refinement_sft_baseline_selection_metric is not None
+            and selection_key != candidate_refinement_sft_baseline_selection_metric
+        ):
+            announce(
+                "The validation selection metric differs from the saved SFT step-0 baseline. "
+                "Discarding that incompatible comparison floor before best selection "
+                f"({candidate_refinement_sft_baseline_selection_metric!r} → {selection_key!r}).",
+                context,
+            )
+            candidate_refinement_sft_baseline_loss = float("inf")
+            candidate_refinement_sft_baseline_selection_metric = None
         if (
             refinement_release_guard_passed
             and best_selection_metric is not None
@@ -1631,9 +1716,20 @@ def train(
             best_selection_metric = None
             best_candidate_refinement_worst_direction_nll_gain = None
             best_candidate_refinement_release_guard_passed = False
+        comparison_loss = best_validation_loss
+        if (
+            requires_candidate_refinement_release_guard
+            and objective is None
+            and best_step < 0
+            and candidate_refinement_sft_baseline_selection_metric == selection_key
+        ):
+            comparison_loss = min(
+                comparison_loss,
+                candidate_refinement_sft_baseline_loss,
+            )
         improved_here = bool(
             refinement_release_guard_passed
-            and candidate < best_validation_loss - training.early_stopping_min_delta
+            and candidate < comparison_loss - training.early_stopping_min_delta
         )
         improved = broadcast_bool(improved_here if context.is_main else False, context)
         if improved:
@@ -1693,10 +1789,17 @@ def train(
         return should_stop
 
     if requires_candidate_refinement_release_guard and best_step < 0:
-        announce(
-            f"Establishing a step-{step} no-regression baseline before the first optimizer update.",
-            context,
-        )
+        if objective is None and step == 0:
+            announce(
+                "Recording the non-deployable SFT step-0 comparison baseline before the first "
+                "translation optimizer update.",
+                context,
+            )
+        else:
+            announce(
+                f"Evaluating step-{step} weights before the next optimizer update.",
+                context,
+            )
         try:
             validate_and_update_early_stopping()
         except BaseException:
@@ -2132,6 +2235,9 @@ def train(
     if requires_candidate_refinement_release_guard:
         result["candidate_refinement_release_guard_passed"] = (
             best_candidate_refinement_release_guard_passed
+        )
+        result["candidate_refinement_min_worst_direction_nll_gain"] = (
+            training.candidate_refinement_min_worst_direction_nll_gain
         )
         if best_candidate_refinement_worst_direction_nll_gain is not None:
             result["candidate_refinement_worst_direction_nll_gain"] = (

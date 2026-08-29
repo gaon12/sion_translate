@@ -617,6 +617,23 @@ def test_unknown_sft_selection_metric_is_rejected() -> None:
         config.validate()
 
 
+@pytest.mark.parametrize(
+    "minimum_gain",
+    (True, None, "0.1", 0.0, -1e-5, float("inf"), float("nan")),
+)
+def test_candidate_refinement_release_margin_must_be_finite_and_positive(
+    minimum_gain: object,
+) -> None:
+    config = AppConfig()
+    config.training.candidate_refinement_min_worst_direction_nll_gain = minimum_gain
+
+    with pytest.raises(
+        ValueError,
+        match="candidate_refinement_min_worst_direction_nll_gain must be finite and positive",
+    ):
+        config.validate()
+
+
 def test_final_export_formats_cover_all_requested_deployment_precisions() -> None:
     config = AppConfig()
     config.data.language_pair = ["ko", "ja"]

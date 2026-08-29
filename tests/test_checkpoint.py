@@ -508,12 +508,17 @@ def test_dcp_resume_rejects_a_non_integer_step_before_model_mutation(tmp_path: P
     [
         {},
         {
-            "best_candidate_refinement_guard_schema": ("sion-candidate-refinement-release-v1"),
+            "best_candidate_refinement_guard_schema": ("sion-candidate-refinement-release-v2"),
             "best_candidate_refinement_deployed_family": "ema",
             "best_candidate_refinement_direction_fingerprint": "b" * 64,
             "best_candidate_refinement_direction_count": 2,
             "best_candidate_refinement_release_guard_passed": True,
             "best_candidate_refinement_worst_direction_nll_gain": 0.0125,
+            "best_candidate_refinement_min_worst_direction_nll_gain": 1e-5,
+            "candidate_refinement_sft_baseline_loss": 0.75,
+            "candidate_refinement_sft_baseline_selection_metric": (
+                "validation_ema_macro_direction_nll"
+            ),
         },
     ],
     ids=("legacy-without-release-attestation", "versioned-release-attestation"),
@@ -2776,10 +2781,32 @@ def test_the_objective_identity_covers_the_optimizer_schedule() -> None:
         ("precision", "fp32"),
         ("ema_decay", 0.0),
         ("sft_selection_metric", "global_nll"),
+        ("candidate_refinement_min_worst_direction_nll_gain", 2e-5),
     ):
         changed = _objective_config()
         setattr(changed.training, field, value)
         assert build_objective_identity(changed.training) != baseline, field
+
+
+def test_legacy_objective_identity_injects_only_the_authenticated_release_default() -> None:
+    """Old optimizer progress remains usable without trusting a forged objective."""
+
+    current = checkpoint_module.build_objective_identity(_objective_config().training)
+    legacy = deepcopy(current)
+    release_margin_field = "candidate_refinement_min_worst_direction_nll_gain"
+    legacy["supervised"].pop(release_margin_field)
+    unhashed_legacy = {key: value for key, value in legacy.items() if key != "sha256"}
+    legacy["sha256"] = hashlib.sha256(
+        checkpoint_module._canonical_json(unhashed_legacy).encode("utf-8")
+    ).hexdigest()
+
+    normalized = checkpoint_module._normalize_identity_for_comparison({"objective": legacy})
+    assert normalized["objective"] == current
+
+    forged = deepcopy(legacy)
+    forged["sha256"] = "0" * 64
+    normalized_forged = checkpoint_module._normalize_identity_for_comparison({"objective": forged})
+    assert release_margin_field not in normalized_forged["objective"]["supervised"]
 
 
 def test_reward_weights_are_part_of_the_posttraining_identity() -> None:

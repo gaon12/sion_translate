@@ -46,6 +46,8 @@ from sion_translate.synthetic import (
     normalize_synthetic_prefixes,
 )
 
+DEFAULT_CANDIDATE_REFINEMENT_MIN_WORST_DIRECTION_NLL_GAIN = 1e-5
+
 
 @dataclass
 class ExperimentalConfig:
@@ -457,6 +459,12 @@ class TrainingConfig:
     # prevents a high-volume edge from hiding regression on a smaller edge.
     # Custom callers without direction metadata fall back to global NLL.
     sft_selection_metric: str = "macro_direction_nll"
+    # Candidate refinement may be published only after every configured direction
+    # improves by at least this held-out token-NLL margin. A positive floor keeps
+    # the identity initialization and floating-point noise release-ineligible.
+    candidate_refinement_min_worst_direction_nll_gain: float = (
+        DEFAULT_CANDIDATE_REFINEMENT_MIN_WORST_DIRECTION_NLL_GAIN
+    )
     # Exponential moving average: after each step, update shadow weights as
     # ``decay * shadow + (1 - decay) * parameter``. Zero disables EMA.
     ema_decay: float = 0.999
@@ -854,6 +862,20 @@ class AppConfig:
             raise ValueError(
                 "sft_selection_metric must be one of: "
                 + ", ".join(sorted(supported_sft_selection_metrics))
+            )
+        refinement_min_gain: object = (
+            self.training.candidate_refinement_min_worst_direction_nll_gain
+        )
+        if (
+            isinstance(refinement_min_gain, bool)
+            or not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
+                refinement_min_gain, (int, float)
+            )
+            or not math.isfinite(float(refinement_min_gain))
+            or refinement_min_gain <= 0.0
+        ):
+            raise ValueError(
+                "candidate_refinement_min_worst_direction_nll_gain must be finite and positive"
             )
         if not 0.0 <= self.training.ema_decay < 1.0:
             raise ValueError("ema_decay must be in [0, 1)")
