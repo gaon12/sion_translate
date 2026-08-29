@@ -402,7 +402,7 @@ def test_dangling_integrity_metadata_is_not_treated_as_absent(tmp_path: Path) ->
     except OSError:
         pytest.skip("this host does not permit file symlink creation")
 
-    with pytest.raises(BundleContractError, match="must be a regular file"):
+    with pytest.raises(BundleContractError, match="not a regular file"):
         load_embedded_training_contract(tmp_path)
 
 
@@ -499,7 +499,7 @@ def test_runtime_payload_verification_rejects_a_link_like_mutable_artifact_root(
     except OSError:
         pytest.skip("this host does not permit directory symlink creation")
 
-    with pytest.raises(BundleContractError, match="unsafe paths=.*artifacts/tokenizer"):
+    with pytest.raises(BundleContractError, match="unsafe paths:.*artifacts/tokenizer"):
         verify_embedded_bundle_payload(contract)
 
 
@@ -520,7 +520,7 @@ def test_runtime_payload_verification_rejects_a_nested_mutable_artifact_link(
     except OSError:
         pytest.skip("this host does not permit directory symlink creation")
 
-    with pytest.raises(BundleContractError, match="unsafe paths=.*artifacts/dataset/train"):
+    with pytest.raises(BundleContractError, match="unsafe paths:.*artifacts/dataset/train"):
         verify_embedded_bundle_payload(contract)
 
 
