@@ -205,7 +205,7 @@ GPU_PROJECT_CORE_PACKAGES = frozenset(
 GPU_PROJECT_EXPORT_PACKAGES = frozenset({"gguf", "torchao"})
 GPU_PROJECT_BUILD_PACKAGES = frozenset({"setuptools", "wheel"})
 GPU_PROJECT_CORE_REQUIREMENTS = (
-    "numpy>=2.0",
+    "numpy>=2.0,<2.5",
     "PyYAML>=6.0",
     "sacrebleu>=2.5",
     "sentencepiece==0.2.1",

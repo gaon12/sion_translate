@@ -30,8 +30,8 @@
   },
   "inputs": {
     "pyproject.toml": {
-      "sha256": "e0597fef4f79c69c0818783ce7a55f33554fc8dc6254b5469196b3b91f823ffe",
-      "size": 3016
+      "sha256": "5db40de671988eaf055ea9be14a158ccee537175f03607fe695a6f1662c00f76",
+      "size": 3175
     },
     "requirements/gpu-build.in": {
       "sha256": "ad3eff8213b717fddf55c4147eaa0cdbd1ef084417e3b5bf34779940231e31b7",
