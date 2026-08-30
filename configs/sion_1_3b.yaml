@@ -75,4 +75,9 @@ training:
   early_stopping_min_epochs: 2
   early_stopping_patience: 8
   early_stopping_min_delta: 0.001
+  # Publish candidate-refinement weights only when the deployed raw or EMA
+  # family improves every configured direction by this held-out token-NLL margin.
+  candidate_refinement_min_worst_direction_nll_gain: 0.00001
+  # Use distinct held-out rows. Repeating one scarce row cannot create release evidence.
+  candidate_refinement_min_validation_examples_per_direction: 32
   tensorboard: true

@@ -180,6 +180,12 @@ foundation:
 training:
   output_dir: runs/auto
 
+  # Publish candidate-refinement weights only when the deployed raw or EMA
+  # family improves every configured direction by this held-out token-NLL margin.
+  candidate_refinement_min_worst_direction_nll_gain: 0.00001
+  # Use distinct held-out rows. Repeating one scarce row cannot create release evidence.
+  candidate_refinement_min_validation_examples_per_direction: 32
+
 # Optional training overrides:
 #   learning_rate: 0.0003
 #   batch_size_per_gpu: 16          # Lower first after an SFT OOM.
