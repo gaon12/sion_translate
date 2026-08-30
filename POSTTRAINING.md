@@ -84,6 +84,26 @@ direction metadata, the trainer falls back to global reward and reports the fall
 This logic operates on arbitrary BCP 47 direction graphs. It does not assume a particular
 pair or a bidirectional topology.
 
+When candidate refinement is enabled, reward improvement is necessary but not sufficient for
+release. Validation uses a deterministic direction-complete cohort that balances every configured
+edge and expands the batch budget when necessary. It requires at least
+`training.candidate_refinement_min_validation_examples_per_direction` distinct held-out rows per
+edge and never repeats a scarce row to manufacture additional release evidence. The inherited SFT
+checkpoint at posttraining step zero may remain the fallback only when the deployed raw or EMA
+family improves every edge by `training.candidate_refinement_min_worst_direction_nll_gain`. A
+later MRT checkpoint must pass the same directional guard and improve the selected reward metric.
+
+The v3 release attestation binds that decision to the selected checkpoint digest, deployed family,
+exact graph, verified validation cohort, worst observed NLL gain, and configured minimum. It is
+carried into native, Transformers, and GGUF exports. Missing or contradictory evidence makes the
+artifact release-ineligible; `checkpoints/latest` remains available only for restart.
+
+The attestation is sealed only after the exporter authenticates the exact selected checkpoint,
+matches its stored guard state, and hashes the live raw or EMA deployment weights. Native loading
+requires the matching manifest entry, and Transformers loading verifies the reconstructed weight
+state. A later conversion must use the exact manifested FP32 parent; FP16 and BF16 artifacts are
+inference outputs rather than new release-authority sources.
+
 ## Why these components exist
 
 - [Minimum Risk Training for Neural Machine Translation (ACL 2016)](https://aclanthology.org/P16-1159/)

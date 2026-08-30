@@ -35,6 +35,7 @@ python -m pip install -e ".[dev,export,hangul]"
 ruff format --check .
 ruff check .
 pyright
+python scripts/check_repository_data.py
 python -m pytest -p no:cacheprovider
 ```
 
@@ -377,19 +378,40 @@ Held-out validation also measures the per-token difference
 global, target-language, directed-edge, macro-direction, and worst-direction values without
 running a second decoder pass. It checks the raw or EMA family that will actually deploy.
 
+The release cohort is derived from the configured graph rather than from named languages. It
+allocates a deterministic balanced quota to every direction, repeats rare held-out rows only as
+needed, and expands the batch budget when the graph would otherwise be incomplete. Its fingerprint
+also binds the verified prepared-dataset inventory, selected virtual indices, and distributed
+layout.
+
 For translation-capable candidate-refinement runs, checkpoint selection is fail-closed:
 
-- run a step-zero validation before the first update so a neutral or useful incoming model
-  can remain the safe fallback;
-- require finite evidence for every exact configured directed edge;
-- reject a checkpoint when its worst edge is below `-1e-6`;
+- keep the SFT step-zero checkpoint resume-only and save its selection metric as the floor that
+  later SFT checkpoints must beat after at least one optimizer update;
+- require positive finite target-token evidence for every exact configured directed edge;
+- require at least
+  `training.candidate_refinement_min_validation_examples_per_direction` distinct held-out rows
+  per edge and reject repeated-row release evidence;
+- require every edge to improve by at least
+  `training.candidate_refinement_min_worst_direction_nll_gain` (default `1e-5`);
+- allow post-training step zero to remain the fallback only because it is the inherited trained
+  SFT model, and replace it only when a later MRT checkpoint improves the selected reward;
 - keep optimizer progress resumable even when no updated checkpoint is release-safe; and
 - publish only guard-approved `exports/best`, never an unvalidated `exports/latest`.
 
-A versioned attestation stores the deployed family, graph fingerprint, edge count, and
-worst gain with the best checkpoint record. A legacy run may resume its optimizer and data
-cursor, but it must establish new release evidence. `RELEASE_INELIGIBLE.json` blocks any
-stale inference directory until a successful safe-best export replaces it.
+A v3 attestation stores the selected checkpoint step and digest, deployed family, graph
+fingerprint, edge count, validation-cohort fingerprint, worst gain, and configured minimum gain
+with the best checkpoint and every final export representation. Native loading, conversion,
+Transformers/GGUF inspection, and directory validation reject missing or inconsistent evidence.
+The exporter first authenticates the exact checkpoint generation and its stored guard fields,
+then binds the evidence to a hash of the live raw or EMA deployment state. A native file must stay
+beside the manifest entry that authenticates its bytes, and Transformers re-hashes the loaded
+native state. Use only the exact manifested FP32 artifact as a manual conversion parent; FP16 and
+BF16 outputs are deliberately rejected as new authority sources because their rounding changes the
+measured state. The SFT step-zero comparison floor also survives normal and distributed resume.
+A legacy run may resume its optimizer and data cursor, but it must establish new release evidence.
+`RELEASE_INELIGIBLE.json` blocks any stale
+inference directory until a successful safe-best export replaces it.
 
 MRT can use more memory than teacher-forced SFT. If it runs out of memory, reduce
 `posttraining.batch_size_per_gpu`, then candidate micro-batch size, candidates per source,

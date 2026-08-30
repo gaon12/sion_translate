@@ -293,17 +293,42 @@ Intermediate `exports/best` keeps only lightweight native state so large CPU con
 do not stop the H100 at every evaluation. Runs without candidate refinement may also keep
 `exports/latest` for local inspection. Candidate-refinement runs deliberately keep latest
 weights only under `checkpoints/latest`: they are restartable, but they are not deployable
-until every configured direction passes the held-out no-regression guard. After all enabled
+until every configured direction passes the held-out positive-improvement guard. After all enabled
 stages finish, the CLI restores the selected best raw or EMA weights and generates the
 requested final formats once in a transactional directory.
 
 The release check uses `NLL(provisional) - NLL(final)`, so positive values are improvements.
 It verifies the exact configured graph using the deployed raw or EMA family and rejects
-missing, extra, non-finite, or negative worst-direction evidence. A tolerance of `1e-6`
-absorbs floating-point subtraction noise around an exactly neutral refiner. The run writes
-`RELEASE_INELIGIBLE.json` into stale best/latest inference directories before training; all
-normal discovery, native loading, and directory validation paths reject the marker. Only a
-successful guard-approved best export removes it.
+missing, extra, non-finite, or insufficient worst-direction evidence. Every configured edge
+must improve by at least
+`training.candidate_refinement_min_worst_direction_nll_gain` (default `1e-5`). An exactly
+neutral refiner therefore remains release-ineligible.
+
+Validation builds a deterministic direction-complete cohort from the prepared graph. It balances
+all configured edges and automatically expands `eval_batches` until every edge can contribute at
+least `training.candidate_refinement_min_validation_examples_per_direction` distinct rows. It
+never repeats a rare row for release evidence; an undersized edge fails early with the exact
+direction and required count. The cohort identity binds the selected logical indices, per-edge
+counts, and verified dataset artifact inventory, so changing data or the distributed sampling
+contract invalidates prior evidence.
+
+For translation SFT, step zero is resume-only and supplies the validation comparison floor;
+at least one optimizer update must both beat that floor and pass the directional gain rule.
+For post-training, step zero is the inherited trained SFT model and may remain the safe reward
+fallback when it passes the same directional rule. A later MRT checkpoint replaces it only
+after improving the selected reward. These baselines and the v3 release attestation survive
+normal and distributed resume. The attestation binds the checkpoint digest, deployed family,
+language graph, direction-complete cohort, worst observed gain, and configured release floor.
+Final native, Transformers, and GGUF artifacts carry the same evidence, and validation fails if
+one representation loses or changes it. Before export, the code authenticates the selected
+checkpoint generation, compares its stored guard fields, and hashes the exact live raw or EMA
+weights. Native loading requires the matching manifest entry, while Transformers loading hashes
+the reconstructed model state. Manual conversion must start from that exact manifested FP32
+artifact; FP16 and BF16 outputs cannot become new evidence-bearing parents after lossy rounding.
+The run writes `RELEASE_INELIGIBLE.json` into stale
+best/latest inference directories before training; all normal discovery, native loading, and
+directory validation paths reject the marker. Only a successful guard-approved best export
+removes it.
 
 To recover formats manually, provide the exact graph policy:
 
@@ -365,8 +390,8 @@ print(tokenizer.batch_decode(generated, skip_special_tokens=True))
 ## 11. Verify the final artifacts
 
 `export_manifest.json` binds the state, checkpoint step, release role, pipeline lineage,
-trained directions, revision directions, candidate-refinement feature flags, tokenizer,
-token features, and each file or directory digest.
+trained directions, revision directions, candidate-refinement feature flags and v3 release
+attestation, tokenizer, token features, and each file or directory digest.
 
 ```bash
 python -c "import json,sys; from sion_translate.training.export import validate_export_directory; r=validate_export_directory('runs/auto/posttrain/exports/best'); print(json.dumps(r, indent=2)); sys.exit(0 if r['valid'] else 1)"

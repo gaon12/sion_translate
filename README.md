@@ -316,21 +316,56 @@ refined endpoint improved the held-out target token. Reports include token-weigh
 and target-language values, exact directed-edge values, a direction macro mean, and the
 worst directed edge.
 
+Release validation uses a deterministic direction-complete cohort. It derives every edge from
+the configured dataset graph, assigns each edge a balanced quota, repeats a rare held-out row
+only when needed, and expands the evaluation batch count when the requested budget cannot cover
+the graph. The cohort fingerprint binds the selected logical indices, distributed layout, and
+verified dataset artifact inventory. No language name or fixed three-language topology is built
+into this policy.
+
 Translation training treats this measurement as a release rule, not only a diagnostic.
-Before the first optimizer update, it records a safe step-zero fallback. A later checkpoint
-can become the deployable `best` only when all of these conditions hold:
+During SFT, step-zero weights are always resume-only because no translation optimizer update
+has completed. The trainer records their selected validation metric as a comparison floor.
+An SFT checkpoint can become the deployable `best` only after at least one optimizer update,
+when it improves that floor by `training.early_stopping_min_delta`, and when all of these
+conditions hold:
 
 - the checked metrics come from the same raw or EMA weight family that deployment uses;
-- every exact edge in the configured language graph is present with finite token evidence;
+- every exact edge in the configured language graph is present with positive finite target-token
+  evidence;
+- every edge contributes at least
+  `training.candidate_refinement_min_validation_examples_per_direction` distinct held-out rows
+  (default `32`), with no repeated row counted as additional evidence;
 - every per-edge gain is finite; and
-- the worst edge is non-negative, allowing only `1e-6` of numerical tolerance around zero.
+- the worst edge is at least
+  `training.candidate_refinement_min_worst_direction_nll_gain` (default `1e-5`).
 
-The versioned checkpoint attestation binds the deployed weight family and a fingerprint of
-the complete directed graph. Legacy checkpoints can still resume optimizer progress, but
-their old best record is re-evaluated before release. Guarded runs keep `checkpoints/latest`
-for restart safety but do not create `exports/latest`. A `RELEASE_INELIGIBLE.json` marker
-blocks stale inference directories from discovery, direct native loading, and export
-validation until a guard-approved `best` export succeeds.
+Post-training has a different step-zero meaning: it inherits the already trained SFT model.
+That inherited model may remain the deployable reward fallback when it passes the same positive
+per-edge gain rule. A later MRT checkpoint replaces it only when the configured reward selection
+metric also improves.
+
+The v3 release attestation binds the selected checkpoint step and digest, deployed raw or EMA
+family, complete directed graph, direction-complete cohort, observed worst-direction gain, and
+configured minimum gain. It is embedded in the export manifest, native payloads, Transformers
+sidecars, and GGUF metadata. Conversion preserves it, while direct export, loading, and directory
+validation reject a candidate-refinement artifact when the evidence is missing or inconsistent.
+Before sealing that evidence, the exporter opens the exact checkpoint generation under its
+integrity lease, matches every guard field, and hashes the live raw or EMA state that will be
+deployed. A caller-provided or self-hashed evidence object cannot grant release authority by
+itself.
+
+Current candidate-refinement native files must remain beside their `export_manifest.json`; the
+loader verifies the exact file entry before constructing the model. The Transformers loader also
+hashes the loaded native state and compares it with the embedded deployment digest. Manual format
+conversion must start from the exact manifested FP32 parent. FP16 and BF16 files remain valid
+inference outputs, but rounding makes them unsuitable as new authority-bearing conversion parents.
+The SFT comparison floor also survives normal and distributed checkpoint resume. Legacy
+checkpoints can still resume optimizer progress, but their old best record is re-evaluated before
+release. Guarded runs keep `checkpoints/latest` for restart safety but do not create
+`exports/latest`. A `RELEASE_INELIGIBLE.json` marker blocks stale inference directories from
+discovery, direct native loading, and export validation until a guard-approved `best` export
+succeeds.
 
 ## Inference
 
@@ -453,6 +488,7 @@ Use the same order for every change:
 python -m ruff format .
 python -m ruff check .
 python -m pyright
+python scripts/check_repository_data.py
 python -m pytest -p no:cacheprovider
 ```
 
