@@ -7,6 +7,9 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
+import hashlib
+import json
+import math
 import re
 from typing import Any
 
@@ -15,6 +18,7 @@ from transformers import PretrainedConfig
 
 _TRANSLATION_PIPELINE_SCHEMA = "sion-translation-pipeline-v2"
 _FOUNDATION_LINEAGE_SCHEMA = "sion-foundation-lineage-v1"
+_CANDIDATE_REFINEMENT_RELEASE_SCHEMA = "sion-candidate-refinement-release-v3"
 _LOWERCASE_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 try:
@@ -87,6 +91,7 @@ class SionConfig(PretrainedConfig):
         tokenizer_sha256: str | None = None,
         token_features_sha256: str | None = None,
         token_features_shapes: dict[str, list[int] | tuple[int, ...]] | None = None,
+        candidate_refinement_release: Mapping[str, Any] | None = None,
         pad_token_id: int = 0,
         bos_token_id: int = 2,
         eos_token_id: int = 3,
@@ -229,6 +234,14 @@ class SionConfig(PretrainedConfig):
             str(name): [int(dimension) for dimension in shape]
             for name, shape in (token_features_shapes or {}).items()
         }
+        if candidate_refinement_release is not None:
+            if not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
+                candidate_refinement_release, Mapping
+            ):
+                raise ValueError("candidate_refinement_release must be a JSON object")
+            # Set release evidence before ``super().__init__`` because Transformers
+            # may serialize the partially initialized config while validating IDs.
+            self.candidate_refinement_release = dict(candidate_refinement_release)
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -385,6 +398,144 @@ class SionConfig(PretrainedConfig):
             raise ValueError(
                 "every language pair must have at least one translation direction: "
                 f"missing={missing_pairs!r}"
+            )
+        self._validate_candidate_refinement_release(
+            current_capability_contract=current_capability_contract
+        )
+
+    def _validate_candidate_refinement_release(
+        self,
+        *,
+        current_capability_contract: bool,
+    ) -> None:
+        raw_attestation = getattr(self, "candidate_refinement_release", None)
+        candidate_enabled = bool(self.experimental.candidate_refinement_enabled)
+        must_exist = bool(
+            current_capability_contract and self.translation_capable and candidate_enabled
+        )
+        if raw_attestation is None:
+            if must_exist:
+                raise ValueError(
+                    "current candidate-refinement translation checkpoints require release evidence"
+                )
+            return
+        if not candidate_enabled or not self.translation_capable:
+            raise ValueError(
+                "candidate-refinement release evidence requires an enabled translation model"
+            )
+        if not isinstance(raw_attestation, Mapping):
+            raise ValueError("candidate_refinement_release must be a JSON object")
+
+        attestation = dict(raw_attestation)
+        expected_fields = {
+            "schema",
+            "checkpoint_step",
+            "checkpoint_artifact_sha256",
+            "deployed_family",
+            "direction_fingerprint",
+            "direction_count",
+            "validation_cohort_fingerprint",
+            "worst_direction_nll_gain",
+            "minimum_worst_direction_nll_gain",
+            "deployment_state_sha256",
+            "sha256",
+        }
+        if set(attestation) != expected_fields:
+            raise ValueError(
+                "candidate-refinement release evidence fields are incomplete or unexpected"
+            )
+        if attestation.get("schema") != _CANDIDATE_REFINEMENT_RELEASE_SCHEMA:
+            raise ValueError("candidate-refinement release evidence schema is unsupported")
+
+        checkpoint_step = attestation.get("checkpoint_step")
+        if (
+            isinstance(checkpoint_step, bool)
+            or not isinstance(checkpoint_step, int)
+            or checkpoint_step < 0
+        ):
+            raise ValueError(
+                "candidate-refinement release checkpoint_step must be a non-negative integer"
+            )
+        for field_name in (
+            "checkpoint_artifact_sha256",
+            "validation_cohort_fingerprint",
+            "deployment_state_sha256",
+        ):
+            digest = attestation.get(field_name)
+            if not isinstance(digest, str) or _LOWERCASE_SHA256_PATTERN.fullmatch(digest) is None:
+                raise ValueError(
+                    f"candidate-refinement release {field_name} must be a lowercase SHA-256 digest"
+                )
+        deployed_family = attestation.get("deployed_family")
+        if deployed_family not in {"raw", "ema"}:
+            raise ValueError("candidate-refinement release deployed_family must be 'raw' or 'ema'")
+
+        direction_count = attestation.get("direction_count")
+        if isinstance(direction_count, bool) or not isinstance(direction_count, int):
+            raise ValueError("candidate-refinement release direction_count must be an integer")
+        canonical_directions = tuple(tuple(direction) for direction in self.translation_directions)
+        expected_direction_fingerprint = hashlib.sha256(
+            json.dumps(
+                canonical_directions,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        if direction_count != len(canonical_directions):
+            raise ValueError(
+                "candidate-refinement release direction_count does not match the translation graph"
+            )
+        if attestation.get("direction_fingerprint") != expected_direction_fingerprint:
+            raise ValueError(
+                "candidate-refinement release direction fingerprint does not match the "
+                "translation graph"
+            )
+
+        raw_worst_gain = attestation.get("worst_direction_nll_gain")
+        raw_minimum_gain = attestation.get("minimum_worst_direction_nll_gain")
+        for field_name, value in (
+            ("worst_direction_nll_gain", raw_worst_gain),
+            ("minimum_worst_direction_nll_gain", raw_minimum_gain),
+        ):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"candidate-refinement release {field_name} must be a number")
+        worst_gain = float(raw_worst_gain)
+        minimum_gain = float(raw_minimum_gain)
+        if (
+            not math.isfinite(worst_gain)
+            or not math.isfinite(minimum_gain)
+            or minimum_gain <= 0.0
+            or worst_gain < minimum_gain
+        ):
+            raise ValueError(
+                "candidate-refinement release gains must be finite and the worst gain "
+                "must meet the positive minimum"
+            )
+
+        rebuilt = {
+            "schema": _CANDIDATE_REFINEMENT_RELEASE_SCHEMA,
+            "checkpoint_step": checkpoint_step,
+            "checkpoint_artifact_sha256": attestation["checkpoint_artifact_sha256"],
+            "deployed_family": deployed_family,
+            "direction_fingerprint": expected_direction_fingerprint,
+            "direction_count": len(canonical_directions),
+            "validation_cohort_fingerprint": attestation["validation_cohort_fingerprint"],
+            "worst_direction_nll_gain": worst_gain,
+            "minimum_worst_direction_nll_gain": minimum_gain,
+            "deployment_state_sha256": attestation["deployment_state_sha256"],
+        }
+        rebuilt["sha256"] = hashlib.sha256(
+            json.dumps(
+                rebuilt,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        if attestation != rebuilt:
+            raise ValueError(
+                "candidate-refinement release evidence does not match its graph or digest"
             )
 
     def _validate_pipeline_identity(self) -> None:

@@ -18,6 +18,7 @@ import torch
 
 import sion_translate.data.prepare as prepare_module
 from sion_translate.data import (
+    DirectionCompleteValidationBatchSampler,
     DistributedBucketBatchSampler,
     IndexedParallelDataset,
     SionBatchCollator,
@@ -512,6 +513,125 @@ def test_prepare_expands_a_six_language_complete_graph_without_language_branches
         assert serialized["tgt_tokens"] == expected_tgt_tokens
     assert stats.src_tokens == expected_src_tokens
     assert stats.tgt_tokens == expected_tgt_tokens
+
+
+def test_direction_complete_validation_covers_an_imbalanced_arbitrary_graph(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    languages = ("de", "fr", "sw", "ar")
+    graph = (("de", "fr"), ("fr", "de"), ("sw", "ar"))
+
+    class GraphTokenizer(_FakePrepareTokenizer):
+        pass
+
+    GraphTokenizer.languages = languages
+    source = tmp_path / "imbalanced-graph.jsonl"
+    tokenizer = tmp_path / "sion.model"
+    output = tmp_path / "dataset"
+    rows = [
+        {
+            "de": f"A sufficiently long German validation sentence number {index}.",
+            "fr": f"Une phrase française de validation assez longue numéro {index}.",
+        }
+        for index in range(20)
+    ]
+    rows.append(
+        {
+            "sw": "Sentensi ndefu ya uthibitishaji wa Kiswahili kwa ukingo adimu.",
+            "ar": "جملة تحقق عربية طويلة بما يكفي للاتجاه النادر في الرسم.",
+        }
+    )
+    source.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    tokenizer.write_bytes(b"arbitrary-graph-tokenizer")
+    monkeypatch.setattr(prepare_module, "SionTokenizer", GraphTokenizer)
+    prepare_module.prepare_dataset(
+        [str(source)],
+        tokenizer,
+        output,
+        shard_size=32,
+        validation_fraction=0.0,
+        test_fraction=0.0,
+        filter_quality=False,
+        dedup_backend="memory",
+        language_pairs=(("de", "fr"), ("sw", "ar")),
+        translation_directions=graph,
+        num_workers=1,
+    )
+    verified_inventory_sha256 = prepare_module.validate_dataset_artifact_inventory(output)
+    dataset = IndexedParallelDataset(
+        output,
+        "train",
+        bidirectional=True,
+        verify_integrity=False,
+        verified_artifact_inventory_sha256=verified_inventory_sha256,
+    )
+    assert dataset.verify_integrity is False
+    assert dataset.artifact_inventory_sha256 == verified_inventory_sha256
+
+    grouped = dataset.virtual_indices_by_translation_direction(graph)
+    assert {direction: len(indices) for direction, indices in grouped.items()} == {
+        ("de", "fr"): 20,
+        ("fr", "de"): 20,
+        ("sw", "ar"): 1,
+    }
+
+    samplers = [
+        DirectionCompleteValidationBatchSampler(
+            dataset,
+            batch_size=1,
+            directions=graph,
+            max_batches=1,
+            rank=rank,
+            world_size=2,
+            seed=19,
+        )
+        for rank in range(2)
+    ]
+    assert [len(sampler) for sampler in samplers] == [2, 2]
+    assert samplers[0].cohort_fingerprint == samplers[1].cohort_fingerprint
+    assert samplers[0].cohort_identity["dataset_split"] == "train"
+    assert (
+        samplers[0].cohort_identity["dataset_artifact_inventory_sha256"]
+        == dataset.artifact_inventory_sha256
+    )
+    selected_directions = {
+        (str(dataset[index]["src_language"]), str(dataset[index]["target_language"]))
+        for sampler in samplers
+        for batch in sampler
+        for index in batch
+    }
+    assert selected_directions == set(graph)
+    assert list(samplers[0]) == list(samplers[0])
+
+    with pytest.raises(
+        ValueError,
+        match=r"requires 2 distinct examples for direction sw->ar.*contains only 1",
+    ):
+        DirectionCompleteValidationBatchSampler(
+            dataset,
+            batch_size=1,
+            directions=graph,
+            max_batches=1,
+            minimum_examples_per_direction=2,
+            require_unique_examples=True,
+        )
+
+    unique_sampler = DirectionCompleteValidationBatchSampler(
+        dataset,
+        batch_size=2,
+        directions=graph[:2],
+        max_batches=1,
+        minimum_examples_per_direction=10,
+        require_unique_examples=True,
+    )
+    unique_indices = [index for batch in unique_sampler for index in batch]
+    assert len(unique_indices) == len(set(unique_indices)) == 20
+    assert unique_sampler.cohort_identity["minimum_examples_per_direction"] == 10
+    assert unique_sampler.cohort_identity["unique_examples_required"] is True
 
 
 def test_prepare_capacity_plan_covers_large_supported_metadata(

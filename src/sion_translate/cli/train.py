@@ -39,6 +39,7 @@ import secrets
 import tempfile
 import threading
 import time
+from collections.abc import Mapping
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -68,6 +69,7 @@ from sion_translate.config import (
 )
 from sion_translate.console import configure_stdio
 from sion_translate.data import (
+    DirectionCompleteValidationBatchSampler,
     DistributedBucketBatchSampler,
     IndexedParallelDataset,
     SionBatchCollator,
@@ -888,6 +890,8 @@ def export_final_model(
     translation_directions: Sequence[Sequence[str]] | None = None,
     authenticated_revision_directions: Sequence[Sequence[str]] | None = None,
     pipeline_identity: dict[str, Any] | None = None,
+    candidate_refinement_release_attestation: Mapping[str, Any] | None = None,
+    candidate_refinement_checkpoint_source: str | Path | None = None,
 ) -> Path:
     """Create the required final format set from the restored best weights."""
 
@@ -898,6 +902,18 @@ def export_final_model(
     )
     if translation_capable and translation_directions is None:
         translation_directions = config.data.configured_translation_directions()
+    if (
+        translation_capable
+        and config.model.experimental.candidate_refinement_enabled
+        and (
+            candidate_refinement_release_attestation is None
+            or candidate_refinement_checkpoint_source is None
+        )
+    ):
+        raise ValueError(
+            "candidate-refinement final export requires the selected checkpoint's "
+            "release attestation and authenticated source"
+        )
     if not translation_capable:
         if authenticated_revision_directions:
             raise ValueError("foundation exports cannot contain revision directions")
@@ -993,6 +1009,8 @@ def export_final_model(
             bidirectional=config.data.bidirectional,
             revision_directions=export_revision_directions,
             revision_trained=bool(export_revision_directions),
+            candidate_refinement_release_attestation=(candidate_refinement_release_attestation),
+            candidate_refinement_checkpoint_source=candidate_refinement_checkpoint_source,
             strict=True,
         )
     except BaseException as error:
@@ -2199,14 +2217,14 @@ def ensure_artifacts(
     locks_held: bool = False,
     embedded_contract: EmbeddedTrainingContract | None = None,
     allow_local_checkout: bool = False,
-) -> None:
-    """Prepare artifacts on rank 0 without timing out the training process group."""
+) -> dict[str, Any]:
+    """Prepare artifacts and return the inventory identity agreed by every rank."""
 
     if foundation_plan is None:
         foundation_plan = plan_foundation_stage(config)
     if not locks_held:
         with coordinated_artifact_run_locks(config, foundation_plan, context):
-            ensure_artifacts(
+            return ensure_artifacts(
                 config,
                 context,
                 foundation_plan,
@@ -2216,7 +2234,6 @@ def ensure_artifacts(
                 embedded_contract=embedded_contract,
                 allow_local_checkout=allow_local_checkout,
             )
-        return
     _run_long_rank_zero_action(
         context,
         Path(config.training.output_dir) / ".artifact-preparation-status.json",
@@ -2232,7 +2249,7 @@ def ensure_artifacts(
             allow_local_checkout=allow_local_checkout,
         ),
     )
-    _verify_prepared_artifact_consensus(
+    return _verify_prepared_artifact_consensus(
         config,
         foundation_plan,
         context,
@@ -4380,7 +4397,7 @@ def main() -> None:
                 and not explicit_pretrain_resume
             )
         )
-        ensure_artifacts(
+        prepared_artifact_identity = ensure_artifacts(
             config,
             context,
             foundation_plan,
@@ -4396,6 +4413,13 @@ def main() -> None:
             embedded_contract=embedded_contract,
             allow_local_checkout=args.allow_local_checkout,
         )
+        translation_artifact_inventory_sha256 = prepared_artifact_identity.get(
+            "translation_artifact_inventory_sha256"
+        )
+        if not isinstance(translation_artifact_inventory_sha256, str):
+            raise RuntimeError(
+                "prepared translation artifact consensus did not return an inventory digest"
+            )
         tokenizer = SionTokenizer(config.data.tokenizer_model)
         config.model.vocab_size = len(tokenizer)
         preflight_morphoscript_token_features(config, tokenizer)
@@ -4407,6 +4431,7 @@ def main() -> None:
             legacy_bidirectional=config.data.bidirectional,
             legacy_language_pairs=config.data.configured_language_pairs(),
             verify_integrity=False,
+            verified_artifact_inventory_sha256=translation_artifact_inventory_sha256,
         )
         validation_dataset = IndexedParallelDataset(
             config.data.dataset_dir,
@@ -4415,6 +4440,7 @@ def main() -> None:
             legacy_bidirectional=config.data.bidirectional,
             legacy_language_pairs=config.data.configured_language_pairs(),
             verify_integrity=False,
+            verified_artifact_inventory_sha256=translation_artifact_inventory_sha256,
         )
         preflight_dataset_direction_contract(config, train_dataset, require_all_pairs=True)
         preflight_dataset_direction_contract(
@@ -4551,7 +4577,7 @@ def main() -> None:
         # The sampler buckets similar lengths to reduce padding and partitions
         # batches across ranks without overlap during distributed training.
         post_sampler: DistributedBucketBatchSampler | None = None
-        post_validation_sampler: DistributedBucketBatchSampler | None = None
+        post_validation_sampler: DirectionCompleteValidationBatchSampler | None = None
         if post_config is not None:
             post = config.posttraining
             post_sampler = DistributedBucketBatchSampler(
@@ -4566,21 +4592,35 @@ def main() -> None:
                 max_source_upsampling=config.data.max_source_upsampling,
                 language_pair_sampling_alpha=config.data.language_pair_sampling_alpha,
             )
-            post_validation_sampler = DistributedBucketBatchSampler(
+            post_validation_sampler = DirectionCompleteValidationBatchSampler(
                 validation_dataset,
                 post.eval_batch_size_per_gpu,
+                directions=config.data.configured_translation_directions(),
+                max_batches=post_config.training.eval_batches,
                 rank=context.rank,
                 world_size=context.world_size,
-                bucket_size=config.data.bucket_size,
                 seed=config.training.seed + 3,
+                minimum_examples_per_direction=(
+                    config.training.candidate_refinement_min_validation_examples_per_direction
+                    if config.model.experimental.candidate_refinement_enabled
+                    else 1
+                ),
+                require_unique_examples=(config.model.experimental.candidate_refinement_enabled),
             )
-        validation_sampler = DistributedBucketBatchSampler(
+        validation_sampler = DirectionCompleteValidationBatchSampler(
             validation_dataset,
             config.training.batch_size_per_gpu,
+            directions=config.data.configured_translation_directions(),
+            max_batches=config.training.eval_batches,
             rank=context.rank,
             world_size=context.world_size,
-            bucket_size=config.data.bucket_size,
             seed=config.training.seed + 1,
+            minimum_examples_per_direction=(
+                config.training.candidate_refinement_min_validation_examples_per_direction
+                if config.model.experimental.candidate_refinement_enabled
+                else 1
+            ),
+            require_unique_examples=config.model.experimental.candidate_refinement_enabled,
         )
         train_loader_args = dataloader_runtime_kwargs(
             config.data.num_workers,
@@ -4904,10 +4944,46 @@ def main() -> None:
                     context,
                 )
             final_step = int(posttrain_result["selected_step"])
+            final_result = posttrain_result
         else:
             announce("posttraining.enabled=false; skipping posttraining.", context)
             assert pretrain_result is not None
             final_step = int(pretrain_result["selected_step"])
+            final_result = pretrain_result
+
+        candidate_refinement_release_attestation: Mapping[str, Any] | None = None
+        candidate_refinement_checkpoint_source: str | Path | None = None
+        raw_release_attestation = final_result.get("candidate_refinement_release_attestation_json")
+        if config.model.experimental.candidate_refinement_enabled:
+            if not isinstance(raw_release_attestation, str):
+                raise RuntimeError(
+                    "selected candidate-refinement checkpoint has no serialized release attestation"
+                )
+            try:
+                decoded_release_attestation: object = json.loads(raw_release_attestation)
+            except json.JSONDecodeError as error:
+                raise RuntimeError(
+                    "selected candidate-refinement checkpoint has malformed release evidence"
+                ) from error
+            if not isinstance(decoded_release_attestation, dict):
+                raise RuntimeError(
+                    "selected candidate-refinement checkpoint release evidence must be an object"
+                )
+            candidate_refinement_release_attestation = cast(
+                Mapping[str, Any],
+                decoded_release_attestation,
+            )
+            raw_checkpoint_source = final_result.get("selected_checkpoint_source")
+            if not isinstance(raw_checkpoint_source, str) or not raw_checkpoint_source:
+                raise RuntimeError(
+                    "selected candidate-refinement checkpoint has no authenticated source path"
+                )
+            candidate_refinement_checkpoint_source = raw_checkpoint_source
+        elif raw_release_attestation is not None:
+            raise RuntimeError(
+                "non-refinement training unexpectedly returned candidate-refinement "
+                "release evidence"
+            )
 
         # Intermediate best/latest checkpoints store only lightweight formats
         # needed for resume and quick validation. After every training stage, emit
@@ -4928,6 +5004,8 @@ def main() -> None:
             step=final_step,
             authenticated_revision_directions=revision_directions,
             pipeline_identity=pipeline_identity,
+            candidate_refinement_release_attestation=(candidate_refinement_release_attestation),
+            candidate_refinement_checkpoint_source=candidate_refinement_checkpoint_source,
         )
         announce(f"Final model export validation complete: {final_export_dir}", context)
     finally:

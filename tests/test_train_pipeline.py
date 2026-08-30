@@ -50,6 +50,7 @@ from sion_translate.training.distributed import (
     parallelize_model,
     resolve_parallel_strategy,
 )
+from sion_translate.training.export import build_candidate_refinement_release_attestation
 
 
 class WorkerIterator:
@@ -842,6 +843,8 @@ def test_prepare_only_runs_training_contract_preflights_before_return(
     config.training.output_dir = str(tmp_path / "run")
     context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
     events: list[str] = []
+    artifact_inventory_sha256 = "a" * 64
+    dataset_open_options: list[dict[str, object]] = []
 
     class TokenizerStub:
         draft_id = 17
@@ -915,7 +918,10 @@ def test_prepare_only_runs_training_contract_preflights_before_return(
     monkeypatch.setattr(
         train_module,
         "ensure_artifacts",
-        lambda *_args, **_kwargs: events.append("artifacts"),
+        lambda *_args, **_kwargs: (
+            events.append("artifacts")
+            or {"translation_artifact_inventory_sha256": artifact_inventory_sha256}
+        ),
     )
     monkeypatch.setattr(train_module, "SionTokenizer", lambda _path: TokenizerStub())
     monkeypatch.setattr(
@@ -923,11 +929,12 @@ def test_prepare_only_runs_training_contract_preflights_before_return(
         "preflight_morphoscript_token_features",
         lambda *_args: events.append("token features"),
     )
-    monkeypatch.setattr(
-        train_module,
-        "IndexedParallelDataset",
-        lambda _root, split, **_kwargs: DatasetStub(split),
-    )
+
+    def open_dataset(_root: object, split: str, **kwargs: object) -> DatasetStub:
+        dataset_open_options.append(kwargs)
+        return DatasetStub(split)
+
+    monkeypatch.setattr(train_module, "IndexedParallelDataset", open_dataset)
     monkeypatch.setattr(
         train_module,
         "preflight_dataset_direction_contract",
@@ -968,6 +975,22 @@ def test_prepare_only_runs_training_contract_preflights_before_return(
         "automatic data settings",
         "effective sampling",
         "cleanup",
+    ]
+    assert dataset_open_options == [
+        {
+            "bidirectional": True,
+            "legacy_bidirectional": True,
+            "legacy_language_pairs": (("de", "fr"),),
+            "verify_integrity": False,
+            "verified_artifact_inventory_sha256": artifact_inventory_sha256,
+        },
+        {
+            "bidirectional": True,
+            "legacy_bidirectional": True,
+            "legacy_language_pairs": (("de", "fr"),),
+            "verify_integrity": False,
+            "verified_artifact_inventory_sha256": artifact_inventory_sha256,
+        },
     ]
 
 
@@ -1449,6 +1472,56 @@ def test_final_export_wires_all_formats_and_model_sidecars(
         "branch": "translation-only",
     }
     assert kwargs["strict"] is True
+
+
+def test_candidate_refinement_final_export_requires_and_forwards_release_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = AppConfig()
+    config.data.language_pair = ["de", "fr"]
+    config.model.experimental.candidate_refinement_enabled = True
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+    attestation = build_candidate_refinement_release_attestation(
+        checkpoint_step=17,
+        checkpoint_artifact_sha256="a" * 64,
+        deployed_family="raw",
+        translation_directions=config.data.configured_translation_directions(),
+        validation_cohort_fingerprint="b" * 64,
+        worst_direction_nll_gain=0.02,
+        minimum_worst_direction_nll_gain=0.00001,
+    )
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        train_module,
+        "export_inference_models",
+        lambda *_args, **kwargs: captured.update(kwargs),
+    )
+
+    with pytest.raises(ValueError, match="requires.*release attestation"):
+        export_final_model(
+            torch.nn.Linear(1, 1),
+            config,
+            context,
+            tmp_path / "missing",
+            stage="posttrain",
+            step=17,
+        )
+
+    checkpoint_source = tmp_path / "checkpoint" / "best"
+    export_final_model(
+        torch.nn.Linear(1, 1),
+        config,
+        context,
+        tmp_path / "attested",
+        stage="posttrain",
+        step=17,
+        candidate_refinement_release_attestation=attestation,
+        candidate_refinement_checkpoint_source=checkpoint_source,
+    )
+
+    assert captured["candidate_refinement_release_attestation"] == attestation
+    assert captured["candidate_refinement_checkpoint_source"] == checkpoint_source
 
 
 def test_distributed_final_export_publishes_rank_zero_failure_status(

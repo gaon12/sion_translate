@@ -14,6 +14,8 @@ import numpy as np
 import pytest
 import torch
 from safetensors import safe_open
+from safetensors.torch import load_file as load_safetensors
+from safetensors.torch import save_file as save_safetensors
 from transformers import (
     AutoConfig,
     AutoModelForSeq2SeqLM,
@@ -38,6 +40,7 @@ from sion_translate.tokenizer import SionTokenizer as NativeSionTokenizer
 from sion_translate.tokenizer import train_tokenizer
 from sion_translate.training.export import (
     _inspect_transformers_checkpoint,
+    build_candidate_refinement_release_attestation,
     build_export_metadata,
     convert_export,
     export_state_dict_formats,
@@ -62,6 +65,16 @@ def save_transformers_checkpoint(*args: Any, **kwargs: Any) -> Path:
         kwargs["translation_directions"] = [["ko", "ja"], ["ja", "ko"]]
     if translation_capable and release_version == "1.5" and "pipeline_identity" not in kwargs:
         kwargs["pipeline_identity"] = TRANSLATION_PIPELINE_IDENTITY
+    model_config = args[2] if len(args) > 2 else None
+    if (
+        isinstance(model_config, ModelConfig)
+        and model_config.experimental.candidate_refinement_enabled
+        and kwargs.get("candidate_refinement_release_attestation") is not None
+    ):
+        kwargs.setdefault(
+            "_candidate_refinement_release_authority",
+            hf_conversion._CANDIDATE_REFINEMENT_RELEASE_AUTHORITY,
+        )
     return _save_transformers_checkpoint(*args, **kwargs)
 
 
@@ -76,6 +89,23 @@ def tiny_model_config(vocab_size: int = 128) -> ModelConfig:
         d_ff=64,
         max_seq_len=32,
         dropout=0.0,
+    )
+
+
+def candidate_refinement_release_attestation(
+    state_dict: dict[str, torch.Tensor],
+) -> dict[str, Any]:
+    """Return valid release evidence for the default two-direction test graph."""
+
+    return build_candidate_refinement_release_attestation(
+        checkpoint_step=7,
+        checkpoint_artifact_sha256="a" * 64,
+        deployed_family="raw",
+        translation_directions=(("ko", "ja"), ("ja", "ko")),
+        validation_cohort_fingerprint="b" * 64,
+        worst_direction_nll_gain=0.02,
+        minimum_worst_direction_nll_gain=0.01,
+        deployment_state_sha256=hf_conversion._deployment_state_sha256(state_dict),
     )
 
 
@@ -894,14 +924,22 @@ def test_candidate_refinement_transformers_checkpoint_is_self_contained(
     native_config.experimental.candidate_refinement_steps = 1
     native_config.experimental.candidate_refinement_vocab_chunk_size = 16
     native = NativeSionForConditionalGeneration(native_config, pad_id=0).eval()
-    save_transformers_checkpoint(tmp_path, native.state_dict(), native_config)
+    release_attestation = candidate_refinement_release_attestation(native.state_dict())
+    save_transformers_checkpoint(
+        tmp_path,
+        native.state_dict(),
+        native_config,
+        candidate_refinement_release_attestation=release_attestation,
+    )
 
     generation = json.loads((tmp_path / "generation_config.json").read_text(encoding="utf-8"))
     serialized_config = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
     metadata = json.loads((tmp_path / "sion_export.json").read_text(encoding="utf-8"))
     assert generation["reasoning_level"] == 9
     assert serialized_config["default_reasoning_level"] == 9
+    assert serialized_config["candidate_refinement_release"] == release_attestation
     assert metadata["generation_defaults"]["reasoning_level"] == 9
+    assert metadata["candidate_refinement_release"] == release_attestation
     restored = AutoModelForSeq2SeqLM.from_pretrained(tmp_path, trust_remote_code=True).eval()
     assert restored.model.candidate_refinement is not None
     assert restored.config.default_reasoning_level == 9
@@ -968,6 +1006,115 @@ def test_candidate_refinement_transformers_checkpoint_is_self_contained(
             contradictory_checkpoint,
             trust_remote_code=True,
         )
+
+
+def test_candidate_refinement_transformers_checkpoint_rejects_tampered_weights(
+    tmp_path: Path,
+) -> None:
+    native_config = tiny_model_config()
+    native_config.experimental.candidate_refinement_enabled = True
+    native = NativeSionForConditionalGeneration(native_config, pad_id=0).eval()
+    save_transformers_checkpoint(
+        tmp_path,
+        native.state_dict(),
+        native_config,
+        candidate_refinement_release_attestation=(
+            candidate_refinement_release_attestation(native.state_dict())
+        ),
+    )
+
+    weight_files = sorted(tmp_path.glob("model*.safetensors"))
+    assert len(weight_files) == 1
+    weight_file = weight_files[0]
+    state_dict = load_safetensors(weight_file)
+    tensor_name = next(
+        name for name, tensor in sorted(state_dict.items()) if tensor.is_floating_point()
+    )
+    tampered = state_dict[tensor_name].clone()
+    tampered.view(-1)[0] += 1.0
+    state_dict[tensor_name] = tampered
+    save_safetensors(state_dict, weight_file, metadata={"format": "pt"})
+
+    with pytest.raises(ValueError, match="weights do not match their release evidence"):
+        AutoModelForSeq2SeqLM.from_pretrained(tmp_path, trust_remote_code=True)
+
+
+def test_direct_transformers_export_cannot_self_authorize_refinement(
+    tmp_path: Path,
+) -> None:
+    native_config = tiny_model_config()
+    native_config.experimental.candidate_refinement_enabled = True
+    native = NativeSionForConditionalGeneration(native_config, pad_id=0).eval()
+
+    with pytest.raises(ValueError, match="requires authenticated release authority"):
+        _save_transformers_checkpoint(
+            tmp_path,
+            native.state_dict(),
+            native_config,
+            languages=["ko", "ja"],
+            language_pairs=[["ko", "ja"]],
+            translation_directions=[["ko", "ja"], ["ja", "ko"]],
+            pipeline_identity=TRANSLATION_PIPELINE_IDENTITY,
+            candidate_refinement_release_attestation=(
+                candidate_refinement_release_attestation(native.state_dict())
+            ),
+        )
+
+
+@pytest.mark.parametrize("loader", ["config", "model"])
+def test_current_candidate_checkpoint_rejects_stripped_release_evidence(
+    tmp_path: Path,
+    loader: str,
+) -> None:
+    native_config = tiny_model_config()
+    native_config.experimental.candidate_refinement_enabled = True
+    native = NativeSionForConditionalGeneration(native_config, pad_id=0).eval()
+    save_transformers_checkpoint(
+        tmp_path,
+        native.state_dict(),
+        native_config,
+        candidate_refinement_release_attestation=(
+            candidate_refinement_release_attestation(native.state_dict())
+        ),
+    )
+    config_path = tmp_path / "config.json"
+    serialized_config = json.loads(config_path.read_text(encoding="utf-8"))
+    serialized_config.pop("candidate_refinement_release")
+    config_path.write_text(json.dumps(serialized_config), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="require release evidence"):
+        if loader == "config":
+            AutoConfig.from_pretrained(tmp_path, trust_remote_code=True)
+        else:
+            AutoModelForSeq2SeqLM.from_pretrained(tmp_path, trust_remote_code=True)
+
+
+@pytest.mark.parametrize("loader", ["config", "model"])
+def test_current_candidate_checkpoint_rejects_malformed_release_evidence(
+    tmp_path: Path,
+    loader: str,
+) -> None:
+    native_config = tiny_model_config()
+    native_config.experimental.candidate_refinement_enabled = True
+    native = NativeSionForConditionalGeneration(native_config, pad_id=0).eval()
+    save_transformers_checkpoint(
+        tmp_path,
+        native.state_dict(),
+        native_config,
+        candidate_refinement_release_attestation=(
+            candidate_refinement_release_attestation(native.state_dict())
+        ),
+    )
+    config_path = tmp_path / "config.json"
+    serialized_config = json.loads(config_path.read_text(encoding="utf-8"))
+    serialized_config["candidate_refinement_release"]["direction_fingerprint"] = "d" * 64
+    config_path.write_text(json.dumps(serialized_config), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="direction fingerprint does not match"):
+        if loader == "config":
+            AutoConfig.from_pretrained(tmp_path, trust_remote_code=True)
+        else:
+            AutoModelForSeq2SeqLM.from_pretrained(tmp_path, trust_remote_code=True)
 
 
 @pytest.mark.parametrize("default_reasoning_level", [True, 1.0, "1"])
@@ -1331,7 +1478,14 @@ def test_transformers_inspection_rejects_tampered_reasoning_endpoint(
     config = tiny_model_config()
     config.experimental.candidate_refinement_enabled = True
     native = NativeSionForConditionalGeneration(config, pad_id=0)
-    save_transformers_checkpoint(tmp_path, native.state_dict(), config)
+    save_transformers_checkpoint(
+        tmp_path,
+        native.state_dict(),
+        config,
+        candidate_refinement_release_attestation=(
+            candidate_refinement_release_attestation(native.state_dict())
+        ),
+    )
     export_path = tmp_path / "sion_export.json"
     payload = json.loads(export_path.read_text(encoding="utf-8"))
     payload["generation_defaults"] = {"reasoning_level": 0}
@@ -1347,7 +1501,14 @@ def test_transformers_inspection_rejects_tampered_generation_reasoning_endpoint(
     config = tiny_model_config()
     config.experimental.candidate_refinement_enabled = True
     native = NativeSionForConditionalGeneration(config, pad_id=0)
-    save_transformers_checkpoint(tmp_path, native.state_dict(), config)
+    save_transformers_checkpoint(
+        tmp_path,
+        native.state_dict(),
+        config,
+        candidate_refinement_release_attestation=(
+            candidate_refinement_release_attestation(native.state_dict())
+        ),
+    )
     generation_path = tmp_path / "generation_config.json"
     payload = json.loads(generation_path.read_text(encoding="utf-8"))
     payload["reasoning_level"] = 0

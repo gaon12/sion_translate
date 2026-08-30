@@ -508,17 +508,20 @@ def test_dcp_resume_rejects_a_non_integer_step_before_model_mutation(tmp_path: P
     [
         {},
         {
-            "best_candidate_refinement_guard_schema": ("sion-candidate-refinement-release-v2"),
+            "best_candidate_refinement_guard_schema": ("sion-candidate-refinement-release-v3"),
             "best_candidate_refinement_deployed_family": "ema",
             "best_candidate_refinement_direction_fingerprint": "b" * 64,
             "best_candidate_refinement_direction_count": 2,
             "best_candidate_refinement_release_guard_passed": True,
             "best_candidate_refinement_worst_direction_nll_gain": 0.0125,
             "best_candidate_refinement_min_worst_direction_nll_gain": 1e-5,
+            "best_candidate_refinement_validation_cohort_fingerprint": "c" * 64,
+            "best_candidate_refinement_deployment_state_sha256": "d" * 64,
             "candidate_refinement_sft_baseline_loss": 0.75,
             "candidate_refinement_sft_baseline_selection_metric": (
                 "validation_ema_macro_direction_nll"
             ),
+            "candidate_refinement_sft_baseline_validation_cohort_fingerprint": "c" * 64,
         },
     ],
     ids=("legacy-without-release-attestation", "versioned-release-attestation"),

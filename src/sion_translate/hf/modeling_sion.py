@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -71,6 +72,53 @@ class SionForConditionalGeneration(PreTrainedModel, GenerationMixin):
         # has already performed its architecture-specific initialization.
         self.post_init()
         self._synchronize_reasoning_level_default()
+
+    @staticmethod
+    def _deployment_state_sha256(state_dict: dict[str, torch.Tensor]) -> str:
+        """Hash native state bytes with the release attestation's canonical layout."""
+
+        digest = hashlib.sha256()
+        chunk_bytes = 16 * 1024 * 1024
+        for name in sorted(state_dict):
+            tensor = state_dict[name].detach()
+            if tensor.device.type == "meta":
+                raise ValueError(
+                    "candidate-refinement weights cannot be authenticated while meta tensors "
+                    "remain unloaded"
+                )
+            digest.update(name.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(str(tensor.dtype).encode("ascii"))
+            digest.update(b"\0")
+            digest.update(json.dumps(list(tensor.shape), separators=(",", ":")).encode("ascii"))
+            digest.update(b"\0")
+            raw = tensor.contiguous().view(torch.uint8).reshape(-1)
+            for start in range(0, raw.numel(), chunk_bytes):
+                chunk = raw[start : start + chunk_bytes].to(device="cpu")
+                digest.update(memoryview(chunk.numpy().tobytes()))
+        return digest.hexdigest()
+
+    def _validate_candidate_refinement_deployment_state(self) -> None:
+        if not self.config.experimental.candidate_refinement_enabled:
+            return
+        release = getattr(self.config, "candidate_refinement_release", None)
+        if not isinstance(release, dict):
+            raise ValueError("candidate-refinement model loading requires release evidence")
+        observed = self._deployment_state_sha256(dict(self.model.state_dict()))
+        if release.get("deployment_state_sha256") != observed:
+            raise ValueError(
+                "candidate-refinement model weights do not match their release evidence"
+            )
+
+    @classmethod
+    def from_pretrained(cls, *args: Any, **kwargs: Any) -> SionForConditionalGeneration:
+        """Load through Transformers, then authenticate candidate-refinement weight bytes."""
+
+        model = super().from_pretrained(*args, **kwargs)
+        if not isinstance(model, cls):
+            raise TypeError("Transformers returned an unexpected Sion model class")
+        model._validate_candidate_refinement_deployment_state()
+        return model
 
     @staticmethod
     def _validate_reasoning_level(reasoning_level: object) -> int:

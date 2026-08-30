@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import bisect
 from collections.abc import Mapping, Sequence
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -42,6 +43,7 @@ class IndexedParallelDataset(Dataset[dict[str, object]]):
         include_metadata: bool = False,
         verify_integrity: bool = True,
         allow_unverified_legacy: bool = False,
+        verified_artifact_inventory_sha256: str | None = None,
     ):
         self.root = Path(root) / split
         self.dataset_root = Path(root)
@@ -49,11 +51,31 @@ class IndexedParallelDataset(Dataset[dict[str, object]]):
         self.include_metadata = include_metadata
         self.verify_integrity = verify_integrity
         self.allow_unverified_legacy = allow_unverified_legacy
+        if verified_artifact_inventory_sha256 is not None and (
+            len(verified_artifact_inventory_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in verified_artifact_inventory_sha256
+            )
+        ):
+            raise ValueError(
+                "verified_artifact_inventory_sha256 must be a lowercase SHA-256 digest"
+            )
+        artifact_inventory_sha256 = verified_artifact_inventory_sha256
         if verify_integrity:
-            validate_dataset_artifact_inventory(
+            observed_artifact_inventory_sha256 = validate_dataset_artifact_inventory(
                 self.dataset_root,
                 require_manifest=not allow_unverified_legacy,
             )
+            if (
+                artifact_inventory_sha256 is not None
+                and artifact_inventory_sha256 != observed_artifact_inventory_sha256
+            ):
+                raise ValueError(
+                    "verified dataset artifact inventory digest does not match the dataset"
+                )
+            artifact_inventory_sha256 = observed_artifact_inventory_sha256
+        self.artifact_inventory_sha256 = artifact_inventory_sha256
         self._manifest = self._read_dataset_manifest()
         self._current_translation_schema = self._detect_current_translation_schema()
         self.legacy_bidirectional = legacy_bidirectional
@@ -661,6 +683,89 @@ class IndexedParallelDataset(Dataset[dict[str, object]]):
             direction for direction in self.translation_directions if direction in observed
         )
 
+    def virtual_indices_by_translation_direction(
+        self,
+        directions: Sequence[Sequence[str]] | None = None,
+    ) -> dict[tuple[str, str], np.ndarray]:
+        """Return every logical validation index grouped by exact directed edge.
+
+        Prepared rows are stored physically once and may expose one or two virtual
+        directions. This method resolves that compact representation without naming
+        any language in code, so a validation sampler can cover an arbitrary graph.
+        """
+
+        raw_requested = tuple(
+            self.translation_directions
+            if directions is None
+            else (tuple(direction) for direction in directions)
+        )
+        if not raw_requested:
+            raise ValueError("at least one translation direction is required")
+        if any(len(direction) != 2 for direction in raw_requested):
+            raise ValueError("translation directions must contain exactly two languages")
+        requested: tuple[tuple[str, str], ...] = tuple(
+            (direction[0], direction[1]) for direction in raw_requested
+        )
+        if len(set(requested)) != len(requested):
+            raise ValueError("translation directions must not contain duplicates")
+        unknown = [
+            direction for direction in requested if direction not in self.translation_directions
+        ]
+        if unknown:
+            raise ValueError(f"translation directions are absent from the dataset: {unknown!r}")
+
+        grouped_pairs: dict[tuple[str, str], list[np.ndarray]] = {
+            direction: [] for direction in requested
+        }
+        grouped_sides: dict[tuple[str, str], list[np.ndarray]] = {
+            direction: [] for direction in requested
+        }
+        language_to_id = {language: index for index, language in enumerate(self.languages)}
+        physical_offset = 0
+        for index in self.indices:
+            row_count = len(index)
+            if self.is_v3:
+                source_ids = np.asarray(index["src_language_id"], dtype=np.int64)
+                target_ids = np.asarray(index["tgt_language_id"], dtype=np.int64)
+                forward_only = np.asarray(index["forward_only"], dtype=np.bool_)
+            else:
+                source_language, target_language = self.language_pair
+                source_ids = np.full(row_count, language_to_id[source_language], dtype=np.int64)
+                target_ids = np.full(row_count, language_to_id[target_language], dtype=np.int64)
+                forward_only = np.zeros(row_count, dtype=np.bool_)
+            for direction in requested:
+                source_id = language_to_id[direction[0]]
+                target_id = language_to_id[direction[1]]
+                direct = (source_ids == source_id) & (target_ids == target_id)
+                direct_pairs = np.flatnonzero(direct).astype(np.int64, copy=False)
+                if len(direct_pairs):
+                    grouped_pairs[direction].append(direct_pairs + physical_offset)
+                    grouped_sides[direction].append(np.zeros(len(direct_pairs), dtype=np.int64))
+                if self.bidirectional and source_id != target_id:
+                    reverse = (source_ids == target_id) & (target_ids == source_id) & ~forward_only
+                    reverse_pairs = np.flatnonzero(reverse).astype(np.int64, copy=False)
+                    if len(reverse_pairs):
+                        grouped_pairs[direction].append(reverse_pairs + physical_offset)
+                        grouped_sides[direction].append(np.ones(len(reverse_pairs), dtype=np.int64))
+            physical_offset += row_count
+
+        result: dict[tuple[str, str], np.ndarray] = {}
+        missing: list[tuple[str, str]] = []
+        for direction in requested:
+            if not grouped_pairs[direction]:
+                missing.append(direction)
+                continue
+            pair_indices = np.concatenate(grouped_pairs[direction])
+            sides = np.concatenate(grouped_sides[direction])
+            virtual_indices = self._virtual_indices_for_pairs(pair_indices, sides)
+            result[direction] = np.sort(virtual_indices)
+        if missing:
+            raise ValueError(
+                "validation split has no logical rows for configured translation directions: "
+                f"{missing!r}"
+            )
+        return result
+
     def _load_translation_directions(self) -> tuple[tuple[str, str], ...]:
         if self._manifest:
             manifest = self._manifest
@@ -1185,6 +1290,154 @@ class IndexedParallelDataset(Dataset[dict[str, object]]):
             item["metadata"] = metadata
             item.update(metadata)
         return item
+
+
+class DirectionCompleteValidationBatchSampler(Sampler[list[int]]):
+    """Build one deterministic, direction-balanced held-out cohort per rank.
+
+    The requested batch budget is expanded when necessary so even a large or
+    highly imbalanced language graph contributes at least one logical example for
+    every configured edge. The selected cohort is stable across repeated raw/EMA
+    evaluation and checkpoint resume.
+    """
+
+    schema = "sion-direction-complete-validation-v2"
+
+    def __init__(
+        self,
+        dataset: IndexedParallelDataset,
+        batch_size: int,
+        *,
+        directions: Sequence[Sequence[str]],
+        max_batches: int,
+        rank: int = 0,
+        world_size: int = 1,
+        seed: int = 0,
+        minimum_examples_per_direction: int = 1,
+        require_unique_examples: bool = False,
+    ) -> None:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if max_batches <= 0:
+            raise ValueError("max_batches must be positive")
+        if world_size <= 0:
+            raise ValueError("world_size must be positive")
+        if not 0 <= rank < world_size:
+            raise ValueError("rank must be in [0, world_size)")
+        if type(minimum_examples_per_direction) is not int or minimum_examples_per_direction <= 0:
+            raise ValueError("minimum_examples_per_direction must be a positive integer")
+        if type(require_unique_examples) is not bool:
+            raise ValueError("require_unique_examples must be a boolean")
+        raw_directions = tuple(tuple(direction) for direction in directions)
+        if any(len(direction) != 2 for direction in raw_directions):
+            raise ValueError("translation directions must contain exactly two languages")
+        canonical_directions: tuple[tuple[str, str], ...] = tuple(
+            (direction[0], direction[1]) for direction in raw_directions
+        )
+        candidates = dataset.virtual_indices_by_translation_direction(canonical_directions)
+        dataset_artifact_inventory_sha256 = dataset.artifact_inventory_sha256
+        if (
+            not isinstance(dataset_artifact_inventory_sha256, str)
+            or len(dataset_artifact_inventory_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in dataset_artifact_inventory_sha256
+            )
+        ):
+            raise ValueError(
+                "direction-complete validation requires a verified dataset artifact inventory"
+            )
+        minimum_batches = math.ceil(
+            len(canonical_directions) * minimum_examples_per_direction / (batch_size * world_size)
+        )
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.rank = rank
+        self.world_size = world_size
+        self.seed = int(seed)
+        self.minimum_examples_per_direction = minimum_examples_per_direction
+        self.require_unique_examples = require_unique_examples
+        self.drop_last = False
+        self.minimum_batches = minimum_batches
+        self.evaluation_batches = max(max_batches, minimum_batches)
+        self.directions = canonical_directions
+
+        global_size = self.evaluation_batches * batch_size * world_size
+        base_quota, extra = divmod(global_size, len(canonical_directions))
+        selected_groups: list[np.ndarray] = []
+        direction_example_counts: list[dict[str, object]] = []
+        for direction_index, direction in enumerate(canonical_directions):
+            quota = base_quota + int(direction_index < extra)
+            direction_candidates = candidates[direction]
+            direction_rng = np.random.default_rng(self.seed + direction_index * 0x9E3779B1)
+            ordered = direction_rng.permutation(direction_candidates)
+            if require_unique_examples:
+                if quota > len(ordered):
+                    source_language, target_language = direction
+                    raise ValueError(
+                        "candidate-refinement release validation requires "
+                        f"{quota} distinct examples for direction "
+                        f"{source_language}->{target_language}, but the held-out split "
+                        f"contains only {len(ordered)}"
+                    )
+                selected = ordered[:quota]
+            else:
+                repeats, remainder = divmod(quota, len(ordered))
+                parts = [ordered] * repeats
+                if remainder:
+                    parts.append(ordered[:remainder])
+                selected = np.concatenate(parts)
+            selected_groups.append(selected)
+            direction_example_counts.append(
+                {
+                    "direction": list(direction),
+                    "available": len(ordered),
+                    "selected": quota,
+                }
+            )
+        global_indices = np.concatenate(selected_groups)
+        global_rng = np.random.default_rng(self.seed ^ 0xD1B54A32D192ED03)
+        global_rng.shuffle(global_indices)
+        self._global_indices = global_indices.astype(np.int64, copy=False)
+        self._local_indices = self._global_indices[rank::world_size]
+        if len(self._local_indices) != self.evaluation_batches * batch_size:
+            raise RuntimeError("validation cohort partition produced unequal rank sizes")
+
+        identity = {
+            "schema": self.schema,
+            "directions": [list(direction) for direction in canonical_directions],
+            "batch_size_per_rank": batch_size,
+            "world_size": world_size,
+            "evaluation_batches": self.evaluation_batches,
+            "seed": self.seed,
+            "global_examples": global_size,
+            "minimum_examples_per_direction": minimum_examples_per_direction,
+            "unique_examples_required": require_unique_examples,
+            "direction_example_counts": direction_example_counts,
+            "dataset_split": dataset.root.name,
+            "dataset_artifact_inventory_sha256": dataset_artifact_inventory_sha256,
+        }
+        digest = hashlib.sha256(
+            json.dumps(
+                identity,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        digest.update(self._global_indices.astype("<u8", copy=False).tobytes())
+        self.cohort_fingerprint = digest.hexdigest()
+        self.cohort_identity = {**identity, "sha256": self.cohort_fingerprint}
+
+    def __len__(self) -> int:
+        return self.evaluation_batches
+
+    def __iter__(self) -> Iterator[list[int]]:
+        for start in range(0, len(self._local_indices), self.batch_size):
+            batch = self._local_indices[start : start + self.batch_size]
+            lengths = self.dataset.lengths_for_indices(batch)
+            ordered = batch[np.argsort(lengths, kind="stable")]
+            yield ordered.tolist()
 
 
 class DistributedBucketBatchSampler(Sampler[list[int]]):

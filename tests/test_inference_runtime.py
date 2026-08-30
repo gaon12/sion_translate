@@ -394,7 +394,10 @@ def test_find_exported_model_rejects_manifest_path_escape(tmp_path: Path) -> Non
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="escapes export directory"):
+    with pytest.raises(
+        ValueError,
+        match="(?:must be a safe basename|escapes export directory)",
+    ):
         inference.find_exported_model(tmp_path / "run")
 
 

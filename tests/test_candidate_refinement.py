@@ -6,12 +6,14 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+import sion_translate.training.export as export_module
 from sion_translate.cli.translate import build_parser
 from sion_translate.config import ExperimentalConfig, ModelConfig
 from sion_translate.hf import SionConfig
 from sion_translate.hf import SionForConditionalGeneration as HFSionForConditionalGeneration
 from sion_translate.model import SionForConditionalGeneration
 from sion_translate.training.export import (
+    build_candidate_refinement_release_attestation,
     build_export_metadata,
     export_state_dict_formats,
     load_exported_model,
@@ -160,6 +162,31 @@ def test_reported_gain_matches_provisional_to_final_token_nll() -> None:
 
     assert output.candidate_refinement_token_nll_gain is not None
     torch.testing.assert_close(output.candidate_refinement_token_nll_gain, expected_gain)
+
+
+def test_identity_refiner_cannot_report_bfloat16_reduction_noise_as_gain() -> None:
+    torch.manual_seed(13)  # pyright: ignore[reportUnknownMemberType]
+    config = _config(vocab_size=48_001, d_model=16)
+    config.max_seq_len = 40
+    config.label_smoothing = 0.0
+    config.experimental.candidate_refinement_vocab_chunk_size = 257
+    model = SionForConditionalGeneration(config).eval()
+    input_ids = torch.randint(4, config.vocab_size, (2, 32))
+    decoder_input_ids = torch.randint(4, config.vocab_size, (2, 32))
+    labels = torch.randint(4, config.vocab_size, (2, 32))
+    labels[:, -3:] = -100
+
+    with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+        output = model(
+            input_ids=input_ids,
+            attention_mask=torch.ones_like(input_ids, dtype=torch.bool),
+            decoder_input_ids=decoder_input_ids,
+            labels=labels,
+        )
+
+    gain = output.candidate_refinement_token_nll_gain
+    assert gain is not None
+    assert torch.count_nonzero(gain).item() == 0
 
 
 def test_zero_initialized_refiner_wakes_up_across_two_optimizer_steps() -> None:
@@ -434,10 +461,22 @@ def test_disabled_state_is_strictly_compatible_but_cannot_fake_trained_refinemen
 
 def test_native_export_strictly_round_trips_trained_refinement(tmp_path) -> None:
     model = SionForConditionalGeneration(_config()).eval()
+    attestation = build_candidate_refinement_release_attestation(
+        checkpoint_step=0,
+        checkpoint_artifact_sha256="a" * 64,
+        deployed_family="raw",
+        translation_directions=(("en", "de"),),
+        validation_cohort_fingerprint="b" * 64,
+        worst_direction_nll_gain=0.02,
+        minimum_worst_direction_nll_gain=0.00001,
+        deployment_state_sha256=export_module._state_sha256(model.state_dict()),
+    )
     metadata = build_export_metadata(
         model.config,
         language_pair=("en", "de"),
         translation_directions=(("en", "de"),),
+        step=0,
+        candidate_refinement_release_attestation=attestation,
         pipeline_identity={
             "schema": "sion-translation-pipeline-v2",
             "branch": "translation-only",
@@ -450,6 +489,9 @@ def test_native_export_strictly_round_trips_trained_refinement(tmp_path) -> None
         0,
         formats=("fp32",),
         metadata=metadata,
+        _candidate_refinement_release_authority=(
+            export_module._CANDIDATE_REFINEMENT_RELEASE_AUTHORITY
+        ),
     )
 
     restored, restored_config, _ = load_exported_model(tmp_path / "model.pt")

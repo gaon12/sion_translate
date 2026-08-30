@@ -12,6 +12,10 @@ _EXPORTS = {
         "sion_translate.data.indexed",
         "DistributedBucketBatchSampler",
     ),
+    "DirectionCompleteValidationBatchSampler": (
+        "sion_translate.data.indexed",
+        "DirectionCompleteValidationBatchSampler",
+    ),
     "IndexedParallelDataset": ("sion_translate.data.indexed", "IndexedParallelDataset"),
     "SionBatchCollator": ("sion_translate.data.collate", "SionBatchCollator"),
     "QualityPolicy": ("sion_translate.data.quality", "QualityPolicy"),
@@ -22,6 +26,7 @@ _EXPORTS = {
 
 __all__ = [
     "DistributedBucketBatchSampler",
+    "DirectionCompleteValidationBatchSampler",
     "IndexedParallelDataset",
     "QualityPolicy",
     "SionBatchCollator",

@@ -559,6 +559,76 @@ class SionForConditionalGeneration(nn.Module):
             reasoning_budget=_reasoning_budget(reasoning_level),
         )
 
+    @staticmethod
+    def _accumulate_chunked_token_nll(
+        log_normalizer: torch.Tensor,
+        target_logits: torch.Tensor,
+        chunk_logits: torch.Tensor,
+        safe_labels: torch.Tensor | None,
+        *,
+        start: int,
+        stop: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Update exact token-NLL statistics with one vocabulary chunk."""
+
+        log_normalizer = torch.logaddexp(
+            log_normalizer,
+            chunk_logits.logsumexp(-1),
+        )
+        if safe_labels is not None:
+            selected_by_chunk = safe_labels.ge(start) & safe_labels.lt(stop)
+            local_labels = (safe_labels - start).clamp(0, stop - start - 1)
+            selected_logits = chunk_logits.gather(1, local_labels[:, None]).squeeze(1)
+            target_logits = torch.where(
+                selected_by_chunk,
+                selected_logits,
+                target_logits,
+            )
+        return log_normalizer, target_logits
+
+    def _candidate_token_nll_from_logits(
+        self,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> torch.Tensor:
+        """Measure token NLL with the same reduction used for provisional logits.
+
+        The release guard compares a provisional distribution with the refined
+        distribution. Applying a dense cross-entropy reduction to only one side
+        can manufacture a small BF16 gain from reduction order alone. Slice the
+        already-materialized final logits into the configured vocabulary chunks
+        so both endpoints use exactly the same FP32 accumulation order.
+        """
+
+        flat_logits = logits.reshape(-1, logits.shape[-1])
+        flat_labels = labels.reshape(-1)
+        safe_labels = flat_labels.masked_fill(flat_labels.eq(-100), 0)
+        log_normalizer = torch.full(
+            (flat_logits.shape[0],),
+            float("-inf"),
+            device=logits.device,
+            dtype=torch.float32,
+        )
+        target_logits = torch.zeros_like(log_normalizer)
+        chunk_size = min(
+            self.config.experimental.candidate_refinement_vocab_chunk_size,
+            flat_logits.shape[-1],
+        )
+        for start in range(0, flat_logits.shape[-1], chunk_size):
+            stop = min(start + chunk_size, flat_logits.shape[-1])
+            chunk_logits = flat_logits[:, start:stop].float()
+            log_normalizer, target_logits = self._accumulate_chunked_token_nll(
+                log_normalizer,
+                target_logits,
+                chunk_logits,
+                safe_labels,
+                start=start,
+                stop=stop,
+            )
+        valid = flat_labels.ne(-100)
+        token_nll = log_normalizer - target_logits
+        return torch.where(valid, token_nll, torch.zeros_like(token_nll)).reshape_as(labels)
+
     def _candidate_distribution_statistics(
         self,
         hidden: torch.Tensor,
@@ -603,9 +673,13 @@ class SionForConditionalGeneration(nn.Module):
         for start in range(0, vocabulary_size, chunk_size):
             stop = min(start + chunk_size, vocabulary_size)
             chunk_logits = F.linear(flat_hidden, output_weight[start:stop]).float()
-            raw_log_normalizer = torch.logaddexp(
+            raw_log_normalizer, target_logits = self._accumulate_chunked_token_nll(
                 raw_log_normalizer,
-                chunk_logits.logsumexp(-1),
+                target_logits,
+                chunk_logits,
+                safe_labels,
+                start=start,
+                stop=stop,
             )
             scaled_logits = chunk_logits / exp.candidate_refinement_temperature
             chunk_max = scaled_logits.max(-1).values
@@ -621,15 +695,6 @@ class SionForConditionalGeneration(nn.Module):
             )
             distribution_max = next_distribution_max
             logit_sum = logit_sum + chunk_logits.sum(-1)
-            if safe_labels is not None:
-                selected_by_chunk = safe_labels.ge(start) & safe_labels.lt(stop)
-                local_labels = (safe_labels - start).clamp(0, stop - start - 1)
-                selected_logits = chunk_logits.gather(1, local_labels[:, None]).squeeze(1)
-                target_logits = torch.where(
-                    selected_by_chunk,
-                    selected_logits,
-                    target_logits,
-                )
 
         candidate_expectation = (
             (
@@ -785,11 +850,9 @@ class SionForConditionalGeneration(nn.Module):
             with torch.no_grad():
                 pre_repair_logits = self._logits(decoder_states).float()
                 pre_repair_error_targets = pre_repair_logits.argmax(-1).ne(labels)
-                pre_repair_token_nll = F.cross_entropy(
-                    pre_repair_logits.transpose(1, 2),
+                pre_repair_token_nll = self._candidate_token_nll_from_logits(
+                    pre_repair_logits,
                     labels,
-                    ignore_index=-100,
-                    reduction="none",
                 )
                 # Holding one ``(batch, seq, vocab)`` tensor can cost gigabytes
                 # for a large vocabulary. Retain only the two summaries.
@@ -911,12 +974,8 @@ class SionForConditionalGeneration(nn.Module):
         target_mask = labels.ne(-100)
         final_token_nll = None
         if evidence_requests is not None or applied_candidate_steps:
-            final_token_nll = F.cross_entropy(
-                float_logits.transpose(1, 2),
-                labels,
-                ignore_index=-100,
-                reduction="none",
-            )
+            with torch.no_grad():
+                final_token_nll = self._candidate_token_nll_from_logits(float_logits, labels)
         if uncertainty_logits is not None and evidence_requests is not None:
             assert pre_repair_error_targets is not None
             assert pre_repair_token_nll is not None

@@ -3007,8 +3007,11 @@ def _load_checkpoint_impl(
             "best_candidate_refinement_release_guard_passed",
             "best_candidate_refinement_worst_direction_nll_gain",
             "best_candidate_refinement_min_worst_direction_nll_gain",
+            "best_candidate_refinement_validation_cohort_fingerprint",
+            "best_candidate_refinement_deployment_state_sha256",
             "candidate_refinement_sft_baseline_loss",
             "candidate_refinement_sft_baseline_selection_metric",
+            "candidate_refinement_sft_baseline_validation_cohort_fingerprint",
         ):
             if (
                 optional_key not in progress_template

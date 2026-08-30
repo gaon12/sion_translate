@@ -28,6 +28,7 @@ import math
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -64,7 +65,7 @@ from sion_translate.locking import artifact_lock
 from sion_translate.model import SionForConditionalGeneration
 from sion_translate.model.layers import RotaryEmbedding, SwiGLU
 
-from .distributed import DistributedContext
+from .distributed import DistributedContext, broadcast_text
 
 EXPORT_SCHEMA = "sion-inference-export-v2"
 MANIFEST_SCHEMA = "sion-export-manifest-v2"
@@ -98,6 +99,8 @@ _PRECISION_DTYPES = {
 }
 _INT4_GROUP_SIZE = 128
 _EXPORT_LOCK_TIMEOUT_SECONDS = 60.0
+_WINDOWS_DIRECTORY_REPLACE_ATTEMPTS = 8
+_WINDOWS_DIRECTORY_REPLACE_INITIAL_DELAY_SECONDS = 0.025
 _TRANSFORMERS_INSPECTION_PREFIX = "SION_TRANSFORMERS_INSPECTION="
 _TRANSFORMERS_INSPECTION_TIMEOUT_SECONDS = 600.0
 _TRAINING_EXPORT_STATUS_SCHEMA = "sion-training-export-status-v1"
@@ -110,6 +113,8 @@ _TRAINING_EXPORT_STATUS_POLL_SECONDS = 0.25
 _TRANSLATION_PIPELINE_SCHEMA = "sion-translation-pipeline-v2"
 _FOUNDATION_LINEAGE_SCHEMA = "sion-foundation-lineage-v1"
 _LOWERCASE_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+CANDIDATE_REFINEMENT_RELEASE_SCHEMA = "sion-candidate-refinement-release-v3"
+_CANDIDATE_REFINEMENT_RELEASE_AUTHORITY = object()
 
 
 @contextmanager
@@ -259,6 +264,36 @@ def _legacy_inspection_release_identity(
     }
 
 
+def _manifest_basename(value: object, *, field: str) -> str:
+    """Return one portable manifest filename without path or stream syntax."""
+
+    if (
+        not isinstance(value, str)
+        or not value
+        or value in {".", ".."}
+        or Path(value).name != value
+        or "/" in value
+        or "\\" in value
+        or ":" in value
+        or "\0" in value
+    ):
+        raise ValueError(f"{field} must be a safe basename")
+    return value
+
+
+def _is_link_like(path: Path) -> bool:
+    """Detect symbolic links and Windows junctions before following them."""
+
+    if path.is_symlink():
+        return True
+    try:
+        file_attributes = int(getattr(path.lstat(), "st_file_attributes", 0))
+    except OSError:
+        return False
+    reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+    return bool(reparse_flag and file_attributes & reparse_flag)
+
+
 def _file_entry(path: Path) -> dict[str, Any]:
     return {
         "file": path.name,
@@ -281,12 +316,16 @@ def _file_identity(path: str | Path) -> dict[str, Any]:
 def _directory_entry(path: Path) -> dict[str, Any]:
     """Describe a directory with a path-independent deterministic tree hash."""
 
-    if not path.is_dir():
+    if _is_link_like(path) or not path.is_dir():
         raise FileNotFoundError(path)
     files: list[dict[str, Any]] = []
     for child in sorted(path.rglob("*"), key=lambda item: item.relative_to(path).as_posix()):
-        if not child.is_file():
+        if _is_link_like(child):
+            raise ValueError(f"artifact directory contains a linked path: {child}")
+        if child.is_dir():
             continue
+        if not child.is_file():
+            raise ValueError(f"artifact directory contains a non-regular path: {child}")
         files.append(
             {
                 "path": child.relative_to(path).as_posix(),
@@ -310,24 +349,23 @@ def _directory_entry(path: Path) -> dict[str, Any]:
     }
 
 
-def _tensor_bytes(tensor: torch.Tensor) -> memoryview:
-    cpu = tensor.detach().to("cpu").contiguous()
-    return memoryview(cpu.view(torch.uint8).numpy().tobytes())
-
-
 def _state_sha256(state_dict: Mapping[str, torch.Tensor]) -> str:
     """Hash names, shapes, dtypes and bytes in a deterministic order."""
 
     digest = hashlib.sha256()
+    chunk_bytes = 16 * 1024 * 1024
     for name in sorted(state_dict):
-        tensor = state_dict[name]
+        tensor = state_dict[name].detach().contiguous()
         digest.update(name.encode("utf-8"))
         digest.update(b"\0")
         digest.update(str(tensor.dtype).encode("ascii"))
         digest.update(b"\0")
         digest.update(json.dumps(list(tensor.shape), separators=(",", ":")).encode("ascii"))
         digest.update(b"\0")
-        digest.update(_tensor_bytes(tensor))
+        raw = tensor.view(torch.uint8).reshape(-1)
+        for start in range(0, raw.numel(), chunk_bytes):
+            chunk = raw[start : start + chunk_bytes].to(device="cpu")
+            digest.update(memoryview(chunk.numpy().tobytes()))
     return digest.hexdigest()
 
 
@@ -932,6 +970,291 @@ def _metadata_compatibility_id(metadata: Mapping[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _candidate_refinement_direction_fingerprint(
+    directions: Sequence[Sequence[str]],
+) -> str:
+    canonical = tuple(
+        canonicalize_language_pair(direction, field=f"translation direction[{index}]")
+        for index, direction in enumerate(directions)
+    )
+    return hashlib.sha256(
+        json.dumps(
+            canonical,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def build_candidate_refinement_release_attestation(
+    *,
+    checkpoint_step: int,
+    checkpoint_artifact_sha256: str,
+    deployed_family: str,
+    translation_directions: Sequence[Sequence[str]],
+    validation_cohort_fingerprint: str,
+    worst_direction_nll_gain: float,
+    minimum_worst_direction_nll_gain: float,
+    deployment_state_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Build refinement evidence, optionally sealed to exact deployment weights."""
+
+    step = _validated_export_step(checkpoint_step, field="checkpoint_step")
+    if _LOWERCASE_SHA256_PATTERN.fullmatch(checkpoint_artifact_sha256) is None:
+        raise ValueError("checkpoint_artifact_sha256 must be a lowercase SHA-256 digest")
+    if deployed_family not in {"raw", "ema"}:
+        raise ValueError("deployed_family must be 'raw' or 'ema'")
+    if _LOWERCASE_SHA256_PATTERN.fullmatch(validation_cohort_fingerprint) is None:
+        raise ValueError("validation_cohort_fingerprint must be a lowercase SHA-256 digest")
+    if deployment_state_sha256 is not None and (
+        _LOWERCASE_SHA256_PATTERN.fullmatch(deployment_state_sha256) is None
+    ):
+        raise ValueError("deployment_state_sha256 must be a lowercase SHA-256 digest")
+    worst_gain = float(worst_direction_nll_gain)
+    minimum_gain = float(minimum_worst_direction_nll_gain)
+    if (
+        isinstance(worst_direction_nll_gain, bool)
+        or isinstance(minimum_worst_direction_nll_gain, bool)
+        or not math.isfinite(worst_gain)
+        or not math.isfinite(minimum_gain)
+        or minimum_gain <= 0.0
+        or worst_gain < minimum_gain
+    ):
+        raise ValueError(
+            "candidate-refinement release gains must be finite and the worst gain must meet "
+            "the positive minimum"
+        )
+    canonical_directions = tuple(
+        canonicalize_language_pair(direction, field=f"translation direction[{index}]")
+        for index, direction in enumerate(translation_directions)
+    )
+    if not canonical_directions or len(set(canonical_directions)) != len(canonical_directions):
+        raise ValueError("translation_directions must be non-empty and unique")
+    payload: dict[str, Any] = {
+        "schema": CANDIDATE_REFINEMENT_RELEASE_SCHEMA,
+        "checkpoint_step": step,
+        "checkpoint_artifact_sha256": checkpoint_artifact_sha256,
+        "deployed_family": deployed_family,
+        "direction_fingerprint": _candidate_refinement_direction_fingerprint(canonical_directions),
+        "direction_count": len(canonical_directions),
+        "validation_cohort_fingerprint": validation_cohort_fingerprint,
+        "worst_direction_nll_gain": worst_gain,
+        "minimum_worst_direction_nll_gain": minimum_gain,
+    }
+    if deployment_state_sha256 is not None:
+        payload["deployment_state_sha256"] = deployment_state_sha256
+    payload["sha256"] = hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    return payload
+
+
+def _validated_candidate_refinement_release_attestation(
+    metadata: Mapping[str, Any],
+    model_config: ModelConfig,
+    *,
+    required: bool,
+    require_deployment_binding: bool = False,
+    expected_deployment_state_sha256: str | None = None,
+) -> dict[str, Any] | None:
+    raw_attestation = metadata.get("candidate_refinement_release")
+    candidate_enabled = bool(model_config.experimental.candidate_refinement_enabled)
+    translation_capable = _metadata_translation_capable(metadata)
+    must_exist = bool(required and candidate_enabled and translation_capable)
+    if raw_attestation is None:
+        if must_exist:
+            raise ValueError("candidate-refinement translation export requires release attestation")
+        return None
+    if not candidate_enabled or not translation_capable:
+        raise ValueError(
+            "candidate-refinement release attestation requires an enabled translation model"
+        )
+    if not isinstance(raw_attestation, Mapping):
+        raise ValueError("metadata.candidate_refinement_release must be an object")
+    attestation = copy.deepcopy(dict(cast(Mapping[str, Any], raw_attestation)))
+    base_fields = {
+        "schema",
+        "checkpoint_step",
+        "checkpoint_artifact_sha256",
+        "deployed_family",
+        "direction_fingerprint",
+        "direction_count",
+        "validation_cohort_fingerprint",
+        "worst_direction_nll_gain",
+        "minimum_worst_direction_nll_gain",
+        "sha256",
+    }
+    has_deployment_binding = "deployment_state_sha256" in attestation
+    expected_fields = base_fields | (
+        {"deployment_state_sha256"} if has_deployment_binding else set()
+    )
+    if set(attestation) != expected_fields:
+        raise ValueError(
+            "candidate-refinement release attestation fields are incomplete or unexpected"
+        )
+    if attestation.get("schema") != CANDIDATE_REFINEMENT_RELEASE_SCHEMA:
+        raise ValueError("candidate-refinement release attestation schema is unsupported")
+    if expected_deployment_state_sha256 is not None and (
+        _LOWERCASE_SHA256_PATTERN.fullmatch(expected_deployment_state_sha256) is None
+    ):
+        raise ValueError("expected deployment state must be a lowercase SHA-256 digest")
+    if (require_deployment_binding or expected_deployment_state_sha256 is not None) and not (
+        has_deployment_binding
+    ):
+        raise ValueError(
+            "candidate-refinement release attestation is not bound to deployment weights"
+        )
+    metadata_step = _validated_export_step(metadata.get("step"), field="metadata.step")
+    checkpoint_step = _validated_export_step(
+        attestation.get("checkpoint_step"),
+        field="candidate_refinement_release.checkpoint_step",
+    )
+    checkpoint_artifact_sha256 = attestation.get("checkpoint_artifact_sha256")
+    deployed_family = attestation.get("deployed_family")
+    validation_cohort_fingerprint = attestation.get("validation_cohort_fingerprint")
+    worst_direction_nll_gain = attestation.get("worst_direction_nll_gain")
+    minimum_worst_direction_nll_gain = attestation.get("minimum_worst_direction_nll_gain")
+    deployment_state_sha256 = attestation.get("deployment_state_sha256")
+    if not isinstance(checkpoint_artifact_sha256, str):
+        raise ValueError("candidate_refinement_release.checkpoint_artifact_sha256 must be a string")
+    if not isinstance(deployed_family, str):
+        raise ValueError("candidate_refinement_release.deployed_family must be a string")
+    if not isinstance(validation_cohort_fingerprint, str):
+        raise ValueError(
+            "candidate_refinement_release.validation_cohort_fingerprint must be a string"
+        )
+    if deployment_state_sha256 is not None and not isinstance(deployment_state_sha256, str):
+        raise ValueError("candidate_refinement_release.deployment_state_sha256 must be a string")
+    if (
+        expected_deployment_state_sha256 is not None
+        and deployment_state_sha256 != expected_deployment_state_sha256
+    ):
+        raise ValueError(
+            "candidate-refinement release deployment state does not match exported weights"
+        )
+    for field, value in (
+        ("worst_direction_nll_gain", worst_direction_nll_gain),
+        ("minimum_worst_direction_nll_gain", minimum_worst_direction_nll_gain),
+    ):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"candidate_refinement_release.{field} must be a number")
+    typed_worst_direction_nll_gain = cast(
+        int | float,
+        worst_direction_nll_gain,
+    )
+    typed_minimum_worst_direction_nll_gain = cast(
+        int | float,
+        minimum_worst_direction_nll_gain,
+    )
+    rebuilt = build_candidate_refinement_release_attestation(
+        checkpoint_step=checkpoint_step,
+        checkpoint_artifact_sha256=checkpoint_artifact_sha256,
+        deployed_family=deployed_family,
+        translation_directions=_metadata_translation_directions(metadata),
+        validation_cohort_fingerprint=validation_cohort_fingerprint,
+        worst_direction_nll_gain=float(typed_worst_direction_nll_gain),
+        minimum_worst_direction_nll_gain=float(typed_minimum_worst_direction_nll_gain),
+        deployment_state_sha256=deployment_state_sha256,
+    )
+    if rebuilt["checkpoint_step"] != metadata_step:
+        raise ValueError(
+            "candidate-refinement release checkpoint step does not match export metadata"
+        )
+    if attestation != rebuilt:
+        raise ValueError(
+            "candidate-refinement release attestation does not match its graph or digest"
+        )
+    return rebuilt
+
+
+def _seal_candidate_refinement_release_attestation(
+    metadata: dict[str, Any],
+    model_config: ModelConfig,
+    deployment_state_sha256: str,
+    *,
+    release_authorized: bool,
+) -> dict[str, Any] | None:
+    """Bind validated held-out evidence to the exact state passed to conversion."""
+
+    evidence = _validated_candidate_refinement_release_attestation(
+        metadata,
+        model_config,
+        required=True,
+    )
+    if evidence is None:
+        return None
+    if not release_authorized:
+        raise ValueError(
+            "candidate-refinement export requires authenticated checkpoint or manifested "
+            "conversion authority"
+        )
+    existing_state_sha256 = evidence.get("deployment_state_sha256")
+    if existing_state_sha256 is not None and existing_state_sha256 != deployment_state_sha256:
+        raise ValueError(
+            "candidate-refinement release deployment state does not match exported weights"
+        )
+    sealed = build_candidate_refinement_release_attestation(
+        checkpoint_step=int(evidence["checkpoint_step"]),
+        checkpoint_artifact_sha256=str(evidence["checkpoint_artifact_sha256"]),
+        deployed_family=str(evidence["deployed_family"]),
+        translation_directions=_metadata_translation_directions(metadata),
+        validation_cohort_fingerprint=str(evidence["validation_cohort_fingerprint"]),
+        worst_direction_nll_gain=float(evidence["worst_direction_nll_gain"]),
+        minimum_worst_direction_nll_gain=float(evidence["minimum_worst_direction_nll_gain"]),
+        deployment_state_sha256=deployment_state_sha256,
+    )
+    metadata["candidate_refinement_release"] = sealed
+    return _validated_candidate_refinement_release_attestation(
+        metadata,
+        model_config,
+        required=True,
+        require_deployment_binding=True,
+        expected_deployment_state_sha256=deployment_state_sha256,
+    )
+
+
+def _validate_candidate_refinement_checkpoint_guard(
+    attestation: Mapping[str, Any],
+    training_state: Mapping[str, Any],
+) -> None:
+    """Match release evidence to scalar guard state read under a checkpoint lease."""
+
+    expected = {
+        "best_step": attestation.get("checkpoint_step"),
+        "best_candidate_refinement_guard_schema": CANDIDATE_REFINEMENT_RELEASE_SCHEMA,
+        "best_candidate_refinement_deployed_family": attestation.get("deployed_family"),
+        "best_candidate_refinement_direction_fingerprint": attestation.get("direction_fingerprint"),
+        "best_candidate_refinement_direction_count": attestation.get("direction_count"),
+        "best_candidate_refinement_release_guard_passed": True,
+        "best_candidate_refinement_worst_direction_nll_gain": attestation.get(
+            "worst_direction_nll_gain"
+        ),
+        "best_candidate_refinement_min_worst_direction_nll_gain": attestation.get(
+            "minimum_worst_direction_nll_gain"
+        ),
+        "best_candidate_refinement_validation_cohort_fingerprint": attestation.get(
+            "validation_cohort_fingerprint"
+        ),
+        "best_candidate_refinement_deployment_state_sha256": attestation.get(
+            "deployment_state_sha256"
+        ),
+    }
+    mismatched = [
+        key for key, expected_value in expected.items() if training_state.get(key) != expected_value
+    ]
+    if mismatched:
+        raise ValueError(
+            "candidate-refinement release evidence does not match authenticated checkpoint "
+            "guard state: " + ", ".join(mismatched)
+        )
+
+
 def build_export_metadata(
     model_config: ModelConfig,
     *,
@@ -950,6 +1273,7 @@ def build_export_metadata(
     release_version: str = MODEL_RELEASE_VERSION,
     translation_capable: bool = True,
     pipeline_identity: Mapping[str, Any] | None = None,
+    candidate_refinement_release_attestation: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build provenance and compatibility metadata shared by every format.
 
@@ -1064,7 +1388,16 @@ def build_export_metadata(
             "revision_directions": normalized_revision_directions,
             "revision_trained": bool(normalized_revision_directions),
         }
+    if candidate_refinement_release_attestation is not None:
+        metadata["candidate_refinement_release"] = copy.deepcopy(
+            dict(candidate_refinement_release_attestation)
+        )
     _validated_pipeline_identity_contract(metadata)
+    _validated_candidate_refinement_release_attestation(
+        metadata,
+        model_config,
+        required=step is not None,
+    )
     return metadata
 
 
@@ -1099,6 +1432,23 @@ def _export_publish_lock_root(destination: Path) -> Path:
 
     lock_name = f".{destination.name}.sion-export-publish-lock"
     return destination.parent / lock_name
+
+
+def _replace_directory_with_retry(source: Path, destination: Path) -> None:
+    """Retry transient Windows directory rename denials without hiding real errors."""
+
+    for attempt in range(_WINDOWS_DIRECTORY_REPLACE_ATTEMPTS):
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError:
+            if attempt + 1 >= _WINDOWS_DIRECTORY_REPLACE_ATTEMPTS:
+                raise
+            delay = min(
+                _WINDOWS_DIRECTORY_REPLACE_INITIAL_DELAY_SECONDS * (2**attempt),
+                0.5,
+            )
+            time.sleep(delay)
 
 
 def _install_directory(temporary: Path, destination: Path) -> None:
@@ -1138,7 +1488,7 @@ def _install_directory(temporary: Path, destination: Path) -> None:
             # Every child was moved successfully. A locked empty shell must not
             # turn a valid export into a failed publication.
             pass
-        os.replace(handoff, destination)
+        _replace_directory_with_retry(handoff, destination)
     except BaseException:
         try:
             _remove_artifact(handoff)
@@ -1156,7 +1506,7 @@ def _atomic_replace_directory_unlocked(temporary: Path, destination: Path) -> No
     moved_existing = False
     try:
         if destination.exists():
-            os.replace(destination, backup)
+            _replace_directory_with_retry(destination, backup)
             moved_existing = True
         _install_directory(temporary, destination)
     except BaseException as install_error:
@@ -1168,7 +1518,7 @@ def _atomic_replace_directory_unlocked(temporary: Path, destination: Path) -> No
                 rollback_errors.append(error)
         if moved_existing and backup.exists() and not destination.exists():
             try:
-                os.replace(backup, destination)
+                _replace_directory_with_retry(backup, destination)
                 moved_existing = False
             except BaseException as error:
                 rollback_errors.append(error)
@@ -1332,6 +1682,13 @@ def _inspect_transformers_checkpoint_in_process(  # pyright: ignore[reportUnused
         if isinstance(config_pipeline, Mapping)
         else None
     )
+    config_refinement_release = config_payload.get("candidate_refinement_release")
+    export_refinement_release = export_payload.get("candidate_refinement_release")
+    if config_refinement_release != export_refinement_release:
+        raise RuntimeError(
+            "Transformers config and sion_export.json disagree about "
+            "candidate-refinement release evidence"
+        )
     generation_payload = json.loads((path / "generation_config.json").read_text(encoding="utf-8"))
     if not isinstance(generation_payload, Mapping):
         raise RuntimeError("Transformers generation_config.json must contain an object")
@@ -1436,10 +1793,25 @@ def _inspect_transformers_checkpoint_in_process(  # pyright: ignore[reportUnused
         transformers_identity["tokenizer"] = {"sha256": config_tokenizer_sha256}
     if pipeline_identity is not None:
         transformers_identity["pipeline"] = pipeline_identity
+    if config_refinement_release is not None:
+        if not isinstance(config_refinement_release, Mapping):
+            raise RuntimeError(
+                "Transformers candidate-refinement release evidence must be a JSON object"
+            )
+        transformers_identity["step"] = config_refinement_release.get("checkpoint_step")
+        transformers_identity["candidate_refinement_release"] = copy.deepcopy(
+            dict(config_refinement_release)
+        )
     try:
         _validated_pipeline_identity_contract(transformers_identity)
+        _validated_candidate_refinement_release_attestation(
+            transformers_identity,
+            config.to_model_config(),
+            required=not legacy_sidecars,
+            require_deployment_binding=not legacy_sidecars,
+        )
     except ValueError as error:
-        raise RuntimeError(f"invalid Transformers pipeline identity: {error}") from error
+        raise RuntimeError(f"invalid Transformers export identity: {error}") from error
     weight_files = sorted(path.glob("model*.safetensors"))
     if not weight_files:
         raise RuntimeError("Transformers checkpoint has no model*.safetensors weights")
@@ -1570,6 +1942,11 @@ def _inspect_transformers_checkpoint_in_process(  # pyright: ignore[reportUnused
         "revision_trained": config.revision_trained,
         "tokenizer_sha256": config_tokenizer_sha256,
         "pipeline": pipeline_identity,
+        "candidate_refinement_release": (
+            copy.deepcopy(dict(config_refinement_release))
+            if isinstance(config_refinement_release, Mapping)
+            else None
+        ),
         "identity_source": "legacy-manifest" if legacy_sidecars else "sidecars",
     }
 
@@ -1681,8 +2058,12 @@ def _write_transformers_checkpoint(
     release_name: str,
     release_version: str,
     pipeline_identity: Mapping[str, Any] | None,
+    candidate_refinement_release_attestation: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
-    from sion_translate.hf.conversion import save_transformers_checkpoint
+    from sion_translate.hf.conversion import (
+        _CANDIDATE_REFINEMENT_RELEASE_AUTHORITY as HF_REFINEMENT_RELEASE_AUTHORITY,  # pyright: ignore[reportPrivateUsage]
+        save_transformers_checkpoint,
+    )
 
     temporary = _temporary_path(path)
     try:
@@ -1702,6 +2083,12 @@ def _write_transformers_checkpoint(
             release_name=release_name,
             release_version=release_version,
             pipeline_identity=pipeline_identity,
+            candidate_refinement_release_attestation=(candidate_refinement_release_attestation),
+            _candidate_refinement_release_authority=(
+                HF_REFINEMENT_RELEASE_AUTHORITY
+                if candidate_refinement_release_attestation is not None
+                else None
+            ),
             allow_language_subset=not bool(language_pairs),
             _atomic_publish=False,
         )
@@ -1715,6 +2102,12 @@ def _write_transformers_checkpoint(
                 sidecar.pop("pipeline", None)
             else:
                 sidecar["pipeline"] = copy.deepcopy(dict(pipeline_identity))
+            if candidate_refinement_release_attestation is None:
+                sidecar.pop("candidate_refinement_release", None)
+            else:
+                sidecar["candidate_refinement_release"] = copy.deepcopy(
+                    dict(candidate_refinement_release_attestation)
+                )
             _atomic_json_dump(sidecar, sidecar_path)
         inspection = _inspect_transformers_checkpoint(temporary)
         if inspection["release_name"] != release_name:
@@ -1723,6 +2116,11 @@ def _write_transformers_checkpoint(
             raise RuntimeError("Transformers checkpoint release_version changed during export")
         if inspection["pipeline"] != pipeline_identity:
             raise RuntimeError("Transformers checkpoint pipeline identity changed during export")
+        if inspection["candidate_refinement_release"] != candidate_refinement_release_attestation:
+            raise RuntimeError(
+                "Transformers checkpoint candidate-refinement release evidence changed "
+                "during export"
+            )
         # The public export transaction owns the destination lock. Reacquiring
         # it here would deadlock on platforms with non-reentrant file locks.
         _atomic_replace_directory_unlocked(temporary, path)
@@ -2148,6 +2546,18 @@ def _write_sion_gguf(
                     allow_nan=False,
                 ),
             )
+        candidate_refinement_release = metadata.get("candidate_refinement_release")
+        if isinstance(candidate_refinement_release, Mapping):
+            writer.add_string(
+                "sion.candidate_refinement_release",
+                json.dumps(
+                    dict(candidate_refinement_release),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ),
+            )
         writer.add_quantization_version(gguf.GGML_QUANT_VERSION)
         writer.add_file_type(int(gguf.LlamaFileType.MOSTLY_Q4_K_M))
         writer.add_string(
@@ -2228,6 +2638,29 @@ def _inspect_sion_gguf(
             if not isinstance(decoded_pipeline, dict):
                 raise RuntimeError("GGUF sion.pipeline must contain a JSON object")
             pipeline_identity = cast(dict[str, Any], decoded_pipeline)
+
+        candidate_refinement_release: dict[str, Any] | None = None
+        candidate_refinement_field = reader.fields.get("sion.candidate_refinement_release")
+        if candidate_refinement_field is not None:
+            raw_candidate_refinement_release = candidate_refinement_field.contents()
+            if not isinstance(raw_candidate_refinement_release, str):
+                raise RuntimeError("GGUF sion.candidate_refinement_release must be a JSON string")
+            try:
+                decoded_candidate_refinement_release: object = json.loads(
+                    raw_candidate_refinement_release
+                )
+            except json.JSONDecodeError as error:
+                raise RuntimeError(
+                    "GGUF sion.candidate_refinement_release is not valid JSON"
+                ) from error
+            if not isinstance(decoded_candidate_refinement_release, dict):
+                raise RuntimeError(
+                    "GGUF sion.candidate_refinement_release must contain a JSON object"
+                )
+            candidate_refinement_release = cast(
+                dict[str, Any],
+                decoded_candidate_refinement_release,
+            )
 
         languages: list[str] | None = None
         languages_field = reader.fields.get("sion.languages")
@@ -2313,6 +2746,7 @@ def _inspect_sion_gguf(
             "sion.translation_directions",
             "sion.revision_directions",
             "sion.revision_trained",
+            "sion.candidate_refinement_release",
         )
         legacy_fields = legacy_identity is not None and not any(
             name in reader_fields for name in modern_identity_fields
@@ -2471,10 +2905,22 @@ def _inspect_sion_gguf(
             gguf_identity["tokenizer"] = {"sha256": tokenizer_sha256}
         if pipeline_identity is not None:
             gguf_identity["pipeline"] = pipeline_identity
+        if candidate_refinement_release is not None:
+            gguf_identity["step"] = candidate_refinement_release.get("checkpoint_step")
+            gguf_identity["candidate_refinement_release"] = copy.deepcopy(
+                candidate_refinement_release
+            )
         try:
             _validated_pipeline_identity_contract(gguf_identity)
+            if model_config_payload is not None:
+                _validated_candidate_refinement_release_attestation(
+                    gguf_identity,
+                    _model_config_from_dict(model_config_payload),
+                    required=not legacy_fields,
+                    require_deployment_binding=not legacy_fields,
+                )
         except ValueError as error:
-            raise RuntimeError(f"invalid GGUF pipeline identity: {error}") from error
+            raise RuntimeError(f"invalid GGUF export identity: {error}") from error
         return {
             "tensor_count": len(reader.tensors),
             "tensor_counts": counts,
@@ -2489,6 +2935,7 @@ def _inspect_sion_gguf(
             "revision_trained": revision_trained,
             "tokenizer_sha256": tokenizer_sha256,
             "pipeline": pipeline_identity,
+            "candidate_refinement_release": candidate_refinement_release,
             "model_config": model_config_payload,
             "pad_id": pad_token_id,
             "identity_source": "legacy-manifest" if legacy_fields else "fields",
@@ -2529,13 +2976,89 @@ def _read_manifest(path: Path) -> dict[str, Any] | None:
     return loaded
 
 
+def _validate_manifested_candidate_refinement_source(
+    source: Path,
+    metadata: Mapping[str, Any],
+    model_config: ModelConfig,
+    pad_id: int,
+    *,
+    step: int,
+    expected_state_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Authenticate one candidate-refinement file against its complete manifest entry."""
+
+    source_manifest = _read_manifest(source.parent / "export_manifest.json")
+    if source_manifest is None:
+        raise ValueError("candidate-refinement source requires its export manifest")
+    manifest_state_sha256 = source_manifest.get("state_sha256")
+    if not _is_sha256(manifest_state_sha256):
+        raise ValueError("candidate-refinement source manifest state digest is invalid")
+    assert isinstance(manifest_state_sha256, str)
+    if expected_state_sha256 is not None and manifest_state_sha256 != expected_state_sha256:
+        raise ValueError("candidate-refinement source state does not match its manifest")
+    _validated_candidate_refinement_release_attestation(
+        metadata,
+        model_config,
+        required=True,
+        require_deployment_binding=True,
+        expected_deployment_state_sha256=manifest_state_sha256,
+    )
+    if source_manifest.get("metadata") != dict(metadata):
+        raise ValueError("candidate-refinement source metadata does not match its manifest")
+    raw_manifest_config = source_manifest.get("model_config")
+    if not isinstance(raw_manifest_config, Mapping):
+        raise ValueError("candidate-refinement source manifest model config is invalid")
+    manifest_config = _model_config_from_dict(cast(Mapping[str, Any], raw_manifest_config))
+    if dict(raw_manifest_config) != asdict(manifest_config) or asdict(manifest_config) != asdict(
+        model_config
+    ):
+        raise ValueError("candidate-refinement source model config does not match its manifest")
+    if source_manifest.get("pad_id") != pad_id:
+        raise ValueError("candidate-refinement source padding ID does not match its manifest")
+    manifest_step = _validated_export_step(
+        source_manifest.get("step"),
+        field="candidate-refinement source manifest step",
+    )
+    if manifest_step != step:
+        raise ValueError("candidate-refinement source step does not match its manifest")
+    expected_artifact_set_id = _artifact_set_id(manifest_state_sha256, model_config, pad_id)
+    if source_manifest.get("artifact_set_id") != expected_artifact_set_id:
+        raise ValueError("candidate-refinement source artifact set is invalid")
+    if source_manifest.get("metadata_compatibility_id") != _metadata_compatibility_id(metadata):
+        raise ValueError("candidate-refinement source metadata compatibility digest is invalid")
+    source_formats = source_manifest.get("formats")
+    if not isinstance(source_formats, Mapping):
+        raise ValueError("candidate-refinement source manifest formats are invalid")
+    matching_entries = [
+        entry
+        for entry in source_formats.values()
+        if isinstance(entry, Mapping)
+        and entry.get("status") == "ok"
+        and entry.get("file") == source.name
+    ]
+    if len(matching_entries) != 1 or _is_link_like(source):
+        raise ValueError("candidate-refinement source is not the exact manifested artifact")
+    source_entry = matching_entries[0]
+    observed_entry = _file_entry(source)
+    if (
+        source_entry.get("artifact_set_id") != expected_artifact_set_id
+        or source_entry.get("size") != observed_entry["size"]
+        or source_entry.get("sha256") != observed_entry["sha256"]
+    ):
+        raise ValueError("candidate-refinement source bytes do not match the manifest")
+    return source_manifest
+
+
 def _existing_entry_is_valid(directory: Path, entry: Mapping[str, Any]) -> bool:
     if entry.get("status") != "ok" or not isinstance(entry.get("file"), str):
         return False
     if entry.get("size") is None or not _is_sha256(entry.get("sha256")):
         return False
-    path = directory / str(entry["file"])
     try:
+        filename = _manifest_basename(entry["file"], field="artifact entry file")
+        path = directory / filename
+        if _is_link_like(path):
+            return False
         if path.is_dir():
             actual = _directory_entry(path)
             if entry.get("artifact_type") not in {None, "directory"}:
@@ -2544,7 +3067,7 @@ def _existing_entry_is_valid(directory: Path, entry: Mapping[str, Any]) -> bool:
             actual = _file_entry(path)
         else:
             return False
-    except OSError:
+    except (OSError, ValueError):
         return False
     if actual["size"] != int(entry["size"]):
         return False
@@ -2571,9 +3094,15 @@ def resolve_manifest_artifact(
     manifest = _read_manifest(manifest_path)
     if manifest is None:
         raise ValueError(f"missing or invalid export manifest: {manifest_path}")
-    for field in ("state_sha256", "artifact_set_id"):
-        if not _is_sha256(manifest.get(field)):
+    manifest_state_sha256 = manifest.get("state_sha256")
+    manifest_artifact_set_id = manifest.get("artifact_set_id")
+    for field, value in (
+        ("state_sha256", manifest_state_sha256),
+        ("artifact_set_id", manifest_artifact_set_id),
+    ):
+        if not _is_sha256(value):
             raise ValueError(f"manifest.{field} must be a SHA256 digest")
+    assert isinstance(manifest_artifact_set_id, str)
     formats = manifest.get("formats")
     if not isinstance(formats, Mapping):
         raise ValueError("manifest.formats must be an object")
@@ -2587,17 +3116,21 @@ def resolve_manifest_artifact(
             raise ValueError(f"manifest format {format_name!r} must be an object")
         if raw_entry.get("status") != "ok":
             continue
-        if raw_entry.get("artifact_set_id") != manifest["artifact_set_id"]:
+        if raw_entry.get("artifact_set_id") != manifest_artifact_set_id:
             raise ValueError(f"manifest format {format_name!r} has a mismatched artifact_set_id")
         size = raw_entry.get("size")
         if isinstance(size, bool) or not isinstance(size, int) or size < 0:
             raise ValueError(f"manifest format {format_name!r} has an invalid size")
         if not _is_sha256(raw_entry.get("sha256")):
             raise ValueError(f"manifest format {format_name!r} has an invalid SHA256")
-        filename = raw_entry.get("file")
-        if not isinstance(filename, str) or not filename:
-            raise ValueError(f"manifest format {format_name!r} has no artifact path")
-        artifact = (directory / filename).resolve()
+        filename = _manifest_basename(
+            raw_entry.get("file"),
+            field=f"manifest format {format_name!r} file",
+        )
+        unresolved_artifact = directory / filename
+        if _is_link_like(unresolved_artifact):
+            raise ValueError(f"manifest format {format_name!r} points to a linked artifact")
+        artifact = unresolved_artifact.resolve()
         try:
             artifact.relative_to(root)
         except ValueError as error:
@@ -2656,6 +3189,7 @@ def _export_state_dict_formats_unlocked(
     translation_capable: bool = True,
     llama_quantize: str | Path | None = None,
     _filename_overrides: Mapping[str, str] | None = None,
+    _candidate_refinement_release_authority: object | None = None,
 ) -> dict[str, Any]:
     """Export one state dict to requested formats and atomically merge a manifest.
 
@@ -2840,6 +3374,14 @@ def _export_state_dict_formats_unlocked(
     # Revalidate only after every metadata mutation, before copying sidecars or
     # publishing any model artifact, so a successful export is self-validating.
     _validated_pipeline_identity_contract(export_metadata)
+    candidate_refinement_release_attestation = _seal_candidate_refinement_release_attestation(
+        export_metadata,
+        model_config,
+        state_hash,
+        release_authorized=(
+            _candidate_refinement_release_authority is _CANDIDATE_REFINEMENT_RELEASE_AUTHORITY
+        ),
+    )
     for sidecar_path, metadata_name in (
         (tokenizer_path, "tokenizer"),
         (token_features_path, "token_features"),
@@ -2977,6 +3519,9 @@ def _export_state_dict_formats_unlocked(
                     release_name=str(export_metadata["release_name"]),
                     release_version=str(export_metadata["release_version"]),
                     pipeline_identity=_metadata_pipeline_identity(export_metadata),
+                    candidate_refinement_release_attestation=(
+                        candidate_refinement_release_attestation
+                    ),
                 )
                 details = {
                     "dtype": (
@@ -3093,6 +3638,7 @@ def export_state_dict_formats(
     llama_quantize: str | Path | None = None,
     _filename_overrides: Mapping[str, str] | None = None,
     _acquire_publish_lock: bool = True,
+    _candidate_refinement_release_authority: object | None = None,
 ) -> dict[str, Any]:
     """Export one complete file/manifest generation under a destination lock."""
 
@@ -3114,6 +3660,7 @@ def export_state_dict_formats(
             translation_capable=translation_capable,
             llama_quantize=llama_quantize,
             _filename_overrides=_filename_overrides,
+            _candidate_refinement_release_authority=(_candidate_refinement_release_authority),
         )
     destination = Path(directory)
     with artifact_lock(
@@ -3138,6 +3685,7 @@ def export_state_dict_formats(
             translation_capable=translation_capable,
             llama_quantize=llama_quantize,
             _filename_overrides=_filename_overrides,
+            _candidate_refinement_release_authority=(_candidate_refinement_release_authority),
         )
 
 
@@ -3179,6 +3727,7 @@ def convert_export(
         raise ValueError("conversion source must contain a stable state dict")
     if any(not isinstance(value, torch.Tensor) for value in stored.values()):
         raise ValueError("conversion source contains a quantized/non-tensor state dict")
+    tensor_state = cast(Mapping[str, torch.Tensor], stored)
     quantization = payload.get("quantization")
     if quantization:
         raise ValueError("conversion source must be FP32/FP16/BF16, not quantized")
@@ -3191,6 +3740,7 @@ def convert_export(
     if not isinstance(raw_inherited, Mapping):
         raise ValueError("conversion source metadata must be an object")
     inherited = copy.deepcopy(dict(raw_inherited))
+    candidate_refinement_conversion_authorized = False
     # Only the top-level export schema authenticates a current Sion artifact.
     # Mutable metadata inside a schema-less payload cannot promote legacy
     # weights into the 1.5/pipeline trust domain.
@@ -3214,6 +3764,33 @@ def convert_export(
         if _metadata_translation_capable(inherited) and _metadata_language_pairs(inherited):
             _metadata_translation_directions(inherited)
         _metadata_revision_directions(inherited)
+        candidate_refinement_release = _validated_candidate_refinement_release_attestation(
+            inherited,
+            config,
+            required=True,
+            require_deployment_binding=True,
+        )
+        if candidate_refinement_release is not None:
+            non_fp32_tensors = [
+                name
+                for name, tensor in tensor_state.items()
+                if tensor.is_floating_point() and tensor.dtype != torch.float32
+            ]
+            if non_fp32_tensors:
+                raise ValueError(
+                    "candidate-refinement conversion requires the exact FP32 deployment "
+                    "state; FP16/BF16 sources cannot preserve measured release authority"
+                )
+            source_state_sha256 = _state_sha256(tensor_state)
+            _validate_manifested_candidate_refinement_source(
+                source,
+                inherited,
+                config,
+                pad_id,
+                step=step,
+                expected_state_sha256=source_state_sha256,
+            )
+            candidate_refinement_conversion_authorized = True
 
     def resolve_release_identity(explicit: str | None, metadata_name: str) -> str:
         inherited_value: object = inherited.get(metadata_name)
@@ -3408,6 +3985,7 @@ def convert_export(
         release_version=resolved_release_version,
         translation_capable=resolved_translation_capable,
         pipeline_identity=_metadata_pipeline_identity(inherited),
+        candidate_refinement_release_attestation=inherited.get("candidate_refinement_release"),
     )
     if tokenizer_path is None and inherited.get("tokenizer"):
         metadata["tokenizer"] = inherited["tokenizer"]
@@ -3429,6 +4007,11 @@ def convert_export(
         release_name=resolved_release_name,
         translation_capable=resolved_translation_capable,
         llama_quantize=llama_quantize,
+        _candidate_refinement_release_authority=(
+            _CANDIDATE_REFINEMENT_RELEASE_AUTHORITY
+            if candidate_refinement_conversion_authorized
+            else None
+        ),
     )
 
 
@@ -3486,8 +4069,9 @@ def load_exported_model(
         field_name in metadata
         for field_name in ("release_name", "release_version", "translation_capable")
     )
+    validated_release_version: str | None = None
     if declares_release_contract:
-        _validated_release_identity(
+        _, validated_release_version, _ = _validated_release_identity(
             metadata.get("release_name"),
             metadata.get("release_version"),
             translation_capable=metadata.get("translation_capable"),
@@ -3497,6 +4081,23 @@ def load_exported_model(
             _metadata_translation_directions(metadata)
         _metadata_revision_directions(metadata)
     config = _model_config_from_dict(payload["model_config"])
+    current_contract_without_schema = bool(
+        schema is None
+        and (
+            config.experimental.candidate_refinement_enabled
+            or metadata.get("pipeline") is not None
+            or metadata.get("candidate_refinement_release") is not None
+            or (
+                validated_release_version is not None
+                and _release_version_at_least(validated_release_version, (1, 5))
+            )
+        )
+    )
+    if current_contract_without_schema:
+        raise ValueError(
+            f"current release metadata requires the authenticated {EXPORT_SCHEMA} schema"
+        )
+    candidate_refinement_release: dict[str, Any] | None = None
     if schema == EXPORT_SCHEMA:
         payload_step = _validated_export_step(payload.get("step"), field="payload.step")
         metadata_step = _validated_export_step(metadata.get("step"), field="metadata.step")
@@ -3506,9 +4107,23 @@ def load_exported_model(
                 f"{payload_step} != {metadata_step}"
             )
         _validate_feature_flags(metadata, config, required=True)
+        candidate_refinement_release = _validated_candidate_refinement_release_attestation(
+            metadata,
+            config,
+            required=True,
+            require_deployment_binding=True,
+        )
     elif "feature_flags" in metadata:
         _validate_feature_flags(metadata, config, required=False)
     pad_id = int(payload["pad_id"])
+    if candidate_refinement_release is not None:
+        _validate_manifested_candidate_refinement_source(
+            path,
+            metadata,
+            config,
+            pad_id,
+            step=_validated_export_step(payload.get("step"), field="payload.step"),
+        )
     stored = payload["model"]
     quantization = payload.get("quantization")
 
@@ -3620,6 +4235,10 @@ def validate_export_directory(
         return report
     report["schema"] = manifest.get("schema")
     report["artifact_set_id"] = manifest.get("artifact_set_id")
+    raw_manifest_state_sha256 = manifest.get("state_sha256")
+    manifest_state_sha256 = (
+        raw_manifest_state_sha256 if _is_sha256(raw_manifest_state_sha256) else None
+    )
     for field in ("state_sha256", "artifact_set_id"):
         if not _is_sha256(manifest.get(field)):
             report["errors"].append(
@@ -3734,6 +4353,21 @@ def validate_export_directory(
                     "message": str(error),
                 }
             )
+        try:
+            _validated_candidate_refinement_release_attestation(
+                manifest_metadata,
+                manifest_model_config,
+                required=True,
+                require_deployment_binding=True,
+                expected_deployment_state_sha256=manifest_state_sha256,
+            )
+        except ValueError as error:
+            report["errors"].append(
+                {
+                    "error_type": "InvalidCandidateRefinementRelease",
+                    "message": str(error),
+                }
+            )
     try:
         report["pipeline"] = _validated_pipeline_identity_contract(manifest_metadata)
     except (TypeError, ValueError) as error:
@@ -3790,13 +4424,17 @@ def validate_export_directory(
                     }
                 )
                 continue
-            filename = identity.get("filename")
-            safe_filename = (
-                filename if isinstance(filename, str) and Path(filename).name == filename else None
-            )
+            try:
+                safe_filename = _manifest_basename(
+                    identity.get("filename"),
+                    field=f"embedded {metadata_name} filename",
+                )
+            except ValueError:
+                safe_filename = None
             sidecar = directory / str(safe_filename)
             if (
                 safe_filename is None
+                or _is_link_like(sidecar)
                 or not sidecar.is_file()
                 or identity.get("size") != sidecar.stat().st_size
                 or not _is_sha256(identity.get("sha256"))
@@ -3847,10 +4485,11 @@ def validate_export_directory(
                 or not isinstance(raw_entry.get("files"), list)
             ):
                 raise ValueError("Transformers entry requires deterministic directory metadata")
-            filename = raw_entry.get("file")
-            if not isinstance(filename, str) or not filename:
-                raise ValueError("artifact entry has no file")
-            artifact = (directory / filename).resolve()
+            filename = _manifest_basename(raw_entry.get("file"), field="artifact entry file")
+            unresolved_artifact = directory / filename
+            if _is_link_like(unresolved_artifact):
+                raise ValueError("artifact entry points to a linked path")
+            artifact = unresolved_artifact.resolve()
             try:
                 artifact.relative_to(root)
             except ValueError as error:
@@ -3873,7 +4512,7 @@ def validate_export_directory(
                     ),
                 )
                 expected_artifact_set_id = _artifact_set_id(
-                    str(manifest["state_sha256"]),
+                    str(manifest_state_sha256),
                     config,
                     pad_id,
                 )
@@ -3950,6 +4589,12 @@ def validate_export_directory(
                         raise RuntimeError("GGUF revision capability does not match the manifest")
                     if inspection["pipeline"] != _metadata_pipeline_identity(manifest_metadata):
                         raise RuntimeError("GGUF pipeline identity does not match the manifest")
+                    if inspection["candidate_refinement_release"] != manifest_metadata.get(
+                        "candidate_refinement_release"
+                    ):
+                        raise RuntimeError(
+                            "GGUF candidate-refinement release evidence does not match the manifest"
+                        )
                 validation["inspection"] = inspection
             else:
                 for metadata_name, default_filename in (
@@ -3959,11 +4604,14 @@ def validate_export_directory(
                     sidecar_metadata = manifest_metadata.get(metadata_name)
                     if not isinstance(sidecar_metadata, Mapping):
                         continue
-                    sidecar_file = artifact / str(
-                        sidecar_metadata.get("filename", default_filename)
+                    sidecar_filename = _manifest_basename(
+                        sidecar_metadata.get("filename", default_filename),
+                        field=f"Transformers {metadata_name} filename",
                     )
+                    sidecar_file = artifact / sidecar_filename
                     if (
-                        not sidecar_file.is_file()
+                        _is_link_like(sidecar_file)
+                        or not sidecar_file.is_file()
                         or sidecar_metadata.get("size") != sidecar_file.stat().st_size
                         or not _is_sha256(sidecar_metadata.get("sha256"))
                         or _sha256_file(sidecar_file) != sidecar_metadata["sha256"]
@@ -4030,6 +4678,13 @@ def validate_export_directory(
                     raise RuntimeError("Transformers revision directions do not match the manifest")
                 if inspection["pipeline"] != _metadata_pipeline_identity(manifest_metadata):
                     raise RuntimeError("Transformers pipeline identity does not match the manifest")
+                if inspection["candidate_refinement_release"] != manifest_metadata.get(
+                    "candidate_refinement_release"
+                ):
+                    raise RuntimeError(
+                        "Transformers candidate-refinement release evidence does not match "
+                        "the manifest"
+                    )
                 validation["inspection"] = inspection
             validation["valid"] = True
         except Exception as error:
@@ -4090,6 +4745,25 @@ def gather_full_state_dict(
         name: tensor.detach().to(device="cpu", copy=True)
         for name, tensor in unwrap_model(model).state_dict().items()
     }
+
+
+def gather_deployment_state_sha256(
+    model: nn.Module,
+    context: DistributedContext,
+    *,
+    ema: Any | None = None,
+) -> str:
+    """Hash the exact raw or EMA state that a later inference export must reproduce."""
+
+    if ema is not None:
+        with ema.swap(model):
+            deployment_state = gather_full_state_dict(model, context)
+    else:
+        deployment_state = gather_full_state_dict(model, context)
+    digest = _state_sha256(deployment_state) if context.is_main else None
+    deployment_state.clear()
+    gc.collect()
+    return broadcast_text(digest, context)
 
 
 def _synchronize_rank0_exception(
@@ -4541,6 +5215,8 @@ def export_inference_models(
     revision_directions: Sequence[Sequence[str]] | None = None,
     revision_trained: bool | None = None,
     pipeline_identity: Mapping[str, Any] | None = None,
+    candidate_refinement_release_attestation: Mapping[str, Any] | None = None,
+    candidate_refinement_checkpoint_source: str | Path | None = None,
     int4_backend: str = "auto",
     fp8_policy: Fp8Policy | None = None,
     release_name: str = TRANSLATION_RELEASE_NAME,
@@ -4552,6 +5228,55 @@ def export_inference_models(
     requested = _normalize_formats(formats)
     directory = Path(directory)
     working_directory = _temporary_path(directory) if context.is_main and strict else directory
+    candidate_refinement_release_authorized = False
+    requires_candidate_refinement_authority = bool(
+        translation_capable and model_config.experimental.candidate_refinement_enabled
+    )
+    if requires_candidate_refinement_authority:
+        if candidate_refinement_release_attestation is None:
+            raise ValueError("candidate-refinement export requires measured release evidence")
+        if candidate_refinement_checkpoint_source is None:
+            raise ValueError(
+                "candidate-refinement export requires an authenticated checkpoint source"
+            )
+        checkpoint_artifact_sha256 = candidate_refinement_release_attestation.get(
+            "checkpoint_artifact_sha256"
+        )
+        if not isinstance(checkpoint_artifact_sha256, str) or not _is_sha256(
+            checkpoint_artifact_sha256
+        ):
+            raise ValueError(
+                "candidate-refinement checkpoint artifact digest must be a SHA-256 value"
+            )
+        checkpoint_step = _validated_export_step(
+            candidate_refinement_release_attestation.get("checkpoint_step"),
+            field="candidate_refinement_release.checkpoint_step",
+        )
+        from sion_translate.training.checkpoint import (
+            inspect_checkpoint_training_state,
+            verified_checkpoint_generation_lease,
+        )
+
+        with verified_checkpoint_generation_lease(
+            candidate_refinement_checkpoint_source,
+            context,
+            expected_artifact_sha256=checkpoint_artifact_sha256,
+            expected_step=checkpoint_step,
+        ) as authenticated_checkpoint:
+            checkpoint_training_state = inspect_checkpoint_training_state(
+                authenticated_checkpoint.source,
+                context,
+            )
+        _validate_candidate_refinement_checkpoint_guard(
+            candidate_refinement_release_attestation,
+            checkpoint_training_state,
+        )
+        candidate_refinement_release_authorized = True
+    elif candidate_refinement_checkpoint_source is not None:
+        raise ValueError(
+            "candidate_refinement_checkpoint_source is only valid for candidate-refinement "
+            "translation exports"
+        )
     manifest: dict[str, Any] | None = None
     metadata: dict[str, Any] | None = None
     pad_id = 0
@@ -4574,6 +5299,7 @@ def export_inference_models(
                 release_name=release_name,
                 translation_capable=translation_capable,
                 pipeline_identity=pipeline_identity,
+                candidate_refinement_release_attestation=(candidate_refinement_release_attestation),
             )
         except BaseException as error:
             setup_error = error
@@ -4708,6 +5434,11 @@ def export_inference_models(
                 translation_capable=translation_capable,
                 _filename_overrides=filename_overrides,
                 _acquire_publish_lock=not strict,
+                _candidate_refinement_release_authority=(
+                    _CANDIDATE_REFINEMENT_RELEASE_AUTHORITY
+                    if candidate_refinement_release_authorized
+                    else None
+                ),
             )
             if strict:
                 # Conversion is complete. Release the full deployment snapshot

@@ -42,6 +42,7 @@ _SUPPORTED_EXPORT_DTYPES = {
     torch.bfloat16,
 }
 _TOKEN_FEATURE_NAMES = ("script", "onset", "vowel", "coda")
+_CANDIDATE_REFINEMENT_RELEASE_AUTHORITY = object()
 
 
 def _file_sha256(path: Path) -> str:
@@ -49,6 +50,26 @@ def _file_sha256(path: Path) -> str:
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _deployment_state_sha256(state_dict: Mapping[str, torch.Tensor]) -> str:
+    """Match the native export's deterministic state hash without importing it."""
+
+    digest = hashlib.sha256()
+    chunk_bytes = 16 * 1024 * 1024
+    for name in sorted(state_dict):
+        tensor = state_dict[name].detach().contiguous()
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(tensor.dtype).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(json.dumps(list(tensor.shape), separators=(",", ":")).encode("ascii"))
+        digest.update(b"\0")
+        raw = tensor.view(torch.uint8).reshape(-1)
+        for start in range(0, raw.numel(), chunk_bytes):
+            chunk = raw[start : start + chunk_bytes].to(device="cpu")
+            digest.update(memoryview(chunk.numpy().tobytes()))
     return digest.hexdigest()
 
 
@@ -538,12 +559,27 @@ def _save_transformers_checkpoint_unpublished(
     revision_directions: Sequence[Sequence[str]] | None = None,
     revision_trained: bool | None = None,
     pipeline_identity: Mapping[str, Any] | None = None,
+    candidate_refinement_release_attestation: Mapping[str, Any] | None = None,
+    _candidate_refinement_release_authority: object | None = None,
     allow_language_subset: bool = False,
     max_shard_size: str = "5GB",
 ) -> Path:
     """Save native Sion weights as a safe, AutoClass-compatible directory."""
 
     export_dtype = _state_dict_float_dtype(state_dict)
+    if model_config.experimental.candidate_refinement_enabled and translation_capable:
+        if _candidate_refinement_release_authority is not _CANDIDATE_REFINEMENT_RELEASE_AUTHORITY:
+            raise ValueError(
+                "candidate-refinement Transformers export requires authenticated release authority"
+            )
+        if candidate_refinement_release_attestation is None:
+            raise ValueError("candidate-refinement Transformers export requires release evidence")
+        if candidate_refinement_release_attestation.get(
+            "deployment_state_sha256"
+        ) != _deployment_state_sha256(state_dict):
+            raise ValueError(
+                "candidate-refinement Transformers evidence does not match the supplied weights"
+            )
     output_dir = Path(output_dir)
     bos_id = 2
     eos_id = 3
@@ -681,6 +717,11 @@ def _save_transformers_checkpoint_unpublished(
         token_features_sha256=token_features_sha256,
         token_features_shapes=token_features_shapes,
         pipeline=(dict(pipeline_identity) if pipeline_identity is not None else None),
+        candidate_refinement_release=(
+            dict(candidate_refinement_release_attestation)
+            if candidate_refinement_release_attestation is not None
+            else None
+        ),
     )
     # Build only metadata tensors, then bind the caller's stable CPU snapshot
     # directly. A normal 32B wrapper would allocate another ~128 GiB of FP32
@@ -915,6 +956,8 @@ def _save_transformers_checkpoint_unpublished(
     }
     if pipeline_identity is not None:
         metadata["pipeline"] = dict(pipeline_identity)
+    if candidate_refinement_release_attestation is not None:
+        metadata["candidate_refinement_release"] = dict(candidate_refinement_release_attestation)
     (output_dir / "sion_export.json").write_text(
         json.dumps(metadata, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -939,6 +982,8 @@ def save_transformers_checkpoint(
     revision_directions: Sequence[Sequence[str]] | None = None,
     revision_trained: bool | None = None,
     pipeline_identity: Mapping[str, Any] | None = None,
+    candidate_refinement_release_attestation: Mapping[str, Any] | None = None,
+    _candidate_refinement_release_authority: object | None = None,
     allow_language_subset: bool = False,
     max_shard_size: str = "5GB",
     _atomic_publish: bool = True,
@@ -963,6 +1008,8 @@ def save_transformers_checkpoint(
             revision_directions=revision_directions,
             revision_trained=revision_trained,
             pipeline_identity=pipeline_identity,
+            candidate_refinement_release_attestation=(candidate_refinement_release_attestation),
+            _candidate_refinement_release_authority=(_candidate_refinement_release_authority),
             allow_language_subset=allow_language_subset,
             max_shard_size=max_shard_size,
         )
@@ -990,6 +1037,8 @@ def save_transformers_checkpoint(
             revision_directions=revision_directions,
             revision_trained=revision_trained,
             pipeline_identity=pipeline_identity,
+            candidate_refinement_release_attestation=(candidate_refinement_release_attestation),
+            _candidate_refinement_release_authority=(_candidate_refinement_release_authority),
             allow_language_subset=allow_language_subset,
             max_shard_size=max_shard_size,
         )

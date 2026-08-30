@@ -21,11 +21,14 @@ from sion_translate.config import ExperimentalConfig, ModelConfig
 from sion_translate.inference import find_exported_model
 from sion_translate.model import SionForConditionalGeneration
 from sion_translate.model.layers import RotaryEmbedding, SwiGLU
+from sion_translate.training.checkpoint import save_checkpoint
 from sion_translate.training.distributed import DistributedContext
 from sion_translate.training.export import (
+    CANDIDATE_REFINEMENT_RELEASE_SCHEMA,
     EXPORT_SCHEMA,
     _cpu_model,
     _quantize_affine_k,
+    build_candidate_refinement_release_attestation,
     build_export_metadata as _build_export_metadata,
     convert_export,
     export_inference_models,
@@ -76,6 +79,24 @@ def foundation_pipeline_identity() -> dict[str, Any]:
     }
 
 
+def candidate_refinement_release_attestation(
+    *,
+    step: int = 0,
+    directions: tuple[tuple[str, str], ...] = (("ko", "ja"), ("ja", "ko")),
+    deployment_state_sha256: str | None = None,
+) -> dict[str, Any]:
+    return build_candidate_refinement_release_attestation(
+        checkpoint_step=step,
+        checkpoint_artifact_sha256="a" * 64,
+        deployed_family="raw",
+        translation_directions=directions,
+        validation_cohort_fingerprint="b" * 64,
+        worst_direction_nll_gain=0.02,
+        minimum_worst_direction_nll_gain=0.00001,
+        deployment_state_sha256=deployment_state_sha256,
+    )
+
+
 def build_export_metadata(
     model_config: ModelConfig,
     **kwargs: Any,
@@ -116,12 +137,31 @@ def export_state_dict_formats(
 
     if kwargs.get("metadata") is None:
         translation_capable = bool(kwargs.get("translation_capable", True))
-        kwargs["metadata"] = build_export_metadata(
-            model_config,
-            release_name=str(kwargs.get("release_name", "sion_translate")),
-            translation_capable=translation_capable,
-            pipeline_identity=(translation_pipeline_identity() if translation_capable else None),
-        )
+        metadata_kwargs: dict[str, Any] = {
+            "release_name": str(kwargs.get("release_name", "sion_translate")),
+            "translation_capable": translation_capable,
+            "pipeline_identity": (translation_pipeline_identity() if translation_capable else None),
+        }
+        if model_config.experimental.candidate_refinement_enabled and translation_capable:
+            step = int(kwargs.get("step", 0))
+            metadata_kwargs.update(
+                {
+                    "step": step,
+                    "candidate_refinement_release_attestation": (
+                        candidate_refinement_release_attestation(
+                            step=step,
+                            deployment_state_sha256=export_module._state_sha256(state_dict),
+                        )
+                    ),
+                }
+            )
+        kwargs["metadata"] = build_export_metadata(model_config, **metadata_kwargs)
+        if model_config.experimental.candidate_refinement_enabled and translation_capable:
+            # Format-level tests operate below the checkpoint-authority boundary.
+            # Dedicated tests below prove that the public path rejects this evidence.
+            kwargs["_candidate_refinement_release_authority"] = (
+                export_module._CANDIDATE_REFINEMENT_RELEASE_AUTHORITY
+            )
     return _export_state_dict_formats(
         directory,
         state_dict,
@@ -806,6 +846,347 @@ def test_export_rejects_a_reasoning_endpoint_that_bypasses_trained_refinement(
         )
 
 
+def test_candidate_refinement_export_requires_bound_release_evidence(
+    tmp_path: Path,
+) -> None:
+    config = export_config()
+    config.experimental.candidate_refinement_enabled = True
+    model = SionForConditionalGeneration(config)
+    unattested = build_export_metadata(config)
+
+    with pytest.raises(ValueError, match="requires release attestation"):
+        _export_state_dict_formats(
+            tmp_path / "unattested",
+            model.state_dict(),
+            config,
+            0,
+            step=7,
+            formats=("fp32",),
+            metadata=unattested,
+        )
+
+    attestation = candidate_refinement_release_attestation(step=7)
+    metadata = build_export_metadata(
+        config,
+        step=7,
+        candidate_refinement_release_attestation=attestation,
+    )
+    with pytest.raises(ValueError, match="requires authenticated checkpoint"):
+        _export_state_dict_formats(
+            tmp_path / "fabricated",
+            model.state_dict(),
+            config,
+            0,
+            step=7,
+            formats=("fp32",),
+            metadata=metadata,
+        )
+
+    sealed_fabrication = candidate_refinement_release_attestation(
+        step=7,
+        deployment_state_sha256=export_module._state_sha256(model.state_dict()),
+    )
+    sealed_metadata = build_export_metadata(
+        config,
+        step=7,
+        candidate_refinement_release_attestation=sealed_fabrication,
+    )
+    with pytest.raises(ValueError, match="requires authenticated checkpoint"):
+        _export_state_dict_formats(
+            tmp_path / "self-sealed",
+            model.state_dict(),
+            config,
+            0,
+            step=7,
+            formats=("fp32",),
+            metadata=sealed_metadata,
+        )
+
+    manifest = _export_state_dict_formats(
+        tmp_path / "attested",
+        model.state_dict(),
+        config,
+        0,
+        step=7,
+        formats=("fp32",),
+        metadata=metadata,
+        _candidate_refinement_release_authority=(
+            export_module._CANDIDATE_REFINEMENT_RELEASE_AUTHORITY
+        ),
+    )
+
+    sealed_attestation = manifest["metadata"]["candidate_refinement_release"]
+    assert sealed_attestation["deployment_state_sha256"] == manifest["state_sha256"]
+    assert attestation["schema"] == CANDIDATE_REFINEMENT_RELEASE_SCHEMA
+    _, _, _, loaded_metadata = load_exported_model(
+        tmp_path / "attested" / "model.pt",
+        return_metadata=True,
+    )
+    assert loaded_metadata["candidate_refinement_release"] == sealed_attestation
+
+
+def test_candidate_refinement_native_loader_authenticates_manifested_file_bytes(
+    tmp_path: Path,
+) -> None:
+    config = export_config()
+    config.experimental.candidate_refinement_enabled = True
+    model = SionForConditionalGeneration(config)
+    destination = tmp_path / "attested"
+    export_state_dict_formats(
+        destination,
+        model.state_dict(),
+        config,
+        0,
+        step=5,
+        formats=("fp32",),
+    )
+    artifact = destination / "model.pt"
+
+    isolated = tmp_path / "isolated.pt"
+    isolated.write_bytes(artifact.read_bytes())
+    with pytest.raises(ValueError, match="requires its export manifest"):
+        load_exported_model(isolated)
+
+    payload = torch.load(artifact, weights_only=True)
+    state_dict = payload["model"]
+    tensor_name = next(
+        name for name, tensor in sorted(state_dict.items()) if tensor.is_floating_point()
+    )
+    tampered = state_dict[tensor_name].clone()
+    tampered.view(-1)[0] += 1.0
+    state_dict[tensor_name] = tampered
+    torch.save(payload, artifact)
+    with pytest.raises(ValueError, match="source bytes do not match the manifest"):
+        load_exported_model(artifact)
+
+
+def test_candidate_refinement_loader_and_manifest_reject_stripped_evidence(
+    tmp_path: Path,
+) -> None:
+    config = export_config()
+    config.experimental.candidate_refinement_enabled = True
+    model = SionForConditionalGeneration(config)
+    destination = tmp_path / "attested"
+    export_state_dict_formats(
+        destination,
+        model.state_dict(),
+        config,
+        0,
+        step=5,
+        formats=("fp32",),
+    )
+    artifact = destination / "model.pt"
+    payload = torch.load(artifact, weights_only=True)
+    payload["metadata"].pop("candidate_refinement_release")
+    stripped_artifact = tmp_path / "stripped.pt"
+    torch.save(payload, stripped_artifact)
+
+    with pytest.raises(ValueError, match="requires release attestation"):
+        load_exported_model(stripped_artifact)
+
+    manifest_path = destination / "export_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["metadata"].pop("candidate_refinement_release")
+    manifest["metadata_compatibility_id"] = export_module._metadata_compatibility_id(
+        manifest["metadata"]
+    )
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    report = validate_export_directory(destination)
+    assert any(
+        error["error_type"] == "InvalidCandidateRefinementRelease" for error in report["errors"]
+    )
+
+
+@pytest.mark.parametrize("format_name", ["transformers", "gguf_q4_k_m"])
+def test_candidate_refinement_release_evidence_survives_portable_formats(
+    tmp_path: Path,
+    format_name: str,
+) -> None:
+    if format_name == "transformers":
+        pytest.importorskip("transformers")
+        pytest.importorskip("safetensors")
+    else:
+        pytest.importorskip("gguf")
+    config = export_config(d_model=256 if format_name == "gguf_q4_k_m" else 32)
+    config.experimental.candidate_refinement_enabled = True
+    model = SionForConditionalGeneration(config)
+    attestation = candidate_refinement_release_attestation(step=9)
+    metadata = build_export_metadata(
+        config,
+        step=9,
+        candidate_refinement_release_attestation=attestation,
+    )
+
+    manifest = _export_state_dict_formats(
+        tmp_path,
+        model.state_dict(),
+        config,
+        0,
+        step=9,
+        formats=(format_name,),
+        metadata=metadata,
+        _candidate_refinement_release_authority=(
+            export_module._CANDIDATE_REFINEMENT_RELEASE_AUTHORITY
+        ),
+    )
+    report = validate_export_directory(tmp_path)
+
+    assert manifest["formats"][format_name]["status"] == "ok"
+    assert report["valid"] is True
+    sealed_attestation = manifest["metadata"]["candidate_refinement_release"]
+    assert sealed_attestation["deployment_state_sha256"] == manifest["state_sha256"]
+    assert (
+        report["formats"][format_name]["inspection"]["candidate_refinement_release"]
+        == sealed_attestation
+    )
+
+
+def test_candidate_refinement_conversion_requires_manifested_fp32_parent(
+    tmp_path: Path,
+) -> None:
+    config = export_config()
+    config.experimental.candidate_refinement_enabled = True
+    model = SionForConditionalGeneration(config)
+    source = tmp_path / "source"
+    export_state_dict_formats(
+        source,
+        model.state_dict(),
+        config,
+        0,
+        step=11,
+        formats=("fp32",),
+    )
+
+    converted = convert_export(
+        source / "model.pt",
+        tmp_path / "converted",
+        formats=("bf16",),
+    )
+
+    assert converted["formats"]["bf16"]["status"] == "ok"
+    assert (
+        converted["metadata"]["candidate_refinement_release"]["deployment_state_sha256"]
+        == converted["state_sha256"]
+    )
+
+
+@pytest.mark.parametrize("source_format", ["fp16", "bf16"])
+def test_candidate_refinement_conversion_rejects_lossy_precision_parent(
+    tmp_path: Path,
+    source_format: str,
+) -> None:
+    config = export_config()
+    config.experimental.candidate_refinement_enabled = True
+    model = SionForConditionalGeneration(config)
+    source = tmp_path / source_format
+    export_state_dict_formats(
+        source,
+        model.state_dict(),
+        config,
+        0,
+        step=13,
+        formats=(source_format,),
+    )
+
+    with pytest.raises(ValueError, match="requires the exact FP32 deployment state"):
+        convert_export(
+            source / f"model_{source_format}.pt",
+            tmp_path / f"converted-{source_format}",
+            formats=("fp32",),
+        )
+
+
+def test_candidate_training_export_binds_checkpoint_guard_to_live_weights(
+    tmp_path: Path,
+) -> None:
+    config = export_config()
+    config.experimental.candidate_refinement_enabled = True
+    model = SionForConditionalGeneration(config)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _step: 1.0)
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+    checkpoint = tmp_path / "checkpoint"
+    deployment_state_sha256 = export_module._state_sha256(model.state_dict())
+    template = candidate_refinement_release_attestation(
+        step=7,
+        deployment_state_sha256=deployment_state_sha256,
+    )
+    training_state = {
+        "best_step": 7,
+        "best_candidate_refinement_guard_schema": CANDIDATE_REFINEMENT_RELEASE_SCHEMA,
+        "best_candidate_refinement_deployed_family": "raw",
+        "best_candidate_refinement_direction_fingerprint": template["direction_fingerprint"],
+        "best_candidate_refinement_direction_count": template["direction_count"],
+        "best_candidate_refinement_release_guard_passed": True,
+        "best_candidate_refinement_worst_direction_nll_gain": template["worst_direction_nll_gain"],
+        "best_candidate_refinement_min_worst_direction_nll_gain": template[
+            "minimum_worst_direction_nll_gain"
+        ],
+        "best_candidate_refinement_validation_cohort_fingerprint": template[
+            "validation_cohort_fingerprint"
+        ],
+        "best_candidate_refinement_deployment_state_sha256": deployment_state_sha256,
+    }
+    save_checkpoint(
+        checkpoint,
+        model,
+        optimizer,
+        scheduler,
+        7,
+        context,
+        training_state=training_state,
+    )
+    checkpoint_sha256 = export_module._sha256_file(checkpoint / "checkpoint.pt")
+    attestation = build_candidate_refinement_release_attestation(
+        checkpoint_step=7,
+        checkpoint_artifact_sha256=checkpoint_sha256,
+        deployed_family="raw",
+        translation_directions=(("ko", "ja"), ("ja", "ko")),
+        validation_cohort_fingerprint=str(template["validation_cohort_fingerprint"]),
+        worst_direction_nll_gain=float(template["worst_direction_nll_gain"]),
+        minimum_worst_direction_nll_gain=float(template["minimum_worst_direction_nll_gain"]),
+        deployment_state_sha256=deployment_state_sha256,
+    )
+
+    manifest = export_inference_models(
+        tmp_path / "authorized",
+        model,
+        config,
+        context,
+        7,
+        formats=("fp32",),
+        language_pair=("ko", "ja"),
+        bidirectional=True,
+        pipeline_identity=translation_pipeline_identity(),
+        candidate_refinement_release_attestation=attestation,
+        candidate_refinement_checkpoint_source=checkpoint,
+        strict=True,
+    )
+    assert manifest is not None
+    assert manifest["metadata"]["candidate_refinement_release"] == attestation
+
+    with torch.no_grad():
+        next(model.parameters()).add_(1.0)
+    with pytest.raises(ValueError, match="does not match exported weights"):
+        export_inference_models(
+            tmp_path / "wrong-weights",
+            model,
+            config,
+            context,
+            7,
+            formats=("fp32",),
+            language_pair=("ko", "ja"),
+            bidirectional=True,
+            pipeline_identity=translation_pipeline_identity(),
+            candidate_refinement_release_attestation=attestation,
+            candidate_refinement_checkpoint_source=checkpoint,
+            strict=True,
+        )
+
+
 def test_native_loader_rejects_tampered_reasoning_endpoint(tmp_path: Path) -> None:
     config = export_config()
     config.experimental.candidate_refinement_enabled = True
@@ -816,7 +1197,10 @@ def test_native_loader_rejects_tampered_reasoning_endpoint(tmp_path: Path) -> No
     tampered = tmp_path / "tampered.pt"
     torch.save(payload, tampered)
 
-    with pytest.raises(ValueError, match="does not match model features"):
+    with pytest.raises(
+        ValueError,
+        match="does not match (?:model features|its manifest)",
+    ):
         load_exported_model(tampered)
 
 
@@ -860,15 +1244,15 @@ def test_native_loader_rejects_schema_stripping_from_declared_1_5(
     tmp_path: Path,
 ) -> None:
     config = export_config()
+    config.experimental.candidate_refinement_enabled = True
     model = SionForConditionalGeneration(config)
     export_state_dict_formats(tmp_path, model.state_dict(), config, 0, formats=("fp32",))
     payload = torch.load(tmp_path / "model.pt", weights_only=True)
     payload.pop("schema")
-    payload["metadata"].pop("pipeline")
     tampered = tmp_path / "schema-stripped-1.5.pt"
     torch.save(payload, tampered)
 
-    with pytest.raises(ValueError, match="requires pipeline identity"):
+    with pytest.raises(ValueError, match="current release metadata requires.*schema"):
         load_exported_model(tampered)
 
 
@@ -1821,6 +2205,12 @@ def test_validator_requires_v2_integrity_fields(tmp_path: Path) -> None:
     validation = validate_export_directory(tmp_path)
     assert not validation["valid"]
     assert validation["errors"]
+    assert any(
+        error["error_type"] == "InvalidManifest" and "state_sha256" in error["message"]
+        for error in validation["errors"]
+    )
+    with pytest.raises(ValueError, match="manifest.state_sha256"):
+        export_module.resolve_manifest_artifact(tmp_path, ("fp32",))
 
 
 def test_validator_preserves_training_only_config_fields(tmp_path: Path) -> None:
@@ -2218,6 +2608,76 @@ def test_transformers_tokenizer_identity_is_cross_checked_with_manifest(
         "tokenizer identity does not match the manifest" in error["message"]
         for error in validation["errors"]
     )
+
+
+def test_transformers_validation_rejects_sidecar_path_traversal_without_reading_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = export_config()
+    model = SionForConditionalGeneration(config)
+    export_dir = tmp_path / "export"
+    manifest = export_state_dict_formats(
+        export_dir,
+        model.state_dict(),
+        config,
+        0,
+        formats=("transformers",),
+    )
+    outside = tmp_path / "outside-tokenizer.model"
+    outside.write_bytes(b"must not be read through an untrusted manifest")
+    manifest["metadata"]["embedded_sidecars"] = []
+    manifest["metadata"]["tokenizer"] = {
+        "filename": f"../{outside.name}",
+        "size": outside.stat().st_size,
+        "sha256": hashlib.sha256(outside.read_bytes()).hexdigest(),
+    }
+    manifest["metadata_compatibility_id"] = export_module._metadata_compatibility_id(
+        manifest["metadata"]
+    )
+    _store_manifest(export_dir, manifest)
+
+    original_sha256_file = export_module._sha256_file
+    outside_reads: list[Path] = []
+
+    def guarded_sha256_file(path: Path) -> str:
+        if path.resolve() == outside.resolve():
+            outside_reads.append(path)
+            raise AssertionError("validator followed an external sidecar path")
+        return original_sha256_file(path)
+
+    monkeypatch.setattr(export_module, "_sha256_file", guarded_sha256_file)
+
+    validation = validate_export_directory(export_dir)
+
+    assert not validation["valid"]
+    assert not outside_reads
+    assert any("safe basename" in error["message"] for error in validation["errors"])
+
+
+def test_transformers_directory_identity_rejects_linked_members(tmp_path: Path) -> None:
+    artifact = tmp_path / "transformers"
+    artifact.mkdir()
+    outside = tmp_path / "outside.py"
+    outside.write_text("raise RuntimeError('must not be imported')\n", encoding="utf-8")
+    linked = artifact / "configuration_sion.py"
+    try:
+        linked.symlink_to(outside)
+    except OSError as error:
+        pytest.skip(f"symbolic links are unavailable on this filesystem: {error}")
+
+    with pytest.raises(ValueError, match="linked path"):
+        export_module._directory_entry(artifact)
+
+
+def test_link_detection_rejects_windows_reparse_points_without_pathlib_junction_api() -> None:
+    reparse_flag = int(getattr(export_module.stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    reparse_path: Any = types.SimpleNamespace(
+        is_symlink=lambda: False,
+        lstat=lambda: types.SimpleNamespace(st_file_attributes=reparse_flag),
+    )
+
+    assert export_module._is_link_like(reparse_path)
 
 
 def test_transformers_sion_export_contract_is_cross_checked_with_config(
@@ -3298,6 +3758,47 @@ def test_atomic_replace_directory_restores_backup_after_partial_fallback_failure
     assert (destination / "original.txt").read_text(encoding="utf-8") == "known good"
     assert {path.name for path in destination.iterdir()} == {"original.txt"}
     assert not list(tmp_path.glob(".best.backup-*"))
+
+
+def test_atomic_replace_directory_retries_transient_handoff_publication_denials(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "best"
+    destination.mkdir()
+    (destination / "generation.txt").write_text("old", encoding="utf-8")
+    temporary = tmp_path / ".best.tmp-test"
+    temporary.mkdir()
+    (temporary / "generation.txt").write_text("new", encoding="utf-8")
+
+    real_replace = export_module.os.replace
+    handoff_attempts = 0
+
+    def transient_handoff_denial(source: str | Path, target: str | Path) -> None:
+        nonlocal handoff_attempts
+        source_path = Path(source)
+        target_path = Path(target)
+        if source_path == temporary and target_path == destination:
+            raise PermissionError("injected locked staging directory")
+        if source_path.name.startswith(".best.handoff-") and target_path == destination:
+            handoff_attempts += 1
+            if handoff_attempts < 3:
+                raise PermissionError("injected transient handoff denial")
+        real_replace(source_path, target_path)
+
+    monkeypatch.setattr(export_module.os, "replace", transient_handoff_denial)
+    monkeypatch.setattr(
+        export_module,
+        "_WINDOWS_DIRECTORY_REPLACE_INITIAL_DELAY_SECONDS",
+        0.0,
+    )
+
+    export_module._atomic_replace_directory(temporary, destination)
+
+    assert handoff_attempts == 3
+    assert (destination / "generation.txt").read_text(encoding="utf-8") == "new"
+    assert not list(tmp_path.glob(".best.backup-*"))
+    assert not list(tmp_path.glob(".best.handoff-*"))
 
 
 def test_atomic_replace_directory_uses_a_cross_process_publish_lock(tmp_path: Path) -> None:

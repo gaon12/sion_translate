@@ -35,7 +35,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
-from typing import Any, Callable, Concatenate, Iterable, Mapping, ParamSpec, Sequence, TypeVar
+from typing import Any, Callable, Concatenate, Iterable, Mapping, ParamSpec, Sequence, TypeVar, cast
 
 import torch
 import torch.distributed as dist
@@ -68,7 +68,13 @@ from .distributed import (
     reduce_sum,
 )
 from .ema import EMAWeights
-from .export import build_export_metadata, export_inference_models
+from .export import (
+    CANDIDATE_REFINEMENT_RELEASE_SCHEMA,
+    build_candidate_refinement_release_attestation,
+    build_export_metadata,
+    export_inference_models,
+    gather_deployment_state_sha256,
+)
 from .objectives import ObjectiveOutput
 
 
@@ -519,7 +525,94 @@ def _selection_metric_label(key: str) -> str:
     return f"EMA {label}" if ema else label
 
 
-_CANDIDATE_REFINEMENT_RELEASE_SCHEMA = "sion-candidate-refinement-release-v2"
+_DIRECTION_COMPLETE_VALIDATION_SCHEMA = "sion-direction-complete-validation-v2"
+
+
+def _candidate_refinement_validation_cohort_fingerprint(
+    validation_loader: object,
+    expected_directions: Sequence[Sequence[str]],
+    minimum_examples_per_direction: int,
+) -> str:
+    """Authenticate the deterministic graph-complete cohort used for release evidence."""
+
+    batch_sampler = getattr(validation_loader, "batch_sampler", None)
+    raw_identity = getattr(batch_sampler, "cohort_identity", None)
+    if not isinstance(raw_identity, Mapping):
+        raise ValueError(
+            "candidate-refinement release training requires a direction-complete validation "
+            "batch sampler with authenticated cohort identity"
+        )
+    typed_identity = cast(Mapping[str, object], raw_identity)
+    if typed_identity.get("schema") != _DIRECTION_COMPLETE_VALIDATION_SCHEMA:
+        raise ValueError("candidate-refinement validation cohort schema is unsupported")
+    raw_directions = typed_identity.get("directions")
+    if not isinstance(raw_directions, Sequence) or isinstance(raw_directions, (str, bytes)):
+        raise ValueError("candidate-refinement validation cohort directions are invalid")
+    observed_directions: list[tuple[str, str]] = []
+    for raw_direction in cast(Sequence[object], raw_directions):
+        if (
+            not isinstance(raw_direction, Sequence)
+            or isinstance(raw_direction, (str, bytes))
+            or len(raw_direction) != 2
+            or not all(
+                isinstance(language, str) for language in cast(Sequence[object], raw_direction)
+            )
+        ):
+            raise ValueError("candidate-refinement validation cohort directions are invalid")
+        observed_directions.append((str(raw_direction[0]), str(raw_direction[1])))
+    canonical_directions = tuple(tuple(direction) for direction in expected_directions)
+    if tuple(observed_directions) != canonical_directions:
+        raise ValueError(
+            "candidate-refinement validation cohort does not match the configured translation graph"
+        )
+    if typed_identity.get("unique_examples_required") is not True:
+        raise ValueError(
+            "candidate-refinement release validation must not repeat held-out examples"
+        )
+    observed_minimum = typed_identity.get("minimum_examples_per_direction")
+    if (
+        type(observed_minimum) is not int
+        or type(minimum_examples_per_direction) is not int
+        or minimum_examples_per_direction <= 0
+        or observed_minimum < minimum_examples_per_direction
+    ):
+        raise ValueError(
+            "candidate-refinement validation cohort does not meet the configured minimum "
+            "distinct examples per direction"
+        )
+    raw_counts = typed_identity.get("direction_example_counts")
+    if (
+        not isinstance(raw_counts, Sequence)
+        or isinstance(raw_counts, (str, bytes))
+        or len(raw_counts) != len(canonical_directions)
+    ):
+        raise ValueError("candidate-refinement validation cohort example counts are invalid")
+    for expected_direction, raw_count in zip(
+        canonical_directions,
+        cast(Sequence[object], raw_counts),
+        strict=True,
+    ):
+        if not isinstance(raw_count, Mapping):
+            raise ValueError("candidate-refinement validation cohort example counts are invalid")
+        count = cast(Mapping[str, object], raw_count)
+        raw_direction = count.get("direction")
+        available = count.get("available")
+        selected = count.get("selected")
+        if (
+            not isinstance(raw_direction, Sequence)
+            or isinstance(raw_direction, (str, bytes))
+            or tuple(raw_direction) != expected_direction
+            or type(available) is not int
+            or type(selected) is not int
+            or selected < minimum_examples_per_direction
+            or available < selected
+        ):
+            raise ValueError("candidate-refinement validation cohort example counts are invalid")
+    fingerprint = typed_identity.get("sha256")
+    if not _is_sha256_digest(fingerprint):
+        raise ValueError("candidate-refinement validation cohort requires a SHA-256 fingerprint")
+    assert isinstance(fingerprint, str)
+    return fingerprint
 
 
 def _check_candidate_refinement_release(
@@ -562,6 +655,24 @@ def _check_candidate_refinement_release(
         raise RuntimeError(
             "candidate-refinement release evidence is incomplete; missing validation "
             f"metric(s): {', '.join(missing)}"
+        )
+    expected_direction_metric_keys = {
+        key for direction_keys in direction_metric_keys for key in direction_keys
+    }
+    observed_direction_metric_keys = {
+        key
+        for key in metrics
+        if key.startswith(f"{prefix}direction_")
+        and (
+            key.endswith("_candidate_refinement_nll_gain")
+            or key.endswith("_candidate_refinement_tokens")
+        )
+    }
+    if observed_direction_metric_keys != expected_direction_metric_keys:
+        unexpected = sorted(observed_direction_metric_keys - expected_direction_metric_keys)
+        raise RuntimeError(
+            "candidate-refinement validation did not cover the exact configured translation "
+            "graph; unexpected direction metric(s): " + ", ".join(unexpected)
         )
     reported_worst_gain = float(metrics[gain_key])
     raw_direction_count = float(metrics[count_key])
@@ -1012,6 +1123,15 @@ def train(
                 "candidate-refinement translation training requires at least one configured "
                 "translation direction"
             )
+        candidate_refinement_validation_cohort_fingerprint = (
+            _candidate_refinement_validation_cohort_fingerprint(
+                validation_loader,
+                configured_translation_directions,
+                config.training.candidate_refinement_min_validation_examples_per_direction,
+            )
+        )
+    else:
+        candidate_refinement_validation_cohort_fingerprint = None
     if not export_translation_capable:
         if authenticated_revision_directions:
             raise ValueError(
@@ -1079,6 +1199,11 @@ def train(
     _fail_if_known_empty(validation_loader, "validation")
 
     training = config.training
+    validation_batch_sampler = getattr(validation_loader, "batch_sampler", None)
+    validation_evaluation_batches = max(
+        training.eval_batches,
+        int(getattr(validation_batch_sampler, "evaluation_batches", training.eval_batches)),
+    )
     budget = resolve_training_budget(train_loader, training)
     if training.warmup_steps > budget.max_optimizer_steps:
         raise ValueError(
@@ -1143,10 +1268,14 @@ def train(
     if ema is not None:
         announce(f"EMA weight averaging enabled (decay={training.ema_decay}).", context)
     if requires_candidate_refinement_release_guard:
+        assert candidate_refinement_validation_cohort_fingerprint is not None
         announce(
             "Candidate-refinement release guard enabled. Resumable latest checkpoints will "
             "not be duplicated as inference exports; only guard-approved best weights are "
-            "deployable.",
+            "deployable. Required worst-direction NLL gain: "
+            f"{training.candidate_refinement_min_worst_direction_nll_gain:g}; deployed family: "
+            f"{candidate_refinement_deployed_family}; validation cohort: "
+            f"{candidate_refinement_validation_cohort_fingerprint[:12]}...",
             context,
         )
     configured_selection_metric = (
@@ -1194,6 +1323,10 @@ def train(
             _reset_best_training_state(training_state)
             training_state.pop("candidate_refinement_sft_baseline_loss", None)
             training_state.pop("candidate_refinement_sft_baseline_selection_metric", None)
+            training_state.pop(
+                "candidate_refinement_sft_baseline_validation_cohort_fingerprint",
+                None,
+            )
         recorded_best_step = int(training_state.get("best_step", -1))
         recorded_best_value = float(training_state.get("best_validation_loss", float("inf")))
         recorded_best_artifact_sha256 = training_state.get("best_checkpoint_artifact_sha256")
@@ -1246,6 +1379,14 @@ def train(
     )
     selected_checkpoint_source: str | None = None
     selected_checkpoint_artifact_sha256: str | None = None
+    raw_best_deployment_state_sha256 = training_state.get(
+        "best_candidate_refinement_deployment_state_sha256"
+    )
+    best_candidate_refinement_deployment_state_sha256 = (
+        raw_best_deployment_state_sha256
+        if _is_sha256_digest(raw_best_deployment_state_sha256)
+        else None
+    )
     bad_evals = int(training_state.get("early_stopping_bad_evals", 0))
     loaded_best_selection_metric = training_state.get("best_selection_metric")
     best_selection_metric = (
@@ -1265,8 +1406,22 @@ def train(
     candidate_refinement_sft_baseline_selection_metric = (
         raw_sft_baseline_metric if isinstance(raw_sft_baseline_metric, str) else None
     )
-    if not math.isfinite(candidate_refinement_sft_baseline_loss):
+    raw_sft_baseline_cohort_fingerprint = training_state.get(
+        "candidate_refinement_sft_baseline_validation_cohort_fingerprint"
+    )
+    candidate_refinement_sft_baseline_validation_cohort_fingerprint = (
+        raw_sft_baseline_cohort_fingerprint
+        if _is_sha256_digest(raw_sft_baseline_cohort_fingerprint)
+        else None
+    )
+    if (
+        not math.isfinite(candidate_refinement_sft_baseline_loss)
+        or candidate_refinement_sft_baseline_validation_cohort_fingerprint
+        != candidate_refinement_validation_cohort_fingerprint
+    ):
+        candidate_refinement_sft_baseline_loss = float("inf")
         candidate_refinement_sft_baseline_selection_metric = None
+        candidate_refinement_sft_baseline_validation_cohort_fingerprint = None
     raw_best_refinement_gain = training_state.get(
         "best_candidate_refinement_worst_direction_nll_gain"
     )
@@ -1294,12 +1449,16 @@ def train(
         and math.isfinite(float(raw_attested_minimum_gain))
         else None
     )
+    attested_validation_cohort_fingerprint = training_state.get(
+        "best_candidate_refinement_validation_cohort_fingerprint"
+    )
     best_candidate_refinement_release_guard_passed = bool(
         (best_step > 0 or (best_step == 0 and objective is not None))
         and best_checkpoint_artifact_sha256 is not None
+        and best_candidate_refinement_deployment_state_sha256 is not None
         and training_state.get("best_candidate_refinement_release_guard_passed") is True
         and training_state.get("best_candidate_refinement_guard_schema")
-        == _CANDIDATE_REFINEMENT_RELEASE_SCHEMA
+        == CANDIDATE_REFINEMENT_RELEASE_SCHEMA
         and training_state.get("best_candidate_refinement_deployed_family")
         == candidate_refinement_deployed_family
         and training_state.get("best_candidate_refinement_direction_fingerprint")
@@ -1309,6 +1468,8 @@ def train(
         and best_candidate_refinement_worst_direction_nll_gain
         >= training.candidate_refinement_min_worst_direction_nll_gain
         and attested_minimum_gain == training.candidate_refinement_min_worst_direction_nll_gain
+        and attested_validation_cohort_fingerprint
+        == candidate_refinement_validation_cohort_fingerprint
     )
     if (
         requires_candidate_refinement_release_guard
@@ -1328,6 +1489,7 @@ def train(
         best_checkpoint_artifact_sha256 = None
         best_selection_metric = None
         best_candidate_refinement_worst_direction_nll_gain = None
+        best_candidate_refinement_deployment_state_sha256 = None
         best_candidate_refinement_release_guard_passed = False
     if requires_candidate_refinement_release_guard:
         ineligible_exports = ["latest"]
@@ -1373,9 +1535,7 @@ def train(
         if requires_candidate_refinement_release_guard:
             state.update(
                 {
-                    "best_candidate_refinement_guard_schema": (
-                        _CANDIDATE_REFINEMENT_RELEASE_SCHEMA
-                    ),
+                    "best_candidate_refinement_guard_schema": (CANDIDATE_REFINEMENT_RELEASE_SCHEMA),
                     "best_candidate_refinement_deployed_family": (
                         candidate_refinement_deployed_family
                     ),
@@ -1394,6 +1554,12 @@ def train(
                     "best_candidate_refinement_min_worst_direction_nll_gain": (
                         training.candidate_refinement_min_worst_direction_nll_gain
                     ),
+                    "best_candidate_refinement_validation_cohort_fingerprint": (
+                        candidate_refinement_validation_cohort_fingerprint
+                    ),
+                    "best_candidate_refinement_deployment_state_sha256": (
+                        best_candidate_refinement_deployment_state_sha256
+                    ),
                 }
             )
             if (
@@ -1408,6 +1574,9 @@ def train(
                         ),
                         "candidate_refinement_sft_baseline_selection_metric": (
                             candidate_refinement_sft_baseline_selection_metric
+                        ),
+                        "candidate_refinement_sft_baseline_validation_cohort_fingerprint": (
+                            candidate_refinement_sft_baseline_validation_cohort_fingerprint
                         ),
                     }
                 )
@@ -1445,6 +1614,35 @@ def train(
             else None
         )
         resolved_artifact_step = step if artifact_step is None else artifact_step
+        release_attestation: dict[str, Any] | None = None
+        if requires_candidate_refinement_release_guard:
+            if name != "best":
+                raise RuntimeError(
+                    "candidate-refinement inference export is restricted to the "
+                    "guard-approved best checkpoint"
+                )
+            if (
+                not best_candidate_refinement_release_guard_passed
+                or best_checkpoint_artifact_sha256 is None
+                or best_candidate_refinement_worst_direction_nll_gain is None
+                or candidate_refinement_validation_cohort_fingerprint is None
+                or best_candidate_refinement_deployment_state_sha256 is None
+            ):
+                raise RuntimeError(
+                    "candidate-refinement best export requires complete release evidence"
+                )
+            release_attestation = build_candidate_refinement_release_attestation(
+                checkpoint_step=resolved_artifact_step,
+                checkpoint_artifact_sha256=best_checkpoint_artifact_sha256,
+                deployed_family=candidate_refinement_deployed_family,
+                translation_directions=configured_translation_directions,
+                validation_cohort_fingerprint=(candidate_refinement_validation_cohort_fingerprint),
+                worst_direction_nll_gain=(best_candidate_refinement_worst_direction_nll_gain),
+                minimum_worst_direction_nll_gain=(
+                    training.candidate_refinement_min_worst_direction_nll_gain
+                ),
+                deployment_state_sha256=(best_candidate_refinement_deployment_state_sha256),
+            )
         manifest = export_inference_models(
             output_dir / "exports" / name,
             model,
@@ -1469,6 +1667,10 @@ def train(
             release_name=export_release_name,
             translation_capable=export_translation_capable,
             pipeline_identity=pipeline_identity,
+            candidate_refinement_release_attestation=release_attestation,
+            candidate_refinement_checkpoint_source=(
+                output_dir / "checkpoints" / "best" if release_attestation is not None else None
+            ),
         )
         if requires_candidate_refinement_release_guard and name == "best":
             marker_error: Exception | None = None
@@ -1530,14 +1732,16 @@ def train(
         nonlocal best_checkpoint_artifact_sha256, best_selection_metric
         nonlocal best_candidate_refinement_release_guard_passed
         nonlocal best_candidate_refinement_worst_direction_nll_gain
+        nonlocal best_candidate_refinement_deployment_state_sha256
         nonlocal candidate_refinement_sft_baseline_loss
         nonlocal candidate_refinement_sft_baseline_selection_metric
+        nonlocal candidate_refinement_sft_baseline_validation_cohort_fingerprint
         announce(f"Validation starting at step {step}.", context)
         metrics = evaluate(
             model,
             validation_loader,
             context,
-            training.eval_batches,
+            validation_evaluation_batches,
             precision=training.precision,
             show_progress=True,
             objective=objective,
@@ -1551,7 +1755,7 @@ def train(
                     model,
                     validation_loader,
                     context,
-                    training.eval_batches,
+                    validation_evaluation_batches,
                     precision=training.precision,
                     show_progress=True,
                     objective=objective,
@@ -1663,17 +1867,33 @@ def train(
                     training.candidate_refinement_min_worst_direction_nll_gain
                 ),
             )
-            if objective is None and step <= 0:
+            needs_sft_comparison_baseline = bool(
+                objective is None
+                and best_step < 0
+                and candidate_refinement_sft_baseline_selection_metric is None
+            )
+            if objective is None and (step <= 0 or needs_sft_comparison_baseline):
                 refinement_release_guard_passed = False
                 if math.isfinite(candidate):
                     candidate_refinement_sft_baseline_loss = candidate
                     candidate_refinement_sft_baseline_selection_metric = selection_key
-                announce(
-                    "Candidate-refinement release guard kept the SFT step-0 checkpoint "
-                    "resume-only because no translation optimizer update has completed. Its "
-                    "selection metric remains the floor that later SFT checkpoints must beat.",
-                    context,
-                )
+                    candidate_refinement_sft_baseline_validation_cohort_fingerprint = (
+                        candidate_refinement_validation_cohort_fingerprint
+                    )
+                if step <= 0:
+                    announce(
+                        "Candidate-refinement release guard kept the SFT step-0 checkpoint "
+                        "resume-only because no translation optimizer update has completed. Its "
+                        "selection metric remains the floor that later SFT checkpoints must beat.",
+                        context,
+                    )
+                else:
+                    announce(
+                        "The resumed SFT checkpoint has no authenticated comparison floor. "
+                        "Keeping this validation resume-only and recording its finite selection "
+                        "metric; a later optimizer update must improve that new floor.",
+                        context,
+                    )
             elif not refinement_release_guard_passed:
                 announce(
                     "Candidate-refinement release guard rejected this checkpoint: "
@@ -1686,18 +1906,24 @@ def train(
                 )
         if (
             refinement_release_guard_passed
+            and objective is None
             and best_step < 0
             and candidate_refinement_sft_baseline_selection_metric is not None
             and selection_key != candidate_refinement_sft_baseline_selection_metric
         ):
             announce(
                 "The validation selection metric differs from the saved SFT step-0 baseline. "
-                "Discarding that incompatible comparison floor before best selection "
+                "Keeping this checkpoint resume-only and recording a new comparison floor "
                 f"({candidate_refinement_sft_baseline_selection_metric!r} → {selection_key!r}).",
                 context,
             )
-            candidate_refinement_sft_baseline_loss = float("inf")
-            candidate_refinement_sft_baseline_selection_metric = None
+            refinement_release_guard_passed = False
+            if math.isfinite(candidate):
+                candidate_refinement_sft_baseline_loss = candidate
+                candidate_refinement_sft_baseline_selection_metric = selection_key
+                candidate_refinement_sft_baseline_validation_cohort_fingerprint = (
+                    candidate_refinement_validation_cohort_fingerprint
+                )
         if (
             refinement_release_guard_passed
             and best_selection_metric is not None
@@ -1715,6 +1941,7 @@ def train(
             best_checkpoint_artifact_sha256 = None
             best_selection_metric = None
             best_candidate_refinement_worst_direction_nll_gain = None
+            best_candidate_refinement_deployment_state_sha256 = None
             best_candidate_refinement_release_guard_passed = False
         comparison_loss = best_validation_loss
         if (
@@ -1739,6 +1966,11 @@ def train(
             best_selection_metric = selection_key
             best_candidate_refinement_worst_direction_nll_gain = refinement_worst_gain
             best_candidate_refinement_release_guard_passed = refinement_release_guard_passed
+            best_candidate_refinement_deployment_state_sha256 = (
+                gather_deployment_state_sha256(model, context, ema=ema)
+                if requires_candidate_refinement_release_guard
+                else None
+            )
             announce(
                 f"New best {selection_name} ({selection_value:.4f}); saving best checkpoint.",
                 context,
@@ -1764,8 +1996,8 @@ def train(
             export_models("best")
         elif requires_candidate_refinement_release_guard and best_step < 0:
             announce(
-                "No release-safe candidate-refinement baseline exists yet. Continuing without "
-                "consuming early-stopping patience so later updates can satisfy the guard.",
+                "No release-safe candidate-refinement best checkpoint exists yet. Continuing "
+                "without consuming early-stopping patience so later updates can satisfy the guard.",
                 context,
             )
         else:
@@ -2148,8 +2380,8 @@ def train(
         ):
             raise RuntimeError(
                 "training produced no finite validation selection metric or authenticated "
-                "release-safe best checkpoint; refusing to publish unbound or regressive "
-                "final weights"
+                "release-safe best checkpoint; refusing to publish unbound, regressive, or "
+                "insufficiently improved final weights"
             )
         if not requires_candidate_refinement_release_guard:
             export_models("latest")
@@ -2233,14 +2465,39 @@ def train(
     if objective is not None:
         result["best_validation_reward"] = -best_validation_loss
     if requires_candidate_refinement_release_guard:
+        assert candidate_refinement_validation_cohort_fingerprint is not None
+        assert selected_checkpoint_artifact_sha256 is not None
+        assert best_candidate_refinement_worst_direction_nll_gain is not None
+        assert best_candidate_refinement_deployment_state_sha256 is not None
+        release_attestation = build_candidate_refinement_release_attestation(
+            checkpoint_step=best_step,
+            checkpoint_artifact_sha256=selected_checkpoint_artifact_sha256,
+            deployed_family=candidate_refinement_deployed_family,
+            translation_directions=configured_translation_directions,
+            validation_cohort_fingerprint=candidate_refinement_validation_cohort_fingerprint,
+            worst_direction_nll_gain=best_candidate_refinement_worst_direction_nll_gain,
+            minimum_worst_direction_nll_gain=(
+                training.candidate_refinement_min_worst_direction_nll_gain
+            ),
+            deployment_state_sha256=best_candidate_refinement_deployment_state_sha256,
+        )
         result["candidate_refinement_release_guard_passed"] = (
             best_candidate_refinement_release_guard_passed
         )
         result["candidate_refinement_min_worst_direction_nll_gain"] = (
             training.candidate_refinement_min_worst_direction_nll_gain
         )
-        if best_candidate_refinement_worst_direction_nll_gain is not None:
-            result["candidate_refinement_worst_direction_nll_gain"] = (
-                best_candidate_refinement_worst_direction_nll_gain
-            )
+        result["candidate_refinement_validation_cohort_fingerprint"] = (
+            candidate_refinement_validation_cohort_fingerprint
+        )
+        result["candidate_refinement_release_attestation_json"] = json.dumps(
+            release_attestation,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        result["candidate_refinement_worst_direction_nll_gain"] = (
+            best_candidate_refinement_worst_direction_nll_gain
+        )
     return result

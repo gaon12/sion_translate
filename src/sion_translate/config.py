@@ -465,6 +465,10 @@ class TrainingConfig:
     candidate_refinement_min_worst_direction_nll_gain: float = (
         DEFAULT_CANDIDATE_REFINEMENT_MIN_WORST_DIRECTION_NLL_GAIN
     )
+    # Release evidence must contain this many distinct held-out examples for
+    # every configured translation direction. Repeating a scarce row would
+    # inflate token counts without adding independent evidence.
+    candidate_refinement_min_validation_examples_per_direction: int = 32
     # Exponential moving average: after each step, update shadow weights as
     # ``decay * shadow + (1 - decay) * parameter``. Zero disables EMA.
     ema_decay: float = 0.999
@@ -876,6 +880,14 @@ class AppConfig:
         ):
             raise ValueError(
                 "candidate_refinement_min_worst_direction_nll_gain must be finite and positive"
+            )
+        refinement_min_examples = (
+            self.training.candidate_refinement_min_validation_examples_per_direction
+        )
+        if type(refinement_min_examples) is not int or refinement_min_examples <= 0:
+            raise ValueError(
+                "candidate_refinement_min_validation_examples_per_direction must be a "
+                "positive integer"
             )
         if not 0.0 <= self.training.ema_decay < 1.0:
             raise ValueError("ema_decay must be in [0, 1)")

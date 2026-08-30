@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import shutil
+from collections.abc import Iterable
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -40,11 +41,60 @@ TRANSLATION_PIPELINE_IDENTITY = {
 }
 
 
+class _DirectionCompleteTestLoader(list[dict[str, torch.Tensor]]):
+    """Attach the production cohort contract to compact in-memory trainer fixtures."""
+
+    def __init__(self, batches: Iterable[dict[str, torch.Tensor]], config: AppConfig) -> None:
+        super().__init__(batches)
+        directions = config.data.configured_translation_directions()
+        minimum_examples = (
+            config.training.candidate_refinement_min_validation_examples_per_direction
+        )
+        self.batch_sampler = type(
+            "DirectionCompleteTestSampler",
+            (),
+            {
+                "evaluation_batches": config.training.eval_batches,
+                "cohort_identity": {
+                    "schema": "sion-direction-complete-validation-v2",
+                    "directions": [list(direction) for direction in directions],
+                    "minimum_examples_per_direction": minimum_examples,
+                    "unique_examples_required": True,
+                    "direction_example_counts": [
+                        {
+                            "direction": list(direction),
+                            "available": minimum_examples,
+                            "selected": minimum_examples,
+                        }
+                        for direction in directions
+                    ],
+                    "sha256": "c" * 64,
+                },
+            },
+        )()
+
+
 def train(*args, **kwargs):
     """Run translation tests under the exact public 1.5 ancestry contract."""
 
     kwargs.setdefault("pipeline_identity", TRANSLATION_PIPELINE_IDENTITY)
-    return _train(*args, **kwargs)
+    positional = list(args)
+    config = positional[3] if len(positional) > 3 else kwargs["config"]
+    if config.model.experimental.candidate_refinement_enabled:
+        if len(positional) > 2:
+            validation_loader = positional[2]
+            sampler = getattr(validation_loader, "batch_sampler", None)
+            if not hasattr(sampler, "cohort_identity"):
+                positional[2] = _DirectionCompleteTestLoader(validation_loader, config)
+        else:
+            validation_loader = kwargs["validation_loader"]
+            sampler = getattr(validation_loader, "batch_sampler", None)
+            if not hasattr(sampler, "cohort_identity"):
+                kwargs["validation_loader"] = _DirectionCompleteTestLoader(
+                    validation_loader,
+                    config,
+                )
+    return _train(*positional, **kwargs)
 
 
 def tiny_model_config() -> ModelConfig:
@@ -752,6 +802,33 @@ def refinement_release_metrics(
     return metrics
 
 
+def test_candidate_refinement_release_cohort_rejects_repetition_and_small_edges(
+    tmp_path: Path,
+) -> None:
+    config = tiny_app_config(tmp_path)
+    directions = config.data.configured_translation_directions()
+    minimum_examples = config.training.candidate_refinement_min_validation_examples_per_direction
+
+    repeated_loader = _DirectionCompleteTestLoader([], config)
+    repeated_loader.batch_sampler.cohort_identity["unique_examples_required"] = False
+    with pytest.raises(ValueError, match="must not repeat held-out examples"):
+        trainer_module._candidate_refinement_validation_cohort_fingerprint(
+            repeated_loader,
+            directions,
+            minimum_examples,
+        )
+
+    undersized_loader = _DirectionCompleteTestLoader([], config)
+    undersized_counts = undersized_loader.batch_sampler.cohort_identity["direction_example_counts"]
+    undersized_counts[0]["selected"] = minimum_examples - 1
+    with pytest.raises(ValueError, match="example counts are invalid"):
+        trainer_module._candidate_refinement_validation_cohort_fingerprint(
+            undersized_loader,
+            directions,
+            minimum_examples,
+        )
+
+
 def test_candidate_refinement_release_check_uses_the_deployed_ema_family() -> None:
     directions = (("de", "fr"), ("sw", "ar"))
     metrics = refinement_release_metrics(directions, (-0.5, -0.6))
@@ -785,6 +862,21 @@ def test_candidate_refinement_release_check_requires_a_positive_margin(
 
     assert passed is False
     assert observed_worst_gain == pytest.approx(worst_gain)
+
+
+def test_candidate_refinement_release_check_accepts_the_exact_configured_margin() -> None:
+    directions = (("de", "fr"), ("sw", "ar"))
+    metrics = refinement_release_metrics(directions, (1e-5, 0.2))
+
+    passed, _, observed_worst_gain = trainer_module._check_candidate_refinement_release(
+        metrics,
+        prefer_ema=False,
+        expected_directions=directions,
+        minimum_worst_direction_gain=1e-5,
+    )
+
+    assert passed is True
+    assert observed_worst_gain == pytest.approx(1e-5)
 
 
 def test_candidate_refinement_release_check_rejects_incomplete_evidence() -> None:
@@ -830,6 +922,23 @@ def test_candidate_refinement_release_check_rejects_same_size_wrong_graph() -> N
     metrics = refinement_release_metrics(wrong_directions, (0.1, 0.2))
 
     with pytest.raises(RuntimeError, match="evidence is incomplete"):
+        trainer_module._check_candidate_refinement_release(
+            metrics,
+            prefer_ema=False,
+            expected_directions=expected_directions,
+            minimum_worst_direction_gain=1e-5,
+        )
+
+
+def test_candidate_refinement_release_check_rejects_hidden_extra_direction() -> None:
+    expected_directions = (("de", "fr"), ("sw", "ar"))
+    metrics = refinement_release_metrics(expected_directions, (0.1, 0.2))
+    extra_metrics = refinement_release_metrics((("ko", "ja"),), (0.3,))
+    extra_metrics.pop("validation_worst_direction_candidate_refinement_nll_gain")
+    extra_metrics.pop("validation_candidate_refinement_direction_count")
+    metrics.update(extra_metrics)
+
+    with pytest.raises(RuntimeError, match="unexpected direction metric"):
         trainer_module._check_candidate_refinement_release(
             metrics,
             prefer_ema=False,
@@ -1339,6 +1448,7 @@ def test_zero_gain_identity_baseline_is_resume_only_and_attestation_is_resumable
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     export_calls: list[tuple[Path, int]] = []
+    export_attestations: list[object] = []
 
     def record_successful_export(
         path: Path,
@@ -1349,6 +1459,7 @@ def test_zero_gain_identity_baseline_is_resume_only_and_attestation_is_resumable
         **kwargs: object,
     ) -> dict[str, object]:
         export_calls.append((Path(path), artifact_step))
+        export_attestations.append(kwargs.get("candidate_refinement_release_attestation"))
         return {"formats": {"fp32": {"status": "ok"}}}
 
     monkeypatch.setattr(
@@ -1393,6 +1504,13 @@ def test_zero_gain_identity_baseline_is_resume_only_and_attestation_is_resumable
     assert first["candidate_refinement_release_guard_passed"] is True
     assert first["candidate_refinement_min_worst_direction_nll_gain"] == pytest.approx(1e-5)
     assert export_calls == [(tmp_path / "run" / "exports" / "best", 1)]
+    assert len(export_attestations) == 1
+    assert export_attestations[0] == json.loads(
+        str(first["candidate_refinement_release_attestation_json"])
+    )
+    assert isinstance(export_attestations[0], dict)
+    assert export_attestations[0]["checkpoint_step"] == 1
+    assert export_attestations[0]["validation_cohort_fingerprint"] == "c" * 64
     assert not (tmp_path / "run" / "exports" / "best" / RELEASE_INELIGIBLE_FILENAME).exists()
     assert (tmp_path / "run" / "exports" / "latest" / RELEASE_INELIGIBLE_FILENAME).is_file()
     latest_file = tmp_path / "run" / "checkpoints" / "latest" / "checkpoint.pt"
@@ -1400,12 +1518,23 @@ def test_zero_gain_identity_baseline_is_resume_only_and_attestation_is_resumable
     attestation_keys = {
         key for key in payload["training_state"] if key.startswith("best_candidate_refinement_")
     }
-    assert len(attestation_keys) == 7
+    assert attestation_keys == {
+        "best_candidate_refinement_guard_schema",
+        "best_candidate_refinement_deployed_family",
+        "best_candidate_refinement_direction_fingerprint",
+        "best_candidate_refinement_direction_count",
+        "best_candidate_refinement_release_guard_passed",
+        "best_candidate_refinement_worst_direction_nll_gain",
+        "best_candidate_refinement_min_worst_direction_nll_gain",
+        "best_candidate_refinement_validation_cohort_fingerprint",
+        "best_candidate_refinement_deployment_state_sha256",
+    }
     for key in attestation_keys:
         payload["training_state"].pop(key)
     torch.save(payload, latest_file)
 
     export_calls.clear()
+    export_attestations.clear()
     config.training.max_steps = 2
     config.training.resume_from = str(latest_file.parent)
     resumed = train(
@@ -1421,9 +1550,12 @@ def test_zero_gain_identity_baseline_is_resume_only_and_attestation_is_resumable
     assert resumed["best_step"] == 1
     assert resumed["candidate_refinement_release_guard_passed"] is True
     assert export_calls == [(tmp_path / "run" / "exports" / "best", 1)]
+    assert export_attestations == [
+        json.loads(str(resumed["candidate_refinement_release_attestation_json"]))
+    ]
 
 
-def test_positive_gain_sft_step_zero_is_not_deployable_or_a_regression_target(
+def test_positive_gain_sft_step_zero_is_resume_only_and_remains_the_comparison_floor(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1487,6 +1619,258 @@ def test_positive_gain_sft_step_zero_is_not_deployable_or_a_regression_target(
         latest["training_state"]["candidate_refinement_sft_baseline_selection_metric"]
         == "validation_nll"
     )
+
+
+def test_sft_metric_family_change_records_a_new_non_deployable_baseline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fallback-to-configured metric transition must not compare unlike values."""
+
+    export_steps: list[int] = []
+
+    def record_successful_export(
+        _path: Path,
+        _model: nn.Module,
+        _model_config: ModelConfig,
+        _context: DistributedContext,
+        artifact_step: int,
+        **kwargs: object,
+    ) -> dict[str, object]:
+        export_steps.append(artifact_step)
+        return {"formats": {"fp32": {"status": "ok"}}}
+
+    validation_calls = 0
+
+    def changing_selection_metrics(*args: object, **kwargs: object) -> dict[str, float]:
+        nonlocal validation_calls
+        validation_event = validation_calls
+        validation_calls += 1
+        metrics = {
+            "validation_loss": 0.6 - validation_event * 0.1,
+            "validation_nll": 0.6 - validation_event * 0.1,
+            "validation_perplexity": math.exp(0.6 - validation_event * 0.1),
+            "validation_auxiliary_loss": 0.0,
+            "validation_tokens": 6.0,
+            "validation_candidate_refinement_nll_gain": 0.02,
+            **refinement_release_metrics((("ko", "ja"), ("ja", "ko")), (0.02, 0.01)),
+        }
+        if validation_event > 0:
+            metrics["validation_macro_direction_nll"] = 0.6 - validation_event * 0.1
+        return metrics
+
+    monkeypatch.setattr(trainer_module, "export_inference_models", record_successful_export)
+    monkeypatch.setattr(trainer_module, "evaluate", changing_selection_metrics)
+    config = tiny_app_config(tmp_path, max_steps=2, ema_decay=0.0)
+    config.model.experimental.candidate_refinement_enabled = True
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+
+    result = train(
+        SionForConditionalGeneration(config.model),
+        [tiny_batch()],
+        [tiny_batch()],
+        config,
+        context,
+        language_tags={"ko": 4, "ja": 5},
+    )
+
+    assert result["best_step"] == 2
+    assert export_steps == [2]
+    latest = torch.load(
+        tmp_path / "run" / "checkpoints" / "latest" / "checkpoint.pt",
+        map_location="cpu",
+        weights_only=True,
+    )
+    training_state = latest["training_state"]
+    assert training_state["candidate_refinement_sft_baseline_loss"] == pytest.approx(0.5)
+    assert (
+        training_state["candidate_refinement_sft_baseline_selection_metric"]
+        == "validation_macro_direction_nll"
+    )
+
+
+def test_legacy_sft_resume_without_a_comparison_floor_must_rebaseline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A migrated checkpoint cannot compare its first resumed metric with infinity."""
+
+    export_steps: list[int] = []
+
+    def record_successful_export(
+        _path: Path,
+        _model: nn.Module,
+        _model_config: ModelConfig,
+        _context: DistributedContext,
+        artifact_step: int,
+        **kwargs: object,
+    ) -> dict[str, object]:
+        export_steps.append(artifact_step)
+        return {"formats": {"fp32": {"status": "ok"}}}
+
+    initial_calls = 0
+
+    def initial_metrics(*args: object, **kwargs: object) -> dict[str, float]:
+        nonlocal initial_calls
+        validation_event = initial_calls
+        initial_calls += 1
+        nll = 0.6 if validation_event == 0 else 0.5
+        return {
+            "validation_loss": nll,
+            "validation_nll": nll,
+            "validation_perplexity": math.exp(nll),
+            "validation_auxiliary_loss": 0.0,
+            "validation_tokens": 6.0,
+            "validation_candidate_refinement_nll_gain": 0.02,
+            **refinement_release_metrics((("ko", "ja"), ("ja", "ko")), (0.02, 0.01)),
+        }
+
+    monkeypatch.setattr(trainer_module, "export_inference_models", record_successful_export)
+    monkeypatch.setattr(trainer_module, "evaluate", initial_metrics)
+    config = tiny_app_config(tmp_path, max_steps=1, ema_decay=0.0)
+    config.model.experimental.candidate_refinement_enabled = True
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+    train(
+        SionForConditionalGeneration(config.model),
+        [tiny_batch()],
+        [tiny_batch()],
+        config,
+        context,
+        language_tags={"ko": 4, "ja": 5},
+    )
+
+    latest_file = tmp_path / "run" / "checkpoints" / "latest" / "checkpoint.pt"
+    payload = torch.load(latest_file, map_location="cpu", weights_only=True)
+    for key in tuple(payload["training_state"]):
+        if key.startswith("best_candidate_refinement_") or key.startswith(
+            "candidate_refinement_sft_baseline_"
+        ):
+            payload["training_state"].pop(key)
+    torch.save(payload, latest_file)
+
+    resumed_calls = 0
+
+    def regressing_resume_metrics(*args: object, **kwargs: object) -> dict[str, float]:
+        nonlocal resumed_calls
+        nll = 0.5 if resumed_calls == 0 else 0.6
+        resumed_calls += 1
+        return {
+            "validation_loss": nll,
+            "validation_nll": nll,
+            "validation_perplexity": math.exp(nll),
+            "validation_auxiliary_loss": 0.0,
+            "validation_tokens": 6.0,
+            "validation_candidate_refinement_nll_gain": 0.02,
+            **refinement_release_metrics((("ko", "ja"), ("ja", "ko")), (0.02, 0.01)),
+        }
+
+    export_steps.clear()
+    monkeypatch.setattr(trainer_module, "evaluate", regressing_resume_metrics)
+    config.training.max_steps = 2
+    config.training.resume_from = str(latest_file.parent)
+
+    with pytest.raises(RuntimeError, match="release-safe best checkpoint"):
+        train(
+            SionForConditionalGeneration(config.model),
+            [tiny_batch()],
+            [tiny_batch()],
+            config,
+            context,
+            language_tags={"ko": 4, "ja": 5},
+        )
+
+    assert export_steps == []
+    resumed = torch.load(latest_file, map_location="cpu", weights_only=True)
+    state = resumed["training_state"]
+    assert state["candidate_refinement_sft_baseline_loss"] == pytest.approx(0.5)
+    assert state["candidate_refinement_sft_baseline_selection_metric"] == "validation_nll"
+    assert state["best_step"] == -1
+
+
+def test_resume_rejects_a_best_attested_under_a_different_release_margin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Changing the release floor invalidates the historical best evidence."""
+
+    export_steps: list[int] = []
+
+    def record_successful_export(
+        _path: Path,
+        _model: nn.Module,
+        _model_config: ModelConfig,
+        _context: DistributedContext,
+        artifact_step: int,
+        **kwargs: object,
+    ) -> dict[str, object]:
+        export_steps.append(artifact_step)
+        return {"formats": {"fp32": {"status": "ok"}}}
+
+    initial_calls = 0
+
+    def initial_metrics(*args: object, **kwargs: object) -> dict[str, float]:
+        nonlocal initial_calls
+        nll = 0.6 if initial_calls == 0 else 0.5
+        initial_calls += 1
+        return {
+            "validation_loss": nll,
+            "validation_nll": nll,
+            "validation_perplexity": math.exp(nll),
+            "validation_auxiliary_loss": 0.0,
+            "validation_tokens": 6.0,
+            "validation_candidate_refinement_nll_gain": 0.02,
+            **refinement_release_metrics((("ko", "ja"), ("ja", "ko")), (0.02, 0.01)),
+        }
+
+    monkeypatch.setattr(trainer_module, "export_inference_models", record_successful_export)
+    monkeypatch.setattr(trainer_module, "evaluate", initial_metrics)
+    config = tiny_app_config(tmp_path, max_steps=1, ema_decay=0.0)
+    config.model.experimental.candidate_refinement_enabled = True
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+    train(
+        SionForConditionalGeneration(config.model),
+        [tiny_batch()],
+        [tiny_batch()],
+        config,
+        context,
+        language_tags={"ko": 4, "ja": 5},
+    )
+
+    latest_file = tmp_path / "run" / "checkpoints" / "latest" / "checkpoint.pt"
+    payload = torch.load(latest_file, map_location="cpu", weights_only=True)
+    payload["training_state"]["best_candidate_refinement_min_worst_direction_nll_gain"] = 0.0001
+    torch.save(payload, latest_file)
+
+    export_steps.clear()
+    monkeypatch.setattr(
+        trainer_module,
+        "evaluate",
+        lambda *args, **kwargs: {
+            "validation_loss": 0.7,
+            "validation_nll": 0.7,
+            "validation_perplexity": math.exp(0.7),
+            "validation_auxiliary_loss": 0.0,
+            "validation_tokens": 6.0,
+            "validation_candidate_refinement_nll_gain": 0.02,
+            **refinement_release_metrics((("ko", "ja"), ("ja", "ko")), (0.02, 0.01)),
+        },
+    )
+    config.training.max_steps = 2
+    config.training.resume_from = str(latest_file.parent)
+
+    with pytest.raises(RuntimeError, match="release-safe best checkpoint"):
+        train(
+            SionForConditionalGeneration(config.model),
+            [tiny_batch()],
+            [tiny_batch()],
+            config,
+            context,
+            language_tags={"ko": 4, "ja": 5},
+        )
+
+    assert export_steps == []
+    resumed = torch.load(latest_file, map_location="cpu", weights_only=True)
+    assert resumed["training_state"]["best_step"] == -1
 
 
 def test_positive_gain_posttraining_stage_zero_remains_the_reward_fallback(

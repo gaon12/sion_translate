@@ -168,9 +168,9 @@ def test_root_config_gives_every_enabled_module_a_training_signal() -> None:
     """A module that is on must have a non-zero weight, or it is pure cost.
 
     This is the invariant worth pinning. Which modules are on is a per-run
-    decision - the from-scratch run narrowed it to CoRe so a change in quality
-    has one candidate cause - but any module that *is* on has to be learning
-    something.
+    decision - the from-scratch run narrowed it to candidate refinement so a
+    change in quality has one candidate cause - but any module that *is* on has
+    to be learning something.
     """
 
     root_config = Path(__file__).resolve().parents[1] / "sion_translate.yaml"
@@ -630,6 +630,37 @@ def test_candidate_refinement_release_margin_must_be_finite_and_positive(
     with pytest.raises(
         ValueError,
         match="candidate_refinement_min_worst_direction_nll_gain must be finite and positive",
+    ):
+        config.validate()
+
+
+def test_candidate_refinement_release_margin_default_and_shipped_configs_are_exact() -> None:
+    assert AppConfig().training.candidate_refinement_min_worst_direction_nll_gain == 1e-5
+    assert AppConfig().training.candidate_refinement_min_validation_examples_per_direction == 32
+    repository = Path(__file__).resolve().parents[1]
+    for relative_path in (
+        "sion_translate.yaml",
+        "configs/debug.yaml",
+        "configs/sion_data_fit.yaml",
+        "configs/sion_1_3b.yaml",
+        "configs/aspirational/sion_8b.yaml",
+    ):
+        config = load_config(repository / relative_path)
+        assert config.model.experimental.candidate_refinement_enabled is True
+        assert config.training.candidate_refinement_min_worst_direction_nll_gain == 1e-5
+        assert config.training.candidate_refinement_min_validation_examples_per_direction == 32
+
+
+@pytest.mark.parametrize("minimum_examples", (True, None, 0, -1, 1.5, "32"))
+def test_candidate_refinement_release_cohort_size_must_be_a_positive_integer(
+    minimum_examples: object,
+) -> None:
+    config = AppConfig()
+    config.training.candidate_refinement_min_validation_examples_per_direction = minimum_examples
+
+    with pytest.raises(
+        ValueError,
+        match="candidate_refinement_min_validation_examples_per_direction must be a positive integer",
     ):
         config.validate()
 
