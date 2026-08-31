@@ -119,18 +119,24 @@ Treat a graph, tokenizer, token-feature, source-fingerprint, or inventory mismat
 hard failure. Investigate it instead of deleting metadata and forcing reuse.
 
 Inspect `artifacts/dataset/manifest.json` after preparation. New artifacts must declare
-`stats_schema` as `sion-prepare-stats-src-tgt-v2`. The `src_tokens` and `tgt_tokens`
+`stats_schema` as `sion-prepare-stats-src-tgt-v3`. The `src_tokens` and `tgt_tokens`
 values are physical accepted content-token counts for the two stored shard sides; they
 are not Korean/Japanese totals and they do not include virtual reverse directions,
 padding, runtime controls, epoch repetition, or online augmentation. Their values must
-match the sums of `src_length` and `tgt_length` in the authenticated index shards. The v2
-contract also includes the dedicated `refinement_evidence` split count. Older v1 manifests
+match the sums of `src_length` and `tgt_length` in the authenticated index shards. The v3
+contract also includes the dedicated `refinement_evidence` split count and the
+`reserved_draft_separator` rejection count. Older v1 and v2 manifests
 remain readable, and a markerless v1.5 manifest may retain the exact legacy
 `ko_tokens`/`ja_tokens` names for compatibility, but do not copy those misleading names
 into a new manifest.
 Compatibility reading does not make an old artifact eligible for a new GPU handoff. The bundle
-builder requires the current v2 schema and reconciles all total and per-source derived statistics
+builder requires the current v3 schema and reconciles all total and per-source derived statistics
 with the authenticated shard indexes. Rebuild old prepared data locally before packaging it.
+
+Before accepting any row, preparation treats `<draft>` as reserved model-control syntax.
+An ordinary source or any target containing it is rejected even when the general quality
+filter is disabled. Only an exactly directed, revision-marked source may contain one
+separator between non-empty segments. This contract is language-independent.
 
 An interrupted translation build keeps deterministic gzip worker chunks in a hidden
 content-addressed progress directory next to `artifacts/dataset/`. The progress contract

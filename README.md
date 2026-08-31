@@ -179,17 +179,23 @@ duplicates from crossing split boundaries, records source fingerprints, and writ
 manifest for every generated shard.
 
 The dataset manifest names physical token totals by storage side, not by language. Under
-`stats_schema: sion-prepare-stats-src-tgt-v2`, `src_tokens` and `tgt_tokens` count the
+`stats_schema: sion-prepare-stats-src-tgt-v3`, `src_tokens` and `tgt_tokens` count the
 accepted content token IDs physically stored in the source and target shard files. They
 do not count padding, runtime language controls, virtual reverse examples, repeated
 epochs, or later training augmentation. This definition stays valid for any configured
-language graph. The v2 statistics contract also records the dedicated
-`refinement_evidence` count. Authenticated older manifests may use the v1 storage-neutral
+language graph. The v3 statistics contract also records the dedicated
+`refinement_evidence` count and the number of expanded pairs rejected for unauthenticated
+`<draft>` syntax. Authenticated older manifests may use the v1 or v2 storage-neutral
 contract or, when no schema marker exists, the exact legacy `ko_tokens` and `ja_tokens`
-field set. Every new manifest writes only the v2 storage-neutral names.
+field set. Every new manifest writes only the v3 storage-neutral names.
 The local compatibility reader can inspect those older contracts, but a new GPU handoff
-bundle requires the current v2 schema and reconciles every total and per-source statistic
+bundle requires the current v3 schema and reconciles every total and per-source statistic
 against the indexed shard fields. Rebuild an older prepared dataset locally before packaging it.
+
+`<draft>` is reserved model-control syntax. Preparation rejects it on either side of an
+ordinary pair even when general quality filtering is disabled. It is allowed only once in
+the source of a row whose revision marker and row-scoped training direction authenticate
+that exact edge; it is never allowed in a target. This rule is independent of language.
 
 Translation preparation writes deterministic, content-bound worker chunks beside the
 requested output. If tokenization is interrupted, run the same command again: compatible
