@@ -90,15 +90,8 @@ if cancelled.wait(remaining_seconds):
     reader.join(1.0)
     os._exit(0)
 
-message = (
-    "FATAL: checkpoint I/O exceeded its hard deadline; terminating the training "
-    f"process before checkpoint state can keep changing (pid={parent_pid}, "
-    f"operation={operation}).\n"
-)
-try:
-    os.write(2, message.encode("utf-8", errors="replace")[:4096])
-except OSError:
-    pass
+# Terminate before diagnostics. A blocked stderr pipe must never delay the
+# paid-compute safety boundary or allow checkpoint state to keep changing.
 try:
     # Windows does not expose SIGKILL, but os.kill(..., SIGTERM) delegates to
     # TerminateProcess. POSIX uses SIGKILL so application handlers cannot defer
@@ -110,6 +103,16 @@ except ProcessLookupError:
 except OSError as error:
     try:
         os.write(2, f"FATAL: checkpoint watchdog could not stop pid {parent_pid}: {error}\n".encode())
+    except OSError:
+        pass
+else:
+    message = (
+        "FATAL: checkpoint I/O exceeded its hard deadline; terminated the training "
+        f"process before checkpoint state could keep changing (pid={parent_pid}, "
+        f"operation={operation}).\n"
+    )
+    try:
+        os.write(2, message.encode("utf-8", errors="replace")[:4096])
     except OSError:
         pass
 os._exit(124)

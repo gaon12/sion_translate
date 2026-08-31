@@ -1420,6 +1420,14 @@ def test_checkpoint_io_timeout_uses_reviewed_default(
     assert checkpoint_module._checkpoint_io_timeout_seconds() == 600.0
 
 
+def test_checkpoint_io_watchdog_terminates_before_writing_diagnostics() -> None:
+    watchdog_code = checkpoint_module._CHECKPOINT_IO_WATCHDOG_CODE
+
+    assert watchdog_code.index("os.kill(parent_pid") < watchdog_code.index(
+        'message = (\n        "FATAL: checkpoint I/O exceeded'
+    )
+
+
 @pytest.mark.parametrize(
     "mode",
     ["local-save", "local-load", "distributed-save", "distributed-load"],
