@@ -999,12 +999,20 @@ def _write_refinement_evidence_rows(
         dtype=INDEX_DTYPE,
     )
     np.save(evidence / "00000.idx.npy", index, allow_pickle=False)
-    (evidence / "00000.src.bin").write_bytes(
-        np.tile(np.asarray([4, 5], dtype=np.uint32), len(rows)).tobytes()
+    # Keep every logical pair content-distinct. Production preprocessing
+    # establishes this boundary through direction-level deduplication; a bundle
+    # fixture with repeated token pairs would make the exact-K test weaker than
+    # the release policy it claims to exercise.
+    source_tokens = np.asarray(
+        [[4 + row_id % 4, 4 + (row_id // 4) % 4] for row_id in range(len(rows))],
+        dtype=np.uint32,
     )
-    (evidence / "00000.tgt.bin").write_bytes(
-        np.tile(np.asarray([6, 7], dtype=np.uint32), len(rows)).tobytes()
+    target_tokens = np.asarray(
+        [[4 + (row_id // 16) % 4, 4 + (row_id // 64) % 4] for row_id in range(len(rows))],
+        dtype=np.uint32,
     )
+    (evidence / "00000.src.bin").write_bytes(source_tokens.tobytes())
+    (evidence / "00000.tgt.bin").write_bytes(target_tokens.tobytes())
 
     languages = json.loads((dataset / "manifest.json").read_text(encoding="utf-8"))["languages"]
     metadata_payloads = [
