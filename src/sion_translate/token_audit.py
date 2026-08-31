@@ -749,7 +749,11 @@ def _validate_current_preprocessing_options(
 ) -> tuple[int, int]:
     """Validate self-described preprocessing values, not only their field names."""
 
-    for name in ("approximate_split", "filter_quality", "prevent_target_leakage"):
+    for name in (
+        "approximate_split",
+        "filter_quality",
+        "prevent_target_leakage",
+    ):
         if not isinstance(options.get(name), bool):
             raise ValueError(f"Current dataset preprocessing {name} must be boolean")
     if options.get("dedup_backend") not in {"memory", "sqlite"}:
@@ -767,7 +771,11 @@ def _validate_current_preprocessing_options(
         options.get("test_fraction"),
         field="test_fraction",
     )
-    if validation_fraction + test_fraction >= 0.5:
+    refinement_evidence_fraction = _strict_fraction(
+        options.get("refinement_evidence_fraction"),
+        field="refinement_evidence_fraction",
+    )
+    if validation_fraction + test_fraction + refinement_evidence_fraction >= 0.5:
         raise ValueError("Current dataset preprocessing split fractions are unexpectedly large")
 
     approximate = cast(bool, options["approximate_split"])
@@ -799,6 +807,7 @@ def _validate_current_manifest_contract(
     tuple[bool, ...],
     int,
     int,
+    tuple[bool, ...],
     str,
 ]:
     """Authenticate the non-payload half of a published current dataset."""
@@ -809,6 +818,7 @@ def _validate_current_manifest_contract(
         "train",
         "validation",
         "test",
+        "refinement_evidence",
         RAW_FINGERPRINT_FILENAME,
         "manifest.json",
         PREPARE_COMPLETION_FILENAME,
@@ -820,7 +830,7 @@ def _validate_current_manifest_contract(
             f"missing={sorted(allowed_top_level - actual_top_level)}, "
             f"unexpected={sorted(actual_top_level - allowed_top_level)}"
         )
-    for split in ("train", "validation", "test"):
+    for split in ("train", "validation", "test", "refinement_evidence"):
         split_path = dataset_root / split
         if split_path.is_symlink() or not split_path.is_dir():
             raise ValueError(f"Current dataset split is not a regular directory: {split_path}")
@@ -887,7 +897,9 @@ def _validate_current_manifest_contract(
         "record_metadata_fields",
         "record_metadata_format",
         "record_metadata_index_dtype",
+        "refinement_evidence_fraction",
         "shard_size",
+        "source_only_synthetic_evidence_files",
         "source_only_languages",
         "translation_directions",
         "split_key",
@@ -998,9 +1010,40 @@ def _validate_current_manifest_contract(
         or not 0.0 <= float(sampling_weight) <= 1.0
     ):
         raise ValueError("Current dataset synthetic sampling weight is invalid")
+    raw_evidence_files = options.get("source_only_synthetic_evidence_files")
+    if not isinstance(raw_evidence_files, list) or not all(
+        isinstance(name, str)
+        and bool(name)
+        and name not in {".", ".."}
+        and Path(name).name == name
+        and "/" not in name
+        and "\\" not in name
+        and name.casefold().endswith(".jsonl")
+        for name in cast(list[object], raw_evidence_files)
+    ):
+        raise ValueError(
+            "Current dataset source-only synthetic evidence files must be plain basenames"
+        )
+    evidence_files = cast(list[str], raw_evidence_files)
+    if len(evidence_files) != len({name.casefold() for name in evidence_files}):
+        raise ValueError(
+            "Current dataset source-only synthetic evidence files must be case-insensitively unique"
+        )
+    if (
+        evidence_files
+        and float(cast(int | float, options.get("refinement_evidence_fraction"))) <= 0.0
+    ):
+        raise ValueError(
+            "Current dataset source-only synthetic evidence files require a positive "
+            "refinement evidence fraction"
+        )
     expected_synthetic_policy = {
         "record_field": "synthetic",
-        "train_only": True,
+        "train_only_by_default": True,
+        "source_only_holdout_enabled": bool(evidence_files),
+        "source_only_evidence_files": evidence_files,
+        "source_only_holdout_purpose": "relative-refinement-evidence-only-v1",
+        "source_only_target_overlap": "allowed-for-relative-evidence-only-v1",
         "sampling_weight": options.get("synthetic_sampling_weight"),
         "prefixes": list(normalized_prefixes),
     }
@@ -1016,6 +1059,7 @@ def _validate_current_manifest_contract(
         "shard_size": "shard_size",
         "test_fraction": "test_fraction",
         "validation_fraction": "validation_fraction",
+        "refinement_evidence_fraction": "refinement_evidence_fraction",
     }
     for manifest_name, option_name in direct_option_fields.items():
         manifest_value = manifest.get(manifest_name)
@@ -1134,12 +1178,32 @@ def _validate_current_manifest_contract(
     }
     if completion != expected_completion:
         raise ValueError("Current dataset completion marker does not authenticate its generation")
+    evidence_file_set = frozenset(evidence_files)
+    source_evidence_files = tuple(name in evidence_file_set for name in source_names)
+    missing_evidence_files = sorted(evidence_file_set - set(source_names))
+    if missing_evidence_files:
+        raise ValueError(
+            "Current dataset source-only synthetic evidence files are absent from sources: "
+            f"{missing_evidence_files}"
+        )
+    if any(
+        eligible and not synthetic_file
+        for eligible, synthetic_file in zip(
+            source_evidence_files,
+            source_synthetic_files,
+            strict=True,
+        )
+    ):
+        raise ValueError(
+            "Current dataset source-only evidence file is not authenticated as synthetic"
+        )
     return (
         stats,
         tuple(source_stats),
         tuple(source_synthetic_files),
         shard_size,
         maximum_tokens,
+        source_evidence_files,
         inventory_digest,
     )
 
@@ -1153,6 +1217,7 @@ def _validate_current_indexed_payload(
     languages: tuple[str, ...],
     translation_directions: tuple[tuple[str, str], ...],
     source_only_languages: tuple[str, ...],
+    source_evidence_files: Sequence[bool],
     shard_size: int,
     maximum_tokens_per_side: int,
     vocab_size: int,
@@ -1162,6 +1227,8 @@ def _validate_current_indexed_payload(
     source_count = len(source_stats)
     if len(source_synthetic_files) != source_count:
         raise ValueError("Current dataset source synthetic identities are incomplete")
+    if len(source_evidence_files) != source_count:
+        raise ValueError("Current dataset source-only evidence identities are incomplete")
     language_to_id = {language: index for index, language in enumerate(languages)}
     direction_set = frozenset(translation_directions)
     allowed_pairs = {
@@ -1176,11 +1243,12 @@ def _validate_current_indexed_payload(
     source_src_tokens = np.zeros(source_count, dtype=np.int64)
     source_tgt_tokens = np.zeros(source_count, dtype=np.int64)
     source_split_rows = {
-        split: np.zeros(source_count, dtype=np.int64) for split in ("train", "validation", "test")
+        split: np.zeros(source_count, dtype=np.int64)
+        for split in ("train", "validation", "test", "refinement_evidence")
     }
     split_rows: dict[str, int] = {}
 
-    for split in ("train", "validation", "test"):
+    for split in ("train", "validation", "test", "refinement_evidence"):
         split_root = dataset_root / split
         expected_artifacts: set[str] = set()
         split_total = 0
@@ -1234,8 +1302,6 @@ def _validate_current_indexed_payload(
                 np.isin(forward_only, (0, 1)).all()
             ):
                 raise ValueError(f"Current dataset boolean flags are invalid: {index_path}")
-            if split != "train" and bool(np.count_nonzero(synthetic)):
-                raise ValueError(f"Current dataset synthetic rows must be train-only: {index_path}")
             for source_id, synthetic_file in enumerate(source_synthetic_files):
                 if not synthetic_file:
                     continue
@@ -1265,6 +1331,34 @@ def _validate_current_indexed_payload(
                     )
                 source_language = languages[pair[0]]
                 target_language = languages[pair[1]]
+                if split in {"validation", "test"} and bool(synthetic[row_id]):
+                    raise ValueError(
+                        "Current dataset synthetic rows must be train-only outside dedicated "
+                        "refinement evidence and are forbidden in ordinary evaluation "
+                        f"splits: {index_path} row={row_id}"
+                    )
+                evidence_source = bool(source_evidence_files[int(source_ids[row_id])])
+                synthetic_evidence = bool(synthetic[row_id])
+                if (
+                    split == "refinement_evidence"
+                    and synthetic_evidence
+                    and (
+                        not evidence_source
+                        or source_language not in source_only
+                        or target_language in source_only
+                        or not bool(one_way)
+                        or (source_language, target_language) not in direction_set
+                    )
+                ):
+                    raise ValueError(
+                        "Current dataset refinement-evidence row violates the authenticated "
+                        f"synthetic source-only policy: {index_path} row={row_id}"
+                    )
+                if split == "refinement_evidence" and not synthetic_evidence and evidence_source:
+                    raise ValueError(
+                        "Current dataset exact synthetic evidence source produced an unmarked "
+                        f"row: {index_path} row={row_id}"
+                    )
                 reverse_trained = (target_language, source_language) in direction_set
                 if (not bool(one_way) and not reverse_trained) or target_language in source_only:
                     raise ValueError(
@@ -1394,9 +1488,12 @@ def _validate_current_indexed_payload(
         "train": stats["train"],
         "validation": stats["validation"],
         "test": stats["test"],
+        "refinement_evidence": stats["refinement_evidence"],
     }:
         raise ValueError("Current dataset manifest split counts differ from indexed payload rows")
-    if stats["valid_pairs"] != stats["train"] + stats["validation"] + stats["test"]:
+    if stats["valid_pairs"] != (
+        stats["train"] + stats["validation"] + stats["test"] + stats["refinement_evidence"]
+    ):
         raise ValueError("Current dataset valid_pairs differs from its split counts")
     for source_id, expected in enumerate(source_stats):
         derived = {
@@ -1404,6 +1501,7 @@ def _validate_current_indexed_payload(
             "train": int(source_split_rows["train"][source_id]),
             "validation": int(source_split_rows["validation"][source_id]),
             "test": int(source_split_rows["test"][source_id]),
+            "refinement_evidence": int(source_split_rows["refinement_evidence"][source_id]),
             "synthetic_pairs": int(source_synthetic[source_id]),
             "forward_only_pairs": int(source_forward_only[source_id]),
             "quality_score_sum": int(source_quality[source_id]),
@@ -2232,6 +2330,7 @@ def audit_indexed_token_exposure(
             tuple[bool, ...],
             int,
             int,
+            tuple[bool, ...],
             str,
         ]
         | None
@@ -2243,6 +2342,7 @@ def audit_indexed_token_exposure(
             tuple[bool, ...],
             int,
             int,
+            tuple[bool, ...],
         ]
         | None
     ) = None
@@ -2267,6 +2367,7 @@ def audit_indexed_token_exposure(
             source_synthetic_files,
             shard_size,
             maximum_tokens_per_side,
+            source_evidence_files,
             current_inventory_digest,
         ) = current_manifest_contract
         current_payload_contract = (
@@ -2275,6 +2376,7 @@ def audit_indexed_token_exposure(
             source_synthetic_files,
             shard_size,
             maximum_tokens_per_side,
+            source_evidence_files,
         )
         for metadata_path, expected_sha256 in current_metadata_sha256.items():
             if file_sha256(metadata_path) != expected_sha256:
@@ -2299,6 +2401,7 @@ def audit_indexed_token_exposure(
             source_synthetic_files,
             shard_size,
             maximum_tokens_per_side,
+            source_evidence_files,
         ) = current_payload_contract
         _validate_current_indexed_payload(
             root,
@@ -2308,6 +2411,7 @@ def audit_indexed_token_exposure(
             languages=languages,
             translation_directions=translation_directions,
             source_only_languages=source_only_languages,
+            source_evidence_files=source_evidence_files,
             shard_size=shard_size,
             maximum_tokens_per_side=maximum_tokens_per_side,
             vocab_size=vocab_size,

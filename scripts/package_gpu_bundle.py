@@ -230,6 +230,51 @@ DEFAULT_CONFIG_PATH = "sion_translate.yaml"
 DATASET_FINGERPRINT_SCHEMA = "sion-dataset-fingerprint-v2"
 DATASET_ARTIFACT_INVENTORY_SCHEMA = "sion-indexed-artifact-inventory-v1"
 TRANSLATION_DATASET_FORMAT = "sion-indexed-parallel-v6"
+TRANSLATION_SPLITS = ("train", "validation", "test", "refinement_evidence")
+SYNTHETIC_REFINEMENT_EVIDENCE_PURPOSE = "relative-refinement-evidence-only-v1"
+TRANSLATION_STATS_SCHEMA = "sion-prepare-stats-src-tgt-v2"
+TRANSLATION_STATS_FIELDS = (
+    "physical_lines",
+    "valid_pairs",
+    "invalid_json",
+    "invalid_utf8",
+    "invalid_record",
+    "missing_text",
+    "non_string",
+    "invalid_language",
+    "unaligned_lists",
+    "duplicates",
+    "quality_filtered",
+    "too_short",
+    "identical_text",
+    "length_ratio_outlier",
+    "language_mismatch",
+    "control_characters",
+    "excessive_repetition",
+    "structured_span_rejections",
+    "structured_span_warnings",
+    "ja_no_kana_warnings",
+    "split_conflicts",
+    "too_long",
+    "train",
+    "validation",
+    "test",
+    "refinement_evidence",
+    "src_tokens",
+    "tgt_tokens",
+    "quality_score_sum",
+    "synthetic_pairs",
+    "forward_only_pairs",
+)
+TRANSLATION_INDEX_DERIVED_STATS = (
+    "valid_pairs",
+    *TRANSLATION_SPLITS,
+    "src_tokens",
+    "tgt_tokens",
+    "quality_score_sum",
+    "synthetic_pairs",
+    "forward_only_pairs",
+)
 FOUNDATION_DATASET_FORMAT = "sion-foundation-indexed-v3"
 FOUNDATION_RELEASE_NAME = "sion"
 FOUNDATION_PREPROCESSING_SCHEMA = "foundation-mixed-objectives-v6"
@@ -439,8 +484,29 @@ class TranslationShardSummary:
 
     records: int
     source_records: tuple[int, ...]
+    source_source_tokens: tuple[int, ...]
+    source_target_tokens: tuple[int, ...]
+    source_quality_score_sum: tuple[int, ...]
+    source_synthetic_records: tuple[int, ...]
+    source_forward_only_records: tuple[int, ...]
     source_tokens: int
     target_tokens: int
+
+
+@dataclass(frozen=True)
+class TranslationManifestContract:
+    """Authenticated graph, split, and source policy for translation shards."""
+
+    languages: tuple[str, ...]
+    direction_ids: frozenset[tuple[int, int]]
+    source_only_ids: frozenset[int]
+    source_synthetic: tuple[bool, ...]
+    source_evidence: tuple[bool, ...]
+    shard_size: int
+    max_tokens: int
+    split_records: tuple[int, ...]
+    source_split_records: tuple[tuple[int, ...], ...]
+    source_derived_stats: tuple[tuple[int, ...], ...]
 
 
 @dataclass(frozen=True)
@@ -1324,7 +1390,12 @@ def _validated_artifact_inventory(
         if not isinstance(raw_path, str):
             raise BundleError(f"{dataset_root} artifact inventory path must be a string")
         relative = _validated_relative_path(raw_path)
-        if relative.parts[0] not in {"train", "validation", "test"}:
+        allowed_splits = (
+            frozenset(TRANSLATION_SPLITS)
+            if dataset_root == TRANSLATION_DATASET_ROOT_PATH
+            else frozenset({"train", "validation", "test"})
+        )
+        if relative.parts[0] not in allowed_splits:
             raise BundleError(f"{dataset_root} artifact inventory path is outside a split")
         size = entry.get("size")
         digest = entry.get("sha256")
@@ -2011,11 +2082,7 @@ def _translation_shard_groups(
     )
     for raw_path in inventory:
         relative = PurePosixPath(raw_path)
-        if len(relative.parts) != 2 or relative.parts[0] not in {
-            "train",
-            "validation",
-            "test",
-        }:
+        if len(relative.parts) != 2 or relative.parts[0] not in TRANSLATION_SPLITS:
             raise BundleError(f"translation inventory contains a non-shard path: {raw_path}")
         match = pattern.fullmatch(relative.name)
         if match is None:
@@ -2038,7 +2105,7 @@ def _translation_shard_groups(
         present_metadata = set(members) & metadata_kinds
         if present_metadata and present_metadata != metadata_kinds:
             raise BundleError(f"translation shard {split}/{prefix} has incomplete metadata")
-    for split in ("train", "validation", "test"):
+    for split in TRANSLATION_SPLITS:
         prefixes = sorted(prefix for candidate, prefix in groups if candidate == split)
         if split in {"train", "validation"} and not prefixes:
             raise BundleError(f"translation inventory has no {split} shards")
@@ -2048,16 +2115,52 @@ def _translation_shard_groups(
     return groups
 
 
+def _translation_stats(value: object, *, role: str) -> dict[str, int]:
+    """Read one exact current producer statistics object."""
+
+    if not isinstance(value, Mapping):
+        raise BundleError(f"{role} must be an object")
+    stats = cast(Mapping[object, object], value)
+    if set(stats) != set(TRANSLATION_STATS_FIELDS):
+        raise BundleError(f"{role} fields do not match {TRANSLATION_STATS_SCHEMA}")
+    normalized: dict[str, int] = {}
+    for field in TRANSLATION_STATS_FIELDS:
+        raw_value = stats[field]
+        if isinstance(raw_value, bool) or not isinstance(raw_value, int) or raw_value < 0:
+            raise BundleError(f"{role} {field} must be a non-negative integer")
+        normalized[field] = raw_value
+    if normalized["valid_pairs"] != sum(normalized[split] for split in TRANSLATION_SPLITS):
+        raise BundleError(f"{role} valid_pairs disagrees with its split counts")
+    return normalized
+
+
 def _translation_manifest_contract(
     manifest: Mapping[str, object],
-) -> tuple[
-    tuple[str, ...],
-    frozenset[tuple[int, int]],
-    frozenset[int],
-    tuple[bool, ...],
-    int,
-    int,
-]:
+) -> TranslationManifestContract:
+    if manifest.get("format") != TRANSLATION_DATASET_FORMAT:
+        raise BundleError("translation manifest format is unsupported")
+    if manifest.get("stats_schema") != TRANSLATION_STATS_SCHEMA:
+        raise BundleError("translation manifest stats_schema is unsupported")
+    manifest_stats = _translation_stats(
+        manifest.get("stats"),
+        role="translation manifest stats",
+    )
+    manifest_mean = manifest.get("mean_quality_score")
+    expected_manifest_mean = manifest_stats["quality_score_sum"] / max(
+        manifest_stats["valid_pairs"], 1
+    )
+    if (
+        isinstance(manifest_mean, bool)
+        or not isinstance(manifest_mean, (int, float))
+        or not math.isfinite(float(manifest_mean))
+        or not math.isclose(
+            float(manifest_mean),
+            expected_manifest_mean,
+            rel_tol=1e-12,
+            abs_tol=1e-15,
+        )
+    ):
+        raise BundleError("translation manifest mean_quality_score is invalid")
     raw_languages = manifest.get("languages")
     if not isinstance(raw_languages, list):
         raise BundleError("translation manifest languages must contain at least two entries")
@@ -2125,14 +2228,70 @@ def _translation_manifest_contract(
     if not isinstance(raw_sources, list) or not raw_sources:
         raise BundleError("translation manifest has no source identities")
     source_synthetic: list[bool] = []
+    source_names: list[str] = []
+    source_split_records: list[tuple[int, ...]] = []
+    source_stats_records: list[dict[str, int]] = []
     for source_id, raw_source in enumerate(cast(list[object], raw_sources)):
         if not isinstance(raw_source, Mapping):
             raise BundleError("translation manifest source identities must be objects")
         source = cast(Mapping[object, object], raw_source)
+        if set(source) != {
+            "id",
+            "name",
+            "path",
+            "synthetic_file",
+            "stats",
+            "mean_quality_score",
+        }:
+            raise BundleError("translation manifest source fields are invalid")
         synthetic_file = source.get("synthetic_file")
-        if source.get("id") != source_id or not isinstance(synthetic_file, bool):
+        source_name = source.get("name")
+        source_path = source.get("path")
+        if (
+            source.get("id") != source_id
+            or not isinstance(synthetic_file, bool)
+            or not isinstance(source_name, str)
+            or not source_name
+            or source_name in {".", ".."}
+            or PurePosixPath(source_name).name != source_name
+            or "\\" in source_name
+            or not isinstance(source_path, str)
+            or not source_path
+            or PurePosixPath(source_path.replace("\\", "/")).name != source_name
+        ):
             raise BundleError("translation manifest source ids or synthetic markers are invalid")
+        source_stats = _translation_stats(
+            source.get("stats"),
+            role=f"translation source {source_id} stats",
+        )
+        source_mean = source.get("mean_quality_score")
+        expected_source_mean = source_stats["quality_score_sum"] / max(
+            source_stats["valid_pairs"], 1
+        )
+        if (
+            isinstance(source_mean, bool)
+            or not isinstance(source_mean, (int, float))
+            or not math.isfinite(float(source_mean))
+            or not math.isclose(
+                float(source_mean),
+                expected_source_mean,
+                rel_tol=1e-12,
+                abs_tol=1e-15,
+            )
+        ):
+            raise BundleError(f"translation source {source_id} mean_quality_score is invalid")
         source_synthetic.append(synthetic_file)
+        source_names.append(source_name)
+        source_stats_records.append(source_stats)
+        source_split_records.append(tuple(source_stats[split] for split in TRANSLATION_SPLITS))
+
+    if len(source_names) != len(set(source_names)):
+        raise BundleError("translation manifest source names must be unique")
+    for field in TRANSLATION_STATS_FIELDS:
+        if sum(stats[field] for stats in source_stats_records) != manifest_stats[field]:
+            raise BundleError(
+                f"translation per-source {field} totals do not add up to manifest stats"
+            )
 
     raw_options = manifest.get("preprocessing_options")
     if not isinstance(raw_options, Mapping):
@@ -2143,13 +2302,116 @@ def _translation_manifest_contract(
     for field, value in (("shard_size", shard_size), ("max_tokens_per_side", max_tokens)):
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise BundleError(f"translation preprocessing option {field} must be positive")
-    return (
-        languages,
-        frozenset(direction_ids),
-        source_only_ids,
-        tuple(source_synthetic),
-        cast(int, shard_size),
-        cast(int, max_tokens),
+    refinement_evidence_fraction = options.get("refinement_evidence_fraction")
+    if (
+        isinstance(refinement_evidence_fraction, bool)
+        or not isinstance(refinement_evidence_fraction, (int, float))
+        or not math.isfinite(float(refinement_evidence_fraction))
+        or not 0.0 <= float(refinement_evidence_fraction) < 0.5
+    ):
+        raise BundleError("translation preprocessing refinement_evidence_fraction is invalid")
+    raw_evidence_files = options.get("source_only_synthetic_evidence_files")
+    if not isinstance(raw_evidence_files, list) or not all(
+        isinstance(name, str)
+        and bool(name)
+        and name not in {".", ".."}
+        and PurePosixPath(name).name == name
+        and "\\" not in name
+        and name.casefold().endswith(".jsonl")
+        for name in cast(list[object], raw_evidence_files)
+    ):
+        raise BundleError(
+            "translation source-only synthetic evidence files must be plain basenames"
+        )
+    evidence_files = cast(list[str], raw_evidence_files)
+    if len(evidence_files) != len({name.casefold() for name in evidence_files}):
+        raise BundleError(
+            "translation source-only synthetic evidence files must be case-insensitively unique"
+        )
+    prefixes = options.get("train_only_prefixes")
+    if not isinstance(prefixes, list) or not all(
+        isinstance(prefix, str) for prefix in cast(list[object], prefixes)
+    ):
+        raise BundleError("translation preprocessing synthetic prefixes must be a string list")
+    normalized_prefixes = cast(list[str], prefixes)
+    if (
+        not normalized_prefixes
+        or len(normalized_prefixes) != len(set(normalized_prefixes))
+        or any(
+            not prefix
+            or prefix != prefix.strip()
+            or prefix in {".", ".."}
+            or any(character in '/\\<>:"|?*' for character in prefix)
+            for prefix in normalized_prefixes
+        )
+    ):
+        raise BundleError("translation preprocessing synthetic prefixes are invalid")
+    expected_source_synthetic = tuple(
+        name.startswith(tuple(normalized_prefixes)) for name in source_names
+    )
+    if tuple(source_synthetic) != expected_source_synthetic:
+        raise BundleError("translation source synthetic_file markers contradict their names")
+    sampling_weight = options.get("synthetic_sampling_weight")
+    if (
+        isinstance(sampling_weight, bool)
+        or not isinstance(sampling_weight, (int, float))
+        or not math.isfinite(float(sampling_weight))
+        or not 0.0 <= float(sampling_weight) <= 1.0
+    ):
+        raise BundleError("translation preprocessing synthetic sampling weight is invalid")
+    expected_synthetic_policy: dict[str, object] = {
+        "record_field": "synthetic",
+        "train_only_by_default": True,
+        "source_only_holdout_enabled": bool(evidence_files),
+        "source_only_evidence_files": evidence_files,
+        "source_only_holdout_purpose": SYNTHETIC_REFINEMENT_EVIDENCE_PURPOSE,
+        "source_only_target_overlap": "allowed-for-relative-evidence-only-v1",
+        "sampling_weight": sampling_weight,
+        "prefixes": normalized_prefixes,
+    }
+    if manifest.get("synthetic_policy") != expected_synthetic_policy:
+        raise BundleError("translation synthetic policy contradicts its preprocessing options")
+    evidence_file_set = frozenset(evidence_files)
+    source_evidence = tuple(name in evidence_file_set for name in source_names)
+    missing_evidence_files = sorted(evidence_file_set - set(source_names))
+    if missing_evidence_files:
+        raise BundleError(
+            "translation source-only synthetic evidence files are absent from sources: "
+            f"{missing_evidence_files}"
+        )
+    if evidence_files and float(refinement_evidence_fraction) <= 0.0:
+        raise BundleError(
+            "translation synthetic evidence sources require a positive evidence fraction"
+        )
+    if any(
+        eligible and not synthetic
+        for eligible, synthetic in zip(source_evidence, source_synthetic, strict=True)
+    ):
+        raise BundleError(
+            "translation source-only evidence source is not authenticated as synthetic"
+        )
+
+    split_records = tuple(manifest_stats[split] for split in TRANSLATION_SPLITS)
+    source_sums = tuple(
+        sum(counts[split_id] for counts in source_split_records)
+        for split_id in range(len(TRANSLATION_SPLITS))
+    )
+    if source_sums != split_records:
+        raise BundleError("translation source split counts do not add up to manifest stats")
+    return TranslationManifestContract(
+        languages=languages,
+        direction_ids=frozenset(direction_ids),
+        source_only_ids=source_only_ids,
+        source_synthetic=tuple(source_synthetic),
+        source_evidence=source_evidence,
+        shard_size=cast(int, shard_size),
+        max_tokens=cast(int, max_tokens),
+        split_records=split_records,
+        source_split_records=tuple(source_split_records),
+        source_derived_stats=tuple(
+            tuple(stats[field] for field in TRANSLATION_INDEX_DERIVED_STATS)
+            for stats in source_stats_records
+        ),
     )
 
 
@@ -2162,6 +2424,7 @@ def _validate_translation_index_stream(
     direction_ids: frozenset[tuple[int, int]],
     source_only_ids: frozenset[int],
     source_synthetic: tuple[bool, ...],
+    source_evidence: tuple[bool, ...],
     shard_size: int,
     max_tokens: int,
     expected_size: int,
@@ -2177,6 +2440,11 @@ def _validate_translation_index_stream(
         raise BundleError(f"translation index byte size disagrees with its NPY header: {path}")
 
     source_counts = np.zeros(len(source_synthetic), dtype=np.uint64)
+    source_source_tokens = np.zeros(len(source_synthetic), dtype=np.uint64)
+    source_target_tokens = np.zeros(len(source_synthetic), dtype=np.uint64)
+    source_quality_score_sum = np.zeros(len(source_synthetic), dtype=np.uint64)
+    source_synthetic_records = np.zeros(len(source_synthetic), dtype=np.uint64)
+    source_forward_only_records = np.zeros(len(source_synthetic), dtype=np.uint64)
     source_token_cursor = 0
     target_token_cursor = 0
     remaining = records
@@ -2206,24 +2474,51 @@ def _validate_translation_index_stream(
             np.isin(synthetic, (0, 1)).all()
         ):
             raise BundleError(f"translation boolean flags are invalid: {path}")
-        for source_id, target_id, one_way in zip(
-            source_languages.tolist(),
-            target_languages.tolist(),
-            forward_only.tolist(),
-            strict=True,
+        for row_id, (source_language_id, target_id, one_way, is_synthetic) in enumerate(
+            zip(
+                source_languages.tolist(),
+                target_languages.tolist(),
+                forward_only.tolist(),
+                synthetic.tolist(),
+                strict=True,
+            )
         ):
-            direction = (int(source_id), int(target_id))
+            direction = (int(source_language_id), int(target_id))
             if direction not in direction_ids:
                 raise BundleError(f"translation row uses an unconfigured direction: {path}")
             if int(target_id) in source_only_ids or (
-                not bool(one_way) and (int(target_id), int(source_id)) not in direction_ids
+                not bool(one_way) and (int(target_id), int(source_language_id)) not in direction_ids
             ):
                 raise BundleError(f"translation row contradicts its direction policy: {path}")
-        expected_synthetic = np.asarray(source_synthetic, dtype=np.uint8)[source_ids]
-        if not np.array_equal(synthetic, expected_synthetic) or (
-            split != "train" and bool(synthetic.any())
-        ):
-            raise BundleError(f"translation synthetic flags contradict source policy: {path}")
+            if split in {"validation", "test"} and bool(is_synthetic):
+                raise BundleError(
+                    f"translation synthetic row is forbidden in ordinary evaluation: {path}"
+                )
+            evidence_source = source_evidence[int(source_ids[row_id])]
+            if (
+                split == "refinement_evidence"
+                and bool(is_synthetic)
+                and (
+                    not evidence_source
+                    or int(source_language_id) not in source_only_ids
+                    or int(target_id) in source_only_ids
+                    or not bool(one_way)
+                    or direction not in direction_ids
+                )
+            ):
+                raise BundleError(
+                    "translation refinement-evidence row contradicts its exact source-only "
+                    f"synthetic policy: {path}"
+                )
+            if split == "refinement_evidence" and not bool(is_synthetic) and evidence_source:
+                raise BundleError(
+                    f"translation exact synthetic evidence source produced an unmarked row: {path}"
+                )
+        synthetic_file_rows = np.asarray(source_synthetic, dtype=np.uint8)[source_ids]
+        if bool(((synthetic_file_rows == 1) & (synthetic == 0)).any()):
+            raise BundleError(
+                f"translation synthetic-prefixed source contains an unmarked row: {path}"
+            )
 
         source_offsets = np.asarray(index["src_offset"], dtype=np.uint64)
         target_offsets = np.asarray(index["tgt_offset"], dtype=np.uint64)
@@ -2262,6 +2557,11 @@ def _validate_translation_index_stream(
         quality = np.asarray(index["quality_score"], dtype=np.uint8)
         if int(quality.max()) > 100:
             raise BundleError(f"translation quality score is out of range: {path}")
+        np.add.at(source_source_tokens, source_ids, source_lengths)
+        np.add.at(source_target_tokens, source_ids, target_lengths)
+        np.add.at(source_quality_score_sum, source_ids, quality)
+        np.add.at(source_synthetic_records, source_ids, synthetic)
+        np.add.at(source_forward_only_records, source_ids, forward_only)
         source_token_cursor += int(source_lengths.sum(dtype=np.uint64))
         target_token_cursor += int(target_lengths.sum(dtype=np.uint64))
         remaining -= chunk_records
@@ -2270,6 +2570,13 @@ def _validate_translation_index_stream(
     return TranslationShardSummary(
         records=records,
         source_records=tuple(int(value) for value in source_counts.tolist()),
+        source_source_tokens=tuple(int(value) for value in source_source_tokens.tolist()),
+        source_target_tokens=tuple(int(value) for value in source_target_tokens.tolist()),
+        source_quality_score_sum=tuple(int(value) for value in source_quality_score_sum.tolist()),
+        source_synthetic_records=tuple(int(value) for value in source_synthetic_records.tolist()),
+        source_forward_only_records=tuple(
+            int(value) for value in source_forward_only_records.tolist()
+        ),
         source_tokens=source_token_cursor,
         target_tokens=target_token_cursor,
     )
@@ -2339,15 +2646,17 @@ def _validate_translation_dataset_contract(
     open_payload: PayloadOpener,
     tokenizer: ValidatedTokenizer,
 ) -> None:
-    (
-        languages,
-        direction_ids,
-        source_only_ids,
-        source_synthetic,
-        shard_size,
-        max_tokens,
-    ) = _translation_manifest_contract(manifest)
+    contract = _translation_manifest_contract(manifest)
     shard_groups = _translation_shard_groups(inventory)
+    observed_split_records = np.zeros(len(TRANSLATION_SPLITS), dtype=np.uint64)
+    observed_source_split_records = np.zeros(
+        (len(contract.source_synthetic), len(TRANSLATION_SPLITS)),
+        dtype=np.uint64,
+    )
+    observed_source_derived_stats = np.zeros(
+        (len(contract.source_synthetic), len(TRANSLATION_INDEX_DERIVED_STATS)),
+        dtype=np.uint64,
+    )
     dataset_prefix = f"{TRANSLATION_DATASET_ROOT_PATH}/"
     for (split, _prefix), members in sorted(shard_groups.items()):
         index_relative = members["idx.npy"]
@@ -2357,13 +2666,38 @@ def _validate_translation_dataset_contract(
                 source,
                 index_path,
                 split=split,
-                language_count=len(languages),
-                direction_ids=direction_ids,
-                source_only_ids=source_only_ids,
-                source_synthetic=source_synthetic,
-                shard_size=shard_size,
-                max_tokens=max_tokens,
+                language_count=len(contract.languages),
+                direction_ids=contract.direction_ids,
+                source_only_ids=contract.source_only_ids,
+                source_synthetic=contract.source_synthetic,
+                source_evidence=contract.source_evidence,
+                shard_size=contract.shard_size,
+                max_tokens=contract.max_tokens,
                 expected_size=inventory[index_relative][0],
+            )
+        split_id = TRANSLATION_SPLITS.index(split)
+        observed_split_records[split_id] += summary.records
+        observed_source_split_records[:, split_id] += np.asarray(
+            summary.source_records,
+            dtype=np.uint64,
+        )
+        observed_source_derived_stats[:, 0] += np.asarray(
+            summary.source_records,
+            dtype=np.uint64,
+        )
+        observed_source_derived_stats[:, 1 + split_id] += np.asarray(
+            summary.source_records,
+            dtype=np.uint64,
+        )
+        for field, values in (
+            ("src_tokens", summary.source_source_tokens),
+            ("tgt_tokens", summary.source_target_tokens),
+            ("quality_score_sum", summary.source_quality_score_sum),
+            ("synthetic_pairs", summary.source_synthetic_records),
+            ("forward_only_pairs", summary.source_forward_only_records),
+        ):
+            observed_source_derived_stats[:, TRANSLATION_INDEX_DERIVED_STATS.index(field)] += (
+                np.asarray(values, dtype=np.uint64)
             )
         for kind, token_count in (
             ("src.bin", summary.source_tokens),
@@ -2398,6 +2732,78 @@ def _validate_translation_dataset_contract(
                     expected_index_size=inventory[metadata_index_relative][0],
                     expected_data_size=inventory[metadata_data_relative][0],
                 )
+    if tuple(int(value) for value in observed_split_records.tolist()) != contract.split_records:
+        raise BundleError("translation manifest split counts disagree with indexed rows")
+    observed_source_counts = tuple(
+        tuple(int(value) for value in row.tolist()) for row in observed_source_split_records
+    )
+    if observed_source_counts != contract.source_split_records:
+        raise BundleError("translation source split counts disagree with indexed rows")
+    observed_derived = tuple(
+        tuple(int(value) for value in row.tolist()) for row in observed_source_derived_stats
+    )
+    if observed_derived != contract.source_derived_stats:
+        raise BundleError("translation source statistics disagree with indexed rows")
+
+
+def _refinement_evidence_direction_counts(
+    manifest: Mapping[str, object],
+    open_payload: PayloadOpener,
+) -> dict[tuple[str, str], int]:
+    """Count distinct logical examples per edge in the authenticated evidence split."""
+
+    contract = _translation_manifest_contract(manifest)
+    inventory = _validated_artifact_inventory(
+        manifest,
+        dataset_root=TRANSLATION_DATASET_ROOT_PATH,
+    )
+    shard_groups = _translation_shard_groups(inventory)
+    counts = {direction: 0 for direction in contract.direction_ids}
+    dataset_prefix = f"{TRANSLATION_DATASET_ROOT_PATH}/"
+    for (split, _prefix), members in sorted(shard_groups.items()):
+        if split != "refinement_evidence":
+            continue
+        relative = members["idx.npy"]
+        path = f"{dataset_prefix}{relative}"
+        with open_payload(path) as source:
+            records, dtype, header_bytes = _read_npy_header(
+                source,
+                path,
+                expected_dtype=TRANSLATION_INDEX_DTYPE,
+            )
+            expected_size = inventory[relative][0]
+            if expected_size != header_bytes + records * dtype.itemsize:
+                raise BundleError(
+                    f"translation refinement-evidence index size disagrees with its header: {path}"
+                )
+            remaining = records
+            while remaining:
+                chunk_records = min(remaining, FOUNDATION_INDEX_CHUNK_RECORDS)
+                content = _read_exact_stream(source, chunk_records * dtype.itemsize, path)
+                index = np.frombuffer(content, dtype=dtype, count=chunk_records)
+                source_languages = np.asarray(index["src_language_id"], dtype=np.int64)
+                target_languages = np.asarray(index["tgt_language_id"], dtype=np.int64)
+                forward_only = np.asarray(index["forward_only"], dtype=np.uint8)
+                for direction in counts:
+                    source_id, target_id = direction
+                    direct = np.count_nonzero(
+                        (source_languages == source_id) & (target_languages == target_id)
+                    )
+                    reverse = np.count_nonzero(
+                        (forward_only == 0)
+                        & (source_languages == target_id)
+                        & (target_languages == source_id)
+                    )
+                    counts[direction] += int(direct + reverse)
+                remaining -= chunk_records
+            if source.read(1):
+                raise BundleError(
+                    f"translation refinement-evidence index contains trailing bytes: {path}"
+                )
+    return {
+        (contract.languages[source_id], contract.languages[target_id]): count
+        for (source_id, target_id), count in counts.items()
+    }
 
 
 def _validate_foundation_dataset_contract(
@@ -3371,6 +3777,7 @@ def _validate_config_artifact_semantics(
     payload_paths: set[str],
     identities: Mapping[str, tuple[int, str]],
     read_payload: Callable[[str], bytes],
+    open_payload: PayloadOpener,
     raw_parallel_paths: set[str],
     monolingual_paths: set[str],
 ) -> None:
@@ -3380,6 +3787,15 @@ def _validate_config_artifact_semantics(
 
     if not isinstance(config, AppConfig):
         raise BundleError("validated bundle config returned an unexpected object")
+    if (
+        config.model.experimental.candidate_refinement_enabled
+        and DATASET_MANIFEST_PATH not in payload_paths
+    ):
+        raise BundleError(
+            "candidate-refinement GPU bundles require an authenticated prepared tokenizer "
+            "and translation dataset; a raw-only rebuild could discover an undersized "
+            "release-evidence cohort after paid GPU time has started"
+        )
     expected_pairs = [list(pair) for pair in config.data.configured_language_pairs()]
     expected_directions = [
         list(direction) for direction in config.data.configured_translation_directions()
@@ -3457,6 +3873,10 @@ def _validate_config_artifact_semantics(
         expected_options = prepare_preprocessing_options(
             approximate_split=config.data.approximate_split,
             source_only_languages=config.data.configured_source_only_languages(),
+            refinement_evidence_fraction=config.data.refinement_evidence_fraction,
+            source_only_synthetic_evidence_files=(
+                config.data.configured_source_only_synthetic_evidence_files()
+            ),
             translation_directions=config.data.configured_translation_directions(),
             train_only_prefixes=config.data.configured_synthetic_prefixes(),
             managed_augmentation_prefix=config.data.synthetic_prefix,
@@ -3474,6 +3894,22 @@ def _validate_config_artifact_semantics(
             if manifest.get(field) != expected:
                 raise BundleError(
                     f"prepared translation dataset {field} disagrees with the selected training config"
+                )
+        if config.model.experimental.candidate_refinement_enabled:
+            minimum_examples = (
+                config.training.candidate_refinement_min_validation_examples_per_direction
+            )
+            evidence_counts = _refinement_evidence_direction_counts(manifest, open_payload)
+            insufficient = {
+                f"{source}->{target}": evidence_counts.get((source, target), 0)
+                for source, target in config.data.configured_translation_directions()
+                if evidence_counts.get((source, target), 0) < minimum_examples
+            }
+            if insufficient:
+                raise BundleError(
+                    "prepared translation refinement evidence cannot authenticate the release "
+                    f"cohort of {minimum_examples} distinct examples per direction: "
+                    f"insufficient={insufficient}"
                 )
         fingerprint = manifest.get("fingerprint")
         if not isinstance(fingerprint, Mapping):
@@ -3653,6 +4089,7 @@ def _validate_training_contract(
     identities: Mapping[str, tuple[int, str]],
     origins: Mapping[str, str],
     read_payload: Callable[[str], bytes],
+    open_payload: PayloadOpener,
     omitted_source_freshness: OmittedSourceFreshness | None = None,
 ) -> None:
     if not isinstance(contract, Mapping):
@@ -3706,6 +4143,7 @@ def _validate_training_contract(
         payload_paths=payload_paths,
         identities=semantic_identities,
         read_payload=read_payload,
+        open_payload=open_payload,
         raw_parallel_paths=raw_parallel_paths,
         monolingual_paths=monolingual_paths,
     )
@@ -4625,6 +5063,7 @@ def verify_archive(archive_path: Path | str) -> VerificationResult:
                 identities={record.path: (record.size, record.sha256) for record in records},
                 origins={record.path: record.origin for record in records},
                 read_payload=read_payload,
+                open_payload=open_payload,
             )
             if _zip_mode(manifest_info) != "100644":
                 raise BundleError(f"ZIP mode mismatch for {MANIFEST_NAME}")
@@ -4739,6 +5178,7 @@ def verify_tree(tree_path: Path | str) -> VerificationResult:
         identities={record.path: (record.size, record.sha256) for record in records},
         origins={record.path: record.origin for record in records},
         read_payload=read_payload,
+        open_payload=open_payload,
     )
 
     git_identity = raw_manifest["git"]
@@ -4843,6 +5283,7 @@ def build_bundle(
         identities=identities,
         origins=origins,
         read_payload=read_payload,
+        open_payload=open_payload,
         omitted_source_freshness=omitted_source_freshness,
     )
     if any(source.source_path.resolve() == output for source in sources):

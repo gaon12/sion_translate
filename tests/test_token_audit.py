@@ -762,6 +762,7 @@ def test_current_indexed_audit_accepts_authenticated_legacy_storage_side_stats(
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest.pop("stats_schema")
     for stats in (manifest["stats"], manifest["sources"][0]["stats"]):
+        stats.pop("refinement_evidence")
         stats["ko_tokens"] = stats.pop("src_tokens")
         stats["ja_tokens"] = stats.pop("tgt_tokens")
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")

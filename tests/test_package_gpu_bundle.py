@@ -5,10 +5,12 @@ import hashlib
 import io
 import json
 import os
+from collections.abc import Callable
 from pathlib import Path
 import stat
 import subprocess
 from types import SimpleNamespace
+from typing import cast
 import zipfile
 
 import numpy as np
@@ -756,7 +758,7 @@ def _with_tokenizer(root: Path, *, complete: bool = True) -> None:
 
 def _artifact_inventory(dataset: Path) -> dict[str, object]:
     files: list[dict[str, object]] = []
-    for split in ("train", "validation", "test"):
+    for split in ("train", "validation", "test", "refinement_evidence"):
         split_root = dataset / split
         if not split_root.is_dir():
             continue
@@ -769,6 +771,7 @@ def _artifact_inventory(dataset: Path) -> dict[str, object]:
                         "sha256": _file_sha256(path),
                     }
                 )
+    files.sort(key=lambda entry: str(entry["path"]))
     return {"schema": "sion-indexed-artifact-inventory-v1", "files": files}
 
 
@@ -792,8 +795,15 @@ def _with_dataset(
     include_manifest: bool = True,
     include_completion: bool = True,
 ) -> None:
+    from dataclasses import asdict
+
     from sion_translate.config import load_config
-    from sion_translate.data.prepare import INDEX_DTYPE, prepare_preprocessing_options
+    from sion_translate.data.prepare import (
+        INDEX_DTYPE,
+        PREPARE_STATS_SCHEMA,
+        PrepareStats,
+        prepare_preprocessing_options,
+    )
     from sion_translate.fingerprint import PREPROCESSING_SCHEMA
 
     config = load_config(root / "sion_translate.yaml")
@@ -806,6 +816,10 @@ def _with_dataset(
     preprocessing_options = prepare_preprocessing_options(
         approximate_split=config.data.approximate_split,
         source_only_languages=config.data.configured_source_only_languages(),
+        refinement_evidence_fraction=config.data.refinement_evidence_fraction,
+        source_only_synthetic_evidence_files=(
+            config.data.configured_source_only_synthetic_evidence_files()
+        ),
         translation_directions=config.data.configured_translation_directions(),
         train_only_prefixes=config.data.configured_synthetic_prefixes(),
         managed_augmentation_prefix=config.data.synthetic_prefix,
@@ -814,7 +828,7 @@ def _with_dataset(
     )
     dataset = root / "artifacts" / "dataset"
     dataset.mkdir(parents=True)
-    for split in ("train", "validation", "test"):
+    for split in ("train", "validation", "test", "refinement_evidence"):
         (dataset / split).mkdir()
     index = np.asarray(
         [(0, 2, 0, 2, 0, 0, 0, 1, 0, 100, 0, 0)],
@@ -852,10 +866,22 @@ def _with_dataset(
         raw_fingerprint.write_text(json.dumps(fingerprint) + "\n", encoding="utf-8")
     manifest_path = dataset / "manifest.json"
     if include_manifest:
+        stats = asdict(
+            PrepareStats(
+                physical_lines=1,
+                valid_pairs=2,
+                train=1,
+                validation=1,
+                src_tokens=4,
+                tgt_tokens=4,
+                quality_score_sum=200,
+            )
+        )
         manifest_path.write_text(
             json.dumps(
                 {
                     "format": "sion-indexed-parallel-v6",
+                    "stats_schema": PREPARE_STATS_SCHEMA,
                     "language_pairs": language_pairs,
                     "translation_directions": translation_directions,
                     "languages": languages,
@@ -863,7 +889,32 @@ def _with_dataset(
                     "source_only_languages": source_only_languages,
                     "preprocessing_schema": PREPROCESSING_SCHEMA,
                     "preprocessing_options": preprocessing_options,
-                    "sources": [{"id": 0, "synthetic_file": False}],
+                    "synthetic_policy": {
+                        "record_field": "synthetic",
+                        "train_only_by_default": True,
+                        "source_only_holdout_enabled": bool(
+                            preprocessing_options["source_only_synthetic_evidence_files"]
+                        ),
+                        "source_only_evidence_files": preprocessing_options[
+                            "source_only_synthetic_evidence_files"
+                        ],
+                        "source_only_holdout_purpose": ("relative-refinement-evidence-only-v1"),
+                        "source_only_target_overlap": ("allowed-for-relative-evidence-only-v1"),
+                        "sampling_weight": preprocessing_options["synthetic_sampling_weight"],
+                        "prefixes": preprocessing_options["train_only_prefixes"],
+                    },
+                    "stats": stats,
+                    "mean_quality_score": 100.0,
+                    "sources": [
+                        {
+                            "id": 0,
+                            "name": "corpus.jsonl",
+                            "path": str((root / "data" / "corpus.jsonl").resolve()),
+                            "synthetic_file": False,
+                            "stats": stats,
+                            "mean_quality_score": 100.0,
+                        }
+                    ],
                     "fingerprint": {
                         **fingerprint,
                         "tokenizer_sha256": manifest_tokenizer_sha256 or digest,
@@ -911,6 +962,126 @@ def _refresh_dataset_inventory(root: Path) -> None:
         + "\n",
         encoding="utf-8",
     )
+
+
+def _write_refinement_evidence_rows(
+    root: Path,
+    rows: list[tuple[int, int, bool]],
+) -> None:
+    """Add producer-shaped evidence rows and reconcile every authenticated total."""
+
+    from sion_translate.data.prepare import INDEX_DTYPE
+    from sion_translate.data.record_metadata import (
+        RECORD_METADATA_INDEX_DTYPE,
+        encode_record_metadata,
+    )
+
+    dataset = root / "artifacts" / "dataset"
+    evidence = dataset / "refinement_evidence"
+    index = np.asarray(
+        [
+            (
+                row_id * 2,
+                2,
+                row_id * 2,
+                2,
+                0,
+                0,
+                source_language_id,
+                target_language_id,
+                0,
+                100,
+                0,
+                int(forward_only),
+            )
+            for row_id, (source_language_id, target_language_id, forward_only) in enumerate(rows)
+        ],
+        dtype=INDEX_DTYPE,
+    )
+    np.save(evidence / "00000.idx.npy", index, allow_pickle=False)
+    (evidence / "00000.src.bin").write_bytes(
+        np.tile(np.asarray([4, 5], dtype=np.uint32), len(rows)).tobytes()
+    )
+    (evidence / "00000.tgt.bin").write_bytes(
+        np.tile(np.asarray([6, 7], dtype=np.uint32), len(rows)).tobytes()
+    )
+
+    languages = json.loads((dataset / "manifest.json").read_text(encoding="utf-8"))["languages"]
+    metadata_payloads = [
+        (
+            encode_record_metadata(
+                {
+                    "training_direction": [
+                        languages[source_language_id],
+                        languages[target_language_id],
+                    ]
+                }
+            )
+            if forward_only
+            else b""
+        )
+        for source_language_id, target_language_id, forward_only in rows
+    ]
+    metadata_offsets: list[tuple[int, int]] = []
+    cursor = 0
+    for payload in metadata_payloads:
+        metadata_offsets.append((cursor, len(payload)))
+        cursor += len(payload)
+    np.save(
+        evidence / "00000.meta.npy",
+        np.asarray(metadata_offsets, dtype=RECORD_METADATA_INDEX_DTYPE),
+        allow_pickle=False,
+    )
+    (evidence / "00000.meta.bin").write_bytes(b"".join(metadata_payloads))
+
+    manifest_path = dataset / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    count = len(rows)
+    forward_only_count = sum(int(forward_only) for _, _, forward_only in rows)
+    for stats in (manifest["stats"], manifest["sources"][0]["stats"]):
+        stats["valid_pairs"] += count
+        stats["refinement_evidence"] += count
+        stats["src_tokens"] += count * 2
+        stats["tgt_tokens"] += count * 2
+        stats["quality_score_sum"] += count * 100
+        stats["forward_only_pairs"] += forward_only_count
+    manifest["mean_quality_score"] = 100.0
+    manifest["sources"][0]["mean_quality_score"] = 100.0
+    manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+    _refresh_dataset_inventory(root)
+
+
+def _mutate_dataset_manifest(
+    root: Path,
+    mutation: Callable[[dict[str, object]], None],
+) -> None:
+    """Apply one test mutation and refresh the manifest-authentication sidecar."""
+
+    dataset = root / "artifacts" / "dataset"
+    manifest_path = dataset / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    mutation(manifest)
+    manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+    _refresh_dataset_inventory(root)
+
+
+def _enable_candidate_refinement(root: Path) -> None:
+    config = root / "sion_translate.yaml"
+    config.write_text(
+        """\
+model:
+  experimental:
+    candidate_refinement_enabled: true
+data:
+  language_pair: [ko, ja]
+  refinement_evidence_fraction: 0.1
+foundation:
+  languages: [ko]
+""",
+        encoding="utf-8",
+    )
+    _git(root, "add", config.name)
+    _git(root, "commit", "-qm", "enable candidate refinement")
 
 
 def _with_foundation_dataset(
@@ -1180,6 +1351,187 @@ def test_the_dataset_needs_the_tokenizer_that_produced_its_ids(tmp_path: Path) -
     with zipfile.ZipFile(both) as archive:
         archive.extractall(extracted)
     assert package_gpu_bundle.verify_tree(extracted) == archive_result
+
+
+def test_candidate_refinement_bundle_requires_a_full_fixed_release_cohort(
+    tmp_path: Path,
+) -> None:
+    root = _repository(tmp_path)
+    _enable_candidate_refinement(root)
+    _with_tokenizer(root, complete=True)
+    _with_dataset(root)
+
+    output = tmp_path / "insufficient-refinement-evidence.zip"
+    with pytest.raises(
+        package_gpu_bundle.BundleError,
+        match="cannot authenticate the release cohort",
+    ):
+        package_gpu_bundle.build_bundle(
+            root,
+            output,
+            include_tokenizer=True,
+            include_dataset=True,
+        )
+    assert not output.exists()
+
+
+def test_candidate_refinement_raw_only_bundle_is_rejected_before_gpu_handoff(
+    tmp_path: Path,
+) -> None:
+    root = _repository(tmp_path)
+    _enable_candidate_refinement(root)
+    output = tmp_path / "raw-only-candidate.zip"
+
+    with pytest.raises(
+        package_gpu_bundle.BundleError,
+        match="require an authenticated prepared tokenizer and translation dataset",
+    ):
+        package_gpu_bundle.build_bundle(root, output)
+
+    assert not output.exists()
+
+
+def test_candidate_refinement_exact_k_mixed_direction_cohort_is_verifiable(
+    tmp_path: Path,
+) -> None:
+    """Reversible and direct rows must each count once for their logical edges."""
+
+    root = _repository(tmp_path)
+    _enable_candidate_refinement(root)
+    _with_tokenizer(root, complete=True)
+    _with_dataset(root)
+    _write_refinement_evidence_rows(
+        root,
+        [
+            *((0, 1, False) for _ in range(16)),
+            *((0, 1, True) for _ in range(16)),
+            *((1, 0, True) for _ in range(16)),
+        ],
+    )
+    output = tmp_path / "exact-k-candidate.zip"
+
+    package_gpu_bundle.build_bundle(
+        root,
+        output,
+        include_tokenizer=True,
+        include_dataset=True,
+    )
+    archive_result = package_gpu_bundle.verify_archive(output)
+    extracted = tmp_path / "exact-k-extracted"
+    with zipfile.ZipFile(output) as archive:
+        archive.extractall(extracted)
+
+    assert package_gpu_bundle.verify_tree(extracted) == archive_result
+
+
+def test_candidate_refinement_k_minus_one_on_one_edge_publishes_no_archive(
+    tmp_path: Path,
+) -> None:
+    root = _repository(tmp_path)
+    _enable_candidate_refinement(root)
+    _with_tokenizer(root, complete=True)
+    _with_dataset(root)
+    _write_refinement_evidence_rows(
+        root,
+        [
+            *((0, 1, False) for _ in range(16)),
+            *((0, 1, True) for _ in range(16)),
+            *((1, 0, True) for _ in range(15)),
+        ],
+    )
+    output = tmp_path / "one-edge-k-minus-one.zip"
+
+    with pytest.raises(
+        package_gpu_bundle.BundleError,
+        match=r"ja->ko.*31",
+    ):
+        package_gpu_bundle.build_bundle(
+            root,
+            output,
+            include_tokenizer=True,
+            include_dataset=True,
+        )
+
+    assert not output.exists()
+
+
+def test_normal_named_source_may_contain_authenticated_row_level_synthetic_data(
+    tmp_path: Path,
+) -> None:
+    root = _repository(tmp_path)
+    _with_tokenizer(root, complete=True)
+    _with_dataset(root)
+    dataset = root / "artifacts" / "dataset"
+    index_path = dataset / "train" / "00000.idx.npy"
+    index = np.load(index_path, allow_pickle=False)
+    index["synthetic"] = 1
+    np.save(index_path, index, allow_pickle=False)
+
+    manifest_path = dataset / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["stats"]["synthetic_pairs"] = 1
+    manifest["sources"][0]["stats"]["synthetic_pairs"] = 1
+    manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+    _refresh_dataset_inventory(root)
+    output = tmp_path / "mixed-record-synthetic.zip"
+
+    package_gpu_bundle.build_bundle(
+        root,
+        output,
+        include_tokenizer=True,
+        include_dataset=True,
+    )
+    package_gpu_bundle.verify_archive(output)
+
+
+@pytest.mark.parametrize(
+    ("tamper", "message"),
+    (
+        ("stats_schema", "stats_schema is unsupported"),
+        ("stats_field", "fields do not match"),
+        ("source_shape", "source fields are invalid"),
+        ("mean_quality", "mean_quality_score is invalid"),
+        ("synthetic_policy", "synthetic policy contradicts"),
+    ),
+)
+def test_translation_manifest_contract_tampering_publishes_no_archive(
+    tmp_path: Path,
+    tamper: str,
+    message: str,
+) -> None:
+    root = _repository(tmp_path)
+    _with_tokenizer(root, complete=True)
+    _with_dataset(root)
+
+    def mutate(manifest: dict[str, object]) -> None:
+        if tamper == "stats_schema":
+            manifest["stats_schema"] = "sion-prepare-stats-src-tgt-v1"
+        elif tamper == "stats_field":
+            stats = cast(dict[str, object], manifest["stats"])
+            stats["unexpected"] = 0
+        elif tamper == "source_shape":
+            source = cast(list[dict[str, object]], manifest["sources"])[0]
+            source.pop("path")
+        elif tamper == "mean_quality":
+            manifest["mean_quality_score"] = 99.0
+        elif tamper == "synthetic_policy":
+            policy = cast(dict[str, object], manifest["synthetic_policy"])
+            policy["source_only_target_overlap"] = "forbidden"
+        else:
+            raise AssertionError(f"unknown manifest tamper: {tamper}")
+
+    _mutate_dataset_manifest(root, mutate)
+    output = tmp_path / f"tampered-{tamper}.zip"
+
+    with pytest.raises(package_gpu_bundle.BundleError, match=message):
+        package_gpu_bundle.build_bundle(
+            root,
+            output,
+            include_tokenizer=True,
+            include_dataset=True,
+        )
+
+    assert not output.exists()
 
 
 def test_the_dataset_refuses_a_different_tokenizer_fingerprint(tmp_path: Path) -> None:
