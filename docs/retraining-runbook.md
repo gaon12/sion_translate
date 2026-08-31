@@ -279,22 +279,23 @@ python3 scripts/package_gpu_bundle.py verify-tree .
 Stop on any mismatch. Re-upload the verified archive instead of manually repairing a
 failed extraction.
 
-Install the GPU environment and confirm CUDA:
+Install the exact authenticated GPU environment and confirm CUDA. Do not replace this with
+an unlocked `pip install`: `easy_run.py` compares the live interpreter, Torch build, CUDA
+build, and critical package versions with the reviewed lock before preparation begins.
 
 ```bash
-python3 -m pip install --upgrade pip
-python3 -m pip install -e ".[dev,export,hangul]"
-python3 - <<'PY'
-import torch
-
-assert torch.cuda.is_available(), "PyTorch cannot access CUDA"
-print("PyTorch:", torch.__version__)
-print("CUDA runtime:", torch.version.cuda)
-print("GPUs:", [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())])
-print("BF16:", torch.cuda.is_bf16_supported())
-print("NCCL:", torch.distributed.is_nccl_available())
-PY
+python3 -m pip install "uv==0.12.3"
+uv venv --no-config .venv --python cpython@3.11 --managed-python
+uv pip sync --no-config requirements/pylock.gpu-cp311-linux-x86_64-cu128.toml \
+  --python .venv/bin/python --require-hashes --strict --only-binary :all:
+uv pip install --no-config --python .venv/bin/python --no-deps \
+  --no-build-isolation --editable .
 ```
+
+When `.venv/bin/python easy_run.py` is launched later, it prints the authenticated runtime
+versions, runs its bounded CUDA preflight, re-authenticates prepared inputs, and only then
+starts distributed training. A mismatch stops before model allocation; rebuild the environment
+from the lock instead of changing the expected versions on the server.
 
 Authenticate the prepared inputs once more without starting model training:
 

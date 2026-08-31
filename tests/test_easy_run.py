@@ -319,6 +319,11 @@ def test_prepared_bundle_main_never_requires_or_mutates_raw_data(
         "_validate_gpu_runtime",
         lambda _torch: (2, ("NVIDIA H100",)),
     )
+    monkeypatch.setattr(
+        easy_run,
+        "_validate_installed_dependency_runtime",
+        lambda _torch: {"torch": "locked-test-runtime"},
+    )
     for forbidden in (
         "_discover_raw_files",
         "_ram_workspace",
@@ -506,3 +511,98 @@ def test_gpu_preflight_requires_nccl_only_for_multi_gpu() -> None:
     assert easy_run._validate_gpu_runtime(_fake_torch(gpu_count=1, nccl=False))[0] == 1
     with pytest.raises(SystemExit, match="NCCL"):
         easy_run._validate_gpu_runtime(_fake_torch(gpu_count=2, nccl=False))
+
+
+def _locked_runtime_torch():
+    return SimpleNamespace(
+        __version__="2.10.0+cu128",
+        version=SimpleNamespace(cuda="12.8"),
+    )
+
+
+def test_dependency_runtime_matches_the_authenticated_gpu_lock() -> None:
+    locked = {
+        "numpy": "2.4.6",
+        "sentencepiece": "0.2.1",
+        "torchao": "0.17.0+cu128",
+        "transformers": "5.16.1",
+    }
+
+    report = easy_run._validate_installed_dependency_runtime(
+        _locked_runtime_torch(),
+        python_version=(3, 11),
+        operating_system="Linux",
+        machine="x86_64",
+        distribution_version=locked.__getitem__,
+    )
+
+    assert report == {**locked, "torch": "2.10.0+cu128", "cuda": "12.8"}
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement", "message"),
+    (
+        ("torch", "2.10.0+cu126", "torch"),
+        ("cuda", "12.6", "compiled for CUDA"),
+        ("numpy", "2.4.5", "numpy"),
+        ("python", (3, 12), "Python 3.12"),
+        ("system", "Windows", "operating system"),
+        ("machine", "aarch64", "machine"),
+    ),
+)
+def test_dependency_runtime_rejects_any_lock_or_platform_mismatch(
+    field: str,
+    replacement: object,
+    message: str,
+) -> None:
+    torch_module = _locked_runtime_torch()
+    locked = {
+        "numpy": "2.4.6",
+        "sentencepiece": "0.2.1",
+        "torchao": "0.17.0+cu128",
+        "transformers": "5.16.1",
+    }
+    python_version = (3, 11)
+    operating_system = "Linux"
+    machine = "x86_64"
+    if field == "torch":
+        torch_module.__version__ = replacement
+    elif field == "cuda":
+        torch_module.version.cuda = replacement
+    elif field == "python":
+        python_version = replacement  # type: ignore[assignment]
+    elif field == "system":
+        operating_system = str(replacement)
+    elif field == "machine":
+        machine = str(replacement)
+    else:
+        locked[field] = str(replacement)
+
+    with pytest.raises(SystemExit, match=message):
+        easy_run._validate_installed_dependency_runtime(
+            torch_module,
+            python_version=python_version,
+            operating_system=operating_system,
+            machine=machine,
+            distribution_version=locked.__getitem__,
+        )
+
+
+def test_dependency_runtime_reports_missing_locked_packages() -> None:
+    def missing_version(package: str) -> str:
+        if package == "torchao":
+            raise easy_run.importlib_metadata.PackageNotFoundError(package)
+        return {
+            "numpy": "2.4.6",
+            "sentencepiece": "0.2.1",
+            "transformers": "5.16.1",
+        }[package]
+
+    with pytest.raises(SystemExit, match="missing locked packages: torchao"):
+        easy_run._validate_installed_dependency_runtime(
+            _locked_runtime_torch(),
+            python_version=(3, 11),
+            operating_system="Linux",
+            machine="x86_64",
+            distribution_version=missing_version,
+        )

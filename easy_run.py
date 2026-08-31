@@ -13,7 +13,9 @@ import argparse
 from collections.abc import Sequence
 from dataclasses import dataclass
 import hashlib
+from importlib import metadata as importlib_metadata
 import os
+import platform
 import shlex
 import shutil
 import subprocess
@@ -27,6 +29,8 @@ import yaml
 from sion_translate.artifacts import DEFAULT_ARTIFACT_ROOT
 from sion_translate.bundle_contract import (
     BundleContractError,
+    EXPECTED_DEPENDENCY_TARGET,
+    EXPECTED_RUNTIME_VERSIONS,
     load_embedded_training_contract,
     verify_embedded_bundle_payload,
 )
@@ -397,6 +401,75 @@ def _validate_gpu_runtime(torch_module) -> tuple[int, tuple[str, ...]]:
     return gpu_count, names
 
 
+def _validate_installed_dependency_runtime(
+    torch_module,
+    *,
+    python_version: tuple[int, int] | None = None,
+    operating_system: str | None = None,
+    machine: str | None = None,
+    distribution_version=None,
+) -> dict[str, str]:
+    """Require the running interpreter and packages to match the reviewed GPU lock."""
+
+    resolved_python = python_version or (sys.version_info.major, sys.version_info.minor)
+    resolved_system = (operating_system or platform.system()).lower()
+    resolved_machine = (machine or platform.machine()).lower()
+    version_reader = distribution_version or importlib_metadata.version
+    actual_versions = {"torch": str(torch_module.__version__)}
+    missing: list[str] = []
+    for package in EXPECTED_RUNTIME_VERSIONS:
+        if package == "torch":
+            continue
+        try:
+            actual_versions[package] = str(version_reader(package))
+        except importlib_metadata.PackageNotFoundError:
+            missing.append(package)
+
+    mismatches: list[str] = []
+    expected_python = tuple(
+        int(part) for part in str(EXPECTED_DEPENDENCY_TARGET["python_version"]).split(".")
+    )
+    if resolved_python != expected_python:
+        mismatches.append(
+            f"Python {resolved_python[0]}.{resolved_python[1]} is installed; "
+            f"expected {expected_python[0]}.{expected_python[1]}"
+        )
+    if resolved_system != str(EXPECTED_DEPENDENCY_TARGET["os"]):
+        mismatches.append(
+            f"operating system {resolved_system!r} is installed; "
+            f"expected {EXPECTED_DEPENDENCY_TARGET['os']!r}"
+        )
+    normalized_machine = "x86_64" if resolved_machine == "amd64" else resolved_machine
+    if normalized_machine != str(EXPECTED_DEPENDENCY_TARGET["machine"]):
+        mismatches.append(
+            f"machine {resolved_machine!r} is installed; "
+            f"expected {EXPECTED_DEPENDENCY_TARGET['machine']!r}"
+        )
+    for package, expected in EXPECTED_RUNTIME_VERSIONS.items():
+        actual = actual_versions.get(package)
+        if actual is not None and actual != expected:
+            mismatches.append(f"{package} {actual!r} is installed; expected {expected!r}")
+    compiled_cuda = str(getattr(torch_module.version, "cuda", None))
+    expected_cuda = str(EXPECTED_DEPENDENCY_TARGET["torch_backend"]).removeprefix("cu")
+    expected_cuda = f"{int(expected_cuda) // 10}.{int(expected_cuda) % 10}"
+    if compiled_cuda != expected_cuda:
+        mismatches.append(
+            f"PyTorch was compiled for CUDA {compiled_cuda!r}; expected {expected_cuda!r}"
+        )
+    if missing:
+        mismatches.append("missing locked packages: " + ", ".join(sorted(missing)))
+    if mismatches:
+        details = "\n".join(f"  - {message}" for message in mismatches)
+        raise SystemExit(
+            "[easy_run] The installed GPU runtime does not match the authenticated lock:\n"
+            f"{details}\n"
+            "Recreate .venv with CPython 3.11 and run the authenticated uv pip sync "
+            "command from the retraining runbook before allocating GPUs."
+        )
+    actual_versions["cuda"] = compiled_cuda
+    return actual_versions
+
+
 def _report_foundation_corpus(config_path: Path) -> None:
     """Report which monolingual corpora will and will not enter training.
 
@@ -574,6 +647,12 @@ def main() -> None:
     import torch
 
     gpu_count, gpu_names = _validate_gpu_runtime(torch)
+    installed_versions = _validate_installed_dependency_runtime(torch)
+    print(
+        "[easy_run] Authenticated GPU runtime: "
+        + ", ".join(f"{name}={version}" for name, version in sorted(installed_versions.items())),
+        flush=True,
+    )
 
     env = os.environ.copy()
     src_path = str(ROOT / "src")
