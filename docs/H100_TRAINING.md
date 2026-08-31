@@ -303,6 +303,14 @@ healthy batch preparation really needs more than five minutes. A single-process 
 PyTorch's required zero timeout internally, but it cannot leave a separate worker process
 stuck.
 
+Before preparation, `easy_run.py` starts a separate 60-second canary process for every
+visible GPU. The canary uses the production 12-query-head/6-KV-head GQA module with a
+72-wide head, a causal padding mask, BF16 autocast, backward, gradient clipping, fused
+AdamW, and a one-rank NCCL all-reduce when NCCL is available. A failed kernel, non-finite
+value, child crash, or timeout stops the launcher before training. Running the probe in a
+child process also prevents a broken CUDA context from contaminating the later `torchrun`
+workers.
+
 ## 10. Create final exports
 
 Intermediate `exports/best` keeps only lightweight native state so large CPU conversions

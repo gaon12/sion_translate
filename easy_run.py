@@ -14,6 +14,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 import hashlib
 from importlib import metadata as importlib_metadata
+import json
 import os
 import platform
 import shlex
@@ -43,6 +44,7 @@ MIN_RAM_HEADROOM = 8 * 2**30
 PREPARED_ARTIFACT_DIRECTORIES = ("tokenizer", "dataset", "foundation_dataset")
 LOCAL_CHECKOUT_FLAG = "--allow-local-checkout"
 TMUX_SUPPORTED = os.name != "nt"
+CUDA_CANARY_TIMEOUT_SECONDS = 60
 
 
 @dataclass(frozen=True)
@@ -470,6 +472,84 @@ def _validate_installed_dependency_runtime(
     return actual_versions
 
 
+def _run_one_cuda_kernel_canary(
+    device_index: int,
+    env: dict[str, str],
+) -> dict[str, object]:
+    """Run and authenticate one isolated CUDA child result."""
+
+    command = [
+        sys.executable,
+        "-u",
+        "-m",
+        "sion_translate.gpu_runtime",
+        "--device-index",
+        str(device_index),
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            cwd=ROOT,
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=CUDA_CANARY_TIMEOUT_SECONDS,
+            start_new_session=os.name != "nt",
+        )
+    except subprocess.TimeoutExpired as error:
+        raise SystemExit(
+            f"[easy_run] CUDA canary timed out on device {device_index} after "
+            f"{CUDA_CANARY_TIMEOUT_SECONDS} seconds. Training was not started."
+        ) from error
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "no diagnostic output").strip()
+        raise SystemExit(
+            f"[easy_run] CUDA canary failed on device {device_index}. Training was not "
+            f"started.\n{detail}"
+        )
+    lines = [line for line in result.stdout.splitlines() if line.strip()]
+    try:
+        report = json.loads(lines[-1])
+    except (IndexError, json.JSONDecodeError) as error:
+        raise SystemExit(
+            f"[easy_run] CUDA canary on device {device_index} returned no valid JSON report"
+        ) from error
+    if (
+        not isinstance(report, dict)
+        or report.get("schema") != "sion-cuda-canary-v1"
+        or report.get("status") != "passed"
+        or report.get("device_index") != device_index
+    ):
+        raise SystemExit(
+            f"[easy_run] CUDA canary on device {device_index} returned an invalid success report"
+        )
+    return report
+
+
+def _run_cuda_kernel_canaries(gpu_count: int, env: dict[str, str]) -> list[dict[str, object]]:
+    """Probe every GPU concurrently so the whole server waits at most one timeout."""
+
+    with ThreadPoolExecutor(max_workers=gpu_count) as executor:
+        reports = list(
+            executor.map(
+                lambda device_index: _run_one_cuda_kernel_canary(device_index, env),
+                range(gpu_count),
+            )
+        )
+    for device_index, report in enumerate(reports):
+        print(
+            f"[easy_run] CUDA canary passed on device {device_index}: "
+            f"{report.get('device_name', 'unknown GPU')}; "
+            f"{float(report.get('elapsed_seconds', 0.0)):.2f}s; "
+            f"peak {int(report.get('peak_allocated_bytes', 0)) / 2**20:.1f} MiB.",
+            flush=True,
+        )
+    return reports
+
+
 def _report_foundation_corpus(config_path: Path) -> None:
     """Report which monolingual corpora will and will not enter training.
 
@@ -657,6 +737,7 @@ def main() -> None:
     env = os.environ.copy()
     src_path = str(ROOT / "src")
     env["PYTHONPATH"] = src_path + os.pathsep + env.get("PYTHONPATH", "")
+    _run_cuda_kernel_canaries(gpu_count, env)
 
     source_data = ROOT / "data"
     local_checkout_arguments = (

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 from types import SimpleNamespace
 
 from bundle_contract_fixtures import rewrite_manifest, write_test_bundle
@@ -324,6 +325,7 @@ def test_prepared_bundle_main_never_requires_or_mutates_raw_data(
         "_validate_installed_dependency_runtime",
         lambda _torch: {"torch": "locked-test-runtime"},
     )
+    monkeypatch.setattr(easy_run, "_run_cuda_kernel_canaries", lambda _count, _env: [])
     for forbidden in (
         "_discover_raw_files",
         "_ram_workspace",
@@ -606,3 +608,72 @@ def test_dependency_runtime_reports_missing_locked_packages() -> None:
             machine="x86_64",
             distribution_version=missing_version,
         )
+
+
+def test_cuda_canary_runner_checks_every_device_with_a_hard_timeout(
+    monkeypatch,
+) -> None:
+    commands: list[list[str]] = []
+    options: list[dict[str, object]] = []
+
+    def successful_run(command: list[str], **kwargs):
+        commands.append(command)
+        options.append(kwargs)
+        device_index = int(command[-1])
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                '{"schema":"sion-cuda-canary-v1","status":"passed",'
+                '"device_name":"NVIDIA test GPU",'
+                f'"device_index":{device_index},"elapsed_seconds":0.25,'
+                '"peak_allocated_bytes":1048576}\n'
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(easy_run.subprocess, "run", successful_run)
+    reports = easy_run._run_cuda_kernel_canaries(2, {"PYTHONPATH": "test"})
+
+    assert [report["device_index"] for report in reports] == [0, 1]
+    assert sorted(command[-1] for command in commands) == ["0", "1"]
+    assert all("sion_translate.gpu_runtime" in command for command in commands)
+    assert all(option["timeout"] == easy_run.CUDA_CANARY_TIMEOUT_SECONDS for option in options)
+    assert all(option["cwd"] == easy_run.ROOT for option in options)
+    assert all(option["env"] == {"PYTHONPATH": "test"} for option in options)
+
+
+def test_cuda_canary_timeout_stops_before_training(monkeypatch) -> None:
+    def timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(args[0], easy_run.CUDA_CANARY_TIMEOUT_SECONDS)
+
+    monkeypatch.setattr(easy_run.subprocess, "run", timeout)
+    with pytest.raises(SystemExit, match="timed out.*Training was not started"):
+        easy_run._run_one_cuda_kernel_canary(0, {})
+
+
+def test_cuda_canary_failure_preserves_the_remote_diagnostic(monkeypatch) -> None:
+    monkeypatch.setattr(
+        easy_run.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=1,
+            stdout="",
+            stderr="fused AdamW kernel is unsupported",
+        ),
+    )
+    with pytest.raises(SystemExit, match="fused AdamW kernel is unsupported"):
+        easy_run._run_one_cuda_kernel_canary(0, {})
+
+
+def test_cuda_canary_rejects_a_success_report_for_the_wrong_device(monkeypatch) -> None:
+    monkeypatch.setattr(
+        easy_run.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=('{"schema":"sion-cuda-canary-v1","status":"passed","device_index":1}\n'),
+            stderr="",
+        ),
+    )
+    with pytest.raises(SystemExit, match="invalid success report"):
+        easy_run._run_one_cuda_kernel_canary(0, {})
