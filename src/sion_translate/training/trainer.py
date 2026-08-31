@@ -343,6 +343,94 @@ def _make_grad_scaler(training: TrainingConfig, context: DistributedContext):
     return torch.amp.GradScaler("cuda", enabled=enabled)
 
 
+def _preflight_optimizer_step_inputs(
+    parameters: Iterable[nn.Parameter],
+    *,
+    accumulated_loss: torch.Tensor,
+    accumulated_local_normalizer: torch.Tensor,
+    context: DistributedContext,
+    stage_name: str,
+    next_step: int,
+) -> tuple[list[nn.Parameter], float]:
+    """Reject invalid accumulated inputs on every rank before an optimizer update."""
+
+    gradient_parameters = [parameter for parameter in parameters if parameter.grad is not None]
+    status = torch.stack(
+        (
+            accumulated_local_normalizer.detach().to(dtype=torch.float64).reshape(()),
+            (~torch.isfinite(accumulated_loss.detach()).all()).to(dtype=torch.float64),
+            torch.tensor(
+                float(not gradient_parameters),
+                device=context.device,
+                dtype=torch.float64,
+            ),
+        )
+    )
+    # One fixed-size collective makes every rank reach the same decision without
+    # adding a synchronization to each gradient-accumulation microbatch.
+    reduce_sum(status, context)
+    global_normalizer = float(status[0].item())
+    nonfinite_loss_ranks = int(status[1].item())
+    missing_gradient_ranks = int(status[2].item())
+    reasons: list[str] = []
+    if nonfinite_loss_ranks:
+        reasons.append(f"non-finite accumulated loss on {nonfinite_loss_ranks} rank(s)")
+    if not math.isfinite(global_normalizer) or global_normalizer <= 0.0:
+        reasons.append(f"invalid global normalizer {global_normalizer!r}")
+    if missing_gradient_ranks:
+        reasons.append(f"no gradients on {missing_gradient_ranks} rank(s)")
+    if reasons:
+        raise FloatingPointError(
+            f"{stage_name} optimizer step {next_step} was rejected before weights were "
+            f"updated: {'; '.join(reasons)}. The last committed checkpoint remains intact."
+        )
+    return gradient_parameters, global_normalizer
+
+
+def _normalize_and_clip_finite_gradients(
+    gradient_parameters: Sequence[nn.Parameter],
+    *,
+    global_normalizer: float,
+    max_norm: float,
+    context: DistributedContext,
+    stage_name: str,
+    next_step: int,
+) -> torch.Tensor:
+    """Normalize gradients and reject a non-finite global norm before clipping."""
+
+    for parameter in gradient_parameters:
+        assert parameter.grad is not None
+        parameter.grad.div_(global_normalizer)
+    gradients = [cast(torch.Tensor, parameter.grad) for parameter in gradient_parameters]
+    norm_for_clipping = torch.nn.utils.get_total_norm(
+        gradients,
+        error_if_nonfinite=False,
+    )
+    # FSDP2 returns a scalar DTensor. Materialize its globally reduced value on
+    # every rank both for the explicit safety decision and for ordinary logging.
+    full_tensor = getattr(norm_for_clipping, "full_tensor", None)
+    plain_norm = cast(torch.Tensor, full_tensor()) if callable(full_tensor) else norm_for_clipping
+    if plain_norm.numel() != 1:
+        raise RuntimeError("gradient norm calculation did not return one scalar")
+    plain_norm = plain_norm.reshape(())
+    nonfinite_norm = (~torch.isfinite(plain_norm)).to(dtype=torch.int32)
+    reduce_max(nonfinite_norm, context)
+    if bool(nonfinite_norm.item()):
+        raise FloatingPointError(
+            f"{stage_name} optimizer step {next_step} was rejected before weights were "
+            "updated because at least one rank produced a non-finite gradient norm. "
+            "The last committed checkpoint remains intact."
+        )
+    # Preserve the DTensor norm for FSDP2 dispatch while returning the materialized
+    # scalar that downstream logging can safely convert to a Python float.
+    torch.nn.utils.clip_grads_with_norm_(
+        gradient_parameters,
+        max_norm,
+        norm_for_clipping,
+    )
+    return plain_norm.detach()
+
+
 def _make_summary_writer(
     training: TrainingConfig,
     output_dir: Path,
@@ -2271,17 +2359,26 @@ def train(
                     data_wait_started = time.perf_counter()
                     continue  # Continue until the accumulation window is full.
 
-                # Optimizer step: normalize gradients, clip, and update parameters.
+                # Optimizer step: validate accumulated inputs before any state
+                # mutation, then unscale, normalize, validate, clip, and update.
+                gradient_parameters, global_normalizer = _preflight_optimizer_step_inputs(
+                    model.parameters(),
+                    accumulated_loss=window[0],
+                    accumulated_local_normalizer=accumulated_local_normalizer,
+                    context=context,
+                    stage_name=stage_name,
+                    next_step=step + 1,
+                )
                 if scaler.is_enabled():
                     scaler.unscale_(optimizer)
-                # Aggregate the normalizer for the complete window across all ranks once.
-                global_normalizer = accumulated_local_normalizer.clone()
-                reduce_sum(global_normalizer, context)
-                gradient_denominator = global_normalizer.clamp_min(1.0)
-                for parameter in model.parameters():
-                    if parameter.grad is not None:
-                        parameter.grad.div_(gradient_denominator)
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), training.grad_clip)
+                grad_norm = _normalize_and_clip_finite_gradients(
+                    gradient_parameters,
+                    global_normalizer=global_normalizer,
+                    max_norm=training.grad_clip,
+                    context=context,
+                    stage_name=stage_name,
+                    next_step=step + 1,
+                )
                 optimizer_updated = True
                 if scaler.is_enabled():
                     # The scaler skips this update when fp16 overflow occurs.

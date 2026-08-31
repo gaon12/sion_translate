@@ -18,6 +18,7 @@ import torch
 from bundle_contract_fixtures import write_test_bundle
 import sion_translate.cli.train as train_module
 import sion_translate.training.distributed as distributed_module
+import sion_translate.training.trainer as trainer_module
 from sion_translate.bundle_contract import BundleContractError
 from sion_translate.cli.train import (
     build_collator_args,
@@ -2833,6 +2834,24 @@ def test_fsdp2_cpu_gloo_forward_generate_and_sample_smoke(tmp_path: Path) -> Non
             parameter.grad is None or torch.isfinite(parameter.grad).all()
             for parameter in model.parameters()
         )
+        gradient_parameters, global_normalizer = trainer_module._preflight_optimizer_step_inputs(
+            model.parameters(),
+            accumulated_loss=output.loss,
+            accumulated_local_normalizer=torch.ones((), dtype=torch.float64),
+            context=context,
+            stage_name="fsdp2-smoke",
+            next_step=1,
+        )
+        grad_norm = trainer_module._normalize_and_clip_finite_gradients(
+            gradient_parameters,
+            global_normalizer=global_normalizer,
+            max_norm=1.0,
+            context=context,
+            stage_name="fsdp2-smoke",
+            next_step=1,
+        )
+        assert type(grad_norm) is torch.Tensor
+        assert torch.isfinite(grad_norm)
         assert model.register_state.inject_gate.grad is not None
         assert model.typed_memory.gate.grad is not None
 

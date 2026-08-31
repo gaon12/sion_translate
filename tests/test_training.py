@@ -3,7 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import shutil
+import socket
+import subprocess
+import sys
+import textwrap
 from collections.abc import Iterable
 from contextlib import contextmanager
 from pathlib import Path
@@ -309,6 +314,216 @@ def test_single_step_training_loop(tmp_path: Path) -> None:
     assert checkpoint["identity"]["pipeline"] == pipeline_identity
     resolved = json.loads((tmp_path / "run" / "resolved_config.json").read_text(encoding="utf-8"))
     assert resolved == config.to_dict()
+
+
+def test_sft_nonfinite_loss_cannot_mutate_model_or_optimizer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class NonFiniteLossModel(SionForConditionalGeneration):
+        def forward(self, *args: object, **kwargs: object):
+            output = super().forward(*args, **kwargs)
+            assert output.lm_loss_sum is not None
+            output.lm_loss_sum = output.lm_loss_sum * float("nan")
+            return output
+
+    optimizer_steps = 0
+    original_step = torch.optim.AdamW.step
+
+    def record_step(optimizer: torch.optim.AdamW, *args: object, **kwargs: object):
+        nonlocal optimizer_steps
+        optimizer_steps += 1
+        return original_step(optimizer, *args, **kwargs)
+
+    monkeypatch.setattr(torch.optim.AdamW, "step", record_step)
+    config = tiny_app_config(tmp_path, ema_decay=0.0)
+    model = NonFiniteLossModel(config.model)
+    initial = {name: value.detach().clone() for name, value in model.named_parameters()}
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+
+    with pytest.raises(FloatingPointError, match="non-finite accumulated loss"):
+        train(model, [tiny_batch()], [tiny_batch()], config, context)
+
+    assert optimizer_steps == 0
+    for name, parameter in model.named_parameters():
+        torch.testing.assert_close(parameter, initial[name], rtol=0.0, atol=0.0)
+
+
+def test_mrt_nonfinite_backward_cannot_mutate_model_or_optimizer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FiniteForwardNonFiniteBackward(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx: object, value: torch.Tensor) -> torch.Tensor:
+            return value.new_zeros(())
+
+        @staticmethod
+        def backward(ctx: object, gradient: torch.Tensor) -> tuple[torch.Tensor]:
+            return (torch.full_like(gradient, float("inf")),)
+
+    class NonFiniteGradientObjective:
+        def __call__(self, model: nn.Module, batch: dict[str, torch.Tensor]) -> ObjectiveOutput:
+            anchor = next(model.parameters()).sum()
+            loss = FiniteForwardNonFiniteBackward.apply(anchor)
+            normalizer = loss.new_tensor(float(batch["input_ids"].shape[0]))
+            return ObjectiveOutput(
+                loss_sum=loss,
+                normalizer=normalizer,
+                processed_tokens=normalizer,
+                auxiliary_loss=loss.detach(),
+                metrics={},
+            )
+
+    optimizer_steps = 0
+    original_step = torch.optim.AdamW.step
+
+    def record_step(optimizer: torch.optim.AdamW, *args: object, **kwargs: object):
+        nonlocal optimizer_steps
+        optimizer_steps += 1
+        return original_step(optimizer, *args, **kwargs)
+
+    monkeypatch.setattr(torch.optim.AdamW, "step", record_step)
+    config = tiny_app_config(tmp_path, ema_decay=0.0)
+    model = SionForConditionalGeneration(config.model)
+    initial = {name: value.detach().clone() for name, value in model.named_parameters()}
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+
+    with pytest.raises(FloatingPointError, match="non-finite gradient norm"):
+        train(
+            model,
+            [tiny_batch()],
+            [tiny_batch()],
+            config,
+            context,
+            objective=NonFiniteGradientObjective(),
+            stage_name="posttrain/MRT",
+        )
+
+    assert optimizer_steps == 0
+    for name, parameter in model.named_parameters():
+        torch.testing.assert_close(parameter, initial[name], rtol=0.0, atol=0.0)
+
+
+def test_remote_nonfinite_gradient_norm_stops_a_locally_finite_rank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parameter = nn.Parameter(torch.tensor(2.0))
+    parameter.square().backward()
+    context = DistributedContext(0, 0, 2, torch.device("cpu"), True, "gloo")
+
+    def simulate_remote_failure(
+        flag: torch.Tensor,
+        _context: DistributedContext,
+    ) -> torch.Tensor:
+        flag.fill_(1)
+        return flag
+
+    monkeypatch.setattr(trainer_module, "reduce_max", simulate_remote_failure)
+    with pytest.raises(FloatingPointError, match="at least one rank"):
+        trainer_module._normalize_and_clip_finite_gradients(
+            [parameter],
+            global_normalizer=1.0,
+            max_norm=1.0,
+            context=context,
+            stage_name="pretrain",
+            next_step=1,
+        )
+
+    assert parameter.item() == 2.0
+
+
+def test_two_gloo_ranks_reject_one_rank_nonfinite_gradient_without_hanging(
+    tmp_path: Path,
+) -> None:
+    if not torch.distributed.is_available() or not torch.distributed.is_gloo_available():
+        pytest.skip("distributed numerical guard test requires Gloo")
+
+    script = tmp_path / "nonfinite_gradient_worker.py"
+    result_dir = tmp_path / "results"
+    result_dir.mkdir()
+    script.write_text(
+        textwrap.dedent(
+            """
+            import json
+            import sys
+            from pathlib import Path
+
+            import torch
+            from torch import nn
+
+            import sion_translate.training.trainer as trainer_module
+            from sion_translate.training.distributed import cleanup_distributed, initialize_distributed
+
+            result_dir = Path(sys.argv[1])
+            context = initialize_distributed()
+            parameter = nn.Parameter(torch.tensor(2.0))
+            parameter.grad = torch.tensor(float("nan") if context.rank == 1 else 4.0)
+            try:
+                trainer_module._normalize_and_clip_finite_gradients(
+                    [parameter],
+                    global_normalizer=1.0,
+                    max_norm=1.0,
+                    context=context,
+                    stage_name="distributed-smoke",
+                    next_step=1,
+                )
+            except FloatingPointError as error:
+                payload = {"status": "rejected", "message": str(error)}
+            else:
+                payload = {"status": "accepted"}
+            finally:
+                cleanup_distributed(context)
+            (result_dir / f"rank-{context.rank}.json").write_text(
+                json.dumps(payload), encoding="utf-8"
+            )
+            """
+        ),
+        encoding="utf-8",
+    )
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as port_probe:
+        port_probe.bind(("127.0.0.1", 0))
+        rendezvous_port = int(port_probe.getsockname()[1])
+    base_environment = {
+        **os.environ,
+        "CUDA_VISIBLE_DEVICES": "",
+        "MASTER_ADDR": "127.0.0.1",
+        "MASTER_PORT": str(rendezvous_port),
+        "WORLD_SIZE": "2",
+        "PYTHONUTF8": "1",
+        "USE_LIBUV": "0",
+    }
+    processes = [
+        subprocess.Popen(
+            [sys.executable, str(script), str(result_dir)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env={**base_environment, "RANK": str(rank), "LOCAL_RANK": str(rank)},
+        )
+        for rank in range(2)
+    ]
+    outputs: list[tuple[str, str]] = []
+    try:
+        for process in processes:
+            outputs.append(process.communicate(timeout=60))
+    except subprocess.TimeoutExpired:
+        for process in processes:
+            process.kill()
+        for process in processes:
+            process.communicate()
+        raise
+
+    for process, (stdout, stderr) in zip(processes, outputs, strict=True):
+        assert process.returncode == 0, stderr or stdout
+    payloads = [
+        json.loads((result_dir / f"rank-{rank}.json").read_text(encoding="utf-8"))
+        for rank in range(2)
+    ]
+    assert [payload["status"] for payload in payloads] == ["rejected", "rejected"]
+    assert all("at least one rank" in payload["message"] for payload in payloads)
 
 
 @pytest.mark.parametrize("failure_phase", ("preflight", "load"))
