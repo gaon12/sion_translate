@@ -129,7 +129,11 @@ data:
   # Keep release evidence separate from ordinary validation/test so synthetic
   # source-only rows can measure only relative T1-to-T2 refinement gains. Exact
   # basenames make the opt-in reviewable; future synthetic files remain train-only.
-  refinement_evidence_fraction: 0.005
+  # A 0.5% hash window left only 20 accepted examples on the sparsest edge
+  # after endpoint-leakage and deduplication conflicts. A 2% window preserves a
+  # practical margin for the fail-closed 32-distinct-row release cohort without
+  # naming or special-casing any language in preprocessing code.
+  refinement_evidence_fraction: 0.02
   source_only_synthetic_evidence_files:
     - synthetic_dialect_ja.jsonl
     - synthetic_dialect_ko.jsonl

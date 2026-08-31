@@ -718,7 +718,7 @@ def test_candidate_refinement_release_margin_default_and_shipped_configs_are_exa
         assert config.model.experimental.candidate_refinement_enabled is True
         assert config.training.candidate_refinement_min_worst_direction_nll_gain == 1e-5
         assert config.training.candidate_refinement_min_validation_examples_per_direction == 32
-        assert config.data.refinement_evidence_fraction == pytest.approx(0.005)
+        assert config.data.refinement_evidence_fraction == pytest.approx(0.02)
         assert config.data.configured_source_only_synthetic_evidence_files() == (
             "synthetic_dialect_ja.jsonl",
             "synthetic_dialect_ko.jsonl",
