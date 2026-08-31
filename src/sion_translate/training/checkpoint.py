@@ -21,6 +21,8 @@ import os
 import random
 import shutil
 import stat
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -28,9 +30,9 @@ import warnings
 from collections.abc import Callable, Generator, Mapping
 from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass, is_dataclass
-from functools import partial
+from functools import partial, wraps
 from pathlib import Path, PurePosixPath
-from typing import Any, cast
+from typing import Any, ParamSpec, TypeVar, cast
 
 import numpy as np
 import torch
@@ -47,6 +49,265 @@ CHECKPOINT_IDENTITY_SCHEMA = "sion-checkpoint-identity-v1"
 DCP_COMPLETION_FILENAME = ".sion_checkpoint_complete.json"
 DCP_COMPLETION_SCHEMA = "sion-dcp-completion-v2"
 _CHECKPOINT_IO_HEARTBEAT_SECONDS = 1.0
+_CHECKPOINT_IO_TIMEOUT_ENV = "SION_CHECKPOINT_IO_TIMEOUT_SECONDS"
+_CHECKPOINT_IO_TIMEOUT_DEFAULT_SECONDS = 600.0
+_CHECKPOINT_IO_TIMEOUT_MIN_SECONDS = 30.0
+_CHECKPOINT_IO_TIMEOUT_MAX_SECONDS = 1800.0
+_CHECKPOINT_IO_WATCHDOG_START_SECONDS = 5.0
+_CHECKPOINT_IO_WATCHDOG_REAP_SECONDS = 5.0
+_CheckpointIoParameters = ParamSpec("_CheckpointIoParameters")
+_CheckpointIoResult = TypeVar("_CheckpointIoResult")
+_CHECKPOINT_IO_DEADLINE_STATE = threading.local()
+
+# This helper runs in a clean Python interpreter. It does not import PyTorch or
+# touch CUDA after training has started. A pipe byte cancels the deadline. If
+# the parent is blocked past the absolute deadline, SIGKILL/TerminateProcess is
+# the only safe outcome: returning from the caller would leave its I/O thread
+# free to rename or publish checkpoint files after failure was reported.
+_CHECKPOINT_IO_WATCHDOG_CODE = r"""
+import os
+import signal
+import sys
+import threading
+import time
+
+parent_pid = int(sys.argv[1])
+deadline_ns = int(sys.argv[2])
+operation = sys.argv[3]
+cancelled = threading.Event()
+
+def read_cancellation():
+    try:
+        os.read(0, 1)
+    finally:
+        cancelled.set()
+
+reader = threading.Thread(target=read_cancellation, daemon=True)
+reader.start()
+os.write(1, b"R")
+remaining_seconds = max(0.0, (deadline_ns - time.monotonic_ns()) / 1_000_000_000)
+if cancelled.wait(remaining_seconds):
+    reader.join(1.0)
+    os._exit(0)
+
+message = (
+    "FATAL: checkpoint I/O exceeded its hard deadline; terminating the training "
+    f"process before checkpoint state can keep changing (pid={parent_pid}, "
+    f"operation={operation}).\n"
+)
+try:
+    os.write(2, message.encode("utf-8", errors="replace")[:4096])
+except OSError:
+    pass
+try:
+    # Windows does not expose SIGKILL, but os.kill(..., SIGTERM) delegates to
+    # TerminateProcess. POSIX uses SIGKILL so application handlers cannot defer
+    # the paid-compute safety boundary.
+    hard_stop_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
+    os.kill(parent_pid, hard_stop_signal)
+except ProcessLookupError:
+    pass
+except OSError as error:
+    try:
+        os.write(2, f"FATAL: checkpoint watchdog could not stop pid {parent_pid}: {error}\n".encode())
+    except OSError:
+        pass
+os._exit(124)
+"""
+
+
+def _checkpoint_io_timeout_seconds() -> float:
+    """Return the reviewed hard deadline for one checkpoint I/O transaction."""
+
+    raw_value = os.environ.get(_CHECKPOINT_IO_TIMEOUT_ENV)
+    if raw_value is None:
+        return _CHECKPOINT_IO_TIMEOUT_DEFAULT_SECONDS
+    try:
+        timeout_seconds = float(raw_value)
+    except ValueError as error:
+        raise ValueError(f"{_CHECKPOINT_IO_TIMEOUT_ENV} must be a number of seconds") from error
+    if not np.isfinite(timeout_seconds):
+        raise ValueError(f"{_CHECKPOINT_IO_TIMEOUT_ENV} must be finite")
+    if (
+        not _CHECKPOINT_IO_TIMEOUT_MIN_SECONDS
+        <= timeout_seconds
+        <= (_CHECKPOINT_IO_TIMEOUT_MAX_SECONDS)
+    ):
+        raise ValueError(
+            f"{_CHECKPOINT_IO_TIMEOUT_ENV} must be between "
+            f"{_CHECKPOINT_IO_TIMEOUT_MIN_SECONDS:g} and "
+            f"{_CHECKPOINT_IO_TIMEOUT_MAX_SECONDS:g} seconds"
+        )
+    return timeout_seconds
+
+
+def _reap_failed_checkpoint_io_watchdog(watchdog: subprocess.Popen[bytes]) -> None:
+    """Stop a watchdog that could not prove it was armed correctly."""
+
+    if watchdog.stdin is not None:
+        watchdog.stdin.close()
+    if watchdog.poll() is None:
+        watchdog.kill()
+    try:
+        watchdog.wait(timeout=_CHECKPOINT_IO_WATCHDOG_REAP_SECONDS)
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError("checkpoint I/O deadline watchdog could not be reaped") from error
+    else:
+        # Kill before closing the read side. A startup reader may currently own
+        # the pipe's I/O lock; process exit closes the writer and wakes it first.
+        if watchdog.stdout is not None:
+            watchdog.stdout.close()
+
+
+def _start_checkpoint_io_watchdog(
+    *,
+    operation: str,
+    timeout_seconds: float,
+) -> subprocess.Popen[bytes]:
+    """Arm an external deadline that remains runnable if this process wedges."""
+
+    safe_operation = " ".join(operation.splitlines()).strip()[:512] or "unnamed action"
+    deadline_ns = time.monotonic_ns() + int(timeout_seconds * 1_000_000_000)
+    creation_flags = 0
+    if os.name == "nt":
+        # A training worker must not flash one console window per checkpoint.
+        creation_flags = subprocess.CREATE_NO_WINDOW  # pyright: ignore[reportAttributeAccessIssue]
+    try:
+        watchdog = subprocess.Popen(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                _CHECKPOINT_IO_WATCHDOG_CODE,
+                str(os.getpid()),
+                str(deadline_ns),
+                safe_operation,
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            # Inherit stderr so the fatal reason survives an ungraceful exit.
+            stderr=None,
+            bufsize=0,
+            close_fds=True,
+            creationflags=creation_flags,
+        )
+    except OSError as error:
+        raise RuntimeError(
+            "could not start the checkpoint I/O deadline watchdog; refusing "
+            "to begin checkpoint work without a hard stop"
+        ) from error
+    if watchdog.stdin is None or watchdog.stdout is None:
+        _reap_failed_checkpoint_io_watchdog(watchdog)
+        raise RuntimeError("checkpoint I/O deadline watchdog has incomplete control pipes")
+    ready_pipe = watchdog.stdout
+
+    ready: list[bytes] = []
+    startup_errors: list[BaseException] = []
+
+    def read_ready_byte() -> None:
+        try:
+            ready.append(ready_pipe.read(1))
+        except BaseException as error:
+            startup_errors.append(error)
+
+    reader = threading.Thread(
+        target=read_ready_byte,
+        name="sion-checkpoint-watchdog-start",
+        daemon=True,
+    )
+    reader.start()
+    reader.join(_CHECKPOINT_IO_WATCHDOG_START_SECONDS)
+    if reader.is_alive() or startup_errors or ready != [b"R"]:
+        _reap_failed_checkpoint_io_watchdog(watchdog)
+        reader.join(_CHECKPOINT_IO_WATCHDOG_REAP_SECONDS)
+        detail = f": {startup_errors[0]}" if startup_errors else ""
+        raise RuntimeError(
+            "checkpoint I/O deadline watchdog did not confirm that it was armed" + detail
+        )
+    ready_pipe.close()
+    return watchdog
+
+
+def _cancel_checkpoint_io_watchdog(watchdog: subprocess.Popen[bytes]) -> None:
+    """Cancel and reap a watchdog after its checkpoint transaction has ended."""
+
+    cancellation_error: OSError | None = None
+    cancellation_pipe = watchdog.stdin
+    if cancellation_pipe is not None and not cancellation_pipe.closed:
+        try:
+            cancellation_pipe.write(b"\x00")
+            cancellation_pipe.flush()
+        except OSError as error:
+            cancellation_error = error
+        finally:
+            cancellation_pipe.close()
+    try:
+        return_code = watchdog.wait(timeout=_CHECKPOINT_IO_WATCHDOG_REAP_SECONDS)
+    except subprocess.TimeoutExpired as error:
+        watchdog.kill()
+        try:
+            watchdog.wait(timeout=_CHECKPOINT_IO_WATCHDOG_REAP_SECONDS)
+        except subprocess.TimeoutExpired as reap_error:
+            raise RuntimeError(
+                "checkpoint I/O deadline watchdog could not be reaped after cancellation"
+            ) from reap_error
+        raise RuntimeError(
+            "checkpoint I/O deadline watchdog did not acknowledge cancellation"
+        ) from error
+    if return_code != 0 or cancellation_error is not None:
+        detail = f": {cancellation_error}" if cancellation_error is not None else ""
+        raise RuntimeError(
+            f"checkpoint I/O deadline watchdog exited unexpectedly with code {return_code}{detail}"
+        )
+
+
+@contextmanager
+def _checkpoint_io_deadline(operation: str) -> Generator[None, None, None]:
+    """Bound one possibly nested checkpoint transaction with one watchdog."""
+
+    depth = int(getattr(_CHECKPOINT_IO_DEADLINE_STATE, "depth", 0))
+    if depth > 0:
+        _CHECKPOINT_IO_DEADLINE_STATE.depth = depth + 1
+        try:
+            yield
+        finally:
+            _CHECKPOINT_IO_DEADLINE_STATE.depth = depth
+        return
+
+    watchdog = _start_checkpoint_io_watchdog(
+        operation=operation,
+        timeout_seconds=_checkpoint_io_timeout_seconds(),
+    )
+    _CHECKPOINT_IO_DEADLINE_STATE.depth = 1
+    try:
+        yield
+    finally:
+        _CHECKPOINT_IO_DEADLINE_STATE.depth = 0
+        _cancel_checkpoint_io_watchdog(watchdog)
+
+
+def _checkpoint_io_deadline_guard(
+    operation: str,
+) -> Callable[
+    [Callable[_CheckpointIoParameters, _CheckpointIoResult]],
+    Callable[_CheckpointIoParameters, _CheckpointIoResult],
+]:
+    """Decorate a complete checkpoint transaction with the hard deadline."""
+
+    def decorate(
+        function: Callable[_CheckpointIoParameters, _CheckpointIoResult],
+    ) -> Callable[_CheckpointIoParameters, _CheckpointIoResult]:
+        @wraps(function)
+        def guarded(
+            *args: _CheckpointIoParameters.args,
+            **kwargs: _CheckpointIoParameters.kwargs,
+        ) -> _CheckpointIoResult:
+            with _checkpoint_io_deadline(operation):
+                return function(*args, **kwargs)
+
+        return guarded
+
+    return decorate
 
 
 @dataclass(frozen=True)
@@ -891,6 +1152,7 @@ def _preflight_dcp_stage_transfer(
     return probe
 
 
+@_checkpoint_io_deadline_guard("checkpoint identity preflight")
 def preflight_checkpoint_identity(
     path: str | Path,
     context: DistributedContext,
@@ -917,6 +1179,7 @@ def preflight_checkpoint_identity(
     return int(loaded_state["step"])
 
 
+@_checkpoint_io_deadline_guard("checkpoint identity inspection")
 def inspect_checkpoint_identity(
     path: str | Path,
     context: DistributedContext,
@@ -974,6 +1237,7 @@ def inspect_checkpoint_identity(
     return cast(dict[str, Any], normalized)
 
 
+@_checkpoint_io_deadline_guard("checkpoint training-state inspection")
 def inspect_checkpoint_training_state(
     path: str | Path,
     context: DistributedContext,
@@ -1215,7 +1479,36 @@ def _run_checkpoint_io_action(
     operation: str,
     rank_zero_only: bool,
 ) -> None:
-    """Run slow checkpoint I/O without parking peers in one long collective.
+    """Run checkpoint I/O under a process-level hard deadline.
+
+    The watchdog is a separate, isolated Python process. It can terminate this
+    training process even when a filesystem call or the Python GIL is stuck.
+    Normal completion cancels and reaps it before this function returns. A hard
+    timeout kills the whole process, including its I/O worker, because Python
+    cannot safely cancel that worker while preserving transactional ownership.
+
+    Distributed ranks still exchange short completion heartbeats. The deadline
+    applies to every rank, including peers that do not run a rank-zero-only
+    action, so one permanently blocked rank cannot leave paid peers alive.
+    """
+
+    with _checkpoint_io_deadline(operation):
+        _run_checkpoint_io_action_impl(
+            action,
+            context,
+            operation=operation,
+            rank_zero_only=rank_zero_only,
+        )
+
+
+def _run_checkpoint_io_action_impl(
+    action: Callable[[], None],
+    context: DistributedContext,
+    *,
+    operation: str,
+    rank_zero_only: bool,
+) -> None:
+    """Run slow distributed I/O without parking peers in one long collective.
 
     The I/O runs in worker threads while every rank's main thread exchanges a
     tiny completion heartbeat. No individual collective includes the long I/O,
@@ -1235,14 +1528,22 @@ def _run_checkpoint_io_action(
     completed = threading.Event()
     abort_requested = threading.Event()
     errors: list[BaseException] = []
+    deadline_is_armed = bool(getattr(_CHECKPOINT_IO_DEADLINE_STATE, "depth", 0))
 
     def run_action() -> None:
+        if deadline_is_armed:
+            # The main thread's external process already owns the hard stop for
+            # this transaction. Propagate only the nesting marker so decorated
+            # helpers do not fork another watchdog from a PyTorch worker thread.
+            _CHECKPOINT_IO_DEADLINE_STATE.depth = 1
         try:
             if not abort_requested.is_set():
                 action()
         except BaseException as error:
             errors.append(error)
         finally:
+            if deadline_is_armed:
+                _CHECKPOINT_IO_DEADLINE_STATE.depth = 0
             completed.set()
 
     worker: threading.Thread | None = None
@@ -1277,8 +1578,11 @@ def _run_checkpoint_io_action(
         if worker is not None:
             # A failed collective must not let an orphaned worker keep hashing,
             # renaming, or publishing checkpoint bytes after this call returns.
-            # Python cannot safely cancel arbitrary filesystem I/O, so wait for
-            # ownership to end before propagating the collective failure.
+            # Python cannot safely cancel arbitrary filesystem I/O. This join is
+            # intentionally not advertised as bounded: returning early would let
+            # a live thread mutate checkpoint state after the caller reported a
+            # failure. The owning torchrun process group is the safe hard-stop
+            # boundary for a truly wedged filesystem operation.
             worker.join()
 
     failure_source = torch.tensor(
@@ -1717,6 +2021,7 @@ def _is_lightweight_dcp_candidate(path: Path, *, world_size: int) -> bool:
         return False
 
 
+@_checkpoint_io_deadline_guard("checkpoint generation discovery")
 def checkpoint_generation_candidates(
     path: str | Path,
     context: DistributedContext,
@@ -1744,6 +2049,7 @@ def checkpoint_generation_candidates(
     )
 
 
+@_checkpoint_io_deadline_guard("checkpoint generation metadata inspection")
 def checkpoint_generation_candidate_metadata(
     path: str | Path,
     context: DistributedContext,
@@ -1773,6 +2079,7 @@ def checkpoint_generation_candidate_metadata(
     return marker_sha256, marker_step
 
 
+@_checkpoint_io_deadline_guard("checkpoint existence inspection")
 def checkpoint_path_exists(path: str | Path) -> bool:
     """Return whether checkpoint-like artifacts exist, without authenticating them.
 
@@ -1793,6 +2100,7 @@ def checkpoint_path_exists(path: str | Path) -> bool:
     )
 
 
+@_checkpoint_io_deadline_guard("checkpoint source resolution")
 def resolve_checkpoint_source(
     path: str | Path,
     context: DistributedContext,
@@ -1845,6 +2153,7 @@ def _required_dcp_files(path: Path, *, world_size: int) -> list[Path]:
     return [path / ".metadata"] + [path / f"rng-rank-{rank:05d}.pt" for rank in range(world_size)]
 
 
+@_checkpoint_io_deadline_guard("checkpoint source authentication")
 def register_verified_checkpoint_source(
     path: str | Path,
     context: DistributedContext,
@@ -2076,6 +2385,7 @@ def _coordinated_checkpoint_generation_bindings(
     return tuple(bindings)
 
 
+@_checkpoint_io_deadline_guard("checkpoint generation binding")
 def checkpoint_generation_bindings(
     path: str | Path,
     context: DistributedContext,
@@ -2191,7 +2501,8 @@ def verified_checkpoint_generation_lease(
                 payload = source / "checkpoint.pt"
                 if payload.is_symlink() or not payload.is_file():
                     raise ValueError("local checkpoint payload is not a regular file")
-                actual_digest = _sha256_file(payload)
+                with _checkpoint_io_deadline("local checkpoint generation authentication"):
+                    actual_digest = _sha256_file(payload)
                 if (
                     expected_artifact_sha256 is not None
                     and actual_digest != expected_artifact_sha256
@@ -2307,6 +2618,7 @@ def _validate_legacy_dcp_layout(path: Path, *, world_size: int) -> None:
         )
 
 
+@_checkpoint_io_deadline_guard("legacy checkpoint completion upgrade")
 def upgrade_legacy_dcp_completion(
     path: str | Path,
     world_size: int,
@@ -2527,6 +2839,7 @@ def _validate_dcp_resume_metadata(
         )
 
 
+@_checkpoint_io_deadline_guard("checkpoint load-structure preflight")
 def preflight_checkpoint_load_structure(
     path: str | Path,
     model: nn.Module,
@@ -2630,6 +2943,7 @@ def preflight_checkpoint_load_structure(
     return int(loaded_state["step"])
 
 
+@_checkpoint_io_deadline_guard("complete checkpoint save")
 def save_checkpoint(
     path: str | Path,
     model: nn.Module,
@@ -2879,6 +3193,7 @@ def _initialize_model_from_checkpoint_impl(
     }
 
 
+@_checkpoint_io_deadline_guard("checkpoint stage-transfer load")
 def initialize_model_from_checkpoint(
     path: str | Path,
     model: nn.Module,
@@ -3151,6 +3466,7 @@ def _load_checkpoint_impl(
     return int(loaded_state["step"])
 
 
+@_checkpoint_io_deadline_guard("complete checkpoint resume load")
 def load_checkpoint(
     path: str | Path,
     model: nn.Module,

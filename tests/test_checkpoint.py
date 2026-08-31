@@ -6,6 +6,7 @@ from functools import partial
 import hashlib
 import json
 import multiprocessing
+import os
 import random
 from pathlib import Path
 import threading
@@ -149,6 +150,51 @@ def _distributed_save_heartbeat_worker(
             torch.distributed.destroy_process_group()
         result_directory.mkdir(parents=True, exist_ok=True)
         (result_directory / f"rank-{rank}.txt").write_text(result, encoding="utf-8")
+
+
+def _checkpoint_io_hard_deadline_worker(started_path_text: str, mode: str) -> None:
+    """Block a complete save/load path inside a disposable process."""
+
+    # Production rejects dangerously short deadlines. This isolated test lowers
+    # the internal bound so it can prove the hard-stop behavior without waiting
+    # 30 seconds or weakening the user-facing configuration range.
+    checkpoint_module._CHECKPOINT_IO_TIMEOUT_MIN_SECONDS = 0.1
+    os.environ[checkpoint_module._CHECKPOINT_IO_TIMEOUT_ENV] = "0.75"
+    started_path = Path(started_path_text)
+    checkpoint = started_path.parent / f"checkpoint-{mode}"
+    model, optimizer, scheduler, local_context = _components()
+    distributed = mode.startswith("distributed-")
+    context = DistributedContext(
+        0,
+        0,
+        1,
+        torch.device("cpu"),
+        distributed,
+        "gloo" if distributed else None,
+    )
+
+    def block_forever(*_args: object, **_kwargs: object) -> None:
+        started_path.write_text("started", encoding="utf-8")
+        threading.Event().wait()
+
+    if mode == "local-save":
+        checkpoint_module._atomic_torch_save = block_forever
+        save_checkpoint(checkpoint, model, optimizer, scheduler, 1, local_context)
+    elif mode == "local-load":
+        checkpoint.mkdir()
+        (checkpoint / "checkpoint.pt").write_bytes(b"placeholder")
+        checkpoint_module.torch.load = block_forever
+        load_checkpoint(checkpoint, model, optimizer, scheduler, local_context)
+    elif mode == "distributed-save":
+        import torch.distributed.checkpoint as dcp
+
+        dcp.save = block_forever
+        save_checkpoint(checkpoint, model, optimizer, scheduler, 1, context)
+    elif mode == "distributed-load":
+        checkpoint_module._load_checkpoint_impl = block_forever
+        load_checkpoint(checkpoint, model, optimizer, scheduler, context)
+    else:
+        raise AssertionError(f"unknown checkpoint deadline test mode: {mode}")
 
 
 def test_local_checkpoint_round_trip(tmp_path: Path) -> None:
@@ -1344,6 +1390,167 @@ def test_checkpoint_io_collective_failure_waits_for_worker_ownership_to_end(
 
     assert action_completed.is_set()
     assert time.monotonic() - started >= 0.05
+
+
+@pytest.mark.parametrize(
+    ("raw_value", "message"),
+    [
+        ("not-a-number", "must be a number"),
+        ("nan", "must be finite"),
+        ("29.9", "must be between 30 and 1800"),
+        ("1800.1", "must be between 30 and 1800"),
+    ],
+)
+def test_checkpoint_io_timeout_rejects_unsafe_environment_values(
+    monkeypatch: pytest.MonkeyPatch,
+    raw_value: str,
+    message: str,
+) -> None:
+    monkeypatch.setenv(checkpoint_module._CHECKPOINT_IO_TIMEOUT_ENV, raw_value)
+
+    with pytest.raises(ValueError, match=message):
+        checkpoint_module._checkpoint_io_timeout_seconds()
+
+
+def test_checkpoint_io_timeout_uses_reviewed_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(checkpoint_module._CHECKPOINT_IO_TIMEOUT_ENV, raising=False)
+
+    assert checkpoint_module._checkpoint_io_timeout_seconds() == 600.0
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ["local-save", "local-load", "distributed-save", "distributed-load"],
+)
+def test_checkpoint_io_hard_deadline_terminates_the_owning_process(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    started_path = tmp_path / f"started-{mode}.txt"
+    process_context = multiprocessing.get_context("spawn")
+    process = process_context.Process(
+        target=_checkpoint_io_hard_deadline_worker,
+        args=(str(started_path), mode),
+    )
+    started_at = time.monotonic()
+    process.start()
+    process.join(15.0)
+    if process.is_alive():
+        process.terminate()
+        process.join(5.0)
+        pytest.fail("checkpoint I/O watchdog did not terminate the blocked process")
+
+    assert started_path.read_text(encoding="utf-8") == "started"
+    assert process.exitcode not in {None, 0}
+    assert time.monotonic() - started_at < 15.0
+
+
+def test_checkpoint_io_normal_completion_cancels_the_watchdog() -> None:
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+    completed: list[str] = []
+
+    checkpoint_module._run_checkpoint_io_action(
+        lambda: completed.append("done"),
+        context,
+        operation="short test action",
+        rank_zero_only=False,
+    )
+
+    assert completed == ["done"]
+
+
+def test_checkpoint_io_nested_transactions_share_one_watchdog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    watchdog = object()
+    starts: list[tuple[str, float]] = []
+    cancellations: list[object] = []
+
+    def start_watchdog(*, operation: str, timeout_seconds: float) -> object:
+        starts.append((operation, timeout_seconds))
+        return watchdog
+
+    monkeypatch.setattr(checkpoint_module, "_start_checkpoint_io_watchdog", start_watchdog)
+    monkeypatch.setattr(
+        checkpoint_module,
+        "_cancel_checkpoint_io_watchdog",
+        cancellations.append,
+    )
+
+    with checkpoint_module._checkpoint_io_deadline("outer transaction"):
+        with checkpoint_module._checkpoint_io_deadline("inner operation"):
+            pass
+
+    assert starts == [("outer transaction", 600.0)]
+    assert cancellations == [watchdog]
+
+
+def test_verified_generation_lease_releases_deadlines_before_caller_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model, optimizer, scheduler, context = _components()
+    checkpoint = tmp_path / "checkpoint"
+    save_checkpoint(checkpoint, model, optimizer, scheduler, 1, context)
+    started: list[object] = []
+    cancelled: list[object] = []
+
+    def start_watchdog(*, operation: str, timeout_seconds: float) -> object:
+        watchdog = (operation, timeout_seconds, len(started))
+        started.append(watchdog)
+        return watchdog
+
+    monkeypatch.setattr(checkpoint_module, "_start_checkpoint_io_watchdog", start_watchdog)
+    monkeypatch.setattr(checkpoint_module, "_cancel_checkpoint_io_watchdog", cancelled.append)
+
+    with checkpoint_module.verified_checkpoint_generation_lease(
+        checkpoint,
+        context,
+    ) as generation:
+        assert generation.step == 1
+        assert started
+        assert cancelled == started
+        assert getattr(checkpoint_module._CHECKPOINT_IO_DEADLINE_STATE, "depth", 0) == 0
+
+    assert cancelled == started
+
+
+def test_distributed_io_worker_inherits_the_owning_deadline_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = DistributedContext(0, 0, 2, torch.device("cpu"), True, "gloo")
+    watchdog = object()
+    starts: list[object] = []
+    cancellations: list[object] = []
+
+    def start_watchdog(*, operation: str, timeout_seconds: float) -> object:
+        starts.append((operation, timeout_seconds))
+        return watchdog
+
+    monkeypatch.setattr(checkpoint_module, "_start_checkpoint_io_watchdog", start_watchdog)
+    monkeypatch.setattr(
+        checkpoint_module,
+        "_cancel_checkpoint_io_watchdog",
+        cancellations.append,
+    )
+    monkeypatch.setattr(
+        checkpoint_module.torch.distributed,
+        "all_reduce",
+        lambda *_args, **_kwargs: None,
+    )
+
+    checkpoint_module._run_checkpoint_io_action(
+        lambda: checkpoint_module.checkpoint_path_exists(tmp_path / "missing"),
+        context,
+        operation="worker deadline propagation",
+        rank_zero_only=False,
+    )
+
+    assert starts == [("worker deadline propagation", 600.0)]
+    assert cancellations == [watchdog]
 
 
 def _write_fake_complete_dcp(path: Path, *, step: int, world_size: int = 1) -> object:
