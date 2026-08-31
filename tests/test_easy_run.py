@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import subprocess
 from types import SimpleNamespace
+from typing import Any
 
 from bundle_contract_fixtures import rewrite_manifest, write_test_bundle
 import easy_run
@@ -350,6 +351,11 @@ def test_prepared_bundle_main_never_requires_or_mutates_raw_data(
     )
     commands: list[list[str]] = []
     monkeypatch.setattr(easy_run, "_run", lambda command, env: commands.append(command))
+    monkeypatch.setattr(
+        easy_run,
+        "_run_torchrun",
+        lambda command, env: commands.append(command),
+    )
 
     easy_run.main()
 
@@ -653,6 +659,181 @@ def _cuda_canary_report(device_index: int, **overrides: object) -> dict[str, obj
     }
     report.update(overrides)
     return report
+
+
+def test_nccl_watchdog_defaults_preserve_operator_overrides() -> None:
+    environment = {"TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC": "75"}
+
+    easy_run._apply_nccl_watchdog_defaults(environment)
+
+    assert environment["TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC"] == "75"
+    assert environment["TORCH_NCCL_ASYNC_ERROR_HANDLING"] == "1"
+    assert environment["TORCH_NCCL_ENABLE_MONITORING"] == "1"
+    assert environment["TORCH_NCCL_DUMP_ON_TIMEOUT"] == "1"
+    assert environment["TORCH_NCCL_TRACE_BUFFER_SIZE"] == "2000"
+
+
+def test_training_torchrun_owns_a_process_group_and_forwards_safe_environment(
+    monkeypatch,
+) -> None:
+    observed: dict[str, Any] = {}
+    wait_timeouts: list[object] = []
+
+    class SuccessfulProcess:
+        pid = 123
+
+        def wait(self, timeout=None):
+            wait_timeouts.append(timeout)
+            return 0
+
+        def poll(self):
+            return 0
+
+    def launch(command: list[str], **kwargs):
+        observed["command"] = command
+        observed["options"] = kwargs
+        return SuccessfulProcess()
+
+    monkeypatch.setattr(easy_run.subprocess, "Popen", launch)
+    command = ["python", "-m", "torch.distributed.run", "train"]
+    easy_run._run_torchrun(command, {"EXPLICIT": "yes"})
+
+    options = observed["options"]
+    assert observed["command"] == command
+    assert options["start_new_session"] is (easy_run.os.name != "nt")
+    assert options["creationflags"] == (
+        int(getattr(easy_run.subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+        if easy_run.os.name == "nt"
+        else 0
+    )
+    assert options["env"]["EXPLICIT"] == "yes"
+    assert options["env"]["TORCH_NCCL_ENABLE_MONITORING"] == "1"
+    assert wait_timeouts == [None]
+
+
+def test_training_torchrun_interrupt_kills_and_reaps_every_worker(monkeypatch) -> None:
+    killed: list[object] = []
+
+    class InterruptedProcess:
+        pid = 123
+        waits = 0
+
+        def wait(self, timeout=None):
+            self.waits += 1
+            if self.waits == 1:
+                raise KeyboardInterrupt
+            assert timeout == easy_run.PROCESS_REAP_TIMEOUT_SECONDS
+            return -9
+
+        def poll(self):
+            return None
+
+    process = InterruptedProcess()
+    monkeypatch.setattr(easy_run.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(easy_run, "_kill_process_group", lambda candidate: killed.append(candidate))
+
+    with pytest.raises(KeyboardInterrupt):
+        easy_run._run_torchrun(["torchrun", "train"], {})
+
+    assert killed == [process]
+    assert process.waits == 2
+
+
+def test_training_torchrun_sigterm_uses_the_same_cleanup_path(monkeypatch) -> None:
+    killed: list[object] = []
+    original_handler = easy_run.signal.getsignal(easy_run.signal.SIGTERM)
+
+    class TerminatedProcess:
+        pid = 123
+        waits = 0
+
+        def wait(self, timeout=None):
+            self.waits += 1
+            if self.waits == 1:
+                handler = easy_run.signal.getsignal(easy_run.signal.SIGTERM)
+                assert callable(handler)
+                handler(easy_run.signal.SIGTERM, None)
+                raise AssertionError("SIGTERM handler must terminate the launcher")
+            assert timeout == easy_run.PROCESS_REAP_TIMEOUT_SECONDS
+            return -15
+
+        def poll(self):
+            return None
+
+    process = TerminatedProcess()
+    monkeypatch.setattr(easy_run.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(easy_run, "_kill_process_group", lambda candidate: killed.append(candidate))
+
+    with pytest.raises(SystemExit) as termination:
+        easy_run._run_torchrun(["torchrun", "train"], {})
+
+    assert termination.value.code == 128 + int(easy_run.signal.SIGTERM)
+    assert killed == [process]
+    assert process.waits == 2
+    assert easy_run.signal.getsignal(easy_run.signal.SIGTERM) == original_handler
+
+
+def test_process_reaping_never_uses_an_unbounded_pipe_wait() -> None:
+    waits: list[float] = []
+    closed: list[str] = []
+    kills = 0
+
+    class Stream:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def close(self) -> None:
+            closed.append(self.name)
+
+    class UnreapableProcess:
+        stdin = Stream("stdin")
+        stdout = Stream("stdout")
+        stderr = Stream("stderr")
+
+        def wait(self, timeout=None):
+            waits.append(timeout)
+            raise subprocess.TimeoutExpired("torchrun", timeout)
+
+        def poll(self):
+            return None
+
+        def kill(self):
+            nonlocal kills
+            kills += 1
+
+    easy_run._reap_killed_process(UnreapableProcess())
+
+    assert closed == ["stdin", "stdout", "stderr"]
+    assert waits == [easy_run.PROCESS_REAP_TIMEOUT_SECONDS, 1.0]
+    assert kills == 1
+
+
+def test_missing_posix_group_still_kills_a_live_launcher(monkeypatch) -> None:
+    kills = 0
+
+    class EscapedProcess:
+        pid = 123
+
+        def poll(self):
+            return None
+
+        def kill(self):
+            nonlocal kills
+            kills += 1
+
+    def missing_group(_pid: int, _signal: int) -> None:
+        raise ProcessLookupError
+
+    monkeypatch.setattr(
+        easy_run,
+        "os",
+        SimpleNamespace(name="posix", killpg=missing_group),
+    )
+    monkeypatch.setattr(easy_run, "signal", SimpleNamespace(SIGKILL=9))
+
+    easy_run._kill_process_group(EscapedProcess())
+
+    assert kills == 1
 
 
 def test_cuda_canary_runner_checks_every_device_with_a_hard_timeout(

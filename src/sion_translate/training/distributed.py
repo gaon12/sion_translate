@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import math
 import os
+from collections.abc import Mapping, MutableMapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
@@ -14,6 +16,46 @@ import torch.distributed as dist
 from torch import nn
 
 from sion_translate.model.layers import DecoderLayer, EncoderLayer
+
+
+DISTRIBUTED_TIMEOUT_ENV = "SION_DISTRIBUTED_TIMEOUT_SECONDS"
+DEFAULT_DISTRIBUTED_TIMEOUT_SECONDS = 10 * 60.0
+MIN_DISTRIBUTED_TIMEOUT_SECONDS = 30.0
+MAX_DISTRIBUTED_TIMEOUT_SECONDS = 30 * 60.0
+NCCL_WATCHDOG_DEFAULTS = {
+    "TORCH_NCCL_ASYNC_ERROR_HANDLING": "1",
+    "TORCH_NCCL_ENABLE_MONITORING": "1",
+    "TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC": "300",
+    "TORCH_NCCL_DUMP_ON_TIMEOUT": "1",
+    "TORCH_NCCL_TRACE_BUFFER_SIZE": "2000",
+}
+
+
+def configure_nccl_watchdog_environment(environment: MutableMapping[str, str]) -> None:
+    """Install safe NCCL defaults while preserving explicit cluster policy."""
+
+    for name, value in NCCL_WATCHDOG_DEFAULTS.items():
+        environment.setdefault(name, value)
+
+
+def distributed_timeout_seconds(environment: Mapping[str, str] | None = None) -> float:
+    """Resolve a bounded process-group timeout from the launcher environment."""
+
+    source = os.environ if environment is None else environment
+    raw_value = source.get(DISTRIBUTED_TIMEOUT_ENV, str(DEFAULT_DISTRIBUTED_TIMEOUT_SECONDS))
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{DISTRIBUTED_TIMEOUT_ENV} must be a finite number of seconds") from error
+    if not math.isfinite(value):
+        raise ValueError(f"{DISTRIBUTED_TIMEOUT_ENV} must be a finite number of seconds")
+    if not MIN_DISTRIBUTED_TIMEOUT_SECONDS <= value <= MAX_DISTRIBUTED_TIMEOUT_SECONDS:
+        raise ValueError(
+            f"{DISTRIBUTED_TIMEOUT_ENV} must be between "
+            f"{MIN_DISTRIBUTED_TIMEOUT_SECONDS:g} and "
+            f"{MAX_DISTRIBUTED_TIMEOUT_SECONDS:g} seconds"
+        )
+    return value
 
 
 @dataclass(frozen=True)
@@ -48,7 +90,12 @@ def initialize_distributed() -> DistributedContext:
                 "CUDA/NCCL-enabled PyTorch build before launching torchrun."
             )
         backend = "nccl" if device.type == "cuda" else "gloo"
-        dist.init_process_group(backend=backend, timeout=timedelta(minutes=30))
+        if backend == "nccl":
+            configure_nccl_watchdog_environment(os.environ)
+        dist.init_process_group(
+            backend=backend,
+            timeout=timedelta(seconds=distributed_timeout_seconds()),
+        )
     else:
         backend = None
     if device.type == "cuda":

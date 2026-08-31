@@ -48,6 +48,17 @@ LOCAL_CHECKOUT_FLAG = "--allow-local-checkout"
 TMUX_SUPPORTED = os.name != "nt"
 CUDA_CANARY_TIMEOUT_SECONDS = 60
 NCCL_CANARY_TIMEOUT_SECONDS = 60
+PROCESS_REAP_TIMEOUT_SECONDS = 5.0
+NCCL_WATCHDOG_DEFAULTS = {
+    # Abort the communicator and tear down the worker when an asynchronous
+    # NCCL error is detected. Keeping these as defaults preserves a deliberate
+    # cluster-specific override supplied by an operator.
+    "TORCH_NCCL_ASYNC_ERROR_HANDLING": "1",
+    "TORCH_NCCL_ENABLE_MONITORING": "1",
+    "TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC": "300",
+    "TORCH_NCCL_DUMP_ON_TIMEOUT": "1",
+    "TORCH_NCCL_TRACE_BUFFER_SIZE": "2000",
+}
 
 
 @dataclass(frozen=True)
@@ -265,6 +276,13 @@ def _generated_config(raw_dir: Path, artifacts_dir: Path) -> Path:
 def _run(command: list[str], env: dict[str, str]) -> None:
     print("[easy_run] Running:", " ".join(command), flush=True)
     subprocess.run(command, cwd=ROOT, env=env, check=True)
+
+
+def _apply_nccl_watchdog_defaults(env: dict[str, str]) -> None:
+    """Add fail-fast NCCL defaults without replacing operator choices."""
+
+    for name, value in NCCL_WATCHDOG_DEFAULTS.items():
+        env.setdefault(name, value)
 
 
 def _build_expressive_cultural_corpus(data_dir: Path, env: dict[str, str]) -> Path:
@@ -653,7 +671,7 @@ def _validate_distributed_nccl_report(
     return report
 
 
-def _kill_process_group(process: subprocess.Popen[str]) -> None:
+def _kill_process_group(process: subprocess.Popen[bytes] | subprocess.Popen[str]) -> None:
     """Kill torchrun and every worker after a timeout or launcher interruption."""
 
     if os.name != "nt":
@@ -661,22 +679,116 @@ def _kill_process_group(process: subprocess.Popen[str]) -> None:
             os.killpg(process.pid, signal.SIGKILL)
             return
         except ProcessLookupError:
-            return
+            # The process may have escaped its original session or the group
+            # may already be gone while the direct launcher PID is still live.
+            # Fall through and check the launcher itself before returning.
+            pass
         except OSError:
+            pass
+    if os.name == "nt" and process.poll() is None:
+        # CREATE_NEW_PROCESS_GROUP makes the launcher a distinct console group,
+        # while taskkill /T provides the Windows equivalent of POSIX killpg for
+        # workers which no longer share the launcher's console state.
+        try:
+            subprocess.run(
+                ["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=PROCESS_REAP_TIMEOUT_SECONDS,
+            )
+        except (OSError, subprocess.SubprocessError):
             pass
     if process.poll() is None:
         process.kill()
 
 
-def _reap_killed_process(process: subprocess.Popen[str]) -> None:
-    """Bound cleanup itself so a failed probe cannot pin the paid container."""
+def _reap_killed_process(process: subprocess.Popen[bytes] | subprocess.Popen[str]) -> None:
+    """Reap a killed launcher without waiting on pipes retained by descendants."""
 
+    # communicate() can remain blocked after the launcher exits when an escaped
+    # descendant inherited stdout or stderr. Close our readers and wait only for
+    # the exact launcher PID instead. Both waits are finite by construction.
+    for stream_name in ("stdin", "stdout", "stderr"):
+        stream = getattr(process, stream_name, None)
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
+    wait = getattr(process, "wait", None)
+    if wait is None:
+        # Lightweight test doubles and unusual Popen-compatible wrappers may
+        # expose only communicate(). Keep even that compatibility path finite.
+        try:
+            process.communicate(timeout=PROCESS_REAP_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            return
+        return
     try:
-        process.communicate(timeout=5)
+        wait(timeout=PROCESS_REAP_TIMEOUT_SECONDS)
+        return
     except subprocess.TimeoutExpired:
         if process.poll() is None:
             process.kill()
-        process.communicate()
+    try:
+        wait(timeout=1.0)
+    except subprocess.TimeoutExpired:
+        # There is no safe unbounded fallback here. The caller has already sent
+        # a hard kill to the process group, and returning lets the paid parent
+        # container continue its own shutdown instead of waiting forever.
+        return
+
+
+def _run_torchrun(command: list[str], env: dict[str, str]) -> None:
+    """Run training in an owned process group and always reap its launcher."""
+
+    print("[easy_run] Running:", " ".join(command), flush=True)
+    launch_env = env.copy()
+    _apply_nccl_watchdog_defaults(launch_env)
+    previous_sigterm: object | None = None
+    sigterm_handler_installed = False
+
+    def raise_termination(signum: int, _frame: object) -> None:
+        raise SystemExit(128 + signum)
+
+    try:
+        # KeyboardInterrupt already turns Ctrl-C into a BaseException. SIGTERM
+        # needs an explicit Python handler so the cleanup path runs before the
+        # launcher itself exits.
+        previous_sigterm = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, raise_termination)
+        sigterm_handler_installed = True
+    except (OSError, ValueError):
+        # signal.signal is restricted to the main thread. easy_run normally owns
+        # that thread; retain process-group cleanup for every other exception.
+        previous_sigterm = None
+
+    try:
+        # Install the SIGTERM handler before spawning so there is no interval in
+        # which a scheduler can stop easy_run but leave a new torchrun child.
+        process = subprocess.Popen(
+            command,
+            cwd=ROOT,
+            env=launch_env,
+            start_new_session=os.name != "nt",
+            creationflags=(
+                int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)) if os.name == "nt" else 0
+            ),
+        )
+        try:
+            return_code = process.wait()
+        except BaseException:
+            _kill_process_group(process)
+            _reap_killed_process(process)
+            raise
+        if return_code != 0:
+            _kill_process_group(process)
+            _reap_killed_process(process)
+            raise subprocess.CalledProcessError(return_code, command)
+    finally:
+        if sigterm_handler_installed:
+            signal.signal(signal.SIGTERM, previous_sigterm)  # type: ignore[arg-type]
 
 
 def _run_multi_gpu_nccl_canary(
@@ -1016,6 +1128,7 @@ def main() -> None:
     env = os.environ.copy()
     src_path = str(ROOT / "src")
     env["PYTHONPATH"] = src_path + os.pathsep + env.get("PYTHONPATH", "")
+    _apply_nccl_watchdog_defaults(env)
     _run_cuda_kernel_canaries(gpu_count, env)
 
     source_data = ROOT / "data"
@@ -1109,7 +1222,7 @@ def main() -> None:
             str(generated_config),
         ]
         print(f"[easy_run] Starting training on {gpu_count} CUDA GPUs ({', '.join(gpu_names)}).")
-        _run(command, env)
+        _run_torchrun(command, env)
     finally:
         if remove_generated_config:
             generated_config.unlink(missing_ok=True)
