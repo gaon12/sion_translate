@@ -525,7 +525,8 @@ def _selection_metric_label(key: str) -> str:
     return f"EMA {label}" if ema else label
 
 
-_DIRECTION_COMPLETE_VALIDATION_SCHEMA = "sion-direction-complete-validation-v2"
+_DIRECTION_COMPLETE_VALIDATION_SCHEMA = "sion-direction-complete-validation-v3"
+_REFINEMENT_EVIDENCE_SPLIT = "refinement_evidence"
 
 
 def _candidate_refinement_validation_cohort_fingerprint(
@@ -565,16 +566,25 @@ def _candidate_refinement_validation_cohort_fingerprint(
         raise ValueError(
             "candidate-refinement validation cohort does not match the configured translation graph"
         )
+    if typed_identity.get("cohort_mode") != "fixed_replicated":
+        raise ValueError(
+            "candidate-refinement release validation requires a fixed replicated cohort"
+        )
+    if typed_identity.get("dataset_split") != _REFINEMENT_EVIDENCE_SPLIT:
+        raise ValueError(
+            "candidate-refinement release validation requires the authenticated "
+            "refinement_evidence split"
+        )
     if typed_identity.get("unique_examples_required") is not True:
         raise ValueError(
-            "candidate-refinement release validation must not repeat held-out examples"
+            "candidate-refinement release validation requires distinct-example authentication"
         )
     observed_minimum = typed_identity.get("minimum_examples_per_direction")
     if (
         type(observed_minimum) is not int
         or type(minimum_examples_per_direction) is not int
         or minimum_examples_per_direction <= 0
-        or observed_minimum < minimum_examples_per_direction
+        or observed_minimum != minimum_examples_per_direction
     ):
         raise ValueError(
             "candidate-refinement validation cohort does not meet the configured minimum "
@@ -598,16 +608,25 @@ def _candidate_refinement_validation_cohort_fingerprint(
         raw_direction = count.get("direction")
         available = count.get("available")
         selected = count.get("selected")
+        distinct_selected = count.get("distinct_selected")
         if (
             not isinstance(raw_direction, Sequence)
             or isinstance(raw_direction, (str, bytes))
             or tuple(raw_direction) != expected_direction
             or type(available) is not int
             or type(selected) is not int
-            or selected < minimum_examples_per_direction
-            or available < selected
+            or type(distinct_selected) is not int
+            or selected != minimum_examples_per_direction
+            or distinct_selected != minimum_examples_per_direction
+            or available < distinct_selected
         ):
             raise ValueError("candidate-refinement validation cohort example counts are invalid")
+    semantic_examples = typed_identity.get("semantic_examples")
+    if (
+        type(semantic_examples) is not int
+        or semantic_examples != len(canonical_directions) * minimum_examples_per_direction
+    ):
+        raise ValueError("candidate-refinement validation cohort size is invalid")
     fingerprint = typed_identity.get("sha256")
     if not _is_sha256_digest(fingerprint):
         raise ValueError("candidate-refinement validation cohort requires a SHA-256 fingerprint")
@@ -1080,6 +1099,7 @@ def train(
     objective: Callable[[nn.Module, dict[str, torch.Tensor]], ObjectiveOutput] | None = None,
     stage_name: str = "pretrain",
     language_tags: Mapping[str, int] | None = None,
+    refinement_evidence_loader: Iterable[dict[str, torch.Tensor]] | None = None,
     export_release_name: str = TRANSLATION_RELEASE_NAME,
     export_translation_capable: bool = True,
     export_languages: Sequence[str] | None = None,
@@ -1104,6 +1124,11 @@ def train(
         ).encode("utf-8")
     ).hexdigest()
     if requires_candidate_refinement_release_guard:
+        if refinement_evidence_loader is None:
+            raise ValueError(
+                "candidate-refinement translation training requires a separate "
+                "refinement_evidence loader"
+            )
         if not language_tags:
             raise ValueError(
                 "candidate-refinement translation training requires language_tags so every "
@@ -1125,7 +1150,7 @@ def train(
             )
         candidate_refinement_validation_cohort_fingerprint = (
             _candidate_refinement_validation_cohort_fingerprint(
-                validation_loader,
+                refinement_evidence_loader,
                 configured_translation_directions,
                 config.training.candidate_refinement_min_validation_examples_per_direction,
             )
@@ -1197,6 +1222,8 @@ def train(
     )
     _fail_if_known_empty(train_loader, "training")
     _fail_if_known_empty(validation_loader, "validation")
+    if refinement_evidence_loader is not None:
+        _fail_if_known_empty(refinement_evidence_loader, "refinement evidence")
 
     training = config.training
     validation_batch_sampler = getattr(validation_loader, "batch_sampler", None)
@@ -1204,6 +1231,18 @@ def train(
         training.eval_batches,
         int(getattr(validation_batch_sampler, "evaluation_batches", training.eval_batches)),
     )
+    refinement_evidence_batch_sampler = (
+        getattr(refinement_evidence_loader, "batch_sampler", None)
+        if refinement_evidence_loader is not None
+        else None
+    )
+    refinement_evidence_evaluation_batches = int(
+        getattr(refinement_evidence_batch_sampler, "evaluation_batches", 0)
+    )
+    if requires_candidate_refinement_release_guard and refinement_evidence_evaluation_batches <= 0:
+        raise ValueError(
+            "candidate-refinement refinement_evidence loader has no authenticated batches"
+        )
     budget = resolve_training_budget(train_loader, training)
     if training.warmup_steps > budget.max_optimizer_steps:
         raise ValueError(
@@ -1747,6 +1786,22 @@ def train(
             objective=objective,
             language_tags=language_tags,
         )
+        refinement_evidence_metrics: dict[str, float] = {}
+        if requires_candidate_refinement_release_guard:
+            assert refinement_evidence_loader is not None
+            refinement_evidence_metrics = evaluate(
+                model,
+                refinement_evidence_loader,
+                context,
+                refinement_evidence_evaluation_batches,
+                precision=training.precision,
+                show_progress=False,
+                # Release evidence is token-NLL improvement only. MRT generation
+                # rewards and absolute quality metrics remain tied exclusively to
+                # the genuine validation split.
+                objective=None,
+                language_tags=language_tags,
+            )
         if ema is not None:
             # Validate EMA weights separately. Best selection and early stopping
             # use their usually lower and more stable metric.
@@ -1761,9 +1816,28 @@ def train(
                     objective=objective,
                     language_tags=language_tags,
                 )
+                if requires_candidate_refinement_release_guard:
+                    assert refinement_evidence_loader is not None
+                    ema_refinement_evidence_metrics = evaluate(
+                        model,
+                        refinement_evidence_loader,
+                        context,
+                        refinement_evidence_evaluation_batches,
+                        precision=training.precision,
+                        show_progress=False,
+                        objective=None,
+                        language_tags=language_tags,
+                    )
+                else:
+                    ema_refinement_evidence_metrics = {}
             for name, value in ema_metrics.items():
                 if name.startswith("validation_"):
                     metrics[f"validation_ema_{name.removeprefix('validation_')}"] = value
+            for name, value in ema_refinement_evidence_metrics.items():
+                if name.startswith("validation_"):
+                    refinement_evidence_metrics[
+                        f"validation_ema_{name.removeprefix('validation_')}"
+                    ] = value
         if last_train_loss is not None and objective is None:
             # Validation loss minus training loss; larger values indicate overfitting.
             metrics["generalization_gap"] = float(metrics["validation_loss"]) - last_train_loss
@@ -1784,7 +1858,7 @@ def train(
                 )
             refinement_prefix = "validation_ema_" if ema is not None else "validation_"
             refinement_gain_key = f"{refinement_prefix}candidate_refinement_nll_gain"
-            if refinement_gain_key in metrics:
+            if refinement_gain_key in refinement_evidence_metrics:
                 refinement_label = (
                     "EMA provisional-to-final NLL gain"
                     if refinement_gain_key.startswith("validation_ema_")
@@ -1792,19 +1866,20 @@ def train(
                 )
                 summary += ", {}={:.4f}".format(
                     refinement_label,
-                    metrics[refinement_gain_key],
+                    refinement_evidence_metrics[refinement_gain_key],
                 )
             worst_refinement_gain_key = (
                 f"{refinement_prefix}worst_direction_candidate_refinement_nll_gain"
             )
-            if worst_refinement_gain_key in metrics:
+            if worst_refinement_gain_key in refinement_evidence_metrics:
                 worst_refinement_label = (
                     "EMA worst-direction provisional-to-final NLL gain"
                     if worst_refinement_gain_key.startswith("validation_ema_")
                     else "worst-direction provisional-to-final NLL gain"
                 )
                 summary += ", {}={:.4f}".format(
-                    worst_refinement_label, metrics[worst_refinement_gain_key]
+                    worst_refinement_label,
+                    refinement_evidence_metrics[worst_refinement_gain_key],
                 )
             if "validation_ema_loss" in metrics:
                 summary += ", EMA loss={:.4f}".format(metrics["validation_ema_loss"])
@@ -1817,6 +1892,13 @@ def train(
             if writer is not None:
                 for name, value in metrics.items():
                     writer.add_scalar(f"validation/{name.removeprefix('validation_')}", value, step)
+                for name, value in refinement_evidence_metrics.items():
+                    if "candidate_refinement" in name:
+                        writer.add_scalar(
+                            "validation/refinement_evidence/" + name.removeprefix("validation_"),
+                            value,
+                            step,
+                        )
 
         # Rank 0 decides whether the metric improved, then broadcasts the result
         # so every rank saves and stops together. Post-training maximizes actual
@@ -1860,7 +1942,7 @@ def train(
                 refinement_gain_key,
                 refinement_worst_gain,
             ) = _check_candidate_refinement_release(
-                metrics,
+                refinement_evidence_metrics,
                 prefer_ema=ema is not None,
                 expected_directions=configured_translation_directions,
                 minimum_worst_direction_gain=(

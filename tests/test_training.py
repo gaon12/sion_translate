@@ -56,15 +56,19 @@ class _DirectionCompleteTestLoader(list[dict[str, torch.Tensor]]):
             {
                 "evaluation_batches": config.training.eval_batches,
                 "cohort_identity": {
-                    "schema": "sion-direction-complete-validation-v2",
+                    "schema": "sion-direction-complete-validation-v3",
+                    "cohort_mode": "fixed_replicated",
                     "directions": [list(direction) for direction in directions],
                     "minimum_examples_per_direction": minimum_examples,
                     "unique_examples_required": True,
+                    "dataset_split": "refinement_evidence",
+                    "semantic_examples": len(directions) * minimum_examples,
                     "direction_example_counts": [
                         {
                             "direction": list(direction),
                             "available": minimum_examples,
                             "selected": minimum_examples,
+                            "distinct_selected": minimum_examples,
                         }
                         for direction in directions
                     ],
@@ -81,19 +85,12 @@ def train(*args, **kwargs):
     positional = list(args)
     config = positional[3] if len(positional) > 3 else kwargs["config"]
     if config.model.experimental.candidate_refinement_enabled:
-        if len(positional) > 2:
-            validation_loader = positional[2]
-            sampler = getattr(validation_loader, "batch_sampler", None)
-            if not hasattr(sampler, "cohort_identity"):
-                positional[2] = _DirectionCompleteTestLoader(validation_loader, config)
-        else:
-            validation_loader = kwargs["validation_loader"]
-            sampler = getattr(validation_loader, "batch_sampler", None)
-            if not hasattr(sampler, "cohort_identity"):
-                kwargs["validation_loader"] = _DirectionCompleteTestLoader(
-                    validation_loader,
-                    config,
-                )
+        validation_loader = positional[2] if len(positional) > 2 else kwargs["validation_loader"]
+        evidence_loader = kwargs.get("refinement_evidence_loader", validation_loader)
+        sampler = getattr(evidence_loader, "batch_sampler", None)
+        if not hasattr(sampler, "cohort_identity"):
+            evidence_loader = _DirectionCompleteTestLoader(evidence_loader, config)
+        kwargs["refinement_evidence_loader"] = evidence_loader
     return _train(*positional, **kwargs)
 
 
@@ -811,7 +808,7 @@ def test_candidate_refinement_release_cohort_rejects_repetition_and_small_edges(
 
     repeated_loader = _DirectionCompleteTestLoader([], config)
     repeated_loader.batch_sampler.cohort_identity["unique_examples_required"] = False
-    with pytest.raises(ValueError, match="must not repeat held-out examples"):
+    with pytest.raises(ValueError, match="distinct-example authentication"):
         trainer_module._candidate_refinement_validation_cohort_fingerprint(
             repeated_loader,
             directions,
@@ -1406,7 +1403,9 @@ def test_guard_approved_export_failure_keeps_the_release_block(
 
     def improving_validation_metrics(*args: object, **kwargs: object) -> dict[str, float]:
         nonlocal validation_calls
-        validation_event = validation_calls // 2
+        # Each event evaluates ordinary and refinement-evidence loaders for
+        # both raw and EMA weights.
+        validation_event = validation_calls // 4
         validation_calls += 1
         nll = 0.6 if validation_event == 0 else 0.5
         return {
@@ -1470,9 +1469,9 @@ def test_zero_gain_identity_baseline_is_resume_only_and_attestation_is_resumable
 
     def staged_validation_metrics(*args: object, **kwargs: object) -> dict[str, float]:
         nonlocal evaluation_calls
-        # Raw and EMA evaluation form one validation event. Step 0 is an exact
-        # identity baseline; the first post-update event improves every edge.
-        validation_event = evaluation_calls // 2
+        # Ordinary/evidence evaluation for raw and EMA weights form one event.
+        # Step 0 is an exact identity baseline; the first update improves every edge.
+        validation_event = evaluation_calls // 4
         evaluation_calls += 1
         gains = (0.0, 0.0) if validation_event == 0 else (0.02, 0.01)
         nll = 0.6 if validation_event == 0 else 0.5
@@ -1578,7 +1577,7 @@ def test_positive_gain_sft_step_zero_is_resume_only_and_remains_the_comparison_f
 
     def staged_sft_metrics(*args: object, **kwargs: object) -> dict[str, float]:
         nonlocal validation_calls
-        nll = 0.4 if validation_calls == 0 else 0.5
+        nll = 0.4 if validation_calls // 2 == 0 else 0.5
         validation_calls += 1
         return {
             "validation_loss": nll,
@@ -1644,7 +1643,7 @@ def test_sft_metric_family_change_records_a_new_non_deployable_baseline(
 
     def changing_selection_metrics(*args: object, **kwargs: object) -> dict[str, float]:
         nonlocal validation_calls
-        validation_event = validation_calls
+        validation_event = validation_calls // 2
         validation_calls += 1
         metrics = {
             "validation_loss": 0.6 - validation_event * 0.1,
@@ -1712,7 +1711,7 @@ def test_legacy_sft_resume_without_a_comparison_floor_must_rebaseline(
 
     def initial_metrics(*args: object, **kwargs: object) -> dict[str, float]:
         nonlocal initial_calls
-        validation_event = initial_calls
+        validation_event = initial_calls // 2
         initial_calls += 1
         nll = 0.6 if validation_event == 0 else 0.5
         return {
@@ -1752,7 +1751,7 @@ def test_legacy_sft_resume_without_a_comparison_floor_must_rebaseline(
 
     def regressing_resume_metrics(*args: object, **kwargs: object) -> dict[str, float]:
         nonlocal resumed_calls
-        nll = 0.5 if resumed_calls == 0 else 0.6
+        nll = 0.5 if resumed_calls // 2 == 0 else 0.6
         resumed_calls += 1
         return {
             "validation_loss": nll,
@@ -1810,7 +1809,7 @@ def test_resume_rejects_a_best_attested_under_a_different_release_margin(
 
     def initial_metrics(*args: object, **kwargs: object) -> dict[str, float]:
         nonlocal initial_calls
-        nll = 0.6 if initial_calls == 0 else 0.5
+        nll = 0.6 if initial_calls // 2 == 0 else 0.5
         initial_calls += 1
         return {
             "validation_loss": nll,
@@ -1892,23 +1891,6 @@ def test_positive_gain_posttraining_stage_zero_remains_the_reward_fallback(
         export_steps.append(artifact_step)
         return {"formats": {"fp32": {"status": "ok"}}}
 
-    validation_calls = 0
-
-    def staged_reward_metrics(*args: object, **kwargs: object) -> dict[str, float]:
-        nonlocal validation_calls
-        reward = 0.9 if validation_calls == 0 else 0.8
-        validation_calls += 1
-        return {
-            "validation_loss": 0.5,
-            "validation_nll": 0.5,
-            "validation_perplexity": math.exp(0.5),
-            "validation_auxiliary_loss": 0.0,
-            "validation_tokens": 6.0,
-            "validation_reward": reward,
-            "validation_candidate_refinement_nll_gain": 0.02,
-            **refinement_release_metrics((("ko", "ja"), ("ja", "ko")), (0.02, 0.01)),
-        }
-
     class DifferentiableObjective:
         def __call__(self, model: nn.Module, batch: dict[str, torch.Tensor]) -> ObjectiveOutput:
             anchor = next(model.parameters()).sum() * 0.0
@@ -1924,28 +1906,60 @@ def test_positive_gain_posttraining_stage_zero_remains_the_reward_fallback(
                 metrics={},
             )
 
-    monkeypatch.setattr(trainer_module, "export_inference_models", record_successful_export)
-    monkeypatch.setattr(trainer_module, "evaluate", staged_reward_metrics)
     config = tiny_app_config(tmp_path, max_steps=1, ema_decay=0.0)
     config.model.experimental.candidate_refinement_enabled = True
     config.posttraining.selection_metric = "reward"
+    objective = DifferentiableObjective()
+    validation_loader = [tiny_batch()]
+    evidence_loader = _DirectionCompleteTestLoader([tiny_batch()], config)
+    ordinary_calls = 0
+    evaluation_roles: list[str] = []
+
+    def staged_reward_metrics(*args: object, **kwargs: object) -> dict[str, float]:
+        nonlocal ordinary_calls
+        loader = args[1]
+        if loader is validation_loader:
+            evaluation_roles.append("ordinary")
+            assert kwargs["objective"] is objective
+            reward = 0.9 if ordinary_calls == 0 else 0.8
+            ordinary_calls += 1
+            return {
+                "validation_loss": 0.5,
+                "validation_nll": 0.5,
+                "validation_perplexity": math.exp(0.5),
+                "validation_auxiliary_loss": 0.0,
+                "validation_tokens": 6.0,
+                "validation_reward": reward,
+            }
+        assert loader is evidence_loader
+        evaluation_roles.append("evidence")
+        assert kwargs["objective"] is None
+        return {
+            "validation_candidate_refinement_nll_gain": 0.02,
+            **refinement_release_metrics((("ko", "ja"), ("ja", "ko")), (0.02, 0.01)),
+        }
+
+    monkeypatch.setattr(trainer_module, "export_inference_models", record_successful_export)
+    monkeypatch.setattr(trainer_module, "evaluate", staged_reward_metrics)
     context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
 
     result = train(
         SionForConditionalGeneration(config.model),
         [tiny_batch()],
-        [tiny_batch()],
+        validation_loader,
         config,
         context,
-        objective=DifferentiableObjective(),
+        objective=objective,
         stage_name="posttrain/MRT",
         language_tags={"ko": 4, "ja": 5},
+        refinement_evidence_loader=evidence_loader,
     )
 
     assert result["best_step"] == 0
     assert result["best_validation_reward"] == pytest.approx(0.9)
     assert result["candidate_refinement_release_guard_passed"] is True
     assert export_steps == [0]
+    assert evaluation_roles == ["ordinary", "evidence", "ordinary", "evidence"]
 
 
 def test_guard_ineligible_resume_keeps_the_attested_best_and_selection_family(
@@ -1978,7 +1992,7 @@ def test_guard_ineligible_resume_keeps_the_attested_best_and_selection_family(
         nonlocal initial_validation_calls
         if resumed_regression:
             return dict(active_metrics)
-        validation_event = initial_validation_calls // 2
+        validation_event = initial_validation_calls // 4
         initial_validation_calls += 1
         nll = 0.6 if validation_event == 0 else 0.5
         return {

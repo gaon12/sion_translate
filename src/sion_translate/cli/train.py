@@ -168,6 +168,7 @@ FINAL_EXPORT_DEPENDENCIES = {
 }
 FINAL_EXPORT_STATUS_SCHEMA = "sion-final-export-status-v1"
 RANK_ZERO_ACTION_STATUS_SCHEMA = "sion-rank-zero-action-status-v1"
+REFINEMENT_EVIDENCE_SPLIT = "refinement_evidence"
 FINAL_EXPORT_STATUS_TIMEOUT_SECONDS = 24 * 60 * 60
 RANK_ZERO_ACTION_STALE_TIMEOUT_SECONDS = 15 * 60
 RANK_ZERO_ACTION_HEARTBEAT_SECONDS = 30.0
@@ -277,6 +278,26 @@ def build_collator_args(
     }
 
 
+def build_refinement_evidence_collator(
+    config: AppConfig,
+    tokenizer: SionTokenizer,
+) -> SionBatchCollator:
+    """Build a clean translation-only collator for authenticated release evidence.
+
+    Ordinary validation may intentionally sample a denoising objective, but the
+    fixed refinement cohort authenticates directed T1 -> T2 translation gain.
+    Denoising would erase the language direction from a batch and silently
+    reduce the configured K examples, so this collator never applies it.
+    """
+
+    return SionBatchCollator(
+        **build_collator_args(config, tokenizer),
+        denoise_probability=0.0,
+        source_token_dropout=0.0,
+        decoder_input_noise=0.0,
+    )
+
+
 def scan_configured_raw_data(
     config: AppConfig,
     data_dir: Path,
@@ -295,6 +316,10 @@ def scan_configured_raw_data(
         train_only_prefixes=config.data.configured_synthetic_prefixes(),
         managed_augmentation_prefix=config.data.synthetic_prefix,
         synthetic_sampling_weight=config.data.synthetic_sampling_weight,
+        refinement_evidence_fraction=config.data.refinement_evidence_fraction,
+        source_only_synthetic_evidence_files=(
+            config.data.configured_source_only_synthetic_evidence_files()
+        ),
         language_pair_count=len(language_pairs),
     )
     return scan_raw_data(
@@ -2101,6 +2126,10 @@ def _ensure_artifacts_on_main(
                             train_only_prefixes=config.data.configured_synthetic_prefixes(),
                             managed_augmentation_prefix=config.data.synthetic_prefix,
                             synthetic_sampling_weight=config.data.synthetic_sampling_weight,
+                            refinement_evidence_fraction=(config.data.refinement_evidence_fraction),
+                            source_only_synthetic_evidence_files=(
+                                config.data.configured_source_only_synthetic_evidence_files()
+                            ),
                             num_workers=cpu_plan.dataset_workers,
                             expected_fingerprint=files,
                         )
@@ -4132,6 +4161,114 @@ def _build_posttraining_config(config: AppConfig, run_root: Path) -> AppConfig:
     return post_config
 
 
+def build_translation_validation_samplers(
+    config: AppConfig,
+    validation_dataset: IndexedParallelDataset,
+    refinement_evidence_dataset: IndexedParallelDataset | None,
+    context: DistributedContext,
+    *,
+    post_config: AppConfig | None,
+) -> tuple[
+    DirectionCompleteValidationBatchSampler,
+    DirectionCompleteValidationBatchSampler | None,
+    DirectionCompleteValidationBatchSampler | None,
+    DirectionCompleteValidationBatchSampler | None,
+]:
+    """Build genuine validation and hardware-invariant release-evidence cohorts.
+
+    Absolute validation uses only directions physically present in the genuine
+    held-out split. Candidate-refinement release evidence uses a separate,
+    graph-complete artifact split and selects the same fixed semantic cohort for
+    SFT and MRT regardless of rank count or batch packing.
+    """
+
+    configured_directions = config.data.configured_translation_directions()
+    observed_directions = validation_dataset.observed_translation_directions_for_physical_mask(
+        np.ones(validation_dataset.pair_count, dtype=np.bool_)
+    )
+    if not observed_directions:
+        raise ValueError("prepared validation split contains no genuine translation directions")
+
+    validation_sampler = DirectionCompleteValidationBatchSampler(
+        validation_dataset,
+        config.training.batch_size_per_gpu,
+        directions=observed_directions,
+        max_batches=config.training.eval_batches,
+        rank=context.rank,
+        world_size=context.world_size,
+        seed=config.training.seed + 1,
+    )
+    post_validation_sampler = (
+        DirectionCompleteValidationBatchSampler(
+            validation_dataset,
+            config.posttraining.eval_batch_size_per_gpu,
+            directions=observed_directions,
+            max_batches=post_config.training.eval_batches,
+            rank=context.rank,
+            world_size=context.world_size,
+            seed=config.training.seed + 3,
+        )
+        if post_config is not None
+        else None
+    )
+
+    if not config.model.experimental.candidate_refinement_enabled:
+        if refinement_evidence_dataset is not None:
+            raise ValueError(
+                "refinement_evidence dataset must not be opened when candidate refinement "
+                "is disabled"
+            )
+        return validation_sampler, post_validation_sampler, None, None
+    if refinement_evidence_dataset is None:
+        raise ValueError("candidate refinement requires the prepared refinement_evidence split")
+
+    minimum_examples = config.training.candidate_refinement_min_validation_examples_per_direction
+    evidence_seed = config.training.seed + 4
+
+    def fixed_evidence_sampler(
+        batch_size: int, max_batches: int
+    ) -> DirectionCompleteValidationBatchSampler:
+        return DirectionCompleteValidationBatchSampler(
+            refinement_evidence_dataset,
+            batch_size,
+            directions=configured_directions,
+            max_batches=max_batches,
+            rank=context.rank,
+            world_size=context.world_size,
+            seed=evidence_seed,
+            minimum_examples_per_direction=minimum_examples,
+            require_unique_examples=True,
+            cohort_mode="fixed_replicated",
+        )
+
+    refinement_evidence_sampler = fixed_evidence_sampler(
+        config.training.batch_size_per_gpu,
+        config.training.eval_batches,
+    )
+    post_refinement_evidence_sampler = (
+        fixed_evidence_sampler(
+            config.posttraining.eval_batch_size_per_gpu,
+            post_config.training.eval_batches,
+        )
+        if post_config is not None
+        else None
+    )
+    if (
+        post_refinement_evidence_sampler is not None
+        and post_refinement_evidence_sampler.cohort_fingerprint
+        != refinement_evidence_sampler.cohort_fingerprint
+    ):
+        raise RuntimeError(
+            "SFT and MRT refinement-evidence samplers selected different semantic cohorts"
+        )
+    return (
+        validation_sampler,
+        post_validation_sampler,
+        refinement_evidence_sampler,
+        post_refinement_evidence_sampler,
+    )
+
+
 def _coordinated_checkpoint_load_structure(
     source: str | Path,
     model: torch.nn.Module,
@@ -4442,16 +4579,35 @@ def main() -> None:
             verify_integrity=False,
             verified_artifact_inventory_sha256=translation_artifact_inventory_sha256,
         )
-        preflight_dataset_direction_contract(config, train_dataset, require_all_pairs=True)
-        preflight_dataset_direction_contract(
-            config,
-            validation_dataset,
-            require_all_directions=True,
+        refinement_evidence_dataset = (
+            IndexedParallelDataset(
+                config.data.dataset_dir,
+                REFINEMENT_EVIDENCE_SPLIT,
+                bidirectional=True,
+                legacy_bidirectional=config.data.bidirectional,
+                legacy_language_pairs=config.data.configured_language_pairs(),
+                verify_integrity=False,
+                verified_artifact_inventory_sha256=translation_artifact_inventory_sha256,
+            )
+            if config.model.experimental.candidate_refinement_enabled
+            else None
         )
+        preflight_dataset_direction_contract(config, train_dataset, require_all_pairs=True)
+        preflight_dataset_direction_contract(config, validation_dataset)
+        if refinement_evidence_dataset is not None:
+            preflight_dataset_direction_contract(
+                config,
+                refinement_evidence_dataset,
+                require_all_directions=True,
+            )
         announce(
             f"Data size: {len(train_dataset):,} training examples / "
             f"{len(validation_dataset):,} validation examples "
-            "(including configured translation directions)",
+            + (
+                f"/ {len(refinement_evidence_dataset):,} fixed refinement-evidence examples"
+                if refinement_evidence_dataset is not None
+                else ""
+            ),
             context,
         )
 
@@ -4511,11 +4667,28 @@ def main() -> None:
             train_sampler,
             authenticated_revision_directions=revision_directions,
         )
+        run_root = Path(config.training.output_dir)
+        post_config = (
+            _build_posttraining_config(config, run_root) if config.posttraining.enabled else None
+        )
+        (
+            validation_sampler,
+            post_validation_sampler,
+            refinement_evidence_sampler,
+            post_refinement_evidence_sampler,
+        ) = build_translation_validation_samplers(
+            config,
+            validation_dataset,
+            refinement_evidence_dataset,
+            context,
+            post_config=post_config,
+        )
         if args.prepare_only:
             announce(
                 "Preparation-only run complete: tokenizer, indexed shards, exact "
-                "language graph, sampling coverage, revision capabilities, automatic "
-                "model sizing, and export dependencies passed local preflight.",
+                "language graph, sampling coverage, revision capabilities, fixed "
+                "refinement-evidence cohorts, automatic model sizing, and export "
+                "dependencies passed local preflight.",
                 context,
             )
             return
@@ -4535,12 +4708,8 @@ def main() -> None:
             pipeline_identity = build_translation_pipeline_identity(foundation_plan)
 
         # Keep pretraining and posttraining artifacts separate under the run root.
-        run_root = Path(config.training.output_dir)
         pretrain_config = copy.deepcopy(config)
         pretrain_config.training.output_dir = str(run_root / "pretrain")
-        post_config = (
-            _build_posttraining_config(config, run_root) if config.posttraining.enabled else None
-        )
 
         # ── Stage 5: discover previous stage checkpoints ─────────────────
         if not pretrain_config.training.resume_from and pretrain_resume_candidate:
@@ -4574,10 +4743,14 @@ def main() -> None:
             source_token_dropout=0.0,  # Validation always uses clean input.
             decoder_input_noise=0.0,
         )
+        refinement_evidence_collator = (
+            build_refinement_evidence_collator(config, tokenizer)
+            if refinement_evidence_dataset is not None
+            else None
+        )
         # The sampler buckets similar lengths to reduce padding and partitions
         # batches across ranks without overlap during distributed training.
         post_sampler: DistributedBucketBatchSampler | None = None
-        post_validation_sampler: DirectionCompleteValidationBatchSampler | None = None
         if post_config is not None:
             post = config.posttraining
             post_sampler = DistributedBucketBatchSampler(
@@ -4592,36 +4765,6 @@ def main() -> None:
                 max_source_upsampling=config.data.max_source_upsampling,
                 language_pair_sampling_alpha=config.data.language_pair_sampling_alpha,
             )
-            post_validation_sampler = DirectionCompleteValidationBatchSampler(
-                validation_dataset,
-                post.eval_batch_size_per_gpu,
-                directions=config.data.configured_translation_directions(),
-                max_batches=post_config.training.eval_batches,
-                rank=context.rank,
-                world_size=context.world_size,
-                seed=config.training.seed + 3,
-                minimum_examples_per_direction=(
-                    config.training.candidate_refinement_min_validation_examples_per_direction
-                    if config.model.experimental.candidate_refinement_enabled
-                    else 1
-                ),
-                require_unique_examples=(config.model.experimental.candidate_refinement_enabled),
-            )
-        validation_sampler = DirectionCompleteValidationBatchSampler(
-            validation_dataset,
-            config.training.batch_size_per_gpu,
-            directions=config.data.configured_translation_directions(),
-            max_batches=config.training.eval_batches,
-            rank=context.rank,
-            world_size=context.world_size,
-            seed=config.training.seed + 1,
-            minimum_examples_per_direction=(
-                config.training.candidate_refinement_min_validation_examples_per_direction
-                if config.model.experimental.candidate_refinement_enabled
-                else 1
-            ),
-            require_unique_examples=config.model.experimental.candidate_refinement_enabled,
-        )
         train_loader_args = dataloader_runtime_kwargs(
             config.data.num_workers,
             context.device,
@@ -4856,6 +4999,18 @@ def main() -> None:
                 collate_fn=validation_collator,
                 **validation_loader_args,
             )
+            refinement_evidence_loader = (
+                DataLoader(
+                    refinement_evidence_dataset,
+                    batch_sampler=refinement_evidence_sampler,
+                    collate_fn=refinement_evidence_collator,
+                    **validation_loader_args,
+                )
+                if refinement_evidence_dataset is not None
+                and refinement_evidence_sampler is not None
+                and refinement_evidence_collator is not None
+                else None
+            )
             announce("Starting stage 1 SFT pretraining.", context)
             pretrain_result = train(
                 model,
@@ -4865,12 +5020,18 @@ def main() -> None:
                 context,
                 stage_name="pretrain/SFT",
                 language_tags=tokenizer.language_tags,
+                refinement_evidence_loader=refinement_evidence_loader,
                 authenticated_revision_directions=revision_directions,
                 pipeline_identity=pipeline_identity,
             )
             barrier(context)
-            memory = release_stage_resources(context, train_loader, validation_loader)
-            del train_loader, validation_loader
+            memory = release_stage_resources(
+                context,
+                train_loader,
+                validation_loader,
+                refinement_evidence_loader,
+            )
+            del train_loader, validation_loader, refinement_evidence_loader
             if memory:
                 announce(
                     "Pretraining memory cleanup: "
@@ -4880,8 +5041,8 @@ def main() -> None:
                     f"{memory['after_reserved_gib']:.2f} GiB",
                     context,
                 )
-        del train_sampler, validation_sampler
-        del train_collator, validation_collator
+        del train_sampler, validation_sampler, refinement_evidence_sampler
+        del train_collator, validation_collator, refinement_evidence_collator
 
         # ── Stage 7: MRT posttraining ────────────────────────────────────
         if post_config is not None:
@@ -4908,6 +5069,17 @@ def main() -> None:
                 collate_fn=post_collator,
                 **validation_loader_args,
             )
+            post_refinement_evidence_loader = (
+                DataLoader(
+                    refinement_evidence_dataset,
+                    batch_sampler=post_refinement_evidence_sampler,
+                    collate_fn=post_collator,
+                    **validation_loader_args,
+                )
+                if refinement_evidence_dataset is not None
+                and post_refinement_evidence_sampler is not None
+                else None
+            )
             objective = MinimumRiskObjective(tokenizer, post)
             announce(
                 "Starting stage 2 composite MRT/preference posttraining: "
@@ -4925,6 +5097,7 @@ def main() -> None:
                 objective=objective,
                 stage_name="posttrain/composite-MRT+preference",
                 language_tags=tokenizer.language_tags,
+                refinement_evidence_loader=post_refinement_evidence_loader,
                 authenticated_revision_directions=revision_directions,
                 pipeline_identity=pipeline_identity,
             )
@@ -4933,6 +5106,7 @@ def main() -> None:
                 context,
                 post_loader,
                 post_validation_loader,
+                post_refinement_evidence_loader,
             )
             if memory:
                 announce(

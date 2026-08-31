@@ -839,12 +839,16 @@ def test_prepare_only_runs_training_contract_preflights_before_return(
 
     config = AppConfig()
     config.data.language_pair = ["de", "fr"]
+    config.data.refinement_evidence_fraction = 0.1
     config.foundation.enabled = False
+    config.model.experimental.candidate_refinement_enabled = True
+    config.posttraining.enabled = False
     config.training.output_dir = str(tmp_path / "run")
     context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
     events: list[str] = []
     artifact_inventory_sha256 = "a" * 64
     dataset_open_options: list[dict[str, object]] = []
+    validation_sampler_options: list[dict[str, object]] = []
 
     class TokenizerStub:
         draft_id = 17
@@ -862,9 +866,17 @@ def test_prepare_only_runs_training_contract_preflights_before_return(
         def __len__(self) -> int:
             return 11 if self.split == config.data.train_split else 3
 
+        def observed_translation_directions_for_physical_mask(
+            self,
+            _mask: object,
+        ) -> tuple[tuple[str, str], ...]:
+            return config.data.configured_translation_directions()
+
     class SamplerStub:
         def __init__(self, dataset: DatasetStub, *_args: object, **_kwargs: object) -> None:
             self.dataset = dataset
+            if dataset.split != config.data.train_split:
+                validation_sampler_options.append(dict(_kwargs))
 
         def positive_sampling_pair_mask(self) -> object:
             return object()
@@ -954,6 +966,11 @@ def test_prepare_only_runs_training_contract_preflights_before_return(
     )
     monkeypatch.setattr(train_module, "DistributedBucketBatchSampler", SamplerStub)
     monkeypatch.setattr(
+        train_module,
+        "DirectionCompleteValidationBatchSampler",
+        SamplerStub,
+    )
+    monkeypatch.setattr(
         train_module, "resolve_training_revision_directions", lambda *_args, **_kwargs: ()
     )
     monkeypatch.setattr(
@@ -970,6 +987,7 @@ def test_prepare_only_runs_training_contract_preflights_before_return(
         "export dependencies",
         "artifacts",
         "token features",
+        "direction graph",
         "direction graph",
         "direction graph",
         "automatic data settings",
@@ -991,7 +1009,40 @@ def test_prepare_only_runs_training_contract_preflights_before_return(
             "verify_integrity": False,
             "verified_artifact_inventory_sha256": artifact_inventory_sha256,
         },
+        {
+            "bidirectional": True,
+            "legacy_bidirectional": True,
+            "legacy_language_pairs": (("de", "fr"),),
+            "verify_integrity": False,
+            "verified_artifact_inventory_sha256": artifact_inventory_sha256,
+        },
     ]
+    evidence_sampler = next(
+        options
+        for options in validation_sampler_options
+        if options.get("cohort_mode") == "fixed_replicated"
+    )
+    assert evidence_sampler["minimum_examples_per_direction"] == 32
+    assert evidence_sampler["require_unique_examples"] is True
+
+
+def test_refinement_evidence_collator_ignores_general_validation_denoising() -> None:
+    """The authenticated K rows must remain directed translation examples."""
+
+    class TokenizerStub:
+        slot_ids: tuple[int, ...] = ()
+        reasoning_tags: dict[str, int] = {}
+        draft_id: int | None = None
+
+    config = AppConfig()
+    config.data.validation_denoise_probability = 1.0
+    tokenizer = cast(Any, TokenizerStub())
+
+    collator = train_module.build_refinement_evidence_collator(config, tokenizer)
+
+    assert collator.denoise_probability == 0.0
+    assert collator.source_token_dropout == 0.0
+    assert collator.decoder_input_noise == 0.0
 
 
 def test_automatic_resume_candidate_cannot_skip_raw_free_foundation_preflight(
