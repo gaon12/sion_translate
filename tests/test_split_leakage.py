@@ -39,6 +39,26 @@ def _line_for_split(split: str, make_row: Callable[[int], dict[str, str]]) -> st
     raise AssertionError(f"could not construct a multilingual row assigned to {split}")
 
 
+def _line_for_split_with_evidence(
+    split: str,
+    make_row: Callable[[int], dict[str, object]],
+) -> str:
+    for index in range(10_000):
+        line = json.dumps(make_row(index), ensure_ascii=False, sort_keys=True)
+        record_digest = hashlib.sha256(line.encode("utf-8")).hexdigest()
+        if (
+            choose_split_for_key(
+                f"record\0{record_digest}",
+                validation_fraction=0.1,
+                test_fraction=0.1,
+                refinement_evidence_fraction=0.1,
+            )
+            == split
+        ):
+            return line
+    raise AssertionError(f"could not construct a row assigned to {split}")
+
+
 def _case(
     endpoint_roles: str,
 ) -> tuple[
@@ -116,6 +136,117 @@ def test_accept_many_rejection_does_not_partially_register_a_row() -> None:
     assert guard.accept("validation", occupied)
     assert not guard.accept_many("train", (unowned, occupied))
     assert guard.accept("test", unowned)
+
+
+@pytest.mark.parametrize("training_first", (False, True))
+def test_relative_evidence_target_can_overlap_only_training(training_first: bool) -> None:
+    guard = TargetSplitGuard(
+        estimated_pairs=10,
+        validation_fraction=VALIDATION_FRACTION,
+        test_fraction=TEST_FRACTION,
+        refinement_evidence_fraction=0.1,
+    )
+    evidence_source = endpoint_split_digest("x-source", "Synthetic evidence source")
+    shared_target = endpoint_split_digest("x-target", "Shared genuine target")
+
+    if training_first:
+        assert guard.accept("train", shared_target)
+    assert guard.accept_refinement_evidence_with_training_target_overlap(
+        isolated_digests=(evidence_source,),
+        training_overlap_digests=(shared_target,),
+    )
+    if not training_first:
+        assert guard.accept("train", shared_target)
+
+    assert not guard.accept("validation", shared_target)
+    assert not guard.accept("test", shared_target)
+
+
+@pytest.mark.parametrize("ordinary_split", ("validation", "test"))
+def test_relative_evidence_target_rejects_an_existing_ordinary_holdout(
+    ordinary_split: str,
+) -> None:
+    guard = TargetSplitGuard(
+        estimated_pairs=10,
+        validation_fraction=VALIDATION_FRACTION,
+        test_fraction=TEST_FRACTION,
+        refinement_evidence_fraction=0.1,
+    )
+    evidence_source = endpoint_split_digest("x-source", "Synthetic evidence source")
+    shared_target = endpoint_split_digest("x-target", "Shared ordinary holdout target")
+
+    assert guard.accept(ordinary_split, shared_target)
+    assert not guard.accept_refinement_evidence_with_training_target_overlap(
+        isolated_digests=(evidence_source,),
+        training_overlap_digests=(shared_target,),
+    )
+
+    # A failed atomic registration must not reserve the otherwise clean source.
+    assert guard.accept("train", evidence_source)
+
+
+def test_prepare_never_reuses_an_ordinary_holdout_target_as_relative_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Training overlap is the only exception granted to an evidence target."""
+
+    shared_target = "This target must remain exclusive to ordinary validation."
+    real = tmp_path / "real_parallel.jsonl"
+    reviewed = tmp_path / "synthetic_reviewed.jsonl"
+    real.write_text(
+        _line_for_split_with_evidence(
+            "validation",
+            lambda index: {
+                "de": f"Deutscher Validierungssatz Nummer {index}.",
+                "en": shared_target,
+            },
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    reviewed.write_text(
+        _line_for_split_with_evidence(
+            "refinement_evidence",
+            lambda index: {
+                "kj": f"Reviewed source-only input number {index}.",
+                "en": shared_target,
+                "synthetic": True,
+            },
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    tokenizer_model = tmp_path / "tokenizer.model"
+    tokenizer_model.write_bytes(b"test tokenizer identity")
+
+    class EvidenceTokenizerStub(_TokenizerStub):
+        languages = ("de", "en", "kj")
+
+    monkeypatch.setattr(prepare_module, "SionTokenizer", EvidenceTokenizerStub)
+    monkeypatch.setattr(prepare_module, "_PREPARE_WORKER_TOKENIZER", None)
+
+    output = tmp_path / "dataset"
+    stats = prepare_module.prepare_dataset(
+        [str(real), str(reviewed)],
+        tokenizer_model,
+        output,
+        validation_fraction=0.1,
+        test_fraction=0.1,
+        refinement_evidence_fraction=0.1,
+        filter_quality=False,
+        dedup_backend="memory",
+        language_pairs=(("kj", "en"), ("de", "en")),
+        source_only_languages=("kj",),
+        source_only_synthetic_evidence_files=(reviewed.name,),
+        num_workers=1,
+    )
+
+    manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+    source_stats = {source["name"]: source["stats"] for source in manifest["sources"]}
+    assert stats.validation == 1
+    assert stats.refinement_evidence == 0
+    assert source_stats[reviewed.name]["split_conflicts"] == 1
 
 
 @pytest.mark.parametrize(

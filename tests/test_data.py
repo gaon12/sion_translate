@@ -110,6 +110,7 @@ def test_register_inference_inherits_the_primary_language_policy(
 
 def test_prepare_stats_normalize_only_the_exact_unmarked_legacy_representation() -> None:
     neutral = vars(prepare_module.PrepareStats(src_tokens=17, tgt_tokens=23))
+    neutral.pop("refinement_evidence")
     legacy = dict(neutral)
     legacy["ko_tokens"] = legacy.pop("src_tokens")
     legacy["ja_tokens"] = legacy.pop("tgt_tokens")
@@ -141,7 +142,7 @@ def test_prepare_stats_reject_schema_field_mismatches_and_invalid_counts() -> No
     legacy["ja_tokens"] = legacy.pop("tgt_tokens")
 
     for payload, schema in (
-        (neutral, None),
+        ({key: value for key, value in neutral.items() if key != "refinement_evidence"}, None),
         (legacy, prepare_module.PREPARE_STATS_SCHEMA),
         ({**neutral, "ko_tokens": 17}, prepare_module.PREPARE_STATS_SCHEMA),
         ({**legacy, "src_tokens": 17}, None),
@@ -1786,6 +1787,7 @@ def test_prepare_reuses_an_authenticated_unmarked_v10_legacy_stats_manifest(
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest.pop("stats_schema")
     for serialized in (manifest["stats"], manifest["sources"][0]["stats"]):
+        serialized.pop("refinement_evidence")
         serialized["ko_tokens"] = serialized.pop("src_tokens")
         serialized["ja_tokens"] = serialized.pop("tgt_tokens")
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")

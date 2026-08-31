@@ -1298,10 +1298,13 @@ class DirectionCompleteValidationBatchSampler(Sampler[list[int]]):
     The requested batch budget is expanded when necessary so even a large or
     highly imbalanced language graph contributes at least one logical example for
     every configured edge. The selected cohort is stable across repeated raw/EMA
-    evaluation and checkpoint resume.
+    evaluation and checkpoint resume. ``fixed_replicated`` mode instead selects
+    exactly the configured distinct minimum for every direction and evaluates
+    that identical semantic cohort on every rank. Its identity intentionally does
+    not depend on hardware layout or batch packing.
     """
 
-    schema = "sion-direction-complete-validation-v2"
+    schema = "sion-direction-complete-validation-v3"
 
     def __init__(
         self,
@@ -1315,6 +1318,7 @@ class DirectionCompleteValidationBatchSampler(Sampler[list[int]]):
         seed: int = 0,
         minimum_examples_per_direction: int = 1,
         require_unique_examples: bool = False,
+        cohort_mode: str = "budgeted",
     ) -> None:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
@@ -1328,6 +1332,10 @@ class DirectionCompleteValidationBatchSampler(Sampler[list[int]]):
             raise ValueError("minimum_examples_per_direction must be a positive integer")
         if type(require_unique_examples) is not bool:
             raise ValueError("require_unique_examples must be a boolean")
+        if cohort_mode not in {"budgeted", "fixed_replicated"}:
+            raise ValueError("cohort_mode must be 'budgeted' or 'fixed_replicated'")
+        if cohort_mode == "fixed_replicated" and not require_unique_examples:
+            raise ValueError("fixed_replicated validation requires distinct-example authentication")
         raw_directions = tuple(tuple(direction) for direction in directions)
         if any(len(direction) != 2 for direction in raw_directions):
             raise ValueError("translation directions must contain exactly two languages")
@@ -1347,8 +1355,12 @@ class DirectionCompleteValidationBatchSampler(Sampler[list[int]]):
             raise ValueError(
                 "direction-complete validation requires a verified dataset artifact inventory"
             )
+        if not canonical_directions:
+            raise ValueError("translation directions must not be empty")
+        replicated = cohort_mode == "fixed_replicated"
+        rank_divisor = 1 if replicated else world_size
         minimum_batches = math.ceil(
-            len(canonical_directions) * minimum_examples_per_direction / (batch_size * world_size)
+            len(canonical_directions) * minimum_examples_per_direction / (batch_size * rank_divisor)
         )
         self.dataset = dataset
         self.batch_size = batch_size
@@ -1357,13 +1369,20 @@ class DirectionCompleteValidationBatchSampler(Sampler[list[int]]):
         self.seed = int(seed)
         self.minimum_examples_per_direction = minimum_examples_per_direction
         self.require_unique_examples = require_unique_examples
+        self.cohort_mode = cohort_mode
         self.drop_last = False
         self.minimum_batches = minimum_batches
-        self.evaluation_batches = max(max_batches, minimum_batches)
+        self.evaluation_batches = (
+            minimum_batches if replicated else max(max_batches, minimum_batches)
+        )
         self.directions = canonical_directions
 
-        global_size = self.evaluation_batches * batch_size * world_size
-        base_quota, extra = divmod(global_size, len(canonical_directions))
+        semantic_size = (
+            len(canonical_directions) * minimum_examples_per_direction
+            if replicated
+            else self.evaluation_batches * batch_size * world_size
+        )
+        base_quota, extra = divmod(semantic_size, len(canonical_directions))
         selected_groups: list[np.ndarray] = []
         direction_example_counts: list[dict[str, object]] = []
         for direction_index, direction in enumerate(canonical_directions):
@@ -1371,15 +1390,15 @@ class DirectionCompleteValidationBatchSampler(Sampler[list[int]]):
             direction_candidates = candidates[direction]
             direction_rng = np.random.default_rng(self.seed + direction_index * 0x9E3779B1)
             ordered = direction_rng.permutation(direction_candidates)
-            if require_unique_examples:
-                if quota > len(ordered):
-                    source_language, target_language = direction
-                    raise ValueError(
-                        "candidate-refinement release validation requires "
-                        f"{quota} distinct examples for direction "
-                        f"{source_language}->{target_language}, but the held-out split "
-                        f"contains only {len(ordered)}"
-                    )
+            if require_unique_examples and len(ordered) < minimum_examples_per_direction:
+                source_language, target_language = direction
+                raise ValueError(
+                    "candidate-refinement release validation requires "
+                    f"{minimum_examples_per_direction} distinct examples for direction "
+                    f"{source_language}->{target_language}, but the held-out split "
+                    f"contains only {len(ordered)}"
+                )
+            if quota <= len(ordered):
                 selected = ordered[:quota]
             else:
                 repeats, remainder = divmod(quota, len(ordered))
@@ -1387,36 +1406,47 @@ class DirectionCompleteValidationBatchSampler(Sampler[list[int]]):
                 if remainder:
                     parts.append(ordered[:remainder])
                 selected = np.concatenate(parts)
+            distinct_selected = min(quota, len(ordered))
             selected_groups.append(selected)
             direction_example_counts.append(
                 {
                     "direction": list(direction),
                     "available": len(ordered),
                     "selected": quota,
+                    "distinct_selected": distinct_selected,
                 }
             )
-        global_indices = np.concatenate(selected_groups)
+        semantic_indices = np.concatenate(selected_groups)
         global_rng = np.random.default_rng(self.seed ^ 0xD1B54A32D192ED03)
-        global_rng.shuffle(global_indices)
-        self._global_indices = global_indices.astype(np.int64, copy=False)
-        self._local_indices = self._global_indices[rank::world_size]
-        if len(self._local_indices) != self.evaluation_batches * batch_size:
+        global_rng.shuffle(semantic_indices)
+        self._global_indices = semantic_indices.astype(np.int64, copy=False)
+        self._local_indices = (
+            self._global_indices if replicated else self._global_indices[rank::world_size]
+        )
+        expected_local_size = semantic_size if replicated else self.evaluation_batches * batch_size
+        if len(self._local_indices) != expected_local_size:
             raise RuntimeError("validation cohort partition produced unequal rank sizes")
 
         identity = {
             "schema": self.schema,
+            "cohort_mode": cohort_mode,
             "directions": [list(direction) for direction in canonical_directions],
-            "batch_size_per_rank": batch_size,
-            "world_size": world_size,
-            "evaluation_batches": self.evaluation_batches,
             "seed": self.seed,
-            "global_examples": global_size,
+            "semantic_examples": semantic_size,
             "minimum_examples_per_direction": minimum_examples_per_direction,
             "unique_examples_required": require_unique_examples,
             "direction_example_counts": direction_example_counts,
             "dataset_split": dataset.root.name,
             "dataset_artifact_inventory_sha256": dataset_artifact_inventory_sha256,
         }
+        if not replicated:
+            identity.update(
+                {
+                    "batch_size_per_rank": batch_size,
+                    "world_size": world_size,
+                    "evaluation_batches": self.evaluation_batches,
+                }
+            )
         digest = hashlib.sha256(
             json.dumps(
                 identity,

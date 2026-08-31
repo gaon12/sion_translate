@@ -11,7 +11,7 @@ from typing import Any, cast
 from sion_translate.fingerprint import file_sha256
 
 DATASET_ARTIFACT_INVENTORY_SCHEMA = "sion-indexed-artifact-inventory-v1"
-_PAYLOAD_ROOTS = frozenset({"train", "validation", "test"})
+_PAYLOAD_ROOTS = frozenset({"train", "validation", "test", "refinement_evidence"})
 
 
 def _canonical_json(value: object) -> bytes:

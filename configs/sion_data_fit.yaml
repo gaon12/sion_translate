@@ -43,6 +43,11 @@ data:
     - [ko, en]
     - [en, ja]
   source_only_languages: [kj, kd, jd]
+  refinement_evidence_fraction: 0.005
+  source_only_synthetic_evidence_files:
+    - synthetic_dialect_ja.jsonl
+    - synthetic_dialect_ko.jsonl
+    - synthetic_hanboneo.jsonl
   bidirectional: true
   max_source_length: 512
   max_target_length: 512

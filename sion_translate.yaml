@@ -126,6 +126,15 @@ data:
   # requested output languages.
   source_only_languages: [kj, kd, jd]
 
+  # Keep release evidence separate from ordinary validation/test so synthetic
+  # source-only rows can measure only relative T1-to-T2 refinement gains. Exact
+  # basenames make the opt-in reviewable; future synthetic files remain train-only.
+  refinement_evidence_fraction: 0.005
+  source_only_synthetic_evidence_files:
+    - synthetic_dialect_ja.jsonl
+    - synthetic_dialect_ko.jsonl
+    - synthetic_hanboneo.jsonl
+
   # Corpus-wide deduplication (2026-08-28) removed a different share of each
   # edge -- ko-en 6.05%, ko-ja 4.53%, en-ja 4.09% -- so the row counts no longer
   # balance: ko-ja 9,882,248 / en-ja 9,204,513 / ko-en 8,929,306, a 10.7% spread.

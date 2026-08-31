@@ -44,6 +44,66 @@ def test_synthetic_prefixes_cannot_escape_the_raw_directory(prefix: str) -> None
         config.validate()
 
 
+def _source_only_evidence_config() -> AppConfig:
+    return AppConfig(
+        data=DataConfig(
+            language_pairs=[["mixed", "de"], ["mixed", "fr"], ["de", "fr"]],
+            source_only_languages=["mixed"],
+            refinement_evidence_fraction=0.01,
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "name",
+    (
+        "../synthetic_reviewed.jsonl",
+        "nested/synthetic_reviewed.jsonl",
+        "nested\\synthetic_reviewed.jsonl",
+        " synthetic_reviewed.jsonl",
+        "synthetic_reviewed.json",
+        "",
+    ),
+)
+def test_source_only_evidence_allowlist_requires_exact_jsonl_basenames(name: str) -> None:
+    config = _source_only_evidence_config()
+    config.data.source_only_synthetic_evidence_files = [name]
+
+    with pytest.raises(ValueError, match="exact basenames"):
+        config.validate()
+
+
+def test_source_only_evidence_allowlist_rejects_case_insensitive_duplicates() -> None:
+    config = _source_only_evidence_config()
+    config.data.source_only_synthetic_evidence_files = [
+        "synthetic_reviewed.jsonl",
+        "SYNTHETIC_REVIEWED.JSONL",
+    ]
+
+    with pytest.raises(ValueError, match="duplicate basename"):
+        config.validate()
+
+
+@pytest.mark.parametrize("fraction", (True, -0.01, 0.5, float("nan"), float("inf")))
+def test_refinement_evidence_fraction_must_be_finite_and_bounded(
+    fraction: object,
+) -> None:
+    config = _source_only_evidence_config()
+    config.data.refinement_evidence_fraction = fraction  # type: ignore[assignment]
+
+    with pytest.raises(ValueError, match="refinement_evidence_fraction must be in"):
+        config.validate()
+
+
+def test_source_only_evidence_allowlist_requires_a_positive_fraction() -> None:
+    config = _source_only_evidence_config()
+    config.data.refinement_evidence_fraction = 0.0
+    config.data.source_only_synthetic_evidence_files = ["synthetic_reviewed.jsonl"]
+
+    with pytest.raises(ValueError, match="requires a positive refinement_evidence_fraction"):
+        config.validate()
+
+
 def test_shipped_configs_keep_canonical_paths_without_release_namespaces() -> None:
     config_root = Path(__file__).resolve().parents[1] / "configs"
     root_data = load_config(config_root.parent / "sion_translate.yaml").data
@@ -649,6 +709,12 @@ def test_candidate_refinement_release_margin_default_and_shipped_configs_are_exa
         assert config.model.experimental.candidate_refinement_enabled is True
         assert config.training.candidate_refinement_min_worst_direction_nll_gain == 1e-5
         assert config.training.candidate_refinement_min_validation_examples_per_direction == 32
+        assert config.data.refinement_evidence_fraction == pytest.approx(0.005)
+        assert config.data.configured_source_only_synthetic_evidence_files() == (
+            "synthetic_dialect_ja.jsonl",
+            "synthetic_dialect_ko.jsonl",
+            "synthetic_hanboneo.jsonl",
+        )
 
 
 @pytest.mark.parametrize("minimum_examples", (True, None, 0, -1, 1.5, "32"))

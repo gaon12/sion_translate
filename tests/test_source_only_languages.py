@@ -1,6 +1,6 @@
 """Source-only languages must never appear on the target side of a training pair.
 
-한본어(kj) is a code-mixed input variety: the model has to read it, but every
+Hanboneo (kj) is a code-mixed input variety: the model has to read it, but every
 translation it produces must be monolingual Korean or Japanese. Training with
 ``bidirectional=True`` and no restriction would also learn ko->kj and ja->kj,
 which is how a model starts injecting kana into Korean output.
@@ -14,13 +14,16 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+import sion_translate.cli.train as train_module
 from sion_translate.config import AppConfig, DataConfig, config_from_raw
 from sion_translate.data.collate import SionBatchCollator
 from sion_translate.data.indexed import (
+    DirectionCompleteValidationBatchSampler,
     DistributedBucketBatchSampler,
     IndexedParallelDataset,
 )
 from sion_translate.data.prepare import INDEX_DTYPE, prepare_dataset
+from sion_translate.token_audit import audit_indexed_token_exposure
 from sion_translate.tokenizer import SionTokenizer, train_tokenizer
 
 
@@ -98,6 +101,77 @@ def prepared(
     return dataset_dir
 
 
+@pytest.fixture(scope="module")
+def prepared_refinement_evidence(
+    kj_tokenizer: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Path:
+    """Build genuine and explicitly reviewed synthetic refinement evidence."""
+
+    root = tmp_path_factory.mktemp("source-only-refinement-evidence")
+    real = root / "real_standard.jsonl"
+    reviewed = root / "synthetic_reviewed.jsonl"
+    future = root / "synthetic_future.jsonl"
+    with real.open("w", encoding="utf-8", newline="\n") as handle:
+        for index in range(600):
+            handle.write(
+                json.dumps(
+                    {
+                        "ko": f"실제 표준 한국어 근거 문장 번호 {index}입니다.",
+                        "ja": f"実際の標準日本語の根拠文番号{index}です。",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+    with reviewed.open("w", encoding="utf-8", newline="\n") as handle:
+        for index in range(600):
+            handle.write(
+                json.dumps(
+                    {
+                        "kj": f"리뷰済み source-only 입력 문장 {index} です.",
+                        "ko": f"검토된 합성 한국어 목표 문장 {index}입니다.",
+                        "ja": f"確認済みの合成日本語目標文{index}です。",
+                        "synthetic": True,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+    with future.open("w", encoding="utf-8", newline="\n") as handle:
+        for index in range(80):
+            handle.write(
+                json.dumps(
+                    {
+                        "kj": f"미등록 future source-only 입력 {index} です.",
+                        "ko": f"미등록 미래 한국어 목표 {index}입니다.",
+                        "ja": f"未登録の将来日本語目標{index}です。",
+                        "synthetic": True,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+
+    output = root / "dataset"
+    stats = prepare_dataset(
+        [str(real), str(reviewed), str(future)],
+        kj_tokenizer,
+        output,
+        language_pairs=LANGUAGE_PAIRS,
+        source_only_languages=("kj",),
+        validation_fraction=0.0,
+        test_fraction=0.0,
+        refinement_evidence_fraction=0.2,
+        source_only_synthetic_evidence_files=(reviewed.name,),
+        filter_quality=False,
+        dedup_backend="memory",
+        num_workers=1,
+    )
+    assert stats.refinement_evidence > 0
+    return output
+
+
 def test_index_dtype_carries_the_forward_only_flag() -> None:
     assert INDEX_DTYPE.names is not None
     assert "forward_only" in INDEX_DTYPE.names
@@ -108,6 +182,142 @@ def test_manifest_records_the_source_only_languages(prepared: Path) -> None:
 
     assert manifest["source_only_languages"] == ["kj"]
     assert manifest["format"] == "sion-indexed-parallel-v6"
+
+
+def test_synthetic_source_only_evidence_is_exact_and_separate(
+    prepared_refinement_evidence: Path,
+) -> None:
+    """Only the named synthetic source may enter relative refinement evidence."""
+
+    manifest = json.loads(
+        (prepared_refinement_evidence / "manifest.json").read_text(encoding="utf-8")
+    )
+    by_name = {source["name"]: source["stats"] for source in manifest["sources"]}
+    reviewed = by_name["synthetic_reviewed.jsonl"]
+    future = by_name["synthetic_future.jsonl"]
+
+    assert reviewed["refinement_evidence"] >= 64
+    assert reviewed["refinement_evidence"] % 2 == 0
+    assert reviewed["split_conflicts"] == reviewed["refinement_evidence"] // 2
+    assert future["refinement_evidence"] == 0
+    assert future["train"] == future["valid_pairs"] > 0
+    assert manifest["stats"]["validation"] == 0
+    assert manifest["stats"]["test"] == 0
+    assert manifest["synthetic_policy"] == {
+        "record_field": "synthetic",
+        "train_only_by_default": True,
+        "source_only_holdout_enabled": True,
+        "source_only_holdout_purpose": "relative-refinement-evidence-only-v1",
+        "source_only_evidence_files": ["synthetic_reviewed.jsonl"],
+        "source_only_target_overlap": "allowed-for-relative-evidence-only-v1",
+        "sampling_weight": 0.5,
+        "prefixes": ["bt_", "queue_bt_", "concat_", "revise_", "synthetic_"],
+    }
+
+    evidence = IndexedParallelDataset(
+        prepared_refinement_evidence,
+        "refinement_evidence",
+        bidirectional=True,
+    )
+    synthetic_items = [
+        evidence[index] for index in range(len(evidence)) if evidence[index]["synthetic"]
+    ]
+    assert len(synthetic_items) == reviewed["refinement_evidence"]
+    assert {
+        (str(item["src_language"]), str(item["target_language"])) for item in synthetic_items
+    } == {("kj", "ko"), ("kj", "ja")}
+    assert all(item["reverse_direction_trained"] is False for item in synthetic_items)
+
+
+def test_fixed_refinement_cohort_is_hardware_invariant(
+    prepared_refinement_evidence: Path,
+) -> None:
+    """Release evidence must not change with GPU count or batch packing."""
+
+    evidence = IndexedParallelDataset(
+        prepared_refinement_evidence,
+        "refinement_evidence",
+        bidirectional=True,
+    )
+    graph = (("kj", "ko"), ("kj", "ja"), ("ko", "ja"), ("ja", "ko"))
+    samplers = [
+        DirectionCompleteValidationBatchSampler(
+            evidence,
+            batch_size,
+            directions=graph,
+            max_batches=999,
+            rank=rank,
+            world_size=world_size,
+            seed=71,
+            minimum_examples_per_direction=32,
+            require_unique_examples=True,
+            cohort_mode="fixed_replicated",
+        )
+        for world_size, batch_size in ((1, 1), (2, 7), (3, 13), (8, 31))
+        for rank in range(world_size)
+    ]
+    fingerprints = {sampler.cohort_fingerprint for sampler in samplers}
+    logical_cohorts = {
+        frozenset(index for batch in sampler for index in batch) for sampler in samplers
+    }
+
+    assert len(fingerprints) == 1
+    assert len(logical_cohorts) == 1
+    assert len(next(iter(logical_cohorts))) == 32 * len(graph)
+    for sampler in samplers:
+        assert sampler.cohort_identity["cohort_mode"] == "fixed_replicated"
+        assert "world_size" not in sampler.cohort_identity
+        assert "batch_size_per_rank" not in sampler.cohort_identity
+
+
+def test_refinement_sampler_rejects_an_undersized_fixed_cohort_during_preflight(
+    prepared_refinement_evidence: Path,
+) -> None:
+    """Sampler construction must fail locally before any model is allocated."""
+
+    evidence = IndexedParallelDataset(
+        prepared_refinement_evidence,
+        "refinement_evidence",
+        bidirectional=True,
+    )
+    config = AppConfig()
+    config.data.language_pairs = [list(pair) for pair in LANGUAGE_PAIRS]
+    config.data.source_only_languages = ["kj"]
+    config.model.experimental.candidate_refinement_enabled = True
+    config.posttraining.enabled = False
+    config.training.candidate_refinement_min_validation_examples_per_direction = 10_000
+    context = train_module.DistributedContext(
+        rank=0,
+        local_rank=0,
+        world_size=1,
+        device=train_module.torch.device("cpu"),
+        distributed=False,
+    )
+
+    with pytest.raises(ValueError, match="distinct examples"):
+        train_module.build_translation_validation_samplers(
+            config,
+            evidence,
+            evidence,
+            context,
+            post_config=None,
+        )
+
+
+def test_token_audit_accepts_dedicated_source_only_refinement_evidence(
+    prepared_refinement_evidence: Path,
+    kj_tokenizer: Path,
+) -> None:
+    """The independent artifact audit must authenticate the same evidence policy."""
+
+    report = audit_indexed_token_exposure(
+        prepared_refinement_evidence,
+        kj_tokenizer,
+        split="refinement_evidence",
+        max_piece_examples=0,
+    )
+
+    assert report["parameters"]["split"] == "refinement_evidence"
 
 
 def test_kj_is_never_a_target_language(prepared: Path) -> None:

@@ -32,6 +32,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shard-size", type=int, default=100_000)
     parser.add_argument("--validation-fraction", type=float, default=0.005)
     parser.add_argument("--test-fraction", type=float, default=0.005)
+    parser.add_argument(
+        "--refinement-evidence-fraction",
+        type=float,
+        default=0.0,
+        help=(
+            "Reserve a dedicated split for relative candidate-refinement evidence. "
+            "This split never contributes to ordinary validation or test metrics."
+        ),
+    )
     parser.add_argument("--max-tokens-per-side", type=int, default=510)
     parser.add_argument(
         "--workers",
@@ -123,6 +132,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--source-only-synthetic-evidence-file",
+        action="append",
+        default=[],
+        metavar="BASENAME",
+        help=(
+            "Exact synthetic input basename allowed to contribute one-way source-only "
+            "rows to refinement evidence. Repeat explicitly for every reviewed file."
+        ),
+    )
+    parser.add_argument(
         "--managed-augmentation-prefix",
         default="bt_",
         help=(
@@ -150,6 +169,7 @@ def main() -> None:
             shard_size=args.shard_size,
             validation_fraction=args.validation_fraction,
             test_fraction=args.test_fraction,
+            refinement_evidence_fraction=args.refinement_evidence_fraction,
             max_tokens_per_side=args.max_tokens_per_side,
             quality_policy=QualityPolicy(
                 min_chars_per_side=args.min_chars_per_side,
@@ -165,6 +185,7 @@ def main() -> None:
             translation_directions=args.translation_direction,
             source_only_languages=args.source_only_language,
             train_only_prefixes=args.train_only_prefix,
+            source_only_synthetic_evidence_files=(args.source_only_synthetic_evidence_file),
             managed_augmentation_prefix=args.managed_augmentation_prefix or None,
             num_workers=args.workers,
         )

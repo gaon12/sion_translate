@@ -533,6 +533,10 @@ def _expected_preprocessing_options(data: DataConfig) -> dict[str, object]:
         train_only_prefixes=data.configured_synthetic_prefixes(),
         managed_augmentation_prefix=data.synthetic_prefix,
         synthetic_sampling_weight=data.synthetic_sampling_weight,
+        refinement_evidence_fraction=data.refinement_evidence_fraction,
+        source_only_synthetic_evidence_files=(
+            data.configured_source_only_synthetic_evidence_files()
+        ),
         language_pair_count=len(pairs),
     )
 

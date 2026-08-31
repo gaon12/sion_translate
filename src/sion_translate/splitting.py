@@ -173,22 +173,25 @@ def choose_split_for_key(
     key: str,
     validation_fraction: float = 0.005,
     test_fraction: float = 0.005,
+    refinement_evidence_fraction: float = 0.0,
 ) -> str:
     """Assign a normalized source to a deterministic shuffled split.
 
     SHA-256 makes the assignment independent of input-file and row order while
     keeping every occurrence of the same source text in one split.
     """
-    if validation_fraction < 0 or test_fraction < 0:
-        raise ValueError("Validation and test fractions must be non-negative")
-    if validation_fraction + test_fraction >= 0.5:
-        raise ValueError("Validation and test fractions are unexpectedly large")
+    if validation_fraction < 0 or test_fraction < 0 or refinement_evidence_fraction < 0:
+        raise ValueError("Split fractions must be non-negative")
+    if validation_fraction + test_fraction + refinement_evidence_fraction >= 0.5:
+        raise ValueError("Held-out split fractions are unexpectedly large")
     digest = hashlib.sha256(key.encode("utf-8")).digest()
     value = int.from_bytes(digest[:8], "big") / 2**64
     if value < test_fraction:
         return "test"
     if value < test_fraction + validation_fraction:
         return "validation"
+    if value < test_fraction + validation_fraction + refinement_evidence_fraction:
+        return "refinement_evidence"
     return "train"
 
 
@@ -238,6 +241,7 @@ class TargetSplitGuard:
         estimated_pairs: int,
         validation_fraction: float,
         test_fraction: float,
+        refinement_evidence_fraction: float = 0.0,
     ):
         def bit_count(capacity: int, bits_per_item: int, minimum: int) -> int:
             requested = max(minimum, capacity * bits_per_item)
@@ -249,15 +253,32 @@ class TargetSplitGuard:
         estimated_endpoints = estimated_pairs * 2
         train_capacity = max(
             1,
-            round(estimated_endpoints * (1.0 - validation_fraction - test_fraction)),
+            round(
+                estimated_endpoints
+                * (1.0 - validation_fraction - test_fraction - refinement_evidence_fraction)
+            ),
         )
         validation_capacity = max(1, round(estimated_endpoints * validation_fraction))
         test_capacity = max(1, round(estimated_endpoints * test_fraction))
+        refinement_evidence_capacity = max(
+            1,
+            round(estimated_endpoints * refinement_evidence_fraction),
+        )
         self.filters = {
             "train": BloomFilter(bit_count(train_capacity, 24, 1 << 16)),
             "validation": BloomFilter(bit_count(validation_capacity, 32, 1 << 14)),
             "test": BloomFilter(bit_count(test_capacity, 32, 1 << 14)),
+            "refinement_evidence": BloomFilter(
+                bit_count(refinement_evidence_capacity, 32, 1 << 14)
+            ),
         }
+        # Synthetic refinement evidence measures a relative T1 -> T2 change, so
+        # its target may deliberately overlap training. Keep those targets in a
+        # separate filter: ordinary validation and test must still reject them,
+        # while train/evidence ordering must not change which row is accepted.
+        self._training_overlap_evidence_targets = BloomFilter(
+            bit_count(refinement_evidence_capacity, 32, 1 << 14)
+        )
 
     def accept_many(self, split: str, digests: Iterable[bytes]) -> bool:
         """Atomically register all ``digests`` in ``split`` when conflict-free."""
@@ -271,8 +292,47 @@ class TargetSplitGuard:
             for digest in unique_digests
         ):
             return False
+        if split in {"validation", "test"} and any(
+            self._training_overlap_evidence_targets.contains(digest) for digest in unique_digests
+        ):
+            return False
         for digest in unique_digests:
             destination.add(digest)
+        return True
+
+    def accept_refinement_evidence_with_training_target_overlap(
+        self,
+        *,
+        isolated_digests: Iterable[bytes],
+        training_overlap_digests: Iterable[bytes],
+    ) -> bool:
+        """Register relative evidence without weakening ordinary holdout isolation.
+
+        ``isolated_digests`` use the normal refinement-evidence ownership rule.
+        ``training_overlap_digests`` may already belong to, or later enter,
+        training, but they may never belong to ordinary validation or test.
+        Both groups are checked before either filter is mutated.
+        """
+
+        isolated = tuple(dict.fromkeys(isolated_digests))
+        overlap_allowed = tuple(dict.fromkeys(training_overlap_digests))
+        if any(
+            membership.contains(digest)
+            for split, membership in self.filters.items()
+            if split != "refinement_evidence"
+            for digest in isolated
+        ):
+            return False
+        if any(
+            self.filters[split].contains(digest)
+            for split in ("validation", "test")
+            for digest in overlap_allowed
+        ):
+            return False
+        for digest in isolated:
+            self.filters["refinement_evidence"].add(digest)
+        for digest in overlap_allowed:
+            self._training_overlap_evidence_targets.add(digest)
         return True
 
     def accept(self, split: str, digest: bytes) -> bool:

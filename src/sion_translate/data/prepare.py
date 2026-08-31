@@ -93,7 +93,9 @@ PREPARE_PROGRESS_CHUNK_SCHEMA = "sion-prepare-worker-chunk-v2"
 PREPARE_WORKER_ALGORITHM_SCHEMA = "sion-prepare-worker-events-v2"
 PREPARE_BATCH_SIZE = 512
 PREPARE_OUTPUT_LOCK_SCHEMA = "sion-prepare-output-lock-v1"
-PREPARE_STATS_SCHEMA = "sion-prepare-stats-src-tgt-v1"
+PREPARE_STATS_SCHEMA_V1 = "sion-prepare-stats-src-tgt-v1"
+PREPARE_STATS_SCHEMA = "sion-prepare-stats-src-tgt-v2"
+DATASET_SPLITS = ("train", "validation", "test", "refinement_evidence")
 
 # These limits bound every supported language graph without naming any
 # language. They turn adversarial nested records into an early, reproducible
@@ -167,6 +169,7 @@ class PrepareStats:
     train: int = 0
     validation: int = 0
     test: int = 0
+    refinement_evidence: int = 0
     src_tokens: int = 0
     tgt_tokens: int = 0
     quality_score_sum: int = 0
@@ -211,9 +214,15 @@ _PREPARE_STATS_V1_FIELDS = (
     "synthetic_pairs",
     "forward_only_pairs",
 )
-if tuple(field.name for field in fields(PrepareStats)) != _PREPARE_STATS_V1_FIELDS:
+_PREPARE_STATS_V2_FIELDS = (
+    *_PREPARE_STATS_V1_FIELDS[:25],
+    "refinement_evidence",
+    *_PREPARE_STATS_V1_FIELDS[25:],
+)
+if tuple(field.name for field in fields(PrepareStats)) != _PREPARE_STATS_V2_FIELDS:
     raise RuntimeError("PrepareStats changed without a new explicit persisted statistics schema")
 _PREPARE_STATS_V1_FIELD_MAP = tuple((name, name) for name in _PREPARE_STATS_V1_FIELDS)
+_PREPARE_STATS_V2_FIELD_MAP = tuple((name, name) for name in _PREPARE_STATS_V2_FIELDS)
 _PREPARE_STATS_LEGACY_FIELD_MAP = tuple(
     (
         {"src_tokens": "ko_tokens", "tgt_tokens": "ja_tokens"}.get(name, name),
@@ -240,9 +249,12 @@ def prepare_stats_schema_from_manifest(
     if "stats_schema" not in manifest:
         return None
     value = manifest.get("stats_schema")
-    if value != PREPARE_STATS_SCHEMA:
+    if not isinstance(value, str) or value not in {
+        PREPARE_STATS_SCHEMA_V1,
+        PREPARE_STATS_SCHEMA,
+    }:
         raise ValueError(f"{role} stats_schema is unsupported")
-    return PREPARE_STATS_SCHEMA
+    return value
 
 
 def validated_prepare_stats(
@@ -258,8 +270,10 @@ def validated_prepare_stats(
     raw = cast(Mapping[object, object], value)
     if stats_schema is None:
         field_map = _PREPARE_STATS_LEGACY_FIELD_MAP
-    elif stats_schema == PREPARE_STATS_SCHEMA:
+    elif stats_schema == PREPARE_STATS_SCHEMA_V1:
         field_map = _PREPARE_STATS_V1_FIELD_MAP
+    elif stats_schema == PREPARE_STATS_SCHEMA:
+        field_map = _PREPARE_STATS_V2_FIELD_MAP
     else:
         raise ValueError(f"{role} stats_schema is unsupported")
     expected_fields = {serialized_name for serialized_name, _ in field_map}
@@ -1038,6 +1052,8 @@ def prepare_preprocessing_options(
     train_only_prefixes: Sequence[str] = DEFAULT_TRAIN_ONLY_PREFIXES,
     managed_augmentation_prefix: str | None = None,
     synthetic_sampling_weight: float = DEFAULT_SYNTHETIC_SAMPLING_WEIGHT,
+    refinement_evidence_fraction: float = 0.0,
+    source_only_synthetic_evidence_files: Sequence[str] = (),
     language_pair_count: int = 1,
 ) -> dict[str, Any]:
     """Return the fingerprint/manifest contract for every output-affecting option."""
@@ -1060,11 +1076,13 @@ def prepare_preprocessing_options(
         "record_metadata_fields": list(RECORD_METADATA_FIELDS),
         "record_metadata_format": RECORD_METADATA_FORMAT,
         "record_metadata_index_dtype": RECORD_METADATA_INDEX_DTYPE.descr,
+        "refinement_evidence_fraction": refinement_evidence_fraction,
         "shard_size": shard_size,
         "source_only_languages": list(source_only_languages),
         "translation_directions": [list(direction) for direction in translation_directions],
         "split_key": split_key_schema,
         "synthetic_sampling_weight": synthetic_sampling_weight,
+        "source_only_synthetic_evidence_files": list(source_only_synthetic_evidence_files),
         "test_fraction": test_fraction,
         "train_only_prefixes": list(train_only_prefixes),
         "validation_fraction": validation_fraction,
@@ -1764,10 +1782,10 @@ def _ensure_prepare_final_capacity(
         INDEX_DTYPE.itemsize + RECORD_METADATA_INDEX_DTYPE.itemsize + maximum_direction_payload
     )
     token_bytes = summary.token_ids * np.dtype(np.uint32).itemsize
-    # At most two additional nearly empty shards arise when candidates split
-    # over train, validation, and test. The per-shard allowance covers NumPy
+    # At most three additional nearly empty shards arise when candidates split
+    # over train, validation, test, and refinement evidence. The allowance covers NumPy
     # headers, directory entries, inventory records, and filesystem rounding.
-    maximum_shards = math.ceil(summary.candidate_rows / shard_size) + 2
+    maximum_shards = math.ceil(summary.candidate_rows / shard_size) + 3
     shard_overhead = maximum_shards * _PREPARE_PER_SHARD_OVERHEAD_BYTES
     sqlite_overhead = (
         summary.candidate_rows * _PREPARE_SQLITE_BYTES_PER_CANDIDATE
@@ -2089,9 +2107,7 @@ def _publication_failure_is_resumable(
 def _validate_staging_tree_shape(staging_dir: Path) -> None:
     _assert_regular_directory(staging_dir, role="dataset staging")
     allowed = {
-        "train",
-        "validation",
-        "test",
+        *DATASET_SPLITS,
         RAW_FINGERPRINT_FILENAME,
         "manifest.json",
         PREPARE_COMPLETION_FILENAME,
@@ -2102,7 +2118,7 @@ def _validate_staging_tree_shape(staging_dir: Path) -> None:
             "Dataset staging top-level artifacts differ from the complete contract: "
             f"missing={sorted(allowed - actual)}, unexpected={sorted(actual - allowed)}"
         )
-    for split in ("train", "validation", "test"):
+    for split in DATASET_SPLITS:
         _assert_regular_directory(staging_dir / split, role=f"dataset {split} split")
     for filename in (RAW_FINGERPRINT_FILENAME, "manifest.json", PREPARE_COMPLETION_FILENAME):
         _regular_file_stat(staging_dir / filename, role=f"dataset {filename}")
@@ -2186,6 +2202,7 @@ def _validate_indexed_payload_semantics(
     normalized_pairs: tuple[tuple[str, str], ...],
     translation_directions: tuple[tuple[str, str], ...],
     source_only: tuple[str, ...],
+    synthetic_evidence_source_ids: frozenset[int],
 ) -> None:
     """Validate every field consumed later by the indexed dataset loader."""
 
@@ -2208,12 +2225,10 @@ def _validate_indexed_payload_semantics(
     source_quality = np.zeros(source_count, dtype=np.int64)
     source_src_tokens = np.zeros(source_count, dtype=np.int64)
     source_tgt_tokens = np.zeros(source_count, dtype=np.int64)
-    source_split_rows = {
-        split: np.zeros(source_count, dtype=np.int64) for split in ("train", "validation", "test")
-    }
+    source_split_rows = {split: np.zeros(source_count, dtype=np.int64) for split in DATASET_SPLITS}
     split_rows: dict[str, int] = {}
 
-    for split in ("train", "validation", "test"):
+    for split in DATASET_SPLITS:
         split_dir = staging_dir / split
         index_paths = sorted(split_dir.glob("*.idx.npy"))
         expected_artifacts: set[str] = set()
@@ -2284,11 +2299,19 @@ def _validate_indexed_payload_semantics(
             ):
                 raise ValueError(f"Dataset index register is invalid: {index_path}")
             scoped_direction_rows: dict[int, list[str]] = {}
-            for row_id, (src_language_id, tgt_language_id, forward_flag) in enumerate(
+            for row_id, (
+                src_language_id,
+                tgt_language_id,
+                source_id,
+                forward_flag,
+                synthetic_flag,
+            ) in enumerate(
                 zip(
                     src_language_ids,
                     tgt_language_ids,
+                    source_ids,
                     forward_only,
+                    synthetic,
                     strict=True,
                 )
             ):
@@ -2303,6 +2326,33 @@ def _validate_indexed_payload_semantics(
                 ):
                     raise ValueError(
                         f"Dataset index translation direction is invalid: {index_path}"
+                    )
+                if split in {"validation", "test"} and bool(synthetic_flag):
+                    raise ValueError(
+                        f"Dataset index synthetic rows must not enter {split}: {index_path}"
+                    )
+                if (
+                    split == "refinement_evidence"
+                    and bool(synthetic_flag)
+                    and not (
+                        int(source_id) in synthetic_evidence_source_ids
+                        and source_language in source_only_set
+                        and target_language not in source_only_set
+                        and bool(forward_flag)
+                    )
+                ):
+                    raise ValueError(
+                        "Dataset synthetic refinement evidence contradicts its exact-source "
+                        f"and one-way graph policy: {index_path}"
+                    )
+                if (
+                    split == "refinement_evidence"
+                    and not bool(synthetic_flag)
+                    and int(source_id) in synthetic_evidence_source_ids
+                ):
+                    raise ValueError(
+                        "Dataset exact synthetic evidence source produced an unmarked row: "
+                        f"{index_path}"
                     )
                 if bool(forward_flag) and reverse_trained:
                     scoped_direction_rows[row_id] = [source_language, target_language]
@@ -2406,9 +2456,12 @@ def _validate_indexed_payload_semantics(
         "train": stats.train,
         "validation": stats.validation,
         "test": stats.test,
+        "refinement_evidence": stats.refinement_evidence,
     }:
         raise ValueError("Dataset manifest split counts differ from indexed payload rows")
-    if stats.valid_pairs != stats.train + stats.validation + stats.test:
+    if stats.valid_pairs != (
+        stats.train + stats.validation + stats.test + stats.refinement_evidence
+    ):
         raise ValueError("Dataset manifest total valid pairs differ from its split counts")
     for source_id, expected in enumerate(source_stats):
         derived = {
@@ -2416,6 +2469,7 @@ def _validate_indexed_payload_semantics(
             "train": int(source_split_rows["train"][source_id]),
             "validation": int(source_split_rows["validation"][source_id]),
             "test": int(source_split_rows["test"][source_id]),
+            "refinement_evidence": int(source_split_rows["refinement_evidence"][source_id]),
             "synthetic_pairs": int(source_synthetic[source_id]),
             "forward_only_pairs": int(source_forward_only[source_id]),
             "quality_score_sum": int(source_quality[source_id]),
@@ -2513,9 +2567,23 @@ def _validate_complete_staging(
         "index_dtype": preprocessing_options["record_metadata_index_dtype"],
     }:
         raise ValueError("Dataset manifest record-metadata contract is invalid")
+    raw_evidence_sources = preprocessing_options.get("source_only_synthetic_evidence_files")
+    if not isinstance(raw_evidence_sources, list) or any(
+        not isinstance(name, str) for name in cast(list[object], raw_evidence_sources)
+    ):
+        raise ValueError("Dataset preprocessing synthetic evidence sources are invalid")
+    evidence_source_names = cast(list[str], raw_evidence_sources)
+    if any(
+        Path(name).name != name or "/" in name or "\\" in name for name in evidence_source_names
+    ) or len({name.casefold() for name in evidence_source_names}) != len(evidence_source_names):
+        raise ValueError("Dataset preprocessing synthetic evidence basenames are invalid")
     if manifest.get("synthetic_policy") != {
         "record_field": "synthetic",
-        "train_only": True,
+        "train_only_by_default": True,
+        "source_only_holdout_enabled": bool(evidence_source_names),
+        "source_only_holdout_purpose": "relative-refinement-evidence-only-v1",
+        "source_only_evidence_files": evidence_source_names,
+        "source_only_target_overlap": "allowed-for-relative-evidence-only-v1",
         "sampling_weight": preprocessing_options["synthetic_sampling_weight"],
         "prefixes": list(train_only_prefixes),
     }:
@@ -2529,6 +2597,7 @@ def _validate_complete_staging(
         "shard_size": "shard_size",
         "test_fraction": "test_fraction",
         "validation_fraction": "validation_fraction",
+        "refinement_evidence_fraction": "refinement_evidence_fraction",
     }
     for manifest_name, option_name in direct_option_fields.items():
         if manifest.get(manifest_name) != preprocessing_options[option_name]:
@@ -2553,6 +2622,19 @@ def _validate_complete_staging(
         train_only_prefixes,
         stats,
     )
+    evidence_name_to_id = {
+        Path(snapshot.resolved_path).name: source_id
+        for source_id, snapshot in enumerate(source_snapshots)
+    }
+    missing_evidence_sources = sorted(set(evidence_source_names) - set(evidence_name_to_id))
+    if missing_evidence_sources:
+        raise ValueError(
+            "Dataset preprocessing synthetic evidence sources are absent from the manifest: "
+            f"{missing_evidence_sources}"
+        )
+    synthetic_evidence_source_ids = frozenset(
+        evidence_name_to_id[name] for name in evidence_source_names
+    )
     expected_mean = stats.quality_score_sum / max(stats.valid_pairs, 1)
     raw_mean = manifest.get("mean_quality_score")
     if (
@@ -2569,6 +2651,7 @@ def _validate_complete_staging(
         normalized_pairs=normalized_pairs,
         translation_directions=translation_directions,
         source_only=source_only,
+        synthetic_evidence_source_ids=synthetic_evidence_source_ids,
     )
     validate_dataset_artifact_inventory(staging_dir, manifest)
     completion = _read_json_object(
@@ -2731,13 +2814,15 @@ def _prepare_dataset_locked(
     train_only_prefixes: Sequence[str] = DEFAULT_TRAIN_ONLY_PREFIXES,
     managed_augmentation_prefix: str | None = None,
     synthetic_sampling_weight: float = DEFAULT_SYNTHETIC_SAMPLING_WEIGHT,
+    refinement_evidence_fraction: float = 0.0,
+    source_only_synthetic_evidence_files: Sequence[str] = (),
     num_workers: int | None = None,
     expected_fingerprint: DatasetFingerprint | None = None,
 ) -> PrepareStats:
-    if validation_fraction < 0 or test_fraction < 0:
-        raise ValueError("Validation and test fractions must be non-negative")
-    if validation_fraction + test_fraction >= 0.5:
-        raise ValueError("Validation and test fractions are unexpectedly large")
+    if validation_fraction < 0 or test_fraction < 0 or refinement_evidence_fraction < 0:
+        raise ValueError("Split fractions must be non-negative")
+    if validation_fraction + test_fraction + refinement_evidence_fraction >= 0.5:
+        raise ValueError("Held-out split fractions are unexpectedly large")
     if max_tokens_per_side < 1:
         raise ValueError("max_tokens_per_side must be positive")
     if shard_size < 1:
@@ -2785,6 +2870,35 @@ def _prepare_dataset_locked(
         source_only_languages=source_only,
     )
     direction_set = frozenset(normalized_directions)
+    evidence_source_names: list[str] = []
+    evidence_source_casefolded: set[str] = set()
+    for index, raw_name in enumerate(source_only_synthetic_evidence_files):
+        if not isinstance(raw_name, str):  # pyright: ignore[reportUnnecessaryIsInstance]
+            raise ValueError("source_only_synthetic_evidence_files must contain strings")
+        name = raw_name.strip()
+        if (
+            not name
+            or name != raw_name
+            or Path(name).name != name
+            or "/" in name
+            or "\\" in name
+            or not name.casefold().endswith(".jsonl")
+        ):
+            raise ValueError("source_only_synthetic_evidence_files must contain exact basenames")
+        folded = name.casefold()
+        if folded in evidence_source_casefolded:
+            raise ValueError(
+                "source_only_synthetic_evidence_files contains a case-insensitive "
+                f"duplicate at index {index}"
+            )
+        evidence_source_casefolded.add(folded)
+        evidence_source_names.append(name)
+    if evidence_source_names and refinement_evidence_fraction <= 0.0:
+        raise ValueError(
+            "source_only_synthetic_evidence_files requires a positive refinement_evidence_fraction"
+        )
+    if evidence_source_names and not source_only:
+        raise ValueError("source_only_synthetic_evidence_files requires source_only_languages")
 
     preprocessing_options = prepare_preprocessing_options(
         shard_size=shard_size,
@@ -2801,11 +2915,30 @@ def _prepare_dataset_locked(
         train_only_prefixes=train_only_prefixes,
         managed_augmentation_prefix=managed_augmentation_prefix,
         synthetic_sampling_weight=synthetic_sampling_weight,
+        refinement_evidence_fraction=refinement_evidence_fraction,
+        source_only_synthetic_evidence_files=evidence_source_names,
         language_pair_count=len(normalized_pairs),
     )
     endpoint_key_schema = cast(str, preprocessing_options["endpoint_leakage_key"])
     split_key_schema = cast(str, preprocessing_options["split_key"])
     paths, source_snapshots = _capture_input_snapshots(input_patterns)
+    path_by_name = {path.name: path for path in paths}
+    missing_evidence_sources = sorted(set(evidence_source_names) - set(path_by_name))
+    if missing_evidence_sources:
+        raise ValueError(
+            "source-only synthetic evidence files are absent from dataset inputs: "
+            f"{missing_evidence_sources}"
+        )
+    non_synthetic_evidence_sources = [
+        name
+        for name in evidence_source_names
+        if not synthetic_path(path_by_name[name], train_only_prefixes)
+    ]
+    if non_synthetic_evidence_sources:
+        raise ValueError(
+            "source-only synthetic evidence files must match an authenticated synthetic "
+            f"prefix: {non_synthetic_evidence_sources}"
+        )
     if managed_augmentation_prefix is not None:
         # Imported lazily because augmentation accounting reuses this module's
         # preprocessing contract. Official train/prepare callers hold the raw
@@ -3006,13 +3139,13 @@ def _prepare_dataset_locked(
         + RECORD_METADATA_INDEX_DTYPE.itemsize
         + 512
     )
-    # Three split writers stay open concurrently. The exact pre-dedup capacity
+    # Four split writers stay open concurrently. The exact pre-dedup capacity
     # plan above covers the complete staging generation; this smaller rolling
     # reserve still catches external disk consumption between shard openings.
-    concurrent_shard_reserve = maximum_shard_bytes * 3
+    concurrent_shard_reserve = maximum_shard_bytes * len(DATASET_SPLITS)
     writers: dict[str, ShardWriter] = {}
     try:
-        for split in ("train", "validation", "test"):
+        for split in DATASET_SPLITS:
             writers[split] = ShardWriter(
                 staging_dir,
                 split,
@@ -3037,10 +3170,16 @@ def _prepare_dataset_locked(
     per_source_stats = [PrepareStats() for _ in paths]
     estimated_pairs = max(1, sum(snapshot.size for snapshot in source_snapshots) // 200)
     target_split_guard = (
-        TargetSplitGuard(estimated_pairs, validation_fraction, test_fraction)
+        TargetSplitGuard(
+            estimated_pairs,
+            validation_fraction,
+            test_fraction,
+            refinement_evidence_fraction,
+        )
         if prevent_target_leakage
         else None
     )
+    evidence_source_name_set = frozenset(evidence_source_names)
 
     def replay_batches() -> Iterator[list[_PrepareEvent]]:
         for descriptor in expected_descriptors:
@@ -3175,40 +3314,71 @@ def _prepare_dataset_locked(
                 is_synthetic = record_is_synthetic or synthetic_path(
                     paths[source_id], train_only_prefixes
                 )
-                if is_synthetic:
-                    split = "train"
-                elif len(normalized_pairs) > 1:
+                if len(normalized_pairs) > 1:
                     split_key = f"record\0{record_group_key}"
-                    split = choose_split_for_key(
-                        split_key,
-                        validation_fraction,
-                        test_fraction,
-                    )
                 else:
                     split_key = endpoint_split_key(
                         language_a,
                         text_a,
                         approximate=approximate_split,
                     )
-                    split = choose_split_for_key(
-                        split_key,
-                        validation_fraction,
-                        test_fraction,
+                candidate_split = choose_split_for_key(
+                    split_key,
+                    validation_fraction,
+                    test_fraction,
+                    refinement_evidence_fraction,
+                )
+                if is_synthetic:
+                    selected_evidence_group = bool(
+                        paths[source_id].name in evidence_source_name_set
+                        and candidate_split == "refinement_evidence"
                     )
+                    eligible_source_only_edge = bool(
+                        language_a in source_only and language_b not in source_only and forward_only
+                    )
+                    if selected_evidence_group and eligible_source_only_edge:
+                        split = "refinement_evidence"
+                    elif selected_evidence_group:
+                        # One multilingual synthetic record may also expand into
+                        # an ordinary sibling pair. Withhold that sibling rather
+                        # than leaking the same provenance group back into train.
+                        for target in targets:
+                            _increment(target, "split_conflicts")
+                        continue
+                    else:
+                        split = "train"
+                else:
+                    split = candidate_split
                 if target_split_guard is not None:
-                    endpoint_digests = (
-                        endpoint_split_digest(
-                            language_a,
-                            text_a,
-                            approximate=approximate_split,
-                        ),
-                        endpoint_split_digest(
-                            language_b,
-                            text_b,
-                            approximate=approximate_split,
-                        ),
+                    source_endpoint_digest = endpoint_split_digest(
+                        language_a,
+                        text_a,
+                        approximate=approximate_split,
                     )
-                    if not target_split_guard.accept_many(split, endpoint_digests):
+                    if split == "refinement_evidence" and is_synthetic:
+                        accepted_by_split_guard = target_split_guard.accept_refinement_evidence_with_training_target_overlap(
+                            isolated_digests=(source_endpoint_digest,),
+                            training_overlap_digests=(
+                                endpoint_split_digest(
+                                    language_b,
+                                    text_b,
+                                    approximate=approximate_split,
+                                ),
+                            ),
+                        )
+                    else:
+                        accepted_by_split_guard = target_split_guard.accept_many(
+                            split,
+                            (
+                                source_endpoint_digest,
+                                endpoint_split_digest(
+                                    language_b,
+                                    text_b,
+                                    approximate=approximate_split,
+                                ),
+                            ),
+                        )
+                    if not accepted_by_split_guard:
                         for target in targets:
                             _increment(target, "split_conflicts")
                         continue
@@ -3361,7 +3531,11 @@ def _prepare_dataset_locked(
             "train_only_prefixes": list(train_only_prefixes),
             "synthetic_policy": {
                 "record_field": "synthetic",
-                "train_only": True,
+                "train_only_by_default": True,
+                "source_only_holdout_enabled": bool(evidence_source_names),
+                "source_only_holdout_purpose": "relative-refinement-evidence-only-v1",
+                "source_only_evidence_files": list(evidence_source_names),
+                "source_only_target_overlap": "allowed-for-relative-evidence-only-v1",
                 "sampling_weight": synthetic_sampling_weight,
                 "prefixes": list(train_only_prefixes),
             },
@@ -3390,6 +3564,7 @@ def _prepare_dataset_locked(
             "shard_size": shard_size,
             "validation_fraction": validation_fraction,
             "test_fraction": test_fraction,
+            "refinement_evidence_fraction": refinement_evidence_fraction,
             "quality_filter_enabled": filter_quality,
             "quality_policy": quality_policy.to_dict(),
             "target_leakage_guard_enabled": prevent_target_leakage,
@@ -3472,6 +3647,8 @@ def prepare_dataset(
     train_only_prefixes: Sequence[str] = DEFAULT_TRAIN_ONLY_PREFIXES,
     managed_augmentation_prefix: str | None = None,
     synthetic_sampling_weight: float = DEFAULT_SYNTHETIC_SAMPLING_WEIGHT,
+    refinement_evidence_fraction: float = 0.0,
+    source_only_synthetic_evidence_files: Sequence[str] = (),
     num_workers: int | None = None,
     expected_fingerprint: DatasetFingerprint | None = None,
 ) -> PrepareStats:
@@ -3499,6 +3676,8 @@ def prepare_dataset(
             train_only_prefixes=train_only_prefixes,
             managed_augmentation_prefix=managed_augmentation_prefix,
             synthetic_sampling_weight=synthetic_sampling_weight,
+            refinement_evidence_fraction=refinement_evidence_fraction,
+            source_only_synthetic_evidence_files=source_only_synthetic_evidence_files,
             num_workers=num_workers,
             expected_fingerprint=expected_fingerprint,
         )

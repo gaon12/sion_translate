@@ -7,7 +7,7 @@ import warnings
 from dataclasses import asdict, dataclass, field
 import math
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, cast, Sequence
 
 import yaml
 from yaml.constructor import ConstructorError
@@ -313,6 +313,15 @@ class DataConfig:
     synthetic_prefix: str = "bt_"
     synthetic_prefixes: list[str] = field(default_factory=lambda: list(DEFAULT_SYNTHETIC_PREFIXES))
     synthetic_sampling_weight: float = DEFAULT_SYNTHETIC_SAMPLING_WEIGHT
+    # Reserve this fraction in a dedicated candidate-refinement evidence split.
+    # It is separate from validation/test because relative T1-to-T2 evidence
+    # must never influence absolute quality selection or early stopping.
+    refinement_evidence_fraction: float = 0.0
+    # Exact synthetic source basenames allowed to contribute source-only rows to
+    # the refinement evidence split. Prefixes are intentionally insufficient:
+    # adding a future synthetic file must not silently change release evidence.
+    # These rows remain synthetic and are not absolute-quality evidence.
+    source_only_synthetic_evidence_files: list[str] = field(default_factory=list)
     # Record that true ``source <draft> draft -> gold`` examples are present.
     # The training CLI detects ``revise_`` inputs automatically; set this only
     # when an equivalent reviewed source uses another file name.
@@ -373,6 +382,41 @@ class DataConfig:
             field="data.source_only_languages",
             reject_duplicates=False,
         )
+
+    def configured_source_only_synthetic_evidence_files(self) -> tuple[str, ...]:
+        """Return exact, path-safe synthetic evidence source basenames."""
+
+        raw_files = cast(object, self.source_only_synthetic_evidence_files)
+        if not isinstance(raw_files, list):
+            raise ValueError(
+                "data.source_only_synthetic_evidence_files must be a list of basenames"
+            )
+        normalized: list[str] = []
+        seen_casefolded: set[str] = set()
+        for index, raw_name in enumerate(cast(list[object], raw_files)):
+            if not isinstance(raw_name, str):
+                raise ValueError("data.source_only_synthetic_evidence_files must contain strings")
+            name = raw_name.strip()
+            if (
+                not name
+                or name != raw_name
+                or Path(name).name != name
+                or "/" in name
+                or "\\" in name
+                or not name.casefold().endswith(".jsonl")
+            ):
+                raise ValueError(
+                    "data.source_only_synthetic_evidence_files must contain exact basenames"
+                )
+            folded = name.casefold()
+            if folded in seen_casefolded:
+                raise ValueError(
+                    "data.source_only_synthetic_evidence_files contains a duplicate "
+                    f"basename at index {index}"
+                )
+            seen_casefolded.add(folded)
+            normalized.append(name)
+        return tuple(normalized)
 
     def configured_translation_directions(self) -> tuple[tuple[str, str], ...]:
         """Return the directed edges the indexed dataset can actually train."""
@@ -769,6 +813,22 @@ class AppConfig:
         self.data.configured_synthetic_prefixes()
         if not 0.0 <= self.data.synthetic_sampling_weight <= 1.0:
             raise ValueError("synthetic_sampling_weight must be in [0, 1]")
+        evidence_fraction = cast(object, self.data.refinement_evidence_fraction)
+        if (
+            isinstance(evidence_fraction, bool)
+            or not isinstance(evidence_fraction, (int, float))
+            or not math.isfinite(float(evidence_fraction))
+            or not 0.0 <= float(evidence_fraction) < 0.5
+        ):
+            raise ValueError("refinement_evidence_fraction must be in [0, 0.5)")
+        evidence_files = self.data.configured_source_only_synthetic_evidence_files()
+        if evidence_files and float(evidence_fraction) <= 0.0:
+            raise ValueError(
+                "source_only_synthetic_evidence_files requires a positive "
+                "refinement_evidence_fraction"
+            )
+        if evidence_files and not self.data.configured_source_only_languages():
+            raise ValueError("source_only_synthetic_evidence_files requires source_only_languages")
         if not 0.0 <= self.data.denoise_probability <= 1.0:
             raise ValueError("denoise_probability must be in [0, 1]")
         if not 0.0 <= self.data.validation_denoise_probability <= 1.0:
