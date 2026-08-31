@@ -164,6 +164,7 @@ data:
 #   source_sampling_weights:
 #     noisy_source.jsonl: 0.40
 #   num_workers: 8              # Otherwise derived from assigned CPU/GPU resources.
+#   dataloader_timeout_seconds: 300  # Abort instead of billing forever on a stuck worker.
 
 foundation:
   # Optional reasoning JSONL rows use prompt-to-delimited-trace supervision.

@@ -553,10 +553,19 @@ def dataloader_runtime_kwargs(
     device: torch.device,
     *,
     training: bool,
+    timeout_seconds: float = 300.0,
 ) -> dict[str, Any]:
-    """Build stage-specific loader settings without retaining idle worker pools."""
+    """Build stage-specific loader settings with a bounded worker wait."""
 
     workers = max(0, num_workers)
+    raw_timeout = cast(object, timeout_seconds)
+    if (
+        isinstance(raw_timeout, bool)
+        or not isinstance(raw_timeout, (int, float))
+        or not math.isfinite(float(raw_timeout))
+        or float(raw_timeout) <= 0.0
+    ):
+        raise ValueError("DataLoader timeout_seconds must be a finite positive number")
     options: dict[str, Any] = {
         "num_workers": workers,
         "pin_memory": device.type == "cuda",
@@ -566,6 +575,9 @@ def dataloader_runtime_kwargs(
             {
                 "persistent_workers": training,
                 "prefetch_factor": 4 if training else 2,
+                # DataLoader's zero default can wait forever after a worker,
+                # filesystem, or shard failure while the GPU remains allocated.
+                "timeout": float(raw_timeout),
             }
         )
     return options
@@ -3794,6 +3806,7 @@ def run_foundation_stage(
             foundation_config.data.num_workers,
             context.device,
             training=True,
+            timeout_seconds=foundation_config.data.dataloader_timeout_seconds,
         ),
     )
     validation_loader = DataLoader(
@@ -3804,6 +3817,7 @@ def run_foundation_stage(
             0 if foundation_config.data.num_workers == 0 else 1,
             context.device,
             training=False,
+            timeout_seconds=foundation_config.data.dataloader_timeout_seconds,
         ),
     )
 
@@ -4769,6 +4783,7 @@ def main() -> None:
             config.data.num_workers,
             context.device,
             training=True,
+            timeout_seconds=config.data.dataloader_timeout_seconds,
         )
         validation_workers = (
             0 if config.data.num_workers == 0 else min(4, max(1, config.data.num_workers // 4))
@@ -4777,6 +4792,7 @@ def main() -> None:
             validation_workers,
             context.device,
             training=False,
+            timeout_seconds=config.data.dataloader_timeout_seconds,
         )
         # ── Construct and distribute the model ───────────────────────────
         announce("Constructing the model and placing it on devices.", context)

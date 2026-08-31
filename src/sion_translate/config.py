@@ -350,6 +350,10 @@ class DataConfig:
     denoise_noise_density: float = 0.15
     denoise_mean_span: float = 3.0
     num_workers: int = 4
+    # Stop a paid GPU run when a worker cannot produce the next batch. PyTorch's
+    # default is zero, which waits forever. This timeout is used only when
+    # ``num_workers`` is positive because single-process DataLoaders require zero.
+    dataloader_timeout_seconds: float = 300.0
     bucket_size: int = 4096
     source_sampling_alpha: float = 1.0
     source_sampling_weights: dict[str, float] = field(default_factory=dict)
@@ -847,6 +851,14 @@ class AppConfig:
             raise ValueError("pad_to_multiple_of must be at least 1")
         if self.data.num_workers < 0:
             raise ValueError("num_workers must be non-negative")
+        loader_timeout = cast(object, self.data.dataloader_timeout_seconds)
+        if (
+            isinstance(loader_timeout, bool)
+            or not isinstance(loader_timeout, (int, float))
+            or not math.isfinite(float(loader_timeout))
+            or float(loader_timeout) <= 0.0
+        ):
+            raise ValueError("dataloader_timeout_seconds must be a finite positive number")
         if self.data.bucket_size <= 0:
             raise ValueError("bucket_size must be positive")
         if self.data.source_sampling_alpha <= 0.0:

@@ -296,6 +296,13 @@ runs garbage collection, and clears the CUDA allocator cache. A high reserved va
 a low allocated value may be harmless allocator caching. A high allocated value means a
 live tensor still exists and needs investigation.
 
+Every multi-process DataLoader also has a finite batch wait. The default
+`data.dataloader_timeout_seconds: 300` stops the run when a dead worker, unreadable shard,
+or stalled filesystem cannot return the next batch. Increase it only after confirming that
+healthy batch preparation really needs more than five minutes. A single-process loader uses
+PyTorch's required zero timeout internally, but it cannot leave a separate worker process
+stuck.
+
 ## 10. Create final exports
 
 Intermediate `exports/best` keeps only lightweight native state so large CPU conversions

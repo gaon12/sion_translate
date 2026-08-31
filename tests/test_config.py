@@ -33,6 +33,15 @@ def test_default_paths_use_the_stable_public_layout() -> None:
     assert TrainingConfig().output_dir == "runs/auto"
 
 
+@pytest.mark.parametrize("timeout", (True, 0, -1, float("nan"), float("inf"), "300"))
+def test_dataloader_timeout_must_be_a_finite_positive_number(timeout: object) -> None:
+    config = AppConfig()
+    config.data.dataloader_timeout_seconds = timeout  # type: ignore[assignment]
+
+    with pytest.raises(ValueError, match="dataloader_timeout_seconds"):
+        config.validate()
+
+
 @pytest.mark.parametrize(
     "prefix",
     ("../bt_", "..\\bt_", "/bt_", "C:\\bt_", "bad:name", "bad*name", "trailing "),

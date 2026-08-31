@@ -582,8 +582,8 @@ def test_artifact_preparation_hashes_the_full_bundle_before_scanning_sources(
 
 def test_dataloader_runtime_settings_separate_training_and_validation() -> None:
     device = torch.device("cuda")
-    training = dataloader_runtime_kwargs(12, device, training=True)
-    validation = dataloader_runtime_kwargs(3, device, training=False)
+    training = dataloader_runtime_kwargs(12, device, training=True, timeout_seconds=45.5)
+    validation = dataloader_runtime_kwargs(3, device, training=False, timeout_seconds=90)
     single_process = dataloader_runtime_kwargs(0, torch.device("cpu"), training=True)
 
     assert training == {
@@ -591,14 +591,29 @@ def test_dataloader_runtime_settings_separate_training_and_validation() -> None:
         "pin_memory": True,
         "persistent_workers": True,
         "prefetch_factor": 4,
+        "timeout": 45.5,
     }
     assert validation == {
         "num_workers": 3,
         "pin_memory": True,
         "persistent_workers": False,
         "prefetch_factor": 2,
+        "timeout": 90.0,
     }
     assert single_process == {"num_workers": 0, "pin_memory": False}
+
+
+@pytest.mark.parametrize("timeout", (True, 0, -1, float("nan"), float("inf")))
+def test_dataloader_runtime_rejects_an_unbounded_or_invalid_timeout(
+    timeout: object,
+) -> None:
+    with pytest.raises(ValueError, match="finite positive"):
+        dataloader_runtime_kwargs(
+            1,
+            torch.device("cpu"),
+            training=True,
+            timeout_seconds=timeout,  # type: ignore[arg-type]
+        )
 
 
 def test_collator_pipeline_passes_configured_source_only_languages() -> None:
