@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import subprocess
 from types import SimpleNamespace
@@ -533,8 +534,11 @@ def test_dependency_runtime_matches_the_authenticated_gpu_lock() -> None:
     report = easy_run._validate_installed_dependency_runtime(
         _locked_runtime_torch(),
         python_version=(3, 11),
+        python_implementation="CPython",
         operating_system="Linux",
         machine="x86_64",
+        libc_name="glibc",
+        libc_version="2.36",
         distribution_version=locked.__getitem__,
     )
 
@@ -548,8 +552,11 @@ def test_dependency_runtime_matches_the_authenticated_gpu_lock() -> None:
         ("cuda", "12.6", "compiled for CUDA"),
         ("numpy", "2.4.5", "numpy"),
         ("python", (3, 12), "Python 3.12"),
+        ("implementation", "PyPy", "Python implementation"),
         ("system", "Windows", "operating system"),
         ("machine", "aarch64", "machine"),
+        ("libc_name", "musl", "C library"),
+        ("libc_version", "2.27", "manylinux_2_28"),
     ),
 )
 def test_dependency_runtime_rejects_any_lock_or_platform_mismatch(
@@ -565,18 +572,27 @@ def test_dependency_runtime_rejects_any_lock_or_platform_mismatch(
         "transformers": "5.16.1",
     }
     python_version = (3, 11)
+    python_implementation = "CPython"
     operating_system = "Linux"
     machine = "x86_64"
+    libc_name = "glibc"
+    libc_version = "2.36"
     if field == "torch":
         torch_module.__version__ = replacement
     elif field == "cuda":
         torch_module.version.cuda = replacement
     elif field == "python":
         python_version = replacement  # type: ignore[assignment]
+    elif field == "implementation":
+        python_implementation = str(replacement)
     elif field == "system":
         operating_system = str(replacement)
     elif field == "machine":
         machine = str(replacement)
+    elif field == "libc_name":
+        libc_name = str(replacement)
+    elif field == "libc_version":
+        libc_version = str(replacement)
     else:
         locked[field] = str(replacement)
 
@@ -584,8 +600,11 @@ def test_dependency_runtime_rejects_any_lock_or_platform_mismatch(
         easy_run._validate_installed_dependency_runtime(
             torch_module,
             python_version=python_version,
+            python_implementation=python_implementation,
             operating_system=operating_system,
             machine=machine,
+            libc_name=libc_name,
+            libc_version=libc_version,
             distribution_version=locked.__getitem__,
         )
 
@@ -604,10 +623,36 @@ def test_dependency_runtime_reports_missing_locked_packages() -> None:
         easy_run._validate_installed_dependency_runtime(
             _locked_runtime_torch(),
             python_version=(3, 11),
+            python_implementation="CPython",
             operating_system="Linux",
             machine="x86_64",
+            libc_name="glibc",
+            libc_version="2.36",
             distribution_version=missing_version,
         )
+
+
+def _cuda_canary_report(device_index: int, **overrides: object) -> dict[str, object]:
+    report: dict[str, object] = {
+        "schema": "sion-cuda-canary-v1",
+        "status": "passed",
+        "device_index": device_index,
+        "device_name": "NVIDIA test GPU",
+        "compute_capability": [9, 0],
+        "total_memory_bytes": 85_000_000_000,
+        "torch": "2.10.0+cu128",
+        "compiled_cuda": "12.8",
+        "bf16": True,
+        "gqa_query_heads": 12,
+        "gqa_kv_heads": 6,
+        "head_dimension": 72,
+        "gradient_norm": 0.75,
+        "nccl_all_reduce": True,
+        "peak_allocated_bytes": 1_048_576,
+        "elapsed_seconds": 0.25,
+    }
+    report.update(overrides)
+    return report
 
 
 def test_cuda_canary_runner_checks_every_device_with_a_hard_timeout(
@@ -622,16 +667,12 @@ def test_cuda_canary_runner_checks_every_device_with_a_hard_timeout(
         device_index = int(command[-1])
         return SimpleNamespace(
             returncode=0,
-            stdout=(
-                '{"schema":"sion-cuda-canary-v1","status":"passed",'
-                '"device_name":"NVIDIA test GPU",'
-                f'"device_index":{device_index},"elapsed_seconds":0.25,'
-                '"peak_allocated_bytes":1048576}\n'
-            ),
+            stdout=json.dumps(_cuda_canary_report(device_index)) + "\n",
             stderr="",
         )
 
     monkeypatch.setattr(easy_run.subprocess, "run", successful_run)
+    monkeypatch.setattr(easy_run, "_run_multi_gpu_nccl_canary", lambda _count, _env: [])
     reports = easy_run._run_cuda_kernel_canaries(2, {"PYTHONPATH": "test"})
 
     assert [report["device_index"] for report in reports] == [0, 1]
@@ -677,3 +718,151 @@ def test_cuda_canary_rejects_a_success_report_for_the_wrong_device(monkeypatch) 
     )
     with pytest.raises(SystemExit, match="invalid success report"):
         easy_run._run_one_cuda_kernel_canary(0, {})
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    (
+        ({"gradient_norm": float("inf")}, "valid JSON report"),
+        ({"elapsed_seconds": float("nan")}, "valid JSON report"),
+        ({"torch": "2.10.1+cu128"}, "invalid success report"),
+        ({"compiled_cuda": "12.7"}, "invalid success report"),
+        ({"bf16": False}, "invalid success report"),
+        ({"peak_allocated_bytes": 0}, "invalid success report"),
+    ),
+)
+def test_cuda_canary_rejects_malformed_or_incompatible_reports(
+    monkeypatch,
+    overrides: dict[str, object],
+    message: str,
+) -> None:
+    monkeypatch.setattr(
+        easy_run.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(_cuda_canary_report(0, **overrides)) + "\n",
+            stderr="",
+        ),
+    )
+
+    with pytest.raises(SystemExit, match=message):
+        easy_run._run_one_cuda_kernel_canary(0, {})
+
+
+def _distributed_nccl_report(rank: int, world_size: int = 2) -> dict[str, object]:
+    return {
+        "schema": "sion-distributed-nccl-canary-v1",
+        "status": "passed",
+        "rank": rank,
+        "world_size": world_size,
+        "device_index": rank,
+        "all_reduce_value": world_size * (world_size + 1) / 2,
+        "torch": "2.10.0+cu128",
+        "compiled_cuda": "12.8",
+        "elapsed_seconds": 0.5,
+    }
+
+
+def test_distributed_nccl_canary_uses_one_bounded_torchrun_process(monkeypatch) -> None:
+    observed: dict[str, object] = {}
+
+    class SuccessfulProcess:
+        returncode = 0
+        pid = 123
+
+        def communicate(self, timeout=None):
+            observed["timeout"] = timeout
+            stdout = "\n".join(json.dumps(_distributed_nccl_report(rank)) for rank in range(2))
+            return stdout, ""
+
+        def poll(self):
+            return self.returncode
+
+    def launch(command: list[str], **kwargs):
+        observed["command"] = command
+        observed["options"] = kwargs
+        return SuccessfulProcess()
+
+    monkeypatch.setattr(easy_run.subprocess, "Popen", launch)
+    reports = easy_run._run_multi_gpu_nccl_canary(2, {"PYTHONPATH": "test"})
+
+    assert [report["rank"] for report in reports] == [0, 1]
+    assert "torch.distributed.run" in observed["command"]
+    assert "--nproc-per-node=2" in observed["command"]
+    assert observed["timeout"] == easy_run.NCCL_CANARY_TIMEOUT_SECONDS
+    assert observed["options"]["start_new_session"] is (easy_run.os.name != "nt")
+
+
+def test_distributed_nccl_canary_rejects_missing_or_duplicate_ranks(monkeypatch) -> None:
+    class DuplicateRankProcess:
+        returncode = 0
+        pid = 123
+
+        def communicate(self, timeout=None):
+            report = json.dumps(_distributed_nccl_report(0))
+            return f"{report}\n{report}\n", ""
+
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setattr(
+        easy_run.subprocess, "Popen", lambda *args, **kwargs: DuplicateRankProcess()
+    )
+
+    with pytest.raises(SystemExit, match="exactly one valid report from every GPU"):
+        easy_run._run_multi_gpu_nccl_canary(2, {})
+
+
+def test_distributed_nccl_timeout_kills_every_worker(monkeypatch) -> None:
+    killed: list[object] = []
+
+    class TimedOutProcess:
+        returncode = None
+        pid = 123
+        calls = 0
+
+        def communicate(self, timeout=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise subprocess.TimeoutExpired("torchrun", timeout)
+            return "", ""
+
+        def poll(self):
+            return self.returncode
+
+    process = TimedOutProcess()
+    monkeypatch.setattr(easy_run.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(easy_run, "_kill_process_group", lambda candidate: killed.append(candidate))
+
+    with pytest.raises(SystemExit, match="timed out.*Training was not started"):
+        easy_run._run_multi_gpu_nccl_canary(2, {})
+
+    assert killed == [process]
+
+
+def test_distributed_nccl_keyboard_interrupt_kills_every_worker(monkeypatch) -> None:
+    killed: list[object] = []
+
+    class InterruptedProcess:
+        returncode = None
+        pid = 123
+        calls = 0
+
+        def communicate(self, timeout=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise KeyboardInterrupt
+            return "", ""
+
+        def poll(self):
+            return self.returncode
+
+    process = InterruptedProcess()
+    monkeypatch.setattr(easy_run.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(easy_run, "_kill_process_group", lambda candidate: killed.append(candidate))
+
+    with pytest.raises(KeyboardInterrupt):
+        easy_run._run_multi_gpu_nccl_canary(2, {})
+
+    assert killed == [process]

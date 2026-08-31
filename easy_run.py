@@ -15,8 +15,10 @@ from dataclasses import dataclass
 import hashlib
 from importlib import metadata as importlib_metadata
 import json
+import math
 import os
 import platform
+import signal
 import shlex
 import shutil
 import subprocess
@@ -45,6 +47,7 @@ PREPARED_ARTIFACT_DIRECTORIES = ("tokenizer", "dataset", "foundation_dataset")
 LOCAL_CHECKOUT_FLAG = "--allow-local-checkout"
 TMUX_SUPPORTED = os.name != "nt"
 CUDA_CANARY_TIMEOUT_SECONDS = 60
+NCCL_CANARY_TIMEOUT_SECONDS = 60
 
 
 @dataclass(frozen=True)
@@ -407,15 +410,22 @@ def _validate_installed_dependency_runtime(
     torch_module,
     *,
     python_version: tuple[int, int] | None = None,
+    python_implementation: str | None = None,
     operating_system: str | None = None,
     machine: str | None = None,
+    libc_name: str | None = None,
+    libc_version: str | None = None,
     distribution_version=None,
 ) -> dict[str, str]:
-    """Require the running interpreter and packages to match the reviewed GPU lock."""
+    """Require the live runtime target and versions to match the reviewed GPU lock."""
 
     resolved_python = python_version or (sys.version_info.major, sys.version_info.minor)
+    resolved_implementation = (python_implementation or platform.python_implementation()).lower()
     resolved_system = (operating_system or platform.system()).lower()
     resolved_machine = (machine or platform.machine()).lower()
+    detected_libc_name, detected_libc_version = platform.libc_ver()
+    resolved_libc_name = (libc_name or detected_libc_name).lower()
+    resolved_libc_version = libc_version or detected_libc_version
     version_reader = distribution_version or importlib_metadata.version
     actual_versions = {"torch": str(torch_module.__version__)}
     missing: list[str] = []
@@ -436,6 +446,11 @@ def _validate_installed_dependency_runtime(
             f"Python {resolved_python[0]}.{resolved_python[1]} is installed; "
             f"expected {expected_python[0]}.{expected_python[1]}"
         )
+    if resolved_implementation != str(EXPECTED_DEPENDENCY_TARGET["python_implementation"]):
+        mismatches.append(
+            f"Python implementation {resolved_implementation!r} is installed; expected "
+            f"{EXPECTED_DEPENDENCY_TARGET['python_implementation']!r}"
+        )
     if resolved_system != str(EXPECTED_DEPENDENCY_TARGET["os"]):
         mismatches.append(
             f"operating system {resolved_system!r} is installed; "
@@ -446,6 +461,18 @@ def _validate_installed_dependency_runtime(
         mismatches.append(
             f"machine {resolved_machine!r} is installed; "
             f"expected {EXPECTED_DEPENDENCY_TARGET['machine']!r}"
+        )
+    expected_manylinux = str(EXPECTED_DEPENDENCY_TARGET["manylinux"])
+    try:
+        required_glibc = tuple(int(part) for part in expected_manylinux.split("_", maxsplit=1))
+        actual_glibc = tuple(int(part) for part in resolved_libc_version.split(".")[:2])
+    except (TypeError, ValueError):
+        actual_glibc = ()
+        required_glibc = (2, 28)
+    if resolved_libc_name != "glibc" or actual_glibc < required_glibc:
+        mismatches.append(
+            f"C library {resolved_libc_name or 'unknown'} {resolved_libc_version or 'unknown'} "
+            f"is installed; expected glibc compatible with manylinux_{expected_manylinux} or newer"
         )
     for package, expected in EXPECTED_RUNTIME_VERSIONS.items():
         actual = actual_versions.get(package)
@@ -463,13 +490,269 @@ def _validate_installed_dependency_runtime(
     if mismatches:
         details = "\n".join(f"  - {message}" for message in mismatches)
         raise SystemExit(
-            "[easy_run] The installed GPU runtime does not match the authenticated lock:\n"
+            "[easy_run] The live GPU runtime target or versions do not match the "
+            "authenticated dependency contract:\n"
             f"{details}\n"
             "Recreate .venv with CPython 3.11 and run the authenticated uv pip sync "
             "command from the retraining runbook before allocating GPUs."
         )
     actual_versions["cuda"] = compiled_cuda
     return actual_versions
+
+
+_CUDA_CANARY_REPORT_FIELDS = frozenset(
+    {
+        "schema",
+        "status",
+        "device_index",
+        "device_name",
+        "compute_capability",
+        "total_memory_bytes",
+        "torch",
+        "compiled_cuda",
+        "bf16",
+        "gqa_query_heads",
+        "gqa_kv_heads",
+        "head_dimension",
+        "gradient_norm",
+        "nccl_all_reduce",
+        "peak_allocated_bytes",
+        "elapsed_seconds",
+    }
+)
+
+
+def _reject_nonfinite_json_constant(value: str) -> None:
+    raise ValueError(f"non-finite JSON constant is forbidden: {value}")
+
+
+def _load_strict_json_report(line: str, *, role: str) -> dict[str, object]:
+    """Decode one child report while rejecting JSON's optional NaN extensions."""
+
+    try:
+        value = json.loads(line, parse_constant=_reject_nonfinite_json_constant)
+    except (json.JSONDecodeError, ValueError) as error:
+        raise SystemExit(f"[easy_run] {role} returned no valid JSON report") from error
+    if not isinstance(value, dict):
+        raise SystemExit(f"[easy_run] {role} returned a non-object JSON report")
+    return value
+
+
+def _is_finite_number(value: object) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(float(value))
+    )
+
+
+def _validate_cuda_canary_report(
+    report: dict[str, object],
+    *,
+    device_index: int,
+) -> dict[str, object]:
+    """Validate every field before a CUDA child is trusted as a success."""
+
+    capability = report.get("compute_capability")
+    device_name = report.get("device_name")
+    total_memory = report.get("total_memory_bytes")
+    gradient_norm = report.get("gradient_norm")
+    peak_memory = report.get("peak_allocated_bytes")
+    elapsed = report.get("elapsed_seconds")
+    expected_cuda = str(EXPECTED_DEPENDENCY_TARGET["torch_backend"]).removeprefix("cu")
+    expected_cuda = f"{int(expected_cuda) // 10}.{int(expected_cuda) % 10}"
+    valid = (
+        set(report) == _CUDA_CANARY_REPORT_FIELDS
+        and report.get("schema") == "sion-cuda-canary-v1"
+        and report.get("status") == "passed"
+        and not isinstance(report.get("device_index"), bool)
+        and report.get("device_index") == device_index
+        and isinstance(device_name, str)
+        and bool(device_name.strip())
+        and len(device_name) <= 512
+        and isinstance(capability, list)
+        and len(capability) == 2
+        and all(
+            not isinstance(part, bool) and isinstance(part, int) and 0 <= part <= 99
+            for part in capability
+        )
+        and capability[0] >= 8
+        and not isinstance(total_memory, bool)
+        and isinstance(total_memory, int)
+        and total_memory > 0
+        and report.get("torch") == EXPECTED_RUNTIME_VERSIONS["torch"]
+        and report.get("compiled_cuda") == expected_cuda
+        and report.get("bf16") is True
+        and report.get("gqa_query_heads") == 12
+        and report.get("gqa_kv_heads") == 6
+        and report.get("head_dimension") == 72
+        and _is_finite_number(gradient_norm)
+        and float(gradient_norm) >= 0.0
+        and isinstance(report.get("nccl_all_reduce"), bool)
+        and not isinstance(peak_memory, bool)
+        and isinstance(peak_memory, int)
+        and peak_memory > 0
+        and _is_finite_number(elapsed)
+        and 0.0 < float(elapsed) <= CUDA_CANARY_TIMEOUT_SECONDS
+    )
+    if not valid:
+        raise SystemExit(
+            f"[easy_run] CUDA canary on device {device_index} returned an invalid success report"
+        )
+    return report
+
+
+_DISTRIBUTED_NCCL_REPORT_FIELDS = frozenset(
+    {
+        "schema",
+        "status",
+        "rank",
+        "world_size",
+        "device_index",
+        "all_reduce_value",
+        "torch",
+        "compiled_cuda",
+        "elapsed_seconds",
+    }
+)
+
+
+def _validate_distributed_nccl_report(
+    report: dict[str, object],
+    *,
+    gpu_count: int,
+) -> dict[str, object]:
+    """Authenticate one rank report from the all-GPU NCCL canary."""
+
+    rank = report.get("rank")
+    device_index = report.get("device_index")
+    elapsed = report.get("elapsed_seconds")
+    expected_sum = gpu_count * (gpu_count + 1) / 2
+    expected_cuda = str(EXPECTED_DEPENDENCY_TARGET["torch_backend"]).removeprefix("cu")
+    expected_cuda = f"{int(expected_cuda) // 10}.{int(expected_cuda) % 10}"
+    valid = (
+        set(report) == _DISTRIBUTED_NCCL_REPORT_FIELDS
+        and report.get("schema") == "sion-distributed-nccl-canary-v1"
+        and report.get("status") == "passed"
+        and not isinstance(rank, bool)
+        and isinstance(rank, int)
+        and 0 <= rank < gpu_count
+        and report.get("world_size") == gpu_count
+        and not isinstance(device_index, bool)
+        and isinstance(device_index, int)
+        and device_index == rank
+        and _is_finite_number(report.get("all_reduce_value"))
+        and float(report["all_reduce_value"]) == expected_sum
+        and report.get("torch") == EXPECTED_RUNTIME_VERSIONS["torch"]
+        and report.get("compiled_cuda") == expected_cuda
+        and _is_finite_number(elapsed)
+        and 0.0 < float(elapsed) <= NCCL_CANARY_TIMEOUT_SECONDS
+    )
+    if not valid:
+        raise SystemExit("[easy_run] The distributed NCCL canary returned an invalid report")
+    return report
+
+
+def _kill_process_group(process: subprocess.Popen[str]) -> None:
+    """Kill torchrun and every worker after a timeout or launcher interruption."""
+
+    if os.name != "nt":
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+            return
+        except ProcessLookupError:
+            return
+        except OSError:
+            pass
+    if process.poll() is None:
+        process.kill()
+
+
+def _reap_killed_process(process: subprocess.Popen[str]) -> None:
+    """Bound cleanup itself so a failed probe cannot pin the paid container."""
+
+    try:
+        process.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        if process.poll() is None:
+            process.kill()
+        process.communicate()
+
+
+def _run_multi_gpu_nccl_canary(
+    gpu_count: int,
+    env: dict[str, str],
+) -> list[dict[str, object]]:
+    """Run one bounded communicator across every visible GPU."""
+
+    if gpu_count <= 1:
+        return []
+    command = [
+        sys.executable,
+        "-u",
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--max-restarts=0",
+        f"--nproc-per-node={gpu_count}",
+        "-m",
+        "sion_translate.gpu_runtime",
+        "--distributed-nccl",
+    ]
+    process = subprocess.Popen(
+        command,
+        cwd=ROOT,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        start_new_session=os.name != "nt",
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=NCCL_CANARY_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired as error:
+        _kill_process_group(process)
+        _reap_killed_process(process)
+        raise SystemExit(
+            f"[easy_run] The distributed NCCL canary timed out after "
+            f"{NCCL_CANARY_TIMEOUT_SECONDS} seconds. Training was not started."
+        ) from error
+    except BaseException:
+        _kill_process_group(process)
+        _reap_killed_process(process)
+        raise
+    if process.returncode != 0:
+        _kill_process_group(process)
+        detail = (stderr or stdout or "no diagnostic output").strip()
+        raise SystemExit(
+            f"[easy_run] The distributed NCCL canary failed. Training was not started.\n{detail}"
+        )
+
+    reports: list[dict[str, object]] = []
+    for line in stdout.splitlines():
+        candidate = line.strip()
+        if not candidate.startswith("{"):
+            continue
+        try:
+            report = _load_strict_json_report(candidate, role="distributed NCCL canary")
+        except SystemExit:
+            continue
+        if report.get("schema") == "sion-distributed-nccl-canary-v1":
+            reports.append(_validate_distributed_nccl_report(report, gpu_count=gpu_count))
+    ranks = [report["rank"] for report in reports]
+    if len(reports) != gpu_count or set(ranks) != set(range(gpu_count)):
+        raise SystemExit(
+            "[easy_run] The distributed NCCL canary did not return exactly one valid "
+            "report from every GPU"
+        )
+    reports.sort(key=lambda report: int(report["rank"]))
+    print(
+        f"[easy_run] Distributed NCCL canary passed across {gpu_count} GPUs.",
+        flush=True,
+    )
+    return reports
 
 
 def _run_one_cuda_kernel_canary(
@@ -512,21 +795,16 @@ def _run_one_cuda_kernel_canary(
         )
     lines = [line for line in result.stdout.splitlines() if line.strip()]
     try:
-        report = json.loads(lines[-1])
-    except (IndexError, json.JSONDecodeError) as error:
+        report_line = lines[-1]
+    except IndexError as error:
         raise SystemExit(
             f"[easy_run] CUDA canary on device {device_index} returned no valid JSON report"
         ) from error
-    if (
-        not isinstance(report, dict)
-        or report.get("schema") != "sion-cuda-canary-v1"
-        or report.get("status") != "passed"
-        or report.get("device_index") != device_index
-    ):
-        raise SystemExit(
-            f"[easy_run] CUDA canary on device {device_index} returned an invalid success report"
-        )
-    return report
+    report = _load_strict_json_report(
+        report_line,
+        role=f"CUDA canary on device {device_index}",
+    )
+    return _validate_cuda_canary_report(report, device_index=device_index)
 
 
 def _run_cuda_kernel_canaries(gpu_count: int, env: dict[str, str]) -> list[dict[str, object]]:
@@ -547,6 +825,7 @@ def _run_cuda_kernel_canaries(gpu_count: int, env: dict[str, str]) -> list[dict[
             f"peak {int(report.get('peak_allocated_bytes', 0)) / 2**20:.1f} MiB.",
             flush=True,
         )
+    _run_multi_gpu_nccl_canary(gpu_count, env)
     return reports
 
 
@@ -729,7 +1008,7 @@ def main() -> None:
     gpu_count, gpu_names = _validate_gpu_runtime(torch)
     installed_versions = _validate_installed_dependency_runtime(torch)
     print(
-        "[easy_run] Authenticated GPU runtime: "
+        "[easy_run] Verified GPU runtime compatibility: "
         + ", ".join(f"{name}={version}" for name, version in sorted(installed_versions.items())),
         flush=True,
     )

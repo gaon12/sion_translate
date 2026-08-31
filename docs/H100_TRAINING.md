@@ -303,13 +303,21 @@ healthy batch preparation really needs more than five minutes. A single-process 
 PyTorch's required zero timeout internally, but it cannot leave a separate worker process
 stuck.
 
-Before preparation, `easy_run.py` starts a separate 60-second canary process for every
-visible GPU. The canary uses the production 12-query-head/6-KV-head GQA module with a
-72-wide head, a causal padding mask, BF16 autocast, backward, gradient clipping, fused
-AdamW, and a one-rank NCCL all-reduce when NCCL is available. A failed kernel, non-finite
-value, child crash, or timeout stops the launcher before training. Running the probe in a
-child process also prevents a broken CUDA context from contaminating the later `torchrun`
-workers.
+Before preparation, `easy_run.py` verifies the live CPython, Linux, x86-64, glibc,
+package-version, PyTorch, and compiled-CUDA target against the dependency contract. The
+bundle verifier authenticates the lock file bytes; the live check confirms compatibility
+with that lock and does not claim that installed files can be reconstructed from a wheel
+hash.
+
+The launcher then starts a separate 60-second canary process for every visible GPU. The
+canary uses the production 12-query-head/6-KV-head GQA module with a 72-wide head, one
+combined causal-and-padding mask, BF16 autocast, backward, gradient clipping, fused AdamW,
+and a one-rank NCCL all-reduce when NCCL is available. Every JSON field is validated,
+including finite measurements and the exact Torch/CUDA build. On a multi-GPU host, a
+second bounded `torchrun` probe performs one all-reduce through a communicator containing
+every visible GPU. Timeout and interruption handling kills the complete process group so
+orphaned workers cannot keep a paid server busy. A failed kernel, non-finite value, child
+crash, missing rank, or timeout stops the launcher before training.
 
 ## 10. Create final exports
 

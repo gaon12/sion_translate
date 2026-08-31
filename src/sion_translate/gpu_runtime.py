@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 from datetime import timedelta
 import json
+import os
 from pathlib import Path
 import tempfile
 import time
@@ -49,6 +50,57 @@ def _run_nccl_canary(device: torch.device) -> bool:
         finally:
             torch.distributed.destroy_process_group()
     return True
+
+
+def run_distributed_nccl_canary() -> dict[str, Any]:
+    """Exercise one real all-GPU NCCL communicator launched by torchrun."""
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is unavailable")
+    if not torch.distributed.is_available() or not torch.distributed.is_nccl_available():
+        raise RuntimeError("this PyTorch build does not provide NCCL")
+    try:
+        rank = int(os.environ["RANK"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+    except (KeyError, ValueError) as error:
+        raise RuntimeError(
+            "the distributed NCCL canary must be launched through torchrun"
+        ) from error
+    if world_size < 2:
+        raise RuntimeError("the distributed NCCL canary requires at least two ranks")
+    if not 0 <= rank < world_size or not 0 <= local_rank < torch.cuda.device_count():
+        raise RuntimeError("torchrun supplied an invalid rank or CUDA device")
+
+    device = torch.device("cuda", local_rank)
+    torch.cuda.set_device(device)
+    started = time.perf_counter()
+    torch.distributed.init_process_group(backend="nccl", timeout=timedelta(seconds=20))
+    try:
+        value = torch.tensor(float(rank + 1), dtype=torch.float64, device=device)
+        torch.distributed.all_reduce(value)
+        expected = world_size * (world_size + 1) / 2
+        torch.cuda.synchronize(device)
+        if float(value.item()) != expected:
+            raise RuntimeError(
+                "the distributed NCCL canary returned the wrong all-reduce value: "
+                f"rank={rank}, actual={float(value.item())}, expected={expected}"
+            )
+        torch.distributed.barrier()
+        torch.cuda.synchronize(device)
+    finally:
+        torch.distributed.destroy_process_group()
+    return {
+        "schema": "sion-distributed-nccl-canary-v1",
+        "status": "passed",
+        "rank": rank,
+        "world_size": world_size,
+        "device_index": local_rank,
+        "all_reduce_value": expected,
+        "torch": str(torch.__version__),
+        "compiled_cuda": str(torch.version.cuda),
+        "elapsed_seconds": time.perf_counter() - started,
+    }
 
 
 def run_cuda_canary(device_index: int) -> dict[str, Any]:
@@ -149,10 +201,18 @@ def run_cuda_canary(device_index: int) -> dict[str, Any]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--device-index", type=int, required=True)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--device-index", type=int)
+    mode.add_argument("--distributed-nccl", action="store_true")
     args = parser.parse_args()
+    report = (
+        run_distributed_nccl_canary()
+        if args.distributed_nccl
+        else run_cuda_canary(args.device_index)
+    )
     print(
-        json.dumps(run_cuda_canary(args.device_index), sort_keys=True, allow_nan=False), flush=True
+        json.dumps(report, sort_keys=True, allow_nan=False),
+        flush=True,
     )
 
 
