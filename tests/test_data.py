@@ -635,6 +635,19 @@ def test_direction_complete_validation_covers_an_imbalanced_arbitrary_graph(
             require_unique_examples=True,
         )
 
+    with pytest.raises(
+        ValueError,
+        match=r"requires 4 distinct examples for direction sw->ar.*contains only 1",
+    ):
+        DirectionCompleteValidationBatchSampler(
+            dataset,
+            batch_size=2,
+            directions=(("sw", "ar"),),
+            max_batches=2,
+            minimum_examples_per_direction=1,
+            require_unique_examples=True,
+        )
+
     unique_sampler = DirectionCompleteValidationBatchSampler(
         dataset,
         batch_size=2,
@@ -647,6 +660,17 @@ def test_direction_complete_validation_covers_an_imbalanced_arbitrary_graph(
     assert len(unique_indices) == len(set(unique_indices)) == 20
     assert unique_sampler.cohort_identity["minimum_examples_per_direction"] == 10
     assert unique_sampler.cohort_identity["unique_examples_required"] is True
+
+    exact_quota_sampler = DirectionCompleteValidationBatchSampler(
+        dataset,
+        batch_size=1,
+        directions=(("sw", "ar"),),
+        max_batches=1,
+        minimum_examples_per_direction=1,
+        require_unique_examples=True,
+    )
+    exact_quota_indices = [index for batch in exact_quota_sampler for index in batch]
+    assert len(exact_quota_indices) == len(set(exact_quota_indices)) == 1
 
 
 def test_prepare_capacity_plan_covers_large_supported_metadata(

@@ -1390,11 +1390,18 @@ class DirectionCompleteValidationBatchSampler(Sampler[list[int]]):
             direction_candidates = candidates[direction]
             direction_rng = np.random.default_rng(self.seed + direction_index * 0x9E3779B1)
             ordered = direction_rng.permutation(direction_candidates)
-            if require_unique_examples and len(ordered) < minimum_examples_per_direction:
+            if len(ordered) == 0:
+                source_language, target_language = direction
+                raise ValueError(
+                    "direction-complete validation found no examples for direction "
+                    f"{source_language}->{target_language}"
+                )
+            required_distinct = max(minimum_examples_per_direction, quota)
+            if require_unique_examples and len(ordered) < required_distinct:
                 source_language, target_language = direction
                 raise ValueError(
                     "candidate-refinement release validation requires "
-                    f"{minimum_examples_per_direction} distinct examples for direction "
+                    f"{required_distinct} distinct examples for direction "
                     f"{source_language}->{target_language}, but the held-out split "
                     f"contains only {len(ordered)}"
                 )
