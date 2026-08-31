@@ -496,7 +496,7 @@ def test_revision_provenance_cannot_relabel_an_ordinary_translation_row(
         )
 
 
-def test_unmarked_draft_structure_is_rejected_even_when_row_is_not_selected(
+def test_unmarked_draft_structure_is_filtered_before_index_publication(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -525,19 +525,25 @@ def test_unmarked_draft_structure_is_rejected_even_when_row_is_not_selected(
     tokenizer_path.write_bytes(b"stub tokenizer")
     source_path = tmp_path / "ordinary_parallel.jsonl"
     source_path.write_text(
-        json.dumps(
-            {
-                "pt-BR": "Esta fonte esconde uma revisão. <draft> Rascunho oculto.",
-                "zh-Hant": "這筆資料隱藏了修訂結構。",
-                "training_direction": ["pt-BR", "zh-Hant"],
-            },
-            ensure_ascii=False,
-        )
-        + "\n",
+        "".join(
+            json.dumps(row, ensure_ascii=False) + "\n"
+            for row in (
+                {
+                    "pt-BR": "Esta fonte esconde uma revisão. <draft> Rascunho oculto.",
+                    "zh-Hant": "這筆資料隱藏了修訂結構。",
+                    "training_direction": ["pt-BR", "zh-Hant"],
+                },
+                {
+                    "pt-BR": "Esta é uma fonte comum suficientemente longa.",
+                    "zh-Hant": "這是一筆足夠長的一般翻譯資料。",
+                    "training_direction": ["pt-BR", "zh-Hant"],
+                },
+            )
+        ),
         encoding="utf-8",
     )
     dataset_root = tmp_path / "dataset"
-    prepare_dataset(
+    stats = prepare_dataset(
         [str(source_path)],
         tokenizer_path,
         dataset_root,
@@ -551,15 +557,20 @@ def test_unmarked_draft_structure_is_rejected_even_when_row_is_not_selected(
     )
     dataset = IndexedParallelDataset(dataset_root, "train", bidirectional=True)
 
-    with pytest.raises(ValueError, match="lacks a revision filename or provenance marker"):
+    assert stats.reserved_draft_separator == 1
+    assert stats.quality_filtered == 1
+    assert stats.valid_pairs == 1
+    assert len(dataset) == 1
+    assert (
         dataset.detect_revision_directions(
             draft_token_id=StubTokenizer.draft_id,
             max_source_tokens=10_000,
-            physical_mask=np.array([False], dtype=np.bool_),
         )
+        == ()
+    )
 
 
-def test_draft_token_in_target_cannot_create_a_reverse_revision_edge(
+def test_draft_token_in_target_is_filtered_before_it_can_create_a_reverse_edge(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -588,18 +599,23 @@ def test_draft_token_in_target_cannot_create_a_reverse_revision_edge(
     tokenizer_path.write_bytes(b"stub tokenizer")
     source_path = tmp_path / "ordinary_parallel.jsonl"
     source_path.write_text(
-        json.dumps(
-            {
-                "pt-BR": "Uma tradução comum sem estrutura de revisão.",
-                "zh-Hant": "反向來源。 <draft> 不可信的反向草稿。",
-            },
-            ensure_ascii=False,
-        )
-        + "\n",
+        "".join(
+            json.dumps(row, ensure_ascii=False) + "\n"
+            for row in (
+                {
+                    "pt-BR": "Uma tradução comum sem estrutura de revisão.",
+                    "zh-Hant": "反向來源。 <draft> 不可信的反向草稿。",
+                },
+                {
+                    "pt-BR": "Uma fonte comum suficientemente longa para o teste.",
+                    "zh-Hant": "這是一筆足夠長且安全的一般翻譯資料。",
+                },
+            )
+        ),
         encoding="utf-8",
     )
     dataset_root = tmp_path / "dataset"
-    prepare_dataset(
+    stats = prepare_dataset(
         [str(source_path)],
         tokenizer_path,
         dataset_root,
@@ -613,13 +629,17 @@ def test_draft_token_in_target_cannot_create_a_reverse_revision_edge(
     )
     dataset = IndexedParallelDataset(dataset_root, "train", bidirectional=True)
 
+    assert stats.reserved_draft_separator == 1
+    assert stats.quality_filtered == 1
+    assert stats.valid_pairs == 1
     assert len(dataset) == 2
-    assert list(dataset[1]["src"]).count(StubTokenizer.draft_id) == 1
-    with pytest.raises(ValueError, match="target contains the reserved <draft>"):
+    assert (
         dataset.detect_revision_directions(
             draft_token_id=StubTokenizer.draft_id,
             max_source_tokens=10_000,
         )
+        == ()
+    )
 
 
 def test_revision_source_rejects_conflicting_provenance_label(

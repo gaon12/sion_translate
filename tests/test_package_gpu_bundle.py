@@ -1505,7 +1505,7 @@ def test_translation_manifest_contract_tampering_publishes_no_archive(
 
     def mutate(manifest: dict[str, object]) -> None:
         if tamper == "stats_schema":
-            manifest["stats_schema"] = "sion-prepare-stats-src-tgt-v1"
+            manifest["stats_schema"] = "sion-prepare-stats-src-tgt-v2"
         elif tamper == "stats_field":
             stats = cast(dict[str, object], manifest["stats"])
             stats["unexpected"] = 0

@@ -21,7 +21,7 @@ import warnings
 from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import Any, BinaryIO, Sequence, TypeAlias, cast
 
@@ -36,6 +36,7 @@ from sion_translate.fingerprint import (
 from sion_translate.language_tags import canonicalize_language_tags, parse_language_tag
 from sion_translate.locking import _exclusive_lock  # pyright: ignore[reportPrivateUsage]
 from sion_translate.performance import bounded_ordered_map, build_cpu_plan
+from sion_translate.revision import DRAFT_SEPARATOR
 from sion_translate.splitting import (
     TargetSplitGuard,
     choose_split_for_key,
@@ -90,11 +91,12 @@ PREPARE_PROGRESS_EPOCH_FILENAME = "generation.json"
 PREPARE_PROGRESS_EPOCH_SCHEMA = "sion-prepare-worker-generation-v1"
 PREPARE_PROGRESS_WRITER_LOCK_FILENAME = "writer.lock"
 PREPARE_PROGRESS_CHUNK_SCHEMA = "sion-prepare-worker-chunk-v2"
-PREPARE_WORKER_ALGORITHM_SCHEMA = "sion-prepare-worker-events-v2"
+PREPARE_WORKER_ALGORITHM_SCHEMA = "sion-prepare-worker-events-v3"
 PREPARE_BATCH_SIZE = 512
 PREPARE_OUTPUT_LOCK_SCHEMA = "sion-prepare-output-lock-v1"
 PREPARE_STATS_SCHEMA_V1 = "sion-prepare-stats-src-tgt-v1"
-PREPARE_STATS_SCHEMA = "sion-prepare-stats-src-tgt-v2"
+PREPARE_STATS_SCHEMA_V2 = "sion-prepare-stats-src-tgt-v2"
+PREPARE_STATS_SCHEMA = "sion-prepare-stats-src-tgt-v3"
 DATASET_SPLITS = ("train", "validation", "test", "refinement_evidence")
 
 # These limits bound every supported language graph without naming any
@@ -160,6 +162,7 @@ class PrepareStats:
     length_ratio_outlier: int = 0
     language_mismatch: int = 0
     control_characters: int = 0
+    reserved_draft_separator: int = 0
     excessive_repetition: int = 0
     structured_span_rejections: int = 0
     structured_span_warnings: int = 0
@@ -219,10 +222,45 @@ _PREPARE_STATS_V2_FIELDS = (
     "refinement_evidence",
     *_PREPARE_STATS_V1_FIELDS[25:],
 )
-if tuple(field.name for field in fields(PrepareStats)) != _PREPARE_STATS_V2_FIELDS:
+_PREPARE_STATS_V3_FIELDS = (
+    "physical_lines",
+    "valid_pairs",
+    "invalid_json",
+    "invalid_utf8",
+    "invalid_record",
+    "missing_text",
+    "non_string",
+    "invalid_language",
+    "unaligned_lists",
+    "duplicates",
+    "quality_filtered",
+    "too_short",
+    "identical_text",
+    "length_ratio_outlier",
+    "language_mismatch",
+    "control_characters",
+    "reserved_draft_separator",
+    "excessive_repetition",
+    "structured_span_rejections",
+    "structured_span_warnings",
+    "ja_no_kana_warnings",
+    "split_conflicts",
+    "too_long",
+    "train",
+    "validation",
+    "test",
+    "refinement_evidence",
+    "src_tokens",
+    "tgt_tokens",
+    "quality_score_sum",
+    "synthetic_pairs",
+    "forward_only_pairs",
+)
+if tuple(field.name for field in fields(PrepareStats)) != _PREPARE_STATS_V3_FIELDS:
     raise RuntimeError("PrepareStats changed without a new explicit persisted statistics schema")
 _PREPARE_STATS_V1_FIELD_MAP = tuple((name, name) for name in _PREPARE_STATS_V1_FIELDS)
 _PREPARE_STATS_V2_FIELD_MAP = tuple((name, name) for name in _PREPARE_STATS_V2_FIELDS)
+_PREPARE_STATS_V3_FIELD_MAP = tuple((name, name) for name in _PREPARE_STATS_V3_FIELDS)
 _PREPARE_STATS_LEGACY_FIELD_MAP = tuple(
     (
         {"src_tokens": "ko_tokens", "tgt_tokens": "ja_tokens"}.get(name, name),
@@ -251,6 +289,7 @@ def prepare_stats_schema_from_manifest(
     value = manifest.get("stats_schema")
     if not isinstance(value, str) or value not in {
         PREPARE_STATS_SCHEMA_V1,
+        PREPARE_STATS_SCHEMA_V2,
         PREPARE_STATS_SCHEMA,
     }:
         raise ValueError(f"{role} stats_schema is unsupported")
@@ -272,8 +311,10 @@ def validated_prepare_stats(
         field_map = _PREPARE_STATS_LEGACY_FIELD_MAP
     elif stats_schema == PREPARE_STATS_SCHEMA_V1:
         field_map = _PREPARE_STATS_V1_FIELD_MAP
-    elif stats_schema == PREPARE_STATS_SCHEMA:
+    elif stats_schema == PREPARE_STATS_SCHEMA_V2:
         field_map = _PREPARE_STATS_V2_FIELD_MAP
+    elif stats_schema == PREPARE_STATS_SCHEMA:
+        field_map = _PREPARE_STATS_V3_FIELD_MAP
     else:
         raise ValueError(f"{role} stats_schema is unsupported")
     expected_fields = {serialized_name for serialized_name, _ in field_map}
@@ -474,6 +515,7 @@ _QUALITY_REASON_FIELDS = {
     "ko_script_mismatch": "language_mismatch",
     "ja_script_mismatch": "language_mismatch",
     "control_characters": "control_characters",
+    "reserved_draft_separator": "reserved_draft_separator",
     "excessive_repetition": "excessive_repetition",
     "structured_span_mismatch": "structured_span_rejections",
 }
@@ -486,6 +528,8 @@ _PrepareBatchInput: TypeAlias = tuple[
     bool,
     tuple[tuple[str, str], ...],
     int,
+    str,
+    tuple[tuple[str, str], ...],
 ]
 _PrepareEvent: TypeAlias = tuple[str, tuple[Any, ...]]
 
@@ -558,10 +602,72 @@ def _initialize_prepare_worker(tokenizer_model: str) -> None:
     )
 
 
+def _pair_has_unauthenticated_draft_separator(
+    text_a: str,
+    text_b: str,
+    *,
+    language_pair: tuple[str, str],
+    metadata: Mapping[str, object],
+    source_name: str,
+    translation_directions: tuple[tuple[str, str], ...],
+) -> bool:
+    """Reject reserved revision syntax unless the exact source edge authenticates it."""
+
+    if DRAFT_SEPARATOR not in text_a and DRAFT_SEPARATOR not in text_b:
+        return False
+
+    try:
+        direction = resolve_record_training_direction(
+            metadata,
+            language_pair,
+            frozenset(translation_directions),
+        )
+    except ValueError:
+        return True
+    if direction is None:
+        return True
+
+    if direction == language_pair:
+        source_text, target_text = text_a, text_b
+    elif direction == (language_pair[1], language_pair[0]):
+        source_text, target_text = text_b, text_a
+    else:
+        return True
+
+    provenance = metadata.get("provenance")
+    transformation = (
+        cast(Mapping[object, object], provenance).get("transformation")
+        if isinstance(provenance, Mapping)
+        else None
+    )
+    filename_marked = source_name.startswith("revise_")
+    provenance_marked = transformation == "revision"
+    if filename_marked and transformation is not None and not provenance_marked:
+        return True
+    if not (filename_marked or provenance_marked):
+        return True
+
+    # A decoder target can never carry model-control syntax. A revision source
+    # carries exactly one separator between two non-empty text segments.
+    if DRAFT_SEPARATOR in target_text or source_text.count(DRAFT_SEPARATOR) != 1:
+        return True
+    original_source, _, draft = source_text.partition(DRAFT_SEPARATOR)
+    return not original_source.strip() or not draft.strip()
+
+
 def _process_prepare_batch(args: _PrepareBatchInput) -> list[_PrepareEvent]:
     """CPU-heavy, order-preserving row work executed in worker processes."""
 
-    source_id, rows, quality_policy, filter_quality, language_pairs, max_tokens_per_side = args
+    (
+        source_id,
+        rows,
+        quality_policy,
+        filter_quality,
+        language_pairs,
+        max_tokens_per_side,
+        source_name,
+        translation_directions,
+    ) = args
     tokenizer = _PREPARE_WORKER_TOKENIZER
     if tokenizer is None:
         raise RuntimeError("prepare worker tokenizer was not initialized")
@@ -604,7 +710,26 @@ def _process_prepare_batch(args: _PrepareBatchInput) -> list[_PrepareEvent]:
                 assessment,
                 pair.metadata.get("quality_profile"),
             )
-            unsafe_reasons = {"control_characters", "structured_span_mismatch"}
+            if _pair_has_unauthenticated_draft_separator(
+                text_a,
+                text_b,
+                language_pair=language_pair,
+                metadata=pair.metadata,
+                source_name=source_name,
+                translation_directions=translation_directions,
+            ):
+                assessment = replace(
+                    assessment,
+                    accepted=False,
+                    rejection_reasons=tuple(
+                        dict.fromkeys((*assessment.rejection_reasons, "reserved_draft_separator"))
+                    ),
+                )
+            unsafe_reasons = {
+                "control_characters",
+                "reserved_draft_separator",
+                "structured_span_mismatch",
+            }
             unsafe = bool(unsafe_reasons.intersection(assessment.rejection_reasons))
             if not assessment.accepted and (filter_quality or unsafe):
                 output.append(
@@ -682,6 +807,7 @@ def _prepare_batch_records(
     language_pairs: tuple[tuple[str, str], ...],
     train_only_prefixes: tuple[str, ...],
     max_tokens_per_side: int,
+    translation_directions: tuple[tuple[str, str], ...],
     batch_size: int | None = None,
 ) -> Iterator[tuple[_PrepareBatchDescriptor, _PrepareBatchInput]]:
     if batch_size is None:
@@ -746,6 +872,8 @@ def _prepare_batch_records(
                                 filter_quality,
                                 language_pairs,
                                 max_tokens_per_side,
+                                path.name,
+                                translation_directions,
                             ),
                         )
                         batch_index += 1
@@ -781,6 +909,8 @@ def _prepare_batch_records(
                                 filter_quality,
                                 language_pairs,
                                 max_tokens_per_side,
+                                path.name,
+                                translation_directions,
                             ),
                         )
                         batch_index += 1
@@ -809,6 +939,8 @@ def _prepare_batch_records(
                             filter_quality,
                             language_pairs,
                             max_tokens_per_side,
+                            path.name,
+                            translation_directions,
                         ),
                     )
 
@@ -3063,6 +3195,7 @@ def _prepare_dataset_locked(
             normalized_pairs,
             train_only_prefixes,
             max_tokens_per_side,
+            normalized_directions,
         ):
             chunk_name = _prepare_chunk_filename(descriptor)
             if chunk_name in expected_chunk_names:

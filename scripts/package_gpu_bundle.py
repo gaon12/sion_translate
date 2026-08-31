@@ -232,7 +232,7 @@ DATASET_ARTIFACT_INVENTORY_SCHEMA = "sion-indexed-artifact-inventory-v1"
 TRANSLATION_DATASET_FORMAT = "sion-indexed-parallel-v6"
 TRANSLATION_SPLITS = ("train", "validation", "test", "refinement_evidence")
 SYNTHETIC_REFINEMENT_EVIDENCE_PURPOSE = "relative-refinement-evidence-only-v1"
-TRANSLATION_STATS_SCHEMA = "sion-prepare-stats-src-tgt-v2"
+TRANSLATION_STATS_SCHEMA = "sion-prepare-stats-src-tgt-v3"
 TRANSLATION_STATS_FIELDS = (
     "physical_lines",
     "valid_pairs",
@@ -250,6 +250,7 @@ TRANSLATION_STATS_FIELDS = (
     "length_ratio_outlier",
     "language_mismatch",
     "control_characters",
+    "reserved_draft_separator",
     "excessive_repetition",
     "structured_span_rejections",
     "structured_span_warnings",

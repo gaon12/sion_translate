@@ -111,6 +111,7 @@ def test_register_inference_inherits_the_primary_language_policy(
 def test_prepare_stats_normalize_only_the_exact_unmarked_legacy_representation() -> None:
     neutral = vars(prepare_module.PrepareStats(src_tokens=17, tgt_tokens=23))
     neutral.pop("refinement_evidence")
+    neutral.pop("reserved_draft_separator")
     legacy = dict(neutral)
     legacy["ko_tokens"] = legacy.pop("src_tokens")
     legacy["ja_tokens"] = legacy.pop("tgt_tokens")
@@ -124,6 +125,19 @@ def test_prepare_stats_normalize_only_the_exact_unmarked_legacy_representation()
 
     assert normalized.src_tokens == 17
     assert normalized.tgt_tokens == 23
+
+
+def test_prepare_stats_v2_defaults_the_new_reserved_separator_counter() -> None:
+    v2 = vars(prepare_module.PrepareStats(src_tokens=17, tgt_tokens=23))
+    v2.pop("reserved_draft_separator")
+
+    normalized = prepare_module.validated_prepare_stats(
+        v2,
+        stats_schema=prepare_module.PREPARE_STATS_SCHEMA_V2,
+        role="Test manifest",
+    )
+
+    assert normalized.reserved_draft_separator == 0
 
 
 @pytest.mark.parametrize("marker", [None, False, 0, [], {}, "unknown-stats-schema"])
@@ -932,6 +946,7 @@ def test_prepare_generation_fences_orphan_workers_and_reuses_identical_winners(
             (("ko", "ja"),),
             prepare_module.DEFAULT_TRAIN_ONLY_PREFIXES,
             510,
+            (("ko", "ja"), ("ja", "ko")),
         )
     )
     stale_epoch = json.loads(
@@ -1788,6 +1803,7 @@ def test_prepare_reuses_an_authenticated_unmarked_v10_legacy_stats_manifest(
     manifest.pop("stats_schema")
     for serialized in (manifest["stats"], manifest["sources"][0]["stats"]):
         serialized.pop("refinement_evidence")
+        serialized.pop("reserved_draft_separator")
         serialized["ko_tokens"] = serialized.pop("src_tokens")
         serialized["ja_tokens"] = serialized.pop("tgt_tokens")
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
@@ -2118,13 +2134,187 @@ def test_prepare_rejects_critical_structured_corruption_when_quality_filter_is_d
     ).encode("utf-8")
 
     events = prepare_module._process_prepare_batch(  # pyright: ignore[reportPrivateUsage]
-        (0, [(0, row)], QualityPolicy(), False, (("en", "ja"),), 510)
+        (
+            0,
+            [(0, row)],
+            QualityPolicy(),
+            False,
+            (("en", "ja"),),
+            510,
+            "pairs.jsonl",
+            (("en", "ja"), ("ja", "en")),
+        )
     )
 
     quality_events = [event for event in events if event[0] == "quality_filtered"]
     assert len(quality_events) == 1
     assert quality_events[0][1][1] == ("structured_span_mismatch",)
     assert not any(event[0] == "candidate" for event in events)
+
+
+def test_prepare_filters_reserved_revision_syntax_but_keeps_authenticated_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ArbitraryLanguageTokenizer(_FakePrepareTokenizer):
+        languages = ("sw", "ar")
+
+    source = tmp_path / "arbitrary_parallel.jsonl"
+    tokenizer = tmp_path / "sion.model"
+    output = tmp_path / "dataset"
+    rows = [
+        {
+            "sw": "Sentensi salama ya chanzo kwa jaribio hili.",
+            "ar": "هذا نص عادي يتضمن <<draft>> داخل اقتباس طويل.",
+        },
+        {
+            "sw": "Chanzo cha kawaida <draft> chenye alama iliyohifadhiwa.",
+            "ar": "هذه ترجمة عادية لا تملك بيانات مراجعة موثقة.",
+        },
+        {
+            "sw": "Chanzo cha kutafsiri <draft> rasimu inayohitaji kusahihishwa.",
+            "ar": "هذه هي الترجمة المصححة بعد مراجعة المسودة.",
+            "synthetic": True,
+            "training_direction": ["sw", "ar"],
+            "provenance": {"transformation": "revision"},
+        },
+        {
+            "sw": "Hili ndilo toleo lililosahihishwa baada ya kupitia rasimu.",
+            "ar": "هذا مصدر للترجمة <draft> وهذه مسودة تحتاج إلى تصحيح.",
+            "synthetic": True,
+            "training_direction": ["ar", "sw"],
+            "provenance": {"transformation": "revision"},
+        },
+        {
+            "sw": "Chanzo cha kawaida kisicho na muundo wa rasimu.",
+            "ar": "هذه مسودة في الهدف <draft> ولا يجوز قبولها أبدا.",
+            "synthetic": True,
+            "training_direction": ["sw", "ar"],
+            "provenance": {"transformation": "revision"},
+        },
+    ]
+    source.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    tokenizer.write_bytes(b"arbitrary-language-tokenizer")
+    monkeypatch.setattr(prepare_module, "SionTokenizer", ArbitraryLanguageTokenizer)
+
+    stats = prepare_module.prepare_dataset(
+        [str(source)],
+        tokenizer,
+        output,
+        shard_size=8,
+        validation_fraction=0.0,
+        test_fraction=0.0,
+        filter_quality=False,
+        dedup_backend="memory",
+        language_pairs=(("sw", "ar"),),
+        translation_directions=(("sw", "ar"), ("ar", "sw")),
+        num_workers=1,
+    )
+    manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+
+    assert stats.physical_lines == 5
+    assert stats.quality_filtered == 3
+    assert stats.reserved_draft_separator == 3
+    assert stats.valid_pairs == 2
+    assert stats.forward_only_pairs == 2
+    assert manifest["stats_schema"] == "sion-prepare-stats-src-tgt-v3"
+    assert manifest["preprocessing_schema"] == "sion-prepare-v12"
+    assert manifest["stats"]["reserved_draft_separator"] == 3
+
+
+@pytest.mark.parametrize(
+    ("text_a", "text_b", "metadata", "source_name", "rejected"),
+    [
+        (
+            "A safe ordinary source sentence.",
+            "An ordinary target with <<draft>> in a quotation.",
+            {},
+            "ordinary.jsonl",
+            True,
+        ),
+        (
+            "A corrected target sentence.",
+            "A reverse source <draft> followed by its draft.",
+            {
+                "training_direction": ["ar", "sw"],
+                "provenance": {"transformation": "revision"},
+            },
+            "generated.jsonl",
+            False,
+        ),
+        (
+            "A marked source without revision syntax.",
+            "A forbidden target <draft> containing control syntax.",
+            {
+                "training_direction": ["sw", "ar"],
+                "provenance": {"transformation": "revision"},
+            },
+            "generated.jsonl",
+            True,
+        ),
+        (
+            "A source <draft> one draft <draft> another draft.",
+            "A corrected target sentence.",
+            {
+                "training_direction": ["sw", "ar"],
+                "provenance": {"transformation": "revision"},
+            },
+            "generated.jsonl",
+            True,
+        ),
+        (
+            " <draft> a draft without a source.",
+            "A corrected target sentence.",
+            {
+                "training_direction": ["sw", "ar"],
+                "provenance": {"transformation": "revision"},
+            },
+            "generated.jsonl",
+            True,
+        ),
+        (
+            "A source without a draft <draft> ",
+            "A corrected target sentence.",
+            {
+                "training_direction": ["sw", "ar"],
+                "provenance": {"transformation": "revision"},
+            },
+            "generated.jsonl",
+            True,
+        ),
+        (
+            "A source <draft> followed by its draft.",
+            "A corrected target sentence.",
+            {
+                "training_direction": ["sw", "ar"],
+                "provenance": {"transformation": "backtranslation"},
+            },
+            "revise_conflict.jsonl",
+            True,
+        ),
+    ],
+)
+def test_reserved_draft_separator_authentication_is_directional_and_structural(
+    text_a: str,
+    text_b: str,
+    metadata: dict[str, object],
+    source_name: str,
+    rejected: bool,
+) -> None:
+    assert (
+        prepare_module._pair_has_unauthenticated_draft_separator(  # pyright: ignore[reportPrivateUsage]
+            text_a,
+            text_b,
+            language_pair=("sw", "ar"),
+            metadata=metadata,
+            source_name=source_name,
+            translation_directions=(("sw", "ar"), ("ar", "sw")),
+        )
+        is rejected
+    )
 
 
 def test_pair_quality_requires_explicit_language_identity() -> None:
