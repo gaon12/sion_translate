@@ -116,13 +116,15 @@ checksum list are the required trust boundary.
 
 ```bash
 conda activate sion-translate
-CUDA_VISIBLE_DEVICES=0 sion-train --config sion_translate.yaml
+CUDA_VISIBLE_DEVICES=0 python easy_run.py
 ```
 
 One GPU always uses the runtime `single` strategy. Keep `training.precision: bf16` on an
 H100 unless an experiment specifically requires another precision. The single/DDP path
 keeps FP32 master parameters and uses CUDA autocast for BF16 compute. BF16 does not need
-an FP16 gradient scaler.
+an FP16 gradient scaler. `easy_run.py` authenticates the prepared bundle, runs the CUDA
+canary, and owns the complete child process tree. It reads the bundle's authenticated
+configuration; do not append `--config` to this launcher.
 
 Start with a short capacity probe in a separate output directory. A successful probe
 should include the longest realistic sequence buckets and at least one validation pass.
@@ -133,13 +135,11 @@ Example for eight GPUs:
 
 ```bash
 conda activate sion-translate
-torchrun --standalone --nproc-per-node=8 \
-  -m sion_translate.cli.train \
-  --config sion_translate.yaml
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python easy_run.py
 ```
 
-Use the actual local GPU count for `--nproc-per-node`. Each process owns one GPU and uses
-NCCL collectives.
+List exactly the GPUs assigned by the scheduler. The launcher derives the local process
+count, checks every device, runs an all-GPU NCCL canary, and gives each process one GPU.
 
 The effective batch is:
 
@@ -161,6 +161,7 @@ inventory, and readable checkpoint storage. Example for two nodes with eight GPU
 torchrun \
   --nnodes=2 \
   --nproc-per-node=8 \
+  --max-restarts=0 \
   --node-rank=0 \
   --master-addr=10.0.0.10 \
   --master-port=29500 \
@@ -171,6 +172,12 @@ torchrun \
 Run the second node with `--node-rank=1`. The master address must be reachable from every
 node. Use a 100-500-step probe to validate NCCL, shared storage, checkpoint publication,
 and throughput before starting the full run.
+
+The multi-node command is an advanced exception because `easy_run.py` currently owns only
+one node. Run it only inside a scheduler allocation whose job teardown kills every process
+on every node. Raw `torchrun` does not provide the launcher's local parent-death guard or
+pre-training CUDA/NCCL canaries; run the same authenticated preflight and hardware probes
+under the scheduler before the paid training allocation.
 
 If global tokens per second barely improves as nodes are added, measure storage reads and
 network collectives before changing the model.
@@ -319,6 +326,14 @@ every visible GPU. Timeout and interruption handling kills the complete process 
 orphaned workers cannot keep a paid server busy. A failed kernel, non-finite value, child
 crash, missing rank, or timeout stops the launcher before training.
 
+The real training launch uses the same process-group ownership rule. Ctrl-C, SIGTERM, a
+launcher exception, or a non-zero `torchrun` result kills and reaps the launcher and all of
+its workers. NCCL monitoring, asynchronous error handling, timeout diagnostics, and a
+five-minute watchdog heartbeat are enabled with `setdefault`, so an explicit cluster policy
+still wins. Distributed collectives time out after 600 seconds by default instead of waiting
+30 minutes. `SION_DISTRIBUTED_TIMEOUT_SECONDS` may select a reviewed value from 30 through
+1,800 seconds.
+
 ## 10. Create final exports
 
 Intermediate `exports/best` keeps only lightweight native state so large CPU conversions
@@ -328,6 +343,18 @@ weights only under `checkpoints/latest`: they are restartable, but they are not 
 until every configured direction passes the held-out positive-improvement guard. After all enabled
 stages finish, the CLI restores the selected best raw or EMA weights and generates the
 requested final formats once in a transactional directory.
+
+During strict final conversion, rank 0 publishes a heartbeat every 30 seconds. Peer ranks
+stop after ten minutes without progress. Every rank also arms a separate clean Python
+watchdog before validation or conversion starts. The watchdog terminates its owning process
+after the default 30-minute whole-operation deadline even when native code, the filesystem,
+or the Python GIL is stuck. A heartbeat thread that cannot stop within five seconds also
+terminates the owner instead of continuing to mutate release state in the background.
+`SION_FINAL_EXPORT_TIMEOUT_SECONDS` may select a reviewed deadline from 600 through 7,200
+seconds for an unusually large format; all ranks must receive the same value. The final
+artifact is installed atomically, so termination cannot expose a partly written deployment
+directory. Use `easy_run.py` or a scheduler that tears down the complete job when one guarded
+rank exits.
 
 The release check uses `NLL(provisional) - NLL(final)`, so positive values are improvements.
 It verifies the exact configured graph using the deployed raw or EMA family and rejects
