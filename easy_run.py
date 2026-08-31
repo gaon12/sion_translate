@@ -37,6 +37,10 @@ from sion_translate.bundle_contract import (
     load_embedded_training_contract,
     verify_embedded_bundle_payload,
 )
+from sion_translate.process_guard import (
+    EXPECTED_PARENT_PID_ENVIRONMENT,
+    INHERITED_SIGNAL_MASK_ENVIRONMENT,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -59,6 +63,79 @@ NCCL_WATCHDOG_DEFAULTS = {
     "TORCH_NCCL_DUMP_ON_TIMEOUT": "1",
     "TORCH_NCCL_TRACE_BUFFER_SIZE": "2000",
 }
+
+
+def _posix_termination_signals() -> tuple[signal.Signals, ...]:
+    """Return every shutdown signal that must take the owned process tree down."""
+
+    if os.name == "nt":
+        # Keep the existing Windows console behavior: Ctrl-C remains a native
+        # KeyboardInterrupt, while SIGTERM uses the explicit cleanup path.
+        return (signal.SIGTERM,)
+    return tuple(
+        candidate
+        for name in ("SIGHUP", "SIGQUIT", "SIGINT", "SIGTERM")
+        if isinstance((candidate := getattr(signal, name, None)), signal.Signals)
+    )
+
+
+def _block_posix_termination_signals() -> set[signal.Signals] | None:
+    """Block shutdown signals across fork so no signal can outrun child setup."""
+
+    if os.name == "nt" or not hasattr(signal, "pthread_sigmask"):
+        return None
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, _posix_termination_signals())
+    return set(previous)
+
+
+def _restore_posix_signal_mask(previous: set[signal.Signals] | None) -> None:
+    """Restore the calling thread's signal mask after the child PID is owned."""
+
+    if previous is not None:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
+def _configure_guarded_child_environment(
+    environment: dict[str, str],
+    inherited_signal_mask: set[signal.Signals] | None,
+) -> None:
+    """Publish the exact parent PID and signal mask for the guarded wrapper."""
+
+    environment[EXPECTED_PARENT_PID_ENVIRONMENT] = str(os.getpid())
+    if inherited_signal_mask is None:
+        environment.pop(INHERITED_SIGNAL_MASK_ENVIRONMENT, None)
+        return
+    environment[INHERITED_SIGNAL_MASK_ENVIRONMENT] = ",".join(
+        str(int(signum)) for signum in sorted(inherited_signal_mask, key=int)
+    )
+
+
+def _guarded_torchrun_command(
+    *,
+    gpu_count: int,
+    worker_module: str,
+    worker_arguments: Sequence[str],
+) -> list[str]:
+    """Build a torchrun command whose launcher and workers have parent guards."""
+
+    return [
+        sys.executable,
+        "-u",
+        "-m",
+        "sion_translate.process_guard",
+        "launcher",
+        "torch.distributed.run",
+        "--",
+        "--standalone",
+        "--max-restarts=0",
+        f"--nproc-per-node={gpu_count}",
+        "--module",
+        "sion_translate.process_guard",
+        "worker",
+        worker_module,
+        "--",
+        *worker_arguments,
+    ]
 
 
 @dataclass(frozen=True)
@@ -746,49 +823,59 @@ def _run_torchrun(command: list[str], env: dict[str, str]) -> None:
     print("[easy_run] Running:", " ".join(command), flush=True)
     launch_env = env.copy()
     _apply_nccl_watchdog_defaults(launch_env)
-    previous_sigterm: object | None = None
-    sigterm_handler_installed = False
+    previous_handlers: dict[signal.Signals, object] = {}
+    termination_signal: int | None = None
+    process: subprocess.Popen[bytes] | subprocess.Popen[str] | None = None
 
     def raise_termination(signum: int, _frame: object) -> None:
+        nonlocal termination_signal
+        # A second signal can arrive while the first signal's hard-stop path is
+        # killing or reaping descendants.  Do not interrupt that cleanup.
+        if termination_signal is not None:
+            return
+        termination_signal = signum
         raise SystemExit(128 + signum)
 
-    try:
-        # KeyboardInterrupt already turns Ctrl-C into a BaseException. SIGTERM
-        # needs an explicit Python handler so the cleanup path runs before the
-        # launcher itself exits.
-        previous_sigterm = signal.getsignal(signal.SIGTERM)
-        signal.signal(signal.SIGTERM, raise_termination)
-        sigterm_handler_installed = True
-    except (OSError, ValueError):
-        # signal.signal is restricted to the main thread. easy_run normally owns
-        # that thread; retain process-group cleanup for every other exception.
-        previous_sigterm = None
+    for signum in _posix_termination_signals():
+        try:
+            previous_handlers[signum] = signal.getsignal(signum)
+            signal.signal(signum, raise_termination)
+        except (OSError, ValueError):
+            # signal.signal is restricted to the main thread. easy_run normally
+            # owns that thread; retain BaseException cleanup when it does not.
+            previous_handlers.pop(signum, None)
 
     try:
-        # Install the SIGTERM handler before spawning so there is no interval in
-        # which a scheduler can stop easy_run but leave a new torchrun child.
-        process = subprocess.Popen(
-            command,
-            cwd=ROOT,
-            env=launch_env,
-            start_new_session=os.name != "nt",
-            creationflags=(
-                int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)) if os.name == "nt" else 0
-            ),
-        )
+        # Keep handled POSIX signals pending until Popen has returned and the
+        # process object is assigned. The wrapper restores the inherited mask
+        # only after arming PR_SET_PDEATHSIG, closing the setup race on Linux.
+        inherited_signal_mask = _block_posix_termination_signals()
         try:
-            return_code = process.wait()
-        except BaseException:
-            _kill_process_group(process)
-            _reap_killed_process(process)
-            raise
+            _configure_guarded_child_environment(launch_env, inherited_signal_mask)
+            process = subprocess.Popen(
+                command,
+                cwd=ROOT,
+                env=launch_env,
+                start_new_session=os.name != "nt",
+                creationflags=(
+                    int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+                    if os.name == "nt"
+                    else 0
+                ),
+            )
+        finally:
+            _restore_posix_signal_mask(inherited_signal_mask)
+        return_code = process.wait()
         if return_code != 0:
+            raise subprocess.CalledProcessError(return_code, command)
+    except BaseException:
+        if process is not None:
             _kill_process_group(process)
             _reap_killed_process(process)
-            raise subprocess.CalledProcessError(return_code, command)
+        raise
     finally:
-        if sigterm_handler_installed:
-            signal.signal(signal.SIGTERM, previous_sigterm)  # type: ignore[arg-type]
+        for signum, previous_handler in reversed(previous_handlers.items()):
+            signal.signal(signum, previous_handler)  # type: ignore[arg-type]
 
 
 def _run_multi_gpu_nccl_canary(
@@ -799,48 +886,53 @@ def _run_multi_gpu_nccl_canary(
 
     if gpu_count <= 1:
         return []
-    command = [
-        sys.executable,
-        "-u",
-        "-m",
-        "torch.distributed.run",
-        "--standalone",
-        "--max-restarts=0",
-        f"--nproc-per-node={gpu_count}",
-        "-m",
-        "sion_translate.gpu_runtime",
-        "--distributed-nccl",
-    ]
-    process = subprocess.Popen(
-        command,
-        cwd=ROOT,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        start_new_session=os.name != "nt",
+    command = _guarded_torchrun_command(
+        gpu_count=gpu_count,
+        worker_module="sion_translate.gpu_runtime",
+        worker_arguments=["--distributed-nccl"],
     )
+    launch_env = env.copy()
+    process: subprocess.Popen[str] | None = None
     try:
-        stdout, stderr = process.communicate(timeout=NCCL_CANARY_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired as error:
-        _kill_process_group(process)
-        _reap_killed_process(process)
-        raise SystemExit(
-            f"[easy_run] The distributed NCCL canary timed out after "
-            f"{NCCL_CANARY_TIMEOUT_SECONDS} seconds. Training was not started."
-        ) from error
+        inherited_signal_mask = _block_posix_termination_signals()
+        try:
+            _configure_guarded_child_environment(launch_env, inherited_signal_mask)
+            process = subprocess.Popen(
+                command,
+                cwd=ROOT,
+                env=launch_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                start_new_session=os.name != "nt",
+                creationflags=(
+                    int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+                    if os.name == "nt"
+                    else 0
+                ),
+            )
+        finally:
+            _restore_posix_signal_mask(inherited_signal_mask)
+        try:
+            stdout, stderr = process.communicate(timeout=NCCL_CANARY_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired as error:
+            raise SystemExit(
+                f"[easy_run] The distributed NCCL canary timed out after "
+                f"{NCCL_CANARY_TIMEOUT_SECONDS} seconds. Training was not started."
+            ) from error
+        if process.returncode != 0:
+            detail = (stderr or stdout or "no diagnostic output").strip()
+            raise SystemExit(
+                f"[easy_run] The distributed NCCL canary failed. Training was not started.\n"
+                f"{detail}"
+            )
     except BaseException:
-        _kill_process_group(process)
-        _reap_killed_process(process)
+        if process is not None:
+            _kill_process_group(process)
+            _reap_killed_process(process)
         raise
-    if process.returncode != 0:
-        _kill_process_group(process)
-        detail = (stderr or stdout or "no diagnostic output").strip()
-        raise SystemExit(
-            f"[easy_run] The distributed NCCL canary failed. Training was not started.\n{detail}"
-        )
 
     reports: list[dict[str, object]] = []
     for line in stdout.splitlines():
@@ -1209,18 +1301,15 @@ def main() -> None:
                     PERSISTENT_ARTIFACTS / name,
                 )
 
-        command = [
-            sys.executable,
-            "-m",
-            "torch.distributed.run",
-            "--standalone",
-            f"--nproc-per-node={gpu_count}",
-            "-m",
-            "sion_translate.cli.train",
-            *local_checkout_arguments,
-            "--config",
-            str(generated_config),
-        ]
+        command = _guarded_torchrun_command(
+            gpu_count=gpu_count,
+            worker_module="sion_translate.cli.train",
+            worker_arguments=[
+                *local_checkout_arguments,
+                "--config",
+                str(generated_config),
+            ],
+        )
         print(f"[easy_run] Starting training on {gpu_count} CUDA GPUs ({', '.join(gpu_names)}).")
         _run_torchrun(command, env)
     finally:

@@ -673,6 +673,52 @@ def test_nccl_watchdog_defaults_preserve_operator_overrides() -> None:
     assert environment["TORCH_NCCL_TRACE_BUFFER_SIZE"] == "2000"
 
 
+def test_guarded_torchrun_wraps_both_the_launcher_and_every_worker() -> None:
+    command = easy_run._guarded_torchrun_command(
+        gpu_count=2,
+        worker_module="example.training",
+        worker_arguments=["--config", "training.yaml"],
+    )
+
+    assert command == [
+        easy_run.sys.executable,
+        "-u",
+        "-m",
+        "sion_translate.process_guard",
+        "launcher",
+        "torch.distributed.run",
+        "--",
+        "--standalone",
+        "--max-restarts=0",
+        "--nproc-per-node=2",
+        "--module",
+        "sion_translate.process_guard",
+        "worker",
+        "example.training",
+        "--",
+        "--config",
+        "training.yaml",
+    ]
+
+
+def test_guarded_child_environment_replaces_untrusted_parent_state() -> None:
+    environment = {
+        easy_run.EXPECTED_PARENT_PID_ENVIRONMENT: "1",
+        easy_run.INHERITED_SIGNAL_MASK_ENVIRONMENT: "999",
+    }
+    inherited_mask = {easy_run.signal.SIGINT, easy_run.signal.SIGTERM}
+
+    easy_run._configure_guarded_child_environment(environment, inherited_mask)
+
+    assert environment[easy_run.EXPECTED_PARENT_PID_ENVIRONMENT] == str(easy_run.os.getpid())
+    assert environment[easy_run.INHERITED_SIGNAL_MASK_ENVIRONMENT] == ",".join(
+        str(int(signum)) for signum in sorted(inherited_mask, key=int)
+    )
+
+    easy_run._configure_guarded_child_environment(environment, None)
+    assert easy_run.INHERITED_SIGNAL_MASK_ENVIRONMENT not in environment
+
+
 def test_training_torchrun_owns_a_process_group_and_forwards_safe_environment(
     monkeypatch,
 ) -> None:
@@ -708,6 +754,8 @@ def test_training_torchrun_owns_a_process_group_and_forwards_safe_environment(
     )
     assert options["env"]["EXPLICIT"] == "yes"
     assert options["env"]["TORCH_NCCL_ENABLE_MONITORING"] == "1"
+    assert options["env"][easy_run.EXPECTED_PARENT_PID_ENVIRONMENT] == str(easy_run.os.getpid())
+    assert "preexec_fn" not in options
     assert wait_timeouts == [None]
 
 
@@ -973,6 +1021,48 @@ def test_distributed_nccl_canary_uses_one_bounded_torchrun_process(monkeypatch) 
     assert "--nproc-per-node=2" in observed["command"]
     assert observed["timeout"] == easy_run.NCCL_CANARY_TIMEOUT_SECONDS
     assert observed["options"]["start_new_session"] is (easy_run.os.name != "nt")
+    assert observed["options"]["creationflags"] == (
+        int(getattr(easy_run.subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+        if easy_run.os.name == "nt"
+        else 0
+    )
+    assert observed["options"]["env"][easy_run.EXPECTED_PARENT_PID_ENVIRONMENT] == str(
+        easy_run.os.getpid()
+    )
+    assert "preexec_fn" not in observed["options"]
+
+
+def test_distributed_nccl_spawn_interruption_still_kills_and_reaps_the_launcher(
+    monkeypatch,
+) -> None:
+    killed: list[object] = []
+    reaped: list[object] = []
+
+    class SpawnedProcess:
+        returncode = None
+        pid = 123
+
+        def communicate(self, timeout=None):
+            raise AssertionError("communication must not begin after a spawn interruption")
+
+        def poll(self):
+            return self.returncode
+
+    process = SpawnedProcess()
+    monkeypatch.setattr(easy_run.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(
+        easy_run,
+        "_restore_posix_signal_mask",
+        lambda _mask: (_ for _ in ()).throw(KeyboardInterrupt),
+    )
+    monkeypatch.setattr(easy_run, "_kill_process_group", killed.append)
+    monkeypatch.setattr(easy_run, "_reap_killed_process", reaped.append)
+
+    with pytest.raises(KeyboardInterrupt):
+        easy_run._run_multi_gpu_nccl_canary(2, {})
+
+    assert killed == [process]
+    assert reaped == [process]
 
 
 def test_distributed_nccl_canary_rejects_missing_or_duplicate_ranks(monkeypatch) -> None:
