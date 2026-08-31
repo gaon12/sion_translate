@@ -41,9 +41,10 @@ import threading
 import time
 from collections.abc import Mapping
 from contextlib import ExitStack, contextmanager
+from functools import wraps
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, BinaryIO, Callable, Iterator, Sequence, TypeVar, cast
+from typing import Any, BinaryIO, Callable, Iterator, ParamSpec, Sequence, TypeVar, cast
 
 import numpy as np
 import torch
@@ -153,6 +154,10 @@ from sion_translate.training.trainer import (
     train,
 )
 from sion_translate.performance import build_cpu_plan
+from sion_translate.process_deadline import (
+    hard_process_deadline,
+    hard_terminate_current_process,
+)
 
 
 # Editable GPU-bundle installs execute this module directly from
@@ -169,10 +174,38 @@ FINAL_EXPORT_DEPENDENCIES = {
 FINAL_EXPORT_STATUS_SCHEMA = "sion-final-export-status-v1"
 RANK_ZERO_ACTION_STATUS_SCHEMA = "sion-rank-zero-action-status-v1"
 REFINEMENT_EVIDENCE_SPLIT = "refinement_evidence"
-FINAL_EXPORT_STATUS_TIMEOUT_SECONDS = 24 * 60 * 60
+FINAL_EXPORT_STATUS_TIMEOUT_SECONDS = 30 * 60
+FINAL_EXPORT_STATUS_STALE_TIMEOUT_SECONDS = 10 * 60
+FINAL_EXPORT_STATUS_HEARTBEAT_SECONDS = 30.0
+FINAL_EXPORT_HEARTBEAT_STOP_SECONDS = 5.0
+FINAL_EXPORT_TIMEOUT_ENV = "SION_FINAL_EXPORT_TIMEOUT_SECONDS"
+FINAL_EXPORT_TIMEOUT_MIN_SECONDS = FINAL_EXPORT_STATUS_STALE_TIMEOUT_SECONDS
+FINAL_EXPORT_TIMEOUT_MAX_SECONDS = 2 * 60 * 60
 RANK_ZERO_ACTION_STALE_TIMEOUT_SECONDS = 15 * 60
 RANK_ZERO_ACTION_HEARTBEAT_SECONDS = 30.0
 RANK_ZERO_STATUS_FILE_BYTES = 16 * 1024
+_FinalExportParameters = ParamSpec("_FinalExportParameters")
+
+
+def _final_export_timeout_seconds() -> float:
+    """Return the reviewed whole-operation deadline for strict final export."""
+
+    raw_value = os.environ.get(FINAL_EXPORT_TIMEOUT_ENV)
+    if raw_value is None:
+        return float(FINAL_EXPORT_STATUS_TIMEOUT_SECONDS)
+    try:
+        timeout_seconds = float(raw_value)
+    except ValueError as error:
+        raise ValueError(f"{FINAL_EXPORT_TIMEOUT_ENV} must be a number of seconds") from error
+    if not math.isfinite(timeout_seconds):
+        raise ValueError(f"{FINAL_EXPORT_TIMEOUT_ENV} must be finite")
+    if not FINAL_EXPORT_TIMEOUT_MIN_SECONDS <= timeout_seconds <= FINAL_EXPORT_TIMEOUT_MAX_SECONDS:
+        raise ValueError(
+            f"{FINAL_EXPORT_TIMEOUT_ENV} must be between "
+            f"{FINAL_EXPORT_TIMEOUT_MIN_SECONDS:g} and "
+            f"{FINAL_EXPORT_TIMEOUT_MAX_SECONDS:g} seconds"
+        )
+    return timeout_seconds
 
 
 @contextmanager  # pyright: ignore[reportDeprecated]
@@ -886,10 +919,23 @@ def _wait_for_final_export_status(
     step: int,
     release_name: str,
     invocation: str,
+    timeout_seconds: float | None = None,
+    stale_timeout_seconds: float = FINAL_EXPORT_STATUS_STALE_TIMEOUT_SECONDS,
 ) -> None:
-    """Wait without a process-group timeout while rank 0 performs strict conversion."""
+    """Wait for a live strict export without entering a long collective."""
 
-    deadline = time.monotonic() + FINAL_EXPORT_STATUS_TIMEOUT_SECONDS
+    if timeout_seconds is None:
+        timeout_seconds = _final_export_timeout_seconds()
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0.0:
+        raise ValueError("final export timeout must be a finite positive number")
+    if not math.isfinite(stale_timeout_seconds) or stale_timeout_seconds <= 0.0:
+        raise ValueError("final export stale timeout must be a finite positive number")
+    if stale_timeout_seconds > timeout_seconds:
+        raise ValueError("final export stale timeout cannot exceed the total timeout")
+    started = time.monotonic()
+    deadline = started + timeout_seconds
+    last_progress = started
+    heartbeat_sequence: int | None = None
     while True:
         for status in _read_control_status(status_path):
             matches_run = (
@@ -904,14 +950,117 @@ def _wait_for_final_export_status(
                 error_type = status.get("error_type", "RuntimeError")
                 message = status.get("message", "unknown rank-0 export failure")
                 raise RuntimeError(f"rank 0 final export failed: {error_type}: {message}")
-        if time.monotonic() >= deadline:
+            if matches_run and status.get("state") == "running":
+                raw_sequence = status.get("heartbeat_sequence")
+                if (
+                    isinstance(raw_sequence, int)
+                    and not isinstance(raw_sequence, bool)
+                    and raw_sequence >= 0
+                ):
+                    if heartbeat_sequence is None or raw_sequence > heartbeat_sequence:
+                        heartbeat_sequence = raw_sequence
+                        last_progress = time.monotonic()
+        now = time.monotonic()
+        if now - last_progress >= stale_timeout_seconds:
+            raise TimeoutError(
+                "rank 0 final export stopped publishing heartbeats for "
+                f"{stale_timeout_seconds:g} seconds: {status_path}"
+            )
+        if now >= deadline:
             raise TimeoutError(
                 "timed out waiting for rank 0 final export after "
-                f"{FINAL_EXPORT_STATUS_TIMEOUT_SECONDS:g} seconds: {status_path}"
+                f"{timeout_seconds:g} seconds: {status_path}"
             )
         time.sleep(0.25)
 
 
+def _start_final_export_heartbeat(
+    handles: tuple[BinaryIO, BinaryIO],
+    running_status: dict[str, Any],
+    *,
+    interval_seconds: float = FINAL_EXPORT_STATUS_HEARTBEAT_SECONDS,
+) -> tuple[threading.Event, threading.Thread, list[BaseException]]:
+    """Publish progress while rank 0 performs CPU-heavy strict conversion."""
+
+    if not math.isfinite(interval_seconds) or interval_seconds <= 0.0:
+        raise ValueError("final export heartbeat interval must be a finite positive number")
+    if interval_seconds >= FINAL_EXPORT_STATUS_STALE_TIMEOUT_SECONDS:
+        raise ValueError(
+            "final export heartbeat interval must be shorter than the peer stale timeout"
+        )
+    stop = threading.Event()
+    errors: list[BaseException] = []
+
+    def publish() -> None:
+        sequence = int(running_status["heartbeat_sequence"])
+        while not stop.wait(interval_seconds):
+            sequence += 1
+            try:
+                _publish_control_status(
+                    handles,
+                    {
+                        **running_status,
+                        "heartbeat_sequence": sequence,
+                        "updated_unix_ns": time.time_ns(),
+                    },
+                )
+            except BaseException as error:
+                errors.append(error)
+                hard_terminate_current_process(
+                    "final export heartbeat publication failed while rank 0 may still "
+                    "be mutating release files: "
+                    f"{type(error).__name__}"
+                )
+                return
+
+    thread = threading.Thread(
+        target=publish,
+        name="sion-final-export-heartbeat",
+        daemon=True,
+    )
+    thread.start()
+    return stop, thread, errors
+
+
+def _stop_final_export_heartbeat(
+    heartbeat: tuple[threading.Event, threading.Thread, list[BaseException]] | None,
+) -> list[BaseException]:
+    if heartbeat is None:
+        return []
+    stop, thread, errors = heartbeat
+    stop.set()
+    thread.join(FINAL_EXPORT_HEARTBEAT_STOP_SECONDS)
+    if thread.is_alive():
+        hard_terminate_current_process(
+            "final export heartbeat did not stop within "
+            f"{FINAL_EXPORT_HEARTBEAT_STOP_SECONDS:g} seconds; the process cannot "
+            "safely continue while a background thread may still publish release state"
+        )
+        raise RuntimeError("final export heartbeat hard termination returned unexpectedly")
+    return errors
+
+
+def _final_export_hard_deadline_guard(
+    function: Callable[_FinalExportParameters, Path],
+) -> Callable[_FinalExportParameters, Path]:
+    """Protect every rank's complete strict-export transaction with a hard stop."""
+
+    @wraps(function)
+    def guarded(
+        *args: _FinalExportParameters.args,
+        **kwargs: _FinalExportParameters.kwargs,
+    ) -> Path:
+        timeout_seconds = _final_export_timeout_seconds()
+        with hard_process_deadline(
+            "strict final model export",
+            timeout_seconds=timeout_seconds,
+        ):
+            return function(*args, **kwargs)
+
+    return guarded
+
+
+@_final_export_hard_deadline_guard
 def export_final_model(
     model: torch.nn.Module,
     config: AppConfig,
@@ -984,6 +1133,7 @@ def export_final_model(
                     "data.revision_examples must exactly reflect authenticated_revision_directions"
                 )
     status_handles: tuple[BinaryIO, BinaryIO] | None = None
+    status_heartbeat: tuple[threading.Event, threading.Thread, list[BaseException]] | None = None
     invocation = "single-process"
     if context.distributed:
         invocation = broadcast_text(
@@ -1001,6 +1151,8 @@ def export_final_model(
                     "step": step,
                     "release_name": release_name,
                     "formats": list(requested_formats),
+                    "heartbeat_sequence": 0,
+                    "updated_unix_ns": time.time_ns(),
                 },
             ),
             description="publishing final export start state",
@@ -1020,6 +1172,21 @@ def export_final_model(
             _close_control_status(status_handles)
             raise RuntimeError(
                 "final export status is not coherently visible to every distributed rank"
+            )
+        if context.is_main:
+            assert status_handles is not None
+            status_heartbeat = _start_final_export_heartbeat(
+                status_handles,
+                {
+                    "schema": FINAL_EXPORT_STATUS_SCHEMA,
+                    "state": "running",
+                    "invocation": invocation,
+                    "step": step,
+                    "release_name": release_name,
+                    "formats": list(requested_formats),
+                    "heartbeat_sequence": 0,
+                    "updated_unix_ns": time.time_ns(),
+                },
             )
     try:
         export_inference_models(
@@ -1052,6 +1219,13 @@ def export_final_model(
         )
     except BaseException as error:
         if context.distributed and context.is_main and status_handles is not None:
+            heartbeat_errors = _stop_final_export_heartbeat(status_heartbeat)
+            status_heartbeat = None
+            for heartbeat_error in heartbeat_errors:
+                error.add_note(
+                    "final export heartbeat also failed: "
+                    f"{type(heartbeat_error).__name__}: {heartbeat_error}"
+                )
             try:
                 _publish_control_status(
                     status_handles,
@@ -1071,6 +1245,27 @@ def export_final_model(
     if context.distributed:
         if context.is_main:
             assert status_handles is not None
+            heartbeat_errors = _stop_final_export_heartbeat(status_heartbeat)
+            status_heartbeat = None
+            if heartbeat_errors:
+                heartbeat_error = RuntimeError("final export heartbeat publication failed")
+                heartbeat_error.__cause__ = heartbeat_errors[0]
+                try:
+                    _publish_control_status(
+                        status_handles,
+                        {
+                            "schema": FINAL_EXPORT_STATUS_SCHEMA,
+                            "state": "failed",
+                            "invocation": invocation,
+                            "step": step,
+                            "release_name": release_name,
+                            "error_type": type(heartbeat_error).__name__,
+                            "message": _bounded_status_text(heartbeat_error),
+                        },
+                    )
+                finally:
+                    _close_control_status(status_handles)
+                raise heartbeat_error
             try:
                 _publish_control_status(
                     status_handles,
@@ -2446,8 +2641,12 @@ def _wait_for_rank_zero_action(
                 return status
             if matches_operation and status.get("state") == "running":
                 raw_sequence = status.get("heartbeat_sequence")
-                if isinstance(raw_sequence, int) and not isinstance(raw_sequence, bool):
-                    if heartbeat_sequence != raw_sequence:
+                if (
+                    isinstance(raw_sequence, int)
+                    and not isinstance(raw_sequence, bool)
+                    and raw_sequence >= 0
+                ):
+                    if heartbeat_sequence is None or raw_sequence > heartbeat_sequence:
                         heartbeat_sequence = raw_sequence
                         last_progress = time.monotonic()
         if time.monotonic() - last_progress >= stale_timeout_seconds:

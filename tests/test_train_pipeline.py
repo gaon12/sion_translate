@@ -6,8 +6,9 @@ import socket
 import subprocess
 import sys
 import textwrap
+import threading
 import time
-from contextlib import ExitStack, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -1758,6 +1759,271 @@ def test_preallocated_backup_status_survives_one_terminal_write_failure(
     assert injected
 
 
+def test_final_export_peer_rejects_a_stalled_heartbeat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    status_path = tmp_path / "strict-export-status.json"
+    status = {
+        "schema": train_module.FINAL_EXPORT_STATUS_SCHEMA,
+        "state": "running",
+        "invocation": "current-export",
+        "step": 17,
+        "release_name": "sion",
+        "heartbeat_sequence": 1,
+    }
+    older_backup = {**status, "heartbeat_sequence": 0}
+    clock = iter((0.0, 0.0, 0.0, 11.0))
+    monkeypatch.setattr(
+        train_module,
+        "_read_control_status",
+        lambda _path: [status, older_backup],
+    )
+    monkeypatch.setattr(train_module.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(train_module.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(TimeoutError, match="stopped publishing heartbeats for 10 seconds"):
+        train_module._wait_for_final_export_status(
+            status_path,
+            step=17,
+            release_name="sion",
+            invocation="current-export",
+            timeout_seconds=100.0,
+            stale_timeout_seconds=10.0,
+        )
+
+
+def test_final_export_peer_enforces_total_timeout_despite_progress(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    status_path = tmp_path / "strict-export-status.json"
+    sequence = 0
+
+    def running_status(_path: Path) -> list[dict[str, object]]:
+        nonlocal sequence
+        sequence += 1
+        return [
+            {
+                "schema": train_module.FINAL_EXPORT_STATUS_SCHEMA,
+                "state": "running",
+                "invocation": "current-export",
+                "step": 17,
+                "release_name": "sion",
+                "heartbeat_sequence": sequence,
+            }
+        ]
+
+    clock = iter((0.0, 0.0, 0.0, 9.0, 11.0))
+    monkeypatch.setattr(train_module, "_read_control_status", running_status)
+    monkeypatch.setattr(train_module.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(train_module.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(TimeoutError, match="after 10 seconds"):
+        train_module._wait_for_final_export_status(
+            status_path,
+            step=17,
+            release_name="sion",
+            invocation="current-export",
+            timeout_seconds=10.0,
+            stale_timeout_seconds=10.0,
+        )
+
+
+def test_final_export_heartbeat_advances_the_durable_status(tmp_path: Path) -> None:
+    status_path = tmp_path / "strict-export-status.json"
+    running = {
+        "schema": train_module.FINAL_EXPORT_STATUS_SCHEMA,
+        "state": "running",
+        "invocation": "current-export",
+        "step": 17,
+        "release_name": "sion",
+        "heartbeat_sequence": 0,
+        "updated_unix_ns": time.time_ns(),
+    }
+    handles = train_module._initialize_control_status(status_path, running)
+    heartbeat = train_module._start_final_export_heartbeat(
+        handles,
+        running,
+        interval_seconds=0.001,
+    )
+    deadline = time.monotonic() + 1.0
+    try:
+        while time.monotonic() < deadline:
+            statuses = train_module._read_control_status(status_path)
+            if any(int(status.get("heartbeat_sequence", 0)) > 0 for status in statuses):
+                break
+            time.sleep(0.001)
+        else:
+            raise AssertionError("final export heartbeat did not publish progress")
+    finally:
+        errors = train_module._stop_final_export_heartbeat(heartbeat)
+        train_module._close_control_status(handles)
+
+    assert errors == []
+    assert train_module.FINAL_EXPORT_STATUS_TIMEOUT_SECONDS == 30 * 60
+    assert train_module.FINAL_EXPORT_STATUS_STALE_TIMEOUT_SECONDS == 10 * 60
+
+
+@pytest.mark.parametrize(
+    "interval_seconds",
+    [0.0, -1.0, float("nan"), float("inf"), 10 * 60],
+)
+def test_final_export_heartbeat_rejects_unsafe_intervals(
+    tmp_path: Path,
+    interval_seconds: float,
+) -> None:
+    status_path = tmp_path / "strict-export-status.json"
+    running = {
+        "schema": train_module.FINAL_EXPORT_STATUS_SCHEMA,
+        "heartbeat_sequence": 0,
+    }
+    handles = train_module._initialize_control_status(status_path, running)
+    try:
+        with pytest.raises(ValueError, match="heartbeat interval"):
+            train_module._start_final_export_heartbeat(
+                handles,
+                running,
+                interval_seconds=interval_seconds,
+            )
+    finally:
+        train_module._close_control_status(handles)
+
+
+@pytest.mark.parametrize(
+    ("raw_value", "message"),
+    [
+        ("not-a-number", "must be a number"),
+        ("nan", "must be finite"),
+        ("599.9", "must be between 600 and 7200"),
+        ("7200.1", "must be between 600 and 7200"),
+    ],
+)
+def test_final_export_timeout_rejects_unsafe_environment_values(
+    monkeypatch: pytest.MonkeyPatch,
+    raw_value: str,
+    message: str,
+) -> None:
+    monkeypatch.setenv(train_module.FINAL_EXPORT_TIMEOUT_ENV, raw_value)
+
+    with pytest.raises(ValueError, match=message):
+        train_module._final_export_timeout_seconds()
+
+
+def test_final_export_timeout_uses_the_reviewed_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(train_module.FINAL_EXPORT_TIMEOUT_ENV, raising=False)
+
+    assert train_module._final_export_timeout_seconds() == 30 * 60
+
+
+def test_final_export_guard_arms_the_external_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, object]] = []
+
+    @contextmanager
+    def fake_deadline(operation: str, *, timeout_seconds: float):
+        events.append(("start", (operation, timeout_seconds)))
+        try:
+            yield
+        finally:
+            events.append(("stop", operation))
+
+    def action(destination: Path) -> Path:
+        events.append(("action", destination))
+        return destination
+
+    monkeypatch.setattr(train_module, "hard_process_deadline", fake_deadline)
+    monkeypatch.setenv(train_module.FINAL_EXPORT_TIMEOUT_ENV, "600")
+    guarded = train_module._final_export_hard_deadline_guard(action)
+
+    assert guarded(tmp_path) == tmp_path
+    assert events == [
+        ("start", ("strict final model export", 600.0)),
+        ("action", tmp_path),
+        ("stop", "strict final model export"),
+    ]
+
+
+def test_final_export_heartbeat_stall_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = threading.Event()
+    thread = threading.Thread(target=release.wait, daemon=True)
+    thread.start()
+    diagnostics: list[str] = []
+
+    def intercept_termination(message: str) -> None:
+        diagnostics.append(message)
+        raise RuntimeError("hard termination intercepted by test")
+
+    monkeypatch.setattr(train_module, "FINAL_EXPORT_HEARTBEAT_STOP_SECONDS", 0.01)
+    monkeypatch.setattr(
+        train_module,
+        "hard_terminate_current_process",
+        intercept_termination,
+    )
+    try:
+        with pytest.raises(RuntimeError, match="hard termination intercepted"):
+            train_module._stop_final_export_heartbeat((threading.Event(), thread, []))
+    finally:
+        release.set()
+        thread.join(1.0)
+
+    assert diagnostics
+    assert "cannot safely continue" in diagnostics[0]
+
+
+def test_final_export_heartbeat_publication_failure_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    status_path = tmp_path / "strict-export-status.json"
+    running = {
+        "schema": train_module.FINAL_EXPORT_STATUS_SCHEMA,
+        "state": "running",
+        "invocation": "current-export",
+        "step": 17,
+        "release_name": "sion",
+        "heartbeat_sequence": 0,
+        "updated_unix_ns": time.time_ns(),
+    }
+    handles = train_module._initialize_control_status(status_path, running)
+    terminated = threading.Event()
+    diagnostics: list[str] = []
+
+    def reject_publication(*_args: object, **_kwargs: object) -> None:
+        raise OSError("injected heartbeat storage failure")
+
+    def intercept_termination(message: str) -> None:
+        diagnostics.append(message)
+        terminated.set()
+
+    monkeypatch.setattr(train_module, "_publish_control_status", reject_publication)
+    monkeypatch.setattr(
+        train_module,
+        "hard_terminate_current_process",
+        intercept_termination,
+    )
+    heartbeat = train_module._start_final_export_heartbeat(
+        handles,
+        running,
+        interval_seconds=0.001,
+    )
+    try:
+        assert terminated.wait(1.0)
+        errors = train_module._stop_final_export_heartbeat(heartbeat)
+    finally:
+        train_module._close_control_status(handles)
+
+    assert len(errors) == 1
+    assert isinstance(errors[0], OSError)
+    assert "OSError" in diagnostics[0]
+
+
 def test_control_status_bounds_multibyte_and_control_character_diagnostics() -> None:
     diagnostic = ("오류🔥\x00\n" * 20_000) + "tail"
     bounded = train_module._bounded_status_text(diagnostic)
@@ -2666,6 +2932,57 @@ def test_cuda_multi_gpu_fails_before_process_group_without_nccl(monkeypatch) -> 
     with pytest.raises(RuntimeError, match="requires the NCCL"):
         initialize_distributed()
     assert initialized is False
+
+
+def test_distributed_timeout_is_configurable_inside_a_practical_bound() -> None:
+    assert distributed_module.distributed_timeout_seconds({}) == 600.0
+    assert (
+        distributed_module.distributed_timeout_seconds(
+            {distributed_module.DISTRIBUTED_TIMEOUT_ENV: "420.5"}
+        )
+        == 420.5
+    )
+
+    for invalid in ("nan", "29", "1801", "not-a-number"):
+        with pytest.raises(ValueError, match=distributed_module.DISTRIBUTED_TIMEOUT_ENV):
+            distributed_module.distributed_timeout_seconds(
+                {distributed_module.DISTRIBUTED_TIMEOUT_ENV: invalid}
+            )
+
+
+def test_cuda_process_group_receives_timeout_and_nccl_watchdog_defaults(monkeypatch) -> None:
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setenv(distributed_module.DISTRIBUTED_TIMEOUT_ENV, "420")
+    for name in distributed_module.NCCL_WATCHDOG_DEFAULTS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "set_device", lambda _device: None)
+    monkeypatch.setattr(torch.distributed, "is_nccl_available", lambda: True)
+    initialized: dict[str, object] = {}
+    monkeypatch.setattr(
+        torch.distributed,
+        "init_process_group",
+        lambda **kwargs: initialized.update(kwargs),
+    )
+
+    context = initialize_distributed()
+
+    assert context.backend == "nccl"
+    assert initialized["backend"] == "nccl"
+    assert initialized["timeout"].total_seconds() == 420  # type: ignore[union-attr]
+    for name, value in distributed_module.NCCL_WATCHDOG_DEFAULTS.items():
+        assert os.environ[name] == value
+
+
+def test_nccl_watchdog_defaults_do_not_replace_an_operator_override() -> None:
+    environment = {"TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC": "75"}
+
+    distributed_module.configure_nccl_watchdog_environment(environment)
+
+    assert environment["TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC"] == "75"
+    assert environment["TORCH_NCCL_ENABLE_MONITORING"] == "1"
 
 
 def test_fsdp2_registers_custom_generation_forward_methods(monkeypatch) -> None:
