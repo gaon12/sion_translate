@@ -45,7 +45,13 @@ sion-train --allow-local-checkout --config sion_translate.yaml --prepare-only
 ```
 
 This command stops before model allocation. It authenticates and reuses complete
-artifacts on subsequent runs.
+artifacts on subsequent runs. It also opens the ordinary validation and dedicated
+`refinement_evidence` splits and constructs the fixed, graph-complete release cohort.
+Missing directions or fewer than the configured distinct examples per direction fail here,
+before the GPU job can consume paid time.
+The evidence DataLoader uses a separate clean translation collator. Ordinary validation may
+enable denoising, but evidence collation always keeps denoising and input noise at zero so every
+authenticated row retains its directed translation identity.
 
 For a manual one-way example:
 
@@ -91,6 +97,9 @@ foundation artifacts while omitting raw parallel and monolingual training corpor
 is the normal path when local preparation has completed. Use the individual `--with-*`
 options only for a deliberate server-side rebuild; `--with-monolingual-corpus` is needed
 when the server must prepare the foundation dataset and conflicts with `--prepared-only`.
+Candidate-refinement GPU jobs must use a prepared dataset-bearing bundle. The builder rejects a
+raw-only candidate-refinement archive because it cannot authenticate the fixed per-direction
+evidence capacity before paid server work begins.
 After extraction on the server:
 
 ```bash
@@ -304,13 +313,21 @@ must improve by at least
 `training.candidate_refinement_min_worst_direction_nll_gain` (default `1e-5`). An exactly
 neutral refiner therefore remains release-ineligible.
 
-Validation builds a deterministic direction-complete cohort from the prepared graph. It balances
-all configured edges and automatically expands `eval_batches` until every edge can contribute at
-least `training.candidate_refinement_min_validation_examples_per_direction` distinct rows. It
-never repeats a rare row for release evidence; an undersized edge fails early with the exact
-direction and required count. The cohort identity binds the selected logical indices, per-edge
-counts, and verified dataset artifact inventory, so changing data or the distributed sampling
-contract invalidates prior evidence.
+Release validation reads a dedicated `refinement_evidence` split. Genuine ordinary validation
+continues to control absolute NLL, early stopping, and MRT reward; the evidence split contributes
+only relative provisional-to-final NLL gains. Exact reviewed synthetic basenames may contribute
+only forward edges from source-only languages. They never enter ordinary validation or test and
+cannot be treated as absolute translation-quality evidence.
+Their target text may overlap training for the relative comparison, but it may not overlap an
+ordinary validation or test endpoint. This rule is enforced independently of input file order.
+
+The release sampler selects exactly
+`training.candidate_refinement_min_validation_examples_per_direction` distinct logical rows for
+every configured edge. It never repeats a rare row; an undersized edge fails during local
+`--prepare-only` and again during prepared-bundle construction. Every rank evaluates the same
+small cohort, so GPU count and per-rank batch packing do not change membership. The cohort
+identity binds the selected indices, graph, seed, per-edge counts, and verified dataset artifact
+inventory, while excluding hardware layout.
 
 For translation SFT, step zero is resume-only and supplies the validation comparison floor;
 at least one optimizer update must both beat that floor and pass the directional gain rule.

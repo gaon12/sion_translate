@@ -142,7 +142,7 @@ The marker may also be nested in metadata.
 {"ko":"Korean source","ja":"Japanese target","metadata":{"synthetic":true}}
 ```
 
-`synthetic` must be the JSON boolean `true`, not the string `"true"`. A record-level marker or a filename beginning with `bt_`, `concat_`, `revise_`, or `synthetic_` makes the data training-only and applies the default 0.5 sampling weight. Also record the source model, prompt, generation time, decoding settings, and source-text hash in a separate source manifest.
+`synthetic` must be the JSON boolean `true`, not the string `"true"`. A record-level marker or a filename beginning with `bt_`, `concat_`, `revise_`, or `synthetic_` makes the data training-only by default and applies the default 0.5 sampling weight. The only exception is an exact basename explicitly listed in `data.source_only_synthetic_evidence_files`: selected forward-only rows from configured source-only languages may enter the dedicated `refinement_evidence` split to measure relative `T1 -> T2` gain. They never enter ordinary validation or test and must never support an absolute quality claim. Also record the source model, prompt, generation time, decoding settings, and source-text hash in a separate source manifest.
 
 ## 5. Collection and alignment pipeline
 
@@ -224,7 +224,7 @@ Keep multiple translations from one record, adjacent sentences from one document
 
 ## 9. Holdout design
 
-By default, indexed-dataset construction deterministically assigns 0.5% of real data to validation and 0.5% to test. A 100 million-pair corpus does not automatically require 500,000 validation and 500,000 test pairs. Fix the fractions according to final scale and evaluation cost, then keep the hash split unchanged across retraining runs. Never put synthetic data into validation or test.
+By default, indexed-dataset construction deterministically assigns 0.5% of real data to validation and 0.5% to test. A 100 million-pair corpus does not automatically require 500,000 validation and 500,000 test pairs. Fix the fractions according to final scale and evaluation cost, then keep the hash split unchanged across retraining runs. Never put synthetic data into ordinary validation or test. Candidate-refinement release evidence belongs in its separate split and supports only the relative refinement comparison described above.
 
 The minimum evaluation bundle includes:
 

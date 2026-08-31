@@ -143,8 +143,11 @@ sion-train --allow-local-checkout --config sion_translate.yaml --prepare-only
 ```
 
 This is the recommended local workflow before uploading a GPU bundle. It can train the
-tokenizer and build indexed translation and foundation datasets locally. Re-running the
-command checks fingerprints and reuses complete artifacts.
+tokenizer and build indexed translation and foundation datasets locally. Before returning,
+it also opens every required split, authenticates the effective training graph, and builds
+the fixed candidate-refinement release cohort. A missing edge or undersized evidence cohort
+therefore fails on the local CPU instead of after paid GPU allocation. Re-running the command
+checks fingerprints and reuses complete artifacts.
 
 ## Manual tokenizer and dataset preparation
 
@@ -176,13 +179,17 @@ duplicates from crossing split boundaries, records source fingerprints, and writ
 manifest for every generated shard.
 
 The dataset manifest names physical token totals by storage side, not by language. Under
-`stats_schema: sion-prepare-stats-src-tgt-v1`, `src_tokens` and `tgt_tokens` count the
+`stats_schema: sion-prepare-stats-src-tgt-v2`, `src_tokens` and `tgt_tokens` count the
 accepted content token IDs physically stored in the source and target shard files. They
 do not count padding, runtime language controls, virtual reverse examples, repeated
 epochs, or later training augmentation. This definition stays valid for any configured
-language graph. Authenticated v1.5 manifests without a statistics marker are still read
-when they contain the exact legacy `ko_tokens` and `ja_tokens` field set, but every new
-manifest writes only the storage-neutral names.
+language graph. The v2 statistics contract also records the dedicated
+`refinement_evidence` count. Authenticated older manifests may use the v1 storage-neutral
+contract or, when no schema marker exists, the exact legacy `ko_tokens` and `ja_tokens`
+field set. Every new manifest writes only the v2 storage-neutral names.
+The local compatibility reader can inspect those older contracts, but a new GPU handoff
+bundle requires the current v2 schema and reconciles every total and per-source statistic
+against the indexed shard fields. Rebuild an older prepared dataset locally before packaging it.
 
 Translation preparation writes deterministic, content-bound worker chunks beside the
 requested output. If tokenization is interrupted, run the same command again: compatible
@@ -316,12 +323,31 @@ refined endpoint improved the held-out target token. Reports include token-weigh
 and target-language values, exact directed-edge values, a direction macro mean, and the
 worst directed edge.
 
-Release validation uses a deterministic direction-complete cohort. It derives every edge from
-the configured dataset graph, assigns each edge a balanced quota, repeats a rare held-out row
-only when needed, and expands the evaluation batch count when the requested budget cannot cover
-the graph. The cohort fingerprint binds the selected logical indices, distributed layout, and
-verified dataset artifact inventory. No language name or fixed three-language topology is built
-into this policy.
+Release validation uses the dedicated `refinement_evidence` split, not the ordinary
+validation split. Ordinary validation remains genuine-only and continues to control absolute
+NLL, checkpoint selection, early stopping, and MRT reward. The evidence split is used only for
+the relative `T1 -> T2` NLL gain. Real rows may supply any configured edge. Synthetic rows are
+admitted only from exact basenames listed in
+`data.source_only_synthetic_evidence_files`, only for forward-only edges from a configured
+source-only language, and never as absolute translation-quality evidence. Future synthetic
+files remain training-only until their exact basename is reviewed and added. Their standard
+target text is allowed to overlap training because the metric compares two outputs of the same
+model on the same source; this exception does not apply to the evidence source endpoint or to
+ordinary validation and test data.
+
+The evidence loader always uses clean translation collation with zero denoising, source-token
+dropout, and decoder-input noise. This remains true when ordinary validation deliberately enables
+`data.validation_denoise_probability`; otherwise denoising could erase a direction label and make
+the trainer evaluate fewer than the authenticated K rows.
+
+The release cohort derives every edge from the configured graph and selects exactly
+`training.candidate_refinement_min_validation_examples_per_direction` distinct logical rows
+per edge. An undersized edge is an error; rows are never repeated to satisfy the release floor.
+Every distributed rank evaluates the same small semantic cohort, so changing GPU count or batch
+packing cannot change its membership or fingerprint. The fingerprint binds the selected logical
+indices, configured graph, seed, per-edge counts, and verified dataset artifact inventory, while
+intentionally excluding hardware layout. No language name or fixed three-language topology is
+built into this policy.
 
 Translation training treats this measurement as a release rule, not only a diagnostic.
 During SFT, step-zero weights are always resume-only because no translation optimizer update
@@ -446,10 +472,19 @@ CPU-heavy tokenization or indexing.
 Use the individual `--with-*` switches only for an intentional rebuild workflow. For
 example, add `--with-monolingual-corpus` when the GPU server must build the foundation
 dataset itself. That raw-corpus option deliberately conflicts with `--prepared-only`.
+Candidate-refinement runs are stricter: their GPU bundle must include the authenticated
+prepared tokenizer and translation dataset. A raw-only candidate-refinement bundle is rejected
+locally because its fixed evidence capacity would otherwise remain unknown until paid GPU time.
 
 The builder authenticates the tokenizer, token features, translation dataset, foundation
 dataset, source provenance, configuration-selected graph, Git tree, file sizes, and
-SHA-256 digests. Manifest format 2 also binds the exact tracked `sion_translate.yaml`
+SHA-256 digests. Translation authentication requires the exact current v2 statistics and
+recomputes per-source split rows, source/target tokens, quality totals, forward-only rows, and
+synthetic rows directly from the index shards. Record-level `synthetic: true` remains valid in a
+normally named source, while every row from a synthetic-prefixed source must stay marked.
+When candidate refinement is enabled, the builder also counts the prepared
+`refinement_evidence` rows per configured direction and refuses to create the archive if any
+edge is below the fixed release-cohort minimum. Manifest format 2 also binds the exact tracked `sion_translate.yaml`
 path and digest used by the default training command. The current format intentionally
 requires the canonical artifact and corpus paths so an alternate local layout cannot be
 packaged and then interpreted differently on the server. The builder publishes the ZIP

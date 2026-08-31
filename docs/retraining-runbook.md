@@ -119,13 +119,18 @@ Treat a graph, tokenizer, token-feature, source-fingerprint, or inventory mismat
 hard failure. Investigate it instead of deleting metadata and forcing reuse.
 
 Inspect `artifacts/dataset/manifest.json` after preparation. New artifacts must declare
-`stats_schema` as `sion-prepare-stats-src-tgt-v1`. The `src_tokens` and `tgt_tokens`
+`stats_schema` as `sion-prepare-stats-src-tgt-v2`. The `src_tokens` and `tgt_tokens`
 values are physical accepted content-token counts for the two stored shard sides; they
 are not Korean/Japanese totals and they do not include virtual reverse directions,
 padding, runtime controls, epoch repetition, or online augmentation. Their values must
-match the sums of `src_length` and `tgt_length` in the authenticated index shards. A
-markerless v1.5 manifest may retain the exact legacy `ko_tokens`/`ja_tokens` names for
-compatibility, but do not copy those misleading names into a new manifest.
+match the sums of `src_length` and `tgt_length` in the authenticated index shards. The v2
+contract also includes the dedicated `refinement_evidence` split count. Older v1 manifests
+remain readable, and a markerless v1.5 manifest may retain the exact legacy
+`ko_tokens`/`ja_tokens` names for compatibility, but do not copy those misleading names
+into a new manifest.
+Compatibility reading does not make an old artifact eligible for a new GPU handoff. The bundle
+builder requires the current v2 schema and reconciles all total and per-source derived statistics
+with the authenticated shard indexes. Rebuild old prepared data locally before packaging it.
 
 An interrupted translation build keeps deterministic gzip worker chunks in a hidden
 content-addressed progress directory next to `artifacts/dataset/`. The progress contract
@@ -251,6 +256,9 @@ but omits raw parallel and monolingual training corpora even when they are track
 the individual `--with-*` switches only for a deliberate server-side rebuild.
 `--with-monolingual-corpus` is required when the GPU server must rebuild the foundation
 dataset and intentionally conflicts with `--prepared-only`.
+Do not create a raw-only candidate-refinement bundle. Candidate refinement requires the prepared
+tokenizer and translation dataset so the builder can authenticate exactly K distinct logical
+rows per configured direction before the upload.
 
 Record the archive path, byte size, SHA-256, source commit, Git tree, configuration
 fingerprint, and artifact inventory. Do not upload an archive that fails verification.
@@ -379,10 +387,19 @@ global, target-language, directed-edge, macro-direction, and worst-direction val
 running a second decoder pass. It checks the raw or EMA family that will actually deploy.
 
 The release cohort is derived from the configured graph rather than from named languages. It
-allocates a deterministic balanced quota to every direction, repeats rare held-out rows only as
-needed, and expands the batch budget when the graph would otherwise be incomplete. Its fingerprint
-also binds the verified prepared-dataset inventory, selected virtual indices, and distributed
-layout.
+comes from a dedicated `refinement_evidence` split and contains exactly the configured minimum
+number of distinct logical rows per direction. It never repeats a rare row. Ordinary genuine
+validation remains the only source for absolute NLL, early stopping, and MRT reward. The separate
+evidence split contributes only the relative `T1 -> T2` gain. Exact reviewed synthetic basenames
+may supply forward-only source-only edges, but they never become ordinary quality evidence.
+Their target endpoints may overlap training, but remain isolated from ordinary validation and
+test. The dedicated evidence collator also forces denoising, source dropout, and decoder-input
+noise to zero even when ordinary validation uses a denoising mixture.
+
+Every rank evaluates the same small semantic cohort. GPU count and batch packing therefore do not
+change membership or the cohort fingerprint. The fingerprint binds the graph, seed, selected
+virtual indices, per-edge counts, and verified prepared-dataset inventory while excluding hardware
+layout. Local `--prepare-only` and prepared-bundle construction both reject an undersized edge.
 
 For translation-capable candidate-refinement runs, checkpoint selection is fail-closed:
 
