@@ -217,11 +217,39 @@ class GQAAttention(nn.Module):
 
         attention_mask = None
         if key_padding_mask is not None:
-            attention_mask = key_padding_mask[:, None, None, :].to(torch.bool)
-        # Cached single-token decoding always queries the final position, so it
-        # needs no causal mask. SDPA misaligns ``is_causal`` when query and key
-        # lengths differ, so this case must disable it explicitly.
+            expected_shape = (q.shape[0], k.shape[-2])
+            if tuple(key_padding_mask.shape) != expected_shape:
+                raise ValueError(
+                    "key_padding_mask shape must match the attention batch and key length: "
+                    f"expected {expected_shape}, got {tuple(key_padding_mask.shape)}"
+                )
+            attention_mask = key_padding_mask[:, None, None, :].to(
+                device=q.device,
+                dtype=torch.bool,
+            )
+
+        # Some CUDA SDPA backends reject an explicit mask together with
+        # ``is_causal=True``. Merge both constraints into one boolean mask in
+        # that case. Cached chunks need a lower-right causal alignment: query
+        # row zero follows every cached key and may also attend to its own key.
+        self_cache = past_key_value if not is_cross_attention else None
+        has_self_cache = self_cache is not None
         if is_causal and q.shape[-2] == 1:
+            # A single cached query is the final key, so every key is in its
+            # causal past. For the one-token non-cached case this is equivalent
+            # to the ordinary 1x1 causal mask.
+            is_causal = False
+        elif is_causal and (attention_mask is not None or has_self_cache):
+            causal_diagonal = self_cache[0].shape[-2] if self_cache is not None else 0
+            causal_mask = torch.ones(
+                (q.shape[-2], k.shape[-2]),
+                dtype=torch.bool,
+                device=q.device,
+            ).tril(diagonal=causal_diagonal)
+            if attention_mask is None:
+                attention_mask = causal_mask[None, None, :, :]
+            else:
+                attention_mask = attention_mask & causal_mask[None, None, :, :]
             is_causal = False
         enable_gqa = self.num_heads != self.num_kv_heads
         if enable_gqa and not q.is_cuda:

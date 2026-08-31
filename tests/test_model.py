@@ -5,11 +5,12 @@ import types
 import pytest
 import torch
 
+import sion_translate.model.layers as layers_module
 import sion_translate.model.transformer as transformer_module
 from sion_translate.config import ExperimentalConfig, ModelConfig
 from sion_translate.model import SionForConditionalGeneration
 from sion_translate.model.experimental import ContentRegisterState
-from sion_translate.model.layers import SwiGLU
+from sion_translate.model.layers import GQAAttention, RotaryEmbedding, SwiGLU
 
 
 def tiny_config() -> ModelConfig:
@@ -257,6 +258,136 @@ def test_situglu_bounds_activations_and_keeps_swiglu_state_compatible() -> None:
     bounded = situglu.gated_activations(huge_input)
     assert torch.isfinite(bounded).all()
     assert bounded.abs().max() <= 100.0
+
+
+def test_gqa_combines_causal_and_padding_masks_before_sdpa(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CUDA SDPA must receive one combined mask instead of two constraints."""
+    torch.manual_seed(23)
+    attention = GQAAttention(
+        32,
+        4,
+        2,
+        dropout=0.0,
+        qk_norm=True,
+        norm_eps=1e-6,
+        rope=None,
+    )
+    attention.eval()
+    hidden = torch.randn(2, 5, 32)
+    padding_mask = torch.tensor([[True, True, True, False, False], [True, True, True, True, False]])
+    recorded_masks: list[torch.Tensor] = []
+    real_sdpa = layers_module.F.scaled_dot_product_attention
+
+    def reject_separate_causal_mask(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        attn_mask: torch.Tensor | None = None,
+        dropout_p: float = 0.0,
+        is_causal: bool = False,
+        scale: float | None = None,
+        enable_gqa: bool = False,
+    ) -> torch.Tensor:
+        if attn_mask is not None and is_causal:
+            raise AssertionError("SDPA received separate causal and padding constraints")
+        if attn_mask is not None:
+            recorded_masks.append(attn_mask.detach().clone())
+        return real_sdpa(
+            query,
+            key,
+            value,
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+            is_causal=is_causal,
+            scale=scale,
+            enable_gqa=enable_gqa,
+        )
+
+    monkeypatch.setattr(
+        layers_module.F,
+        "scaled_dot_product_attention",
+        reject_separate_causal_mask,
+    )
+    baseline = attention(hidden, key_padding_mask=padding_mask, is_causal=True)
+
+    expected_causal = torch.ones(5, 5, dtype=torch.bool).tril()
+    expected_mask = padding_mask[:, None, None, :] & expected_causal[None, None, :, :]
+    torch.testing.assert_close(recorded_masks[0], expected_mask)
+
+    changed_padding = hidden.clone()
+    changed_padding[~padding_mask] += 1_000.0
+    padding_output = attention(
+        changed_padding,
+        key_padding_mask=padding_mask,
+        is_causal=True,
+    )
+    torch.testing.assert_close(padding_output[padding_mask], baseline[padding_mask])
+
+    changed_future = hidden.clone()
+    changed_future[:, 3] += 1_000.0
+    future_output = attention(
+        changed_future,
+        key_padding_mask=padding_mask,
+        is_causal=True,
+    )
+    torch.testing.assert_close(future_output[:, :3], baseline[:, :3])
+
+
+def test_gqa_cached_chunks_use_lower_right_causal_alignment() -> None:
+    """Chunked cached attention must reproduce one full causal pass."""
+    torch.manual_seed(29)
+    attention = GQAAttention(
+        32,
+        4,
+        2,
+        dropout=0.0,
+        qk_norm=True,
+        norm_eps=1e-6,
+        rope=RotaryEmbedding(head_dim=8, max_seq_len=16),
+    )
+    attention.eval()
+    hidden = torch.randn(2, 5, 32)
+    padding_mask = torch.tensor([[True, False, True, True, True], [True, True, True, False, True]])
+    full = attention(hidden, key_padding_mask=padding_mask, is_causal=True)
+
+    cached_outputs: list[torch.Tensor] = []
+    cache: tuple[torch.Tensor, torch.Tensor] | None = None
+    start = 0
+    for end in (2, 4, 5):
+        output, cache = attention(
+            hidden[:, start:end],
+            key_padding_mask=padding_mask[:, :end],
+            is_causal=True,
+            past_key_value=cache,
+            position_offset=start,
+            use_cache=True,
+        )
+        cached_outputs.append(output)
+        start = end
+
+    torch.testing.assert_close(torch.cat(cached_outputs, dim=1), full, rtol=1e-5, atol=1e-6)
+
+
+def test_gqa_rejects_a_padding_mask_with_the_wrong_key_length() -> None:
+    attention = GQAAttention(
+        16,
+        4,
+        2,
+        dropout=0.0,
+        qk_norm=False,
+        norm_eps=1e-6,
+        rope=None,
+    )
+
+    with pytest.raises(ValueError, match="key_padding_mask shape"):
+        attention(
+            torch.randn(2, 4, 16),
+            key_padding_mask=torch.ones(2, 3, dtype=torch.bool),
+            is_causal=True,
+        )
 
 
 def test_model_wires_situglu_into_encoder_and_decoder_without_extra_parameters() -> None:
