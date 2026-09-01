@@ -6,6 +6,10 @@ translation-quality score. It verifies the reviewed environment, the selected
 accelerator, one production-sized train/inference/checkpoint cycle, and the
 two-rank distributed path where applicable.
 
+This is separate from prepared-data transfer. Stage and recover the tokenizer and
+dataset archive with [MODAL_BUNDLE_STAGE.md](MODAL_BUNDLE_STAGE.md); that workflow
+uses only CPU resources and does not run any accelerator test.
+
 ## Cost and failure boundaries
 
 Every command starts exactly one hardware target. There is deliberately no

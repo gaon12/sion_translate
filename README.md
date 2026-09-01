@@ -506,6 +506,12 @@ Run `sion-train --config sion_translate.yaml --prepare-only` once after verifica
 a prepared-only tree this is an offline authentication pass: missing or inconsistent
 prepared artifacts are errors instead of a request to rediscover omitted raw corpora.
 
+For a recoverable one-upload transfer to a Modal Volume, use the CPU-only workflow in
+[`docs/MODAL_BUNDLE_STAGE.md`](docs/MODAL_BUNDLE_STAGE.md). It preserves a local receipt
+and a remote journal across terminal or Codex interruptions, applies a small explicit
+Workspace budget boundary, and does not request a GPU or begin training. Real A100 and
+H100 validation remains a separate, later step.
+
 ## Export and repository roles
 
 The final run exports from the restored best weights, not merely the last optimizer step.
