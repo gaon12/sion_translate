@@ -1,0 +1,9 @@
+# Minimal, hash-locked verification environment for the CPU-only Modal bundle
+# finalizer. These exact Linux CPython 3.11 wheels are copied from the reviewed
+# GPU dependency lock; the finalizer does not install the training stack.
+numpy==2.4.6 \
+    --hash=sha256:89cd468399cfd2504718f0ba50e410dca55a170b61a02ad92bb18c8a65186e93
+PyYAML==6.0.3 \
+    --hash=sha256:b8bb0864c5a28024fac8a632c443c87c5aa6f215c0b126c449ae1a150412f31d
+sentencepiece==0.2.1 \
+    --hash=sha256:4f5a3e0d9f445ed9d66c0fec47d4b23d12cfc858b407a03c194c1b26c2ac2a63
