@@ -1,0 +1,4 @@
+# Pin and authenticate the Linux x86-64 uv wheel used to install the complete
+# GPU environment. The application dependency set remains in the PEP 751 lock.
+uv==0.12.3 \
+    --hash=sha256:1482d1462b1aecd18ee33627363fe1c63d6a194f12d40d37efc446d9e0d800a1
