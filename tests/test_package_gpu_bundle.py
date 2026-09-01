@@ -301,6 +301,17 @@ def test_bundle_requires_the_committed_gpu_lock(tmp_path: Path) -> None:
         package_gpu_bundle.build_bundle(root, tmp_path / "missing-lock.zip")
 
 
+def test_reviewed_line_endings_contract_protects_jsonl_record_bytes() -> None:
+    attributes = (package_gpu_bundle.REPOSITORY_ROOT / ".gitattributes").read_bytes()
+
+    package_gpu_bundle._validate_gpu_line_endings_contract(attributes)
+
+    assert package_gpu_bundle.GPU_GIT_ATTRIBUTE_RULES[-1] == "*.jsonl text eol=lf"
+    without_jsonl_rule = attributes.replace(b"*.jsonl text eol=lf\n", b"")
+    with pytest.raises(package_gpu_bundle.BundleError, match="reviewed LF rules"):
+        package_gpu_bundle._validate_gpu_line_endings_contract(without_jsonl_rule)
+
+
 def test_bundle_rejects_stale_gpu_lock_provenance(tmp_path: Path) -> None:
     root = _repository(tmp_path)
     project = root / "pyproject.toml"
