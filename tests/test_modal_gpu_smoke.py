@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import signal
 import subprocess
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -225,6 +226,7 @@ def test_modal_functions_are_timeout_configured_without_launching_gpu() -> None:
         "cpu": 4.0,
         "memory": 32_768,
         "ephemeral_disk": 16_384,
+        "volumes": {str(MODULE.RESULT_MOUNT): MODULE.result_volume},
         "include_source": True,
     }
 
@@ -788,3 +790,293 @@ def test_remote_result_rejects_inconsistent_top_level_metrics() -> None:
     production["checkpoint_load_seconds"] = 6.0
     with pytest.raises(RuntimeError, match="inconsistent timing"):
         MODULE._validated_remote_result("a100-40gb", invalid)
+
+
+def test_gpu_smoke_contract_hashes_every_reviewed_runtime_byte(tmp_path: Path) -> None:
+    (tmp_path / MODULE.LOCK_RELATIVE_PATH).parent.mkdir(parents=True)
+    (tmp_path / MODULE.LOCK_RELATIVE_PATH).write_text("lock\n", encoding="utf-8")
+    (tmp_path / MODULE.UV_BOOTSTRAP_RELATIVE_PATH).write_text("bootstrap\n", encoding="utf-8")
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "modal_gpu_smoke.py").write_text("print('smoke')\n", encoding="utf-8")
+    (tmp_path / "src" / "package").mkdir(parents=True)
+    source = tmp_path / "src" / "package" / "runtime.py"
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+
+    first = MODULE.gpu_smoke_contract_sha256(tmp_path)
+    assert MODULE.SHA256_PATTERN.fullmatch(first)
+    assert MODULE.gpu_smoke_contract_sha256(tmp_path) == first
+
+    source.write_text("VALUE = 2\n", encoding="utf-8")
+    assert MODULE.gpu_smoke_contract_sha256(tmp_path) != first
+
+
+def test_executed_entrypoint_must_match_reviewed_image_copy(tmp_path: Path) -> None:
+    executed = tmp_path / "mounted" / "modal_gpu_smoke.py"
+    reviewed = tmp_path / "image" / "modal_gpu_smoke.py"
+    executed.parent.mkdir()
+    reviewed.parent.mkdir()
+    executed.write_text("VALUE = 1\n", encoding="utf-8")
+    reviewed.write_text("VALUE = 1\n", encoding="utf-8")
+
+    MODULE._verify_executed_entrypoint(executed, reviewed)
+    reviewed.write_text("VALUE = 2\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="differs from its reviewed image copy"):
+        MODULE._verify_executed_entrypoint(executed, reviewed)
+
+
+def test_durable_journal_commits_progress_and_final_result(tmp_path: Path) -> None:
+    commits: list[int] = []
+    result = _remote_result()
+    journal = MODULE._DurableRunJournal(
+        tmp_path,
+        run_id="smoke-20260901t120000z-0123456789abcdef",
+        target="a100-40gb",
+        function_call_id="fc-0123456789abcdef",
+        max_dollars=1.0,
+        expected_contract_sha256="a" * 64,
+        commit=lambda: commits.append(len(commits) + 1),
+    )
+
+    journal.started()
+    journal.contract_verified("a" * 64)
+    journal.phase_completed("attention_optimizer")
+    journal.phase_completed("production_model")
+    journal.passed(result)
+
+    run_root = tmp_path / "runs" / "smoke-20260901t120000z-0123456789abcdef"
+    status = json.loads((run_root / "status.json").read_text(encoding="utf-8"))
+    assert commits == [1, 2, 3, 4, 5]
+    assert status["state"] == "passed"
+    assert status["sequence"] == 5
+    assert status["function_call_id"] == "fc-0123456789abcdef"
+    assert status["completed_phases"] == ["attention_optimizer", "production_model"]
+    assert json.loads((run_root / "result.json").read_text(encoding="utf-8")) == result
+    assert len(list((run_root / "events").glob("*.json"))) == 5
+    assert not list(run_root.rglob("*.tmp"))
+
+
+def test_durable_failure_removes_prior_terminal_artifacts(tmp_path: Path) -> None:
+    journal = MODULE._DurableRunJournal(
+        tmp_path,
+        run_id="smoke-20260901t120000z-fedcba9876543210",
+        target="a100-40gb",
+        function_call_id="fc-fedcba9876543210",
+        max_dollars=1.0,
+        expected_contract_sha256="b" * 64,
+        commit=lambda: None,
+    )
+    run_root = tmp_path / "runs" / "smoke-20260901t120000z-fedcba9876543210"
+    run_root.mkdir(parents=True)
+    (run_root / "result.json").write_text("{}\n", encoding="utf-8")
+    (run_root / "failure.json").write_text("{}\n", encoding="utf-8")
+
+    journal.started()
+    assert not (run_root / "result.json").exists()
+    assert not (run_root / "failure.json").exists()
+    journal.failed(RuntimeError("injected durable failure"))
+
+    status = json.loads((run_root / "status.json").read_text(encoding="utf-8"))
+    failure = json.loads((run_root / "failure.json").read_text(encoding="utf-8"))
+    assert status["state"] == "failed"
+    assert failure["error_type"] == "RuntimeError"
+    assert "injected durable failure" in failure["message"]
+    assert not (run_root / "result.json").exists()
+
+
+def test_durable_contract_mismatch_fails_before_gpu_canary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(MODULE, "gpu_smoke_contract_sha256", lambda _root: "d" * 64)
+    monkeypatch.setattr(
+        MODULE,
+        "_run_remote",
+        lambda *_args, **_kwargs: pytest.fail("GPU canary must not run after contract mismatch"),
+    )
+
+    with pytest.raises(RuntimeError, match="inspect its Volume journal"):
+        MODULE._run_durable_remote(
+            "a100-40gb",
+            "smoke-20260901t120000z-aabbccddeeff0011",
+            "fc-aabbccddeeff0011",
+            1.0,
+            "c" * 64,
+            journal_root=tmp_path,
+            commit=lambda: None,
+        )
+
+    run_root = tmp_path / "runs" / "smoke-20260901t120000z-aabbccddeeff0011"
+    status = json.loads((run_root / "status.json").read_text(encoding="utf-8"))
+    assert status["state"] == "failed"
+    assert (run_root / "failure.json").is_file()
+    assert not (run_root / "result.json").exists()
+
+
+def test_durable_timeout_is_wrapped_after_failure_journaling(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(MODULE, "gpu_smoke_contract_sha256", lambda _root: "e" * 64)
+    monkeypatch.setattr(MODULE, "_verify_executed_entrypoint", lambda *_args: None)
+    monkeypatch.setattr(
+        MODULE,
+        "_run_remote",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(TimeoutError("child timed out")),
+    )
+
+    with pytest.raises(RuntimeError, match="inspect its Volume journal") as captured:
+        MODULE._run_durable_remote(
+            "a100-40gb",
+            "smoke-20260901t120000z-1122334455667788",
+            "fc-1122334455667788",
+            1.0,
+            "e" * 64,
+            journal_root=tmp_path,
+            commit=lambda: None,
+        )
+
+    assert isinstance(captured.value.__cause__, TimeoutError)
+
+
+def test_durable_start_commit_failure_prevents_gpu_work(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    called = False
+
+    def run_remote(*_args: Any, **_kwargs: Any) -> dict[str, object]:
+        nonlocal called
+        called = True
+        return _remote_result()
+
+    monkeypatch.setattr(MODULE, "_run_remote", run_remote)
+
+    with pytest.raises(RuntimeError, match="inspect its Volume journal"):
+        MODULE._run_durable_remote(
+            "a100-40gb",
+            "smoke-20260901t120000z-8877665544332211",
+            "fc-8877665544332211",
+            1.0,
+            "f" * 64,
+            journal_root=tmp_path,
+            commit=lambda: (_ for _ in ()).throw(OSError("commit failed")),
+        )
+
+    assert called is False
+
+
+def test_durable_result_commit_failure_cannot_return_false_success(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    commits = 0
+
+    def commit() -> None:
+        nonlocal commits
+        commits += 1
+        if commits == 3:
+            raise OSError("injected terminal commit failure")
+
+    monkeypatch.setattr(MODULE, "gpu_smoke_contract_sha256", lambda _root: "1" * 64)
+    monkeypatch.setattr(MODULE, "_verify_executed_entrypoint", lambda *_args: None)
+    monkeypatch.setattr(MODULE, "_run_remote", lambda *_args, **_kwargs: _remote_result())
+
+    with pytest.raises(RuntimeError, match="inspect its Volume journal") as captured:
+        MODULE._run_durable_remote(
+            "a100-40gb",
+            "smoke-20260901t120000z-1234567890abcdef",
+            "fc-1234567890abcdef",
+            1.0,
+            "1" * 64,
+            journal_root=tmp_path,
+            commit=commit,
+        )
+
+    assert isinstance(captured.value.__cause__, OSError)
+    run_root = tmp_path / "runs" / "smoke-20260901t120000z-1234567890abcdef"
+    status = json.loads((run_root / "status.json").read_text(encoding="utf-8"))
+    assert status["state"] == "failed"
+    assert not (run_root / "result.json").exists()
+
+
+def test_failure_journal_error_does_not_replace_original_gpu_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    commits = 0
+
+    def commit() -> None:
+        nonlocal commits
+        commits += 1
+        if commits == 3:
+            raise OSError("injected failure-journal commit error")
+
+    monkeypatch.setattr(MODULE, "gpu_smoke_contract_sha256", lambda _root: "2" * 64)
+    monkeypatch.setattr(MODULE, "_verify_executed_entrypoint", lambda *_args: None)
+    monkeypatch.setattr(
+        MODULE,
+        "_run_remote",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("original GPU error")),
+    )
+
+    with pytest.raises(RuntimeError, match="inspect its Volume journal") as captured:
+        MODULE._run_durable_remote(
+            "a100-40gb",
+            "smoke-20260901t120000z-abcdef1234567890",
+            "fc-abcdef1234567890",
+            1.0,
+            "2" * 64,
+            journal_root=tmp_path,
+            commit=commit,
+        )
+
+    assert isinstance(captured.value.__cause__, ValueError)
+    assert str(captured.value.__cause__) == "original GPU error"
+
+
+def test_modal_dispatch_binds_the_actual_function_call_id(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    observed: dict[str, object] = {}
+
+    def dispatch(*args: object, **kwargs: object) -> dict[str, object]:
+        observed["args"] = args
+        observed["kwargs"] = kwargs
+        return {"status": "sentinel"}
+
+    monkeypatch.setattr(
+        MODULE,
+        "modal",
+        SimpleNamespace(current_function_call_id=lambda: "fc-0011223344556677"),
+    )
+    monkeypatch.setattr(MODULE, "_dispatch_remote", dispatch)
+
+    result = MODULE._dispatch_modal_function(
+        "a100-40gb",
+        "smoke-20260901t120000z-0011223344556677",
+        1.0,
+        "3" * 64,
+        journal_root=tmp_path,
+        commit=lambda: None,
+    )
+
+    assert result == {"status": "sentinel"}
+    assert observed["args"] == (
+        "a100-40gb",
+        "smoke-20260901t120000z-0011223344556677",
+        "fc-0011223344556677",
+        1.0,
+        "3" * 64,
+    )
+
+
+def test_durable_dispatch_rejects_partial_identity(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="supplied together"):
+        MODULE._dispatch_remote(
+            "a100-40gb",
+            run_id="smoke-20260901t120000z-0011223344556677",
+            journal_root=tmp_path,
+            commit=lambda: None,
+        )
