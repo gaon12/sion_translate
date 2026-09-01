@@ -223,6 +223,7 @@ GPU_GIT_ATTRIBUTE_RULES = (
     "requirements/gpu-build.in text eol=lf",
     "requirements/gpu-lock-provenance.json text eol=lf",
     "requirements/pylock.gpu-*.toml text eol=lf",
+    "*.jsonl text eol=lf",
 )
 TOKENIZER_TRAINING_SCHEMA = "sion-tokenizer-training-v4"
 TOKENIZER_INPUT_TRAVERSAL_POLICY = "portable-input-order-v1"

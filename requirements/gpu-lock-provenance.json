@@ -45,8 +45,8 @@
   },
   "normalization": {
     "path": ".gitattributes",
-    "sha256": "18f61172548ee06e4ab0639dd8e0366db90379a0185bb0dbf128fd2fdfaf24a4",
-    "size": 341
+    "sha256": "21ca015c2be40bcb34cb400f7c514952a94e9764a4a99ce1f6f388b88141fa08",
+    "size": 506
   },
   "schema": "sion-gpu-lock-provenance-v1",
   "target": {
