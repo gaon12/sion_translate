@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 from copy import deepcopy
+from datetime import UTC, datetime
 import hashlib
 import importlib.metadata
 import json
@@ -22,12 +23,14 @@ import math
 import os
 from pathlib import Path, PurePosixPath
 import platform
+import re
 import signal
 import subprocess
 import sys
 import tempfile
 import time
-from typing import Any
+import traceback
+from typing import Any, Callable
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -49,6 +52,19 @@ MEMORY_USD_PER_GIB_SECOND = 0.00000222
 EXPECTED_PARENT_PID_ENVIRONMENT = "SION_EXPECTED_GUARDIAN_PID"
 INHERITED_SIGNAL_MASK_ENVIRONMENT = "SION_INHERITED_SIGNAL_MASK"
 EXPECTED_MODAL_CLIENT_VERSION = "1.5.3"
+APP_NAME = "sion-budget-gated-gpu-smoke"
+RESULT_VOLUME_NAME = "sion-gpu-smoke-results"
+RESULT_MOUNT = PurePosixPath("/sion-results")
+JOURNAL_VERSION = 1
+RUN_ID_PATTERN = re.compile(r"^smoke-[a-z0-9][a-z0-9-]{7,79}$")
+SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+FUNCTION_CALL_ID_PATTERN = re.compile(r"^fc-[A-Za-z0-9_-]{8,128}$")
+REMOTE_FUNCTION_NAMES = {
+    "a100-40gb": "a100_40gb",
+    "a100-80gb": "a100_80gb",
+    "h100": "h100_exact",
+    "a100-40gb-x2": "a100_40gb_x2",
+}
 
 # Modal's public per-second resource prices on 2026-08-31. The CLI uses these only
 # as a conservative spending guard and labels every result as an estimate.
@@ -189,6 +205,200 @@ def _sha256(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _stable_regular_file_sha256(path: Path) -> tuple[int, str]:
+    """Hash one regular file and reject identity changes during the read."""
+
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError(f"GPU smoke contract path is not a regular file: {path}")
+    before = path.stat()
+    digest = _sha256(path)
+    after = path.stat()
+    before_identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+    after_identity = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+    if before_identity != after_identity:
+        raise RuntimeError(f"GPU smoke contract path changed while hashing: {path}")
+    return after.st_size, digest
+
+
+def _verify_executed_entrypoint(executed_path: Path, reviewed_path: Path) -> None:
+    """Bind Modal's mounted executable source to the reviewed image copy."""
+
+    executed_size, executed_sha256 = _stable_regular_file_sha256(executed_path)
+    reviewed_size, reviewed_sha256 = _stable_regular_file_sha256(reviewed_path)
+    if (executed_size, executed_sha256) != (reviewed_size, reviewed_sha256):
+        raise RuntimeError(
+            "Modal's executed GPU smoke entrypoint differs from its reviewed image copy"
+        )
+
+
+def gpu_smoke_contract_sha256(root: Path) -> str:
+    """Hash every reviewed byte copied into the paid GPU smoke image."""
+
+    resolved_root = root.resolve()
+    relative_paths = [
+        LOCK_RELATIVE_PATH,
+        UV_BOOTSTRAP_RELATIVE_PATH,
+        Path("scripts/modal_gpu_smoke.py"),
+    ]
+    source_root = resolved_root / "src"
+    if source_root.is_symlink() or not source_root.is_dir():
+        raise RuntimeError(f"GPU smoke source root is not a regular directory: {source_root}")
+    relative_paths.extend(
+        sorted(
+            (path.relative_to(resolved_root) for path in source_root.rglob("*.py")),
+            key=lambda path: path.as_posix(),
+        )
+    )
+    if len(relative_paths) != len(set(relative_paths)):
+        raise RuntimeError("GPU smoke contract contains duplicate paths")
+    contract = hashlib.sha256()
+    for relative_path in relative_paths:
+        path = resolved_root / relative_path
+        size, digest = _stable_regular_file_sha256(path)
+        contract.update(f"{relative_path.as_posix()}\0{size}\0{digest}\n".encode("utf-8"))
+    return contract.hexdigest()
+
+
+def _validated_run_id(run_id: object) -> str:
+    if not isinstance(run_id, str) or RUN_ID_PATTERN.fullmatch(run_id) is None:
+        raise ValueError("durable Modal run ID is invalid")
+    return run_id
+
+
+def _validated_contract_sha256(value: object) -> str:
+    if not isinstance(value, str) or SHA256_PATTERN.fullmatch(value) is None:
+        raise ValueError("durable Modal contract SHA-256 is invalid")
+    return value
+
+
+def _validated_function_call_id(value: object) -> str:
+    if not isinstance(value, str) or FUNCTION_CALL_ID_PATTERN.fullmatch(value) is None:
+        raise ValueError("durable Modal FunctionCall ID is invalid")
+    return value
+
+
+def _write_json_atomic(path: Path, value: object) -> None:
+    """Publish one finite JSON document without exposing a partial file."""
+
+    _validate_json_value(value)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=path.parent,
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            json.dump(
+                value,
+                handle,
+                allow_nan=False,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+class _DurableRunJournal:
+    """Commit immutable progress events and a current status to one run directory."""
+
+    def __init__(
+        self,
+        root: Path,
+        *,
+        run_id: str,
+        target: str,
+        function_call_id: str,
+        max_dollars: float,
+        expected_contract_sha256: str,
+        commit: Callable[[], None],
+    ) -> None:
+        self.run_id = _validated_run_id(run_id)
+        if target not in TARGETS:
+            raise ValueError(f"unsupported Modal GPU smoke target: {target}")
+        self.target = target
+        self.function_call_id = _validated_function_call_id(function_call_id)
+        self.max_dollars = max_dollars
+        self.expected_contract_sha256 = _validated_contract_sha256(expected_contract_sha256)
+        self._commit = commit
+        self._sequence = 0
+        self._completed_phases: list[str] = []
+        self._run_root = root / "runs" / self.run_id
+
+    def _base_status(self, state: str) -> dict[str, Any]:
+        return {
+            "journal_version": JOURNAL_VERSION,
+            "run_id": self.run_id,
+            "target": self.target,
+            "function_call_id": self.function_call_id,
+            "state": state,
+            "sequence": self._sequence,
+            "updated_at_utc": datetime.now(UTC).isoformat(),
+            "completed_phases": list(self._completed_phases),
+            "max_dollars": self.max_dollars,
+            "authorization_compute_charge_usd": authorization_compute_charge(self.target),
+            "expected_contract_sha256": self.expected_contract_sha256,
+        }
+
+    def _publish(self, state: str, event: str, **details: object) -> None:
+        self._sequence += 1
+        status = self._base_status(state)
+        status["event"] = event
+        if details:
+            status["details"] = details
+        event_path = self._run_root / "events" / f"{self._sequence:04d}-{event}.json"
+        _write_json_atomic(event_path, status)
+        _write_json_atomic(self._run_root / "status.json", status)
+        self._commit()
+
+    def started(self) -> None:
+        (self._run_root / "result.json").unlink(missing_ok=True)
+        (self._run_root / "failure.json").unlink(missing_ok=True)
+        self._publish("running", "started")
+
+    def contract_verified(self, observed_contract_sha256: str) -> None:
+        self._publish(
+            "running",
+            "contract-verified",
+            observed_contract_sha256=_validated_contract_sha256(observed_contract_sha256),
+        )
+
+    def phase_completed(self, phase: str) -> None:
+        if phase in self._completed_phases:
+            raise RuntimeError(f"durable Modal phase was reported twice: {phase}")
+        self._completed_phases.append(phase)
+        self._publish("running", "phase-completed", phase=phase)
+
+    def passed(self, result: dict[str, Any]) -> None:
+        _write_json_atomic(self._run_root / "result.json", result)
+        self._publish("passed", "finished", result_path="result.json")
+
+    def failed(self, error: BaseException) -> None:
+        (self._run_root / "result.json").unlink(missing_ok=True)
+        failure = {
+            "error_type": type(error).__name__,
+            "message": str(error)[:4_000],
+            "traceback_tail": "".join(
+                traceback.format_exception(type(error), error, error.__traceback__)
+            )[-16_000:],
+        }
+        _write_json_atomic(self._run_root / "failure.json", failure)
+        self._publish("failed", "failed", failure_path="failure.json", **failure)
 
 
 def _production_config(target: str):
@@ -1614,7 +1824,10 @@ def _validated_remote_result(target: str, value: object) -> dict[str, Any]:
     return result
 
 
-def _run_remote(target: str) -> dict[str, Any]:
+def _run_remote(
+    target: str,
+    phase_completed: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
     started = time.perf_counter()
     import torch
 
@@ -1622,10 +1835,13 @@ def _run_remote(target: str) -> dict[str, Any]:
     _validate_target_hardware(target, runtime)
     device = torch.device("cuda", 0)
     torch.cuda.set_device(device)
-    phases: dict[str, Any] = {
-        "attention_optimizer": _attention_optimizer_canary(torch, device),
-        "production_model": _production_model_canary(torch, device, target),
-    }
+    phases: dict[str, Any] = {}
+    phases["attention_optimizer"] = _attention_optimizer_canary(torch, device)
+    if phase_completed is not None:
+        phase_completed("attention_optimizer")
+    phases["production_model"] = _production_model_canary(torch, device, target)
+    if phase_completed is not None:
+        phase_completed("production_model")
     if int(TARGETS[target]["gpu_count"]) == 2:
         # The full-model probe has returned and owns no live tensors, but the
         # parent's caching allocator may still reserve GPU 0 memory needed by
@@ -1636,6 +1852,8 @@ def _run_remote(target: str) -> dict[str, Any]:
         torch.cuda.empty_cache()
         child_timeout = _remaining_child_timeout(time.perf_counter() - started)
         phases["distributed_fsdp2"] = _two_gpu_canary(child_timeout)
+        if phase_completed is not None:
+            phase_completed("distributed_fsdp2")
     torch.cuda.synchronize(device)
     elapsed = time.perf_counter() - started
     return _validated_remote_result(
@@ -1653,6 +1871,89 @@ def _run_remote(target: str) -> dict[str, Any]:
             "peak_allocated_gib": torch.cuda.max_memory_allocated(device) / 2**30,
             "peak_reserved_gib": torch.cuda.max_memory_reserved(device) / 2**30,
         },
+    )
+
+
+def _run_durable_remote(
+    target: str,
+    run_id: str,
+    function_call_id: str,
+    max_dollars: float,
+    expected_contract_sha256: str,
+    *,
+    journal_root: Path,
+    commit: Callable[[], None],
+) -> dict[str, Any]:
+    """Run one smoke probe while persisting enough state to recover without its client."""
+
+    journal = _DurableRunJournal(
+        journal_root,
+        run_id=run_id,
+        target=target,
+        function_call_id=function_call_id,
+        max_dollars=max_dollars,
+        expected_contract_sha256=expected_contract_sha256,
+        commit=commit,
+    )
+    try:
+        journal.started()
+        validate_cost_guard(target, max_dollars)
+        observed_contract_sha256 = gpu_smoke_contract_sha256(Path(REMOTE_ROOT))
+        if observed_contract_sha256 != expected_contract_sha256:
+            raise RuntimeError(
+                "deployed Modal GPU smoke bytes differ from the submitted local contract"
+            )
+        _verify_executed_entrypoint(
+            Path(__file__),
+            Path(REMOTE_ROOT) / "scripts" / "modal_gpu_smoke.py",
+        )
+        journal.contract_verified(observed_contract_sha256)
+        result = _run_remote(target, journal.phase_completed)
+        journal.passed(result)
+        return result
+    except BaseException as error:
+        try:
+            journal.failed(error)
+        except BaseException as journal_error:
+            print(
+                "Failed to persist the durable Modal failure journal: "
+                f"{type(journal_error).__name__}: {journal_error}",
+                file=sys.stderr,
+                flush=True,
+            )
+        raise RuntimeError(
+            f"durable Modal GPU smoke {run_id} failed; inspect its Volume journal"
+        ) from error
+
+
+def _dispatch_remote(
+    target: str,
+    run_id: str = "",
+    function_call_id: str = "",
+    max_dollars: float = 0.0,
+    expected_contract_sha256: str = "",
+    *,
+    journal_root: Path,
+    commit: Callable[[], None],
+) -> dict[str, Any]:
+    durable_arguments = (
+        bool(run_id),
+        bool(function_call_id),
+        max_dollars != 0.0,
+        bool(expected_contract_sha256),
+    )
+    if not any(durable_arguments):
+        return _run_remote(target)
+    if not all(durable_arguments):
+        raise ValueError("durable Modal invocation arguments must be supplied together")
+    return _run_durable_remote(
+        target,
+        run_id,
+        function_call_id,
+        max_dollars,
+        expected_contract_sha256,
+        journal_root=journal_root,
+        commit=commit,
     )
 
 
@@ -1680,6 +1981,34 @@ def _validate_modal_client_version() -> None:
         )
 
 
+def _dispatch_modal_function(
+    target: str,
+    run_id: str,
+    max_dollars: float,
+    expected_contract_sha256: str,
+    *,
+    journal_root: Path,
+    commit: Callable[[], None],
+) -> dict[str, Any]:
+    if modal is None:
+        raise RuntimeError("Modal is unavailable inside the remote function")
+    function_call_id = ""
+    if run_id:
+        observed_call_id = modal.current_function_call_id()
+        if observed_call_id is None:
+            raise RuntimeError("Modal did not expose the current durable FunctionCall ID")
+        function_call_id = observed_call_id
+    return _dispatch_remote(
+        target,
+        run_id,
+        function_call_id,
+        max_dollars,
+        expected_contract_sha256,
+        journal_root=journal_root,
+        commit=commit,
+    )
+
+
 if modal is not None:
     image = (
         modal.Image.debian_slim(python_version="3.11")
@@ -1693,7 +2022,12 @@ if modal is not None:
             str(REMOTE_ROOT / LOCK_RELATIVE_PATH),
             copy=True,
         )
-        .add_local_dir(str(REPOSITORY_ROOT / "src"), str(REMOTE_ROOT / "src"), copy=True)
+        .add_local_dir(
+            str(REPOSITORY_ROOT / "src"),
+            str(REMOTE_ROOT / "src"),
+            copy=True,
+            ignore=("**/__pycache__/**", "**/*.pyc", "**/*.pyo"),
+        )
         .add_local_file(
             str(REPOSITORY_ROOT / "scripts/modal_gpu_smoke.py"),
             str(REMOTE_ROOT / "scripts/modal_gpu_smoke.py"),
@@ -1709,7 +2043,8 @@ if modal is not None:
         )
         .env({"PYTHONPATH": str(REMOTE_ROOT / "src"), "PYTHONUNBUFFERED": "1"})
     )
-    app = modal.App("sion-budget-gated-gpu-smoke", image=image, include_source=False)
+    app = modal.App(APP_NAME, image=image, include_source=False)
+    result_volume = modal.Volume.from_name(RESULT_VOLUME_NAME, create_if_missing=True)
     _common_options = {
         "retries": 0,
         "timeout": FUNCTION_TIMEOUT_SECONDS,
@@ -1722,6 +2057,7 @@ if modal is not None:
         "cpu": CPU_CORES,
         "memory": MEMORY_GIB * 1024,
         "ephemeral_disk": 16_384,
+        "volumes": {str(RESULT_MOUNT): result_volume},
         # Modal must mount this entrypoint so the remote worker can import its
         # decorated functions. The same reviewed file is also copied to
         # /opt/sion for the timeout-configured torchrun child.
@@ -1729,38 +2065,83 @@ if modal is not None:
     }
 
     @app.function(gpu="A100-40GB", name="a100_40gb", **_common_options)
-    def smoke_a100_40gb() -> dict[str, Any]:
-        return _run_remote("a100-40gb")
+    def smoke_a100_40gb(
+        run_id: str = "",
+        max_dollars: float = 0.0,
+        expected_contract_sha256: str = "",
+    ) -> dict[str, Any]:
+        return _dispatch_modal_function(
+            "a100-40gb",
+            run_id,
+            max_dollars,
+            expected_contract_sha256,
+            journal_root=Path(RESULT_MOUNT),
+            commit=result_volume.commit,
+        )
 
     @app.function(gpu="A100-80GB", name="a100_80gb", **_common_options)
-    def smoke_a100_80gb() -> dict[str, Any]:
-        return _run_remote("a100-80gb")
+    def smoke_a100_80gb(
+        run_id: str = "",
+        max_dollars: float = 0.0,
+        expected_contract_sha256: str = "",
+    ) -> dict[str, Any]:
+        return _dispatch_modal_function(
+            "a100-80gb",
+            run_id,
+            max_dollars,
+            expected_contract_sha256,
+            journal_root=Path(RESULT_MOUNT),
+            commit=result_volume.commit,
+        )
 
     @app.function(gpu="H100!", name="h100_exact", **_common_options)
-    def smoke_h100() -> dict[str, Any]:
-        return _run_remote("h100")
+    def smoke_h100(
+        run_id: str = "",
+        max_dollars: float = 0.0,
+        expected_contract_sha256: str = "",
+    ) -> dict[str, Any]:
+        return _dispatch_modal_function(
+            "h100",
+            run_id,
+            max_dollars,
+            expected_contract_sha256,
+            journal_root=Path(RESULT_MOUNT),
+            commit=result_volume.commit,
+        )
 
     @app.function(gpu="A100-40GB:2", name="a100_40gb_x2", **_common_options)
-    def smoke_a100_40gb_x2() -> dict[str, Any]:
-        return _run_remote("a100-40gb-x2")
+    def smoke_a100_40gb_x2(
+        run_id: str = "",
+        max_dollars: float = 0.0,
+        expected_contract_sha256: str = "",
+    ) -> dict[str, Any]:
+        return _dispatch_modal_function(
+            "a100-40gb-x2",
+            run_id,
+            max_dollars,
+            expected_contract_sha256,
+            journal_root=Path(RESULT_MOUNT),
+            commit=result_volume.commit,
+        )
+
+    smoke_functions = {
+        "a100-40gb": smoke_a100_40gb,
+        "a100-80gb": smoke_a100_80gb,
+        "h100": smoke_h100,
+        "a100-40gb-x2": smoke_a100_40gb_x2,
+    }
 
     @app.local_entrypoint()
     def main(target: str, max_dollars: float) -> None:
         _validate_modal_client_version()
         authorized = validate_cost_guard(target, max_dollars)
-        functions = {
-            "a100-40gb": smoke_a100_40gb,
-            "a100-80gb": smoke_a100_80gb,
-            "h100": smoke_h100,
-            "a100-40gb-x2": smoke_a100_40gb_x2,
-        }
         print(
             "Authorized two-attempt compute contingency: "
             f"${authorized:.4f}. This is not an account-level hard cap.",
             flush=True,
         )
         invocation_started = time.perf_counter()
-        result = _validated_remote_result(target, functions[target].remote())
+        result = _validated_remote_result(target, smoke_functions[target].remote())
         result["client_roundtrip_seconds"] = time.perf_counter() - invocation_started
         _validate_json_value(result)
         print(
@@ -1775,6 +2156,7 @@ if modal is not None:
 
 else:
     app = None
+    smoke_functions: dict[str, Any] = {}
 
 
 if __name__ == "__main__":
