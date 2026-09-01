@@ -5,3 +5,7 @@ pyproject.toml text eol=lf
 requirements/gpu-build.in text eol=lf
 requirements/gpu-lock-provenance.json text eol=lf
 requirements/pylock.gpu-*.toml text eol=lf
+
+# JSON Lines fixtures are generated and compared byte-for-byte. Keep their
+# record separators stable when core.autocrlf is enabled on Windows.
+*.jsonl text eol=lf
