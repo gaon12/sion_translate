@@ -22,6 +22,10 @@ CALL_ID = "fc-0123456789abcdef"
 CONTRACT_SHA256 = "a" * 64
 
 
+def _identity_remote_result(_target: str, value: object) -> object:
+    return value
+
+
 def _receipt(*, state: str = "submitted", call_id: str | None = CALL_ID) -> dict[str, object]:
     target = "a100-40gb"
     max_dollars = 1.0
@@ -107,10 +111,22 @@ def _configure_submit(
                 raise spawn_error
             return SimpleNamespace(object_id=CALL_ID)
 
-    monkeypatch.setattr(MODULE, "_require_modal", lambda: object())
-    monkeypatch.setattr(MODULE, "_new_run_id", lambda: RUN_ID)
-    monkeypatch.setattr(MODULE, "_git_commit", lambda: "b" * 40)
-    monkeypatch.setattr(MODULE.SMOKE, "gpu_smoke_contract_sha256", lambda _root: CONTRACT_SHA256)
+    def require_modal() -> object:
+        return object()
+
+    def new_run_id() -> str:
+        return RUN_ID
+
+    def git_commit() -> str:
+        return "b" * 40
+
+    def contract_sha256(_root: Path) -> str:
+        return CONTRACT_SHA256
+
+    monkeypatch.setattr(MODULE, "_require_modal", require_modal)
+    monkeypatch.setattr(MODULE, "_new_run_id", new_run_id)
+    monkeypatch.setattr(MODULE, "_git_commit", git_commit)
+    monkeypatch.setattr(MODULE.SMOKE, "gpu_smoke_contract_sha256", contract_sha256)
     monkeypatch.setattr(MODULE.SMOKE, "app", FakeApp())
     monkeypatch.setattr(MODULE.SMOKE, "smoke_functions", {"a100-40gb": FakeFunction()})
     return observed, calls
@@ -268,11 +284,17 @@ def _configure_status(
     output_expired_type: type[BaseException] | None = None,
     modal_timeout_type: type[BaseException] | None = None,
     function_timeout_type: type[BaseException] | None = None,
+    internal_failure_type: type[BaseException] | None = None,
 ) -> None:
     volume = _FakeVolume(files)
 
     class FakeCall:
-        logs = SimpleNamespace(tail=lambda **_kwargs: [])
+        class Logs:
+            @staticmethod
+            def tail(**_kwargs: object) -> list[object]:
+                return []
+
+        logs = Logs()
 
         def get(self, *, timeout: float) -> object:
             assert timeout == 0
@@ -290,13 +312,24 @@ def _configure_status(
         OutputExpiredError=output_expired_type,
         TimeoutError=modal_timeout_type,
         FunctionTimeoutError=function_timeout_type,
+        InternalFailure=internal_failure_type,
     )
+
+    class FakeVolumeType:
+        @staticmethod
+        def from_name(_name: str) -> _FakeVolume:
+            return volume
+
     fake_modal = SimpleNamespace(
-        Volume=SimpleNamespace(from_name=lambda _name: volume),
+        Volume=FakeVolumeType,
         FunctionCall=FakeFunctionCall,
         exception=fake_exception,
     )
-    monkeypatch.setattr(MODULE, "_require_modal", lambda: fake_modal)
+
+    def require_modal() -> object:
+        return fake_modal
+
+    monkeypatch.setattr(MODULE, "_require_modal", require_modal)
 
 
 def test_status_distinguishes_pending_from_output_expiration(
@@ -407,6 +440,28 @@ def test_status_keeps_client_errors_non_terminal(
         MODULE._assert_no_unresolved_receipts(tmp_path)
 
 
+def test_status_keeps_retriable_modal_internal_failure_non_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class InternalFailure(Exception):
+        pass
+
+    receipt_path = _write_receipt(tmp_path)
+    _configure_status(
+        monkeypatch,
+        {},
+        InternalFailure("temporary Modal internal failure"),
+        internal_failure_type=InternalFailure,
+    )
+
+    snapshot = MODULE.status(receipt_path, include_logs=False)
+    assert snapshot["function_call_state"] == "unavailable"
+    assert snapshot["recovered_state"] == "status-unavailable"
+    with pytest.raises(RuntimeError, match="no recovered terminal state"):
+        MODULE._assert_no_unresolved_receipts(tmp_path)
+
+
 def test_status_does_not_swallow_keyboard_interrupt(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -487,7 +542,7 @@ def test_status_requires_terminal_call_after_committed_volume_result(
     monkeypatch.setattr(
         MODULE.SMOKE,
         "_validated_remote_result",
-        lambda _target, value: value,
+        _identity_remote_result,
     )
     receipt_path = _write_receipt(tmp_path)
     root = f"runs/{RUN_ID}"
@@ -520,7 +575,7 @@ def test_status_rejects_volume_success_and_terminal_call_failure(
     monkeypatch.setattr(
         MODULE.SMOKE,
         "_validated_remote_result",
-        lambda _target, value: value,
+        _identity_remote_result,
     )
     receipt_path = _write_receipt(tmp_path)
     root = f"runs/{RUN_ID}"
@@ -547,7 +602,7 @@ def test_status_rejects_volume_failure_and_function_call_success(
     monkeypatch.setattr(
         MODULE.SMOKE,
         "_validated_remote_result",
-        lambda _target, value: value,
+        _identity_remote_result,
     )
     receipt_path = _write_receipt(tmp_path)
     root = f"runs/{RUN_ID}"

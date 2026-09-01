@@ -593,7 +593,6 @@ def status(receipt_path: Path, *, include_logs: bool = True) -> dict[str, Any]:
                     exception_type
                     for name in (
                         "FunctionTimeoutError",
-                        "InternalFailure",
                         "RemoteError",
                         "ExecutionError",
                     )
