@@ -2056,7 +2056,6 @@ if modal is not None:
         "single_use_containers": True,
         "cpu": CPU_CORES,
         "memory": MEMORY_GIB * 1024,
-        "ephemeral_disk": 16_384,
         "volumes": {str(RESULT_MOUNT): result_volume},
         # Modal must mount this entrypoint so the remote worker can import its
         # decorated functions. The same reviewed file is also copied to

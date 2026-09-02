@@ -225,7 +225,6 @@ def test_modal_functions_are_timeout_configured_without_launching_gpu() -> None:
         "single_use_containers": True,
         "cpu": 4.0,
         "memory": 32_768,
-        "ephemeral_disk": 16_384,
         "volumes": {str(MODULE.RESULT_MOUNT): MODULE.result_volume},
         "include_source": True,
     }

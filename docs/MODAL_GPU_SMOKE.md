@@ -20,7 +20,7 @@ Every command starts exactly one hardware target. There is deliberately no
 - a separate 180-second container-startup timeout;
 - at most one container, with no warm or buffered containers;
 - a two-second scale-down window and a single input per container;
-- 4 CPU cores, 32 GiB of host memory, and 16 GiB of temporary disk;
+- 4 CPU cores, 32 GiB of host memory, and Modal's default container disk quota;
 - a 150-second maximum for the nested two-rank job; and
 - a 20-second parent margin reserved for killing and reaping every `torchrun`
   process if the nested job stalls.
@@ -131,6 +131,12 @@ automatically retries it. Once the remote journal appears, its validated
 FunctionCall ID is used to recover that ambiguous submission. A new target is
 blocked until the previous receipt has a locally recovered `passed` or `failed`
 state backed by terminal FunctionCall evidence.
+
+If Modal rejects the Function definition before the detached App context opens,
+the receipt is instead terminal `submission-failed`, because the controller
+body and `spawn` could not have run. Fix the rejected resource or image contract
+before creating a new smoke receipt. Failures after the App context opens remain
+ambiguous unless a valid FunctionCall ID was persisted.
 
 After a passed result and an updated billing check, the remaining targets use the
 same pattern:

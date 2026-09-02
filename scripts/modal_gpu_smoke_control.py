@@ -432,10 +432,12 @@ def submit(
             "submission_error": None,
         }
         _write_json_atomic(receipt_path, receipt)
+        app_entered = False
         try:
             if SMOKE.app is None or target not in SMOKE.smoke_functions:
                 raise RuntimeError("the Modal GPU smoke App is unavailable")
             with SMOKE.app.run(detach=True):
+                app_entered = True
                 function_call = SMOKE.smoke_functions[target].spawn(
                     run_id, max_dollars, contract_sha256
                 )
@@ -450,7 +452,9 @@ def submit(
                 _write_json_atomic(receipt_path, receipt)
         except BaseException as error:
             if receipt["submission_state"] != "submitted":
-                receipt["submission_state"] = "submission-unknown"
+                receipt["submission_state"] = (
+                    "submission-unknown" if app_entered else "submission-failed"
+                )
             receipt["submission_error"] = {
                 "error_type": type(error).__name__,
                 "message": str(error)[:4_000],

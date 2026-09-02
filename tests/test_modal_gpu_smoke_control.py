@@ -68,11 +68,21 @@ def _write_receipt(root: Path, value: dict[str, object] | None = None) -> Path:
 
 
 class _RunContext(AbstractContextManager[None]):
-    def __init__(self, observed: dict[str, object], exit_error: BaseException | None = None):
+    def __init__(
+        self,
+        observed: dict[str, object],
+        *,
+        enter_error: BaseException | None = None,
+        exit_error: BaseException | None = None,
+    ):
         self.observed = observed
+        self.enter_error = enter_error
         self.exit_error = exit_error
 
     def __enter__(self) -> None:
+        self.observed["enter_attempted"] = True
+        if self.enter_error is not None:
+            raise self.enter_error
         self.observed["entered"] = True
         return None
 
@@ -87,6 +97,7 @@ def _configure_submit(
     monkeypatch: pytest.MonkeyPatch,
     receipt_root: Path,
     *,
+    enter_error: BaseException | None = None,
     spawn_error: BaseException | None = None,
     exit_error: BaseException | None = None,
 ) -> tuple[dict[str, object], list[tuple[object, ...]]]:
@@ -96,7 +107,11 @@ def _configure_submit(
     class FakeApp:
         def run(self, *, detach: bool = False) -> _RunContext:
             observed["detach"] = detach
-            return _RunContext(observed, exit_error)
+            return _RunContext(
+                observed,
+                enter_error=enter_error,
+                exit_error=exit_error,
+            )
 
     class FakeFunction:
         def spawn(self, *arguments: object) -> object:
@@ -148,7 +163,12 @@ def test_submit_persists_intent_then_detached_function_call_id(
 
     receipt = MODULE._read_receipt(receipt_path)
     assert calls == [(RUN_ID, 1.0, CONTRACT_SHA256)]
-    assert observed == {"detach": True, "entered": True, "exited": True}
+    assert observed == {
+        "detach": True,
+        "enter_attempted": True,
+        "entered": True,
+        "exited": True,
+    }
     assert receipt["submission_state"] == "submitted"
     assert receipt["function_call_id"] == CALL_ID
     assert receipt["submission_error"] is None
@@ -207,6 +227,34 @@ def test_ambiguous_spawn_is_not_retried_and_blocks_another_submission(
         )
     assert len(calls) == 1
     assert not (tmp_path / MODULE.SUBMISSION_LOCK_NAME).exists()
+
+
+def test_function_creation_failure_is_terminal_without_a_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    observed, calls = _configure_submit(
+        monkeypatch,
+        tmp_path,
+        enter_error=RuntimeError("function definition was rejected"),
+    )
+
+    with pytest.raises(RuntimeError, match="function definition was rejected"):
+        MODULE.submit(
+            "a100-40gb",
+            1.0,
+            tmp_path,
+            workspace_budget=2.0,
+            workspace_usage=1.0,
+        )
+
+    receipt = MODULE._read_receipt(tmp_path / RUN_ID / "receipt.json")
+    assert observed["enter_attempted"] is True
+    assert "entered" not in observed
+    assert calls == []
+    assert receipt["submission_state"] == "submission-failed"
+    assert receipt["function_call_id"] is None
+    assert receipt["submission_error"]["error_type"] == "RuntimeError"
 
 
 def test_existing_submission_lock_fails_closed_before_spawn(
