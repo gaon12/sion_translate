@@ -98,6 +98,9 @@ OPERATION_SCHEMA = "sion-modal-bundle-operation-v1"
 RESULT_SCHEMA = "sion-modal-bundle-result-v1"
 READY_SCHEMA = "sion-modal-prepared-bundle-ready-v1"
 SUBMISSION_CLAIM_SCHEMA = "sion-modal-bundle-submission-claim-v1"
+SOURCE_RECOVERY_CLAIM_SCHEMA = "sion-modal-bundle-source-recovery-claim-v1"
+SOURCE_RECOVERY_ERROR_TYPE = "PackageNotFoundError"
+SOURCE_RECOVERY_ERROR_MESSAGE = "No package metadata was found for modal"
 DEFAULT_RECEIPT_ROOT = REPOSITORY_ROOT / "artifacts" / "modal-bundle-uploads"
 SUBMISSION_LOCK_NAME = ".submission-lock"
 COPY_BUFFER_SIZE = 8 * 1024 * 1024
@@ -140,6 +143,26 @@ RECEIPT_FIELDS = {
     "remote_submission_claim_path",
     "submission_claim_state",
     "submission_claim_error",
+}
+SOURCE_RECOVERY_CLAIM_FIELDS = {
+    "schema",
+    "source_upload_id",
+    "attempt_upload_id",
+    "bundle_sha256",
+    "bundle_size",
+    "source_function_call_id",
+    "source_runtime_contract_sha256",
+    "replacement_runtime_contract_sha256",
+    "source_remote_incoming_path",
+    "source_remote_operation_path",
+    "attempt_remote_operation_path",
+    "source_status_sha256",
+    "source_failure_sha256",
+    "source_receipt_sha256",
+    "original_submission_claim_sha256",
+    "recovery_claim_id",
+    "remote_recovery_claim_path",
+    "archive_reuploaded",
 }
 
 
@@ -560,6 +583,12 @@ def _new_submission_claim_id() -> str:
 
 def _remote_submission_claim_path(upload_id: str) -> str:
     return f"/submission-claims/{_validate_upload_id(upload_id)}.json"
+
+
+def _remote_source_recovery_claim_path(source_upload_id: str, source_call_id: str) -> str:
+    validated_upload_id = _validate_upload_id(source_upload_id)
+    validated_call_id = _validate_function_call_id(source_call_id)
+    return f"/recovery-claims/{validated_upload_id}/runtime-metadata-{validated_call_id}.json"
 
 
 def _remote_paths(upload_id: str, sha256: str) -> tuple[str, str, str]:
@@ -1042,10 +1071,8 @@ def _require_modal() -> Any:
     return modal
 
 
-def _build_finalizer_runtime(modal_module: Any, volume: Any) -> tuple[Any, Any]:
-    """Build one ephemeral, CPU-only finalizer definition for ``App.run``."""
-
-    image = (
+def _build_finalizer_image(modal_module: Any) -> Any:
+    return (
         modal_module.Image.debian_slim(python_version="3.11")
         .pip_install_from_requirements(
             str(FINALIZER_REQUIREMENTS),
@@ -1074,22 +1101,34 @@ def _build_finalizer_runtime(modal_module: Any, volume: Any) -> tuple[Any, Any]:
         )
         .env({"PYTHONPATH": str(REMOTE_ROOT / "src"), "PYTHONUNBUFFERED": "1"})
     )
+
+
+def _finalizer_function_options(volume: Any) -> dict[str, object]:
+    return {
+        "volumes": {str(VOLUME_MOUNT): volume},
+        "cpu": FINALIZER_CPU_CORES,
+        "memory": FINALIZER_MEMORY_MIB,
+        "timeout": FINALIZER_TIMEOUT_SECONDS,
+        "retries": 0,
+        "min_containers": 0,
+        "max_containers": 1,
+        "buffer_containers": 0,
+        "scaledown_window": FINALIZER_SCALEDOWN_WINDOW_SECONDS,
+        "single_use_containers": True,
+        "serialized": True,
+        "include_source": True,
+    }
+
+
+def _build_finalizer_runtime(modal_module: Any, volume: Any) -> tuple[Any, Any]:
+    """Build one ephemeral, CPU-only finalizer definition for ``App.run``."""
+
+    image = _build_finalizer_image(modal_module)
     app = modal_module.App(APP_NAME, image=image, include_source=False)
 
     @app.function(
         name=FINALIZER_FUNCTION_NAME,
-        volumes={str(VOLUME_MOUNT): volume},
-        cpu=FINALIZER_CPU_CORES,
-        memory=FINALIZER_MEMORY_MIB,
-        timeout=FINALIZER_TIMEOUT_SECONDS,
-        retries=0,
-        min_containers=0,
-        max_containers=1,
-        buffer_containers=0,
-        scaledown_window=FINALIZER_SCALEDOWN_WINDOW_SECONDS,
-        single_use_containers=True,
-        serialized=True,
-        include_source=True,
+        **_finalizer_function_options(volume),
     )
     def finalize(
         upload_id: str,
@@ -1110,6 +1149,46 @@ def _build_finalizer_runtime(modal_module: Any, volume: Any) -> tuple[Any, Any]:
             function_call_id,
             expected_runtime_contract_sha256,
             package_module=package_module,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True), flush=True)
+        return result
+
+    return app, finalize
+
+
+def build_source_recovery_runtime(modal_module: Any, volume: Any) -> tuple[Any, Any]:
+    """Build an attested worker that reads one immutable prior incoming path."""
+
+    image = _build_finalizer_image(modal_module)
+    app = modal_module.App(APP_NAME, image=image, include_source=False)
+
+    @app.function(
+        name=FINALIZER_FUNCTION_NAME,
+        **_finalizer_function_options(volume),
+    )
+    def finalize(
+        source_upload_id: str,
+        attempt_upload_id: str,
+        expected_sha256: str,
+        expected_size: int,
+        expected_runtime_contract_sha256: str,
+        recovery_claim: dict[str, object],
+    ) -> dict[str, object]:
+        function_call_id = modal_module.current_function_call_id()
+        if function_call_id is None:
+            raise RuntimeError("Modal did not expose the bundle finalizer FunctionCall ID")
+        package_module = _load_package_module(Path(str(REMOTE_PACKAGE_SCRIPT)))
+        result = _finalize_bundle(
+            volume,
+            Path(str(VOLUME_MOUNT)),
+            attempt_upload_id,
+            expected_sha256,
+            expected_size,
+            function_call_id,
+            expected_runtime_contract_sha256,
+            package_module=package_module,
+            source_upload_id=source_upload_id,
+            source_recovery_claim=recovery_claim,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True), flush=True)
         return result
@@ -1180,6 +1259,83 @@ def _validated_submission_claim(
         ) from error
     if claim != expected or not isinstance(claim.get("receipt_created_at_utc"), str):
         raise BundleStageError("Modal submission claim identity is invalid")
+    return claim
+
+
+def _source_recovery_claim_payload(
+    *,
+    source_upload_id: object,
+    attempt_upload_id: object,
+    bundle_sha256: object,
+    bundle_size: object,
+    source_function_call_id: object,
+    source_runtime_contract_sha256: object,
+    replacement_runtime_contract_sha256: object,
+    source_status_sha256: object,
+    source_failure_sha256: object,
+    source_receipt_sha256: object,
+    original_submission_claim_sha256: object,
+    recovery_claim_id: object,
+) -> dict[str, object]:
+    """Build the immutable claim for one post-journal source recovery attempt."""
+
+    source_id = _validate_upload_id(source_upload_id)
+    attempt_id = _validate_upload_id(attempt_upload_id)
+    if source_id == attempt_id:
+        raise ValueError("source recovery requires a fresh attempt identity")
+    sha256 = _validate_sha256(bundle_sha256)
+    source_incoming, _source_final, source_operation = _remote_paths(source_id, sha256)
+    _attempt_incoming, _attempt_final, attempt_operation = _remote_paths(attempt_id, sha256)
+    source_call_id = _validate_function_call_id(source_function_call_id)
+    return {
+        "schema": SOURCE_RECOVERY_CLAIM_SCHEMA,
+        "source_upload_id": source_id,
+        "attempt_upload_id": attempt_id,
+        "bundle_sha256": sha256,
+        "bundle_size": _validate_positive_size(bundle_size),
+        "source_function_call_id": source_call_id,
+        "source_runtime_contract_sha256": _validate_sha256(source_runtime_contract_sha256),
+        "replacement_runtime_contract_sha256": _validate_sha256(
+            replacement_runtime_contract_sha256
+        ),
+        "source_remote_incoming_path": source_incoming,
+        "source_remote_operation_path": source_operation,
+        "attempt_remote_operation_path": attempt_operation,
+        "source_status_sha256": _validate_sha256(source_status_sha256),
+        "source_failure_sha256": _validate_sha256(source_failure_sha256),
+        "source_receipt_sha256": _validate_sha256(source_receipt_sha256),
+        "original_submission_claim_sha256": _validate_sha256(original_submission_claim_sha256),
+        "recovery_claim_id": _validate_submission_claim_id(recovery_claim_id),
+        "remote_recovery_claim_path": _remote_source_recovery_claim_path(source_id, source_call_id),
+        "archive_reuploaded": False,
+    }
+
+
+def _validated_source_recovery_claim(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise BundleStageError("source recovery claim is not a JSON object")
+    claim = cast(dict[str, object], value.copy())
+    if set(claim) != SOURCE_RECOVERY_CLAIM_FIELDS or claim.get("archive_reuploaded") is not False:
+        raise BundleStageError("source recovery claim fields are invalid")
+    try:
+        expected = _source_recovery_claim_payload(
+            source_upload_id=claim.get("source_upload_id"),
+            attempt_upload_id=claim.get("attempt_upload_id"),
+            bundle_sha256=claim.get("bundle_sha256"),
+            bundle_size=claim.get("bundle_size"),
+            source_function_call_id=claim.get("source_function_call_id"),
+            source_runtime_contract_sha256=claim.get("source_runtime_contract_sha256"),
+            replacement_runtime_contract_sha256=claim.get("replacement_runtime_contract_sha256"),
+            source_status_sha256=claim.get("source_status_sha256"),
+            source_failure_sha256=claim.get("source_failure_sha256"),
+            source_receipt_sha256=claim.get("source_receipt_sha256"),
+            original_submission_claim_sha256=claim.get("original_submission_claim_sha256"),
+            recovery_claim_id=claim.get("recovery_claim_id"),
+        )
+    except ValueError as error:
+        raise BundleStageError("source recovery claim identity is invalid") from error
+    if claim != expected:
+        raise BundleStageError("source recovery claim paths or identity are invalid")
     return claim
 
 
@@ -1610,6 +1766,101 @@ def _read_json_file(path: Path, label: str) -> object:
     return _read_local_json(path, label)
 
 
+def _read_hashed_json_file(path: Path, expected_sha256: str, label: str) -> object:
+    expected = _validate_sha256(expected_sha256)
+    before_size, before_sha256 = _hash_regular_file_stable(path, label)
+    if before_size > MAX_JSON_BYTES or before_sha256 != expected:
+        raise BundleStageError(f"{label} identity is invalid")
+    value = _read_local_json(path, label)
+    after_size, after_sha256 = _hash_regular_file_stable(path, label)
+    if (after_size, after_sha256) != (before_size, before_sha256):
+        raise BundleStageError(f"{label} changed while it was validated")
+    return value
+
+
+def _verify_source_recovery_context(
+    mount_root: Path,
+    recovery_claim: Mapping[str, object],
+    *,
+    attempt_upload_id: str,
+    bundle_sha256: str,
+    bundle_size: int,
+    replacement_runtime_contract_sha256: str,
+) -> dict[str, object]:
+    """Authenticate one immutable failed journal without modifying its bytes."""
+
+    claim = _validated_source_recovery_claim(dict(recovery_claim))
+    if (
+        claim["attempt_upload_id"] != _validate_upload_id(attempt_upload_id)
+        or claim["bundle_sha256"] != _validate_sha256(bundle_sha256)
+        or claim["bundle_size"] != _validate_positive_size(bundle_size)
+        or claim["replacement_runtime_contract_sha256"]
+        != _validate_sha256(replacement_runtime_contract_sha256)
+    ):
+        raise BundleStageError("source recovery claim does not authorize this attempt")
+
+    claim_remote = cast(str, claim["remote_recovery_claim_path"])
+    claim_relative = _relative_remote_path(claim_remote)
+    claim_parent = _existing_directory_chain_no_links(
+        mount_root,
+        claim_relative.parent,
+        "source recovery claim directory",
+    )
+    claim_path = claim_parent / claim_relative.name
+    if claim_path != _mounted_path(mount_root, claim_remote):
+        raise BundleStageError("internal source recovery claim path is inconsistent")
+    if _read_json_file(claim_path, "source recovery claim") != claim:
+        raise BundleStageError("remote source recovery claim conflicts with the worker input")
+
+    source_operation_remote = cast(str, claim["source_remote_operation_path"])
+    source_operation_relative = _relative_remote_path(source_operation_remote)
+    source_operation = _existing_directory_chain_no_links(
+        mount_root,
+        source_operation_relative,
+        "source failed operation directory",
+    )
+    if source_operation != _mounted_path(mount_root, source_operation_remote):
+        raise BundleStageError("internal source failed operation path is inconsistent")
+
+    source_receipt_identity = {
+        "upload_id": claim["source_upload_id"],
+        "bundle_sha256": claim["bundle_sha256"],
+        "bundle_size": claim["bundle_size"],
+        "function_call_id": claim["source_function_call_id"],
+        "runtime_contract_sha256": claim["source_runtime_contract_sha256"],
+    }
+    source_status = _validated_operation_status(
+        _read_hashed_json_file(
+            source_operation / "status.json",
+            cast(str, claim["source_status_sha256"]),
+            "source failed operation status",
+        ),
+        source_receipt_identity,
+    )
+    source_failure = _validated_failure(
+        _read_hashed_json_file(
+            source_operation / "failure.json",
+            cast(str, claim["source_failure_sha256"]),
+            "source failed operation failure",
+        ),
+        source_receipt_identity,
+    )
+    if (
+        source_status is None
+        or source_status.get("state") != "failed"
+        or source_status.get("sequence") != 2
+        or source_failure is None
+        or source_failure.get("error_type") != SOURCE_RECOVERY_ERROR_TYPE
+        or source_failure.get("message") != SOURCE_RECOVERY_ERROR_MESSAGE
+        or "importlib.metadata.PackageNotFoundError"
+        not in cast(str, source_failure["traceback_tail"])
+    ):
+        raise BundleStageError("source operation is not the supported runtime metadata failure")
+    if _path_exists_no_follow(source_operation / "result.json"):
+        raise BundleStageError("source failed operation unexpectedly contains a result")
+    return claim
+
+
 def _verify_existing_final(
     final_directory: Path,
     expected_sha256: str,
@@ -1790,8 +2041,12 @@ def _finalize_materialization(
     runtime_contract_sha256: str,
     *,
     package_module: Any,
+    source_upload_id: str | None = None,
 ) -> dict[str, object]:
-    incoming_remote, final_remote, _operation_remote = _remote_paths(upload_id, expected_sha256)
+    source_id = upload_id if source_upload_id is None else _validate_upload_id(source_upload_id)
+    incoming_remote, final_remote, _source_operation_remote = _remote_paths(
+        source_id, expected_sha256
+    )
     incoming_relative = _relative_remote_path(incoming_remote)
     final_relative = _relative_remote_path(final_remote)
     incoming = _mounted_path(mount_root, incoming_remote)
@@ -1939,6 +2194,8 @@ def _finalize_bundle_with_journal(
     expected_runtime_contract_sha256: str,
     *,
     package_module: Any = PACKAGE,
+    source_upload_id: str | None = None,
+    source_recovery_claim: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Journal and finalize one already uploaded bundle on its mounted Volume."""
 
@@ -1947,10 +2204,27 @@ def _finalize_bundle_with_journal(
     expected_size = _validate_positive_size(expected_size)
     validated_call_id = _validate_function_call_id(function_call_id)
     validated_runtime_contract = _validate_sha256(expected_runtime_contract_sha256)
+    validated_source_id = (
+        validated_upload_id if source_upload_id is None else _validate_upload_id(source_upload_id)
+    )
+    if validated_source_id == validated_upload_id:
+        if source_recovery_claim is not None:
+            raise BundleStageError("normal finalization cannot carry a source recovery claim")
+    elif source_recovery_claim is None:
+        raise BundleStageError("source recovery finalization requires an immutable claim")
     mount_root = _resolve_volume_mount(mount_root)
     # The upload is committed by a different client before this fresh container
     # starts. Reload explicitly so a reused worker cannot observe an older view.
     volume.reload()
+    if source_recovery_claim is not None:
+        _verify_source_recovery_context(
+            mount_root,
+            source_recovery_claim,
+            attempt_upload_id=validated_upload_id,
+            bundle_sha256=validated_sha256,
+            bundle_size=expected_size,
+            replacement_runtime_contract_sha256=validated_runtime_contract,
+        )
     _incoming, _final, operation_remote = _remote_paths(validated_upload_id, validated_sha256)
     operation_relative = _relative_remote_path(operation_remote)
     operation_parent = _mkdir_chain_no_links(mount_root, operation_relative.parent)
@@ -2002,7 +2276,17 @@ def _finalize_bundle_with_journal(
             validated_call_id,
             validated_runtime_contract,
             package_module=package_module,
+            source_upload_id=validated_source_id,
         )
+        if source_recovery_claim is not None:
+            _verify_source_recovery_context(
+                mount_root,
+                source_recovery_claim,
+                attempt_upload_id=validated_upload_id,
+                bundle_sha256=validated_sha256,
+                bundle_size=expected_size,
+                replacement_runtime_contract_sha256=validated_runtime_contract,
+            )
         failure_path.unlink(missing_ok=True)
         _write_json_atomic(result_path, result)
         _write_json_atomic(
@@ -2069,6 +2353,8 @@ def _finalize_bundle(
     expected_runtime_contract_sha256: str,
     *,
     package_module: Any = PACKAGE,
+    source_upload_id: str | None = None,
+    source_recovery_claim: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Return only a result or one run-bound terminal failure envelope."""
 
@@ -2086,6 +2372,8 @@ def _finalize_bundle(
             function_call_id,
             expected_runtime_contract_sha256,
             package_module=package_module,
+            source_upload_id=source_upload_id,
+            source_recovery_claim=source_recovery_claim,
         )
     except BaseException as error:
         if type(error) is RuntimeError and str(error) == terminal_message:

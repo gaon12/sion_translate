@@ -1474,6 +1474,136 @@ def test_success_commits_artifact_before_consistent_final_result(
     assert not incoming.exists()
 
 
+def _write_source_recovery_claim(
+    mount: Path,
+    *,
+    sha256: str,
+    size: int,
+) -> tuple[dict[str, object], bytes, bytes]:
+    source_runtime_contract = "d" * 64
+    source_operation = mount / "operations" / UPLOAD_ID
+    source_operation.mkdir(parents=True)
+    status = MODULE._operation_status(
+        UPLOAD_ID,
+        sha256,
+        size,
+        "failed",
+        2,
+        function_call_id=CALL_ID,
+        runtime_contract_sha256=source_runtime_contract,
+    )
+    failure = {
+        "schema": MODULE.OPERATION_SCHEMA,
+        "upload_id": UPLOAD_ID,
+        "bundle_sha256": sha256,
+        "bundle_size": size,
+        "function_call_id": CALL_ID,
+        "runtime_contract_sha256": source_runtime_contract,
+        "error_type": MODULE.SOURCE_RECOVERY_ERROR_TYPE,
+        "message": MODULE.SOURCE_RECOVERY_ERROR_MESSAGE,
+        "recorded_at_utc": "2026-09-02T11:12:32+00:00",
+        "traceback_tail": (
+            "importlib.metadata.PackageNotFoundError: No package metadata was found for modal\n"
+        ),
+    }
+    MODULE._write_json_atomic(source_operation / "status.json", status)
+    MODULE._write_json_atomic(source_operation / "failure.json", failure)
+    status_bytes = (source_operation / "status.json").read_bytes()
+    failure_bytes = (source_operation / "failure.json").read_bytes()
+    claim = MODULE._source_recovery_claim_payload(
+        source_upload_id=UPLOAD_ID,
+        attempt_upload_id=SECOND_UPLOAD_ID,
+        bundle_sha256=sha256,
+        bundle_size=size,
+        source_function_call_id=CALL_ID,
+        source_runtime_contract_sha256=source_runtime_contract,
+        replacement_runtime_contract_sha256=RUNTIME_CONTRACT,
+        source_status_sha256=hashlib.sha256(status_bytes).hexdigest(),
+        source_failure_sha256=hashlib.sha256(failure_bytes).hexdigest(),
+        source_receipt_sha256="1" * 64,
+        original_submission_claim_sha256="2" * 64,
+        recovery_claim_id=SUBMISSION_CLAIM_ID,
+    )
+    claim_path = MODULE._mounted_path(mount, cast(str, claim["remote_recovery_claim_path"]))
+    claim_path.parent.mkdir(parents=True)
+    MODULE._write_json_atomic(claim_path, claim)
+    return claim, status_bytes, failure_bytes
+
+
+def test_source_recovery_uses_fresh_journal_without_moving_prior_evidence(
+    tmp_path: Path,
+) -> None:
+    mount = tmp_path / "volume"
+    mount.mkdir()
+    source_incoming = mount / "incoming" / UPLOAD_ID
+    size, sha256 = _make_prepared_archive(source_incoming / "bundle.zip")
+    claim, status_before, failure_before = _write_source_recovery_claim(
+        mount,
+        sha256=sha256,
+        size=size,
+    )
+
+    result = MODULE._finalize_bundle(
+        _FakeVolume(mount),
+        mount,
+        SECOND_UPLOAD_ID,
+        sha256,
+        size,
+        OTHER_CALL_ID,
+        RUNTIME_CONTRACT,
+        package_module=_FakePackage(),
+        source_upload_id=UPLOAD_ID,
+        source_recovery_claim=claim,
+    )
+
+    assert result["upload_id"] == SECOND_UPLOAD_ID
+    assert not source_incoming.exists()
+    assert not (mount / "incoming" / SECOND_UPLOAD_ID).exists()
+    source_operation = mount / "operations" / UPLOAD_ID
+    assert (source_operation / "status.json").read_bytes() == status_before
+    assert (source_operation / "failure.json").read_bytes() == failure_before
+    assert not (source_operation / "result.json").exists()
+    attempt_operation = mount / "operations" / SECOND_UPLOAD_ID
+    assert json.loads((attempt_operation / "status.json").read_text())["state"] == "passed"
+    assert json.loads((attempt_operation / "result.json").read_text()) == result
+
+
+def test_source_recovery_rejects_changed_failure_before_creating_attempt_journal(
+    tmp_path: Path,
+) -> None:
+    mount = tmp_path / "volume"
+    mount.mkdir()
+    source_incoming = mount / "incoming" / UPLOAD_ID
+    size, sha256 = _make_prepared_archive(source_incoming / "bundle.zip")
+    claim, status_before, _failure_before = _write_source_recovery_claim(
+        mount,
+        sha256=sha256,
+        size=size,
+    )
+    source_failure = mount / "operations" / UPLOAD_ID / "failure.json"
+    source_failure.write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="inspect its Volume journal") as captured:
+        MODULE._finalize_bundle(
+            _FakeVolume(mount),
+            mount,
+            SECOND_UPLOAD_ID,
+            sha256,
+            size,
+            OTHER_CALL_ID,
+            RUNTIME_CONTRACT,
+            package_module=_FakePackage(),
+            source_upload_id=UPLOAD_ID,
+            source_recovery_claim=claim,
+        )
+
+    assert isinstance(captured.value.__cause__, MODULE.BundleStageError)
+    assert "identity is invalid" in str(captured.value.__cause__)
+    assert (mount / "operations" / UPLOAD_ID / "status.json").read_bytes() == status_before
+    assert source_incoming.is_dir()
+    assert not (mount / "operations" / SECOND_UPLOAD_ID).exists()
+
+
 def test_pre_journal_reload_failure_uses_the_terminal_failure_envelope(
     tmp_path: Path,
 ) -> None:
