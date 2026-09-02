@@ -39,7 +39,7 @@ The remote finalizer is fixed to the following resources:
 
 - no GPU;
 - 2 CPU cores and 8 GiB of memory;
-- 2 GiB of ephemeral disk;
+- Modal's default per-container disk quota, without an explicit smaller request;
 - one container, no warm or buffered containers;
 - zero application retries; and
 - a four-hour timeout with a two-second scale-down window.
@@ -160,6 +160,31 @@ refuses to recreate a missing Volume. It also refuses any existing finalizer
 journal, a missing or conflicting attempted claim, a changed local finalizer
 runtime, or any receipt that may already have submitted a FunctionCall.
 
+### Recover the legacy 2 GiB Function-definition rejection
+
+Modal now provides a 512 GiB default container disk quota and rejects an
+explicit 2 GiB request before the detached App context opens. A legacy receipt
+with the exact `InvalidError` from that Function-definition step may already
+have an uploaded archive and immutable claim but no FunctionCall identity. Do
+not upload the archive again and do not edit the receipt manually. After saving
+a `status-latest.json` snapshot that proves there is no FunctionCall or remote
+journal, use the narrow recovery controller:
+
+```powershell
+.venv\Scripts\python.exe scripts\recover_modal_bundle_disk_rejection.py `
+  --receipt artifacts\modal-bundle-uploads\<upload-id>\receipt.json `
+  --max-dollars 1.27 `
+  --workspace-budget <hard-budget> `
+  --workspace-usage <current-usage>
+```
+
+The controller reconstructs the receipt's exact historical image bytes, checks
+their runtime hash, rehashes the local archive, validates the existing remote
+claim and absence of operation files, and changes only the legacy disk option
+to `None` in memory. It writes immutable pre-recovery evidence beside the
+receipt and never calls the archive upload API. Any different error, claim,
+runtime hash, status snapshot, archive, or remote journal fails closed.
+
 The remote finalizer is the authoritative check for the uploaded ZIP. If an
 interrupted upload did not commit a complete archive, finalization fails quickly
 and records a durable failure instead of retransmitting unknown bytes.
@@ -177,6 +202,11 @@ and records a durable failure instead of retransmitting unknown bytes.
 | `status-unavailable`, `claim-creation-unknown`, or `upload-unknown` | Treat the operation as unresolved. Restore connectivity or inspect provider state; never delete evidence to bypass the guard. |
 | `output-expired` | Use the consistent durable Volume result or failure when available; otherwise investigate manually. |
 | `passed` or `failed` | The receipt is terminal and no longer blocks a new stage operation. Preserve it for audit. |
+
+A Modal Function-definition error raised before the detached App context opens
+is recorded as `not-submitted`: the controller body, including `spawn`, could
+not have executed. Errors after the App context opens remain
+`submission-unknown` unless a valid FunctionCall ID was already persisted.
 
 There is one unavoidable fail-closed edge: Modal 1.5.3 provides no custom
 idempotency key or lookup by upload ID for a spawn whose response is lost before

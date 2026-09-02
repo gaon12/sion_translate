@@ -88,7 +88,6 @@ FINALIZER_FUNCTION_NAME = "finalize_prepared_bundle"
 FINALIZER_TIMEOUT_SECONDS = 4 * 60 * 60
 FINALIZER_CPU_CORES = 2.0
 FINALIZER_MEMORY_MIB = 8 * 1024
-FINALIZER_EPHEMERAL_DISK_MIB = 2 * 1024
 FINALIZER_SCALEDOWN_WINDOW_SECONDS = 2
 FINALIZER_ATTEMPT_CONTINGENCY = 2
 CPU_USD_PER_CORE_SECOND = 0.0000131
@@ -1074,7 +1073,6 @@ def _build_finalizer_runtime(modal_module: Any, volume: Any) -> tuple[Any, Any]:
         volumes={str(VOLUME_MOUNT): volume},
         cpu=FINALIZER_CPU_CORES,
         memory=FINALIZER_MEMORY_MIB,
-        ephemeral_disk=FINALIZER_EPHEMERAL_DISK_MIB,
         timeout=FINALIZER_TIMEOUT_SECONDS,
         retries=0,
         min_containers=0,
@@ -1231,8 +1229,10 @@ def _submit_finalizer(
     receipt["finalizer_state"] = "submitting"
     receipt["finalizer_error"] = None
     _write_json_atomic(receipt_path, receipt)
+    app_entered = False
     try:
         with app.run(detach=True):
+            app_entered = True
             function_call = finalizer.spawn(
                 receipt["upload_id"],
                 receipt["bundle_sha256"],
@@ -1247,7 +1247,7 @@ def _submit_finalizer(
             _write_json_atomic(receipt_path, receipt)
     except BaseException as error:
         if receipt["function_call_id"] is None:
-            receipt["finalizer_state"] = "submission-unknown"
+            receipt["finalizer_state"] = "submission-unknown" if app_entered else "not-submitted"
         receipt["finalizer_error"] = _error_record(error)
         _write_json_atomic(receipt_path, receipt)
         raise

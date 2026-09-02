@@ -194,18 +194,28 @@ class _FakeVolume:
 
 
 class _RunContext(AbstractContextManager[None]):
-    def __init__(self, observed: dict[str, object], error: BaseException | None = None):
+    def __init__(
+        self,
+        observed: dict[str, object],
+        *,
+        enter_error: BaseException | None = None,
+        exit_error: BaseException | None = None,
+    ):
         self.observed = observed
-        self.error = error
+        self.enter_error = enter_error
+        self.exit_error = exit_error
 
     def __enter__(self) -> None:
+        self.observed["run_enter_attempted"] = True
+        if self.enter_error is not None:
+            raise self.enter_error
         self.observed["run_entered"] = True
         return None
 
     def __exit__(self, *_args: object) -> bool:
         self.observed["run_exited"] = True
-        if self.error is not None:
-            raise self.error
+        if self.exit_error is not None:
+            raise self.exit_error
         return False
 
 
@@ -254,6 +264,7 @@ def _configure_stage(
     *,
     upload_error: BaseException | None = None,
     claim_error: BaseException | None = None,
+    run_enter_error: BaseException | None = None,
     spawn_error: BaseException | None = None,
     remote_operation_status: object | None = None,
     remote_files: dict[str, object] | None = None,
@@ -303,7 +314,7 @@ def _configure_stage(
     class FakeApp:
         def run(self, *, detach: bool) -> _RunContext:
             observed["detach"] = detach
-            return _RunContext(observed)
+            return _RunContext(observed, enter_error=run_enter_error)
 
     class FakeFinalizer:
         def spawn(self, *arguments: object) -> object:
@@ -784,6 +795,37 @@ def test_ambiguous_finalizer_submission_preserves_uploaded_identity(
     assert receipt["upload_state"] == "uploaded"
     assert receipt["finalizer_state"] == "submission-unknown"
     assert receipt["function_call_id"] is None
+
+
+def test_function_creation_failure_is_recorded_before_any_submission(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    bundle, observed = _configure_stage(
+        monkeypatch,
+        tmp_path,
+        run_enter_error=RuntimeError("function definition was rejected"),
+    )
+
+    with pytest.raises(RuntimeError, match="function definition was rejected"):
+        MODULE.stage(
+            bundle,
+            VOLUME_NAME,
+            tmp_path / "receipts",
+            max_dollars=MAX_DOLLARS,
+            workspace_budget=WORKSPACE_BUDGET,
+            workspace_usage=WORKSPACE_USAGE,
+        )
+
+    receipt = MODULE._read_receipt(tmp_path / "receipts" / UPLOAD_ID / "receipt.json")
+    assert observed["run_enter_attempted"] is True
+    assert "run_entered" not in observed
+    assert "spawn" not in observed
+    assert receipt["upload_state"] == "uploaded"
+    assert receipt["submission_claim_state"] == "created"
+    assert receipt["finalizer_state"] == "not-submitted"
+    assert receipt["function_call_id"] is None
+    assert receipt["finalizer_error"]["error_type"] == "RuntimeError"
 
 
 def test_existing_submission_lock_blocks_before_upload(
@@ -2308,7 +2350,7 @@ def test_finalizer_runtime_is_cpu_only_and_uses_posix_remote_paths() -> None:
     assert options["volumes"] == {"/mnt/sion-bundles": volume}
     assert options["cpu"] == MODULE.FINALIZER_CPU_CORES
     assert options["memory"] == MODULE.FINALIZER_MEMORY_MIB
-    assert options["ephemeral_disk"] == MODULE.FINALIZER_EPHEMERAL_DISK_MIB
+    assert "ephemeral_disk" not in options
     assert options["timeout"] == MODULE.FINALIZER_TIMEOUT_SECONDS
     assert options["retries"] == 0
     assert options["max_containers"] == 1
