@@ -20,6 +20,7 @@ SPEC.loader.exec_module(MODULE)
 
 UPLOAD_ID = "bundle-20260902t065624z-174a5e7835536906"
 CALL_ID = "fc-0123456789abcdef"
+REPLACEMENT_CALL_ID = "fc-fedcba9876543210"
 RUNTIME_HASH = "a" * 64
 BUNDLE_HASH = "b" * 64
 COMMIT = "c" * 40
@@ -193,34 +194,178 @@ def test_materialize_legacy_runtime_preserves_noncontroller_bytes(
     ).read_bytes() == b"source\r\n"
 
 
-def test_reconstructed_modules_are_serialized_without_remote_imports(tmp_path: Path) -> None:
-    helper_path = tmp_path / "legacy_helper.py"
-    helper_path.write_text("VALUE = 'serialized by value'\n", encoding="utf-8")
-    helper_spec = importlib.util.spec_from_file_location("sion_legacy_helper_test", helper_path)
-    assert helper_spec is not None and helper_spec.loader is not None
-    helper = importlib.util.module_from_spec(helper_spec)
-    sys.modules[helper_spec.name] = helper
-    helper_spec.loader.exec_module(helper)
+def test_exact_finalizer_imports_the_attested_remote_stage_module(tmp_path: Path) -> None:
+    stage_source = """
+from pathlib import Path, PurePosixPath
+REPOSITORY_ROOT = Path('.')
+SOURCE_PACKAGE_RELATIVE_PATH = Path('src/sion_translate')
+FINALIZER_REQUIREMENTS = Path('requirements/modal-bundle-stage.txt')
+PACKAGE_SCRIPT = Path('scripts/package_gpu_bundle.py')
+STAGE_SCRIPT = Path('scripts/modal_stage_gpu_bundle.py')
+REMOTE_ROOT = PurePosixPath('/opt/sion-bundle-stage')
+REMOTE_SOURCE_PACKAGE = REMOTE_ROOT / 'src/sion_translate'
+REMOTE_PACKAGE_SCRIPT = REMOTE_ROOT / 'scripts/package_gpu_bundle.py'
+REMOTE_STAGE_SCRIPT = REMOTE_ROOT / 'scripts/modal_stage_gpu_bundle.py'
+REMOTE_FINALIZER_REQUIREMENTS = REMOTE_ROOT / 'requirements/modal-bundle-stage.txt'
+APP_NAME = 'test-finalizer'
+FINALIZER_FUNCTION_NAME = 'finalize_prepared_bundle'
+VOLUME_MOUNT = PurePosixPath('/mnt/sion-bundles')
+FINALIZER_CPU_CORES = 2.0
+FINALIZER_MEMORY_MIB = 8192
+FINALIZER_TIMEOUT_SECONDS = 14400
+FINALIZER_SCALEDOWN_WINDOW_SECONDS = 2
+def _load_package_module(path): return path
+def _finalize_bundle(*args, **kwargs): return {'state': 'passed'}
+"""
+    local_stage = tmp_path / "local" / "modal_stage_gpu_bundle.py"
+    local_stage.parent.mkdir()
+    local_stage.write_text(stage_source, encoding="utf-8")
+    legacy = MODULE._load_legacy_module(local_stage)
 
-    stage_path = tmp_path / "legacy_stage.py"
-    stage_path.write_text(
-        "import sion_legacy_helper_test as PACKAGE\ndef read_value():\n    return PACKAGE.VALUE\n",
-        encoding="utf-8",
+    class FakeImage:
+        environment: dict[str, str] = {}
+
+        @classmethod
+        def debian_slim(cls, **_kwargs: object) -> "FakeImage":
+            return cls()
+
+        def __getattr__(self, _name: str) -> Any:
+            def chain(*_args: object, **_kwargs: object) -> "FakeImage":
+                return self
+
+            return chain
+
+        def env(self, values: dict[str, str]) -> "FakeImage":
+            type(self).environment = values
+            return self
+
+    class FakeApp:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def function(self, **_kwargs: object) -> Any:
+            return lambda function: function
+
+    fake_modal = SimpleNamespace(
+        Image=FakeImage,
+        App=FakeApp,
+        current_function_call_id=lambda: CALL_ID,
     )
-    legacy = MODULE._load_legacy_module(stage_path)
+    _app, finalizer = MODULE._build_importable_finalizer_runtime(
+        legacy,
+        fake_modal,
+        object(),
+    )
 
     from modal._serialization import deserialize, serialize
 
+    payload = serialize(finalizer)
+    remote_scripts = tmp_path / "remote" / "scripts"
+    remote_scripts.mkdir(parents=True)
+    remote_stage = remote_scripts / "modal_stage_gpu_bundle.py"
+    remote_stage.write_text(stage_source + "REMOTE_MARKER = True\n", encoding="utf-8")
+    sys.modules.pop(legacy.__name__, None)
+    sys.path.insert(0, str(remote_scripts))
     try:
-        with MODULE._pickle_legacy_runtime_by_value(legacy):
-            payload = serialize(legacy.read_value)
-        sys.modules.pop(legacy.__name__, None)
-        sys.modules.pop(helper.__name__, None)
         restored = deserialize(payload, None)
-        assert restored() == "serialized by value"
+        closure = dict(
+            zip(
+                restored.__code__.co_freevars,
+                (cell.cell_contents for cell in restored.__closure__ or ()),
+                strict=True,
+            )
+        )
+        restored_legacy = closure["legacy"]
+        assert Path(restored_legacy.__file__).resolve() == remote_stage.resolve()
+        assert restored_legacy.REMOTE_MARKER is True
+        assert FakeImage.environment["PYTHONPATH"] == (
+            "/opt/sion-bundle-stage/src:/opt/sion-bundle-stage/scripts"
+        )
     finally:
+        sys.path.remove(str(remote_scripts))
         sys.modules.pop(legacy.__name__, None)
-        sys.modules.pop(helper.__name__, None)
+
+
+def test_cli_routes_preflight_only_to_deserialization_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    observed: dict[str, object] = {}
+
+    def fake_recovery(receipt: Path, **options: object) -> Path:
+        observed["receipt"] = receipt
+        observed.update(options)
+        return receipt
+
+    monkeypatch.setattr(MODULE, "recover_deserialization_failure", fake_recovery)
+    receipt = tmp_path / "receipt.json"
+    assert (
+        MODULE.main(
+            [
+                "--receipt",
+                str(receipt),
+                "--failed-app-id",
+                "ap-0123456789abcdef",
+                "--max-dollars",
+                "1.27",
+                "--workspace-budget",
+                "1.50",
+                "--workspace-usage",
+                "0.01",
+                "--preflight-only",
+            ]
+        )
+        == 0
+    )
+    assert observed == {
+        "receipt": receipt,
+        "failed_app_id": "ap-0123456789abcdef",
+        "max_dollars": 1.27,
+        "workspace_budget": 1.5,
+        "workspace_usage": 0.01,
+        "preflight_only": True,
+    }
+
+
+def test_cli_routes_preflight_only_to_mount_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    observed: dict[str, object] = {}
+
+    def fake_recovery(receipt: Path, **options: object) -> Path:
+        observed["receipt"] = receipt
+        observed.update(options)
+        return receipt
+
+    monkeypatch.setattr(MODULE, "recover_mount_failure", fake_recovery)
+    receipt = tmp_path / "receipt.json"
+    assert (
+        MODULE.main(
+            [
+                "--receipt",
+                str(receipt),
+                "--mount-failure-app-id",
+                "ap-fedcba9876543210",
+                "--max-dollars",
+                "1.27",
+                "--workspace-budget",
+                "1.50",
+                "--workspace-usage",
+                "0.02",
+                "--preflight-only",
+            ]
+        )
+        == 0
+    )
+    assert observed == {
+        "receipt": receipt,
+        "failed_app_id": "ap-fedcba9876543210",
+        "max_dollars": 1.27,
+        "workspace_budget": 1.5,
+        "workspace_usage": 0.02,
+        "preflight_only": True,
+    }
 
 
 def test_recovery_reuses_the_claim_and_never_uploads_the_archive(
@@ -328,3 +473,246 @@ def test_recovery_rejects_a_remote_journal_or_missing_claim(tmp_path: Path) -> N
             workspace_usage=0.0,
         )
     assert "submitted-without-upload" not in legacy.events
+
+
+def _mount_source_receipt(bundle: Path) -> dict[str, Any]:
+    return {
+        "receipt_version": 1,
+        "upload_id": UPLOAD_ID,
+        "volume_name": "sion-prepared-bundles",
+        "volume_version": 1,
+        "app_name": "sion-prepared-bundle-finalizer",
+        "function_name": "finalize_prepared_bundle",
+        "runtime_contract_sha256": "d" * 64,
+        "local_bundle_path": str(bundle.resolve()),
+        "bundle_sha256": hashlib.sha256(bundle.read_bytes()).hexdigest(),
+        "bundle_size": bundle.stat().st_size,
+        "verification": {
+            "file_count": 3,
+            "total_bytes": 12,
+            "git_commit": COMMIT,
+            "git_tree": "e" * 40,
+        },
+        "remote_incoming_path": f"/incoming/{UPLOAD_ID}",
+        "remote_final_path": f"/bundles/sha256/bb/{BUNDLE_HASH}",
+        "remote_operation_path": f"/operations/{UPLOAD_ID}",
+        "created_at_utc": "2026-09-02T10:00:00+00:00",
+        "authorization_compute_charge_usd": 1.0,
+        "max_dollars": 1.27,
+        "workspace_budget_usd": 1.5,
+        "workspace_usage_before_submit_usd": 0.01,
+        "workspace_budget_headroom_usd": 1.49,
+        "budget_observations": [],
+        "upload_state": "uploaded",
+        "upload_error": None,
+        "finalizer_state": "submitted",
+        "function_call_id": CALL_ID,
+        "finalizer_error": None,
+        "submission_claim_id": "claim-0123456789abcdef0123456789abcdef",
+        "remote_submission_claim_path": f"/submission-claims/{UPLOAD_ID}.json",
+        "submission_claim_state": "created",
+        "submission_claim_error": None,
+    }
+
+
+class _FakeMountVolume:
+    def __init__(self, receipt: dict[str, Any], *, operation_exists: bool = False) -> None:
+        self.receipt = receipt
+        self.operation_exists = operation_exists
+        self.remote_json: dict[str, object] = {
+            str(receipt["remote_submission_claim_path"]): {"claim": "exact"}
+        }
+        self.uploads: list[tuple[str, object]] = []
+
+    def iterdir(self, path: str, *, recursive: bool) -> Iterator[object]:
+        assert recursive is False
+        if path == self.receipt["remote_operation_path"]:
+            if self.operation_exists:
+                return iter(())
+            raise FileNotFoundError(path)
+        if path == self.receipt["remote_incoming_path"]:
+            entry = SimpleNamespace(
+                path=f"{path}/bundle.zip",
+                size=self.receipt["bundle_size"],
+                type=SimpleNamespace(name="FILE"),
+            )
+            return iter((entry,))
+        raise FileNotFoundError(path)
+
+    @contextmanager
+    def batch_upload(self, *, force: bool) -> Iterator[Any]:
+        assert force is False
+        outer = self
+
+        class Batch:
+            def put_file(self, content: Any, path: str) -> None:
+                value = json.loads(content.read().decode("utf-8"))
+                outer.uploads.append((path, value))
+                outer.remote_json[path] = value
+
+        yield Batch()
+
+
+class _FakeMountRuntime(_FakeLegacy):
+    FINALIZER_EPHEMERAL_DISK_MIB: int | None = None
+
+    def __init__(self, runtime_root: Path, volume: _FakeMountVolume) -> None:
+        super().__init__(runtime_root, volume.remote_json)
+        self.volume = volume
+        outer = self
+
+        class Volume:
+            @staticmethod
+            def from_name(name: str, *, create_if_missing: bool, version: int) -> object:
+                outer.events.append(("volume", name, create_if_missing, version))
+                return outer.volume
+
+        self._modal = SimpleNamespace(Volume=Volume)
+
+    def _receipt_path(self, root: Path, upload_id: str) -> Path:
+        return root / upload_id / "receipt.json"
+
+    @staticmethod
+    def _new_submission_claim_id() -> str:
+        return "claim-fedcba9876543210fedcba9876543210"
+
+    def _read_volume_json(self, _volume: object, path: str) -> object | None:
+        self.events.append(("read", path))
+        return self.volume.remote_json.get(path)
+
+    def _validated_submission_claim(self, value: object, _receipt: object) -> object | None:
+        return value if value == {"claim": "exact"} else None
+
+    def _submit_finalizer(
+        self,
+        _modal: object,
+        _volume: object,
+        receipt_path: Path,
+        receipt: dict[str, Any],
+    ) -> None:
+        self.events.append("submitted-without-upload")
+        receipt["finalizer_state"] = "submitted"
+        receipt["function_call_id"] = REPLACEMENT_CALL_ID
+        self._write_json_atomic(receipt_path, receipt)
+
+
+def _write_mount_failure_fixture(tmp_path: Path) -> tuple[Path, dict[str, Any]]:
+    bundle = tmp_path / "prepared.zip"
+    bundle.write_bytes(b"prepared archive")
+    receipt = _mount_source_receipt(bundle)
+    receipt_path = tmp_path / "receipts" / UPLOAD_ID / "receipt.json"
+    receipt_path.parent.mkdir(parents=True)
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    expected_message = (
+        f"durable Modal bundle finalizer {UPLOAD_ID} failed; inspect its Volume journal"
+    )
+    status = {
+        "receipt": receipt,
+        "recovered_state": "failed",
+        "function_call_state": "failed",
+        "function_call_id_source": "receipt",
+        "observed_function_call_id": CALL_ID,
+        "function_call_result": None,
+        "function_call_error": {"error_type": "RuntimeError", "message": expected_message},
+        "remote_status": None,
+        "remote_result": None,
+        "remote_failure": None,
+    }
+    (receipt_path.parent / "status-latest.json").write_text(json.dumps(status), encoding="utf-8")
+    return receipt_path, receipt
+
+
+def _patch_mount_external_proofs(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(MODULE, "_fetch_mount_failure_logs", lambda _app: "exact logs")
+    monkeypatch.setattr(MODULE, "_assert_app_stopped", lambda _app: None)
+    monkeypatch.setattr(MODULE, "_assert_terminal_failed_call", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(MODULE, "_runtime_builder_sha256", lambda: "f" * 64)
+
+
+def test_mount_recovery_binds_identity_and_uploads_only_its_claim(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_mount_external_proofs(monkeypatch)
+    receipt_path, source = _write_mount_failure_fixture(tmp_path)
+    volume = _FakeMountVolume(source)
+    runtime = _FakeMountRuntime(tmp_path / "runtime", volume)
+
+    recovered_path = MODULE._recover_mount_with_committed_runtime(
+        runtime,
+        receipt_path,
+        failed_app_id="ap-0123456789abcdef",
+        replacement_commit=COMMIT,
+        max_dollars=1.27,
+        workspace_budget=1.5,
+        workspace_usage=0.01,
+    )
+
+    recovered = runtime._read_receipt(recovered_path)
+    assert recovered["function_call_id"] == REPLACEMENT_CALL_ID
+    assert recovered["finalizer_state"] == "submitted"
+    assert recovered["runtime_contract_sha256"] == RUNTIME_HASH
+    assert MODULE._receipt_identity_projection(recovered) == MODULE._receipt_identity_projection(
+        source
+    )
+    assert runtime.events.count("submitted-without-upload") == 1
+    assert len(volume.uploads) == 1
+    claim_path, claim = volume.uploads[0]
+    assert claim_path == f"/recovery-claims/{UPLOAD_ID}/mount-symlink-{CALL_ID}.json"
+    assert claim["schema"] == MODULE.MOUNT_RECOVERY_CLAIM_SCHEMA
+    assert claim["source_receipt_identity"] == MODULE._receipt_identity_projection(source)
+    assert "bundle.zip" not in claim_path
+
+
+def test_mount_recovery_rejects_an_empty_operation_directory_before_writes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_mount_external_proofs(monkeypatch)
+    receipt_path, source = _write_mount_failure_fixture(tmp_path)
+    volume = _FakeMountVolume(source, operation_exists=True)
+    runtime = _FakeMountRuntime(tmp_path / "runtime", volume)
+
+    with pytest.raises(MODULE.LegacyRecoveryError, match="operation directory"):
+        MODULE._recover_mount_with_committed_runtime(
+            runtime,
+            receipt_path,
+            failed_app_id="ap-0123456789abcdef",
+            replacement_commit=COMMIT,
+            max_dollars=1.27,
+            workspace_budget=1.5,
+            workspace_usage=0.01,
+        )
+    assert volume.uploads == []
+    assert "submitted-without-upload" not in runtime.events
+
+
+def test_mount_recovery_rejects_a_redirected_existing_receipt_before_claim(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_mount_external_proofs(monkeypatch)
+    receipt_path, source = _write_mount_failure_fixture(tmp_path)
+    volume = _FakeMountVolume(source)
+    runtime = _FakeMountRuntime(tmp_path / "runtime", volume)
+    recovery_path = receipt_path.parent / "mount-recovery" / UPLOAD_ID / "receipt.json"
+    redirected = dict(source)
+    redirected["runtime_contract_sha256"] = RUNTIME_HASH
+    redirected["volume_name"] = "attacker-volume"
+    redirected["finalizer_state"] = "not-submitted"
+    redirected["function_call_id"] = None
+    recovery_path.parent.mkdir(parents=True)
+    recovery_path.write_text(json.dumps(redirected), encoding="utf-8")
+
+    with pytest.raises(MODULE.LegacyRecoveryError, match="exact authorized replacement"):
+        MODULE._recover_mount_with_committed_runtime(
+            runtime,
+            receipt_path,
+            failed_app_id="ap-0123456789abcdef",
+            replacement_commit=COMMIT,
+            max_dollars=1.27,
+            workspace_budget=1.5,
+            workspace_usage=0.01,
+        )
+    assert volume.uploads == []
+    assert "submitted-without-upload" not in runtime.events
