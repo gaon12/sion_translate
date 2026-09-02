@@ -32,7 +32,7 @@ dependencies = [
 # ruff is pinned to a minor range on purpose. Its formatter changes between
 # minor versions, so an open bound lets CI reformat code the maintainer never
 # touched and fail `ruff format --check` with no commit to blame.
-dev = ["modal==1.5.3", "pyright>=1.1.411,<1.2", "pytest>=8.3", "ruff>=0.15,<0.16"]
+dev = ["pyright>=1.1.411,<1.2", "pytest>=8.3", "ruff>=0.15,<0.16"]
 baselines = []
 export = ["gguf>=0.19", "torchao>=0.17"]
 # Korean-specific helper used only by scripts/data/build_hanboneo.py for josa
