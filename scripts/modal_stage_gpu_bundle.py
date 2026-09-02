@@ -1019,10 +1019,18 @@ def recover_submission_lock(receipt_root: Path) -> Path:
 
 
 def _validate_modal_client_version() -> None:
-    observed = importlib.metadata.version("modal")
+    try:
+        observed = importlib.metadata.version("modal")
+    except importlib.metadata.PackageNotFoundError as error:
+        # Modal injects its runtime package at /pkg/modal inside Functions. That
+        # package exposes __version__, but it intentionally has no dist-info
+        # directory for importlib.metadata to discover.
+        observed = getattr(modal, "__version__", None)
+        if not isinstance(observed, str) or not observed:
+            raise RuntimeError("cannot determine the active Modal client version") from error
     if observed != EXPECTED_MODAL_CLIENT_VERSION:
         raise RuntimeError(
-            "the Modal bundle stager requires local Modal client "
+            "the Modal bundle stager requires Modal client "
             f"{EXPECTED_MODAL_CLIENT_VERSION}, got {observed}"
         )
 

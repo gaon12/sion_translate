@@ -2401,5 +2401,34 @@ def test_modal_client_guard_rejects_unreviewed_version(
         return "1.5.4"
 
     monkeypatch.setattr(MODULE.importlib.metadata, "version", unreviewed_version)
-    with pytest.raises(RuntimeError, match="requires local Modal client 1.5.3"):
+    with pytest.raises(RuntimeError, match="requires Modal client 1.5.3"):
+        MODULE._validate_modal_client_version()
+
+
+def test_modal_client_guard_accepts_injected_runtime_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def missing_distribution(_name: str) -> str:
+        raise MODULE.importlib.metadata.PackageNotFoundError("modal")
+
+    monkeypatch.setattr(MODULE.importlib.metadata, "version", missing_distribution)
+    monkeypatch.setattr(
+        MODULE,
+        "modal",
+        SimpleNamespace(__version__=MODULE.EXPECTED_MODAL_CLIENT_VERSION),
+    )
+
+    MODULE._validate_modal_client_version()
+
+
+def test_modal_client_guard_rejects_unversioned_injected_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def missing_distribution(_name: str) -> str:
+        raise MODULE.importlib.metadata.PackageNotFoundError("modal")
+
+    monkeypatch.setattr(MODULE.importlib.metadata, "version", missing_distribution)
+    monkeypatch.setattr(MODULE, "modal", SimpleNamespace())
+
+    with pytest.raises(RuntimeError, match="cannot determine the active Modal client version"):
         MODULE._validate_modal_client_version()
