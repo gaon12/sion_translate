@@ -93,6 +93,11 @@ GPU_BUILD_INPUT_PATH = "requirements/gpu-build.in"
 GPU_LOCK_PROVENANCE_PATH = "requirements/gpu-lock-provenance.json"
 GPU_PROJECT_INPUT_PATH = "pyproject.toml"
 GPU_GIT_ATTRIBUTES_PATH = ".gitattributes"
+# These process-owned lease files can remain after a clean shutdown. They are
+# mutable runtime coordination state, not model artifacts, and the extracted
+# bundle contract already permits them to appear after verification. Keep this
+# allowlist synchronized with ``sion_translate.bundle_contract``.
+RUNTIME_LOCK_FILENAMES = frozenset({".sion_artifacts.lock", ".sion_training_run.lock"})
 GPU_LOCK_UV_VERSION = "0.12.3"
 GPU_LOCK_EXCLUDE_NEWER = "2026-08-28T00:00:00Z"
 GPU_LOCK_EXPECTED_SHA256 = "0820c94d97a424e7c051cec1e01bba452a038904ae0df4730849fdabe50f350f"
@@ -882,6 +887,8 @@ def _walk_regular_tree(tree_root: Path, origin: str) -> list[Path]:
             if stat.S_ISDIR(metadata.st_mode):
                 child_directories.append(child_path)
             elif stat.S_ISREG(metadata.st_mode):
+                if child.name in RUNTIME_LOCK_FILENAMES:
+                    continue
                 files.append(child_path)
             else:
                 raise BundleError(f"{origin} contains a non-regular path: {child_path}")

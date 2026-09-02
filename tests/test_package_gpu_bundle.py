@@ -18,6 +18,7 @@ import pytest
 
 from scripts import package_gpu_bundle
 from sion_translate.bundle_contract import (
+    RUNTIME_LOCK_FILENAMES as CONTRACT_RUNTIME_LOCK_FILENAMES,
     load_embedded_training_contract,
     verify_embedded_bundle_payload,
 )
@@ -1318,6 +1319,28 @@ def test_the_tokenizer_ships_only_when_asked_for_and_only_if_complete(tmp_path: 
 
     origins = {entry["path"]: entry["origin"] for entry in _manifest(included)["files"]}
     assert origins["artifacts/tokenizer/sion.model"] == "tokenizer"
+    package_gpu_bundle.verify_archive(included)
+
+
+def test_runtime_lease_files_are_not_packaged_as_tokenizer_artifacts(tmp_path: Path) -> None:
+    """A completed local preflight may leave harmless process lease files behind."""
+
+    root = _repository(tmp_path)
+    _with_tokenizer(root, complete=True)
+    tokenizer_root = root / "artifacts" / "tokenizer"
+    for filename in sorted(package_gpu_bundle.RUNTIME_LOCK_FILENAMES):
+        (tokenizer_root / filename).write_text(
+            "host=test pid=123 started=456\n",
+            encoding="utf-8",
+        )
+
+    included = tmp_path / "with-runtime-locks.zip"
+    package_gpu_bundle.build_bundle(root, included, include_tokenizer=True)
+
+    with zipfile.ZipFile(included) as archive:
+        names = set(archive.namelist())
+    assert not any(Path(name).name in package_gpu_bundle.RUNTIME_LOCK_FILENAMES for name in names)
+    assert package_gpu_bundle.RUNTIME_LOCK_FILENAMES == CONTRACT_RUNTIME_LOCK_FILENAMES
     package_gpu_bundle.verify_archive(included)
 
 
