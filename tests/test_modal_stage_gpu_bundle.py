@@ -1240,8 +1240,11 @@ def test_stream_extraction_rejects_unsafe_paths(
         normalized = unsafe_name.replace("\\", "/").encode("utf-8")
         hostile = unsafe_name.encode("utf-8")
         payload = archive.read_bytes()
-        assert payload.count(normalized) == 2
-        archive.write_bytes(payload.replace(normalized, hostile))
+        if payload.count(hostile) == 0:
+            assert payload.count(normalized) == 2
+            archive.write_bytes(payload.replace(normalized, hostile))
+        else:
+            assert payload.count(hostile) == 2
     extraction = tmp_path / "tree"
     extraction.mkdir()
 
