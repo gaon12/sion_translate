@@ -687,6 +687,31 @@ def test_mount_recovery_rejects_an_empty_operation_directory_before_writes(
     assert "submitted-without-upload" not in runtime.events
 
 
+def test_remote_path_absence_accepts_only_filesystem_or_modal_not_found() -> None:
+    class ModalNotFound(Exception):
+        pass
+
+    ModalNotFound.__module__ = "modal.exception"
+    ModalNotFound.__name__ = "NotFoundError"
+
+    class MissingVolume:
+        @staticmethod
+        def iterdir(_path: str, *, recursive: bool) -> Iterator[object]:
+            assert recursive is False
+            raise ModalNotFound("missing")
+
+    MODULE._assert_remote_path_absent(MissingVolume(), "/operations/missing", "operation")
+
+    class BrokenVolume:
+        @staticmethod
+        def iterdir(_path: str, *, recursive: bool) -> Iterator[object]:
+            assert recursive is False
+            raise RuntimeError("transport failed")
+
+    with pytest.raises(RuntimeError, match="transport failed"):
+        MODULE._assert_remote_path_absent(BrokenVolume(), "/operations/missing", "operation")
+
+
 def test_mount_recovery_rejects_a_redirected_existing_receipt_before_claim(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

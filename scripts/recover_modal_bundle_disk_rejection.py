@@ -597,8 +597,14 @@ def _assert_remote_path_absent(volume: Any, path: str, label: str) -> None:
             next(iterator)
         except StopIteration:
             pass
-    except FileNotFoundError:
-        return
+    except BaseException as error:
+        is_local_not_found = isinstance(error, FileNotFoundError)
+        is_modal_not_found = (
+            type(error).__module__ == "modal.exception" and type(error).__name__ == "NotFoundError"
+        )
+        if is_local_not_found or is_modal_not_found:
+            return
+        raise
     raise LegacyRecoveryError(f"{label} already exists on the Modal Volume: {path}")
 
 
