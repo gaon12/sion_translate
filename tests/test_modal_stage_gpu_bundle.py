@@ -1258,6 +1258,25 @@ def test_stream_extraction_rejects_unsafe_paths(
     assert not (tmp_path / "escape.txt").exists()
 
 
+def test_volume_mount_symlink_is_pinned_to_its_directory_target(tmp_path: Path) -> None:
+    target = tmp_path / "volume-target"
+    target.mkdir()
+    mount = tmp_path / "volume-mount"
+    try:
+        mount.symlink_to(target, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"directory symlinks are unavailable: {error}")
+
+    assert MODULE._resolve_volume_mount(mount) == target.resolve()
+
+    unsafe_target = tmp_path / "regular-file"
+    unsafe_target.write_bytes(b"not a directory")
+    unsafe_mount = tmp_path / "unsafe-mount"
+    unsafe_mount.symlink_to(unsafe_target)
+    with pytest.raises(Exception, match="directory"):
+        MODULE._resolve_volume_mount(unsafe_mount)
+
+
 def test_exact_existing_artifact_is_verified_and_reused(
     tmp_path: Path,
 ) -> None:

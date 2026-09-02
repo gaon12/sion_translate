@@ -1459,6 +1459,33 @@ def _ensure_directory(path: Path, label: str) -> None:
         raise BundleStageError(f"{label} must be a regular non-symlink directory: {path}")
 
 
+def _resolve_volume_mount(path: Path) -> Path:
+    """Pin a Modal-managed mount symlink to its regular directory target."""
+
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError as error:
+        raise BundleStageError(f"Modal Volume mount does not exist: {path}") from error
+    if stat.S_ISDIR(metadata.st_mode) and not _is_link_like(metadata):
+        return path
+    if not stat.S_ISLNK(metadata.st_mode):
+        raise BundleStageError(
+            f"Modal Volume mount must be a directory or directory symlink: {path}"
+        )
+    raw_target = os.readlink(path)
+    target = Path(raw_target)
+    if not target.is_absolute():
+        raise BundleStageError("Modal Volume mount symlink target must be absolute")
+    try:
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise BundleStageError("Modal Volume mount symlink cannot be resolved safely") from error
+    if resolved == Path(resolved.anchor) or resolved != target.resolve(strict=True):
+        raise BundleStageError("Modal Volume mount symlink target is unsafe")
+    _ensure_directory(resolved, "resolved Modal Volume mount")
+    return resolved
+
+
 def _mkdir_chain_no_links(root: Path, relative: PurePosixPath) -> Path:
     current = root
     _ensure_directory(root, "extraction root")
@@ -1912,7 +1939,7 @@ def _finalize_bundle_with_journal(
     expected_size = _validate_positive_size(expected_size)
     validated_call_id = _validate_function_call_id(function_call_id)
     validated_runtime_contract = _validate_sha256(expected_runtime_contract_sha256)
-    _ensure_directory(mount_root, "Modal Volume mount")
+    mount_root = _resolve_volume_mount(mount_root)
     # The upload is committed by a different client before this fresh container
     # starts. Reload explicitly so a reused worker cannot observe an older view.
     volume.reload()
