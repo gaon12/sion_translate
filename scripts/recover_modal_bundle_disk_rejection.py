@@ -17,6 +17,7 @@ receipt and remote claim keep their original runtime identity.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from datetime import UTC, datetime
 import importlib.util
 import json
@@ -28,7 +29,7 @@ import subprocess
 import sys
 import tempfile
 from types import ModuleType
-from typing import Any, Mapping, Sequence, cast
+from typing import Any, Generator, Mapping, Sequence, cast
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -149,6 +150,28 @@ def _load_legacy_module(stage_path: Path) -> ModuleType:
             sys.modules[name] = previous
         raise
     return module
+
+
+@contextmanager
+def _pickle_legacy_runtime_by_value(legacy: ModuleType) -> Generator[None, None, None]:
+    """Keep reconstructed modules import-independent during Modal serialization."""
+
+    cloudpickle = importlib.import_module("modal._vendor.cloudpickle")
+    raw_package = getattr(legacy, "PACKAGE", None)
+    if not isinstance(raw_package, ModuleType):
+        raise LegacyRecoveryError("reconstructed runtime verifier is not a module")
+    modules = tuple(dict.fromkeys((legacy, raw_package)))
+    registered_names = cloudpickle.list_registry_pickle_by_value()
+    added: list[ModuleType] = []
+    try:
+        for module in modules:
+            if module.__name__ not in registered_names:
+                cloudpickle.register_pickle_by_value(module)
+                added.append(module)
+        yield
+    finally:
+        for module in reversed(added):
+            cloudpickle.unregister_pickle_by_value(module)
 
 
 def _validate_rejected_receipt(receipt: Mapping[str, object]) -> None:
@@ -338,13 +361,14 @@ def recover(
             runtime_root,
         )
         legacy = _load_legacy_module(stage_path)
-        return _recover_with_legacy_module(
-            legacy,
-            receipt_path,
-            max_dollars=max_dollars,
-            workspace_budget=workspace_budget,
-            workspace_usage=workspace_usage,
-        )
+        with _pickle_legacy_runtime_by_value(legacy):
+            return _recover_with_legacy_module(
+                legacy,
+                receipt_path,
+                max_dollars=max_dollars,
+                workspace_budget=workspace_budget,
+                workspace_usage=workspace_usage,
+            )
 
 
 def build_parser() -> argparse.ArgumentParser:

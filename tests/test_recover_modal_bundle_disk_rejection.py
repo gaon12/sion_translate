@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 from typing import Any, Iterator
 
@@ -190,6 +191,36 @@ def test_materialize_legacy_runtime_preserves_noncontroller_bytes(
     assert (
         tmp_path / "runtime" / "src" / "sion_translate" / "__init__.py"
     ).read_bytes() == b"source\r\n"
+
+
+def test_reconstructed_modules_are_serialized_without_remote_imports(tmp_path: Path) -> None:
+    helper_path = tmp_path / "legacy_helper.py"
+    helper_path.write_text("VALUE = 'serialized by value'\n", encoding="utf-8")
+    helper_spec = importlib.util.spec_from_file_location("sion_legacy_helper_test", helper_path)
+    assert helper_spec is not None and helper_spec.loader is not None
+    helper = importlib.util.module_from_spec(helper_spec)
+    sys.modules[helper_spec.name] = helper
+    helper_spec.loader.exec_module(helper)
+
+    stage_path = tmp_path / "legacy_stage.py"
+    stage_path.write_text(
+        "import sion_legacy_helper_test as PACKAGE\ndef read_value():\n    return PACKAGE.VALUE\n",
+        encoding="utf-8",
+    )
+    legacy = MODULE._load_legacy_module(stage_path)
+
+    from modal._serialization import deserialize, serialize
+
+    try:
+        with MODULE._pickle_legacy_runtime_by_value(legacy):
+            payload = serialize(legacy.read_value)
+        sys.modules.pop(legacy.__name__, None)
+        sys.modules.pop(helper.__name__, None)
+        restored = deserialize(payload, None)
+        assert restored() == "serialized by value"
+    finally:
+        sys.modules.pop(legacy.__name__, None)
+        sys.modules.pop(helper.__name__, None)
 
 
 def test_recovery_reuses_the_claim_and_never_uploads_the_archive(
