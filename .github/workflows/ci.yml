@@ -71,7 +71,10 @@ jobs:
         run: python -m pytest -p no:cacheprovider
 
   windows-native-binding:
-    runs-on: windows-latest
+    runs-on: windows-2022
+    env:
+      CMAKE_GENERATOR: Visual Studio 17 2022
+      CMAKE_GENERATOR_PLATFORM: x64
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7

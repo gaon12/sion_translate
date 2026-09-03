@@ -19,6 +19,17 @@ ORIGINAL_PROXY = "# Version 4.3.0\n" + native._OLD_IMPORT + "\n    pass\n"
 GENERATED_PROXY = "# Version 4.4.0\n" + native._NEW_IMPORT + "\n    pass\n"
 
 
+def test_windows_ci_selects_a_compatible_compiler_and_preserves_source_bytes() -> None:
+    workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml").read_text(
+        encoding="utf-8"
+    )
+    windows_job = workflow.split("  windows-native-binding:", 1)[1]
+    assert "runs-on: windows-2022" in windows_job
+    assert "CMAKE_GENERATOR: Visual Studio 17 2022" in windows_job
+    assert "CMAKE_GENERATOR_PLATFORM: x64" in windows_job
+    assert "git clone --config core.autocrlf=false" in windows_job
+
+
 def _make_wheel(
     path: Path, *, proxy: bytes = GENERATED_PROXY.encode(), version: str = "0.2.1"
 ) -> None:
