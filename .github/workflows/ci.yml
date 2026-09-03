@@ -44,7 +44,7 @@ jobs:
 
       - name: Preserve native build evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sentencepiece-native-linux-${{ matrix.python-version }}
           path: |
@@ -83,7 +83,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           python -m pip install -r requirements/sentencepiece-native-build.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          git clone --depth 1 --branch v0.2.1 https://github.com/google/sentencepiece.git "$env:RUNNER_TEMP/sentencepiece-source"
+          git clone --config core.autocrlf=false --depth 1 --branch v0.2.1 https://github.com/google/sentencepiece.git "$env:RUNNER_TEMP/sentencepiece-source"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python scripts/build_sentencepiece_native.py --source "$env:RUNNER_TEMP/sentencepiece-source" --output "$env:RUNNER_TEMP/sentencepiece-native"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -91,7 +91,7 @@ jobs:
           exit $LASTEXITCODE
       - name: Preserve the Windows wheel and evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sentencepiece-native-windows-3.11
           path: |
