@@ -38,6 +38,53 @@ CLAIM_ID = "claim-" + "d" * 32
 ORIGINAL_CLAIM_ID = "claim-" + "e" * 32
 
 
+@pytest.mark.parametrize(
+    ("state", "stopped_at", "accepted"),
+    [
+        ("APP_STATE_STOPPED", 123.0, True),
+        ("APP_STATE_STOPPED", 0.0, False),
+        ("APP_STATE_STOPPED", float("nan"), False),
+        ("APP_STATE_STOPPING", 123.0, False),
+        ("APP_STATE_DETACHED", 0.0, False),
+    ],
+)
+def test_missing_recent_app_requires_exact_stopped_lifecycle(
+    monkeypatch: pytest.MonkeyPatch, state: str, stopped_at: float, accepted: bool
+) -> None:
+    def run(*_args: object, **_kwargs: object) -> object:
+        return SimpleNamespace(returncode=0, stdout="[]")
+
+    def lifecycle(app_id: str) -> tuple[str, float]:
+        assert app_id == SOURCE_APP_ID
+        return state, stopped_at
+
+    monkeypatch.setattr(MODULE.subprocess, "run", run)
+    monkeypatch.setattr(MODULE, "_read_exact_app_lifecycle", lifecycle)
+    if accepted:
+        MODULE._assert_app_stopped(SOURCE_APP_ID)
+    else:
+        with pytest.raises(MODULE.RuntimeMetadataRecoveryError, match="lifecycle is not stopped"):
+            MODULE._assert_app_stopped(SOURCE_APP_ID)
+
+
+def test_live_app_list_entry_cannot_be_overridden_by_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def run(*_args: object, **_kwargs: object) -> object:
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps([{"app_id": SOURCE_APP_ID, "state": "stopping", "tasks": "1"}]),
+        )
+
+    def lifecycle(_app_id: str) -> tuple[str, float]:
+        raise AssertionError("a live list entry must not use the absent-entry fallback")
+
+    monkeypatch.setattr(MODULE.subprocess, "run", run)
+    monkeypatch.setattr(MODULE, "_read_exact_app_lifecycle", lifecycle)
+    with pytest.raises(MODULE.RuntimeMetadataRecoveryError, match="zero tasks"):
+        MODULE._assert_app_stopped(SOURCE_APP_ID)
+
+
 class _UploadBatch(AbstractContextManager["_UploadBatch"]):
     def __init__(self, volume: "_Volume") -> None:
         self.volume = volume

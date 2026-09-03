@@ -9,11 +9,13 @@ original incoming directory directly and writes only a fresh operation journal.
 from __future__ import annotations
 
 import argparse
+import asyncio
 from datetime import UTC, datetime
 import hashlib
 import importlib.util
 import io
 import json
+import math
 from pathlib import Path
 import re
 import subprocess
@@ -213,6 +215,21 @@ def _validate_remote_incoming(volume: Any, receipt: Mapping[str, object]) -> Non
         raise RuntimeMetadataRecoveryError("source incoming archive identity is invalid")
 
 
+def _read_exact_app_lifecycle(app_id: str) -> tuple[str, float]:
+    # Use the same read-only endpoint as the pinned SDK's exact-ID CLI lookup.
+    # AppList only retains recently stopped Apps; absence is not proof of exit.
+    from modal.client import _Client
+    from modal_proto import api_pb2
+
+    async def read() -> tuple[str, float]:
+        client = await _Client.from_env()
+        response = await client.stub.AppGetLifecycle(api_pb2.AppGetLifecycleRequest(app_id=app_id))
+        lifecycle = response.lifecycle
+        return api_pb2.AppState.Name(lifecycle.app_state), lifecycle.stopped_at
+
+    return asyncio.run(read())
+
+
 def _assert_app_stopped(app_id: str) -> None:
     if APP_ID_PATTERN.fullmatch(app_id) is None:
         raise RuntimeMetadataRecoveryError("failed Modal App ID is invalid")
@@ -238,6 +255,11 @@ def _assert_app_stopped(app_id: str) -> None:
         app = cast(dict[str, object], value)
         if app.get("app_id") == app_id:
             matches.append(app)
+    if not matches:
+        state, stopped_at = _read_exact_app_lifecycle(app_id)
+        if state != "APP_STATE_STOPPED" or not math.isfinite(stopped_at) or stopped_at <= 0:
+            raise RuntimeMetadataRecoveryError("exact failed Modal App lifecycle is not stopped")
+        return
     if len(matches) != 1 or matches[0].get("state") != "stopped" or matches[0].get("tasks") != "0":
         raise RuntimeMetadataRecoveryError("failed Modal App is not stopped with zero tasks")
 
