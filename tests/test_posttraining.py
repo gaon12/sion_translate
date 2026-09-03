@@ -50,6 +50,55 @@ def test_composite_reward_penalizes_number_corruption_and_slot_omission() -> Non
     assert result.components["slot"][0].tolist() == [1.0, 0.0]
 
 
+def test_reward_components_remain_rectangular_for_mixed_short_and_empty_candidates() -> None:
+    """Reproduce the real A100 MRT failure without requiring a GPU."""
+    reward = CompositeTranslationReward(TextTokenizer(), PostTrainingConfig())
+    source = torch.tensor([[4, 10, 11, 3], [4, 10, 11, 3]])
+    reference = torch.tensor([[23, 3, -100, -100], [23, 3, -100, -100]])
+    candidates = torch.tensor(
+        [
+            [[2, 23, 3, 0], [2, 23, 3, 0], [2, 23, 3, 0], [2, 0, 3, 0]],
+            [[2, 23, 3, 0], [2, 23, 3, 0], [2, 20, 3, 0], [2, 0, 3, 0]],
+        ]
+    )
+    result = reward(candidates, source, reference)
+    assert result.reward.shape == (2, 4)
+    assert all(values.shape == (2, 4) for values in result.components.values())
+    assert result.component_masks["language"].tolist() == [
+        [True, True, True, True],
+        [True, True, False, True],
+    ]
+    for row in range(2):
+        for candidate in range(4):
+            expected, _ = reward._score_one(
+                source[row].tolist(),
+                candidates[row, candidate, 1:].tolist(),
+                reference[row].tolist(),
+                "ja",
+                None,
+            )
+            assert result.reward[row, candidate].item() == pytest.approx(expected)
+    diagnostics = result.diagnostics()
+    assert diagnostics["reward_language_coverage"].item() == pytest.approx(7 / 8)
+    assert diagnostics["reward_language"].item() == pytest.approx(5 / 7)
+    assert all(torch.isfinite(value).item() for value in diagnostics.values())
+
+
+def test_unavailable_language_components_have_zero_coverage_not_nan() -> None:
+    reward = CompositeTranslationReward(TextTokenizer(), PostTrainingConfig())
+    result = reward(
+        torch.tensor([[[2, 20, 3], [2, 21, 3]]]),
+        torch.tensor([[4, 10, 3]]),
+        torch.tensor([[20, 3, -100]]),
+    )
+    assert result.components["language"].shape == (1, 2)
+    assert not result.component_masks["language"].any()
+    diagnostics = result.diagnostics()
+    assert diagnostics["reward_language"].item() == 0
+    assert diagnostics["reward_language_coverage"].item() == 0
+    assert all(torch.isfinite(value).item() for value in diagnostics.values())
+
+
 def test_a_value_changing_candidate_cannot_win_on_chrf() -> None:
     """Use a hard penalty because weighted terms can prefer a wrong number.
 

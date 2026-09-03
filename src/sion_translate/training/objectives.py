@@ -3,7 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Iterable
 from contextlib import AbstractContextManager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 import time
 from typing import Any, Callable, cast
@@ -75,6 +75,30 @@ class RewardOutput:
 
     reward: torch.Tensor
     components: dict[str, torch.Tensor]
+    component_masks: dict[str, torch.Tensor] = field(
+        default_factory=lambda: dict[str, torch.Tensor]()
+    )
+
+    def diagnostics(self) -> dict[str, torch.Tensor]:
+        """Average only defined components and expose their coverage separately.
+
+        A short or unrecognized-language candidate has no language score. Its
+        storage slot is zero, but it must not become a measured language failure.
+        Entirely undefined batches report zero coverage and a finite zero value.
+        Composite rewards already renormalize their active weights independently.
+        """
+        metrics: dict[str, torch.Tensor] = {}
+        for name, values in self.components.items():
+            mask = self.component_masks.get(name)
+            if mask is None:
+                metrics[f"reward_{name}"] = values.mean().detach()
+            else:
+                weights = mask.to(dtype=values.dtype)
+                metrics[f"reward_{name}"] = (
+                    (values * weights).sum() / weights.sum().clamp_min(1)
+                ).detach()
+                metrics[f"reward_{name}_coverage"] = weights.mean().detach()
+        return metrics
 
 
 class CompositeTranslationReward:
@@ -269,6 +293,10 @@ class CompositeTranslationReward:
             components={
                 name: values.to(device=device) for name, values in cpu_output.components.items()
             },
+            component_masks={
+                name: values.to(device=device)
+                for name, values in cpu_output.component_masks.items()
+            },
         )
 
     def score_cpu(
@@ -296,6 +324,7 @@ class CompositeTranslationReward:
         )
         reward_rows: list[list[float]] = []
         component_rows: dict[str, list[list[float]]] = {name: [] for name in self.weights}
+        component_mask_rows: dict[str, list[list[bool]]] = {name: [] for name in self.weights}
         for row_index, (source, candidate_row, reference) in enumerate(
             zip(inputs_cpu, candidates_cpu, references_cpu, strict=True)
         ):
@@ -310,6 +339,7 @@ class CompositeTranslationReward:
             target_language = self.language_by_tag.get(source_ids[0]) if source_ids else None
             row_rewards: list[float] = []
             row_components: dict[str, list[float]] = {name: [] for name in self.weights}
+            row_masks: dict[str, list[bool]] = {name: [] for name in self.weights}
             for candidate_index, candidate in enumerate(candidate_row):
                 candidate_ids = cast(
                     list[int],
@@ -336,16 +366,25 @@ class CompositeTranslationReward:
                     roundtrip_ids,
                 )
                 row_rewards.append(reward)
-                for name, value in components.items():
-                    row_components[name].append(value)
+                # Append exactly one slot per candidate even when a diagnostic
+                # is inapplicable. Iterating only returned keys creates ragged
+                # arrays when a batch mixes short and ordinary hypotheses.
+                for name in self.weights:
+                    row_components[name].append(components.get(name, 0.0))
+                    row_masks[name].append(name in components)
             reward_rows.append(row_rewards)
             for name, values in row_components.items():
                 component_rows[name].append(values)
+                component_mask_rows[name].append(row_masks[name])
         return RewardOutput(
             reward=torch.tensor(reward_rows, dtype=torch.float32),
             components={
                 name: torch.tensor(rows, dtype=torch.float32)
                 for name, rows in component_rows.items()
+            },
+            component_masks={
+                name: torch.tensor(rows, dtype=torch.bool)
+                for name, rows in component_mask_rows.items()
             },
         )
 
@@ -820,9 +859,7 @@ class MinimumRiskObjective:
             roundtrip_mask=roundtrip_mask,
         )
         metrics = {"reward": reward_output.reward.mean()}
-        metrics.update(
-            {f"reward_{name}": values.mean() for name, values in reward_output.components.items()}
-        )
+        metrics.update(reward_output.diagnostics())
         metrics.update(self._direction_reward_metrics(batch, reward_output.reward))
         return metrics
 
@@ -1008,6 +1045,10 @@ class MinimumRiskObjective:
                 name: values.to(device=sampled.device)
                 for name, values in reward_output_cpu.components.items()
             },
+            component_masks={
+                name: values.to(device=sampled.device)
+                for name, values in reward_output_cpu.component_masks.items()
+            },
         )
         rewards = reward_output.reward
         candidate_distribution = torch.softmax(self.config.mrt_alpha * generated_scores, dim=-1)
@@ -1087,12 +1128,7 @@ class MinimumRiskObjective:
                 dtype=torch.float32,
             ),
         }
-        metrics.update(
-            {
-                f"reward_{name}": values.mean().detach()
-                for name, values in reward_output.components.items()
-            }
-        )
+        metrics.update(reward_output.diagnostics())
         metrics.update(reference_diagnostics)
         return ObjectiveOutput(
             loss_sum=total_loss * normalizer,
