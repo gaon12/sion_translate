@@ -35,6 +35,15 @@ provider recovery is separate from application retries. Storage, image builds,
 network, and billing-report delays remain outside that estimate; the provider's
 hard budget is the independent spending backstop.
 
+After the initial sweep, `--case-set headroom` measures CE batch 24 and MRT
+source batches 8, 16, and 32 with candidate micro-batch 8. These are explicit
+experimental overrides, not saved production configuration changes. Effective
+batch changes remain flagged. The probe matches production's `high` FP32 matmul
+precision, warms every measured CE shape, and profiles a separate warmed CE
+update to identify the actual attention backend. Earlier receipts without this
+precision field used PyTorch's default and should not be mixed into a final
+like-for-like speed comparison.
+
 Each call is limited to 1,200 seconds, with zero application retries. Each batch
 candidate runs in a separate process with a shorter timeout. Progress, results,
 and raw child stdout/stderr persist in the `sion-training-probe-results` Volume.

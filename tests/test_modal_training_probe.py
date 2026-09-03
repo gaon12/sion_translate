@@ -25,6 +25,14 @@ def test_modal_app_definition_is_valid_without_submitting(tmp_path):
     assert function is not None
 
 
+def test_headroom_cases_keep_all_stages_and_explicit_candidate_batching():
+    cases = probe.CASE_SETS["headroom"]
+    assert cases["foundation"] == [(24, None)]
+    assert cases["sft"] == [(24, None)]
+    assert cases["mrt"] == [(8, 8), (16, 8), (32, 8)]
+    assert probe.compute_contingency("h100") < 4
+
+
 def _plan(tmp_path: Path):
     asset = tmp_path / "tokenizer" / "sion.model"
     asset.parent.mkdir()

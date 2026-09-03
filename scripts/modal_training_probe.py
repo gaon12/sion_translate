@@ -38,6 +38,18 @@ CPU = 8
 MEMORY_GIB = 48
 PRICES = {"a100-80gb": 0.000694, "h100": 0.001097}
 GPU_NAMES = {"a100-80gb": "A100-80GB", "h100": "H100!"}
+CASE_SETS = {
+    "full": {
+        "foundation": [(batch, None) for batch in (8, 16, 32, 64)],
+        "sft": [(batch, None) for batch in (8, 16, 32, 64)],
+        "mrt": [(batch, None) for batch in (1, 2, 4, 8)],
+    },
+    "headroom": {
+        "foundation": [(24, None)],
+        "sft": [(24, None)],
+        "mrt": [(8, 8), (16, 8), (32, 8)],
+    },
+}
 
 
 def sha256(path: Path) -> str:
@@ -159,7 +171,14 @@ def resolved_config(plan: dict[str, Any], directory: Path):
     return config, decisions
 
 
-def run_case(directory: Path, plan_hash: str, stage_name: str, batch_size: int, output: Path):
+def run_case(
+    directory: Path,
+    plan_hash: str,
+    stage_name: str,
+    batch_size: int,
+    output: Path,
+    candidate_micro_batch: int | None = None,
+):
     import torch
 
     from sion_translate.cli.train import _build_posttraining_config, build_collator_args
@@ -179,6 +198,8 @@ def run_case(directory: Path, plan_hash: str, stage_name: str, batch_size: int, 
 
     started = time.perf_counter()
     torch.set_num_threads(CPU)
+    # Match initialize_distributed(), including FP32 attention fallback kernels.
+    torch.set_float32_matmul_precision("high")
     torch.manual_seed(20260903)
     torch.cuda.manual_seed_all(20260903)
     plan = verify_plan(directory, plan_hash)
@@ -189,6 +210,11 @@ def run_case(directory: Path, plan_hash: str, stage_name: str, batch_size: int, 
         config = _build_posttraining_config(config, output.parent)
     elif stage_name != "sft":
         raise ValueError("unknown training stage")
+    if candidate_micro_batch is not None:
+        if stage_name != "mrt" or not 1 <= candidate_micro_batch <= 64:
+            raise ValueError("candidate micro-batch override requires MRT and a value in 1..64")
+        config.posttraining.candidate_micro_batch = candidate_micro_batch
+        config.validate()
     training = config.training
     effective_batch = training.batch_size_per_gpu * training.gradient_accumulation_steps
     tokenizer = SionTokenizer(directory / "tokenizer/sion.model")
@@ -281,11 +307,16 @@ def run_case(directory: Path, plan_hash: str, stage_name: str, batch_size: int, 
 
     warmup = micro(batch_at_fraction(cohort["representative"], batch_size, 0.5))
     update(warmup["normalizer"])
-    torch.cuda.reset_peak_memory_stats()
     # Equal-probability length strata approximate the sampled distribution.
     # Inputs are collated/transferred inside the timing. Whole-corpus disk and
     # DataLoader stalls are not measured by this resident-cohort experiment.
     fractions = [0.125, 0.375, 0.625, 0.875]
+    if stage_name != "mrt":
+        shape_warmups = [
+            micro(batch_at_fraction(cohort["representative"], batch_size, f)) for f in fractions
+        ]
+        update(sum(item["normalizer"] for item in shape_warmups))
+    torch.cuda.reset_peak_memory_stats()
     samples = [micro(batch_at_fraction(cohort["representative"], batch_size, f)) for f in fractions]
     optimizer_seconds = update(sum(item["normalizer"] for item in samples))
     summary = summarize_measurements(samples, optimizer_seconds, batch_size, effective_batch)
@@ -297,6 +328,8 @@ def run_case(directory: Path, plan_hash: str, stage_name: str, batch_size: int, 
         "parameter_count": model.parameter_count(),
         "gradient_checkpointing": config.model.gradient_checkpointing,
         "precision": training.precision,
+        "float32_matmul_precision": torch.get_float32_matmul_precision(),
+        "candidate_micro_batch": config.posttraining.candidate_micro_batch if objective else None,
         "epochs": training.num_train_epochs,
         "max_steps": training.max_steps,
         "examples_per_epoch": cohort["examples_per_epoch"],
@@ -318,7 +351,7 @@ def run_case(directory: Path, plan_hash: str, stage_name: str, batch_size: int, 
 
     # Authenticate an actual full optimizer/EMA checkpoint once per stage.
     # Save and resume are outside steady-state throughput, but retain timings.
-    if batch_size == (1 if stage_name == "mrt" else 8):
+    if batch_size in {1, 8, 24}:
         checkpoint = output.parent / f"checkpoint-{stage_name}"
         begin = time.perf_counter()
         save_checkpoint(checkpoint, model, optimizer, scheduler, total_updates, context, ema=ema)
@@ -347,6 +380,38 @@ def run_case(directory: Path, plan_hash: str, stage_name: str, batch_size: int, 
         import shutil
 
         shutil.rmtree(checkpoint)
+    if batch_size == 24 and stage_name != "mrt":
+        # Profile one warmed update outside the throughput window. Report actual
+        # kernel dispatch instead of inferring the attention backend from VRAM.
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+        ) as profiler:
+            profiled = micro(batch_at_fraction(cohort["representative"], batch_size, 0.5))
+            update(profiled["normalizer"])
+        events = profiler.key_averages()
+        report["profile"] = {
+            "attention": [
+                {
+                    "operator": event.key,
+                    "calls": event.count,
+                    "cpu_us": event.cpu_time_total,
+                    "device_us": event.device_time_total,
+                }
+                for event in events
+                if "scaled_dot_product" in event.key
+            ],
+            "top_cpu": [
+                {
+                    "operator": event.key,
+                    "calls": event.count,
+                    "self_cpu_us": event.self_cpu_time_total,
+                    "self_device_us": event.self_device_time_total,
+                }
+                for event in sorted(
+                    events, key=lambda event: event.self_cpu_time_total, reverse=True
+                )[:12]
+            ],
+        }
     report["status"] = "passed"
     report["total_seconds"] = time.perf_counter() - started
     write_json(output, report)
@@ -355,7 +420,14 @@ def run_case(directory: Path, plan_hash: str, stage_name: str, batch_size: int, 
 
 def child(args) -> int:
     try:
-        run_case(args.data, args.plan_sha256, args.stage, args.batch, args.output)
+        run_case(
+            args.data,
+            args.plan_sha256,
+            args.stage,
+            args.batch,
+            args.output,
+            candidate_micro_batch=args.candidate_micro_batch,
+        )
     except BaseException as error:
         import torch
 
@@ -368,7 +440,14 @@ def child(args) -> int:
     return 0
 
 
-def execute(target: str, run_id: str, plan_hash: str, source_hash: str, probe_hash: str):
+def execute(
+    target: str,
+    run_id: str,
+    plan_hash: str,
+    source_hash: str,
+    probe_hash: str,
+    case_set: str = "full",
+):
     """Modal entrypoint: run bounded children and publish progress after each one."""
     import modal
     import torch
@@ -384,6 +463,7 @@ def execute(target: str, run_id: str, plan_hash: str, source_hash: str, probe_ha
         "plan_sha256": plan_hash,
         "source_contract_sha256": source_hash,
         "probe_sha256": probe_hash,
+        "case_set": case_set,
         "status": "running",
         "cases": [],
     }
@@ -408,9 +488,9 @@ def execute(target: str, run_id: str, plan_hash: str, source_hash: str, probe_ha
         smoke._validate_target_hardware(target, runtime)
         report["runtime"] = runtime
         publish()
-        for stage in ("foundation", "sft", "mrt"):
+        for stage, candidates in CASE_SETS[case_set].items():
             child_timeout = MRT_CHILD_TIMEOUT if stage == "mrt" else CHILD_TIMEOUT
-            for batch_size in (1, 2, 4, 8) if stage == "mrt" else (8, 16, 32, 64):
+            for batch_size, candidate_micro_batch in candidates:
                 remaining = TIMEOUT - (time.monotonic() - started) - 45
                 if remaining < child_timeout:
                     report["status"] = "incomplete_deadline"
@@ -437,6 +517,8 @@ def execute(target: str, run_id: str, plan_hash: str, source_hash: str, probe_ha
                     "--output",
                     str(case_path),
                 ]
+                if candidate_micro_batch is not None:
+                    command.extend(["--candidate-micro-batch", str(candidate_micro_batch)])
                 with (
                     (root / f"{name}.stdout.log").open("w") as stdout,
                     (root / f"{name}.stderr.log").open("w") as stderr,
@@ -613,6 +695,7 @@ def submit(args):
             "compute_contingency_usd": compute_contingency(args.target),
             "created_utc": datetime.now(UTC).isoformat(),
             "volume": VOLUME,
+            "case_set": args.case_set,
         }
         write_json(receipt_path, receipt)
         # Canonical registration makes Modal import this module remotely instead
@@ -627,7 +710,9 @@ def submit(args):
         with modal.enable_output(), app.run(detach=True):
             receipt["app_id"] = app.app_id
             write_json(receipt_path, receipt)
-            call = function.spawn(args.target, run_id, plan_hash, contract, receipt["probe_sha256"])
+            call = function.spawn(
+                args.target, run_id, plan_hash, contract, receipt["probe_sha256"], args.case_set
+            )
             receipt.update(state="submitted", call_id=call.object_id)
             write_json(receipt_path, receipt)
         print(json.dumps({"receipt": str(receipt_path), **receipt}, indent=2))
@@ -667,6 +752,8 @@ def status(args):
         ):
             if journal[key] != receipt[key]:
                 raise RuntimeError(f"remote journal identity mismatch: {key}")
+        if journal.get("case_set", "full") != receipt.get("case_set", "full"):
+            raise RuntimeError("remote case set differs from the authorized receipt")
         if result is not None and result != journal:
             raise RuntimeError("FunctionCall result differs from the durable journal")
         write_json(args.receipt.parent / "result.json", journal)
@@ -707,6 +794,7 @@ def main():
     launch.add_argument("--target", choices=GPU_NAMES, required=True)
     launch.add_argument("--max-dollars", type=float, required=True)
     launch.add_argument("--workspace-hard-budget", type=float, required=True)
+    launch.add_argument("--case-set", choices=CASE_SETS, default="full")
     launch.add_argument("--receipts", type=Path, default=ROOT / "artifacts/modal-probes")
     inspect = commands.add_parser("status")
     inspect.add_argument("--receipt", type=Path, required=True)
@@ -716,6 +804,7 @@ def main():
     worker.add_argument("--stage", choices=("foundation", "sft", "mrt"), required=True)
     worker.add_argument("--batch", type=int, required=True)
     worker.add_argument("--output", type=Path, required=True)
+    worker.add_argument("--candidate-micro-batch", type=int)
     args = parser.parse_args()
     if args.command == "child":
         raise SystemExit(child(args))
