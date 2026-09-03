@@ -225,6 +225,45 @@ timeout, interruption, nonzero exit, or validation failure therefore cannot leav
 an unguarded NCCL worker consuming the two paid GPUs. Reported sequential phase
 durations must also fit inside the observed function duration used for the cost estimate.
 
+## Recovering a CPU runtime-metadata failure
+
+Use `scripts/recover_modal_bundle_runtime_metadata.py` only for a failed CPU
+finalizer whose durable journal reports that the injected Modal package has no
+distribution metadata. Other failures need their own diagnosis. Commit and push
+the replacement runtime, then require CI to pass before submitting a recovery.
+The controller rejects runtime files that differ from the pushed commit,
+including extra source files that Git ignores.
+
+Start with a read-only preflight:
+
+```text
+python scripts/recover_modal_bundle_runtime_metadata.py --receipt <failed-receipt.json> --failed-app-id <stopped-app-id> --max-dollars <authorized-ceiling> --workspace-budget <actual-hard-budget> --workspace-usage <fresh-observed-usage> --preflight-only
+```
+
+Supply current budget observations, not example values from an earlier run.
+Preflight checks the exact stopped App, terminal FunctionCall, preserved failure
+journal, original submission claim, local archive hash, and remote archive entry.
+It does not upload or start a Function. Remove `--preflight-only` only after
+reviewing that evidence and confirming the paid CPU attempt is authorized.
+
+Recovery uses a fresh attempt ID and a version-2 receipt that points truthfully
+to the original incoming archive. It never reuploads, copies, or moves the
+archive before verification. The worker authenticates the recovery claim and
+preserves the original failed journal; new status and result records belong to
+the new attempt. The result also binds the source ID and recovery-claim digest.
+
+A no-overwrite source claim and a separate permanent submission marker prevent
+a copied local receipt from silently starting another attempt. A lost submission
+response is ambiguous, not permission to retry. Inspect the saved intent,
+receipt, exact FunctionCall, and Volume journal instead. Do not delete claims or
+use the ordinary `resume` command on a source-bound receipt.
+
+If the worker publishes prepared files but stops before recording its result,
+the controller stops because the original incoming archive may no longer exist.
+This requires explicit reconciliation of the published files and journal; do
+not manufacture a successful result or automatically submit another worker.
+CPU recovery is not evidence that either A100 or H100 execution has passed.
+
 ## What this cannot prove
 
 A short smoke test cannot prove long-run convergence, dataset throughput,
