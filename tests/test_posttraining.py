@@ -950,6 +950,38 @@ def _legacy_full_candidate_loss(
     )
 
 
+@pytest.mark.parametrize("micro_batch", [1, 2, 3, 4, 8])
+@pytest.mark.parametrize("checkpointed", [False, True])
+def test_actual_mrt_chunks_exclude_reference_for_any_candidate_batch(micro_batch, checkpointed):
+    class FourCandidateScorer(AutocastCacheRecordingScorer):
+        @torch.no_grad()
+        def sample(self, input_ids, attention_mask, *, num_samples, **kwargs):
+            candidates = super().sample(input_ids, attention_mask, num_samples=2, **kwargs)
+            return candidates[:, torch.arange(num_samples) % 2]
+
+    torch.manual_seed(31)
+    baseline_model = FourCandidateScorer()
+    chunked_model = deepcopy(baseline_model)
+    config = PostTrainingConfig(
+        samples_per_source=4,
+        candidate_micro_batch=1,
+        candidate_gradient_checkpointing=checkpointed,
+        max_new_tokens=4,
+    )
+    batch = {name: value.repeat(2, 1) for name, value in posttraining_batch().items()}
+    baseline = MinimumRiskObjective(TextTokenizer(), config)(baseline_model, batch)
+    chunked_config = deepcopy(config)
+    chunked_config.candidate_micro_batch = micro_batch
+    chunked = MinimumRiskObjective(TextTokenizer(), chunked_config)(chunked_model, batch)
+    torch.testing.assert_close(chunked.loss_sum, baseline.loss_sum)
+    baseline.loss_sum.backward()
+    chunked.loss_sum.backward()
+    for expected, actual in zip(
+        baseline_model.parameters(), chunked_model.parameters(), strict=True
+    ):
+        torch.testing.assert_close(actual.grad, expected.grad)
+
+
 def test_candidate_micro_batches_match_legacy_loss_and_gradients() -> None:
     torch.manual_seed(17)
     config = PostTrainingConfig(

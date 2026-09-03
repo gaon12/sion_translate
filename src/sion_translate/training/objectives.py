@@ -999,12 +999,19 @@ class MinimumRiskObjective:
                 self._sequence_log_probabilities(
                     model,
                     batch,
-                    decoder_inputs[:, start : start + self.config.candidate_micro_batch],
-                    labels[:, start : start + self.config.candidate_micro_batch],
+                    # The final slot is the gold reference, not a generated
+                    # candidate. A partial or oversized chunk must stop before
+                    # it, otherwise scores have one more column than rewards.
+                    decoder_inputs[
+                        :, start : min(samples, start + self.config.candidate_micro_batch)
+                    ],
+                    labels[:, start : min(samples, start + self.config.candidate_micro_batch)],
                 )
                 for start in range(0, samples, self.config.candidate_micro_batch)
             ]
             generated_scores = torch.cat(score_chunks, dim=1)
+            if generated_scores.shape != (batch_size, samples):
+                raise RuntimeError("candidate scoring must return exactly one score per sample")
             (
                 ce_loss,
                 reference_tokens,
