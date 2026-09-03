@@ -323,6 +323,18 @@ def parallelize_model(
             output_dtype=dtype,
             cast_forward_inputs=True,
         )
+        initialize_dense_cpu = materialize_meta and context.device.type == "cpu"
+        if initialize_dense_cpu:
+            # CPU DTensor does not implement distributed random initialization.
+            # Initialize ordinary tensors first, then shard the same rank-zero
+            # state on every rank. CUDA keeps shard-first initialization below
+            # so a full model is never temporarily allocated on each GPU.
+            model.to_empty(device=context.device)
+            model.init_weights()
+            if context.world_size > 1:
+                with torch.no_grad():
+                    for tensor in (*model.parameters(), *model.buffers()):
+                        dist.broadcast(tensor, src=0)
         for module in model.modules():
             if isinstance(module, (EncoderLayer, DecoderLayer)):
                 fully_shard(
@@ -335,7 +347,7 @@ def parallelize_model(
             reshard_after_forward=reshard_after_forward,
             mp_policy=policy,
         )
-        if materialize_meta:
+        if materialize_meta and not initialize_dense_cpu:
             model.to_empty(device=context.device)
             model.init_weights()
         # FSDP2 installs all-gather/reshard hooks on ``forward`` by default.

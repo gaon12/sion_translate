@@ -3049,6 +3049,48 @@ def test_fsdp2_registers_custom_generation_forward_methods(monkeypatch) -> None:
     ]
 
 
+@pytest.mark.parametrize("device_type", ["cpu", "cuda"])
+def test_fsdp2_meta_initialization_order_preserves_gpu_memory_safety(
+    monkeypatch, device_type: str
+) -> None:
+    events: list[str] = []
+
+    class Model(torch.nn.Module):
+        def to_empty(self, **_kwargs):
+            events.append("materialize")
+            return self
+
+        def init_weights(self):
+            events.append("initialize")
+
+    def shard(_model, **_kwargs):
+        events.append("shard")
+
+    def api():
+        return lambda **_kwargs: object(), shard, lambda *_args: None
+
+    monkeypatch.setattr(distributed_module, "_load_fsdp2_api", api)
+    context = DistributedContext(0, 0, 1, torch.device(device_type), True, "gloo")
+    parallelize_model(
+        Model(),
+        context,
+        strategy="fsdp2",
+        precision="fp32",
+        reshard_after_forward=True,
+        materialize_meta=True,
+    )
+    expected = (
+        ["materialize", "initialize", "shard"]
+        if device_type == "cpu"
+        else [
+            "shard",
+            "materialize",
+            "initialize",
+        ]
+    )
+    assert events == expected
+
+
 def test_fsdp2_cpu_gloo_forward_generate_and_sample_smoke(tmp_path: Path) -> None:
     if not torch.distributed.is_available() or not torch.distributed.is_gloo_available():
         pytest.skip("CPU FSDP2 smoke test requires torch.distributed with Gloo")
@@ -3102,6 +3144,15 @@ def test_fsdp2_cpu_gloo_forward_generate_and_sample_smoke(tmp_path: Path) -> Non
             distributed=True,
             backend="gloo",
         )
+        # CPU initialization must match the seeded dense reference, not rely on
+        # unsupported DTensor random operators during meta materialization.
+        torch.manual_seed(1729)
+        reference = SionForConditionalGeneration(model.config)
+        torch.manual_seed(1729)
+        reference.init_weights()
+        expected_state = {name: tensor.clone() for name, tensor in reference.state_dict().items()}
+        del reference
+        torch.manual_seed(1729)
         model = parallelize_model(
             model,
             context,
@@ -3111,6 +3162,11 @@ def test_fsdp2_cpu_gloo_forward_generate_and_sample_smoke(tmp_path: Path) -> Non
             reshard_after_forward=True,
             materialize_meta=True,
         )
+        from torch.distributed.tensor import DTensor
+
+        for name, value in model.state_dict().items():
+            actual = value.full_tensor() if isinstance(value, DTensor) else value
+            torch.testing.assert_close(actual, expected_state[name], rtol=0, atol=0)
         assert all(torch.isfinite(parameter).all() for parameter in model.parameters())
         assert torch.count_nonzero(model.morph_gates) == 0
         assert torch.count_nonzero(model.evidence_repair.repair_scale) == 0
