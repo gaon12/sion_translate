@@ -24,6 +24,9 @@ from .layers import DecoderLayer, EncoderLayer, GQAAttention, RMSNorm, RotaryEmb
 
 
 _activation_checkpoint = cast(Callable[..., torch.Tensor], checkpoint)
+_refinement_checkpoint = cast(
+    Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor]], checkpoint
+)
 _KeyValue = tuple[torch.Tensor, torch.Tensor]
 _MAX_REASONING_LEVEL = 9
 
@@ -762,13 +765,10 @@ class SionForConditionalGeneration(nn.Module):
 
         for _ in range(steps):
             if self.training and torch.is_grad_enabled():
-                refined = cast(
-                    tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-                    checkpoint(
-                        refinement_step,
-                        hidden,
-                        use_reentrant=False,
-                    ),
+                refined = _refinement_checkpoint(
+                    refinement_step,
+                    hidden,
+                    use_reentrant=False,
                 )
             else:
                 refined = self._candidate_refinement_step(hidden, labels)
