@@ -488,9 +488,9 @@ def build_app(data: Path, target: str):
     smoke._validate_modal_client_version()
     image = (
         smoke.image.add_local_file(
-            str(Path(__file__)), str(REMOTE / "scripts/modal_training_probe.py"), copy=True
+            str(Path(__file__)), (REMOTE / "scripts/modal_training_probe.py").as_posix(), copy=True
         )
-        .add_local_dir(str(data), str(REMOTE / "probe"), copy=True)
+        .add_local_dir(str(data), (REMOTE / "probe").as_posix(), copy=True)
         .env({"PYTHONPATH": "/opt/sion/src:/opt/sion/scripts"})
     )
     app = modal.App("sion-real-data-training-probe", include_source=False)
@@ -618,7 +618,12 @@ def submit(args):
         # Canonical registration makes Modal import this module remotely instead
         # of serializing a __main__ closure with a client-side filesystem path.
         canonical = importlib.import_module("modal_training_probe")
-        app, function = canonical.build_app(data, args.target)
+        try:
+            app, function = canonical.build_app(data, args.target)
+        except Exception as error:
+            receipt.update(state="failed", phase="local_app_definition", error=repr(error))
+            write_json(receipt_path, receipt)
+            raise
         with modal.enable_output(), app.run(detach=True):
             receipt["app_id"] = app.app_id
             write_json(receipt_path, receipt)

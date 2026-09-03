@@ -18,6 +18,13 @@ from sion_translate.auto import EnvironmentInfo
 from sion_translate.config import config_from_raw, load_raw_config
 
 
+def test_modal_app_definition_is_valid_without_submitting(tmp_path):
+    pytest.importorskip("modal")
+    app, function = probe.build_app(tmp_path, "a100-80gb")
+    assert app.name == "sion-real-data-training-probe"
+    assert function is not None
+
+
 def _plan(tmp_path: Path):
     asset = tmp_path / "tokenizer" / "sion.model"
     asset.parent.mkdir()
