@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 from copy import deepcopy
 from datetime import timedelta
 from functools import partial
 import hashlib
 import json
 import multiprocessing
+from multiprocessing.synchronize import Event
 import os
 import random
 from pathlib import Path
@@ -76,6 +78,173 @@ def _components() -> tuple[
     scheduler = cosine_scheduler(optimizer, warmup_steps=1, max_steps=10, min_ratio=0.1)
     context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
     return model, optimizer, scheduler, context
+
+
+@pytest.fixture
+def local_gloo_group(tmp_path: Path) -> Iterator[None]:
+    """Exercise real distributed payload I/O without altering metadata preflights."""
+    if not torch.distributed.is_available() or not torch.distributed.is_gloo_available():
+        pytest.skip("distributed checkpoint test requires Gloo")
+    assert not torch.distributed.is_initialized()
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=(tmp_path / "local-dcp-rendezvous").resolve().as_uri(),
+        rank=0,
+        world_size=1,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        yield
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+def _save_test_dcp(state: dict[str, object], *, checkpoint_id: Path) -> None:
+    """Create real DCP fixtures through its public single-process storage protocol."""
+    from torch.distributed.checkpoint.default_planner import DefaultSavePlanner
+    from torch.distributed.checkpoint.filesystem import FileSystemWriter
+
+    writer = FileSystemWriter(checkpoint_id)
+    planner = DefaultSavePlanner()
+    planner.set_up_planner(state, storage_meta=writer.storage_meta(), is_coordinator=True)
+    writer.set_up_storage_writer(is_coordinator=True)
+    local_plan = writer.prepare_local_plan(planner.create_local_plan())
+    plans, metadata = planner.create_global_plan([local_plan])
+    plans = writer.prepare_global_plan(plans)
+    final_plan = planner.finish_plan(plans[0])
+    writes = writer.write_data(final_plan, planner)
+    writes.wait()
+    writer.finish(metadata, [writes.value()])
+
+
+def _local_dcp_probe_worker(
+    rank: int, rendezvous_uri: str, checkpoint_text: str, completed: Event
+) -> None:
+    """Rank one waits outside PyTorch while rank zero inspects a checkpoint."""
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=rendezvous_uri,
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=10),
+    )
+    try:
+        if rank == 0:
+            probe = {"identity": {"languages": [{"code": None}]}, "step": 0}
+            checkpoint_module._load_dcp_metadata(probe, checkpoint_id=Path(checkpoint_text))
+            assert probe == {"identity": {"languages": [{"code": "de"}]}, "step": 11}
+            completed.set()
+        else:
+            assert completed.wait(15), "rank-local metadata read tried to communicate"
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+def test_local_dcp_metadata_does_not_require_collectives_from_other_ranks(
+    tmp_path: Path,
+) -> None:
+    if not torch.distributed.is_available() or not torch.distributed.is_gloo_available():
+        pytest.skip("distributed checkpoint test requires Gloo")
+    checkpoint = tmp_path / "local-probe"
+    _save_test_dcp(
+        {"identity": {"languages": [{"code": "de"}]}, "step": 11},
+        checkpoint_id=checkpoint,
+    )
+    process_context = multiprocessing.get_context("spawn")
+    completed = process_context.Event()
+    processes = [
+        process_context.Process(
+            target=_local_dcp_probe_worker,
+            args=(
+                rank,
+                (tmp_path / "local-probe-rendezvous").resolve().as_uri(),
+                str(checkpoint),
+                completed,
+            ),
+        )
+        for rank in range(2)
+    ]
+    try:
+        for process in processes:
+            process.start()
+        deadline = time.monotonic() + 35
+        for process in processes:
+            process.join(max(0, deadline - time.monotonic()))
+        assert not any(process.is_alive() for process in processes), "local probe hung"
+        assert [process.exitcode for process in processes] == [0, 0]
+        assert completed.is_set()
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(5)
+
+
+@pytest.mark.parametrize("failure", ["missing-key", "corrupt-shard", "tensor"])
+def test_local_dcp_metadata_preserves_strict_validation_and_storage_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    import torch.distributed.checkpoint as dcp
+
+    checkpoint = tmp_path / "invalid-local-probe"
+    _save_test_dcp({"step": 11, "weight": torch.ones(2)}, checkpoint_id=checkpoint)
+    target = torch.zeros(2)
+    probe = {"absent": 0} if failure == "missing-key" else {"step": 0}
+    if failure == "tensor":
+        probe = {"weight": target}
+    if failure == "corrupt-shard":
+        for shard in checkpoint.glob("*.distcp"):
+            shard.write_bytes(b"corrupt checkpoint bytes")
+
+    def reject_distributed_call(*args, **kwargs):
+        pytest.fail("local metadata reads must not use distributed APIs")
+
+    for name in ("load", "save"):
+        monkeypatch.setattr(dcp, name, reject_distributed_call)
+    for name in ("init_process_group", "all_gather_object", "broadcast_object_list", "barrier"):
+        monkeypatch.setattr(torch.distributed, name, reject_distributed_call)
+
+    with pytest.raises(checkpoint_module._LocalDcpReadError) as captured:
+        checkpoint_module._load_dcp_metadata(probe, checkpoint_id=checkpoint)
+    cause = captured.value.__cause__
+    assert cause is not None
+    if failure == "missing-key":
+        assert "Missing key" in str(cause)
+    elif failure == "tensor":
+        assert "cannot load tensors" in str(cause)
+    torch.testing.assert_close(target, torch.zeros(2))
+
+
+def test_dcp_preflight_normalizes_a_rank_local_reader_failure(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "corrupt-preflight"
+    _save_test_dcp({"step": 11}, checkpoint_id=checkpoint)
+    for shard in checkpoint.glob("*.distcp"):
+        shard.write_bytes(b"corrupt scalar payload")
+    with pytest.raises(ValueError, match="identity/step could not be preflighted") as captured:
+        checkpoint_module._preflight_dcp_identity(checkpoint, None)
+    assert isinstance(captured.value.__cause__, checkpoint_module._LocalDcpReadError)
+
+
+def test_local_dcp_metadata_waits_for_and_propagates_reader_future_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from torch.distributed.checkpoint.filesystem import FileSystemReader
+
+    checkpoint = tmp_path / "failed-read-future"
+    _save_test_dcp({"step": 11}, checkpoint_id=checkpoint)
+    failure = RuntimeError("injected storage read future failure")
+
+    def fail_read_data(*args, **kwargs):
+        future = torch.futures.Future()
+        future.set_exception(failure)
+        return future
+
+    monkeypatch.setattr(FileSystemReader, "read_data", fail_read_data)
+    probe = {"step": 0}
+    with pytest.raises(checkpoint_module._LocalDcpReadError) as captured:
+        checkpoint_module._load_dcp_metadata(probe, checkpoint_id=checkpoint)
+    assert captured.value.__cause__ is failure
+    assert probe == {"step": 0}
 
 
 def _distributed_save_heartbeat_worker(
@@ -460,13 +629,13 @@ def test_dcp_preflight_round_trips_the_full_training_identity(tmp_path: Path) ->
         },
     )
     checkpoint = tmp_path / "dcp-full-identity"
-    dcp.save({"identity": identity, "step": 13}, checkpoint_id=checkpoint)
+    _save_test_dcp({"identity": identity, "step": 13}, checkpoint_id=checkpoint)
 
     assert checkpoint_module._preflight_dcp_identity(checkpoint, identity) == 13
     checkpoint_module._preflight_dcp_stage_transfer(checkpoint, identity)
     metadata = dcp.FileSystemReader(checkpoint).read_metadata()
     probe = checkpoint_module._dcp_identity_probe(metadata)
-    dcp.load(probe, checkpoint_id=checkpoint)
+    checkpoint_module._load_dcp_metadata(probe, checkpoint_id=checkpoint)
     checkpoint_module._restore_expected_empty_mappings(probe["identity"], identity)
 
     assert probe == {"identity": identity}
@@ -478,9 +647,7 @@ def _write_test_dcp_generation(
     *,
     marker_step: int,
 ) -> None:
-    import torch.distributed.checkpoint as dcp
-
-    dcp.save(state, checkpoint_id=checkpoint)
+    _save_test_dcp(state, checkpoint_id=checkpoint)
     _seal_test_dcp(checkpoint, step=marker_step)
 
 
@@ -572,6 +739,7 @@ def test_dcp_resume_rejects_a_non_integer_step_before_model_mutation(tmp_path: P
     ],
     ids=("legacy-without-release-attestation", "versioned-release-attestation"),
 )
+@pytest.mark.usefixtures("local_gloo_group")
 def test_dcp_resume_restores_optional_best_generation_binding_fields(
     tmp_path: Path,
     release_fields: dict[str, object],
@@ -660,14 +828,19 @@ def test_dcp_stage_transfer_rejects_a_non_integer_step_before_model_mutation(
     )
     before = _clone_model_state(target)
     context = DistributedContext(0, 0, 1, torch.device("cpu"), True, "gloo")
-    real_load = dcp.load
-    preflight_no_dist: list[bool] = []
+    real_load = checkpoint_module._load_dcp_metadata
+    preflight_calls = 0
 
     def record_preflight_load(*args, **kwargs):
-        preflight_no_dist.append(bool(kwargs.get("no_dist")))
+        nonlocal preflight_calls
+        preflight_calls += 1
         return real_load(*args, **kwargs)
 
-    monkeypatch.setattr(dcp, "load", record_preflight_load)
+    def reject_collective_load(*args, **kwargs):
+        pytest.fail("metadata preflight must not call the distributed loader")
+
+    monkeypatch.setattr(checkpoint_module, "_load_dcp_metadata", record_preflight_load)
+    monkeypatch.setattr(dcp, "load", reject_collective_load)
 
     with pytest.raises(ValueError, match="stage-transfer checkpoint step must be an integer"):
         initialize_model_from_checkpoint(
@@ -677,7 +850,7 @@ def test_dcp_stage_transfer_rejects_a_non_integer_step_before_model_mutation(
             expected_identity=identity,
         )
 
-    assert preflight_no_dist == [True]
+    assert preflight_calls == 1
     _assert_model_state_unchanged(target, before)
 
 
@@ -707,18 +880,23 @@ def test_dcp_resume_normalizes_a_second_load_checkpoint_exception(
         marker_step=5,
     )
     before = _clone_model_state(target)
-    real_load = dcp.load
+    real_load = checkpoint_module._load_dcp_metadata
     load_calls = 0
+
+    def record_local_load(*args, **kwargs):
+        nonlocal load_calls
+        load_calls += 1
+        assert load_calls == 1
+        return real_load(*args, **kwargs)
 
     def fail_second_load(*args, **kwargs):
         nonlocal load_calls
         load_calls += 1
-        if load_calls == 1:
-            assert kwargs.get("no_dist") is True
-            return real_load(*args, **kwargs)
+        assert load_calls == 2
         assert kwargs.get("no_dist", False) is False
         raise dcp.CheckpointException("injected second-load failure", {})
 
+    monkeypatch.setattr(checkpoint_module, "_load_dcp_metadata", record_local_load)
     monkeypatch.setattr(dcp, "load", fail_second_load)
     context = DistributedContext(0, 0, 1, torch.device("cpu"), True, "gloo")
 
@@ -806,12 +984,12 @@ def test_dcp_identity_probe_preserves_integer_list_paths(tmp_path: Path) -> None
         }
     }
     checkpoint = tmp_path / "dcp-list-identity"
-    dcp.save(state, checkpoint_id=checkpoint)
+    _save_test_dcp(state, checkpoint_id=checkpoint)
     metadata = dcp.FileSystemReader(checkpoint).read_metadata()
 
     probe = checkpoint_module._dcp_identity_probe(metadata)
     assert isinstance(probe["identity"]["languages"], list)
-    dcp.load(probe, checkpoint_id=checkpoint)
+    checkpoint_module._load_dcp_metadata(probe, checkpoint_id=checkpoint)
 
     assert probe == state
 
@@ -1587,9 +1765,7 @@ def test_checkpoint_discovery_includes_a_retained_local_previous_generation(
 
 
 def _write_markerless_scalar_dcp(path: Path, *, step: int) -> None:
-    import torch.distributed.checkpoint as dcp
-
-    dcp.save({"step": step}, checkpoint_id=path)
+    _save_test_dcp({"step": step}, checkpoint_id=path)
     torch.save(
         {
             "schema": CHECKPOINT_SCHEMA,
@@ -2188,10 +2364,8 @@ def test_verified_checkpoint_lease_covers_repeated_public_preflight(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import torch.distributed.checkpoint as dcp
-
     checkpoint = tmp_path / "leased-preflight"
-    dcp.save({"step": 15}, checkpoint_id=checkpoint)
+    _save_test_dcp({"step": 15}, checkpoint_id=checkpoint)
     _seal_test_dcp(checkpoint, step=15)
     marker = checkpoint / checkpoint_module.DCP_COMPLETION_FILENAME
     marker_digest = hashlib.sha256(marker.read_bytes()).hexdigest()
@@ -2653,9 +2827,13 @@ def test_stage_transfer_loads_weights_without_optimizer_or_step(tmp_path: Path) 
     checkpoint = tmp_path / "foundation"
     with torch.no_grad():
         model.token_embedding.weight.fill_(0.5)
-    trained = model.token_embedding.weight.detach().clone()
     for _ in range(5):
+        optimizer.zero_grad(set_to_none=True)
+        model.token_embedding.weight.square().mean().backward()
+        optimizer.step()
         scheduler.step()
+    trained = model.token_embedding.weight.detach().clone()
+    assert optimizer.state
     save_checkpoint(checkpoint, model, optimizer, scheduler, 4200, context)
 
     fresh, fresh_optimizer, fresh_scheduler, _ = _components()
@@ -2822,11 +3000,10 @@ def test_stage_transfer_validates_all_ema_tensors_before_copying_any(
         torch.testing.assert_close(tensor, before[name])
 
 
+@pytest.mark.usefixtures("local_gloo_group")
 def test_distributed_stage_transfer_selects_the_checkpoint_ema_weights(
     tmp_path: Path,
 ) -> None:
-    import torch.distributed.checkpoint as dcp
-
     model, _, _, _ = _components()
     with torch.no_grad():
         model.token_embedding.weight.fill_(1.0)
@@ -2834,7 +3011,7 @@ def test_distributed_stage_transfer_selects_the_checkpoint_ema_weights(
     with torch.no_grad():
         ema.shadow["token_embedding.weight"].fill_(2.0)
     checkpoint = tmp_path / "foundation-dcp"
-    dcp.save(
+    _save_test_dcp(
         {
             "model": model.state_dict(),
             "step": 9,
@@ -2858,8 +3035,6 @@ def test_distributed_stage_transfer_preflights_ema_metadata(
     tmp_path: Path,
     tamper: str,
 ) -> None:
-    import torch.distributed.checkpoint as dcp
-
     model, _, _, _ = _components()
     ema = EMAWeights(model, decay=0.9)
     ema_state = ema.state_dict()
@@ -2869,7 +3044,7 @@ def test_distributed_stage_transfer_preflights_ema_metadata(
     else:
         ema_state["injected.unexpected"] = torch.tensor([3.0])
     checkpoint = tmp_path / f"foundation-dcp-{tamper}"
-    dcp.save(
+    _save_test_dcp(
         {
             "model": model.state_dict(),
             "step": 9,

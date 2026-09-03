@@ -1050,6 +1050,47 @@ def _dcp_identity_probe(metadata: Any) -> dict[str, Any]:
     return _dcp_mapping_probe(metadata, "identity")
 
 
+class _LocalDcpReadError(RuntimeError):
+    """A rank-local metadata read failed before live state was touched."""
+
+
+def _load_dcp_metadata(state_dict: dict[str, Any], *, checkpoint_id: Path) -> None:
+    """Load scalar/nested metadata with the public, noncollective DCP protocol.
+
+    Preflight may run on one rank while its peers are doing unrelated work.
+    It must never use a process group. The high-level DCP loader warns even
+    when explicitly passed ``no_dist=True``; its public storage and planner
+    interfaces express this intentionally local operation directly instead.
+    Keep the default planner's strict missing-key checks and reject tensor
+    requests so this helper cannot become an accidental unsharded model load.
+    """
+
+    from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
+    from torch.distributed.checkpoint.filesystem import FileSystemReader
+    from torch.distributed.checkpoint.planner import LoadItemType
+
+    try:
+        reader = FileSystemReader(checkpoint_id)
+        metadata = reader.read_metadata()
+        planner = DefaultLoadPlanner(allow_partial_load=False)
+        planner.set_up_planner(  # pyright: ignore[reportUnknownMemberType]
+            state_dict, metadata, is_coordinator=True
+        )
+        reader.set_up_storage_reader(metadata, is_coordinator=True)
+        local_plan = reader.prepare_local_plan(planner.create_local_plan())
+        if any(item.type != LoadItemType.BYTE_IO for item in local_plan.items):
+            raise ValueError("rank-local checkpoint inspection cannot load tensors")
+        plans = reader.prepare_global_plan(planner.create_global_plan([local_plan]))
+        if len(plans) != 1:
+            raise ValueError("rank-local checkpoint inspection requires exactly one plan")
+        final_plan = planner.finish_plan(plans[0])
+        reader.read_data(final_plan, planner).wait()
+    except Exception as error:
+        raise _LocalDcpReadError(
+            f"rank-local checkpoint metadata could not be loaded: {checkpoint_id}"
+        ) from error
+
+
 def _restore_expected_empty_mappings(
     actual: dict[str, Any],
     expected: Mapping[str, Any],
@@ -1090,12 +1131,11 @@ def _preflight_dcp_identity(
         raise ValueError("distributed checkpoint is missing step metadata")
     probe["step"] = 0
     try:
-        dcp.load(  # pyright: ignore[reportUnknownMemberType, reportPrivateImportUsage]
+        _load_dcp_metadata(
             probe,
             checkpoint_id=path,
-            no_dist=True,
         )
-    except dcp.CheckpointException as error:  # pyright: ignore[reportPrivateImportUsage]
+    except (_LocalDcpReadError, dcp.CheckpointException) as error:  # pyright: ignore[reportPrivateImportUsage]
         raise ValueError(
             f"distributed checkpoint identity/step could not be preflighted: {path}"
         ) from error
@@ -1133,12 +1173,11 @@ def _preflight_dcp_stage_transfer(
         raise ValueError("distributed stage-transfer checkpoint is missing step metadata")
     probe["step"] = 0
     try:
-        dcp.load(  # pyright: ignore[reportUnknownMemberType, reportPrivateImportUsage]
+        _load_dcp_metadata(
             probe,
             checkpoint_id=path,
-            no_dist=True,
         )
-    except dcp.CheckpointException as error:  # pyright: ignore[reportPrivateImportUsage]
+    except (_LocalDcpReadError, dcp.CheckpointException) as error:  # pyright: ignore[reportPrivateImportUsage]
         raise ValueError(
             f"distributed stage-transfer identity/step could not be preflighted: {path}"
         ) from error
@@ -1208,12 +1247,11 @@ def inspect_checkpoint_identity(
             ) from error
         probe = _dcp_identity_probe(metadata)
         try:
-            dcp.load(  # pyright: ignore[reportUnknownMemberType, reportPrivateImportUsage]
+            _load_dcp_metadata(
                 probe,
                 checkpoint_id=source,
-                no_dist=True,
             )
-        except dcp.CheckpointException as error:  # pyright: ignore[reportPrivateImportUsage]
+        except (_LocalDcpReadError, dcp.CheckpointException) as error:  # pyright: ignore[reportPrivateImportUsage]
             raise ValueError(
                 f"distributed checkpoint identity could not be inspected: {source}"
             ) from error
@@ -1267,12 +1305,11 @@ def inspect_checkpoint_training_state(
         if not probe:
             return {}
         try:
-            dcp.load(  # pyright: ignore[reportUnknownMemberType, reportPrivateImportUsage]
+            _load_dcp_metadata(
                 probe,
                 checkpoint_id=source,
-                no_dist=True,
             )
-        except dcp.CheckpointException as error:  # pyright: ignore[reportPrivateImportUsage]
+        except (_LocalDcpReadError, dcp.CheckpointException) as error:  # pyright: ignore[reportPrivateImportUsage]
             raise ValueError(
                 f"distributed checkpoint training state could not be inspected: {source}"
             ) from error
