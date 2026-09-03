@@ -694,6 +694,12 @@ def status(args):
 
 
 def main():
+    # Modal's status output includes Unicode symbols. Korean Windows consoles
+    # may default to CP949, which cannot encode them even in redirected logs.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     launch = commands.add_parser("submit")
