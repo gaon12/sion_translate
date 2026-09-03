@@ -19,17 +19,29 @@ from pathlib import Path
 import re
 import secrets
 import subprocess
+import sys
 import tempfile
 from typing import Any, cast, Generator, Sequence
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 SMOKE_SCRIPT = REPOSITORY_ROOT / "scripts" / "modal_gpu_smoke.py"
-SMOKE_SPEC = importlib.util.spec_from_file_location("sion_modal_gpu_smoke", SMOKE_SCRIPT)
+SMOKE_SPEC = importlib.util.spec_from_file_location("modal_gpu_smoke", SMOKE_SCRIPT)
 if SMOKE_SPEC is None or SMOKE_SPEC.loader is None:  # pragma: no cover - import invariant
     raise RuntimeError(f"cannot load the Modal GPU smoke module: {SMOKE_SCRIPT}")
 SMOKE: Any = importlib.util.module_from_spec(SMOKE_SPEC)
-SMOKE_SPEC.loader.exec_module(SMOKE)
+# Modal inspects the registered module to mount the entrypoint by filename.
+# An unregistered dynamic module instead becomes a serialized closure.
+_previous_smoke_module = sys.modules.get(SMOKE_SPEC.name)
+sys.modules[SMOKE_SPEC.name] = SMOKE
+try:
+    SMOKE_SPEC.loader.exec_module(SMOKE)
+except BaseException:
+    if _previous_smoke_module is None:
+        sys.modules.pop(SMOKE_SPEC.name, None)
+    else:
+        sys.modules[SMOKE_SPEC.name] = _previous_smoke_module
+    raise
 
 try:
     import modal
@@ -42,7 +54,7 @@ DEFAULT_RECEIPT_ROOT = REPOSITORY_ROOT / "artifacts" / "modal-runs"
 MAX_REMOTE_JSON_BYTES = 8 * 1024 * 1024
 MAX_LOG_ENTRIES = 200
 MAX_LOG_BYTES = 2 * 1024 * 1024
-MAX_WORKSPACE_BUDGET_HEADROOM_USD = 5.0
+MAX_WORKSPACE_BUDGET_HEADROOM_USD = 30.0
 SUBMISSION_LOCK_NAME = ".submission-lock"
 RECEIPT_FIELDS = {
     "receipt_version",
@@ -378,7 +390,7 @@ def _validate_workspace_budget_guard(
         )
     if headroom > MAX_WORKSPACE_BUDGET_HEADROOM_USD + 1e-9:
         raise ValueError(
-            "Workspace budget headroom exceeds the $5 safety ceiling; lower the hard "
+            "Workspace budget headroom exceeds the $30 safety ceiling; lower the hard "
             "Workspace budget before submitting"
         )
     return headroom

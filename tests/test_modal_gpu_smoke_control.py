@@ -4,6 +4,7 @@ from contextlib import AbstractContextManager
 from datetime import UTC, datetime
 import importlib.util
 import json
+import inspect
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -20,6 +21,20 @@ SPEC.loader.exec_module(MODULE)
 RUN_ID = "smoke-20260901t120000z-0123456789abcdef"
 CALL_ID = "fc-0123456789abcdef"
 CONTRACT_SHA256 = "a" * 64
+
+
+def test_smoke_entrypoint_has_a_registered_file_module() -> None:
+    function = MODULE.SMOKE.smoke_a100_40gb.get_raw_f()
+    assert inspect.getmodule(function) is MODULE.SMOKE
+    from modal._utils.function_utils import FunctionInfo
+
+    info = FunctionInfo(function)
+    assert not info.is_serialized()
+    assert info.module_name == "modal_gpu_smoke"
+
+
+def test_workspace_guard_accepts_authorized_thirty_dollar_budget() -> None:
+    assert MODULE._validate_workspace_budget_guard("a100-40gb", 1.0, 30.0, 0.0) == 30.0
 
 
 def _identity_remote_result(_target: str, value: object) -> object:
@@ -283,7 +298,7 @@ def test_existing_submission_lock_fails_closed_before_spawn(
     ("workspace_budget", "workspace_usage", "message"),
     (
         (1.5, 1.0, "does not cover"),
-        (8.0, 1.0, r"exceeds the \$5"),
+        (32.0, 1.0, r"exceeds the \$30"),
         (float("nan"), 0.0, "finite non-negative"),
         (True, 0.0, "finite non-negative"),
     ),
