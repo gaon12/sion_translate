@@ -26,6 +26,7 @@ SECOND_UPLOAD_ID = "bundle-20260901t120001z-fedcba9876543210"
 CALL_ID = "fc-0123456789abcdef"
 OTHER_CALL_ID = "fc-fedcba9876543210"
 SUBMISSION_CLAIM_ID = "claim-" + "c" * 32
+ORIGINAL_SUBMISSION_CLAIM_ID = "claim-" + "f" * 32
 VOLUME_NAME = "sion-prepared-bundles"
 GIT_COMMIT = "a" * 40
 GIT_TREE = "b" * 40
@@ -1481,6 +1482,7 @@ def _write_source_recovery_claim(
     size: int,
 ) -> tuple[dict[str, object], bytes, bytes]:
     source_runtime_contract = "d" * 64
+    source_created_at = "2026-09-02T11:11:54+00:00"
     source_operation = mount / "operations" / UPLOAD_ID
     source_operation.mkdir(parents=True)
     status = MODULE._operation_status(
@@ -1510,18 +1512,41 @@ def _write_source_recovery_claim(
     MODULE._write_json_atomic(source_operation / "failure.json", failure)
     status_bytes = (source_operation / "status.json").read_bytes()
     failure_bytes = (source_operation / "failure.json").read_bytes()
+    original_claim = MODULE._submission_claim_payload(
+        {
+            "upload_id": UPLOAD_ID,
+            "bundle_sha256": sha256,
+            "bundle_size": size,
+            "runtime_contract_sha256": source_runtime_contract,
+            "submission_claim_id": ORIGINAL_SUBMISSION_CLAIM_ID,
+            "created_at_utc": source_created_at,
+        }
+    )
+    original_claim_path = MODULE._mounted_path(
+        mount, MODULE._remote_submission_claim_path(UPLOAD_ID)
+    )
+    original_claim_path.parent.mkdir(parents=True)
+    MODULE._write_json_atomic(original_claim_path, original_claim)
+    original_claim_bytes = original_claim_path.read_bytes()
     claim = MODULE._source_recovery_claim_payload(
         source_upload_id=UPLOAD_ID,
         attempt_upload_id=SECOND_UPLOAD_ID,
         bundle_sha256=sha256,
         bundle_size=size,
         source_function_call_id=CALL_ID,
+        source_app_id="ap-0123456789abcdef",
         source_runtime_contract_sha256=source_runtime_contract,
         replacement_runtime_contract_sha256=RUNTIME_CONTRACT,
+        replacement_commit="7" * 40,
+        replacement_tree="8" * 40,
+        recovery_builder_sha256="9" * 64,
         source_status_sha256=hashlib.sha256(status_bytes).hexdigest(),
         source_failure_sha256=hashlib.sha256(failure_bytes).hexdigest(),
         source_receipt_sha256="1" * 64,
-        original_submission_claim_sha256="2" * 64,
+        original_submission_claim_sha256=hashlib.sha256(original_claim_bytes).hexdigest(),
+        original_submission_claim_id=ORIGINAL_SUBMISSION_CLAIM_ID,
+        original_submission_runtime_contract_sha256=source_runtime_contract,
+        source_receipt_created_at_utc=source_created_at,
         recovery_claim_id=SUBMISSION_CLAIM_ID,
     )
     claim_path = MODULE._mounted_path(mount, cast(str, claim["remote_recovery_claim_path"]))
@@ -2485,7 +2510,7 @@ def test_finalizer_runtime_is_cpu_only_and_uses_posix_remote_paths() -> None:
         "--require-hashes --only-binary=:all: --no-cache-dir",
     )
     assert app.image.environment == {
-        "PYTHONPATH": "/opt/sion-bundle-stage/src",
+        "PYTHONPATH": "/opt/sion-bundle-stage/src:/opt/sion-bundle-stage/scripts",
         "PYTHONUNBUFFERED": "1",
     }
     remote_copy_paths = [path for _local, path in app.image.local_directories]
@@ -2508,7 +2533,13 @@ def test_finalizer_runtime_is_cpu_only_and_uses_posix_remote_paths() -> None:
     assert options["max_containers"] == 1
     assert options["single_use_containers"] is True
     assert options["serialized"] is True
+    assert options["include_source"] is True
     assert "gpu" not in options
+
+    recovery_app, _recovery_finalizer = MODULE.build_source_recovery_runtime(fake_modal, volume)
+    recovery_options = recovery_app.function_options
+    assert recovery_options is not None
+    assert recovery_options["include_source"] is False
 
 
 def test_executed_finalizer_must_match_reviewed_image_copy(tmp_path: Path) -> None:
