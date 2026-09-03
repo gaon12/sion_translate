@@ -33,6 +33,15 @@ def test_headroom_cases_keep_all_stages_and_explicit_candidate_batching():
     assert probe.compute_contingency("h100") < 4
 
 
+def test_profiler_preserves_events_under_strict_warnings():
+    import torch
+
+    with probe.make_profiler(torch, cuda=False) as profiler:
+        torch.ones(4).sum()
+    assert profiler.acc_events is True
+    assert any(event.key == "aten::sum" for event in profiler.key_averages())
+
+
 def _plan(tmp_path: Path):
     asset = tmp_path / "tokenizer" / "sion.model"
     asset.parent.mkdir()

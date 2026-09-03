@@ -114,6 +114,15 @@ def batch_at_fraction(items: list[dict[str, Any]], batch_size: int, fraction: fl
     return ordered[start : start + batch_size]
 
 
+def make_profiler(torch_module, *, cuda: bool):
+    activities = [torch_module.profiler.ProfilerActivity.CPU]
+    if cuda:
+        activities.append(torch_module.profiler.ProfilerActivity.CUDA)
+    # Preserve every event explicitly instead of relying on cycle-clearing
+    # defaults, which warn under the strict GPU runtime's PyTorch version.
+    return torch_module.profiler.profile(activities=activities, acc_events=True)
+
+
 def summarize_measurements(
     samples: list[dict[str, Any]], optimizer_seconds: float, batch_size: int, effective_batch: int
 ) -> dict[str, float | int]:
@@ -380,12 +389,11 @@ def run_case(
         import shutil
 
         shutil.rmtree(checkpoint)
+        write_json(output, report)
     if batch_size == 24 and stage_name != "mrt":
         # Profile one warmed update outside the throughput window. Report actual
         # kernel dispatch instead of inferring the attention backend from VRAM.
-        with torch.profiler.profile(
-            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
-        ) as profiler:
+        with make_profiler(torch, cuda=True) as profiler:
             profiled = micro(batch_at_fraction(cohort["representative"], batch_size, 0.5))
             update(profiled["normalizer"])
         events = profiler.key_averages()
