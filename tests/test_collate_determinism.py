@@ -105,6 +105,7 @@ def test_augmentation_is_independent_of_global_rng_order_and_workers() -> None:
         items,
         batch_size=1,
         num_workers=2,
+        multiprocessing_context="spawn",
         persistent_workers=True,
         collate_fn=worker_collator,
     )
