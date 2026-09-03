@@ -219,7 +219,7 @@ def _wheel_identity(wheel: Path) -> dict[str, Any]:
         ]
         if len(metadata_paths) != 1:
             raise ValueError("wheel must have exactly one distribution metadata file")
-        metadata = archive.read(metadata_paths[0]).decode("utf-8")
+        metadata = archive.read(metadata_paths[0]).decode("utf-8").replace("\r\n", "\n")
         if not re.search(r"^Name: sentencepiece$", metadata, re.MULTILINE) or not re.search(
             r"^Version: 0\.2\.1$", metadata, re.MULTILINE
         ):

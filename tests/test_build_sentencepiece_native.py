@@ -31,13 +31,19 @@ def test_windows_ci_selects_a_compatible_compiler_and_preserves_source_bytes() -
 
 
 def _make_wheel(
-    path: Path, *, proxy: bytes = GENERATED_PROXY.encode(), version: str = "0.2.1"
+    path: Path,
+    *,
+    proxy: bytes = GENERATED_PROXY.encode(),
+    version: str = "0.2.1",
+    metadata_newline: str = "\n",
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     contents = {
         "sentencepiece/__init__.py": proxy,
         "sentencepiece/_sentencepiece.cpython-test.so": b"test native extension bytes",
-        f"sentencepiece-{version}.dist-info/METADATA": f"Name: sentencepiece\nVersion: {version}\n".encode(),
+        f"sentencepiece-{version}.dist-info/METADATA": (
+            f"Name: sentencepiece{metadata_newline}Version: {version}{metadata_newline}".encode()
+        ),
     }
     record_name = f"sentencepiece-{version}.dist-info/RECORD"
     record = io.StringIO()
@@ -50,6 +56,12 @@ def _make_wheel(
         for name, payload in contents.items():
             archive.writestr(name, payload)
         archive.writestr(record_name, record.getvalue())
+
+
+def test_wheel_accepts_windows_metadata_line_endings(tmp_path: Path) -> None:
+    wheel = tmp_path / "sentencepiece-0.2.1-cp311-cp311-win_amd64.whl"
+    _make_wheel(wheel, metadata_newline="\r\n")
+    assert native._wheel_identity(wheel)["name"] == wheel.name
 
 
 @pytest.fixture
