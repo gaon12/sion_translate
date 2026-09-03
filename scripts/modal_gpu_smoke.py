@@ -18,6 +18,7 @@ from copy import deepcopy
 from datetime import UTC, datetime
 import hashlib
 import importlib.metadata
+import importlib.util
 import json
 import math
 import os
@@ -37,6 +38,11 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 REMOTE_ROOT = PurePosixPath("/opt/sion")
 LOCK_RELATIVE_PATH = Path("requirements/pylock.gpu-cp311-linux-x86_64-cu128.toml")
 UV_BOOTSTRAP_RELATIVE_PATH = Path("requirements/modal-bootstrap.txt")
+NATIVE_BUILD_RELATIVE_PATH = Path("scripts/build_sentencepiece_native.py")
+NATIVE_REQUIREMENTS_RELATIVE_PATH = Path("requirements/sentencepiece-native-build.txt")
+NATIVE_MANIFEST_PATH = REMOTE_ROOT / "native/manifest.json"
+NATIVE_CORE_COMMIT = "31646a467d2051eb904e0b45de3a73e91fe1c1e3"
+NATIVE_CORE_TREE = "a256eb7f5d3e634041fa11aa2cbb4b1de065359b"
 LOCK_SHA256 = "0820c94d97a424e7c051cec1e01bba452a038904ae0df4730849fdabe50f350f"
 FUNCTION_TIMEOUT_SECONDS = 300
 STARTUP_TIMEOUT_SECONDS = 180
@@ -240,6 +246,8 @@ def gpu_smoke_contract_sha256(root: Path) -> str:
     relative_paths = [
         LOCK_RELATIVE_PATH,
         UV_BOOTSTRAP_RELATIVE_PATH,
+        NATIVE_BUILD_RELATIVE_PATH,
+        NATIVE_REQUIREMENTS_RELATIVE_PATH,
         Path("scripts/modal_gpu_smoke.py"),
     ]
     source_root = resolved_root / "src"
@@ -533,6 +541,42 @@ def _is_finite_number(value: object) -> bool:
     )
 
 
+def _native_sentencepiece_report() -> dict[str, Any]:
+    """Verify the declared native overlay separately from the stock base lock."""
+    helper = Path(str(REMOTE_ROOT / NATIVE_BUILD_RELATIVE_PATH))
+    spec = importlib.util.spec_from_file_location("sion_native_binding_evidence", helper)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("the native SentencePiece verifier is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return _validate_native_sentencepiece_evidence(
+        module.verify_installed(Path(str(NATIVE_MANIFEST_PATH)))
+    )
+
+
+def _validate_native_sentencepiece_evidence(value: object) -> dict[str, Any]:
+    hash_fields = {
+        "wrapper_sha256",
+        "proxy_sha256",
+        "wheel_sha256",
+        "installed_extension_sha256",
+        "manifest_sha256",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != hash_fields | {"source_commit", "source_tree", "swig_version"}
+        or value.get("source_commit") != NATIVE_CORE_COMMIT
+        or value.get("source_tree") != NATIVE_CORE_TREE
+        or value.get("swig_version") != "4.4.0"
+        or any(
+            not isinstance(value.get(field), str) or SHA256_PATTERN.fullmatch(value[field]) is None
+            for field in hash_fields
+        )
+    ):
+        raise RuntimeError("Modal GPU smoke returned invalid native SentencePiece evidence")
+    return value
+
+
 def _runtime_report(torch_module) -> dict[str, Any]:
     observed_versions = {
         package: importlib.metadata.version(package) for package in EXPECTED_RUNTIME_VERSIONS
@@ -614,6 +658,7 @@ def _runtime_report(torch_module) -> dict[str, Any]:
         "nccl_version": list(nccl_version),
         "devices": devices,
         "lock_sha256": LOCK_SHA256,
+        "native_sentencepiece": _native_sentencepiece_report(),
     }
 
 
@@ -1551,10 +1596,12 @@ def _validate_runtime_evidence(target: str, value: object) -> dict[str, Any]:
         "nccl_version",
         "devices",
         "lock_sha256",
+        "native_sentencepiece",
     }
     if not isinstance(value, dict) or set(value) != required:
         raise RuntimeError("Modal GPU smoke returned an unexpected runtime schema")
     runtime = value
+    _validate_native_sentencepiece_evidence(runtime.get("native_sentencepiece"))
     if (
         _version_tuple(runtime.get("python"), components=3, label="Python version")[:2] != (3, 11)
         or runtime.get("python_implementation") != "CPython"
@@ -2012,6 +2059,17 @@ def _dispatch_modal_function(
 if modal is not None:
     image = (
         modal.Image.debian_slim(python_version="3.11")
+        .apt_install("build-essential", "git")
+        .add_local_file(
+            str(REPOSITORY_ROOT / NATIVE_BUILD_RELATIVE_PATH),
+            str(REMOTE_ROOT / NATIVE_BUILD_RELATIVE_PATH),
+            copy=True,
+        )
+        .add_local_file(
+            str(REPOSITORY_ROOT / NATIVE_REQUIREMENTS_RELATIVE_PATH),
+            str(REMOTE_ROOT / NATIVE_REQUIREMENTS_RELATIVE_PATH),
+            copy=True,
+        )
         .add_local_file(
             str(REPOSITORY_ROOT / UV_BOOTSTRAP_RELATIVE_PATH),
             str(REMOTE_ROOT / UV_BOOTSTRAP_RELATIVE_PATH),
@@ -2040,8 +2098,27 @@ if modal is not None:
             "uv pip sync --system --no-config "
             f"{REMOTE_ROOT / LOCK_RELATIVE_PATH} "
             "--require-hashes --strict --only-binary :all:",
+            "python -m venv /opt/sion-native-tools",
+            "/opt/sion-native-tools/bin/python -m pip install "
+            f"-r {REMOTE_ROOT / NATIVE_REQUIREMENTS_RELATIVE_PATH}",
+            "git clone --depth 1 --branch v0.2.1 "
+            "https://github.com/google/sentencepiece.git /opt/sion-native-source",
+            "PATH=/opt/sion-native-tools/bin:$PATH /opt/sion-native-tools/bin/python "
+            f"{REMOTE_ROOT / NATIVE_BUILD_RELATIVE_PATH} "
+            "--source /opt/sion-native-source --output /opt/sion/native --jobs 2",
+            "uv pip install --system --no-deps --reinstall /opt/sion/native/wheels/*.whl",
+            f"python {REMOTE_ROOT / NATIVE_BUILD_RELATIVE_PATH} verify-installed "
+            f"--manifest {NATIVE_MANIFEST_PATH}",
+            f"python {REMOTE_ROOT / NATIVE_BUILD_RELATIVE_PATH} verify "
+            f"--manifest {NATIVE_MANIFEST_PATH} --output /opt/sion/native-verification",
         )
-        .env({"PYTHONPATH": str(REMOTE_ROOT / "src"), "PYTHONUNBUFFERED": "1"})
+        .env(
+            {
+                "PYTHONPATH": str(REMOTE_ROOT / "src"),
+                "PYTHONUNBUFFERED": "1",
+                "PYTHONWARNINGS": "error",
+            }
+        )
     )
     app = modal.App(APP_NAME, image=image, include_source=False)
     result_volume = modal.Volume.from_name(RESULT_VOLUME_NAME, create_if_missing=True)

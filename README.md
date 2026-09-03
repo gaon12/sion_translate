@@ -48,6 +48,11 @@ The package version is `1.5.0`. Model release metadata uses the generation label
 - Enough local disk space for the raw data, tokenizer, indexed datasets, and final ZIP
 - Git when running directly from an editable source tree
 
+CI and the Modal smoke image rebuild SentencePiece 0.2.1 with SWIG 4.4.0 to fix
+native Python type warnings without changing the tokenizer core. A normal PyPI
+install still uses the stock binding. The separate, verified native build recipe
+and its provenance are described in [the GPU smoke guide](docs/MODAL_GPU_SMOKE.md#authenticated-environment).
+
 Run editable installs from a real Git clone and pass `--allow-local-checkout` to `easy_run.py`
 or `sion-train`. The flag is an explicit opt-in to a metadata-free development tree; never
 use it for an extracted GPU bundle. This prevents a damaged bundle from silently becoming

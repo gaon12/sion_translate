@@ -38,7 +38,8 @@ uses `app.run(detach=True)` instead, so a Codex or terminal disconnect does not
 stop the input while the ephemeral App still retains a finite crash-rate cutoff.
 Before submission, the controller also requires the user to record the current
 Workspace usage and hard budget. It accepts only enough remaining headroom for
-the selected target and refuses more than $5. These values are a recorded manual
+the selected target and refuses more than $30. This ceiling matches the user's
+explicit validation allowance; it is not a spending target. These values are a recorded manual
 attestation because Modal 1.5.3 does not expose the configured hard budget through
 the public client API. Confirm them in **Usage & Billing** immediately before the
 command.
@@ -76,9 +77,11 @@ they cover Ampere, Hopper, activation checkpointing, non-checkpointed execution,
 and FSDP2. The A100 80 GB target is an additional single-GPU capacity check and
 can wait for the next credit reset.
 
-First set the Modal Workspace usage budget to the displayed current-cycle usage
-plus no more than $5. The budget caps usage before credits are applied, so a $30
-credit balance does not require a $30 smoke-test allowance. Then submit one target
+First confirm the Modal Workspace usage budget and displayed current-cycle usage.
+Keep the remaining headroom within the explicitly authorized allowance, at most
+$30. A smaller hard budget is appropriate when the user requests one. The budget
+caps usage before credits are applied; a $30 credit balance is not a requirement
+to spend $30. Then submit one target
 with the durable controller. Replace the example budget and usage values with the
 numbers shown in the dashboard:
 
@@ -169,6 +172,16 @@ uv then synchronizes the complete PEP 751 GPU lock with required hashes, strict
 validation, and binary wheels only. Before CUDA work starts, the remote process
 checks the lock digest and the exact versions of Torch, CUDA, torchao, NumPy,
 SentencePiece, Transformers, cuDNN, and NCCL.
+
+SentencePiece is an explicitly declared exception to the stock wheel bytes:
+the image rebuilds the exact 0.2.1 core commit with SWIG 4.4.0 bindings. This
+fixes the native Python type warnings without upgrading the tokenizer core or
+filtering warnings. Build tools live in a separate virtual environment. The
+image preserves the build manifest, wheel, and fresh-interpreter verification
+logs under `/opt/sion/native` and `/opt/sion/native-verification`. Each GPU result
+records the source commit/tree and generated binding, installed extension,
+wheel, and manifest SHA-256 values separately from the base dependency lock.
+CI and the GPU runtime treat Python warnings as errors.
 
 The runtime rejects the wrong GPU count, family, compute capability, memory
 class, missing native BF16, an H200 substituted for the exact H100, and any

@@ -134,6 +134,21 @@ def _remote_result(target: str = "a100-40gb") -> dict[str, object]:
                 for index in range(int(MODULE.TARGETS[target]["gpu_count"]))
             ],
             "lock_sha256": MODULE.LOCK_SHA256,
+            "native_sentencepiece": {
+                "source_commit": MODULE.NATIVE_CORE_COMMIT,
+                "source_tree": MODULE.NATIVE_CORE_TREE,
+                "swig_version": "4.4.0",
+                **dict.fromkeys(
+                    (
+                        "wrapper_sha256",
+                        "proxy_sha256",
+                        "wheel_sha256",
+                        "installed_extension_sha256",
+                        "manifest_sha256",
+                    ),
+                    "a" * 64,
+                ),
+            },
         },
         "phases": phases,
         "elapsed_seconds": elapsed,
@@ -797,6 +812,12 @@ def test_gpu_smoke_contract_hashes_every_reviewed_runtime_byte(tmp_path: Path) -
     (tmp_path / MODULE.UV_BOOTSTRAP_RELATIVE_PATH).write_text("bootstrap\n", encoding="utf-8")
     (tmp_path / "scripts").mkdir()
     (tmp_path / "scripts" / "modal_gpu_smoke.py").write_text("print('smoke')\n", encoding="utf-8")
+    (tmp_path / MODULE.NATIVE_BUILD_RELATIVE_PATH).write_text(
+        "# native builder\n", encoding="utf-8"
+    )
+    (tmp_path / MODULE.NATIVE_REQUIREMENTS_RELATIVE_PATH).write_text(
+        "swig==4.4.0\n", encoding="utf-8"
+    )
     (tmp_path / "src" / "package").mkdir(parents=True)
     source = tmp_path / "src" / "package" / "runtime.py"
     source.write_text("VALUE = 1\n", encoding="utf-8")
@@ -807,6 +828,40 @@ def test_gpu_smoke_contract_hashes_every_reviewed_runtime_byte(tmp_path: Path) -
 
     source.write_text("VALUE = 2\n", encoding="utf-8")
     assert MODULE.gpu_smoke_contract_sha256(tmp_path) != first
+    second = MODULE.gpu_smoke_contract_sha256(tmp_path)
+    (tmp_path / MODULE.NATIVE_BUILD_RELATIVE_PATH).write_text(
+        "# altered builder\n", encoding="utf-8"
+    )
+    assert MODULE.gpu_smoke_contract_sha256(tmp_path) != second
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    (
+        ("source_commit", "b" * 40),
+        ("source_tree", "b" * 40),
+        ("swig_version", "4.3.0"),
+        ("wrapper_sha256", ""),
+        ("wheel_sha256", None),
+        ("installed_extension_sha256", "wrong"),
+        ("manifest_sha256", 123),
+        ("proxy_sha256", "A" * 64),
+    ),
+)
+def test_remote_result_rejects_unverified_native_overlay(field: str, value: object) -> None:
+    result = _remote_result("a100-40gb")
+    runtime = cast(dict[str, Any], result["runtime"])
+    runtime["native_sentencepiece"][field] = value
+    with pytest.raises(RuntimeError, match="native SentencePiece"):
+        MODULE._validated_remote_result("a100-40gb", result)
+
+
+def test_remote_result_requires_native_overlay_evidence() -> None:
+    result = _remote_result("h100")
+    runtime = cast(dict[str, Any], result["runtime"])
+    del runtime["native_sentencepiece"]
+    with pytest.raises(RuntimeError, match="runtime schema"):
+        MODULE._validated_remote_result("h100", result)
 
 
 def test_executed_entrypoint_must_match_reviewed_image_copy(tmp_path: Path) -> None:
