@@ -31,8 +31,26 @@ jobs:
       - name: Install package
         run: |
           python -m pip install --upgrade pip
+          python -m pip install -r requirements/sentencepiece-native-build.txt
+          git clone --depth 1 --branch v0.2.1 https://github.com/google/sentencepiece.git "$RUNNER_TEMP/sentencepiece-source"
+          python scripts/build_sentencepiece_native.py --source "$RUNNER_TEMP/sentencepiece-source" --output "$RUNNER_TEMP/sentencepiece-native"
+          python -m pip install --no-deps "$RUNNER_TEMP/sentencepiece-native/wheels"/*.whl
+          python scripts/build_sentencepiece_native.py verify-installed --manifest "$RUNNER_TEMP/sentencepiece-native/manifest.json"
           python -m pip install -e ".[dev,export]"
           python -m pip install "modal==1.5.3"
+
+      - name: Verify native binding in a fresh interpreter
+        run: python scripts/build_sentencepiece_native.py verify --manifest "$RUNNER_TEMP/sentencepiece-native/manifest.json" --output "$RUNNER_TEMP/sentencepiece-verification"
+
+      - name: Preserve native build evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sentencepiece-native-linux-${{ matrix.python-version }}
+          path: |
+            ${{ runner.temp }}/sentencepiece-native
+            ${{ runner.temp }}/sentencepiece-verification
+          if-no-files-found: error
 
       - name: Check formatting
         run: ruff format --check .
@@ -49,4 +67,34 @@ jobs:
       - name: Test
         env:
           PYTHONDONTWRITEBYTECODE: "1"
+          PYTHONWARNINGS: error
         run: python -m pytest -p no:cacheprovider
+
+  windows-native-binding:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Build and verify the Windows native binding
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m pip install -r requirements/sentencepiece-native-build.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git clone --depth 1 --branch v0.2.1 https://github.com/google/sentencepiece.git "$env:RUNNER_TEMP/sentencepiece-source"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/build_sentencepiece_native.py --source "$env:RUNNER_TEMP/sentencepiece-source" --output "$env:RUNNER_TEMP/sentencepiece-native"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/build_sentencepiece_native.py verify --manifest "$env:RUNNER_TEMP/sentencepiece-native/manifest.json" --output "$env:RUNNER_TEMP/sentencepiece-verification"
+          exit $LASTEXITCODE
+      - name: Preserve the Windows wheel and evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sentencepiece-native-windows-3.11
+          path: |
+            ${{ runner.temp }}/sentencepiece-native
+            ${{ runner.temp }}/sentencepiece-verification
+          if-no-files-found: error
