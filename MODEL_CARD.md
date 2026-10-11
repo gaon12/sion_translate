@@ -28,11 +28,20 @@ sion_translate is a custom PyTorch encoder-decoder model for bidirectional Korea
 translation. The uploaded release contains inference exports and its SentencePiece tokenizer;
 training datasets and training checkpoints are not distributed.
 
+## v1 numeric inference update
+
+Existing v1 users should download the updated inference code from
+[the pinned maintenance runtime](docs/V1_NUMERIC_HOTFIX.md). The existing public
+`model_ema.pt`, `kjx.model`, and `token_features.npz` can be reused. No retraining or
+weight replacement is required. This preserves numeric literals and checks
+Korean/Japanese hour/minute associations; it does not change the model's learned
+numerical abilities or general translation quality.
+
 ## Files
 
 - `model_ema.pt`: recommended FP32 EMA inference export
 - `model_int8.pt`: smaller CPU-only dynamic INT8 export
-- `sion.model`, `sion.vocab`, `token_features.npz`: tokenizer files
+- `kjx.model`, `kjx.vocab`, `token_features.npz`: tokenizer files
 
 The model uses custom code from
 [`gaon12/sion_translate`](https://github.com/gaon12/sion_translate) and is not a Transformers
@@ -41,9 +50,8 @@ The model uses custom code from
 ## Usage
 
 ```bash
-git clone https://github.com/gaon12/sion_translate.git
-cd sion_translate
-python -m pip install -e .
+python -m pip install --upgrade "sion-translate @ git+https://github.com/gaon12/sion_translate.git@c2ccc5210f2436017e2adaf067d02a7c83ceec98"
+python -m pip install huggingface_hub
 hf download gaon12/sion_translate --local-dir models/sion_translate
 ```
 
@@ -52,15 +60,14 @@ from sion_translate.inference import Translator
 
 translator = Translator(
     "models/sion_translate/model_ema.pt",
-    "models/sion_translate/sion.model",
+    "models/sion_translate/kjx.model",
 )
 print(translator.translate(["안녕하세요."], target_language="ja", num_beams=4)[0])
 print(translator.translate(["こんにちは。"], target_language="ko", num_beams=4)[0])
 ```
 
-Use `model_int8.pt` for CPU inference with lower storage and memory requirements. It reduces file
-size and memory, not latency: on the same CPU its generation speed matches the FP32 export. Only
-load PyTorch pickle-based artifacts from repositories you trust.
+The numeric update was verified with `model_ema.pt` on CPU. The public legacy pickled
+`model_int8.pt` is not covered by this release's safe weights-only loading validation.
 
 ## Evaluation
 
@@ -87,7 +94,8 @@ chrF 53.43 on an out-of-domain diagnostic set.
 
 ## Limitations
 
-- **Numbers can change value.** This release's tokenizer was trained without digit splitting, so
+- **Historical unprotected v1 output can change number values.** This release's tokenizer was
+  trained without digit splitting, so
   the model treats numbers as memorised pieces rather than sequences of digits. It substitutes a
   plausible wrong value rather than dropping it. Eight of ten numeric probe sentences are
   corrupted at beam 4:
@@ -107,8 +115,10 @@ chrF 53.43 on an out-of-domain diagnostic set.
   width does not change this, and neither does post-training: the representation does not expose
   digits, so `reward_number_weight` has no signal to optimise. Verify every amount, dosage, date
   and identifier against the source. Loading the tokenizer emits a warning, and `sion-train`
-  refuses it outright, so this checkpoint cannot be trained further — fixing it requires a new
-  tokenizer and therefore a new model, because the tied embedding is 18.4% of the parameters.
+  refuses it outright, so this checkpoint cannot be trained further — changing that learned
+  representation requires a new
+  tokenizer and model. The numeric inference update instead uses existing protected slots
+  to preserve literals without changing token IDs or weights.
 - Proper nouns are memorised, not generalised. Names and places present in training are accurate,
   while unseen ones get translated morpheme by morpheme (`五十嵐大輔` → `50폭풍 대장`). Supply a
   glossary for names that matter.
