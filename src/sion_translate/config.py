@@ -499,6 +499,10 @@ class TrainingConfig:
     eval_every: int = 250
     eval_batches: int = 20
     save_every: int = 500
+    # Save at the next completed optimizer update after this interval as well.
+    # Slow MRT updates can otherwise leave hours of paid work uncheckpointed.
+    # Inherited by foundation and MRT; zero disables the elapsed-time trigger.
+    save_every_seconds: float = 900.0
     # Complete this many epochs before early stopping can react to noisy validation.
     early_stopping_min_epochs: int = 2
     early_stopping_patience: int = 5
@@ -910,6 +914,14 @@ class AppConfig:
             raise ValueError("fsdp_reduce_dtype must be one of: auto, fp32, bf16")
         if self.training.fsdp2 is not None and self.training.parallel_strategy.lower() != "auto":
             raise ValueError("training.fsdp2 and training.parallel_strategy cannot both be set")
+        interval = cast(object, self.training.save_every_seconds)
+        if (
+            isinstance(interval, bool)
+            or not isinstance(interval, (int, float))
+            or not math.isfinite(interval)
+            or interval < 0
+        ):
+            raise ValueError("training.save_every_seconds must be finite and non-negative")
         for name, value in (
             ("log_every", self.training.log_every),
             ("eval_every", self.training.eval_every),

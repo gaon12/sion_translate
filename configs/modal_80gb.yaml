@@ -1,0 +1,132 @@
+# Measured single A100/H100 80GB candidate, 2026-09-03.
+# Fixed 273,484,225 parameters with a 48,000-token vocabulary; lengths <= 512.
+# See docs/gpu-training-audit-2026-09-03.md for evidence, cost and limitations.
+# SFT effective batch remains 256 and MRT remains 16. Foundation increases 16 -> 32.
+# MRT source batch 16 failed longest-row stress; do not promote it from short-row speed.
+# Keeps foundation/SFT at 3 epochs; caps MRT at 100,000 updates (1.6M source rows).
+# This is a budget scenario, not measured convergence. Review costs before launching.
+# Use a new run directory: changing batch/accumulation is incompatible with old resumes.
+# Re-probe after changing model, tokenizer, lengths, objectives or corpus distribution.
+
+model:
+  experimental:
+    situglu_enabled: false
+    bats_enabled: false
+    bats_coverage_weight: 0.0
+    core_enabled: false
+    register_loss_weight: 0.05
+    morphoscript_enabled: false
+    tetm_enabled: false
+    evidence_repair_enabled: false
+    candidate_refinement_enabled: true
+    candidate_refinement_steps: 1
+    candidate_refinement_temperature: 1.0
+    candidate_refinement_loss_weight: 0.25
+    candidate_refinement_vocab_chunk_size: 2048
+    semantic_parity_enabled: false
+  vocab_size: 48000
+  d_model: 832
+  encoder_layers: 18
+  decoder_layers: 9
+  num_heads: 8
+  num_kv_heads: 4
+  d_ff: 2304
+  gradient_checkpointing: false
+data:
+  raw_dir: data
+  tokenizer_model: artifacts/tokenizer/sion.model
+  tokenizer_features: artifacts/tokenizer/token_features.npz
+  dataset_dir: artifacts/dataset
+  approximate_split: true
+  language_pairs:
+  - - kj
+    - ko
+  - - kj
+    - ja
+  - - kd
+    - ko
+  - - kd
+    - ja
+  - - jd
+    - ko
+  - - jd
+    - ja
+  - - ko
+    - ja
+  - - ko
+    - en
+  - - en
+    - ja
+  source_only_languages:
+  - kj
+  - kd
+  - jd
+  refinement_evidence_fraction: 0.02
+  source_only_synthetic_evidence_files:
+  - synthetic_dialect_ja.jsonl
+  - synthetic_dialect_ko.jsonl
+  - synthetic_hanboneo.jsonl
+  language_pair_sampling_alpha: 0.0
+  max_source_length: 512
+  max_target_length: 512
+  num_workers: 7
+foundation:
+  reasoning_sample_share: 0.05
+  languages:
+  - ko
+  - ja
+  - en
+  tokenizer_sample_ratio: 0.4
+  batch_size_per_gpu: 32
+  gradient_accumulation_steps: 1
+training:
+  output_dir: runs/modal-80gb
+  candidate_refinement_min_worst_direction_nll_gain: 1.0e-05
+  candidate_refinement_min_validation_examples_per_direction: 32
+  precision: bf16
+  compile: false
+  batch_size_per_gpu: 32
+  gradient_accumulation_steps: 8
+  save_every_seconds: 900
+posttraining:
+  enabled: true
+  method: mrt
+  num_train_epochs: 2
+  max_steps: 100000
+  batch_size_per_gpu: 8
+  gradient_accumulation_steps: 2
+  learning_rate: 3.0e-05
+  warmup_steps: 200
+  samples_per_source: 4
+  candidate_micro_batch: 4
+  candidate_gradient_checkpointing: true
+  sampling_temperature: 1.0
+  top_k: 64
+  max_new_tokens: 256
+  risk_weight: 0.2
+  mrt_alpha: 1.0
+  preference_weight: 0.1
+  preference_min_gap: 0.05
+  preference_temperature: 1.0
+  reward_chrf_weight: 0.55
+  reward_token_f1_weight: 0.15
+  reward_number_weight: 0.1
+  reward_structured_weight: 0.05
+  reward_slot_weight: 0.05
+  reward_language_weight: 0.05
+  reward_length_weight: 0.05
+  reward_repetition_penalty: 0.15
+  reward_copy_penalty: 0.1
+  reward_number_corruption_penalty: 0.35
+  roundtrip_enabled: true
+  roundtrip_reward_weight: 0.2
+  roundtrip_failure_penalty: 0.15
+  roundtrip_min_score: 0.55
+  roundtrip_num_beams: 1
+  roundtrip_max_new_tokens: 256
+  validation_num_beams: 4
+  eval_batch_size_per_gpu: 1
+  eval_every: 250
+  save_every: 1000
+  early_stopping_min_epochs: 2
+  early_stopping_patience: 5

@@ -37,19 +37,37 @@ source provenance, tokenizer, datasets, and canonical paths used by the default 
 
 ## 2. Install a compatible GPU environment
 
-Use Python 3.11 or 3.12, PyTorch 2.8 or newer, and a CUDA build appropriate for the
-server. A100 and H100 machines use the same project entry point.
+The included installer verifies the extracted tree, installs the locked environment,
+and checks the runtime/GPU without starting training:
+
+```bash
+python3 setup_gpu.py
+```
+
+It requires internet access and Python's `venv`/`ensurepip` support. If the host's
+Python lacks them, install its `python3-venv` package first. Use
+`.venv/bin/python` for the subsequent preparation and training commands, or run
+`source .venv/bin/activate`. The equivalent manual installation is below.
+
+Use the authenticated CPython 3.11/Linux x86_64/CUDA 12.8 dependency lock. The
+launcher checks exact critical package versions, including Torch 2.10.0+cu128;
+an unpinned install or Python 3.12 will fail its runtime preflight. A100 and H100
+machines use the same project entry point.
 
 ```bash
 nvidia-smi
-python3 -m pip install --upgrade pip
-python3 -m pip install -e ".[dev,export,hangul]"
-python3 - <<'PY'
-from importlib.metadata import version
+python3 -m pip install "uv==0.12.3"
+uv venv --no-config .venv --python cpython@3.11 --managed-python
+uv pip sync --no-config requirements/pylock.gpu-cp311-linux-x86_64-cu128.toml \
+  --python .venv/bin/python --require-hashes --strict --only-binary :all:
+uv pip install --no-config --python .venv/bin/python --no-deps \
+  --no-build-isolation --editable .
+source .venv/bin/activate
+python - <<'PY'
 import torch
 
-torch_version = tuple(map(int, version("torch").split("+")[0].split(".")[:2]))
-assert torch_version >= (2, 8), f"PyTorch 2.8 or newer is required: {torch.__version__}"
+assert torch.__version__ == "2.10.0+cu128", torch.__version__
+assert torch.version.cuda == "12.8", torch.version.cuda
 assert torch.cuda.is_available(), "This PyTorch installation has no CUDA support"
 print("PyTorch:", torch.__version__)
 print("CUDA runtime:", torch.version.cuda)
@@ -58,9 +76,8 @@ print("NCCL:", torch.distributed.is_nccl_available())
 PY
 ```
 
-If PyTorch is not installed, select the correct command with the
-[official PyTorch installer](https://pytorch.org/get-started/locally/). Do not guess a
-wheel URL from the driver version shown by `nvidia-smi`.
+The lock installs the reviewed Torch build. Use the activated environment for all
+remaining commands; the launcher also validates the other locked runtime packages.
 
 NCCL is required for multiple GPUs. The runner checks it before any long preparation or
 training work begins.
@@ -93,16 +110,25 @@ same training contract as the bundle configuration.
 
 ## 4. Start training
 
+The launcher reads the authenticated `sion_translate.yaml`; it does not accept
+`--config`. The default now matches `configs/modal_80gb.yaml`: the measured 273M
+model, foundation batch 32, SFT batch 32 with accumulation 8, and MRT batch 8 with
+accumulation 2 and `max_steps: 100000`. The explicit MRT update budget takes
+precedence over its epoch field. This profile targets one A100/H100 80GB; its
+runtime estimate does not establish multi-GPU scaling. A 100k step cap is a
+budget scenario, not a validated quality target. Do not edit an extracted bundle's
+authenticated configuration; prepare a new bundle after changing source settings.
+
 ```bash
-python3 easy_run.py
+.venv/bin/python easy_run.py
 ```
 
 The runner performs these operations:
 
 1. Validates CUDA, NCCL, the visible GPU set, and the common BF16 capability.
 2. Authenticates the raw inputs and all prepared artifact inventories.
-3. Selects a smooth token-scaled model architecture, batch size, precision, and
-   distributed strategy from the corpus and the smallest visible GPU.
+3. Applies the configured model/batch/precision profile and validates capacity
+   against the smallest visible GPU; selects the distributed strategy.
 4. Resumes the furthest fully authenticated stage.
 5. Runs foundation pretraining when a prepared monolingual dataset is available.
 6. Runs directed translation SFT from the selected foundation weights.
@@ -114,15 +140,21 @@ a checkout-specific session. Slurm, `nohup`, containers, and non-interactive SSH
 in the current process. Disable tmux explicitly with:
 
 ```bash
-SION_NO_TMUX=1 python3 easy_run.py
+SION_NO_TMUX=1 .venv/bin/python easy_run.py
 ```
+
+These commands run on an already provisioned GPU host. The repository's Modal
+smoke/performance scripts are bounded diagnostics; they do not deploy a full
+training scheduler. A full Modal run additionally needs persistent checkpoint
+storage and a launcher that resumes across the service's execution windows.
 
 ## 5. Automatic GPU policy
 
 - The runner uses every visible CUDA GPU.
 - It uses BF16 only when every rank supports native BF16; otherwise automatic precision
   falls back to FP16.
-- Batch and activation checkpointing decisions use the smallest visible VRAM capacity.
+- The default 80GB profile supplies explicit batch/checkpointing settings; capacity
+  checks use the smallest visible VRAM capacity.
 - Multiple GPUs use DDP when full persistent state fits, or FSDP2 when sharding is needed.
 - MRT starts with a small candidate micro-batch because candidate generation has more
   variable memory use than teacher-forced SFT.
@@ -147,7 +179,7 @@ updates happen only after real training and evaluation finish.
 ## 7. Results and restart locations
 
 ```text
-runs/auto/
+runs/modal-80gb/
 ├── foundation/
 │   ├── checkpoints/
 │   ├── exports/best/       # foundation model: sion, not translation-capable

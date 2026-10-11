@@ -676,14 +676,19 @@ class SionForConditionalGeneration(nn.Module):
         for start in range(0, vocabulary_size, chunk_size):
             stop = min(start + chunk_size, vocabulary_size)
             chunk_logits = F.linear(flat_hidden, output_weight[start:stop]).float()
-            raw_log_normalizer, target_logits = self._accumulate_chunked_token_nll(
-                raw_log_normalizer,
-                target_logits,
-                chunk_logits,
-                safe_labels,
-                start=start,
-                stop=stop,
-            )
+            # Autoregressive generation only consumes the expectation. Computing
+            # draft CE reductions here would launch unused work for every token
+            # and every vocabulary chunk, including MRT and round-trip decoding.
+            if safe_labels is not None:
+                raw_log_normalizer, target_logits = self._accumulate_chunked_token_nll(
+                    raw_log_normalizer,
+                    target_logits,
+                    chunk_logits,
+                    safe_labels,
+                    start=start,
+                    stop=stop,
+                )
+                logit_sum = logit_sum + chunk_logits.sum(-1)
             scaled_logits = chunk_logits / exp.candidate_refinement_temperature
             chunk_max = scaled_logits.max(-1).values
             next_distribution_max = torch.maximum(distribution_max, chunk_max)
@@ -697,7 +702,6 @@ class SionForConditionalGeneration(nn.Module):
                 + chunk_weights @ embedding_weight[start:stop].float()
             )
             distribution_max = next_distribution_max
-            logit_sum = logit_sum + chunk_logits.sum(-1)
 
         candidate_expectation = (
             (

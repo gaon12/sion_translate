@@ -33,6 +33,21 @@ def test_default_paths_use_the_stable_public_layout() -> None:
     assert TrainingConfig().output_dir == "runs/auto"
 
 
+@pytest.mark.parametrize("interval", [True, -1, float("inf"), float("nan"), "900"])
+def test_checkpoint_time_interval_rejects_invalid_values(interval):
+    config = AppConfig()
+    config.training.save_every_seconds = interval
+    with pytest.raises(ValueError, match="save_every_seconds"):
+        config.validate()
+
+
+@pytest.mark.parametrize("interval", [0, 0.5, 900])
+def test_checkpoint_time_interval_accepts_disabled_or_positive(interval):
+    config = AppConfig(data=DataConfig(language_pair=["de", "fr"]))
+    config.training.save_every_seconds = interval
+    config.validate()
+
+
 @pytest.mark.parametrize("timeout", (True, 0, -1, float("nan"), float("inf"), "300"))
 def test_dataloader_timeout_must_be_a_finite_positive_number(timeout: object) -> None:
     config = AppConfig()
@@ -118,6 +133,7 @@ def test_shipped_configs_keep_canonical_paths_without_release_namespaces() -> No
     root_data = load_config(config_root.parent / "sion_translate.yaml").data
     expected_runs = {
         "debug.yaml": "runs/debug",
+        "modal_80gb.yaml": "runs/modal-80gb",
         "sion_1_3b.yaml": "runs/sion-1.3b",
         "sion_8b.yaml": "runs/sion-8b",
         "sion_data_fit.yaml": "runs/sion-data-fit",
@@ -784,7 +800,7 @@ def test_runnable_presets_do_not_outrun_the_corpus() -> None:
     """
     config_root = Path(__file__).resolve().parents[1] / "configs"
     runnable = sorted(path.name for path in config_root.glob("*.yaml"))
-    assert runnable == ["debug.yaml", "sion_1_3b.yaml", "sion_data_fit.yaml"]
+    assert runnable == ["debug.yaml", "modal_80gb.yaml", "sion_1_3b.yaml", "sion_data_fit.yaml"]
     assert (config_root / "aspirational" / "README.md").is_file()
 
 

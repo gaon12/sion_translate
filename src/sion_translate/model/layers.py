@@ -252,7 +252,13 @@ class GQAAttention(nn.Module):
                 attention_mask = attention_mask & causal_mask[None, None, :, :]
             is_causal = False
         enable_gqa = self.num_heads != self.num_kv_heads
-        if enable_gqa and not q.is_cuda:
+        if enable_gqa and (not q.is_cuda or attention_mask is not None):
+            # Native CUDA GQA with an explicit mask falls back to the math
+            # backend in the pinned PyTorch 2.10 stack: Flash rejects the mask
+            # and efficient attention requires equal head counts. Expand only
+            # the SDPA inputs so masked training can use efficient attention.
+            # Keep the returned KV cache compact and retain native GQA for the
+            # mask-free Flash path. Never remove padding/causality constraints.
             repeats = self.num_heads // self.num_kv_heads
             k = k.repeat_interleave(repeats, dim=1)
             v = v.repeat_interleave(repeats, dim=1)

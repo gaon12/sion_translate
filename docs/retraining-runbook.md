@@ -296,6 +296,7 @@ uv pip sync --no-config requirements/pylock.gpu-cp311-linux-x86_64-cu128.toml \
   --python .venv/bin/python --require-hashes --strict --only-binary :all:
 uv pip install --no-config --python .venv/bin/python --no-deps \
   --no-build-isolation --editable .
+source .venv/bin/activate
 ```
 
 When `.venv/bin/python easy_run.py` is launched later, it prints the authenticated runtime
@@ -462,6 +463,16 @@ Checkpoint aliases have distinct purposes:
 - `best` is selected by authenticated validation metrics;
 - `latest` is the normal restart point;
 - `final` records the last completed step.
+
+`training.save_every_seconds` also saves `latest` after 900 elapsed seconds by
+default, at the next completed optimizer update. This setting is inherited by
+foundation and MRT. Set it to zero to use only the existing step cadence.
+The timer resets only after a successful `latest` save. All distributed ranks
+follow rank zero's decision; partial gradient accumulation is never checkpointed.
+Timed saves do not create inference exports. The interval is not a hard deadline:
+one long update, validation, or checkpoint I/O can extend it. On Modal, write the
+run directory to a persistent Volume and commit completed checkpoints before
+ending the function; an ephemeral container directory cannot support recovery.
 
 Use `best` for release evaluation. Always move the matching tokenizer and token-feature
 sidecar with model weights.

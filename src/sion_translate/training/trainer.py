@@ -30,6 +30,7 @@ import math
 import os
 import tempfile
 import time
+from time import monotonic
 from collections.abc import Sized
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -252,6 +253,23 @@ def resolve_training_budget(
         target_epochs=training.num_train_epochs,
         batches_per_epoch=batches_per_epoch,
     )
+
+
+def _periodic_checkpoint_due(
+    training: TrainingConfig,
+    context: DistributedContext,
+    *,
+    step: int,
+    last_save_time: float,
+) -> bool:
+    if step % training.save_every == 0:
+        return True
+    if training.save_every_seconds == 0:
+        return False
+    # Only rank zero decides: independent wall clocks must never send just one
+    # rank into a collective DCP save and deadlock the other ranks.
+    due = context.is_main and monotonic() - last_save_time >= training.save_every_seconds
+    return broadcast_bool(due, context)
 
 
 def announce(message: str, context: DistributedContext) -> None:
@@ -1645,6 +1663,7 @@ def train(
     log_start = time.perf_counter()
     data_wait_seconds = 0.0
     steps_since_log = 0
+    last_resume_save_time = monotonic()
     if context.device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(context.device)
 
@@ -1711,6 +1730,7 @@ def train(
 
     def save(path: Path) -> None:
         """Save model, optimizer, scheduler, and progress state for resume."""
+        nonlocal last_resume_save_time
         save_checkpoint(
             path,
             model,
@@ -1723,6 +1743,8 @@ def train(
             ema=ema,
             identity=checkpoint_identity,
         )
+        if path == output_dir / "checkpoints" / "latest":
+            last_resume_save_time = monotonic()
 
     def export_models(name: str, *, artifact_step: int | None = None) -> None:
         """Save an inference model under ``exports/<name>/``.
@@ -2497,13 +2519,21 @@ def train(
                         epoch_completed = False
                         break
 
-                # Save the latest resume checkpoint and inference export periodically.
-                if step % training.save_every == 0:
+                # Save only at a completed optimizer boundary: the data cursor
+                # must never advance beyond gradients represented by the state.
+                if _periodic_checkpoint_due(
+                    training, context, step=step, last_save_time=last_resume_save_time
+                ):
                     announce(
                         f"Saving latest checkpoint at step {step}: checkpoints/latest.", context
                     )
                     save(output_dir / "checkpoints" / "latest")
-                    if not requires_candidate_refinement_release_guard:
+                    # Time-based recovery saves must not trigger expensive
+                    # inference exports more frequently than the step cadence.
+                    if (
+                        step % training.save_every == 0
+                        and not requires_candidate_refinement_release_guard
+                    ):
                         export_models("latest")
                 if not budget.epoch_limited and step >= budget.max_optimizer_steps:
                     epoch_completed = False

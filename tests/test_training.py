@@ -2349,6 +2349,59 @@ def test_exported_models_reload_and_run(tmp_path: Path) -> None:
     torch.testing.assert_close(rebuilt.token_embedding.weight, model.token_embedding.weight)
 
 
+def test_timed_checkpoint_preserves_completed_accumulation_before_loader_failure(
+    tmp_path, monkeypatch
+):
+    config = tiny_app_config(
+        tmp_path,
+        max_steps=5,
+        gradient_accumulation_steps=2,
+        eval_every=100,
+        save_every=100,
+        save_every_seconds=10,
+    )
+    now = [0.0]
+    monkeypatch.setattr(trainer_module, "monotonic", lambda: now[0])
+    context = DistributedContext(0, 0, 1, torch.device("cpu"), False)
+
+    def batches():
+        for _ in range(3):
+            now[0] += 11
+            yield tiny_batch()
+        raise RuntimeError("worker failed after a partial accumulation")
+
+    with pytest.raises(RuntimeError, match="worker failed"):
+        train(
+            SionForConditionalGeneration(config.model), batches(), [tiny_batch()], config, context
+        )
+    saved = torch.load(
+        tmp_path / "run/checkpoints/latest/checkpoint.pt",
+        weights_only=True,
+    )
+    assert saved["step"] == 1
+    assert saved["training_state"]["batch_in_epoch"] == 2
+    assert saved["optimizer"]["state"]
+    assert not (tmp_path / "run/exports/latest").exists()
+
+
+def test_timed_checkpoint_uses_rank_zero_decision(monkeypatch):
+    config = TrainingConfig(save_every=100, save_every_seconds=10)
+    context = DistributedContext(1, 1, 2, torch.device("cpu"), True)
+    monkeypatch.setattr(trainer_module, "monotonic", lambda: pytest.fail("non-main clock read"))
+    observed = []
+
+    def broadcast(value, ctx):
+        observed.append((value, ctx.rank))
+        return True
+
+    monkeypatch.setattr(trainer_module, "broadcast_bool", broadcast)
+    assert trainer_module._periodic_checkpoint_due(config, context, step=1, last_save_time=0)
+    assert observed == [(False, 1)]
+    config.save_every_seconds = 0
+    assert not trainer_module._periodic_checkpoint_due(config, context, step=1, last_save_time=0)
+    assert trainer_module._periodic_checkpoint_due(config, context, step=100, last_save_time=0)
+
+
 def test_early_stopping_saves_best_checkpoint(tmp_path: Path) -> None:
     config = tiny_app_config(
         tmp_path,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import types
+from copy import deepcopy
 
 import pytest
 import torch
@@ -334,6 +335,58 @@ def test_gqa_combines_causal_and_padding_masks_before_sdpa(
         is_causal=True,
     )
     torch.testing.assert_close(future_output[:, :3], baseline[:, :3])
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_masked_cuda_gqa_expands_only_sdpa_inputs_and_preserves_gradients(monkeypatch, causal):
+    torch.manual_seed(291)
+    attention = GQAAttention(
+        32,
+        4,
+        2,
+        dropout=0.0,
+        qk_norm=True,
+        norm_eps=1e-6,
+        rope=None,
+    ).double()
+    reference = deepcopy(attention)
+    hidden = torch.randn(2, 5, 32, dtype=torch.float64, requires_grad=True)
+    reference_hidden = hidden.detach().clone().requires_grad_()
+    mask = torch.tensor([[True, False, True, True, False], [True, True, True, True, True]])
+    expected, expected_cache = reference(
+        reference_hidden,
+        key_padding_mask=mask,
+        is_causal=causal,
+        use_cache=True,
+    )
+    expected.square().sum().backward()
+
+    # Exercise the CUDA dispatch decision on CPU CI; the actual SDPA operation
+    # still runs on real tensors and is compared through backward as well.
+    monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: True))
+    real_sdpa = layers_module.F.scaled_dot_product_attention
+    calls = []
+
+    def checked_sdpa(q, k, v, **kwargs):
+        calls.append(kwargs["enable_gqa"])
+        if kwargs["attn_mask"] is not None:
+            assert k.shape[1] == v.shape[1] == q.shape[1] == 4
+            assert kwargs["enable_gqa"] is False
+        return real_sdpa(q, k, v, **kwargs)
+
+    monkeypatch.setattr(layers_module.F, "scaled_dot_product_attention", checked_sdpa)
+    actual, cache = attention(hidden, key_padding_mask=mask, is_causal=causal, use_cache=True)
+    actual.square().sum().backward()
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(hidden.grad, reference_hidden.grad)
+    for parameter, reference_parameter in zip(
+        attention.parameters(), reference.parameters(), strict=True
+    ):
+        torch.testing.assert_close(parameter.grad, reference_parameter.grad)
+    assert cache[0].shape[1] == cache[1].shape[1] == 2
+    torch.testing.assert_close(cache, expected_cache)
+    attention(hidden.detach(), is_causal=causal)
+    assert calls == [False, True]
 
 
 def test_gqa_cached_chunks_use_lower_right_causal_alignment() -> None:

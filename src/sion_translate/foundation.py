@@ -221,6 +221,9 @@ def build_foundation_config(config: AppConfig) -> AppConfig:
     # Foundation shards intentionally exclude source-only languages. Keeping
     # them here could make the collator skip every reconstruction example.
     derived.data.source_only_languages = []
+    # These translation-only holdouts require the source-only language policy
+    # above. Retaining them makes the real trainer reject the derived config.
+    derived.data.source_only_synthetic_evidence_files = []
     # Keep ``data.language_pairs`` from the translation configuration. A
     # reconstruction pair would be self-directed, such as (ko, ko), while the
     # shared validator correctly requires distinct endpoints for translation.

@@ -22,6 +22,7 @@ the code for a future run changed.
 | Document | Question |
 |---|---|
 | [`retraining-runbook.md`](retraining-runbook.md) | How do I run every preparation and training stage manually? |
+| [`gpu-training-audit-2026-09-03.md`](gpu-training-audit-2026-09-03.md) | What passed on Modal A100/H100, which batches ran out of memory, and what would full training cost? |
 | [`foundation-pretraining.md`](foundation-pretraining.md) | What is the reconstruction foundation stage, and how is its separate model role authenticated? |
 | [`sentencepiece-sigsegv.md`](sentencepiece-sigsegv.md) | What caused the tokenizer-training SIGSEGV, and what operational guard prevents it? |
 | [`H100_TRAINING.md`](H100_TRAINING.md) | How do I prepare, size, launch, monitor, recover, and export on H100 hardware? |

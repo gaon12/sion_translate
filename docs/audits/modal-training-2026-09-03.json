@@ -1,0 +1,1071 @@
+{
+  "date": "2026-09-03",
+  "scope": "Single GPU, fixed prepared snapshot, short resident-cohort probes; not full training",
+  "model_parameters": 273484225,
+  "vocabulary_size": 48000,
+  "source_target_max_length": 512,
+  "physical_parallel_pairs": 28148216,
+  "physical_parallel_tokens": 1550725850,
+  "foundation_examples_per_epoch": 56593480,
+  "sft_mrt_examples_per_epoch": 56109623,
+  "resources": {
+    "cpu_request_limit_cores": [
+      8,
+      8
+    ],
+    "memory_request_limit_gib": [
+      48,
+      48
+    ]
+  },
+  "runs": [
+    {
+      "run_id": "probe-20260903t110622z-926772782ddc",
+      "target": "a100-80gb",
+      "case_set": "headroom",
+      "status": "completed",
+      "plan_sha256": "18fb196748d3d7388a8517634683a41dba0ccfade9f531a9bd00533511d0ccd9",
+      "source_contract_sha256": "f697e57b95f5b4cd4f34f60f63951898597e2d41ba9f4d2be8abda055bc8bd6d",
+      "probe_sha256": "f51100cd9ad1956af9f5c23819932a4d3175f1403fe8dc0867a7c26146b093c3",
+      "elapsed_seconds": 184.897004406,
+      "runtime": {
+        "python": "3.11.12",
+        "python_implementation": "CPython",
+        "libc": {
+          "name": "glibc",
+          "version": "2.36"
+        },
+        "versions": {
+          "numpy": "2.4.6",
+          "nvidia-cudnn-cu12": "9.10.2.21",
+          "nvidia-nccl-cu12": "2.27.5",
+          "sentencepiece": "0.2.1",
+          "torch": "2.10.0+cu128",
+          "torchao": "0.17.0+cu128",
+          "transformers": "5.16.1"
+        },
+        "cuda_runtime": "12.8",
+        "cudnn": 91002,
+        "nccl_available": true,
+        "nccl_version": [
+          2,
+          27,
+          5
+        ],
+        "devices": [
+          {
+            "index": 0,
+            "name": "NVIDIA A100-SXM4-80GB",
+            "capability": [
+              8,
+              0
+            ],
+            "total_memory_gib": 79.250732421875,
+            "bf16_native": true
+          }
+        ],
+        "lock_sha256": "0820c94d97a424e7c051cec1e01bba452a038904ae0df4730849fdabe50f350f",
+        "native_sentencepiece": {
+          "source_commit": "31646a467d2051eb904e0b45de3a73e91fe1c1e3",
+          "source_tree": "a256eb7f5d3e634041fa11aa2cbb4b1de065359b",
+          "swig_version": "4.4.0",
+          "wrapper_sha256": "5f3a020f7610c79603e537ff3c530992cfc8b6ea2015991baf87f0f7ae281ab5",
+          "proxy_sha256": "dac0615447d799a5d4df81442b0b57b07c725fa787fb77c457931e23949820a0",
+          "wheel_sha256": "6299d1ffa6e3532a02505fc8c272d0fa39ef5af94b29106ad6fdbe98dbc5a32b",
+          "installed_extension_sha256": "db0b3f467b93234c8dcb36f249cdc2d57959390a256f8e0a9281e8a9c16a109d",
+          "manifest_sha256": "1742b8520feb05ef70960166f9e68ee0723b0a67c019ddee1de9144b572a6020"
+        }
+      },
+      "commit": "e0777fe064f504f0432fcd44c143156c3deeb4e3",
+      "app_id": "ap-UPErBCGdHNLwvlnyhyXp9U",
+      "cases": [
+        {
+          "name": "foundation-b24",
+          "stage": "foundation",
+          "status": "passed",
+          "batch_size": 24,
+          "candidate_micro_batch": null,
+          "epochs": 3,
+          "max_steps": null,
+          "summary": {
+            "micro_batch": 24,
+            "projected_accumulation": 1,
+            "projected_effective_batch": 24,
+            "examples_per_second": 93.42212592580852,
+            "tokens_per_second": 5288.081586258786,
+            "mean_micro_seconds": 0.24020759700000038,
+            "optimizer_ema_seconds": 0.01669086000000064,
+            "measurement_microbatches": 4,
+            "effective_batch_changed": true
+          },
+          "representative_peak_reserved_gib": 18.23046875,
+          "stress_peak_reserved_gib": 39.82421875,
+          "checkpoint": {
+            "save_seconds": 9.552177939,
+            "load_seconds": 2.171856000000002,
+            "resumed_update": true,
+            "bytes": 4376239011,
+            "peak_allocated_gib": 37.1437029838562,
+            "peak_reserved_gib": 39.826171875
+          },
+          "error": null,
+          "attention_operators": [
+            "aten::scaled_dot_product_attention",
+            "aten::_scaled_dot_product_efficient_attention",
+            "aten::_scaled_dot_product_flash_attention",
+            "aten::_scaled_dot_product_efficient_attention_backward",
+            "aten::_scaled_dot_product_flash_attention_backward"
+          ]
+        },
+        {
+          "name": "sft-b24",
+          "stage": "sft",
+          "status": "passed",
+          "batch_size": 24,
+          "candidate_micro_batch": null,
+          "epochs": 3,
+          "max_steps": null,
+          "summary": {
+            "micro_batch": 24,
+            "projected_accumulation": 11,
+            "projected_effective_batch": 264,
+            "examples_per_second": 108.06510512181883,
+            "tokens_per_second": 2551.9124303246176,
+            "mean_micro_seconds": 0.22068948349999928,
+            "optimizer_ema_seconds": 0.015387440999987234,
+            "measurement_microbatches": 4,
+            "effective_batch_changed": true
+          },
+          "representative_peak_reserved_gib": 9.841796875,
+          "stress_peak_reserved_gib": 37.927734375,
+          "checkpoint": {
+            "save_seconds": 9.638624500000006,
+            "load_seconds": 1.9017258699999928,
+            "resumed_update": true,
+            "bytes": 4376238947,
+            "peak_allocated_gib": 36.69334697723389,
+            "peak_reserved_gib": 37.9296875
+          },
+          "error": null,
+          "attention_operators": [
+            "aten::scaled_dot_product_attention",
+            "aten::_scaled_dot_product_efficient_attention",
+            "aten::_scaled_dot_product_flash_attention",
+            "aten::_scaled_dot_product_efficient_attention_backward",
+            "aten::_scaled_dot_product_flash_attention_backward"
+          ]
+        },
+        {
+          "name": "mrt-b8",
+          "stage": "mrt",
+          "status": "passed",
+          "batch_size": 8,
+          "candidate_micro_batch": 8,
+          "epochs": 2,
+          "max_steps": null,
+          "summary": {
+            "micro_batch": 8,
+            "projected_accumulation": 2,
+            "projected_effective_batch": 16,
+            "examples_per_second": 1.496282577396731,
+            "tokens_per_second": 35.022364077192236,
+            "mean_micro_seconds": 5.338352054000001,
+            "optimizer_ema_seconds": 0.016463239999993107,
+            "measurement_microbatches": 4,
+            "effective_batch_changed": false
+          },
+          "representative_peak_reserved_gib": 15.767578125,
+          "stress_peak_reserved_gib": 44.69140625,
+          "checkpoint": {
+            "save_seconds": 8.394736722000005,
+            "load_seconds": 1.7533201919999897,
+            "resumed_update": true,
+            "bytes": 4376239011,
+            "peak_allocated_gib": 42.9001088142395,
+            "peak_reserved_gib": 44.69140625
+          },
+          "error": null,
+          "attention_operators": []
+        },
+        {
+          "name": "mrt-b16",
+          "stage": "mrt",
+          "status": "capacity_oom",
+          "batch_size": 16,
+          "candidate_micro_batch": 8,
+          "epochs": 2,
+          "max_steps": null,
+          "summary": {
+            "micro_batch": 16,
+            "projected_accumulation": 1,
+            "projected_effective_batch": 16,
+            "examples_per_second": 3.1727098887769447,
+            "tokens_per_second": 74.8065503463189,
+            "mean_micro_seconds": 5.027495665250001,
+            "optimizer_ema_seconds": 0.015511908999997104,
+            "measurement_microbatches": 4,
+            "effective_batch_changed": false
+          },
+          "representative_peak_reserved_gib": 24.5625,
+          "stress_peak_reserved_gib": null,
+          "checkpoint": null,
+          "error": "OutOfMemoryError('CUDA out of memory. Tried to allocate 5.86 GiB. GPU 0 has a total capacity of 79.25 GiB of which 2.56 GiB is free. Process 1 has 76.68 GiB memory in use. Of the allocated memory 74.18 GiB is allocated by PyTorch, and 1.99 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)')",
+          "attention_operators": []
+        }
+      ]
+    },
+    {
+      "run_id": "probe-20260903t111314z-2833fc4a270e",
+      "target": "a100-80gb",
+      "case_set": "balanced",
+      "status": "completed",
+      "plan_sha256": "18fb196748d3d7388a8517634683a41dba0ccfade9f531a9bd00533511d0ccd9",
+      "source_contract_sha256": "f697e57b95f5b4cd4f34f60f63951898597e2d41ba9f4d2be8abda055bc8bd6d",
+      "probe_sha256": "fb9b51afcd2a3c181fa709afe5ec0a7c0921574305c527eec0dd6f38d357ec16",
+      "elapsed_seconds": 261.34359044300004,
+      "runtime": {
+        "python": "3.11.12",
+        "python_implementation": "CPython",
+        "libc": {
+          "name": "glibc",
+          "version": "2.36"
+        },
+        "versions": {
+          "numpy": "2.4.6",
+          "nvidia-cudnn-cu12": "9.10.2.21",
+          "nvidia-nccl-cu12": "2.27.5",
+          "sentencepiece": "0.2.1",
+          "torch": "2.10.0+cu128",
+          "torchao": "0.17.0+cu128",
+          "transformers": "5.16.1"
+        },
+        "cuda_runtime": "12.8",
+        "cudnn": 91002,
+        "nccl_available": true,
+        "nccl_version": [
+          2,
+          27,
+          5
+        ],
+        "devices": [
+          {
+            "index": 0,
+            "name": "NVIDIA A100-SXM4-80GB",
+            "capability": [
+              8,
+              0
+            ],
+            "total_memory_gib": 79.250732421875,
+            "bf16_native": true
+          }
+        ],
+        "lock_sha256": "0820c94d97a424e7c051cec1e01bba452a038904ae0df4730849fdabe50f350f",
+        "native_sentencepiece": {
+          "source_commit": "31646a467d2051eb904e0b45de3a73e91fe1c1e3",
+          "source_tree": "a256eb7f5d3e634041fa11aa2cbb4b1de065359b",
+          "swig_version": "4.4.0",
+          "wrapper_sha256": "5f3a020f7610c79603e537ff3c530992cfc8b6ea2015991baf87f0f7ae281ab5",
+          "proxy_sha256": "dac0615447d799a5d4df81442b0b57b07c725fa787fb77c457931e23949820a0",
+          "wheel_sha256": "6299d1ffa6e3532a02505fc8c272d0fa39ef5af94b29106ad6fdbe98dbc5a32b",
+          "installed_extension_sha256": "db0b3f467b93234c8dcb36f249cdc2d57959390a256f8e0a9281e8a9c16a109d",
+          "manifest_sha256": "1742b8520feb05ef70960166f9e68ee0723b0a67c019ddee1de9144b572a6020"
+        }
+      },
+      "commit": "ed885787259de8a3abed0a17b7caac5953a9d8cf",
+      "app_id": "ap-4k0QvKe8LyD7RMgULFRymE",
+      "cases": [
+        {
+          "name": "foundation-b32",
+          "stage": "foundation",
+          "status": "passed",
+          "batch_size": 32,
+          "candidate_micro_batch": null,
+          "epochs": 3,
+          "max_steps": null,
+          "summary": {
+            "micro_batch": 32,
+            "projected_accumulation": 1,
+            "projected_effective_batch": 32,
+            "examples_per_second": 101.8613046973495,
+            "tokens_per_second": 5714.578351809897,
+            "mean_micro_seconds": 0.2973876257499999,
+            "optimizer_ema_seconds": 0.0167650359999989,
+            "measurement_microbatches": 4,
+            "effective_batch_changed": true
+          },
+          "representative_peak_reserved_gib": 22.453125,
+          "stress_peak_reserved_gib": 54.60546875,
+          "checkpoint": {
+            "save_seconds": 10.018846623999995,
+            "load_seconds": 2.1161653650000005,
+            "resumed_update": true,
+            "bytes": 4376239011,
+            "peak_allocated_gib": 47.66157865524292,
+            "peak_reserved_gib": 54.60546875
+          },
+          "error": null,
+          "attention_operators": [
+            "aten::scaled_dot_product_attention",
+            "aten::_scaled_dot_product_efficient_attention",
+            "aten::_scaled_dot_product_flash_attention",
+            "aten::_scaled_dot_product_efficient_attention_backward",
+            "aten::_scaled_dot_product_flash_attention_backward"
+          ]
+        },
+        {
+          "name": "sft-b32",
+          "stage": "sft",
+          "status": "passed",
+          "batch_size": 32,
+          "candidate_micro_batch": null,
+          "epochs": 3,
+          "max_steps": null,
+          "summary": {
+            "micro_batch": 32,
+            "projected_accumulation": 8,
+            "projected_effective_batch": 256,
+            "examples_per_second": 116.52268331168389,
+            "tokens_per_second": 2783.799730993198,
+            "mean_micro_seconds": 0.27249132849999036,
+            "optimizer_ema_seconds": 0.017066494999994575,
+            "measurement_microbatches": 4,
+            "effective_batch_changed": false
+          },
+          "representative_peak_reserved_gib": 10.939453125,
+          "stress_peak_reserved_gib": 49.646484375,
+          "checkpoint": {
+            "save_seconds": 10.176818972999996,
+            "load_seconds": 2.1083699579999973,
+            "resumed_update": true,
+            "bytes": 4376239011,
+            "peak_allocated_gib": 47.24413299560547,
+            "peak_reserved_gib": 49.646484375
+          },
+          "error": null,
+          "attention_operators": [
+            "aten::scaled_dot_product_attention",
+            "aten::_scaled_dot_product_efficient_attention",
+            "aten::_scaled_dot_product_flash_attention",
+            "aten::_scaled_dot_product_efficient_attention_backward",
+            "aten::_scaled_dot_product_flash_attention_backward"
+          ]
+        },
+        {
+          "name": "mrt-b8",
+          "stage": "mrt",
+          "status": "passed",
+          "batch_size": 8,
+          "candidate_micro_batch": 4,
+          "epochs": 2,
+          "max_steps": null,
+          "summary": {
+            "micro_batch": 8,
+            "projected_accumulation": 2,
+            "projected_effective_batch": 16,
+            "examples_per_second": 1.22719977621294,
+            "tokens_per_second": 28.724144761984128,
+            "mean_micro_seconds": 6.509951284750002,
+            "optimizer_ema_seconds": 0.01790945600001237,
+            "measurement_microbatches": 4,
+            "effective_batch_changed": false
+          },
+          "representative_peak_reserved_gib": 15.767578125,
+          "stress_peak_reserved_gib": 44.69140625,
+          "checkpoint": {
+            "save_seconds": 9.395703663999996,
+            "load_seconds": 2.121349488999982,
+            "resumed_update": true,
+            "bytes": 4376239011,
+            "peak_allocated_gib": 42.9001088142395,
+            "peak_reserved_gib": 44.69140625
+          },
+          "error": null,
+          "attention_operators": []
+        },
+        {
+          "name": "mrt-b16",
+          "stage": "mrt",
+          "status": "capacity_oom",
+          "batch_size": 16,
+          "candidate_micro_batch": 4,
+          "epochs": 2,
+          "max_steps": null,
+          "summary": {
+            "micro_batch": 16,
+            "projected_accumulation": 1,
+            "projected_effective_batch": 16,
+            "examples_per_second": 2.5033398290727957,
+            "tokens_per_second": 59.02405940735701,
+            "mean_micro_seconds": 6.374133658499993,
+            "optimizer_ema_seconds": 0.017327786000009837,
+            "measurement_microbatches": 4,
+            "effective_batch_changed": false
+          },
+          "representative_peak_reserved_gib": 24.5625,
+          "stress_peak_reserved_gib": null,
+          "checkpoint": null,
+          "error": "OutOfMemoryError('CUDA out of memory. Tried to allocate 5.86 GiB. GPU 0 has a total capacity of 79.25 GiB of which 2.56 GiB is free. Process 1 has 76.68 GiB memory in use. Of the allocated memory 74.18 GiB is allocated by PyTorch, and 1.99 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)')",
+          "attention_operators": []
+        }
+      ],
+      "estimates": {
+        "full": {
+          "schema": "sion-training-estimate-v1",
+          "target": "a100-80gb",
+          "run_id": "probe-20260903t111314z-2833fc4a270e",
+          "plan_sha256": "18fb196748d3d7388a8517634683a41dba0ccfade9f531a9bd00533511d0ccd9",
+          "source_contract_sha256": "f697e57b95f5b4cd4f34f60f63951898597e2d41ba9f4d2be8abda055bc8bd6d",
+          "probe_sha256": "fb9b51afcd2a3c181fa709afe5ec0a7c0921574305c527eec0dd6f38d357ec16",
+          "pricing_date": "2026-09-03",
+          "pricing_source": "https://modal.com/pricing",
+          "cpu_cores": 8,
+          "memory_gib": 48,
+          "hourly_compute_usd": 3.2592959999999995,
+          "max_reserved_fraction": 0.85,
+          "assumed_overhead_fraction": [
+            0.2,
+            0.5
+          ],
+          "schedule_overrides": {
+            "mrt_max_steps": null
+          },
+          "stages": [
+            {
+              "stage": "foundation",
+              "case": "foundation-b32",
+              "batch_size": 32,
+              "candidate_micro_batch": null,
+              "accumulation": 1,
+              "effective_batch_changed": true,
+              "examples": 169780440,
+              "max_steps_override": null,
+              "examples_per_second": 101.8613046973495,
+              "peak_reserved_gib": 54.60546875,
+              "compute_hours": 462.9945932212323,
+              "compute_usd": 1509.0364257075894,
+              "scenario_hours": [
+                555.5935118654787,
+                694.4918898318485
+              ],
+              "scenario_usd": [
+                1810.8437108491073,
+                2263.5546385613843
+              ]
+            },
+            {
+              "stage": "sft",
+              "case": "sft-b32",
+              "batch_size": 32,
+              "candidate_micro_batch": null,
+              "accumulation": 8,
+              "effective_batch_changed": false,
+              "examples": 168328869,
+              "max_steps_override": null,
+              "examples_per_second": 116.52268331168389,
+              "peak_reserved_gib": 49.646484375,
+              "compute_hours": 401.2782561966471,
+              "compute_usd": 1307.8846153087068,
+              "scenario_hours": [
+                481.53390743597646,
+                601.9173842949706
+              ],
+              "scenario_usd": [
+                1569.4615383704481,
+                1961.82692296306
+              ]
+            },
+            {
+              "stage": "mrt",
+              "case": "mrt-b8",
+              "batch_size": 8,
+              "candidate_micro_batch": 4,
+              "accumulation": 2,
+              "effective_batch_changed": false,
+              "examples": 112219246,
+              "max_steps_override": null,
+              "examples_per_second": 1.22719977621294,
+              "peak_reserved_gib": 44.69140625,
+              "compute_hours": 25400.927690821958,
+              "compute_usd": 82789.14201898524,
+              "scenario_hours": [
+                30481.11322898635,
+                38101.391536232935
+              ],
+              "scenario_usd": [
+                99346.97042278228,
+                124183.71302847785
+              ]
+            }
+          ],
+          "excluded_candidates": [
+            {
+              "name": "mrt-b16",
+              "reason": "capacity_oom"
+            }
+          ],
+          "total_compute_hours": 26265.20054023984,
+          "total_compute_usd": 85606.06306000153,
+          "total_scenario_days": [
+            1313.260027011992,
+            1641.57503376499
+          ],
+          "total_scenario_usd": [
+            102727.27567200184,
+            128409.09459000229
+          ],
+          "limitations": [
+            "Resident cohort timings exclude full-corpus I/O, validation, checkpoints and exports.",
+            "Overhead percentages are sensitivity assumptions, not measured confidence bounds.",
+            "Random-weight MRT generation is not representative of a trained SFT model's termination.",
+            "Changing effective batch changes optimization; selected cases are scenarios, not automatic config updates.",
+            "The recorded prepared snapshot may differ from currently edited raw data; re-prepare and re-measure after changes.",
+            "Prices exclude storage, image builds, networking, discounts, credits and region/preemption surcharges; CPU/RAM usage above these assumptions costs extra.",
+            "Passing short probes does not establish full-training completion or convergence."
+          ]
+        },
+        "mrt100k": {
+          "schema": "sion-training-estimate-v1",
+          "target": "a100-80gb",
+          "run_id": "probe-20260903t111314z-2833fc4a270e",
+          "plan_sha256": "18fb196748d3d7388a8517634683a41dba0ccfade9f531a9bd00533511d0ccd9",
+          "source_contract_sha256": "f697e57b95f5b4cd4f34f60f63951898597e2d41ba9f4d2be8abda055bc8bd6d",
+          "probe_sha256": "fb9b51afcd2a3c181fa709afe5ec0a7c0921574305c527eec0dd6f38d357ec16",
+          "pricing_date": "2026-09-03",
+          "pricing_source": "https://modal.com/pricing",
+          "cpu_cores": 8,
+          "memory_gib": 48,
+          "hourly_compute_usd": 3.2592959999999995,
+          "max_reserved_fraction": 0.85,
+          "assumed_overhead_fraction": [
+            0.2,
+            0.5
+          ],
+          "schedule_overrides": {
+            "mrt_max_steps": 100000
+          },
+          "stages": [
+            {
+              "stage": "foundation",
+              "case": "foundation-b32",
+              "batch_size": 32,
+              "candidate_micro_batch": null,
+              "accumulation": 1,
+              "effective_batch_changed": true,
+              "examples": 169780440,
+              "max_steps_override": null,
+              "examples_per_second": 101.8613046973495,
+              "peak_reserved_gib": 54.60546875,
+              "compute_hours": 462.9945932212323,
+              "compute_usd": 1509.0364257075894,
+              "scenario_hours": [
+                555.5935118654787,
+                694.4918898318485
+              ],
+              "scenario_usd": [
+                1810.8437108491073,
+                2263.5546385613843
+              ]
+            },
+            {
+              "stage": "sft",
+              "case": "sft-b32",
+              "batch_size": 32,
+              "candidate_micro_batch": null,
+              "accumulation": 8,
+              "effective_batch_changed": false,
+              "examples": 168328869,
+              "max_steps_override": null,
+              "examples_per_second": 116.52268331168389,
+              "peak_reserved_gib": 49.646484375,
+              "compute_hours": 401.2782561966471,
+              "compute_usd": 1307.8846153087068,
+              "scenario_hours": [
+                481.53390743597646,
+                601.9173842949706
+              ],
+              "scenario_usd": [
+                1569.4615383704481,
+                1961.82692296306
+              ]
+            },
+            {
+              "stage": "mrt",
+              "case": "mrt-b8",
+              "batch_size": 8,
+              "candidate_micro_batch": 4,
+              "accumulation": 2,
+              "effective_batch_changed": false,
+              "examples": 1600000,
+              "max_steps_override": 100000,
+              "examples_per_second": 1.22719977621294,
+              "peak_reserved_gib": 44.69140625,
+              "compute_hours": 362.16144515277824,
+              "compute_usd": 1180.3913495406694,
+              "scenario_hours": [
+                434.5937341833339,
+                543.2421677291674
+              ],
+              "scenario_usd": [
+                1416.469619448803,
+                1770.587024311004
+              ]
+            }
+          ],
+          "excluded_candidates": [
+            {
+              "name": "mrt-b16",
+              "reason": "capacity_oom"
+            }
+          ],
+          "total_compute_hours": 1226.4342945706576,
+          "total_compute_usd": 3997.3123905569655,
+          "total_scenario_days": [
+            61.321714728532875,
+            76.6521434106661
+          ],
+          "total_scenario_usd": [
+            4796.774868668358,
+            5995.968585835448
+          ],
+          "limitations": [
+            "Resident cohort timings exclude full-corpus I/O, validation, checkpoints and exports.",
+            "Overhead percentages are sensitivity assumptions, not measured confidence bounds.",
+            "Random-weight MRT generation is not representative of a trained SFT model's termination.",
+            "Changing effective batch changes optimization; selected cases are scenarios, not automatic config updates.",
+            "The recorded prepared snapshot may differ from currently edited raw data; re-prepare and re-measure after changes.",
+            "Prices exclude storage, image builds, networking, discounts, credits and region/preemption surcharges; CPU/RAM usage above these assumptions costs extra.",
+            "Passing short probes does not establish full-training completion or convergence."
+          ]
+        }
+      }
+    },
+    {
+      "run_id": "probe-20260903t111853z-c5cefa0e8573",
+      "target": "h100",
+      "case_set": "balanced",
+      "status": "completed",
+      "plan_sha256": "18fb196748d3d7388a8517634683a41dba0ccfade9f531a9bd00533511d0ccd9",
+      "source_contract_sha256": "f697e57b95f5b4cd4f34f60f63951898597e2d41ba9f4d2be8abda055bc8bd6d",
+      "probe_sha256": "fb9b51afcd2a3c181fa709afe5ec0a7c0921574305c527eec0dd6f38d357ec16",
+      "elapsed_seconds": 170.57396619300002,
+      "runtime": {
+        "python": "3.11.12",
+        "python_implementation": "CPython",
+        "libc": {
+          "name": "glibc",
+          "version": "2.36"
+        },
+        "versions": {
+          "numpy": "2.4.6",
+          "nvidia-cudnn-cu12": "9.10.2.21",
+          "nvidia-nccl-cu12": "2.27.5",
+          "sentencepiece": "0.2.1",
+          "torch": "2.10.0+cu128",
+          "torchao": "0.17.0+cu128",
+          "transformers": "5.16.1"
+        },
+        "cuda_runtime": "12.8",
+        "cudnn": 91002,
+        "nccl_available": true,
+        "nccl_version": [
+          2,
+          27,
+          5
+        ],
+        "devices": [
+          {
+            "index": 0,
+            "name": "NVIDIA H100 80GB HBM3",
+            "capability": [
+              9,
+              0
+            ],
+            "total_memory_gib": 79.1788330078125,
+            "bf16_native": true
+          }
+        ],
+        "lock_sha256": "0820c94d97a424e7c051cec1e01bba452a038904ae0df4730849fdabe50f350f",
+        "native_sentencepiece": {
+          "source_commit": "31646a467d2051eb904e0b45de3a73e91fe1c1e3",
+          "source_tree": "a256eb7f5d3e634041fa11aa2cbb4b1de065359b",
+          "swig_version": "4.4.0",
+          "wrapper_sha256": "5f3a020f7610c79603e537ff3c530992cfc8b6ea2015991baf87f0f7ae281ab5",
+          "proxy_sha256": "dac0615447d799a5d4df81442b0b57b07c725fa787fb77c457931e23949820a0",
+          "wheel_sha256": "6299d1ffa6e3532a02505fc8c272d0fa39ef5af94b29106ad6fdbe98dbc5a32b",
+          "installed_extension_sha256": "db0b3f467b93234c8dcb36f249cdc2d57959390a256f8e0a9281e8a9c16a109d",
+          "manifest_sha256": "1742b8520feb05ef70960166f9e68ee0723b0a67c019ddee1de9144b572a6020"
+        }
+      },
+      "commit": "c72b769fda06705a5315f54c475e11ddb10caae2",
+      "app_id": "ap-TFO2gIQ3TVfeRvkNWTlOgI",
+      "cases": [
+        {
+          "name": "foundation-b32",
+          "stage": "foundation",
+          "status": "passed",
+          "batch_size": 32,
+          "candidate_micro_batch": null,
+          "epochs": 3,
+          "max_steps": null,
+          "summary": {
+            "micro_batch": 32,
+            "projected_accumulation": 1,
+            "projected_effective_batch": 32,
+            "examples_per_second": 255.2874961722099,
+            "tokens_per_second": 14322.027421973746,
+            "mean_micro_seconds": 0.11542235824999914,
+            "optimizer_ema_seconds": 0.00992651500000008,
+            "measurement_microbatches": 4,
+            "effective_batch_changed": true
+          },
+          "representative_peak_reserved_gib": 23.560546875,
+          "stress_peak_reserved_gib": 54.6171875,
+          "checkpoint": {
+            "save_seconds": 12.798392796999998,
+            "load_seconds": 2.745078441000004,
+            "resumed_update": true,
+            "bytes": 4376238947,
+            "peak_allocated_gib": 47.71182584762573,
+            "peak_reserved_gib": 54.6171875
+          },
+          "error": null,
+          "attention_operators": [
+            "aten::scaled_dot_product_attention",
+            "aten::_scaled_dot_product_efficient_attention",
+            "aten::_scaled_dot_product_flash_attention",
+            "aten::_scaled_dot_product_efficient_attention_backward",
+            "aten::_scaled_dot_product_flash_attention_backward"
+          ]
+        },
+        {
+          "name": "sft-b32",
+          "stage": "sft",
+          "status": "passed",
+          "batch_size": 32,
+          "candidate_micro_batch": null,
+          "epochs": 3,
+          "max_steps": null,
+          "summary": {
+            "micro_batch": 32,
+            "projected_accumulation": 8,
+            "projected_effective_batch": 256,
+            "examples_per_second": 337.86702577497203,
+            "tokens_per_second": 8071.854412655191,
+            "mean_micro_seconds": 0.0935403474999994,
+            "optimizer_ema_seconds": 0.009371758000000341,
+            "measurement_microbatches": 4,
+            "effective_batch_changed": false
+          },
+          "representative_peak_reserved_gib": 10.970703125,
+          "stress_peak_reserved_gib": 49.677734375,
+          "checkpoint": {
+            "save_seconds": 13.292732883,
+            "load_seconds": 2.924241097999996,
+            "resumed_update": true,
+            "bytes": 4376239011,
+            "peak_allocated_gib": 47.289459228515625,
+            "peak_reserved_gib": 49.677734375
+          },
+          "error": null,
+          "attention_operators": [
+            "aten::scaled_dot_product_attention",
+            "aten::_scaled_dot_product_efficient_attention",
+            "aten::_scaled_dot_product_flash_attention",
+            "aten::_scaled_dot_product_efficient_attention_backward",
+            "aten::_scaled_dot_product_flash_attention_backward"
+          ]
+        },
+        {
+          "name": "mrt-b8",
+          "stage": "mrt",
+          "status": "passed",
+          "batch_size": 8,
+          "candidate_micro_batch": 4,
+          "epochs": 2,
+          "max_steps": null,
+          "summary": {
+            "micro_batch": 8,
+            "projected_accumulation": 2,
+            "projected_effective_batch": 16,
+            "examples_per_second": 3.14344218575027,
+            "tokens_per_second": 73.57619366021726,
+            "mean_micro_seconds": 2.5403114967500002,
+            "optimizer_ema_seconds": 0.00933860099999606,
+            "measurement_microbatches": 4,
+            "effective_batch_changed": false
+          },
+          "representative_peak_reserved_gib": 15.826171875,
+          "stress_peak_reserved_gib": 44.69921875,
+          "checkpoint": {
+            "save_seconds": 13.08566446799999,
+            "load_seconds": 2.802122695999998,
+            "resumed_update": true,
+            "bytes": 4376239011,
+            "peak_allocated_gib": 42.95880174636841,
+            "peak_reserved_gib": 44.69921875
+          },
+          "error": null,
+          "attention_operators": []
+        },
+        {
+          "name": "mrt-b16",
+          "stage": "mrt",
+          "status": "capacity_oom",
+          "batch_size": 16,
+          "candidate_micro_batch": 4,
+          "epochs": 2,
+          "max_steps": null,
+          "summary": {
+            "micro_batch": 16,
+            "projected_accumulation": 1,
+            "projected_effective_batch": 16,
+            "examples_per_second": 6.264087576935233,
+            "tokens_per_second": 147.69543989992604,
+            "mean_micro_seconds": 2.5447763235000025,
+            "optimizer_ema_seconds": 0.009466381999999385,
+            "measurement_microbatches": 4,
+            "effective_batch_changed": false
+          },
+          "representative_peak_reserved_gib": 24.6171875,
+          "stress_peak_reserved_gib": null,
+          "checkpoint": null,
+          "error": "OutOfMemoryError('CUDA out of memory. Tried to allocate 5.86 GiB. GPU 0 has a total capacity of 79.18 GiB of which 2.23 GiB is free. Process 1 has 76.94 GiB memory in use. Of the allocated memory 74.23 GiB is allocated by PyTorch, and 1.98 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)')",
+          "attention_operators": []
+        }
+      ],
+      "estimates": {
+        "full": {
+          "schema": "sion-training-estimate-v1",
+          "target": "h100",
+          "run_id": "probe-20260903t111853z-c5cefa0e8573",
+          "plan_sha256": "18fb196748d3d7388a8517634683a41dba0ccfade9f531a9bd00533511d0ccd9",
+          "source_contract_sha256": "f697e57b95f5b4cd4f34f60f63951898597e2d41ba9f4d2be8abda055bc8bd6d",
+          "probe_sha256": "fb9b51afcd2a3c181fa709afe5ec0a7c0921574305c527eec0dd6f38d357ec16",
+          "pricing_date": "2026-09-03",
+          "pricing_source": "https://modal.com/pricing",
+          "cpu_cores": 8,
+          "memory_gib": 48,
+          "hourly_compute_usd": 4.710096,
+          "max_reserved_fraction": 0.85,
+          "assumed_overhead_fraction": [
+            0.2,
+            0.5
+          ],
+          "schedule_overrides": {
+            "mrt_max_steps": null
+          },
+          "stages": [
+            {
+              "stage": "foundation",
+              "case": "foundation-b32",
+              "batch_size": 32,
+              "candidate_micro_batch": null,
+              "accumulation": 1,
+              "effective_batch_changed": true,
+              "examples": 169780440,
+              "max_steps_override": null,
+              "examples_per_second": 255.2874961722099,
+              "peak_reserved_gib": 54.6171875,
+              "compute_hours": 184.7377331066762,
+              "compute_usd": 870.1324577548231,
+              "scenario_hours": [
+                221.6852797280114,
+                277.1065996600143
+              ],
+              "scenario_usd": [
+                1044.1589493057877,
+                1305.1986866322347
+              ]
+            },
+            {
+              "stage": "sft",
+              "case": "sft-b32",
+              "batch_size": 32,
+              "candidate_micro_batch": null,
+              "accumulation": 8,
+              "effective_batch_changed": false,
+              "examples": 168328869,
+              "max_steps_override": null,
+              "examples_per_second": 337.86702577497203,
+              "peak_reserved_gib": 49.677734375,
+              "compute_hours": 138.39178019641577,
+              "compute_usd": 651.8385703360171,
+              "scenario_hours": [
+                166.07013623569893,
+                207.58767029462365
+              ],
+              "scenario_usd": [
+                782.2062844032206,
+                977.7578555040257
+              ]
+            },
+            {
+              "stage": "mrt",
+              "case": "mrt-b8",
+              "batch_size": 8,
+              "candidate_micro_batch": 4,
+              "accumulation": 2,
+              "effective_batch_changed": false,
+              "examples": 112219246,
+              "max_steps_override": null,
+              "examples_per_second": 3.14344218575027,
+              "peak_reserved_gib": 44.69921875,
+              "compute_hours": 9916.521741384504,
+              "compute_usd": 46707.769388008186,
+              "scenario_hours": [
+                11899.826089661405,
+                14874.782612076757
+              ],
+              "scenario_usd": [
+                56049.32326560982,
+                70061.65408201228
+              ]
+            }
+          ],
+          "excluded_candidates": [
+            {
+              "name": "mrt-b16",
+              "reason": "capacity_oom"
+            }
+          ],
+          "total_compute_hours": 10239.651254687597,
+          "total_compute_usd": 48229.74041609903,
+          "total_scenario_days": [
+            511.9825627343798,
+            639.9782034179748
+          ],
+          "total_scenario_usd": [
+            57875.688499318836,
+            72344.61062414855
+          ],
+          "limitations": [
+            "Resident cohort timings exclude full-corpus I/O, validation, checkpoints and exports.",
+            "Overhead percentages are sensitivity assumptions, not measured confidence bounds.",
+            "Random-weight MRT generation is not representative of a trained SFT model's termination.",
+            "Changing effective batch changes optimization; selected cases are scenarios, not automatic config updates.",
+            "The recorded prepared snapshot may differ from currently edited raw data; re-prepare and re-measure after changes.",
+            "Prices exclude storage, image builds, networking, discounts, credits and region/preemption surcharges; CPU/RAM usage above these assumptions costs extra.",
+            "Passing short probes does not establish full-training completion or convergence."
+          ]
+        },
+        "mrt100k": {
+          "schema": "sion-training-estimate-v1",
+          "target": "h100",
+          "run_id": "probe-20260903t111853z-c5cefa0e8573",
+          "plan_sha256": "18fb196748d3d7388a8517634683a41dba0ccfade9f531a9bd00533511d0ccd9",
+          "source_contract_sha256": "f697e57b95f5b4cd4f34f60f63951898597e2d41ba9f4d2be8abda055bc8bd6d",
+          "probe_sha256": "fb9b51afcd2a3c181fa709afe5ec0a7c0921574305c527eec0dd6f38d357ec16",
+          "pricing_date": "2026-09-03",
+          "pricing_source": "https://modal.com/pricing",
+          "cpu_cores": 8,
+          "memory_gib": 48,
+          "hourly_compute_usd": 4.710096,
+          "max_reserved_fraction": 0.85,
+          "assumed_overhead_fraction": [
+            0.2,
+            0.5
+          ],
+          "schedule_overrides": {
+            "mrt_max_steps": 100000
+          },
+          "stages": [
+            {
+              "stage": "foundation",
+              "case": "foundation-b32",
+              "batch_size": 32,
+              "candidate_micro_batch": null,
+              "accumulation": 1,
+              "effective_batch_changed": true,
+              "examples": 169780440,
+              "max_steps_override": null,
+              "examples_per_second": 255.2874961722099,
+              "peak_reserved_gib": 54.6171875,
+              "compute_hours": 184.7377331066762,
+              "compute_usd": 870.1324577548231,
+              "scenario_hours": [
+                221.6852797280114,
+                277.1065996600143
+              ],
+              "scenario_usd": [
+                1044.1589493057877,
+                1305.1986866322347
+              ]
+            },
+            {
+              "stage": "sft",
+              "case": "sft-b32",
+              "batch_size": 32,
+              "candidate_micro_batch": null,
+              "accumulation": 8,
+              "effective_batch_changed": false,
+              "examples": 168328869,
+              "max_steps_override": null,
+              "examples_per_second": 337.86702577497203,
+              "peak_reserved_gib": 49.677734375,
+              "compute_hours": 138.39178019641577,
+              "compute_usd": 651.8385703360171,
+              "scenario_hours": [
+                166.07013623569893,
+                207.58767029462365
+              ],
+              "scenario_usd": [
+                782.2062844032206,
+                977.7578555040257
+              ]
+            },
+            {
+              "stage": "mrt",
+              "case": "mrt-b8",
+              "batch_size": 8,
+              "candidate_micro_batch": 4,
+              "accumulation": 2,
+              "effective_batch_changed": false,
+              "examples": 1600000,
+              "max_steps_override": 100000,
+              "examples_per_second": 3.14344218575027,
+              "peak_reserved_gib": 44.69921875,
+              "compute_hours": 141.38782206944435,
+              "compute_usd": 665.9502151780016,
+              "scenario_hours": [
+                169.6653864833332,
+                212.08173310416652
+              ],
+              "scenario_usd": [
+                799.1402582136019,
+                998.9253227670024
+              ]
+            }
+          ],
+          "excluded_candidates": [
+            {
+              "name": "mrt-b16",
+              "reason": "capacity_oom"
+            }
+          ],
+          "total_compute_hours": 464.5173353725363,
+          "total_compute_usd": 2187.921243268842,
+          "total_scenario_days": [
+            23.225866768626815,
+            29.03233346078352
+          ],
+          "total_scenario_usd": [
+            2625.50549192261,
+            3281.881864903263
+          ],
+          "limitations": [
+            "Resident cohort timings exclude full-corpus I/O, validation, checkpoints and exports.",
+            "Overhead percentages are sensitivity assumptions, not measured confidence bounds.",
+            "Random-weight MRT generation is not representative of a trained SFT model's termination.",
+            "Changing effective batch changes optimization; selected cases are scenarios, not automatic config updates.",
+            "The recorded prepared snapshot may differ from currently edited raw data; re-prepare and re-measure after changes.",
+            "Prices exclude storage, image builds, networking, discounts, credits and region/preemption surcharges; CPU/RAM usage above these assumptions costs extra.",
+            "Passing short probes does not establish full-training completion or convergence."
+          ]
+        }
+      }
+    }
+  ],
+  "reported_compute_cost_usd": 0.65556874,
+  "billing_caveat": "Reported compute charges at reconciliation; provider billing can lag and exclude image/storage charges.",
+  "final_configuration_fix": "c00799e clears foundation-only invalid holdouts; CPU regression tested after GPU compute probes. It does not change tensor computation."
+}

@@ -27,6 +27,30 @@ def test_bible_inline_note_cleanup_is_narrow_and_reproducible() -> None:
     assert REBUILD.clean_bible_verse("ja", "OTHER.1.1", "第1 「本文") == "第1 「本文"
 
 
+def test_bible_parser_supports_hashed_css_modules_and_excludes_notes() -> None:
+    parser = REBUILD.VerseParser()
+    parser.feed(
+        '<span class="ChapterContent-module__abc__verse" data-usfm="GEN.1.1">'
+        '<span class="ChapterContent-module__abc__label">1</span>'
+        '<span class="ChapterContent-module__abc__content">When God began</span>'
+        '<span class="ChapterContent-module__abc__note">not a verse</span>'
+        '<span class="ChapterContent-module__abc__content"> to create</span>'
+        "</span>"
+    )
+
+    assert "".join(parser.verses["GEN.1.1"]) == "When God began to create"
+
+
+def test_nrsvue_bible_version_is_pinned() -> None:
+    assert REBUILD.BIBLE_VERSIONS["en"] == {
+        "id": "3523",
+        "title": "NRSVUE",
+        "start": "GEN.1",
+        "locale": "en",
+        "slug": "NRSVUE",
+    }
+
+
 def test_massive_is_not_rebuilt_by_default(monkeypatch) -> None:
     monkeypatch.setattr(sys, "argv", ["rebuild_verified_parallel.py"])
     args = REBUILD.parse_args()

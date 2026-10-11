@@ -5,7 +5,8 @@ This script intentionally keeps source-specific provenance and performs only
 deterministic joins:
 
 * NICT QE/APE: Japanese ``*.source`` and Korean human ``*.ref`` rows joined by ID.
-* Bible.com: Korean RNKSV and Japanese Bible 1819 verses joined by ``data-usfm``.
+* Bible.com: Korean RNKSV and Japanese Bible 1819 verses joined by ``data-usfm``;
+  ``add_nrsvue_to_data18.py`` augments that stable row set with English NRSVue.
 * MASSIVE: optional audit-only rebuild of train rows joined by ID after removing
   locale-specific slot localization. It is not rebuilt by default because equal
   intent IDs are not guaranteed to be literal translations across locales.
@@ -69,6 +70,13 @@ BIBLE_VERSIONS = {
         "start": "GEN.1",
         "locale": "ja",
         "slug": "新共同訳",
+    },
+    "en": {
+        "id": "3523",
+        "title": "NRSVUE",
+        "start": "GEN.1",
+        "locale": "en",
+        "slug": "NRSVUE",
     },
 }
 
@@ -353,6 +361,11 @@ class VerseParser(HTMLParser):
         self._stack.append((self.current_verse, self.collect_depth, self.blocked_depth))
         attributes = dict(attrs)
         classes = set((attributes.get("class") or "").split())
+        # Bible.com's current Next.js build prefixes semantic class names with
+        # a generated CSS-module token (for example
+        # ``ChapterContent-module__cat7xG__verse``). Keep compatibility with
+        # both the older plain classes and the generated suffixes.
+        classes |= {class_name.rsplit("__", 1)[-1] for class_name in classes}
         if "verse" in classes and attributes.get("data-usfm"):
             self.current_verse = str(attributes["data-usfm"])
         if classes & self._BLOCKED_CLASSES:
@@ -417,10 +430,17 @@ def _fetch_bible_chapter(
             request = Request(url, headers={"User-Agent": USER_AGENT})
             with urlopen(request, timeout=60) as response:
                 page = response.read().decode("utf-8")
-            payload = _parse_next_data(page)
-            chapter_info = payload["props"]["pageProps"]["chapterInfo"]
             parser = VerseParser()
-            parser.feed(str(chapter_info["content"]))
+            try:
+                payload = _parse_next_data(page)
+                chapter_info = payload["props"]["pageProps"]["chapterInfo"]
+                parser.feed(str(chapter_info["content"]))
+                next_usfm = _next_usfm(chapter_info)
+            except (ValueError, KeyError):
+                # The 2026 App Router page no longer has __NEXT_DATA__, but it
+                # server-renders the same data-usfm verse markup in the HTML.
+                parser.feed(page)
+                next_usfm = None
             verses = {}
             for verse_id, parts in parser.verses.items():
                 verse = clean_bible_verse(language, verse_id, "".join(parts))
@@ -428,7 +448,7 @@ def _fetch_bible_chapter(
                     verses[verse_id] = verse
             result = {
                 "usfm": usfm,
-                "next": _next_usfm(chapter_info),
+                "next": next_usfm,
                 "verses": verses,
                 "url": url,
             }

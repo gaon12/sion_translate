@@ -29,18 +29,30 @@ binds the exact tracked sion_translate.yaml digest and configured training contr
 2. INSTALL THE PACKAGE AND CHECK CUDA
 -------------------------------------
 
-Use Python 3.11 or 3.12 and PyTorch 2.8 or newer.
+Automatic installation (verifies the bundle first and does not start training):
+
+python3 setup_gpu.py
+
+Internet access and Python venv/ensurepip support are required. If missing on an
+Ubuntu/Debian host, install python3-venv first. Use .venv/bin/python afterwards,
+or source .venv/bin/activate. The equivalent manual installation follows.
+
+Use the authenticated CPython 3.11/Linux x86_64/CUDA 12.8 dependency lock.
+easy_run.py requires exact critical package versions, including Torch 2.10.0+cu128.
+An unpinned install or Python 3.12 will fail its runtime preflight.
 
 nvidia-smi
-python3 -m pip install --upgrade pip
-python3 -m pip install -e ".[dev,export,hangul]"
+python3 -m pip install "uv==0.12.3"
+uv venv --no-config .venv --python cpython@3.11 --managed-python
+uv pip sync --no-config requirements/pylock.gpu-cp311-linux-x86_64-cu128.toml --python .venv/bin/python --require-hashes --strict --only-binary :all:
+uv pip install --no-config --python .venv/bin/python --no-deps --no-build-isolation --editable .
+source .venv/bin/activate
 
-python3 - <<'PY'
-from importlib.metadata import version
+python - <<'PY'
 import torch
 
-parsed = tuple(map(int, version("torch").split("+")[0].split(".")[:2]))
-assert parsed >= (2, 8), f"PyTorch 2.8 or newer is required: {torch.__version__}"
+assert torch.__version__ == "2.10.0+cu128", torch.__version__
+assert torch.version.cuda == "12.8", torch.version.cuda
 assert torch.cuda.is_available(), "This PyTorch installation has no CUDA support"
 print("PyTorch:", torch.__version__)
 print("CUDA runtime:", torch.version.cuda)
@@ -48,11 +60,8 @@ print("GPUs:", [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_c
 print("NCCL:", torch.distributed.is_nccl_available())
 PY
 
-If PyTorch is absent, use the official installer at:
-https://pytorch.org/get-started/locally/
-
-Do not guess a wheel URL from the driver version. NCCL is required when more than one GPU
-is visible.
+The lock installs the reviewed Torch build. Keep this environment active for the
+remaining commands. NCCL is required when more than one GPU is visible.
 
 
 3. AUTHENTICATE THE PREPARED INPUTS
@@ -71,21 +80,33 @@ clone without bundle metadata and must not replace this bundle's manifest verifi
 4. START OR RESUME TRAINING
 ---------------------------
 
-python3 easy_run.py
+easy_run.py reads the authenticated sion_translate.yaml and does not accept --config.
+The default now matches configs/modal_80gb.yaml: measured 273M model, foundation
+batch 32, SFT 32 x 8 accumulation, and MRT 8 x 2 accumulation capped at 100000 updates.
+The MRT update budget takes precedence over its epoch field. This profile targets
+one A100/H100 80GB; its runtime estimate does not establish multi-GPU scaling.
+The 100k cap is a budget scenario, not a validated quality target. Do not edit the
+authenticated configuration in an extracted bundle; rebuild after source changes.
 
-The runner validates the hardware and data, selects a smooth token-scaled architecture,
+.venv/bin/python easy_run.py
+
+The runner validates the hardware and data, applies the configured architecture,
 resumes the furthest authenticated stage, runs optional foundation pretraining,
 translation SFT, gold-anchored MRT/preference posttraining, and final verified export.
 
 To disable optional tmux handling:
 
-SION_NO_TMUX=1 python3 easy_run.py
+SION_NO_TMUX=1 .venv/bin/python easy_run.py
+
+These commands target an already provisioned GPU host. The repository's Modal scripts
+run bounded diagnostics, not a full training scheduler. Full Modal training additionally
+needs persistent checkpoint storage and resumption across execution windows.
 
 Automatic hardware policy:
 
 - Use every visible CUDA GPU.
 - Use BF16 only when every rank supports it; otherwise use FP16 automatically.
-- Select batch and checkpointing from the smallest visible VRAM capacity.
+- Apply the explicit 80GB batch/checkpointing profile and check the smallest visible VRAM.
 - Use DDP when full state fits, or FSDP2 when sharding is necessary.
 - Keep MRT candidate micro-batches conservative.
 - Do not enable torch.compile unless configuration explicitly requests it.
@@ -95,17 +116,17 @@ Automatic hardware policy:
 -----------------------
 
 Foundation best:
-  runs/auto/foundation/exports/best
+  runs/modal-80gb/foundation/exports/best
   This is the sion base model and cannot translate.
 
 Translation SFT best:
-  runs/auto/pretrain/exports/best
+  runs/modal-80gb/pretrain/exports/best
 
 Final translation best when MRT is enabled:
-  runs/auto/posttrain/exports/best
+  runs/modal-80gb/posttrain/exports/best
 
 Resume checkpoints:
-  runs/auto/*/checkpoints/latest
+  runs/modal-80gb/*/checkpoints/latest
 
 Prepared tokenizer and datasets:
   artifacts/tokenizer

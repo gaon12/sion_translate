@@ -105,6 +105,25 @@ def test_generated_config_points_only_data_artifacts_to_runtime(
         config_path.unlink(missing_ok=True)
 
 
+def test_default_launcher_preserves_mrt_update_cap_and_effective_batch(tmp_path: Path) -> None:
+    from sion_translate.config import load_config
+    from sion_translate.cli.train import _build_posttraining_config
+
+    generated = easy_run._generated_config(tmp_path / "data", tmp_path / "artifacts")
+    try:
+        config = load_config(generated)
+        post_config = _build_posttraining_config(config, Path(config.training.output_dir))
+        assert config.posttraining.enabled
+        assert post_config.training.max_steps == 100_000
+        assert (
+            post_config.training.batch_size_per_gpu
+            * post_config.training.gradient_accumulation_steps
+        ) == 16
+        assert post_config.training.save_every_seconds == 900
+    finally:
+        generated.unlink()
+
+
 def test_generated_config_preserves_explicit_source_sampling_alpha(
     tmp_path: Path, monkeypatch
 ) -> None:

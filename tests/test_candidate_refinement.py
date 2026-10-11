@@ -96,6 +96,46 @@ def test_full_vocabulary_expectation_and_draft_ce_match_dense_reference() -> Non
     torch.testing.assert_close(token_nll, dense_nll, rtol=1e-5, atol=1e-6)
 
 
+@pytest.mark.parametrize("use_bf16", [False, True])
+@pytest.mark.parametrize("tie_embeddings", [False, True])
+def test_unlabelled_refinement_skips_ce_without_changing_expectation_or_gradients(
+    monkeypatch: pytest.MonkeyPatch, use_bf16: bool, tie_embeddings: bool
+) -> None:
+    torch.manual_seed(31)  # pyright: ignore[reportUnknownMemberType]
+    config = _config()
+    config.tie_embeddings = tie_embeddings
+    model = SionForConditionalGeneration(config).eval()
+    labelled_hidden = torch.randn(2, 3, config.d_model, requires_grad=True)
+    unlabelled_hidden = labelled_hidden.detach().clone().requires_grad_(True)
+    labels = torch.tensor([[4, 5, -100], [6, 7, 8]])
+    weights = [model.token_embedding.weight]
+    if model.lm_head is not None:
+        weights.append(model.lm_head.weight)
+
+    with torch.autocast("cpu", dtype=torch.bfloat16, enabled=use_bf16, cache_enabled=False):
+        expected, _, _ = model._candidate_distribution_statistics(labelled_hidden, labels)
+
+    def unexpected_ce(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("Unlabelled generation must not compute unused draft CE reductions")
+
+    monkeypatch.setattr(model, "_accumulate_chunked_token_nll", unexpected_ce)
+    with torch.autocast("cpu", dtype=torch.bfloat16, enabled=use_bf16, cache_enabled=False):
+        actual, draft_loss, token_nll = model._candidate_distribution_statistics(
+            unlabelled_hidden, None
+        )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert draft_loss.shape == () and draft_loss.item() == 0
+    assert token_nll.shape == labels.shape and token_nll.count_nonzero().item() == 0
+    assert token_nll.dtype == torch.float32
+    expected_gradients = torch.autograd.grad(expected.square().sum(), (labelled_hidden, *weights))
+    actual_gradients = torch.autograd.grad(actual.square().sum(), (unlabelled_hidden, *weights))
+    for actual_gradient, expected_gradient in zip(
+        actual_gradients, expected_gradients, strict=True
+    ):
+        torch.testing.assert_close(actual_gradient, expected_gradient, rtol=0, atol=0)
+
+
 def test_training_supervises_draft_and_refinement_without_detaching_gradients() -> None:
     torch.manual_seed(5)  # pyright: ignore[reportUnknownMemberType]
     model = SionForConditionalGeneration(_config()).train()

@@ -49,6 +49,13 @@ CASE_SETS = {
         "sft": [(24, None)],
         "mrt": [(8, 8), (16, 8), (32, 8)],
     },
+    "balanced": {
+        # SFT 32x8 and MRT 16x1 preserve their production effective batch.
+        # Foundation 32x1 changes its effective batch and remains an experiment.
+        "foundation": [(32, None)],
+        "sft": [(32, None)],
+        "mrt": [(8, 4), (16, 4)],
+    },
 }
 
 
@@ -223,7 +230,9 @@ def run_case(
         if stage_name != "mrt" or not 1 <= candidate_micro_batch <= 64:
             raise ValueError("candidate micro-batch override requires MRT and a value in 1..64")
         config.posttraining.candidate_micro_batch = candidate_micro_batch
-        config.validate()
+    # Match train()'s validation after deriving the stage, not only before it.
+    # Otherwise a valid microbenchmark can mask a production startup failure.
+    config.validate()
     training = config.training
     effective_batch = training.batch_size_per_gpu * training.gradient_accumulation_steps
     tokenizer = SionTokenizer(directory / "tokenizer/sion.model")
@@ -360,7 +369,7 @@ def run_case(
 
     # Authenticate an actual full optimizer/EMA checkpoint once per stage.
     # Save and resume are outside steady-state throughput, but retain timings.
-    if batch_size in {1, 8, 24}:
+    if batch_size in {1, 8, 24, 32}:
         checkpoint = output.parent / f"checkpoint-{stage_name}"
         begin = time.perf_counter()
         save_checkpoint(checkpoint, model, optimizer, scheduler, total_updates, context, ema=ema)
@@ -390,7 +399,7 @@ def run_case(
 
         shutil.rmtree(checkpoint)
         write_json(output, report)
-    if batch_size == 24 and stage_name != "mrt":
+    if batch_size in {24, 32} and stage_name != "mrt":
         # Profile one warmed update outside the throughput window. Report actual
         # kernel dispatch instead of inferring the attention backend from VRAM.
         with make_profiler(torch, cuda=True) as profiler:
@@ -587,8 +596,10 @@ def build_app(data: Path, target: str):
     function = app.function(
         image=image,
         gpu=GPU_NAMES[target],
-        cpu=CPU,
-        memory=MEMORY_GIB * 1024,
+        # Scalar requests can burst above the values priced by the admission
+        # estimate. Use matching limits so CPU/RAM cannot silently exceed it.
+        cpu=(CPU, CPU),
+        memory=(MEMORY_GIB * 1024, MEMORY_GIB * 1024),
         timeout=TIMEOUT,
         startup_timeout=STARTUP,
         retries=0,
@@ -733,6 +744,25 @@ def status(args):
     import modal
 
     receipt = read_json(args.receipt)
+    if not receipt.get("call_id"):
+        if receipt.get("state") not in {"submission_intent", "failed"}:
+            raise ValueError("submitted probe receipt is missing its function call ID")
+        # Image construction can take minutes before spawn assigns a call ID.
+        # Do not overwrite the live receipt: the submitter may be adding it now.
+        print(
+            json.dumps(
+                {
+                    "receipt": str(args.receipt),
+                    "state": receipt["state"],
+                    "phase": receipt.get("phase", "app_initialization_before_spawn"),
+                    "app_id": receipt.get("app_id"),
+                    "error": receipt.get("error"),
+                    "message": "No function call ID recorded; inspect the submission process before retrying.",
+                },
+                indent=2,
+            )
+        )
+        return
     call = modal.FunctionCall.from_id(receipt["call_id"])
     result = None
     call_error = None

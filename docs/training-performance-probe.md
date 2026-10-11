@@ -35,6 +35,11 @@ provider recovery is separate from application retries. Storage, image builds,
 network, and billing-report delays remain outside that estimate; the provider's
 hard budget is the independent spending backstop.
 
+CPU and RAM requests now have matching container limits. A scalar Modal resource
+request can burst and is billed at actual usage when higher; estimating costs
+from that request alone understates the possible bill. The limits cover the
+probe's 8 physical cores and 48 GiB RAM. They do not cap non-compute charges.
+
 After the initial sweep, `--case-set headroom` measures CE batch 24 and MRT
 source batches 8, 16, and 32 with candidate micro-batch 8. These are explicit
 experimental overrides, not saved production configuration changes. Effective
@@ -43,6 +48,13 @@ precision, warms every measured CE shape, and profiles a separate warmed CE
 update to identify the actual attention backend. Earlier receipts without this
 precision field used PyTorch's default and should not be mixed into a final
 like-for-like speed comparison.
+
+After the masked-GQA optimization, `--case-set balanced` measures CE batch 32
+and MRT source batches 8/16 with candidate micro-batch 4. SFT accumulation 8
+preserves effective batch 256; MRT accumulation 2/1 preserves effective batch 16.
+Foundation batch 32 changes its effective batch from 16 to 32. All cases still
+exercise the longest-row cohort; discard fast representative timings when that
+stress test runs out of memory.
 
 Each call is limited to 1,200 seconds, with zero application retries. Each batch
 candidate runs in a separate process with a shorter timeout. Progress, results,
@@ -76,3 +88,21 @@ Local receipts and recovered results live under `artifacts/modal-probes`.
 Warnings are not filtered. The known Modal 1.5.3 container-bootstrap unclosed-file
 warning occurs before project code starts and must remain visible in the report,
 even if every project computation passes.
+
+## Calculate a training scenario
+
+```powershell
+python scripts/estimate_training_cost.py artifacts/modal-probes/RUN_ID/result.json --output artifacts/training-estimate.json
+python scripts/estimate_training_cost.py artifacts/modal-probes/RUN_ID/result.json --mrt-max-steps 100000 --output artifacts/training-estimate-mrt100k.json
+```
+
+The calculator requires a completed run with production BF16/high matmul settings.
+It selects the fastest passing case per stage below 85% peak reserved VRAM and
+excludes OOM/failed cases even if they contain throughput measurements. The JSON
+records the selected accumulation, effective-batch changes, excluded candidates,
+snapshot hashes, and pricing assumptions. Single-GPU measurements cannot predict
+multi-GPU scaling. The default extra 20–50% time is an explicit sensitivity
+scenario, not a confidence interval; full-corpus MRT rollouts may differ much more.
+Old reports without `drop_last` project all recorded rows, including at most one
+incomplete microbatch per epoch. This small rounding term is separate from the
+much larger sampling and runtime uncertainty.

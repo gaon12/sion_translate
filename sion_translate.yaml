@@ -2,9 +2,10 @@
 # sion_translate 1.5 production configuration
 #
 # `sion-train` loads this file automatically when no --config path is given.
-# Unspecified values are selected from the effective data size and available
-# CPU/GPU resources. Uncomment only the settings that a measured experiment
-# needs to override.
+# Default launch uses the measured single A100/H100 80GB profile and caps MRT
+# at 100,000 optimizer updates. See docs/gpu-training-audit-2026-09-03.md.
+# Unspecified values still follow the automatic policy. Re-measure after
+# changing the corpus, vocabulary, model, sequence lengths, or objectives.
 #
 # Automatic policy covers:
 #   - smooth token-scaled capacity from a dense valid architecture ladder;
@@ -76,17 +77,15 @@ model:
     # disabled until a separate ablation.
     semantic_parity_enabled: false
 
-# To pin capacity manually, uncomment a complete compatible set. By default,
-# the authenticated prepared src+tgt token total selects a smooth capacity
-# target; virtual graph directions and repeated epochs do not inflate it.
-#   d_model: 768
-#   encoder_layers: 16
-#   decoder_layers: 8
-#   num_heads: 12
-#   num_kv_heads: 6
-#   d_ff: 2048
-#   dropout: 0.10
-#   label_smoothing: 0.10
+  # Measured architecture: 273,484,225 parameters with this vocabulary.
+  vocab_size: 48000
+  d_model: 832
+  encoder_layers: 18
+  decoder_layers: 9
+  num_heads: 8
+  num_kv_heads: 4
+  d_ff: 2304
+  gradient_checkpointing: false
 
 data:
   # Adding or changing an immediate JSONL file updates the authenticated source
@@ -99,6 +98,9 @@ data:
   tokenizer_model: artifacts/tokenizer/sion.model
   tokenizer_features: artifacts/tokenizer/token_features.npz
   dataset_dir: artifacts/dataset
+  max_source_length: 512
+  max_target_length: 512
+  num_workers: 7
 
   # Character 5-gram MinHash grouping keeps near duplicates in one split.
   approximate_split: true
@@ -190,9 +192,17 @@ foundation:
   # normalization regression caused a native crash. See
   # docs/sentencepiece-sigsegv.md for the reproduced evidence and policy.
   tokenizer_sample_ratio: 0.40
+  batch_size_per_gpu: 32
+  gradient_accumulation_steps: 1
 
 training:
-  output_dir: runs/auto
+  # New identity avoids resuming an incompatible older automatic batch plan.
+  output_dir: runs/modal-80gb
+  precision: bf16
+  compile: false
+  batch_size_per_gpu: 32
+  gradient_accumulation_steps: 8
+  save_every_seconds: 900
 
   # Publish candidate-refinement weights only when the deployed raw or EMA
   # family improves every configured direction by this held-out token-NLL margin.
@@ -205,6 +215,7 @@ training:
 #   batch_size_per_gpu: 16          # Lower first after an SFT OOM.
 #   num_train_epochs: 3             # Complete corpus passes.
 #   ema_decay: 0.999                # Zero disables EMA.
+#   save_every_seconds: 900         # Resume save at next completed update; 0 disables.
 #   early_stopping_min_epochs: 2
 #   early_stopping_patience: 5
 #   precision: bf16                 # fp32 / bf16 / fp16
@@ -214,21 +225,23 @@ training:
 #   final_export_formats: [fp32, fp16, bf16, int8, int4, gguf_q4_k_m, transformers]
 
 # Run composite MRT and candidate-preference training after translation SFT.
-# The SFT comparison artifact is under runs/auto/pretrain; the final refined
-# deployment artifact is under runs/auto/posttrain.
+# The SFT comparison artifact is under runs/modal-80gb/pretrain; the final
+# refined deployment artifact is under runs/modal-80gb/posttrain.
 posttraining:
   enabled: true
   method: mrt
   num_train_epochs: 2
+  # Explicit update budget takes precedence over the epoch count.
+  max_steps: 100000
 
-  # Candidate generation varies more in memory than teacher-forced SFT. Start
-  # with micro-batch one and preserve effective batch through accumulation.
-  batch_size_per_gpu: 1
-  gradient_accumulation_steps: 16
+  # Long-row stress passed at source batch 8; source batch 16 ran out of memory.
+  # Preserve effective batch 16 while increasing GPU work per microbatch.
+  batch_size_per_gpu: 8
+  gradient_accumulation_steps: 2
   learning_rate: 0.00003
   warmup_steps: 200
   samples_per_source: 4
-  candidate_micro_batch: 1
+  candidate_micro_batch: 4
   candidate_gradient_checkpointing: true
   sampling_temperature: 1.0
   top_k: 64

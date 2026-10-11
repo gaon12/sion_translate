@@ -9,8 +9,9 @@ translation training while believing that a 5 GB corpus was used.
 from __future__ import annotations
 
 import pytest
+from pathlib import Path
 
-from sion_translate.config import AppConfig
+from sion_translate.config import AppConfig, load_config
 from sion_translate.foundation import (
     build_foundation_config,
     build_translation_pipeline_identity,
@@ -200,6 +201,27 @@ def test_the_derived_config_uses_a_direction_free_selection_metric(tmp_path) -> 
 
 def test_the_derived_config_still_validates(tmp_path) -> None:
     build_foundation_config(_config(tmp_path)).validate()
+
+
+def test_production_source_only_holdouts_do_not_invalidate_foundation():
+    config = load_config(Path(__file__).resolve().parents[1] / "sion_translate.yaml")
+    original_files = list(config.data.source_only_synthetic_evidence_files)
+    assert original_files
+    derived = build_foundation_config(config)
+    derived.validate()
+    assert derived.data.source_only_synthetic_evidence_files == []
+    assert config.data.source_only_synthetic_evidence_files == original_files
+
+
+def test_custom_source_only_evidence_is_cleared_without_language_special_cases(tmp_path):
+    config = _config(tmp_path)
+    config.data.language_pairs = [["mixed", "de"], ["de", "fr"]]
+    config.data.source_only_languages = ["mixed"]
+    config.data.refinement_evidence_fraction = 0.02
+    config.data.source_only_synthetic_evidence_files = ["synthetic_mixed.jsonl"]
+    config.validate()
+    build_foundation_config(config).validate()
+    assert config.data.source_only_synthetic_evidence_files == ["synthetic_mixed.jsonl"]
 
 
 def test_deriving_does_not_mutate_the_translation_config(tmp_path) -> None:

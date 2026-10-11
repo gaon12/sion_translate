@@ -25,12 +25,37 @@ def test_modal_app_definition_is_valid_without_submitting(tmp_path):
     assert function is not None
 
 
+def test_probe_resource_limits_match_the_compute_contingency(tmp_path, monkeypatch):
+    modal = pytest.importorskip("modal")
+    observed = {}
+
+    def function(**kwargs):
+        observed.update(kwargs)
+        return lambda worker: worker
+
+    monkeypatch.setattr(modal, "App", lambda *args, **kwargs: SimpleNamespace(function=function))
+    probe.build_app(tmp_path, "h100")
+    assert observed["cpu"] == (probe.CPU, probe.CPU)
+    assert observed["memory"] == (probe.MEMORY_GIB * 1024, probe.MEMORY_GIB * 1024)
+    assert observed["retries"] == 0
+    assert observed["timeout"] == probe.TIMEOUT
+
+
 def test_headroom_cases_keep_all_stages_and_explicit_candidate_batching():
     cases = probe.CASE_SETS["headroom"]
     assert cases["foundation"] == [(24, None)]
     assert cases["sft"] == [(24, None)]
     assert cases["mrt"] == [(8, 8), (16, 8), (32, 8)]
     assert probe.compute_contingency("h100") < 4
+
+
+def test_balanced_cases_preserve_sft_and_mrt_effective_batch_divisibility():
+    cases = probe.CASE_SETS["balanced"]
+    assert cases["foundation"] == [(32, None)]
+    assert cases["sft"] == [(32, None)]
+    assert 256 % cases["sft"][0][0] == 0
+    assert cases["mrt"] == [(8, 4), (16, 4)]
+    assert all(16 % batch == 0 for batch, _ in cases["mrt"])
 
 
 def test_profiler_preserves_events_under_strict_warnings():
@@ -130,14 +155,26 @@ def test_production_config_uses_full_token_count_and_mocked_80gb_gpu(
     }
     environment = EnvironmentInfo(True, 1, 1, "NVIDIA A100 80GB", 80.0, True, 8, "Linux")
     monkeypatch.setattr(automatic, "probe_environment", lambda: environment)
-    resolved, decisions = probe.resolved_config(plan, tmp_path)
+    observed_counts = {}
+    apply_auto_settings = automatic.apply_auto_settings
+
+    def record_auto_settings(*args, **kwargs):
+        observed_counts.update(kwargs)
+        return apply_auto_settings(*args, **kwargs)
+
+    monkeypatch.setattr(automatic, "apply_auto_settings", record_auto_settings)
+    resolved, _decisions = probe.resolved_config(plan, tmp_path)
     assert resolved.training.precision == "bf16"
     assert resolved.training.compile is False
     assert resolved.model.vocab_size == 48_000
     assert resolved.model.d_model == 832
     assert resolved.model.encoder_layers == 18 and resolved.model.decoder_layers == 9
     assert resolved.training.num_train_epochs == 3
-    assert any("1,550,725,850" in decision for decision in decisions)
+    # Explicit architecture pins skip the automatic sizing log. Verify the
+    # complete dataset reaches the policy rather than relying on that message.
+    assert observed_counts["train_examples"] == 56_109_623
+    assert observed_counts["physical_train_pairs"] == 28_148_216
+    assert observed_counts["physical_train_tokens"] == 1_550_725_850
     assert resolved.data.tokenizer_model == str(tmp_path / "tokenizer/sion.model")
     assert plan["config"] == asdict(config)
 
@@ -159,6 +196,47 @@ def test_worker_imports_and_scheduler_checkpoint_bindings_match_real_apis():
                     *([None] * len(node.args)),
                     **{keyword.arg: None for keyword in node.keywords},
                 )
+
+
+def test_invalid_derived_stage_stops_before_model_allocation(tmp_path, monkeypatch):
+    import torch
+    import sion_translate.foundation as foundation
+
+    config = config_from_raw(
+        load_raw_config(Path(__file__).resolve().parents[1] / "sion_translate.yaml")
+    )
+    config.data.source_only_languages = []
+    monkeypatch.setattr(torch, "set_num_threads", lambda _: None)
+    monkeypatch.setattr(torch, "manual_seed", lambda _: None)
+    monkeypatch.setattr(torch.cuda, "manual_seed_all", lambda _: None)
+    monkeypatch.setattr(probe, "verify_plan", lambda *_: {})
+    monkeypatch.setattr(probe, "resolved_config", lambda *_: (config, []))
+    monkeypatch.setattr(foundation, "build_foundation_config", lambda _: config)
+    with pytest.raises(ValueError, match="requires source_only_languages"):
+        probe.run_case(tmp_path, "0" * 64, "foundation", 32, tmp_path / "result.json")
+
+
+@pytest.mark.parametrize("state", ["submission_intent", "failed"])
+def test_status_before_spawn_does_not_access_a_call_or_overwrite_receipt(
+    tmp_path, monkeypatch, capsys, state
+):
+    receipt = tmp_path / "receipt.json"
+    probe.write_json(receipt, {"state": state, "app_id": "ap-building"})
+    before = receipt.read_bytes()
+    monkeypatch.setitem(sys.modules, "modal", SimpleNamespace())
+    probe.status(SimpleNamespace(receipt=receipt))
+    status = json.loads(capsys.readouterr().out)
+    assert status["state"] == state
+    assert status["app_id"] == "ap-building"
+    assert receipt.read_bytes() == before
+
+
+def test_status_rejects_a_submitted_receipt_without_a_call_id(tmp_path, monkeypatch):
+    receipt = tmp_path / "receipt.json"
+    probe.write_json(receipt, {"state": "submitted"})
+    monkeypatch.setitem(sys.modules, "modal", SimpleNamespace())
+    with pytest.raises(ValueError, match="missing its function call ID"):
+        probe.status(SimpleNamespace(receipt=receipt))
 
 
 @pytest.mark.parametrize("outcome", ["success", "error", "pending"])
