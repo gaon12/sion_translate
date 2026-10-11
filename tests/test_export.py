@@ -46,6 +46,23 @@ def export_config(*, d_model: int = 32) -> ModelConfig:
     )
 
 
+def test_native_loader_materializes_derived_rope_buffers(tmp_path: Path) -> None:
+    config = export_config()
+    original = SionForConditionalGeneration(config)
+    path = tmp_path / "legacy.pt"
+    torch.save({"model_config": asdict(config), "pad_id": 0, "model": original.state_dict()}, path)
+    restored, _, _ = load_exported_model(path)
+    restored.to("cpu")
+    for name, buffer in restored.named_buffers():
+        assert buffer.device.type == "cpu", name
+        torch.testing.assert_close(buffer, dict(original.named_buffers())[name])
+    ids = torch.tensor([[4, 20, 3]])
+    original.eval()
+    with torch.no_grad():
+        mask = torch.ones_like(ids, dtype=torch.bool)
+        torch.testing.assert_close(restored(ids, mask, ids).logits, original(ids, mask, ids).logits)
+
+
 def test_loader_resolves_pre_rename_kjx_module_pickles(tmp_path: Path) -> None:
     legacy_root = types.ModuleType("kjx")
     legacy_root.__path__ = []

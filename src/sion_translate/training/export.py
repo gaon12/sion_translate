@@ -1619,6 +1619,13 @@ def load_exported_model(
         # another full model before copying.  This keeps strict validation of a
         # 32B FP32 artifact near one model's host-memory footprint rather than two.
         model.load_state_dict(state, assign=True)
+        # RoPE caches are non-persistent, so the state dictionary cannot fill
+        # their meta tensors. Rebuild only these derived buffers on the CPU
+        # before Translator moves the model to its requested device.
+        for module in model.modules():
+            if isinstance(module, RotaryEmbedding):
+                module.cos, module.sin = module._build_cache("cpu")
+                module._cache_device = "cpu"
     model.eval()
     metadata = copy.deepcopy(payload.get("metadata") or {})
     if isinstance(quantization, Mapping):

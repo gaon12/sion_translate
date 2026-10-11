@@ -64,6 +64,11 @@ _TRANSLATABLE_NUMBER_SUFFIX = re.compile(
     re.IGNORECASE,
 )
 
+# In legacy inference, keep units visible to the decoder and hide only values.
+# A hidden ``250mg`` can make v1 invent a second counter after the slot.
+_NUMERIC_VALUE = re.compile(r"(?:[$€£¥₩₹]\s*)?[+\-±−＋－]?\d+(?:[.,:/\-]\d+)*")
+_DIGIT_IDENTIFIER = re.compile(r"(?<![A-Za-z0-9_])\d+(?:-\d+){2,}(?![A-Za-z0-9_])")
+
 _URL_TRAILING_PUNCTUATION = ".,!?;:。！？、，；："
 _URL_KOREAN_PARTICLES = tuple(
     sorted(
@@ -413,12 +418,34 @@ def mask_structured_spans(
     text: str,
     *,
     slot_symbols: Sequence[str],
+    keep_number_units_visible: bool = False,
 ) -> tuple[str, dict[str, str]]:
     """Mask source-side structured values and return ``slot -> exact surface``."""
 
-    selected = _select_non_overlapping(extract_structured_spans(text))
+    candidates = extract_structured_spans(text)
+    if keep_number_units_visible:
+        refined: list[StructuredSpan] = []
+        for span in candidates:
+            if span.kind != "number":
+                refined.append(span)
+                continue
+            for match in _NUMERIC_VALUE.finditer(span.surface):
+                start = span.start + match.start()
+                end = span.start + match.end()
+                if start == span.start and start > 0 and text[start - 1] in "±−＋－":
+                    start -= 1
+                refined.append(_span(start, end, text[start:end], "number"))
+        # A phone/account ID is one opaque value, not a translatable range.
+        for match in _DIGIT_IDENTIFIER.finditer(text):
+            refined.append(_span(match.start(), match.end(), match.group(), "number"))
+        candidates = refined
+    selected = _select_non_overlapping(candidates)
     ordered_keys = list(dict.fromkeys(span.key for span in selected))[: len(slot_symbols)]
     key_to_slot = dict(zip(ordered_keys, slot_symbols[: len(ordered_keys)], strict=True))
+    if keep_number_units_visible and any(
+        span.kind == "number" and span.key not in key_to_slot for span in selected
+    ):
+        raise ValueError("Too many protected numeric values for the tokenizer's available slots")
     first_surface: dict[str, str] = {}
     for span in selected:
         first_surface.setdefault(span.key, span.surface)

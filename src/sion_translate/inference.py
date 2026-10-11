@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import hashlib
 import math
+import re
 import warnings
 from collections.abc import Mapping
+from collections import Counter
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -27,6 +29,21 @@ from sion_translate.tokenizer import (
     tokenizer_split_digits_policy,
 )
 from sion_translate.training.export import load_exported_model, resolve_manifest_artifact
+
+
+class NumericPreservationError(ValueError):
+    """Legacy decoding dropped or duplicated a protected numeric value."""
+
+
+def _numeric_times(text: str, language: str) -> Counter[tuple[str, str]]:
+    units = {"ko": ("시", "분"), "ja": ("時", "分")}.get(language)
+    if units is None:
+        return Counter()
+    hour, minute = units
+    return Counter(
+        (match.group(1), match.group(2))
+        for match in re.finditer(rf"(?<!\d)(\d+)\s*{hour}\s*(\d+)\s*{minute}", text)
+    )
 
 
 def _language_pairs_from_metadata(
@@ -149,16 +166,17 @@ class Translator:
         tokenizer_path = Path(tokenizer_path)
         self.tokenizer = SionTokenizer(tokenizer_path)
         declared_split_digits = tokenizer_split_digits_policy(tokenizer_path)
-        if declared_split_digits is False or (
+        self._legacy_numeric_protection = declared_split_digits is False or (
             declared_split_digits is None and not self.tokenizer.splits_digits
-        ):
+        )
+        if self._legacy_numeric_protection:
             # split_digits 없이 학습된 토크나이저는 숫자를 덩어리로 암기하므로
             # 금액·용량·날짜가 조용히 다른 값으로 바뀔 수 있습니다. 출력만 보고는
             # 알아채기 어려우므로 로드 시점에 한 번 알립니다.
             warnings.warn(
                 f"{tokenizer_path} 는 숫자를 자릿수로 분리하지 않습니다. "
-                "금액·용량·날짜가 다른 값으로 바뀔 수 있으니 숫자가 중요한 문장은 "
-                "사람이 검토하세요. 재학습 시에는 split_digits 를 켜십시오.",
+                "추론 시 숫자값을 자동 보호하고 복원합니다. 숫자와 단위의 의미까지 "
+                "보장하지는 않으므로 중요한 문장은 검토하세요.",
                 RuntimeWarning,
                 stacklevel=2,
             )
@@ -553,6 +571,7 @@ class Translator:
         glossary: Glossary | None = None,
         append_missing_glossary: bool = True,
         append_missing_structured: bool = True,
+        strict_numbers: bool = True,
         num_candidates: int = 0,
         rerank: str = "mbr+qe",
         temperature: float = 0.3,
@@ -580,6 +599,11 @@ class Translator:
         숫자·단위·URL·현지화 플레이스홀더도 같은 slot 경로로 자동 보호하고
         원문의 정확한 표면형으로 복원합니다. 모델이 slot 을 누락했을 때에도
         ``append_missing_structured`` 가 참이면 값 자체가 사라지지 않게 덧붙입니다.
+
+        숫자를 분리하지 않는 v1 토크나이저는 단위 문맥을 남기고 숫자값만
+        보호합니다. 기본 ``strict_numbers=True`` 는 보호값의 누락·중복과
+        한국어↔일본어 시·분 대응 오류를 거부합니다. ``False`` 는 진단용으로
+        검증되지 않은 출력을 허용하므로 정상 서비스에서는 켜 두십시오.
 
         ``num_candidates`` 를 1 이상으로 두면 beam 결과에 더해 그 수만큼 확률적
         후보를 뽑고 ``rerank`` 방식으로 하나를 고릅니다 (``sion_translate.rerank``
@@ -655,10 +679,24 @@ class Translator:
             row: Sequence[int],
             structured_map: dict[str, str] | None,
             glossary_map: dict[str, str] | None,
+            numeric_counts: dict[str, int],
+            source_text: str,
         ) -> str:
             """생성 토큰을 문자열로 되돌리고 보호 slot 을 복원합니다."""
             tokens = [token for token in row if token not in special_ids]
             text = self.tokenizer.decode(tokens)
+            if strict_numbers and numeric_counts:
+                failures = [
+                    structured_map[slot]
+                    for slot, count in numeric_counts.items()
+                    if text.count(slot) != count
+                ]
+                if failures:
+                    raise NumericPreservationError(
+                        "Legacy numeric protection could not preserve each value's "
+                        f"occurrence count: {failures!r}. No repaired translation was returned. "
+                        "Use a shorter input or strict_numbers=False to inspect unverified output."
+                    )
             if structured_map:
                 text, missing = restore_targets(text, structured_map)
                 if missing and append_missing_structured:
@@ -669,6 +707,14 @@ class Translator:
                     # 모델이 slot 을 흘린 경우: 최소한의 용어 보존을 위해
                     # 강제 용어를 괄호로 덧붙입니다.
                     text = f"{text} ({', '.join(missing)})"
+            if strict_numbers and self._legacy_numeric_protection:
+                expected_times = _numeric_times(source_text, source_language)
+                if expected_times - _numeric_times(text, target_language):
+                    raise NumericPreservationError(
+                        "Legacy numeric protection could not preserve hour/minute associations. "
+                        "No repaired translation was returned. Use a shorter input or "
+                        "strict_numbers=False to inspect unverified output."
+                    )
             return text
 
         for start in range(0, len(texts), batch_size):
@@ -678,11 +724,20 @@ class Translator:
             # 글로서리 적용: 원문의 용어를 slot 으로 치환하고 문장별 매핑을 보관.
             structured_maps: list[dict[str, str]] = []
             glossary_maps: list[dict[str, str]] = []
+            numeric_counts: list[dict[str, int]] = []
             prepared: list[str] = []
             for text in chunk:
                 masked, structured_map = mask_structured_spans(
                     text,
                     slot_symbols=SLOT_SYMBOLS,
+                    keep_number_units_visible=self._legacy_numeric_protection,
+                )
+                numeric_counts.append(
+                    {
+                        slot: masked.count(slot)
+                        for slot, surface in structured_map.items()
+                        if self._legacy_numeric_protection and re.search(r"\d", surface)
+                    }
                 )
                 structured_maps.append(structured_map)
                 glossary_map: dict[str, str] = {}
@@ -763,7 +818,13 @@ class Translator:
                 **({} if generation_context is not None else generation_features),
             )
             beam_texts = [
-                restore(row, structured_maps[index], glossary_maps[index])
+                restore(
+                    row,
+                    structured_maps[index],
+                    glossary_maps[index],
+                    numeric_counts[index],
+                    sources[index],
+                )
                 for index, row in enumerate(generated.tolist())
             ]
 
@@ -792,11 +853,18 @@ class Translator:
             for row_index, source_text in enumerate(sources):
                 candidates = [beam_texts[row_index]]
                 for sample_row in sampled[row_index].tolist():
-                    candidate = restore(
-                        sample_row,
-                        structured_maps[row_index],
-                        glossary_maps[row_index],
-                    )
+                    try:
+                        candidate = restore(
+                            sample_row,
+                            structured_maps[row_index],
+                            glossary_maps[row_index],
+                            numeric_counts[row_index],
+                            source_text,
+                        )
+                    except NumericPreservationError:
+                        # Keep the verified beam result; an invalid stochastic
+                        # candidate must not enter reranking or discard it.
+                        continue
                     # 같은 문장을 여러 번 채점할 이유가 없습니다.
                     if candidate not in candidates:
                         candidates.append(candidate)

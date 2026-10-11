@@ -44,6 +44,99 @@ class FakeTokenizer:
         return " ".join(map(str, ids))
 
 
+class LegacyNumericTokenizer(FakeTokenizer):
+    splits_digits = False
+
+
+@pytest.mark.parametrize(
+    ("source", "decoded", "expected"),
+    [
+        ("17시 30분", "<slot_0>時<slot_1>分", "17時30分"),
+        ("17시와 17시", "<slot_0>時と<slot_0>時", "17時と17時"),
+    ],
+)
+def test_legacy_numeric_slots_restore_time_and_repeated_values(
+    monkeypatch, tmp_path: Path, source: str, decoded: str, expected: str
+) -> None:
+    with pytest.warns(RuntimeWarning, match="자동 보호"):
+        translator = make_translator(
+            monkeypatch, tmp_path, runtime_config(), tokenizer_class=LegacyNumericTokenizer
+        )
+    monkeypatch.setattr(translator.tokenizer, "decode", lambda _ids: decoded)
+    monkeypatch.setattr(
+        translator.model, "generate", lambda *_args, **_kw: torch.tensor([[2, 20, 3]])
+    )
+    assert translator.translate([source], target_language="ja", max_new_tokens=4) == [expected]
+
+
+@pytest.mark.parametrize("decoded", ["1730分", "<slot_0>時", "<slot_0>時<slot_1>分<slot_1>分"])
+def test_legacy_numeric_slots_reject_dropped_or_duplicated_values(
+    monkeypatch, tmp_path: Path, decoded: str
+) -> None:
+    with pytest.warns(RuntimeWarning, match="자동 보호"):
+        translator = make_translator(
+            monkeypatch, tmp_path, runtime_config(), tokenizer_class=LegacyNumericTokenizer
+        )
+    monkeypatch.setattr(translator.tokenizer, "decode", lambda _ids: decoded)
+    monkeypatch.setattr(
+        translator.model, "generate", lambda *_args, **_kw: torch.tensor([[2, 20, 3]])
+    )
+    with pytest.raises(inference.NumericPreservationError, match="No repaired translation"):
+        translator.translate(["17시 30분"], target_language="ja", max_new_tokens=4)
+
+
+@pytest.mark.parametrize("decoded", ["<slot_0><slot_1>分", "<slot_1>時<slot_0>分"])
+def test_legacy_time_units_reject_joined_or_swapped_time_values(
+    monkeypatch, tmp_path: Path, decoded: str
+) -> None:
+    with pytest.warns(RuntimeWarning, match="자동 보호"):
+        translator = make_translator(
+            monkeypatch, tmp_path, runtime_config(), tokenizer_class=LegacyNumericTokenizer
+        )
+    monkeypatch.setattr(translator.tokenizer, "decode", lambda _ids: decoded)
+    monkeypatch.setattr(
+        translator.model, "generate", lambda *_args, **_kw: torch.tensor([[2, 20, 3]])
+    )
+    with pytest.raises(inference.NumericPreservationError, match="hour/minute associations"):
+        translator.translate(["17시 30분"], target_language="ja", max_new_tokens=4)
+
+
+def test_legacy_numeric_optout_exposes_unverified_output(monkeypatch, tmp_path: Path) -> None:
+    with pytest.warns(RuntimeWarning, match="자동 보호"):
+        translator = make_translator(
+            monkeypatch, tmp_path, runtime_config(), tokenizer_class=LegacyNumericTokenizer
+        )
+    monkeypatch.setattr(translator.tokenizer, "decode", lambda _ids: "<slot_0>時")
+    monkeypatch.setattr(
+        translator.model, "generate", lambda *_args, **_kw: torch.tensor([[2, 20, 3]])
+    )
+    assert translator.translate(
+        ["17시 30분"], target_language="ja", max_new_tokens=4, strict_numbers=False
+    ) == ["17時 (30)"]
+
+
+def test_legacy_reranking_excludes_invalid_numeric_sample(monkeypatch, tmp_path: Path) -> None:
+    with pytest.warns(RuntimeWarning, match="자동 보호"):
+        translator = make_translator(
+            monkeypatch, tmp_path, runtime_config(), tokenizer_class=LegacyNumericTokenizer
+        )
+    monkeypatch.setattr(
+        translator.tokenizer,
+        "decode",
+        lambda ids: "1730分" if 21 in ids else "<slot_0>時<slot_1>分",
+    )
+    monkeypatch.setattr(translator.model, "prepare_generation", lambda *_args, **_kw: object())
+    monkeypatch.setattr(
+        translator.model, "generate", lambda *_args, **_kw: torch.tensor([[2, 20, 3]])
+    )
+    monkeypatch.setattr(
+        translator.model, "sample", lambda *_args, **_kw: torch.tensor([[[2, 21, 3], [2, 20, 3]]])
+    )
+    assert translator.translate(
+        ["17시 30분"], target_language="ja", max_new_tokens=4, num_candidates=2
+    ) == ["17時30分"]
+
+
 class MultilingualFakeTokenizer(FakeTokenizer):
     language_tags = {"ja": 4, "ko": 5, "en": 12, "ru": 13}
     denoise_tags = {"ja": 7, "ko": 8, "en": 14, "ru": 15}

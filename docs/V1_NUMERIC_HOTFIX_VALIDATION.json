@@ -1,0 +1,199 @@
+{
+  "schema": "sion-v1-numeric-hotfix-validation-v1",
+  "date": "2026-10-12",
+  "model_repo": "gaon12/sion_translate",
+  "model_revision": "2e478ef0e62c613c65c09e628c910fd69797ec91",
+  "artifacts": {
+    "model_ema.pt": {
+      "size": 802029835,
+      "sha256": "829580d1db1693ec00ee641398ce6ba9549388e266f6259f85e5a19ea28bfc2e"
+    },
+    "kjx.model": {
+      "size": 852890,
+      "sha256": "c1b5447e08692bf7a7d2e485ba7b71b3ff5584c96844ecac07e25c9d1340db50"
+    },
+    "token_features.npz": {
+      "size": 69121,
+      "sha256": "54951b569255bd0a2e1d333860db2294113f1368a2e25e4ae5bc2bcdb6976b4c"
+    }
+  },
+  "retrained": false,
+  "weights_changed": false,
+  "original_runtime_commit": "603f40f21860797332802ceac3fa341b78105172",
+  "previous_documented_runtime_commit": "ad09f1bb906bf30ae15cbd177df549ac812cc853",
+  "previous_documented_runtime_note": "RoPE buffers were rebuilt to make its safe loader runnable; numeric protection was unchanged.",
+  "runtime_ref": "v1-numeric-hotfix",
+  "regression_tests_passed": 78,
+  "regression_validation_note": "76 tests passed together; the corrected RoPE test and the added candidate-filtering test passed separately. Ruff check and formatting passed for changed Python files.",
+  "probe_settings": {
+    "torch_version": "2.13.0+cpu",
+    "device": "cpu",
+    "precision": "fp32",
+    "num_beams": 4,
+    "length_penalty": 1.0,
+    "max_new_tokens": 100,
+    "batch_size": 6,
+    "strict_numbers": true
+  },
+  "probe_cases": 18,
+  "numeric_cases": 16,
+  "greeting_cases": 2,
+  "scope": "Authored diagnostic inputs; source literal preservation allows added digits from translated word-written numbers. No full translation benchmark, arithmetic, or general unit-semantic improvement is claimed.",
+  "runtime_source_sha256": {
+    "src/sion_translate/inference.py": "8cb98b0b189c45ae03ffe2e9cf253ec92bf431c040da334ec34bfe36d6283a49",
+    "src/sion_translate/structured.py": "e535b2614902a9333fdc6b8d7d865146321fa6430680fedc171e5792b3f4f36a",
+    "src/sion_translate/training/export.py": "058cdc57cbdc7a942446f44673248ed07d679d247f7ff4cb8ffaa9845f0d9e5b"
+  },
+  "rows": [
+    {
+      "source_language": "ko",
+      "target_language": "ja",
+      "source": "회의는 17시 30분에 시작합니다.",
+      "translation": "会議は17時30分に始まります。",
+      "source_literal_values_preserved": true,
+      "previous_documented_runtime_output": "会議は17時30分に始まります。",
+      "original_v1_runtime_output": "会議は17時半に始まります。"
+    },
+    {
+      "source_language": "ko",
+      "target_language": "ja",
+      "source": "17시 30분",
+      "translation": "17時30分",
+      "source_literal_values_preserved": true,
+      "previous_documented_runtime_output": "17時30分",
+      "original_v1_runtime_output": "１７時半"
+    },
+    {
+      "source_language": "ko",
+      "target_language": "ja",
+      "source": "17시 30분부터 18시 45분까지입니다.",
+      "translation": "17時30分から18時45分までです。",
+      "source_literal_values_preserved": true,
+      "previous_documented_runtime_output": "17時30分から18時45分までです。"
+    },
+    {
+      "source_language": "ko",
+      "target_language": "ja",
+      "source": "농도는 0.0037mg/L 이하로 유지하세요.",
+      "translation": "濃度は0.0037 mg/L以下に保ってください。",
+      "source_literal_values_preserved": true,
+      "previous_documented_runtime_output": "濃度は0.0037mg/L以下に保ってください。",
+      "original_v1_runtime_output": "濃度は1.337mg/L以下に保ってください。"
+    },
+    {
+      "source_language": "ko",
+      "target_language": "ja",
+      "source": "250mg씩 하루 두 번 복용하세요.",
+      "translation": "250mgずつ1日2回服用してください。",
+      "source_literal_values_preserved": true,
+      "previous_documented_runtime_output": "250mg回ずつ1日2回服用してください。",
+      "original_v1_runtime_output": "1200mgずつ1日2回服用してください。"
+    },
+    {
+      "source_language": "ko",
+      "target_language": "ja",
+      "source": "비율은 35%에서 62.5%로 증가했습니다.",
+      "translation": "割合は 35% から 62.5% に増加しました。",
+      "source_literal_values_preserved": true,
+      "previous_documented_runtime_output": "割合は 35% から 62.5% に増加しました。",
+      "original_v1_runtime_output": "平均的な割合は ４割から６割に 増加しました 平均的な割合は ６割から６割に 増加しました 平均的な割合は ６割から６割に 増加しました 平均的な割合は ６割から６割に 増加しました 平均的な割合は ６割から６割に 増加しました 平均的な割合は ６割から６割に 増加しました"
+    },
+    {
+      "source_language": "ko",
+      "target_language": "ja",
+      "source": "결제 금액은 128,500원이며 환불 기한은 8월 3일입니다.",
+      "translation": "決済金額は128,500ウォンであり、払い戻し期限は8月3日です。",
+      "source_literal_values_preserved": true,
+      "previous_documented_runtime_output": "決済金額は128,500ウォンであり、払い戻し期限は8月3日です。",
+      "original_v1_runtime_output": "決済金額は128,500ウォンで、払い戻し期限は8月3日です。"
+    },
+    {
+      "source_language": "ko",
+      "target_language": "ja",
+      "source": "전화번호는 110-482-937561입니다.",
+      "translation": "電話番号は110-482-937561です。",
+      "source_literal_values_preserved": true,
+      "previous_documented_runtime_output": "電話番号は110-482から937561です。"
+    },
+    {
+      "source_language": "ko",
+      "target_language": "ja",
+      "source": "오차는 ±0.05mm 이내입니다.",
+      "translation": "誤差は±0.05ミリ以内です。",
+      "source_literal_values_preserved": true,
+      "previous_documented_runtime_output": "誤差は0.05mm%以内です。"
+    },
+    {
+      "source_language": "ko",
+      "target_language": "ja",
+      "source": "인구가 38,720명에서 7,842,913명으로 증가했습니다.",
+      "translation": "人口が38,720人から7,842,913人に増加しました。",
+      "source_literal_values_preserved": true,
+      "previous_documented_runtime_output": "人口が38,720人から7,842,913人に増加しました。"
+    },
+    {
+      "source_language": "ko",
+      "target_language": "ja",
+      "source": "안녕하세요.",
+      "translation": "こんにちは。",
+      "source_literal_values_preserved": true,
+      "previous_documented_runtime_output": "こんにちは。"
+    },
+    {
+      "source_language": "ja",
+      "target_language": "ko",
+      "source": "会議は17時30分に始まります。",
+      "translation": "회의는 17시 30분에 시작됩니다.",
+      "source_literal_values_preserved": true,
+      "previous_documented_runtime_output": "회의는 17시 30분에 시작됩니다."
+    },
+    {
+      "source_language": "ja",
+      "target_language": "ko",
+      "source": "17時30分から18時45分までです。",
+      "translation": "17시 30분부터 18시 45분까지 입니다.",
+      "source_literal_values_preserved": true,
+      "previous_documented_runtime_output": "17시 30분부터 18시 45분까지 입니다."
+    },
+    {
+      "source_language": "ja",
+      "target_language": "ko",
+      "source": "濃度は0.0037mg/L以下に保ってください。",
+      "translation": "농도는 0.0037 mg/L 이하로 유지하세요.",
+      "source_literal_values_preserved": true,
+      "previous_documented_runtime_output": "농도는 0.0037mg/L 이하로 유지하세요."
+    },
+    {
+      "source_language": "ja",
+      "target_language": "ko",
+      "source": "割合は35%から62.5%に増えました。",
+      "translation": "비율은 35%에서 62.5%로 늘었습니다.",
+      "source_literal_values_preserved": true,
+      "previous_documented_runtime_output": "비율은 35%에서 62.5%로 늘었습니다."
+    },
+    {
+      "source_language": "ja",
+      "target_language": "ko",
+      "source": "支払額は128,500ウォンで、返金期限は8月3日です。",
+      "translation": "지급액은 128,500원이며, 환불기한은 8월 3일입니다.",
+      "source_literal_values_preserved": true,
+      "previous_documented_runtime_output": "지급액은 128,500원이며, 환불기한은 8월 3일입니다."
+    },
+    {
+      "source_language": "ja",
+      "target_language": "ko",
+      "source": "誤差は±0.05mm以内です。",
+      "translation": "오차는 ±0.05 mm 이내입니다.",
+      "source_literal_values_preserved": true,
+      "previous_documented_runtime_output": "오차는 $0.05mm 이내입니다."
+    },
+    {
+      "source_language": "ja",
+      "target_language": "ko",
+      "source": "こんにちは。",
+      "translation": "안녕하세요.",
+      "source_literal_values_preserved": true,
+      "previous_documented_runtime_output": "안녕하세요."
+    }
+  ]
+}

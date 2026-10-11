@@ -396,6 +396,36 @@ def test_structured_mask_leaves_natural_language_units_translatable() -> None:
     assert not critical_mismatch
 
 
+def test_legacy_numeric_mask_keeps_unit_and_time_context() -> None:
+    source = "17시 30분, 250mg, ±0.05mm, 110-482-937561, 12,500원"
+    masked, mapping = mask_structured_spans(
+        source, slot_symbols=SLOT_SYMBOLS, keep_number_units_visible=True
+    )
+    assert set(mapping.values()) == {"17", "30", "250", "±0.05", "110-482-937561", "12,500"}
+    for unit in ("시", "분", "mg", "mm", "원"):
+        assert unit in masked
+    restored, missing = restore_targets(masked, mapping)
+    assert restored == source
+    assert not missing
+
+
+def test_legacy_numeric_mask_keeps_opaque_placeholders_and_urls() -> None:
+    source = "https://example.com/17 값 {count_30} 및 17時30分"
+    masked, mapping = mask_structured_spans(
+        source, slot_symbols=SLOT_SYMBOLS, keep_number_units_visible=True
+    )
+    assert set(mapping.values()) == {"https://example.com/17", "{count_30}", "17", "30"}
+    assert "時" in masked and "分" in masked
+    assert restore_targets(masked, mapping) == (source, [])
+
+
+def test_legacy_numeric_mask_rejects_slot_overflow() -> None:
+    with pytest.raises(ValueError, match="Too many protected numeric values"):
+        mask_structured_spans(
+            "17시 30분", slot_symbols=["<slot_0>"], keep_number_units_visible=True
+        )
+
+
 def test_shared_complex_placeable_is_replaced_once() -> None:
     placeable = '{ DATETIME($date, month: "long", year: "numeric") }'
     left, right = protect_shared_spans(
