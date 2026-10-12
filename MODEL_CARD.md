@@ -28,6 +28,31 @@ sion_translate is a custom PyTorch encoder-decoder model for bidirectional Korea
 translation. The uploaded release contains inference exports and its SentencePiece tokenizer;
 training datasets and training checkpoints are not distributed.
 
+## Known remaining issues after the 2026-10-12 reevaluation
+
+This is a **partial inference correction, not a complete fix for numerical translation**.
+The runtime and model weights have not changed since the numeric patch. More extensive
+evaluation found failures that the default protected-slot check does not reject:
+
+- A spaced sign can disappear: `誤差は± 0.05mm以内です。` produced
+  `오차는 0.05 mm 이내입니다.`
+- A value can survive while its unit changes: `용량은 250mL이며 속도는 3.5km/h입니다.`
+  produced `容量は250 mmで、速度は 3.5 km/h です。`
+- Some suffixes such as `15mile` and `40mile` are not recognized by the numeric
+  masker, so their values can be omitted without a protected-slot error.
+- Automatically masking non-numeric acronyms can degrade otherwise ordinary text.
+  A focused diagnostic that bypassed this masking restored the original output in
+  all five tested cases; this experiment has not been deployed.
+
+`strict_numbers=True` checks **recognized protected values** and supported hour/minute
+forms. It does not independently verify every source number, sign, unit, or numerical
+association. It can also reject an input instead of returning a translation. The earlier
+18-case probe documents that limited cohort, not a guarantee for arbitrary inputs.
+
+**한국어 안내:** 숫자 처리는 부분적으로 개선됐습니다. 부호·단위 손실, 지원하지
+않는 단위 뒤의 숫자 누락, 일부 일반 문장 회귀가 남아 있으므로 숫자가 완벽하게
+안전한 버전으로 설명해서는 안 됩니다. 숫자값뿐 아니라 부호·단위·문맥을 확인하세요.
+
 ## v1 numeric inference update
 
 Existing v1 users should download the updated inference code from

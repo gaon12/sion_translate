@@ -1,9 +1,10 @@
 # sion_translate 1.5
 
-**Public v1 numeric update:** Existing v1 users should download the updated inference code.
+**Public v1 partial numeric update:** Existing v1 users should download the updated inference code.
 No retraining or new weights are required. Use the pinned v1 maintenance runtime in
 [the update guide](docs/V1_NUMERIC_HOTFIX.md); the main training pipeline remains on its
-current generation.
+current generation. Remaining sign/unit errors, parser gaps, and individual translation
+regressions are documented in that guide; this is not a complete numeric fix.
 
 `sion_translate` is a from-scratch encoder-decoder training stack for multilingual
 machine translation. The repository currently uses Korean, English, and Japanese data,
