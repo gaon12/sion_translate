@@ -1,10 +1,12 @@
 # sion_translate 1.5
 
-**Public v1 partial numeric update:** Existing v1 users should download the updated inference code.
-No retraining or new weights are required. Use the pinned v1 maintenance runtime in
-[the update guide](docs/V1_NUMERIC_HOTFIX.md); the main training pipeline remains on its
-current generation. Remaining sign/unit errors, parser gaps, and individual translation
-regressions are documented in that guide; this is not a complete numeric fix.
+**Public v1 inference update (runtime 0.1.2):** Existing v1 users should reinstall
+the updated inference code. The follow-up fixes verified spaced-sign, measurement-unit,
+numeric-suffix and acronym-masking cases without retraining or replacing weights.
+Use the pinned v1 runtime in [the update guide](docs/V1_NUMERIC_HOTFIX.md).
+The main training pipeline remains on its current generation. This is a partial
+numeric correction; some omissions still cause an error and full numerical semantics
+are not guaranteed.
 
 `sion_translate` is a from-scratch encoder-decoder training stack for multilingual
 machine translation. The repository currently uses Korean, English, and Japanese data,

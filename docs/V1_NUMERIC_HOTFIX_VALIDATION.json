@@ -195,5 +195,1430 @@
       "source_literal_values_preserved": true,
       "previous_documented_runtime_output": "안녕하세요."
     }
-  ]
+  ],
+  "follow_up_0_1_2": {
+    "date": "2026-10-12",
+    "runtime_git_commit": "45254b8cb84e7725aa7b58709f060317ff4e2ab6",
+    "model_weights_changed": false,
+    "retrained": false,
+    "regression_tests_passed": 98,
+    "summary": {
+      "focused_cases": 238,
+      "status_counts": {
+        "ok": 236,
+        "blocked": 2
+      },
+      "statuses_by_cohort": {
+        "existing_authored_diagnostic": {
+          "ok": 16
+        },
+        "flores_devtest": {
+          "ok": 148,
+          "blocked": 2
+        },
+        "numeric_stress_authored": {
+          "ok": 72
+        }
+      },
+      "affected_total": 176,
+      "affected_flores": 149,
+      "paired_scores": {
+        "ja-all_rerun_flores": {
+          "cases": 79,
+          "previous_chrfpp": 25.66355962858717,
+          "current_chrfpp": 26.499861563447567,
+          "changed_outputs": 53
+        },
+        "ja-no_numeric_literals": {
+          "cases": 36,
+          "previous_chrfpp": 25.783940386627602,
+          "current_chrfpp": 26.172278385861297,
+          "changed_outputs": 21
+        },
+        "ko-all_rerun_flores": {
+          "cases": 69,
+          "previous_chrfpp": 30.852184698801278,
+          "current_chrfpp": 31.422928891250905,
+          "changed_outputs": 45
+        },
+        "ko-no_numeric_literals": {
+          "cases": 30,
+          "previous_chrfpp": 32.126356806750636,
+          "current_chrfpp": 32.54247523706177,
+          "changed_outputs": 15
+        }
+      },
+      "numeric_authored_cases": 68,
+      "numeric_authored_literal_preservation": 68,
+      "scope": "Focused 98-case cohort plus every FLORES input affected by changed preprocessing or recognized-unit restoration; not a fresh full FLORES rerun.",
+      "blocked": [
+        {
+          "id": "ko-ja-flores200-devtest-0270",
+          "error": "Legacy numeric protection could not preserve each value's occurrence count: ['25', '21']. No repaired translation was returned. Use a shorter input or strict_numbers=False to inspect unverified output."
+        },
+        {
+          "id": "ja-ko-flores200-devtest-0755",
+          "error": "Legacy numeric protection could not preserve each value's occurrence count: ['1']. No repaired translation was returned. Use a shorter input or strict_numbers=False to inspect unverified output."
+        }
+      ]
+    },
+    "authored_outputs": [
+      {
+        "id": "stress-ko-ja-001",
+        "source": "회의는 17시 30분에 시작합니다.",
+        "source_language": "ko",
+        "target_language": "ja",
+        "reference": "会議は17時30分に始まります。",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "会議は17時30分に始まります。",
+        "protected_values": [
+          "17",
+          "30"
+        ],
+        "status": "ok",
+        "translation": "会議は17時30分に始まります。"
+      },
+      {
+        "id": "stress-ko-ja-002",
+        "source": "17시 30분부터 18시 45분까지입니다.",
+        "source_language": "ko",
+        "target_language": "ja",
+        "reference": "17時30分から18時45分までです。",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "17時30分から18時45分までです。",
+        "protected_values": [
+          "17",
+          "30",
+          "18",
+          "45"
+        ],
+        "status": "ok",
+        "translation": "17時30分から18時45分までです。"
+      },
+      {
+        "id": "stress-ko-ja-003",
+        "source": "첫 회의는 17시 30분에, 다음 회의도 17시 30분에 시작합니다.",
+        "source_language": "ko",
+        "target_language": "ja",
+        "reference": "最初の会議は17時30分に、次の会議も17時30分に始まります。",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "最初の会議は17時30分に、次の会議も17時30分から始まります。",
+        "protected_values": [
+          "17",
+          "30"
+        ],
+        "status": "ok",
+        "translation": "最初の会議は17時30分に、次の会議も17時30分から始まります。"
+      },
+      {
+        "id": "stress-ko-ja-004",
+        "source": "알람을 00시 05분에 설정하세요.",
+        "source_language": "ko",
+        "target_language": "ja",
+        "reference": "アラームを00時05分に設定してください。",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "アラームを00時05分に設定してください。",
+        "protected_values": [
+          "00",
+          "05"
+        ],
+        "status": "ok",
+        "translation": "アラームを00時05分に設定してください。"
+      },
+      {
+        "id": "stress-ko-ja-005",
+        "source": "회의는 오후 5시 30분에 시작합니다.",
+        "source_language": "ko",
+        "target_language": "ja",
+        "reference": "会議は午後5時30分に始まります。",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "会議は午後5時30分に始まります。",
+        "protected_values": [
+          "5",
+          "30"
+        ],
+        "status": "ok",
+        "translation": "会議は午後5時30分に始まります。"
+      },
+      {
+        "id": "stress-ko-ja-006",
+        "source": "예약은 오전 12시 10분입니다.",
+        "source_language": "ko",
+        "target_language": "ja",
+        "reference": "予約は午前12時10分です。",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "予約は午前12時10分です。",
+        "protected_values": [
+          "12",
+          "10"
+        ],
+        "status": "ok",
+        "translation": "予約は午前12時10分です。"
+      },
+      {
+        "id": "stress-ko-ja-007",
+        "source": "소요 시간은 17시간 30분입니다.",
+        "source_language": "ko",
+        "target_language": "ja",
+        "reference": "所要時間は17時間30分です。",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "所要時間は17時間30分です。",
+        "protected_values": [
+          "17",
+          "30"
+        ],
+        "status": "ok",
+        "translation": "所要時間は17時間30分です。"
+      },
+      {
+        "id": "stress-ko-ja-008",
+        "source": "회의는 17:30에 시작합니다.",
+        "source_language": "ko",
+        "target_language": "ja",
+        "reference": "会議は17:30に始まります。",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "会議は17:30時に始まります。",
+        "protected_values": [
+          "17:30"
+        ],
+        "status": "ok",
+        "translation": "会議は17:30時に始まります。"
+      },
+      {
+        "id": "stress-ko-ja-009",
+        "source": "예약은 2026년 10월 12일 17시 30분입니다.",
+        "source_language": "ko",
+        "target_language": "ja",
+        "reference": "予約は2026年10月12日17時30分です。",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "予約は2026年10月12日17時30分です。",
+        "protected_values": [
+          "2026",
+          "10",
+          "12",
+          "17",
+          "30"
+        ],
+        "status": "ok",
+        "translation": "予約は2026年10月12日17時30分です。"
+      },
+      {
+        "id": "stress-ko-ja-010",
+        "source": "마감일은 2026-10-12입니다.",
+        "source_language": "ko",
+        "target_language": "ja",
+        "reference": "締め切りは2026-10-12です。",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "締め切りは2026-10-12日です。",
+        "protected_values": [
+          "2026-10-12"
+        ],
+        "status": "ok",
+        "translation": "締め切りは2026-10-12日です。"
+      },
+      {
+        "id": "stress-ko-ja-011",
+        "source": "농도는 0.0037mg/L 이하로 유지하세요.",
+        "source_language": "ko",
+        "target_language": "ja",
+        "reference": "濃度は0.0037mg/L以下に保ってください。",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "濃度は0.0037 mg/L以下に保ってください。",
+        "protected_values": [
+          "0.0037"
+        ],
+        "status": "ok",
+        "translation": "濃度は0.0037mg/L以下に保ってください。"
+      },
+      {
+        "id": "stress-ko-ja-012",
+        "source": "평균은 0.00000125입니다.",
+        "source_language": "ko",
+        "target_language": "ja",
+        "reference": "平均は0.00000125です。",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "平均は0.00000125です。",
+        "protected_values": [
+          "0.00000125"
+        ],
+        "status": "ok",
+        "translation": "平均は0.00000125です。"
+      },
+      {
+        "id": "stress-ko-ja-013",
+        "source": "250mg씩 하루 두 번 복용하세요.",
+        "source_language": "ko",
+        "target_language": "ja",
+        "reference": "250mgずつ1日2回服用してください。",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "250mgずつ1日2回服用してください。",
+        "protected_values": [
+          "250"
+        ],
+        "status": "ok",
+        "translation": "250mgずつ1日2回服用してください。"
+      },
+      {
+        "id": "stress-ko-ja-014",
+        "source": "무게는 62.5kg이고 길이는 0.05mm입니다.",
+        "source_language": "ko",
+        "target_language": "ja",
+        "reference": "重さは62.5kgで長さは0.05mmです。",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "重さは62.5キロで、長さは0.05ミリです。",
+        "protected_values": [
+          "62.5",
+          "0.05"
+        ],
+        "status": "ok",
+        "translation": "重さは62.5kgで、長さは0.05mmです。"
+      },
+      {
+        "id": "stress-ko-ja-015",
+        "source": "용량은 250mL이며 속도는 3.5km/h입니다.",
+        "source_language": "ko",
+        "target_language": "ja",
+        "reference": "容量は250mLで速度は3.5km/hです。",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "容量は250 mmで、速度は 3.5 km/h です。",
+        "protected_values": [
+          "250",
+          "3.5"
+        ],
+        "status": "ok",
+        "translation": "容量は250mLで、速度は 3.5km/h です。"
+      },
+      {
+        "id": "stress-ko-ja-016",
+        "source": "비율은 35%에서 62.5%로 증가했습니다.",
+        "source_language": "ko",
+        "target_language": "ja",
+        "reference": "割合は35%から62.5%に増加しました。",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "割合は 35% から 62.5% に増加しました。",
+        "protected_values": [
+          "35",
+          "62.5"
+        ],
+        "status": "ok",
+        "translation": "割合は 35% から 62.5% に増加しました。"
+      },
+      {
+        "id": "stress-ko-ja-017",
+        "source": "비율은 35%이며 다음 값도 35%입니다.",
+        "source_language": "ko",
+        "target_language": "ja",
+        "reference": "割合は35%で、次の値も35%です。",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "割合は35%で、次の値も35%です。",
+        "protected_values": [
+          "35"
+        ],
+        "status": "ok",
+        "translation": "割合は35%で、次の値も35%です。"
+      },
+      {
+        "id": "stress-ko-ja-018",
+        "source": "결제 금액은 128,500원이며 환불 기한은 8월 3일입니다.",
+        "source_language": "ko",
+        "target_language": "ja",
+        "reference": "支払額は128,500ウォンで返金期限は8月3日です。",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "決済金額は128,500ウォンであり、払い戻し期限は8月3日です。",
+        "protected_values": [
+          "128,500",
+          "8",
+          "3"
+        ],
+        "status": "ok",
+        "translation": "決済金額は128,500ウォンであり、払い戻し期限は8月3日です。"
+      },
+      {
+        "id": "stress-ko-ja-019",
+        "source": "가격은 1,200엔이고 배송비는 300엔입니다.",
+        "source_language": "ko",
+        "target_language": "ja",
+        "reference": "価格は1,200円で送料は300円です。",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "価格は 1,200円で、送料は 300円です。",
+        "protected_values": [
+          "1,200",
+          "300"
+        ],
+        "status": "ok",
+        "translation": "価格は 1,200円で、送料は 300円です。"
+      },
+      {
+        "id": "stress-ko-ja-020",
+        "source": "가격은 $12.50이며 할인액은 $0.75입니다.",
+        "source_language": "ko",
+        "target_language": "ja",
+        "reference": "価格は$12.50で割引額は$0.75です。",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "価格は$12.50円で、割引額は$0.75円です。",
+        "protected_values": [
+          "$12.50",
+          "$0.75"
+        ],
+        "status": "ok",
+        "translation": "価格は$12.50円で、割引額は$0.75円です。"
+      },
+      {
+        "id": "stress-ko-ja-021",
+        "source": "오차는 ±0.05mm 이내입니다.",
+        "source_language": "ko",
+        "target_language": "ja",
+        "reference": "誤差は±0.05mm以内です。",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "誤差は±0.05ミリ以内です。",
+        "protected_values": [
+          "±0.05"
+        ],
+        "status": "ok",
+        "translation": "誤差は±0.05mm以内です。"
+      },
+      {
+        "id": "stress-ko-ja-022",
+        "source": "오차는 ± 0.05mm 이내입니다.",
+        "source_language": "ko",
+        "target_language": "ja",
+        "reference": "誤差は± 0.05mm以内です。",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "誤差は0.05mm以内です。",
+        "protected_values": [
+          "± 0.05"
+        ],
+        "status": "ok",
+        "translation": "誤差は± 0.05mm以内です。"
+      },
+      {
+        "id": "stress-ko-ja-023",
+        "source": "온도 변화는 −3.5°C입니다.",
+        "source_language": "ko",
+        "target_language": "ja",
+        "reference": "温度変化は−3.5°Cです。",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "温度変化は−3.5℃です。",
+        "protected_values": [
+          "−3.5"
+        ],
+        "status": "ok",
+        "translation": "温度変化は−3.5℃です。"
+      },
+      {
+        "id": "stress-ko-ja-024",
+        "source": "온도 변화는 − 3.5°C입니다.",
+        "source_language": "ko",
+        "target_language": "ja",
+        "reference": "温度変化は− 3.5°Cです。",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "温度変化は−3.5℃です。",
+        "protected_values": [
+          "− 3.5"
+        ],
+        "status": "ok",
+        "translation": "温度変化は− 3.5℃です。"
+      },
+      {
+        "id": "stress-ko-ja-025",
+        "source": "변동률은 -3.5%에서 +2.0%로 바뀌었습니다.",
+        "source_language": "ko",
+        "target_language": "ja",
+        "reference": "変動率は-3.5%から+2.0%に変わりました。",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "変動率は-3.5%から+2.0%に変わりました。",
+        "protected_values": [
+          "-3.5",
+          "+2.0"
+        ],
+        "status": "ok",
+        "translation": "変動率は-3.5%から+2.0%に変わりました。"
+      },
+      {
+        "id": "stress-ko-ja-026",
+        "source": "전화번호는 110-482-937561입니다.",
+        "source_language": "ko",
+        "target_language": "ja",
+        "reference": "電話番号は110-482-937561です。",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "電話番号は110-482-937561です。",
+        "protected_values": [
+          "110-482-937561"
+        ],
+        "status": "ok",
+        "translation": "電話番号は110-482-937561です。"
+      },
+      {
+        "id": "stress-ko-ja-027",
+        "source": "주문 번호는 SKU-00017203입니다.",
+        "source_language": "ko",
+        "target_language": "ja",
+        "reference": "注文番号はSKU-00017203です。",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "注文番号はSKU-00017203です。",
+        "protected_values": [
+          "SKU-00017203"
+        ],
+        "status": "ok",
+        "translation": "注文番号はSKU-00017203です。"
+      },
+      {
+        "id": "stress-ko-ja-028",
+        "source": "연락처는 +82-10-1234-5678입니다.",
+        "source_language": "ko",
+        "target_language": "ja",
+        "reference": "連絡先は+82-10-1234-5678です。",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "連絡先は+82-10-1234-5678です。",
+        "protected_values": [
+          "+82-10-1234-5678"
+        ],
+        "status": "ok",
+        "translation": "連絡先は+82-10-1234-5678です。"
+      },
+      {
+        "id": "stress-ko-ja-029",
+        "source": "농도는 3.7e-5 mol/L입니다.",
+        "source_language": "ko",
+        "target_language": "ja",
+        "reference": "濃度は3.7e-5 mol/Lです。",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "濃度は3.7e-5 mol/Lです。",
+        "protected_values": [
+          "3.7e-5"
+        ],
+        "status": "ok",
+        "translation": "濃度は3.7e-5mol/Lです。"
+      },
+      {
+        "id": "stress-ko-ja-030",
+        "source": "사용한 양은 전체의 1/3입니다.",
+        "source_language": "ko",
+        "target_language": "ja",
+        "reference": "使用した量は全体の1/3です。",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "使用した量は全体の 1/3 です。",
+        "protected_values": [
+          "1/3"
+        ],
+        "status": "ok",
+        "translation": "使用した量は全体の 1/3 です。"
+      },
+      {
+        "id": "stress-ko-ja-031",
+        "source": "정상 범위는 10~20mg입니다.",
+        "source_language": "ko",
+        "target_language": "ja",
+        "reference": "正常範囲は10~20mgです。",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "正常範囲は10~20mgです。",
+        "protected_values": [
+          "10",
+          "20"
+        ],
+        "status": "ok",
+        "translation": "正常範囲は10~20mgです。"
+      },
+      {
+        "id": "stress-ko-ja-032",
+        "source": "항목의 값은 17, 17, 30, 30입니다.",
+        "source_language": "ko",
+        "target_language": "ja",
+        "reference": "項目の値は17、17、30、30です。",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "項目の値は 17、17、30、30です。",
+        "protected_values": [
+          "17",
+          "30"
+        ],
+        "status": "ok",
+        "translation": "項目の値は 17、17、30、30です。"
+      },
+      {
+        "id": "stress-ko-ja-033",
+        "source": "작업에는 두 시간 삼십 분이 걸립니다.",
+        "source_language": "ko",
+        "target_language": "ja",
+        "reference": "作業には二時間三十分かかります。",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "作業には二時間三十分かかります。",
+        "protected_values": [],
+        "status": "ok",
+        "translation": "作業には二時間三十分かかります。"
+      },
+      {
+        "id": "stress-ko-ja-034",
+        "source": "참가자는 열일곱 명이고 예비 인원은 서른 명입니다.",
+        "source_language": "ko",
+        "target_language": "ja",
+        "reference": "参加者は十七人で予備の人数は三十人です。",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "参加者は17人で、予備人員は30人です。",
+        "protected_values": [],
+        "status": "ok",
+        "translation": "参加者は17人で、予備人員は30人です。"
+      },
+      {
+        "id": "stress-ko-ja-035",
+        "source": "250mg을 복용하지 말고 125mg만 복용하세요.",
+        "source_language": "ko",
+        "target_language": "ja",
+        "reference": "250mgを服用せず125mgだけ服用してください。",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "250mgを服用せず、125mgだけ服用してください。",
+        "protected_values": [
+          "250",
+          "125"
+        ],
+        "status": "ok",
+        "translation": "250mgを服用せず、125mgだけ服用してください。"
+      },
+      {
+        "id": "stress-ko-ja-036",
+        "source": "첫 상자의 무게는 17kg이고 둘째 상자는 30kg입니다.",
+        "source_language": "ko",
+        "target_language": "ja",
+        "reference": "最初の箱の重さは17kgで二番目の箱は30kgです。",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "最初の箱の重さは17キロで、2番目の箱は30キロです。",
+        "protected_values": [
+          "17",
+          "30"
+        ],
+        "status": "ok",
+        "translation": "最初の箱の重さは17kgで、2番目の箱は30kgです。"
+      },
+      {
+        "id": "ko-ja-honorific-01",
+        "source": "회의가 끝나면 수정된 자료를 검토해 주시겠어요?",
+        "source_language": "ko",
+        "target_language": "ja",
+        "reference": "会議が終わったら、修正した資料を確認していただけますか。",
+        "cohort": "existing_authored_diagnostic",
+        "previous_status": "ok",
+        "previous_translation": "会議が終われば、修正された資料を検討していただけますか。",
+        "protected_values": [],
+        "status": "ok",
+        "translation": "会議が終われば、修正された資料を検討していただけますか。"
+      },
+      {
+        "id": "ko-ja-ambiguity-01",
+        "source": "배가 고파서 배를 하나 깎아 먹었다.",
+        "source_language": "ko",
+        "target_language": "ja",
+        "reference": "お腹が空いたので、梨を一つむいて食べた。",
+        "cohort": "existing_authored_diagnostic",
+        "previous_status": "ok",
+        "previous_translation": "お腹が空いてお腹を一つ削って食べた。",
+        "protected_values": [],
+        "status": "ok",
+        "translation": "お腹が空いてお腹を一つ削って食べた。"
+      },
+      {
+        "id": "ko-ja-numbers-01",
+        "source": "결제 금액은 128,500원이며 환불 기한은 8월 3일입니다.",
+        "source_language": "ko",
+        "target_language": "ja",
+        "reference": "決済金額は128,500ウォンで、返金期限は8月3日です。",
+        "cohort": "existing_authored_diagnostic",
+        "previous_status": "ok",
+        "previous_translation": "決済金額は128,500ウォンであり、払い戻し期限は8月3日です。",
+        "protected_values": [
+          "128,500",
+          "8",
+          "3"
+        ],
+        "status": "ok",
+        "translation": "決済金額は128,500ウォンであり、払い戻し期限は8月3日です。"
+      },
+      {
+        "id": "ko-ja-technical-01",
+        "source": "API가 HTTP 429를 반환하면 2초 뒤에 다시 시도하세요.",
+        "source_language": "ko",
+        "target_language": "ja",
+        "reference": "APIがHTTP 429を返した場合は、2秒後に再試行してください。",
+        "cohort": "existing_authored_diagnostic",
+        "previous_status": "ok",
+        "previous_translation": "API が HTTP と 429 を返すと、2 秒後にもう一度試してください。",
+        "protected_values": [
+          "429",
+          "2"
+        ],
+        "status": "ok",
+        "translation": "APIが HTTP 429 を返したら、2 秒後に再試行してください。"
+      },
+      {
+        "id": "ko-ja-colloquial-01",
+        "source": "아, 그건 좀 아닌 것 같은데? 다른 방법을 찾아보자.",
+        "source_language": "ko",
+        "target_language": "ja",
+        "reference": "あ、それはちょっと違うと思うけど？別の方法を探してみよう。",
+        "cohort": "existing_authored_diagnostic",
+        "previous_status": "ok",
+        "previous_translation": "あ、それはちょっと違うと思うけど？ 他の方法を探してみよう。",
+        "protected_values": [],
+        "status": "ok",
+        "translation": "あ、それはちょっと違うと思うけど？ 他の方法を探してみよう。"
+      },
+      {
+        "id": "ko-ja-long-01",
+        "source": "비가 오는 줄 알았더라면 우산을 챙겼을 텐데, 아침에는 하늘이 너무 맑았다.",
+        "source_language": "ko",
+        "target_language": "ja",
+        "reference": "雨が降ると分かっていたら傘を持ってきたのに、朝は空がとても晴れていた。",
+        "cohort": "existing_authored_diagnostic",
+        "previous_status": "ok",
+        "previous_translation": "雨が降ると思っていたら傘を持って行ったはずなのに、朝は空がとても澄んだ。",
+        "protected_values": [],
+        "status": "ok",
+        "translation": "雨が降ると思っていたら傘を持って行ったはずなのに、朝は空がとても澄んだ。"
+      },
+      {
+        "id": "ko-ja-proper-01",
+        "source": "해솔역에서 내려 별빛도서관까지 걸어가 주세요.",
+        "source_language": "ko",
+        "target_language": "ja",
+        "reference": "ヘソル駅で降りて、星明かり図書館まで歩いてください。",
+        "cohort": "existing_authored_diagnostic",
+        "previous_status": "ok",
+        "previous_translation": "ヘソル駅から降りて星光図書館まで歩いてください。",
+        "protected_values": [],
+        "status": "ok",
+        "translation": "ヘソル駅から降りて星光図書館まで歩いてください。"
+      },
+      {
+        "id": "ko-ja-idiom-01",
+        "source": "일이 꼬였지만 지금 포기하면 다 된 밥에 재를 뿌리는 셈이다.",
+        "source_language": "ko",
+        "target_language": "ja",
+        "reference": "事態はこじれたが、今諦めたら、せっかくの努力を台無しにすることになる。",
+        "cohort": "existing_authored_diagnostic",
+        "previous_status": "ok",
+        "previous_translation": "仕事がもつれたが、今諦めれば、出来上がったご飯に灰を振りかけるわけだ。",
+        "protected_values": [],
+        "status": "ok",
+        "translation": "仕事がもつれたが、今諦めれば、出来上がったご飯に灰を振りかけるわけだ。"
+      },
+      {
+        "id": "stress-ja-ko-001",
+        "source": "会議は17時30分に始まります。",
+        "source_language": "ja",
+        "target_language": "ko",
+        "reference": "회의는 17시 30분에 시작합니다.",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "회의는 17시 30분에 시작됩니다.",
+        "protected_values": [
+          "17",
+          "30"
+        ],
+        "status": "ok",
+        "translation": "회의는 17시 30분에 시작됩니다."
+      },
+      {
+        "id": "stress-ja-ko-002",
+        "source": "17時30分から18時45分までです。",
+        "source_language": "ja",
+        "target_language": "ko",
+        "reference": "17시 30분부터 18시 45분까지입니다.",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "17시 30분부터 18시 45분까지 입니다.",
+        "protected_values": [
+          "17",
+          "30",
+          "18",
+          "45"
+        ],
+        "status": "ok",
+        "translation": "17시 30분부터 18시 45분까지 입니다."
+      },
+      {
+        "id": "stress-ja-ko-003",
+        "source": "最初の会議は17時30分に、次の会議も17時30分に始まります。",
+        "source_language": "ja",
+        "target_language": "ko",
+        "reference": "첫 회의는 17시 30분에, 다음 회의도 17시 30분에 시작합니다.",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "첫 번째 회의는 17시 30분에, 다음 회의도 17시30분에 시작됩니다.",
+        "protected_values": [
+          "17",
+          "30"
+        ],
+        "status": "ok",
+        "translation": "첫 번째 회의는 17시 30분에, 다음 회의도 17시30분에 시작됩니다."
+      },
+      {
+        "id": "stress-ja-ko-004",
+        "source": "アラームを00時05分に設定してください。",
+        "source_language": "ja",
+        "target_language": "ko",
+        "reference": "알람을 00시 05분에 설정하세요.",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "알람을 00시 05분에 설정해주세요.",
+        "protected_values": [
+          "00",
+          "05"
+        ],
+        "status": "ok",
+        "translation": "알람을 00시 05분에 설정해주세요."
+      },
+      {
+        "id": "stress-ja-ko-005",
+        "source": "会議は午後5時30分に始まります。",
+        "source_language": "ja",
+        "target_language": "ko",
+        "reference": "회의는 오후 5시 30분에 시작합니다.",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "회의는 오후 5시 30분에 시작됩니다.",
+        "protected_values": [
+          "5",
+          "30"
+        ],
+        "status": "ok",
+        "translation": "회의는 오후 5시 30분에 시작됩니다."
+      },
+      {
+        "id": "stress-ja-ko-006",
+        "source": "予約は午前12時10分です。",
+        "source_language": "ja",
+        "target_language": "ko",
+        "reference": "예약은 오전 12시 10분입니다.",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "예약은 오전 12시 10분입니다.",
+        "protected_values": [
+          "12",
+          "10"
+        ],
+        "status": "ok",
+        "translation": "예약은 오전 12시 10분입니다."
+      },
+      {
+        "id": "stress-ja-ko-007",
+        "source": "所要時間は17時間30分です。",
+        "source_language": "ja",
+        "target_language": "ko",
+        "reference": "소요 시간은 17시간 30분입니다.",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "소요시간은 17시간 30분 입니다.",
+        "protected_values": [
+          "17",
+          "30"
+        ],
+        "status": "ok",
+        "translation": "소요시간은 17시간 30분 입니다."
+      },
+      {
+        "id": "stress-ja-ko-008",
+        "source": "会議は17:30に始まります。",
+        "source_language": "ja",
+        "target_language": "ko",
+        "reference": "회의는 17:30에 시작합니다.",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "회의는 17:30시에 시작됩니다.",
+        "protected_values": [
+          "17:30"
+        ],
+        "status": "ok",
+        "translation": "회의는 17:30시에 시작됩니다."
+      },
+      {
+        "id": "stress-ja-ko-009",
+        "source": "予約は2026年10月12日17時30分です。",
+        "source_language": "ja",
+        "target_language": "ko",
+        "reference": "예약은 2026년 10월 12일 17시 30분입니다.",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "예약은 2026년 10월 12일 17시 30분입니다.",
+        "protected_values": [
+          "2026",
+          "10",
+          "12",
+          "17",
+          "30"
+        ],
+        "status": "ok",
+        "translation": "예약은 2026년 10월 12일 17시 30분입니다."
+      },
+      {
+        "id": "stress-ja-ko-010",
+        "source": "締め切りは2026-10-12です。",
+        "source_language": "ja",
+        "target_language": "ko",
+        "reference": "마감일은 2026-10-12입니다.",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "마감은 2026-10-12입니다.",
+        "protected_values": [
+          "2026-10-12"
+        ],
+        "status": "ok",
+        "translation": "마감은 2026-10-12입니다."
+      },
+      {
+        "id": "stress-ja-ko-011",
+        "source": "濃度は0.0037mg/L以下に保ってください。",
+        "source_language": "ja",
+        "target_language": "ko",
+        "reference": "농도는 0.0037mg/L 이하로 유지하세요.",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "농도는 0.0037 mg/L 이하로 유지하세요.",
+        "protected_values": [
+          "0.0037"
+        ],
+        "status": "ok",
+        "translation": "농도는 0.0037mg/L 이하로 유지하세요."
+      },
+      {
+        "id": "stress-ja-ko-012",
+        "source": "平均は0.00000125です。",
+        "source_language": "ja",
+        "target_language": "ko",
+        "reference": "평균은 0.00000125입니다.",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "평균은 0.00000125입니다.",
+        "protected_values": [
+          "0.00000125"
+        ],
+        "status": "ok",
+        "translation": "평균은 0.00000125입니다."
+      },
+      {
+        "id": "stress-ja-ko-013",
+        "source": "250mgずつ1日2回服用してください。",
+        "source_language": "ja",
+        "target_language": "ko",
+        "reference": "250mg씩 하루 두 번 복용하세요.",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "250 mg씩 1일 2회 복용하세요.",
+        "protected_values": [
+          "250",
+          "1",
+          "2"
+        ],
+        "status": "ok",
+        "translation": "250mg씩 1일 2회 복용하세요."
+      },
+      {
+        "id": "stress-ja-ko-014",
+        "source": "重さは62.5kgで長さは0.05mmです。",
+        "source_language": "ja",
+        "target_language": "ko",
+        "reference": "무게는 62.5kg이고 길이는 0.05mm입니다.",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "무게는 62.5 kg이고 길이는 0.05 mm 입니다.",
+        "protected_values": [
+          "62.5",
+          "0.05"
+        ],
+        "status": "ok",
+        "translation": "무게는 62.5kg이고 길이는 0.05mm 입니다."
+      },
+      {
+        "id": "stress-ja-ko-015",
+        "source": "容量は250mLで速度は3.5km/hです。",
+        "source_language": "ja",
+        "target_language": "ko",
+        "reference": "용량은 250mL이며 속도는 3.5km/h입니다.",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "용량은 250 ml이고 속도는 3.5 km/h입니다.",
+        "protected_values": [
+          "250",
+          "3.5"
+        ],
+        "status": "ok",
+        "translation": "용량은 250mL이고 속도는 3.5km/h입니다."
+      },
+      {
+        "id": "stress-ja-ko-016",
+        "source": "割合は35%から62.5%に増加しました。",
+        "source_language": "ja",
+        "target_language": "ko",
+        "reference": "비율은 35%에서 62.5%로 증가했습니다.",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "비율은 35%에서 62.5%로 증가했습니다.",
+        "protected_values": [
+          "35",
+          "62.5"
+        ],
+        "status": "ok",
+        "translation": "비율은 35%에서 62.5%로 증가했습니다."
+      },
+      {
+        "id": "stress-ja-ko-017",
+        "source": "割合は35%で、次の値も35%です。",
+        "source_language": "ja",
+        "target_language": "ko",
+        "reference": "비율은 35%이며 다음 값도 35%입니다.",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "비율은 35%이고 다음 값도 35%입니다.",
+        "protected_values": [
+          "35"
+        ],
+        "status": "ok",
+        "translation": "비율은 35%이고 다음 값도 35%입니다."
+      },
+      {
+        "id": "stress-ja-ko-018",
+        "source": "支払額は128,500ウォンで返金期限は8月3日です。",
+        "source_language": "ja",
+        "target_language": "ko",
+        "reference": "결제 금액은 128,500원이며 환불 기한은 8월 3일입니다.",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "지급액은 128,500원으로 환불기한은 8월 3일 입니다.",
+        "protected_values": [
+          "128,500",
+          "8",
+          "3"
+        ],
+        "status": "ok",
+        "translation": "지급액은 128,500원으로 환불기한은 8월 3일 입니다."
+      },
+      {
+        "id": "stress-ja-ko-019",
+        "source": "価格は1,200円で送料は300円です。",
+        "source_language": "ja",
+        "target_language": "ko",
+        "reference": "가격은 1,200엔이고 배송비는 300엔입니다.",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "가격은 1,200엔이고 배송비는 300엔입니다.",
+        "protected_values": [
+          "1,200",
+          "300"
+        ],
+        "status": "ok",
+        "translation": "가격은 1,200엔이고 배송비는 300엔입니다."
+      },
+      {
+        "id": "stress-ja-ko-020",
+        "source": "価格は$12.50で割引額は$0.75です。",
+        "source_language": "ja",
+        "target_language": "ko",
+        "reference": "가격은 $12.50이며 할인액은 $0.75입니다.",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "가격은 $12.50이고 할인액은 $0.75입니다.",
+        "protected_values": [
+          "$12.50",
+          "$0.75"
+        ],
+        "status": "ok",
+        "translation": "가격은 $12.50이고 할인액은 $0.75입니다."
+      },
+      {
+        "id": "stress-ja-ko-021",
+        "source": "誤差は±0.05mm以内です。",
+        "source_language": "ja",
+        "target_language": "ko",
+        "reference": "오차는 ±0.05mm 이내입니다.",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "오차는 ±0.05 mm 이내입니다.",
+        "protected_values": [
+          "±0.05"
+        ],
+        "status": "ok",
+        "translation": "오차는 ±0.05mm 이내입니다."
+      },
+      {
+        "id": "stress-ja-ko-022",
+        "source": "誤差は± 0.05mm以内です。",
+        "source_language": "ja",
+        "target_language": "ko",
+        "reference": "오차는 ± 0.05mm 이내입니다.",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "오차는 0.05 mm 이내입니다.",
+        "protected_values": [
+          "± 0.05"
+        ],
+        "status": "ok",
+        "translation": "오차는 ± 0.05mm 이내입니다."
+      },
+      {
+        "id": "stress-ja-ko-023",
+        "source": "温度変化は−3.5°Cです。",
+        "source_language": "ja",
+        "target_language": "ko",
+        "reference": "온도 변화는 −3.5°C입니다.",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "온도 변화는 −3.5℃입니다.",
+        "protected_values": [
+          "−3.5"
+        ],
+        "status": "ok",
+        "translation": "온도 변화는 −3.5℃입니다."
+      },
+      {
+        "id": "stress-ja-ko-024",
+        "source": "温度変化は− 3.5°Cです。",
+        "source_language": "ja",
+        "target_language": "ko",
+        "reference": "온도 변화는 − 3.5°C입니다.",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "온도 변화는 -3.5℃입니다.",
+        "protected_values": [
+          "− 3.5"
+        ],
+        "status": "ok",
+        "translation": "온도 변화는 − 3.5℃입니다."
+      },
+      {
+        "id": "stress-ja-ko-025",
+        "source": "変動率は-3.5%から+2.0%に変わりました。",
+        "source_language": "ja",
+        "target_language": "ko",
+        "reference": "변동률은 -3.5%에서 +2.0%로 바뀌었습니다.",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "변동률은 -3.5%에서 +2.0%로 바뀌었습니다.",
+        "protected_values": [
+          "-3.5",
+          "+2.0"
+        ],
+        "status": "ok",
+        "translation": "변동률은 -3.5%에서 +2.0%로 바뀌었습니다."
+      },
+      {
+        "id": "stress-ja-ko-026",
+        "source": "電話番号は110-482-937561です。",
+        "source_language": "ja",
+        "target_language": "ko",
+        "reference": "전화번호는 110-482-937561입니다.",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "전화번호는 110-482-937561입니다.",
+        "protected_values": [
+          "110-482-937561"
+        ],
+        "status": "ok",
+        "translation": "전화번호는 110-482-937561입니다."
+      },
+      {
+        "id": "stress-ja-ko-027",
+        "source": "注文番号はSKU-00017203です。",
+        "source_language": "ja",
+        "target_language": "ko",
+        "reference": "주문 번호는 SKU-00017203입니다.",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "주문번호는 SKU-00017203 입니다.",
+        "protected_values": [
+          "SKU-00017203"
+        ],
+        "status": "ok",
+        "translation": "주문번호는 SKU-00017203입니다."
+      },
+      {
+        "id": "stress-ja-ko-028",
+        "source": "連絡先は+82-10-1234-5678です。",
+        "source_language": "ja",
+        "target_language": "ko",
+        "reference": "연락처는 +82-10-1234-5678입니다.",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "연락처는 +82-10-1234-5678입니다.",
+        "protected_values": [
+          "+82-10-1234-5678"
+        ],
+        "status": "ok",
+        "translation": "연락처는 +82-10-1234-5678입니다."
+      },
+      {
+        "id": "stress-ja-ko-029",
+        "source": "濃度は3.7e-5 mol/Lです。",
+        "source_language": "ja",
+        "target_language": "ko",
+        "reference": "농도는 3.7e-5 mol/L입니다.",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "농도는 3.7e-5 mol/L 입니다.",
+        "protected_values": [
+          "3.7e-5"
+        ],
+        "status": "ok",
+        "translation": "농도는 3.7e-5mol/L 입니다."
+      },
+      {
+        "id": "stress-ja-ko-030",
+        "source": "使用した量は全体の1/3です。",
+        "source_language": "ja",
+        "target_language": "ko",
+        "reference": "사용한 양은 전체의 1/3입니다.",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "사용한 양은 전체의 1/3입니다.",
+        "protected_values": [
+          "1/3"
+        ],
+        "status": "ok",
+        "translation": "사용한 양은 전체의 1/3입니다."
+      },
+      {
+        "id": "stress-ja-ko-031",
+        "source": "正常範囲は10~20mgです。",
+        "source_language": "ja",
+        "target_language": "ko",
+        "reference": "정상 범위는 10~20mg입니다.",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "정상 범위는 10~20 mg 입니다.",
+        "protected_values": [
+          "10",
+          "20"
+        ],
+        "status": "ok",
+        "translation": "정상 범위는 10~20mg 입니다."
+      },
+      {
+        "id": "stress-ja-ko-032",
+        "source": "項目の値は17、17、30、30です。",
+        "source_language": "ja",
+        "target_language": "ko",
+        "reference": "항목의 값은 17, 17, 30, 30입니다.",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "항목의 값은 17, 17,30, 30입니다.",
+        "protected_values": [
+          "17",
+          "30"
+        ],
+        "status": "ok",
+        "translation": "항목의 값은 17, 17,30, 30입니다."
+      },
+      {
+        "id": "stress-ja-ko-033",
+        "source": "作業には二時間三十分かかります。",
+        "source_language": "ja",
+        "target_language": "ko",
+        "reference": "작업에는 두 시간 삼십 분이 걸립니다.",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "작업에는 2시간 30분 걸립니다.",
+        "protected_values": [],
+        "status": "ok",
+        "translation": "작업에는 2시간 30분 걸립니다."
+      },
+      {
+        "id": "stress-ja-ko-034",
+        "source": "参加者は十七人で予備の人数は三十人です。",
+        "source_language": "ja",
+        "target_language": "ko",
+        "reference": "참가자는 열일곱 명이고 예비 인원은 서른 명입니다.",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "참가자는 17명이고 예비 인원은 30명입니다.",
+        "protected_values": [],
+        "status": "ok",
+        "translation": "참가자는 17명이고 예비 인원은 30명입니다."
+      },
+      {
+        "id": "stress-ja-ko-035",
+        "source": "250mgを服用せず125mgだけ服用してください。",
+        "source_language": "ja",
+        "target_language": "ko",
+        "reference": "250mg을 복용하지 말고 125mg만 복용하세요.",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "250 mg 복용하지 말고 125 mg만 복용하세요.",
+        "protected_values": [
+          "250",
+          "125"
+        ],
+        "status": "ok",
+        "translation": "250mg 복용하지 말고 125mg만 복용하세요."
+      },
+      {
+        "id": "stress-ja-ko-036",
+        "source": "最初の箱の重さは17kgで二番目の箱は30kgです。",
+        "source_language": "ja",
+        "target_language": "ko",
+        "reference": "첫 상자의 무게는 17kg이고 둘째 상자는 30kg입니다.",
+        "cohort": "numeric_stress_authored",
+        "previous_status": "ok",
+        "previous_translation": "첫 번째 박스의 무게는 17 kg이고 두 번째 박스는 30 kg입니다.",
+        "protected_values": [
+          "17",
+          "30"
+        ],
+        "status": "ok",
+        "translation": "첫 번째 박스의 무게는 17kg이고 두 번째 박스는 30kg입니다."
+      },
+      {
+        "id": "ja-ko-honorific-01",
+        "source": "恐れ入りますが、こちらにお名前をご記入いただけますか。",
+        "source_language": "ja",
+        "target_language": "ko",
+        "reference": "죄송하지만, 여기에 성함을 적어 주시겠습니까?",
+        "cohort": "existing_authored_diagnostic",
+        "previous_status": "ok",
+        "previous_translation": "죄송하지만 여기 성함을 기입해 주시겠어요?",
+        "protected_values": [],
+        "status": "ok",
+        "translation": "죄송하지만 여기 성함을 기입해 주시겠어요?"
+      },
+      {
+        "id": "ja-ko-ambiguity-01",
+        "source": "今日はちょっと……また今度誘ってください。",
+        "source_language": "ja",
+        "target_language": "ko",
+        "reference": "오늘은 좀 곤란해요……다음에 또 불러 주세요.",
+        "cohort": "existing_authored_diagnostic",
+        "previous_status": "ok",
+        "previous_translation": "오늘은 좀……. 다음에 또 초대해주세요.",
+        "protected_values": [],
+        "status": "ok",
+        "translation": "오늘은 좀……. 다음에 또 초대해주세요."
+      },
+      {
+        "id": "ja-ko-numbers-01",
+        "source": "受付は17時30分までで、手数料は1,200円です。",
+        "source_language": "ja",
+        "target_language": "ko",
+        "reference": "접수는 17시 30분까지이며 수수료는 1,200엔입니다.",
+        "cohort": "existing_authored_diagnostic",
+        "previous_status": "ok",
+        "previous_translation": "접수는 17시 30분까지이고, 수수료는 1,200엔입니다.",
+        "protected_values": [
+          "17",
+          "30",
+          "1,200"
+        ],
+        "status": "ok",
+        "translation": "접수는 17시 30분까지이고, 수수료는 1,200엔입니다."
+      },
+      {
+        "id": "ja-ko-technical-01",
+        "source": "config.yamlを保存してから、サーバーを再起動してください。",
+        "source_language": "ja",
+        "target_language": "ko",
+        "reference": "config.yaml을 저장한 뒤 서버를 다시 시작해 주세요.",
+        "cohort": "existing_authored_diagnostic",
+        "previous_status": "ok",
+        "previous_translation": "config.yaml을 저장한 후 서버를 재부팅하세요.",
+        "protected_values": [
+          "config.yaml"
+        ],
+        "status": "ok",
+        "translation": "config.yaml을 저장한 후 서버를 재부팅하세요."
+      },
+      {
+        "id": "ja-ko-colloquial-01",
+        "source": "それ、めっちゃ助かる！あとでコーヒーおごるよ。",
+        "source_language": "ja",
+        "target_language": "ko",
+        "reference": "그거 진짜 도움 된다! 나중에 커피 살게.",
+        "cohort": "existing_authored_diagnostic",
+        "previous_status": "ok",
+        "previous_translation": "정말 고마워! 나중에 커피 한 잔 살게",
+        "protected_values": [],
+        "status": "ok",
+        "translation": "정말 고마워! 나중에 커피 한 잔 살게"
+      },
+      {
+        "id": "ja-ko-long-01",
+        "source": "電車が遅れていなければ間に合ったはずだが、駅に着いた時には受付が終わっていた。",
+        "source_language": "ja",
+        "target_language": "ko",
+        "reference": "전철이 늦지 않았다면 제시간에 도착했을 텐데, 역에 도착했을 때는 접수가 끝나 있었다.",
+        "cohort": "existing_authored_diagnostic",
+        "previous_status": "ok",
+        "previous_translation": "전철이 늦어지지 않았다면 시간에 맞췄을 텐데, 역에 도착했을 때는 접수가 끝났었다.",
+        "protected_values": [],
+        "status": "ok",
+        "translation": "전철이 늦어지지 않았다면 시간에 맞췄을 텐데, 역에 도착했을 때는 접수가 끝났었다."
+      },
+      {
+        "id": "ja-ko-proper-01",
+        "source": "朝凪町の月影公園で、白波さんと待ち合わせています。",
+        "source_language": "ja",
+        "target_language": "ko",
+        "reference": "아사나기 마을의 츠키카게 공원에서 시라나미 씨와 만나기로 했습니다.",
+        "cohort": "existing_authored_diagnostic",
+        "previous_status": "ok",
+        "previous_translation": "아사바 마을 월영공원에서 시라나미(白波) 씨와 만나고 있습니다.",
+        "protected_values": [],
+        "status": "ok",
+        "translation": "아사바 마을 월영공원에서 시라나미(白波) 씨와 만나고 있습니다."
+      },
+      {
+        "id": "ja-ko-idiom-01",
+        "source": "急がば回れと言うし、まず原因を一つずつ確認しよう。",
+        "source_language": "ja",
+        "target_language": "ko",
+        "reference": "급할수록 돌아가라고 하니, 우선 원인을 하나씩 확인하자.",
+        "cohort": "existing_authored_diagnostic",
+        "previous_status": "ok",
+        "previous_translation": "급하면 돌아가라고 할거고 원인을 하나씩 확인하자.",
+        "protected_values": [],
+        "status": "ok",
+        "translation": "급하면 돌아가라고 할거고 원인을 하나씩 확인하자."
+      }
+    ],
+    "settings": {
+      "device": "cpu",
+      "precision": "fp32",
+      "threads": 4,
+      "num_beams": 4,
+      "length_penalty": 1.0,
+      "max_new_tokens": 256,
+      "strict_numbers": true
+    },
+    "original_full_reevaluation_runtime": "c2ccc5210f2436017e2adaf067d02a7c83ceec98",
+    "full_flores_rerun": false
+  }
 }

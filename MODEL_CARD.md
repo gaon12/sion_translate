@@ -28,39 +28,34 @@ sion_translate is a custom PyTorch encoder-decoder model for bidirectional Korea
 translation. The uploaded release contains inference exports and its SentencePiece tokenizer;
 training datasets and training checkpoints are not distributed.
 
-## Known remaining issues after the 2026-10-12 reevaluation
+## v1 numeric inference update — runtime 0.1.2
 
-This is a **partial inference correction, not a complete fix for numerical translation**.
-The runtime and model weights have not changed since the numeric patch. More extensive
-evaluation found failures that the default protected-slot check does not reject:
+**Existing v1 users: reinstall the updated inference code.** Existing verified v1
+weights and tokenizer can be reused; no retraining or weight replacement is needed.
+The follow-up preserves spaced signs, repairs recognized measurement-unit suffixes
+(including compound units and powers), protects previously unrecognized numeric
+suffixes, and keeps ordinary uppercase acronyms visible during translation.
 
-- A spaced sign can disappear: `誤差は± 0.05mm以内です。` produced
-  `오차는 0.05 mm 이내입니다.`
-- A value can survive while its unit changes: `용량은 250mL이며 속도는 3.5km/h입니다.`
-  produced `容量は250 mmで、速度は 3.5 km/h です。`
-- Some suffixes such as `15mile` and `40mile` are not recognized by the numeric
-  masker, so their values can be omitted without a protected-slot error.
-- Automatically masking non-numeric acronyms can degrade otherwise ordinary text.
-  A focused diagnostic that bypassed this masking restored the original output in
-  all five tested cases; this experiment has not been deployed.
+Actual v1 EMA execution now preserves ± 0.05, 250mL, 3,850km², 15mile, and 40mile
+in the previously failing cases. The five identified acronym regressions are also
+corrected. This remains a **partial inference correction**: arbitrary units,
+word-written numbers, arithmetic, and full numerical semantics are not guaranteed.
+Some numerical omissions still cause an error instead of a translation.
 
-`strict_numbers=True` checks **recognized protected values** and supported hour/minute
-forms. It does not independently verify every source number, sign, unit, or numerical
-association. It can also reject an input instead of returning a translation. The earlier
-18-case probe documents that limited cohort, not a guarantee for arbitrary inputs.
+The focused follow-up attempted 238 inputs, returned
+236 outputs, and blocked 2.
+It includes 72 authored numeric stress inputs, 16 existing diagnostics, and every
+affected FLORES input. Average chrF++ on the rerun no-digit subset increased in both
+directions; individual regressions are still possible. This was not a fresh full
+FLORES rerun. Related regression tests: 98 passed.
 
-**한국어 안내:** 숫자 처리는 부분적으로 개선됐습니다. 부호·단위 손실, 지원하지
-않는 단위 뒤의 숫자 누락, 일부 일반 문장 회귀가 남아 있으므로 숫자가 완벽하게
-안전한 버전으로 설명해서는 안 됩니다. 숫자값뿐 아니라 부호·단위·문맥을 확인하세요.
+**한국어 안내:** 부호·단위·숫자 인식 누락·약어 회귀를 재학습 없이 보완했습니다.
+기존 사용자는 추론 코드를 다시 받으세요. 기존 가중치는 재사용 가능합니다.
+숫자 처리가 완벽하다는 의미는 아니며, 일부 값 누락은 오류로 차단됩니다.
 
-## v1 numeric inference update
+Details: [update guide](docs/V1_NUMERIC_HOTFIX.md).
 
-Existing v1 users should download the updated inference code from
-[the pinned maintenance runtime](docs/V1_NUMERIC_HOTFIX.md). The existing public
-`model_ema.pt`, `kjx.model`, and `token_features.npz` can be reused. No retraining or
-weight replacement is required. This preserves numeric literals and checks
-Korean/Japanese hour/minute associations; it does not change the model's learned
-numerical abilities or general translation quality.
+Runtime commit: [45254b8cb84e](https://github.com/gaon12/sion_translate/commit/45254b8cb84e7725aa7b58709f060317ff4e2ab6).
 
 ## Files
 
@@ -75,7 +70,7 @@ The model uses custom code from
 ## Usage
 
 ```bash
-python -m pip install --upgrade "sion-translate @ git+https://github.com/gaon12/sion_translate.git@c2ccc5210f2436017e2adaf067d02a7c83ceec98"
+python -m pip install --upgrade "sion-translate @ git+https://github.com/gaon12/sion_translate.git@45254b8cb84e7725aa7b58709f060317ff4e2ab6"
 python -m pip install huggingface_hub
 hf download gaon12/sion_translate --local-dir models/sion_translate
 ```
