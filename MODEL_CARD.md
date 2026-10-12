@@ -22,17 +22,46 @@ widget:
     text: "죄송하지만 여기 성함을 기입해 주시겠어요?"
 ---
 
-# sion_translate Korean–Japanese Translation
+# sion_translate 1.0 Korean–Japanese Translation
 
 sion_translate is a custom PyTorch encoder-decoder model for bidirectional Korean↔Japanese
 translation. The uploaded release contains inference exports and its SentencePiece tokenizer;
 training datasets and training checkpoints are not distributed.
 
+## v1 numeric inference update — runtime 0.1.2
+
+**Existing v1 users: reinstall the updated inference code.** Existing verified v1
+weights and tokenizer can be reused; no retraining or weight replacement is needed.
+The follow-up preserves spaced signs, repairs recognized measurement-unit suffixes
+(including compound units and powers), protects previously unrecognized numeric
+suffixes, and keeps ordinary uppercase acronyms visible during translation.
+
+Actual v1 EMA execution now preserves ± 0.05, 250mL, 3,850km², 15mile, and 40mile
+in the previously failing cases. The five identified acronym regressions are also
+corrected. This remains a **partial inference correction**: arbitrary units,
+word-written numbers, arithmetic, and full numerical semantics are not guaranteed.
+Some numerical omissions still cause an error instead of a translation.
+
+The focused follow-up attempted 238 inputs, returned
+236 outputs, and blocked 2.
+It includes 72 authored numeric stress inputs, 16 existing diagnostics, and every
+affected FLORES input. Average chrF++ on the rerun no-digit subset increased in both
+directions; individual regressions are still possible. This was not a fresh full
+FLORES rerun. Related regression tests: 98 passed.
+
+**한국어 안내:** 부호·단위·숫자 인식 누락·약어 회귀를 재학습 없이 보완했습니다.
+기존 사용자는 추론 코드를 다시 받으세요. 기존 가중치는 재사용 가능합니다.
+숫자 처리가 완벽하다는 의미는 아니며, 일부 값 누락은 오류로 차단됩니다.
+
+Details: [update guide](docs/V1_NUMERIC_HOTFIX.md).
+
+Runtime commit: [45254b8cb84e](https://github.com/gaon12/sion_translate/commit/45254b8cb84e7725aa7b58709f060317ff4e2ab6).
+
 ## Files
 
 - `model_ema.pt`: recommended FP32 EMA inference export
 - `model_int8.pt`: smaller CPU-only dynamic INT8 export
-- `sion.model`, `sion.vocab`, `token_features.npz`: tokenizer files
+- `kjx.model`, `kjx.vocab`, `token_features.npz`: tokenizer files
 
 The model uses custom code from
 [`gaon12/sion_translate`](https://github.com/gaon12/sion_translate) and is not a Transformers
@@ -41,9 +70,8 @@ The model uses custom code from
 ## Usage
 
 ```bash
-git clone https://github.com/gaon12/sion_translate.git
-cd sion_translate
-python -m pip install -e .
+python -m pip install --upgrade "sion-translate @ git+https://github.com/gaon12/sion_translate.git@45254b8cb84e7725aa7b58709f060317ff4e2ab6"
+python -m pip install huggingface_hub
 hf download gaon12/sion_translate --local-dir models/sion_translate
 ```
 
@@ -52,21 +80,26 @@ from sion_translate.inference import Translator
 
 translator = Translator(
     "models/sion_translate/model_ema.pt",
-    "models/sion_translate/sion.model",
+    "models/sion_translate/kjx.model",
 )
 print(translator.translate(["안녕하세요."], target_language="ja", num_beams=4)[0])
 print(translator.translate(["こんにちは。"], target_language="ko", num_beams=4)[0])
 ```
 
-Use `model_int8.pt` for CPU inference with lower storage and memory requirements. It reduces file
-size and memory, not latency: on the same CPU its generation speed matches the FP32 export. Only
-load PyTorch pickle-based artifacts from repositories you trust.
+The numeric update was verified with `model_ema.pt` on CPU. The public legacy pickled
+`model_int8.pt` is not covered by this release's safe weights-only loading validation.
 
 ## Evaluation
 
 The GitHub repository includes a small, independently authored diagnostic JSONL covering both
 directions and provides a common scorer for sion_translate, LibreTranslate, Papago, Google Translation,
 DeepL, M2M100 418M, and NLLB-200. No universal quality claim is made from that small set.
+
+On the repository's 20-sentence-per-direction beam-4 probe, the uploaded release scored chrF
+59.81 for ko→ja and 49.87 for ja→ko. The roughly ten-point gap is material: Japanese→Korean is
+the weaker direction and should not be described as equivalent to Korean→Japanese. The current
+repository contains direction-balanced checkpoint selection and a compatibility-checked retraining
+pipeline, but those code changes do not retroactively improve the weights in this release.
 
 Scores from the repository's own test split are in-domain: the split is drawn from the same
 sources as the training data, so quality on unseen domains is substantially lower. Any single
@@ -81,7 +114,8 @@ chrF 53.43 on an out-of-domain diagnostic set.
 
 ## Limitations
 
-- **Numbers can change value.** This release's tokenizer was trained without digit splitting, so
+- **Historical unprotected v1 output can change number values.** This release's tokenizer was
+  trained without digit splitting, so
   the model treats numbers as memorised pieces rather than sequences of digits. It substitutes a
   plausible wrong value rather than dropping it. Eight of ten numeric probe sentences are
   corrupted at beam 4:
@@ -101,13 +135,18 @@ chrF 53.43 on an out-of-domain diagnostic set.
   width does not change this, and neither does post-training: the representation does not expose
   digits, so `reward_number_weight` has no signal to optimise. Verify every amount, dosage, date
   and identifier against the source. Loading the tokenizer emits a warning, and `sion-train`
-  refuses it outright, so this checkpoint cannot be trained further — fixing it requires a new
-  tokenizer and therefore a new model, because the tied embedding is 18.4% of the parameters.
+  refuses it outright, so this checkpoint cannot be trained further — changing that learned
+  representation requires a new
+  tokenizer and model. The numeric inference update instead uses existing protected slots
+  to preserve literals without changing token IDs or weights.
 - Proper nouns are memorised, not generalised. Names and places present in training are accurate,
   while unseen ones get translated morpheme by morpheme (`五十嵐大輔` → `50폭풍 대장`). Supply a
   glossary for names that matter.
 - Machine translations can omit, add, or reverse meaning. Rare vocabulary can be replaced by an
   unrelated similar-looking word.
+- Profanity, internet slang, non-lexical vocalizations, and culture-bound idioms are
+  style-sensitive. This release was not accepted against the repository's newer isolated
+  expressive/cultural challenge set; literal, weakened, or over-strong renderings require review.
 - Short context-dependent utterances, specialist terminology, and long inputs need human review.
 - Do not use unreviewed output for medical, legal, safety-critical, or certified translation.
 - The custom architecture requires the repository code; hosted Transformers inference is not

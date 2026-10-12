@@ -1,9 +1,12 @@
 # sion_translate
 
-**v1 numeric inference update:** Existing v1 users should download the updated
+**v1 numeric inference update (runtime 0.1.2):** Existing v1 users should download the updated
 inference code from this `v1-numeric-hotfix` branch. The existing v1 weights and
 tokenizer can be reused; no retraining is required. See
 [the update instructions and direct-execution results](docs/V1_NUMERIC_HOTFIX.md).
+The follow-up fixes verified spaced-sign, unit, numeric-suffix and acronym cases.
+Some numerical omissions still cause an error; complete numerical semantics are
+not guaranteed.
 
 sion_translate는 한국어↔일본어 번역 모델을 처음부터 학습하고 평가하는 PyTorch 프로젝트입니다.
 joint SentencePiece, GQA, RoPE, pre-RMSNorm, QK-norm, SwiGLU, EMA, 양방향 번역,
