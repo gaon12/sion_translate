@@ -13,6 +13,8 @@ from dataclasses import dataclass
 import re
 from typing import Iterable, Sequence
 
+from sion_translate.numeric_units import source_unit_at
+
 
 _WHITESPACE = re.compile(r"\s+")
 _ENTITY = re.compile(r"&(?:#\d+|#[xX][0-9A-Fa-f]+|[A-Za-z][A-Za-z0-9]+);")
@@ -66,8 +68,11 @@ _TRANSLATABLE_NUMBER_SUFFIX = re.compile(
 
 # In legacy inference, keep units visible to the decoder and hide only values.
 # A hidden ``250mg`` can make v1 invent a second counter after the slot.
-_NUMERIC_VALUE = re.compile(r"(?:[$€£¥₩₹]\s*)?[+\-±−＋－]?\d+(?:[.,:/\-]\d+)*")
-_DIGIT_IDENTIFIER = re.compile(r"(?<![A-Za-z0-9_])\d+(?:-\d+){2,}(?![A-Za-z0-9_])")
+_LEGACY_NUMERIC_VALUE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:[$€£¥₩₹]\s*)?[+\-±−＋－]?\s*"
+    r"(?:\d+(?:[.,:/\-]\d+)*|[.,]\d+)(?:[eE][+\-−]?\d+)?"
+)
+_DIGIT_IDENTIFIER = re.compile(r"(?<![A-Za-z0-9_])[+\-±−＋－]?\d+(?:-\d+){2,}(?![A-Za-z0-9_])")
 
 _URL_TRAILING_PUNCTUATION = ".,!?;:。！？、，；："
 _URL_KOREAN_PARTICLES = tuple(
@@ -424,17 +429,41 @@ def mask_structured_spans(
 
     candidates = extract_structured_spans(text)
     if keep_number_units_visible:
-        refined: list[StructuredSpan] = []
-        for span in candidates:
-            if span.kind != "number":
-                refined.append(span)
+        # Scan numeric values independently of the known-unit allowlist. An
+        # unfamiliar suffix (15mile, 3.7N) must not bypass strict preservation.
+        # Pure alphabetic acronyms stay visible: hiding AI/USAF made v1 invent
+        # counters. Higher-priority URLs/placeables still remain opaque.
+        refined = [
+            span
+            for span in candidates
+            if span.kind != "number"
+            and not (
+                span.kind == "identifier"
+                and span.surface.isascii()
+                and span.surface.isalpha()
+                and span.surface.isupper()
+            )
+        ]
+        for match in _LEGACY_NUMERIC_VALUE.finditer(text):
+            start, end = match.span()
+            while start < end and text[start].isspace():
+                start += 1
+            if any(
+                span.kind == "identifier"
+                and not span.surface[0].isdigit()
+                and span.start <= start
+                and end <= span.end
+                for span in refined
+            ):
                 continue
-            for match in _NUMERIC_VALUE.finditer(span.surface):
-                start = span.start + match.start()
-                end = span.start + match.end()
-                if start == span.start and start > 0 and text[start - 1] in "±−＋－":
-                    start -= 1
-                refined.append(_span(start, end, text[start:end], "number"))
+            value = _span(start, end, text[start:end], "number")
+            unit = source_unit_at(text, end)
+            if unit is not None:
+                # Equal values with different units need distinct slots.
+                value = StructuredSpan(
+                    start, end, value.surface, value.kind, value.key + "\0unit:" + unit
+                )
+            refined.append(value)
         # A phone/account ID is one opaque value, not a translatable range.
         for match in _DIGIT_IDENTIFIER.finditer(text):
             refined.append(_span(match.start(), match.end(), match.group(), "number"))

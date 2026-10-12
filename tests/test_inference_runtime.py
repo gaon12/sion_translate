@@ -49,6 +49,31 @@ class LegacyNumericTokenizer(FakeTokenizer):
 
 
 @pytest.mark.parametrize(
+    "decoded,expected",
+    [
+        ("容量は<slot_0> mmです。", "容量は250mLです。"),
+        ("容量は<slot_0>です。", None),
+    ],
+)
+def test_legacy_unit_restoration_is_used_by_translator(
+    monkeypatch, tmp_path: Path, decoded: str, expected: str | None
+) -> None:
+    with pytest.warns(RuntimeWarning, match="자동 보호"):
+        translator = make_translator(
+            monkeypatch, tmp_path, runtime_config(), tokenizer_class=LegacyNumericTokenizer
+        )
+    monkeypatch.setattr(translator.tokenizer, "decode", lambda _ids: decoded)
+    monkeypatch.setattr(translator.model, "generate", lambda *_a, **_kw: torch.tensor([[2, 20, 3]]))
+    if expected is None:
+        with pytest.raises(inference.NumericPreservationError, match="measurement unit"):
+            translator.translate(["용량은 250mL입니다."], target_language="ja", max_new_tokens=4)
+    else:
+        assert translator.translate(
+            ["용량은 250mL입니다."], target_language="ja", max_new_tokens=4
+        ) == [expected]
+
+
+@pytest.mark.parametrize(
     ("source", "decoded", "expected"),
     [
         ("17시 30분", "<slot_0>時<slot_1>分", "17時30分"),

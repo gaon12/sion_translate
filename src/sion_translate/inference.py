@@ -22,6 +22,8 @@ from sion_translate.glossary import Glossary, apply_source_placeholders, restore
 from sion_translate.rerank import select as rerank_select
 from sion_translate.revision import DRAFT_SEPARATOR, serialize_revision_input
 from sion_translate.structured import mask_structured_spans
+from sion_translate.numeric_units import legacy_unit_map, restore_legacy_units
+
 from sion_translate.tokenizer import (
     SLOT_SYMBOLS,
     SionTokenizer,
@@ -30,9 +32,11 @@ from sion_translate.tokenizer import (
 )
 from sion_translate.training.export import load_exported_model, resolve_manifest_artifact
 
+LEGACY_NUMERIC_PATCH_VERSION = 2
+
 
 class NumericPreservationError(ValueError):
-    """Legacy decoding dropped or duplicated a protected numeric value."""
+    """Legacy decoding failed numeric counts, time associations, or unit locations."""
 
 
 def _numeric_times(text: str, language: str) -> Counter[tuple[str, str]]:
@@ -602,7 +606,9 @@ class Translator:
 
         숫자를 분리하지 않는 v1 토크나이저는 단위 문맥을 남기고 숫자값만
         보호합니다. 기본 ``strict_numbers=True`` 는 보호값의 누락·중복과
-        한국어↔일본어 시·분 대응 오류를 거부합니다. ``False`` 는 진단용으로
+        한국어↔일본어 시·분 대응 오류를 거부합니다. 인식한 계량 단위는
+        숫자 slot 바로 뒤의 단위를 원문 표기로 복원하며, 위치를 확인할 수
+        없으면 오류로 거부합니다. ``False`` 는 진단용으로
         검증되지 않은 출력을 허용하므로 정상 서비스에서는 켜 두십시오.
 
         ``num_candidates`` 를 1 이상으로 두면 beam 결과에 더해 그 수만큼 확률적
@@ -680,6 +686,7 @@ class Translator:
             structured_map: dict[str, str] | None,
             glossary_map: dict[str, str] | None,
             numeric_counts: dict[str, int],
+            unit_map: dict[str, str],
             source_text: str,
         ) -> str:
             """생성 토큰을 문자열로 되돌리고 보호 slot 을 복원합니다."""
@@ -697,6 +704,11 @@ class Translator:
                         f"occurrence count: {failures!r}. No repaired translation was returned. "
                         "Use a shorter input or strict_numbers=False to inspect unverified output."
                     )
+            if strict_numbers and unit_map:
+                try:
+                    text = restore_legacy_units(text, unit_map)
+                except ValueError as error:
+                    raise NumericPreservationError(str(error)) from error
             if structured_map:
                 text, missing = restore_targets(text, structured_map)
                 if missing and append_missing_structured:
@@ -725,6 +737,7 @@ class Translator:
             structured_maps: list[dict[str, str]] = []
             glossary_maps: list[dict[str, str]] = []
             numeric_counts: list[dict[str, int]] = []
+            unit_maps: list[dict[str, str]] = []
             prepared: list[str] = []
             for text in chunk:
                 masked, structured_map = mask_structured_spans(
@@ -740,6 +753,15 @@ class Translator:
                     }
                 )
                 structured_maps.append(structured_map)
+                unit_maps.append(
+                    {
+                        slot: unit
+                        for slot, unit in legacy_unit_map(masked).items()
+                        if slot in numeric_counts[-1]
+                    }
+                    if self._legacy_numeric_protection
+                    else {}
+                )
                 glossary_map: dict[str, str] = {}
                 if glossary is not None and source_language:
                     remaining_slots = SLOT_SYMBOLS[len(structured_map) :]
@@ -823,6 +845,7 @@ class Translator:
                     structured_maps[index],
                     glossary_maps[index],
                     numeric_counts[index],
+                    unit_maps[index],
                     sources[index],
                 )
                 for index, row in enumerate(generated.tolist())
@@ -859,6 +882,7 @@ class Translator:
                             structured_maps[row_index],
                             glossary_maps[row_index],
                             numeric_counts[row_index],
+                            unit_maps[row_index],
                             source_text,
                         )
                     except NumericPreservationError:

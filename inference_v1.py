@@ -25,6 +25,12 @@ def main() -> None:
     if "strict_numbers" not in inspect.signature(Translator.translate).parameters:
         parser.error("Install the v1-numeric-hotfix runtime listed in the model card first.")
     manifest = json.loads((args.model_dir / "v1_numeric_hotfix.json").read_text(encoding="utf-8"))
+    from sion_translate import inference
+
+    if getattr(inference, "LEGACY_NUMERIC_PATCH_VERSION", 1) < manifest.get(
+        "numeric_patch_version", 1
+    ):
+        parser.error("Upgrade to the v1 runtime pinned in the downloaded NUMERIC_HOTFIX.md.")
     for filename, identity in manifest["artifacts"].items():
         path = args.model_dir / filename
         digest = hashlib.sha256()
