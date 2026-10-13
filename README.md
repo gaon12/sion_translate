@@ -8,6 +8,13 @@ The main training pipeline remains on its current generation. This is a partial
 numeric correction; some omissions still cause an error and full numerical semantics
 are not guaranteed.
 
+**Sion 1.5 models are published on Hugging Face** in the
+[Sion collection](https://huggingface.co/collections/alice-noa-chan/sion-6abb683ff636ba703e4c0d8a):
+[translation MRT](https://huggingface.co/alice-noa-chan/sion_translate-1.5-mrt),
+[translation SFT](https://huggingface.co/alice-noa-chan/sion_translate-1.5), and the experimental
+[base model](https://huggingface.co/alice-noa-chan/sion-1.5-base). Each model card lists its
+evaluation results and known limitations.
+
 `sion_translate` is a from-scratch encoder-decoder training stack for multilingual
 machine translation. The repository currently uses Korean, English, and Japanese data,
 but the implementation does not assume those languages. A run may define any set of
@@ -15,15 +22,15 @@ BCP 47 language tags, physical language pairs, and directed translation edges.
 
 Version 1.5 separates two model roles:
 
-| Stage | Purpose | Local output | Hugging Face role |
+| Stage | Purpose | Local output | Hugging Face release |
 |---|---|---|---|
-| Foundation | Monolingual span reconstruction and optional reasoning data | `runs/*/foundation/` | A new base-model repository, created only after training finishes |
-| Translation SFT | Directed translation from the selected foundation weights | `runs/*/pretrain/` | Intermediate `sion_translate` weights |
-| Translation MRT | Sequence-level risk and preference optimization | `runs/*/posttrain/` | Final `gaon12/sion_translate` release |
+| Foundation | Monolingual span reconstruction and optional reasoning data | `runs/*/foundation/` | [`alice-noa-chan/sion-1.5-base`](https://huggingface.co/alice-noa-chan/sion-1.5-base) |
+| Translation SFT | Directed translation from the selected foundation weights | `runs/*/pretrain/` | [`alice-noa-chan/sion_translate-1.5`](https://huggingface.co/alice-noa-chan/sion_translate-1.5) |
+| Translation MRT | Sequence-level risk and preference optimization | `runs/*/posttrain/` | [`alice-noa-chan/sion_translate-1.5-mrt`](https://huggingface.co/alice-noa-chan/sion_translate-1.5-mrt) |
 
 The foundation artifact is not a translation model. It has never learned translation
-directions, and the inference runtime rejects it. Model cards are intentionally not
-updated before the corresponding training and evaluation runs are complete.
+directions, and the inference runtime rejects it. The public v1 Korean–Japanese model remains
+at [`gaon12/sion_translate`](https://huggingface.co/gaon12/sion_translate).
 
 ## What version 1.5 adds
 
