@@ -2672,6 +2672,21 @@ def test_structured_mask_leaves_natural_language_units_translatable() -> None:
     assert not critical_mismatch
 
 
+def test_structured_mask_leaves_hyphenated_words_translatable() -> None:
+    source = "A three-dimensional model of one-third scale uses API-KEY between 10:00-11:00 pm."
+    masked, mapping = mask_structured_spans(
+        source,
+        slot_symbols=SLOT_SYMBOLS,
+    )
+
+    assert "three-dimensional" in masked
+    assert "one-third" in masked
+    assert set(mapping.values()) == {"API-KEY", "10:00-11:00"}
+    restored, missing = restore_targets(masked, mapping)
+    assert restored == source
+    assert not missing
+
+
 def test_shared_complex_placeable_is_replaced_once() -> None:
     placeable = '{ DATETIME($date, month: "long", year: "numeric") }'
     left, right = protect_shared_spans(

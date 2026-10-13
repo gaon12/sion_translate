@@ -35,6 +35,11 @@ _IDENTIFIER = re.compile(
     r"\d[A-Za-z][A-Za-z0-9_.-]*)"
     r"(?![A-Za-z0-9_.-])"
 )
+# Ordinary hyphenated words (``three-dimensional``, ``one-third``) match
+# ``_IDENTIFIER`` but are translated in parallel data, so training protects
+# them only when both sides share the surface.  Masking them unconditionally
+# at inference copies English into Korean/Japanese output.
+_HYPHENATED_WORD = re.compile(r"[A-Za-z]+(?:-[A-Za-z]+)+")
 _NUMBER = re.compile(
     r"(?<![A-Za-z0-9_])"
     r"(?:[$€£¥₩₹]\s*)?[+-]?"
@@ -48,7 +53,7 @@ _NUMBER = re.compile(
     r"ml|mL|cl|cL|dl|dL|L|"
     r"개|명|원|엔|달러|유로|퍼센트))?"
     r"(?:\s?(?:-|–|—|~|〜)\s?"
-    r"(?:[$€£¥₩₹]\s*)?[+-]?\d+(?:[.,]\d+)?"
+    r"(?:[$€£¥₩₹]\s*)?[+-]?\d+(?:[.,:]\d+)?"
     r"(?:\s?(?:%|‰|°[CF]?|KiB|MiB|GiB|TiB|KB|MB|GB|TB|B|"
     r"kg|mg|µg|μg|g|km|cm|mm|m|ms|sec|min|hrs?|days?))?)?"
     r"(?![A-Za-z0-9_])",
@@ -416,7 +421,15 @@ def mask_structured_spans(
 ) -> tuple[str, dict[str, str]]:
     """Mask source-side structured values and return ``slot -> exact surface``."""
 
-    selected = _select_non_overlapping(extract_structured_spans(text))
+    selected = _select_non_overlapping(
+        span
+        for span in extract_structured_spans(text)
+        if not (
+            span.kind == "identifier"
+            and _HYPHENATED_WORD.fullmatch(span.surface)
+            and not span.surface.isupper()
+        )
+    )
     ordered_keys = list(dict.fromkeys(span.key for span in selected))[: len(slot_symbols)]
     key_to_slot = dict(zip(ordered_keys, slot_symbols[: len(ordered_keys)], strict=True))
     first_surface: dict[str, str] = {}
