@@ -598,27 +598,35 @@ use and distribution of models developed using its data, with attribution to the
 dataset names and AI-Hub. Redistribution of original or merely edited source data
 is restricted. These terms apply to the AI-Hub sources listed here.
 
-## AI-Hub dataset attribution for 1.5 Japanese translation data
+## AI-Hub dataset attribution for 1.5
 
-The following AI-Hub datasets supplied Korean-Japanese text for the 1.5
-translation corpus and shared tokenizer. We acknowledge AI-Hub
+The following AI-Hub datasets supplied Korean-Japanese and Korean-English text
+for the 1.5 translation corpus and shared tokenizer. We acknowledge AI-Hub
 ([aihub.or.kr](https://aihub.or.kr/)) and the dataset creators. This table credits
-the identified Japanese-translation sources from AI-Hub; it is not a complete
-inventory of all training sources.
+the individually identified AI-Hub sources; it is not a complete inventory of
+all training sources. The language pairs below describe the identified source
+files, not every language available in the upstream datasets.
 
-| AI-Hub dataset ID | Official dataset name and source |
-|---|---|
-| 127 | [한국어-일본어 번역 말뭉치](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=127) |
-| 546 | [일상생활 및 구어체 한-중, 한-일 번역 병렬 말뭉치 데이터](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=546) |
-| 71493 | [한국어-다국어(영어 제외) 번역 말뭉치(기술과학)](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=71493) |
-| 71496 | [한국어-다국어 번역 말뭉치(기초과학)](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=71496) |
-| 71498 | [한국어-다국어 번역 말뭉치 (인문학)](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=71498) |
-| 71735 | [생성형AI 한-중/한-일 특허 및 기술과학 분야 병렬 말뭉치 데이터](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=71735) |
-| 71782 | [생성형AI 금융 분야 다국어 병렬 말뭉치 데이터](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=71782) |
-| 71591 | [방송콘텐츠 한국어-아시아어 번역 말뭉치](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=71591) |
-| 71671 | [생성형AI 라이브 스트리밍 영상 일본어 통번역 데이터](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=71671) |
-| 71263 | [방송 콘텐츠 한-중, 한-일 번역 병렬 말뭉치 데이터](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=71263) |
-| 71411 | [발화유형(문어, 구어, 채팅)별 기계번역 병렬 말뭉치](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=71411) |
+| AI-Hub dataset ID | Official dataset name and source | Language pairs |
+|---|---|---|
+| 127 | [한국어-일본어 번역 말뭉치](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=127) | ko-ja |
+| 546 | [일상생활 및 구어체 한-중, 한-일 번역 병렬 말뭉치 데이터](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=546) | ko-ja |
+| 71493 | [한국어-다국어(영어 제외) 번역 말뭉치(기술과학)](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=71493) | ko-ja |
+| 71496 | [한국어-다국어 번역 말뭉치(기초과학)](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=71496) | ko-ja |
+| 71498 | [한국어-다국어 번역 말뭉치 (인문학)](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=71498) | ko-ja |
+| 71735 | [생성형AI 한-중/한-일 특허 및 기술과학 분야 병렬 말뭉치 데이터](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=71735) | ko-ja |
+| 71782 | [생성형AI 금융 분야 다국어 병렬 말뭉치 데이터](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=71782) | ko-ja |
+| 71591 | [방송콘텐츠 한국어-아시아어 번역 말뭉치](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=71591) | ko-ja |
+| 71671 | [생성형AI 라이브 스트리밍 영상 일본어 통번역 데이터](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=71671) | ko-ja |
+| 71263 | [방송 콘텐츠 한-중, 한-일 번역 병렬 말뭉치 데이터](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=71263) | ko-ja |
+| 71411 | [발화유형(문어, 구어, 채팅)별 기계번역 병렬 말뭉치](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=71411) | ko-ja, ko-en |
+| 71265 | [일상생활 및 구어체 한-영 번역 병렬 말뭉치 데이터](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=71265) | ko-en |
+| 71266 | [기술과학 분야 한-영 번역 병렬 말뭉치 데이터](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=71266) | ko-en |
+
+Additional Korean-English text came from a combined source containing 14
+AI-Hub corpora alongside other sources. The available combined-source records
+retain its aggregate provenance but do not identify each AI-Hub dataset ID;
+the table above lists the individually verified datasets.
 
 The foundation model credits these sources for its shared tokenizer. Its
 parameter training used the monolingual and reasoning sources described in the
