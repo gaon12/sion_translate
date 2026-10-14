@@ -15,6 +15,15 @@ are not guaranteed.
 [base model](https://huggingface.co/alice-noa-chan/sion-1.5-base). Each model card lists its
 evaluation results and known limitations.
 
+**Portable artifacts:** the public v1 model and both 1.5 translation models include a
+`portable/` folder with FP32 safetensors and a CPU INT8 `state_dict` that loads with
+`torch.load(weights_only=True)`. Its `portable_manifest.json` records the SHA-256 of every
+file, the source checkpoint, the runtime commit, the architecture, and the quantization
+layout. The bundled `sion_portable.py` verifies those hashes and loads the weights with
+`strict=True`. FP32 output matched the source export on all 40 diagnostic sentences for
+each model. See the *Portable artifacts* section of each model card for usage and INT8
+validation.
+
 `sion_translate` is a from-scratch encoder-decoder training stack for multilingual
 machine translation. The repository currently uses Korean, English, and Japanese data,
 but the implementation does not assume those languages. A run may define any set of

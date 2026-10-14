@@ -66,7 +66,9 @@ strict_numbers=False is for inspecting unverified output and disables these chec
 This is a partial inference correction. It does not guarantee arbitrary units,
 word-written numbers, arithmetic, numeric-to-entity associations, or complete
 translation semantics. The verified path uses the safe FP32 EMA state dictionary;
-the legacy pickled INT8 artifact is outside this validation.
+the legacy pickled INT8 artifact is outside this validation. For pickle-free loading, the
+model repository's `portable/` folder provides FP32 safetensors that are bitwise-equal to
+the EMA and a plain INT8 `state_dict`, with SHA-256 hashes in `portable_manifest.json`.
 
 **한국어 안내:** 확인된 부호·단위·숫자 인식 누락·약어 회귀를 재학습 없이
 보완했습니다. 기존 사용자는 추론 코드를 다시 설치하세요. 기존 가중치는

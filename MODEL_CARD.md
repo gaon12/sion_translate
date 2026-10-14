@@ -60,7 +60,10 @@ Runtime commit: [45254b8cb84e](https://github.com/gaon12/sion_translate/commit/4
 ## Files
 
 - `model_ema.pt`: recommended FP32 EMA inference export
-- `model_int8.pt`: smaller CPU-only dynamic INT8 export
+- `model_int8.pt`: legacy pickled CPU-only dynamic INT8 export, kept for compatibility;
+  prefer `portable/model_int8_state_dict.pt`
+- `portable/`: FP32 safetensors and a plain INT8 `state_dict` with a SHA-256 manifest
+  (see [Portable artifacts](#portable-artifacts-portable))
 - `kjx.model`, `kjx.vocab`, `token_features.npz`: tokenizer files
 
 The model uses custom code from
@@ -87,7 +90,57 @@ print(translator.translate(["こんにちは。"], target_language="ko", num_bea
 ```
 
 The numeric update was verified with `model_ema.pt` on CPU. The public legacy pickled
-`model_int8.pt` is not covered by this release's safe weights-only loading validation.
+`model_int8.pt` is not covered by this release's safe weights-only loading validation;
+use the portable artifacts below for strict, pickle-free loading.
+
+## Portable artifacts (`portable/`)
+
+`portable/` holds plain-tensor copies of `model_ema.pt` that load with `strict=True` and
+without executing pickled classes. `sion_portable.py` checks the size and SHA-256 of every file
+listed in `portable_manifest.json` before it builds the model.
+
+| File | Contents | Size | SHA-256 |
+|---|---|---:|---|
+| `model_fp32.safetensors` | FP32 safetensors; every tensor bitwise-equal to `model_ema.pt` | 0.80 GB | `94d5fe4a6834c943aae2c98e64c716286f555cfa6151c3e182e8571e8168adb4` |
+| `model_int8_state_dict.pt` | CPU dynamic INT8 `state_dict` (`torch.ao`); loads with `torch.load(weights_only=True)`, no pickled classes | 0.31 GB | `1757e67bb4ed611894d35fe15a96cf2b3f76f6b486a0e2b46eb3b82e8a1f0b20` |
+| `kjx.model` | Tokenizer | 853 KB | `c1b5447e08692bf7a7d2e485ba7b71b3ff5584c96844ecac07e25c9d1340db50` |
+| `token_features.npz` | Tokenizer features | 69 KB | `54951b569255bd0a2e1d333860db2294113f1368a2e25e4ae5bc2bcdb6976b4c` |
+| `portable_manifest.json` | Hashes, source checkpoint, runtime commit, architecture, quantization layout | 12 KB | `29044d46d94344b5eb4266f4550b2ce5749b24300a97930d4371e5dea3a86020` |
+
+`sion_portable.py` (loader), `translate_portable.py` (CLI), and `portable_validation.json`
+(per-sentence outputs) are in the same folder.
+
+- Source: `gaon12/sion_translate` revision `1f106d9caa22`, `model_ema.pt` (SHA-256 `829580d1db1693ec00ee641398ce6ba9549388e266f6259f85e5a19ea28bfc2e`)
+- Runtime: `sion-translate` commit [`45254b8cb84e`](https://github.com/gaon12/sion_translate/commit/45254b8cb84e7725aa7b58709f060317ff4e2ab6)
+- INT8 recipe: dynamic `qint8` weights (per output channel) for 200 encoder/decoder `nn.Linear` modules, `onednn` engine, no calibration data, CPU only
+
+```bash
+python -m pip install "sion-translate @ git+https://github.com/gaon12/sion_translate.git@45254b8cb84e7725aa7b58709f060317ff4e2ab6" safetensors huggingface_hub
+hf download gaon12/sion_translate --include "portable/*" --local-dir sion_translate
+python sion_translate/portable/translate_portable.py --precision fp32 --target-language ja --text "회의는 17시 30분에 시작합니다."
+```
+
+```python
+import sys
+sys.path.insert(0, "sion_translate/portable")
+import sion_portable
+from sion_translate.inference import Translator
+
+sion_portable.install()  # Translator now accepts portable weight files
+translator = Translator("sion_translate/portable/model_fp32.safetensors", "sion_translate/portable/kjx.model", device="cpu")
+```
+
+**Validation** (40-sentence diagnostic set, CPU, beam 4, torch 2.13.0+cpu):
+
+| Weights | Identical output | Blocked by numeric guard | chrF |
+|---|---:|---:|---:|
+| `model_ema.pt` (source) | — | 0 | 59.13 |
+| `model_fp32.safetensors` | 40/40 vs source | 0 | 59.13 |
+| `model_int8_state_dict.pt` | 28/40 vs FP32 | 2 | 57.57 |
+
+FP32 is the reference portable format. INT8 trades a small quality loss for size and CPU speed;
+prefer FP32 when numbers must be preserved. The INT8 file uses PyTorch's quantized tensor
+types, which PyTorch has deprecated; it was verified with torch 2.13.0+cpu only.
 
 ## Evaluation
 
