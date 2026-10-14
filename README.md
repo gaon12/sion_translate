@@ -573,6 +573,31 @@ documentation update, or file group, and write detailed English commit messages.
 - [`docs/DATA_EXPANSION_PLAN.md`](docs/DATA_EXPANSION_PLAN.md): corpus expansion plan
 - [`docs/QUALITY_OVERHAUL.md`](docs/QUALITY_OVERHAUL.md): quality work and evaluation rules
 
+## AI-Hub dataset attribution for public v1
+
+The AI-Hub portion of the public v1 (KJ-X) training data includes the datasets
+below. We acknowledge AI-Hub ([aihub.or.kr](https://aihub.or.kr/)) and the dataset
+creators. This table credits those AI-Hub sources; it is not a complete inventory
+of all training sources.
+
+| AI-Hub dataset ID | Official dataset name and source |
+|---|---|
+| 127 | [한국어-일본어 번역 말뭉치](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=127) |
+| 546 | [일상생활 및 구어체 한-중, 한-일 번역 병렬 말뭉치 데이터](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=546) |
+| 71493 | [한국어-다국어(영어 제외) 번역 말뭉치(기술과학)](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=71493) |
+| 71496 | [한국어-다국어 번역 말뭉치(기초과학)](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=71496) |
+| 71498 | [한국어-다국어 번역 말뭉치 (인문학)](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=71498) |
+| 71646 | [생성형AI 다국어 번역 품질 평가 데이터](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=71646) |
+| 71735 | [생성형AI 한-중/한-일 특허 및 기술과학 분야 병렬 말뭉치 데이터](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=71735) |
+| 71782 | [생성형AI 금융 분야 다국어 병렬 말뭉치 데이터](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=71782) |
+| 71591 | [방송콘텐츠 한국어-아시아어 번역 말뭉치](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=71591) |
+| 71671 | [생성형AI 라이브 스트리밍 영상 일본어 통번역 데이터](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=71671) |
+
+[AI-Hub's official FAQ](https://aihub.or.kr/aihubnews/faq/list.do) permits commercial
+use and distribution of models developed using its data, with attribution to the
+dataset names and AI-Hub. Redistribution of original or merely edited source data
+is restricted. These terms apply to the AI-Hub sources listed here.
+
 ## License
 
 Code is released under the [MIT License](LICENSE). Dataset and model artifact rights are
