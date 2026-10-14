@@ -598,6 +598,36 @@ use and distribution of models developed using its data, with attribution to the
 dataset names and AI-Hub. Redistribution of original or merely edited source data
 is restricted. These terms apply to the AI-Hub sources listed here.
 
+## AI-Hub dataset attribution for 1.5 Japanese translation data
+
+The following AI-Hub datasets supplied Korean-Japanese text for the 1.5
+translation corpus and shared tokenizer. We acknowledge AI-Hub
+([aihub.or.kr](https://aihub.or.kr/)) and the dataset creators. This table credits
+the identified Japanese-translation sources from AI-Hub; it is not a complete
+inventory of all training sources.
+
+| AI-Hub dataset ID | Official dataset name and source |
+|---|---|
+| 127 | [한국어-일본어 번역 말뭉치](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=127) |
+| 546 | [일상생활 및 구어체 한-중, 한-일 번역 병렬 말뭉치 데이터](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=546) |
+| 71493 | [한국어-다국어(영어 제외) 번역 말뭉치(기술과학)](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=71493) |
+| 71496 | [한국어-다국어 번역 말뭉치(기초과학)](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=71496) |
+| 71498 | [한국어-다국어 번역 말뭉치 (인문학)](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=71498) |
+| 71735 | [생성형AI 한-중/한-일 특허 및 기술과학 분야 병렬 말뭉치 데이터](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=71735) |
+| 71782 | [생성형AI 금융 분야 다국어 병렬 말뭉치 데이터](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=71782) |
+| 71591 | [방송콘텐츠 한국어-아시아어 번역 말뭉치](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=71591) |
+| 71671 | [생성형AI 라이브 스트리밍 영상 일본어 통번역 데이터](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=71671) |
+| 71263 | [방송 콘텐츠 한-중, 한-일 번역 병렬 말뭉치 데이터](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=71263) |
+| 71411 | [발화유형(문어, 구어, 채팅)별 기계번역 병렬 말뭉치](https://aihub.or.kr/aihubdata/data/view.do?dataSetSn=71411) |
+
+The foundation model credits these sources for its shared tokenizer. Its
+parameter training used the monolingual and reasoning sources described in the
+[base model card](https://huggingface.co/alice-noa-chan/sion-1.5-base#training-data).
+
+AI-Hub's [official FAQ](https://aihub.or.kr/aihubnews/faq/list.do) permits commercial
+use of learned models with dataset-name and AI-Hub attribution; it restricts
+redistribution of original or merely edited source data.
+
 ## License
 
 Code is released under the [MIT License](LICENSE). Dataset and model artifact rights are
